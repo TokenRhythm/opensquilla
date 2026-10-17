@@ -14,11 +14,18 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
-import { withDeadline } from './e2e-shutdown-helpers.mjs'
+import { closeElectronWithDeadline, withDeadline } from './e2e-shutdown-helpers.mjs'
+import {
+  desktopGatewayAuthToken,
+  desktopProfileFingerprint,
+  loadDesktopGatewayOwnershipRecord,
+  readVerifiedDesktopGatewayActivity,
+} from '../dist/desktop-gateway-ownership.js'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 
 async function exists(path) {
   try {
@@ -107,6 +114,33 @@ const cleanupJournal = join(userData, '.opensquilla.profile-cleanup.json')
 const helperDiagnostics = join(root, 'cleanup-helper-diagnostics')
 const deleteAllHelperTimeoutMs = process.platform === 'win32' ? 90_000 : 30_000
 let desktopApp
+let flowSucceeded = false
+let phase = 'automatic-cleanup-abandon'
+
+async function shutdownDiagnostics() {
+  const log = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => null)
+  if (log === null) return { phase, logReadFailed: true }
+  const events = new Set([
+    'gateway_spawned', 'gateway_ready', 'gateway_exited', 'quit_gateway_activity_checked',
+    'quit_confirmation_required', 'quit_confirmation_failed', 'quit_cancelled_by_user',
+    'quit_confirmed', 'quit_deferred_for_profile_writer', 'quit_deferred_for_update_drain',
+    'before_quit', 'desktop_exit_phase', 'quit_gateway_shutdown_requested',
+    'quit_gateway_exit', 'quit_gateway_drain_failed', 'quit_gateway_still_running',
+  ])
+  const fields = new Set([
+    'event', 'at', 'pid', 'port', 'kind', 'activity', 'activeCount', 'ownershipMatched',
+    'retainedScope', 'exited', 'gatewayStatus', 'from', 'to', 'activeWriters',
+    'gatewayDrainInFlight', 'accepted', 'alreadyStopping', 'hardTerminated',
+  ])
+  const records = []
+  for (const line of log.split(/\r?\n/)) {
+    let record
+    try { record = JSON.parse(line) } catch { continue }
+    if (!events.has(record?.event)) continue
+    records.push(Object.fromEntries(Object.entries(record).filter(([key]) => fields.has(key))))
+  }
+  return { phase, logBytes: Buffer.byteLength(log, 'utf8'), records: records.slice(-32) }
+}
 
 async function observeDeleteAllHelper(app) {
   await mkdir(helperDiagnostics, { recursive: true })
@@ -252,13 +286,43 @@ try {
   )))
   assert.deepEqual(await readFile(join(workspace, 'IDENTITY.md')), identityBeforeAbandon)
   assert.deepEqual(await readFile(join(state, 'sessions.db.keep')), stateBeforeAbandon)
-  await desktopApp.close()
+  // Journal abandonment precedes Gateway ownership verification. Closing in
+  // that startup gap legitimately asks about unknown activity. This keyless
+  // fixture exercises idle shutdown only after its own launch is verified.
+  const phase1OwnershipDir = join(userData, 'gateway-ownership', desktopProfileFingerprint(primaryHome))
+  const phase1Gateway = await waitFor(async () => {
+    for (const page of desktopApp.windows()) {
+      if (page.isClosed()) continue
+      const connection = await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())
+      if (connection?.status !== 'ready' || !/^[0-9a-f]{64}$/.test(connection.authToken ?? '')) continue
+      const loaded = loadDesktopGatewayOwnershipRecord(phase1OwnershipDir)
+      if (loaded.status !== 'valid'
+        || loaded.record.profile_fingerprint !== connection.profileFingerprint
+        || loaded.record.port !== Number(new URL(connection.httpUrl).port)
+        || desktopGatewayAuthToken(loaded.record.instance_nonce) !== connection.authToken) continue
+      const activity = await readVerifiedDesktopGatewayActivity(loaded.record)
+      if (activity.kind === 'ok' && activity.activeCount === 0) return loaded.record
+    }
+    return false
+  }, 'the isolated cleanup Gateway to be ready, owned and idle before shutdown')
+  console.log(JSON.stringify({ event: 'desktop_cleanup_idle_verified',
+    pid: phase1Gateway.pid, port: phase1Gateway.port, activeCount: 0 }))
+  const phase1Shutdown = await closeElectronWithDeadline({
+    app: desktopApp,
+    phase: 'cleanup-abandon-shutdown',
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    diagnostics: shutdownDiagnostics,
+  })
   desktopApp = null
+  if (phase1Shutdown.error) throw phase1Shutdown.error
+  assert.equal(phase1Shutdown.closed, true, 'Phase 1 requires a clean natural Electron exit')
+  assert.equal(loadDesktopGatewayOwnershipRecord(phase1OwnershipDir).status, 'missing', 'the verified Gateway released its ownership')
   await delay(200)
 
   // Phase 2: force the repair page through the remaining hard startup gate
   // (config authored by a newer build), then run the trusted
   // delete-current-profile flow from that page.
+  phase = 'delete-current-profile'
   await writeFile(
     join(primaryHome, 'config.toml'),
     `workspace_dir = ${JSON.stringify(join(root, 'missing-workspace'))}\nconfig_version = 999\n`,
@@ -298,6 +362,9 @@ try {
     })
   ), preview.previewId).catch(() => {})
   await withDeadline(() => exited, 'Desktop exit after deleting the current profile', 30_000)
+  assert.equal(process.exitCode, 0, 'current-profile cleanup must exit naturally')
+  assert.equal(process.signalCode, null)
+  desktopApp = null
 
   assert.equal(await exists(primaryHome), false)
   assert.equal(await exists(join(userData, 'desktop-credential.json')), false)
@@ -311,6 +378,7 @@ try {
   // Phase 3: recreate a synthetic blocked primary profile, then verify
   // delete-all is handed to the detached offline helper and does not begin
   // until this Electron process has actually exited.
+  phase = 'delete-all-user-data'
   desktopApp = null
   await mkdir(workspace, { recursive: true })
   await mkdir(state, { recursive: true })
@@ -357,6 +425,9 @@ try {
     })
   ), deleteAllPreview.previewId).catch(() => {})
   await withDeadline(() => deleteAllExited, 'Desktop exit before the delete-all helper handoff', 30_000)
+  assert.equal(deleteAllProcess.exitCode, 0, 'delete-all cleanup must exit naturally')
+  assert.equal(deleteAllProcess.signalCode, null)
+  desktopApp = null
   try {
     await waitFor(async () => (
       !await exists(primaryHome)
@@ -371,6 +442,7 @@ try {
     )
   }
 
+  flowSucceeded = true
   console.log(JSON.stringify({
     ok: true,
     trustedPreviewVerified: true,
@@ -383,10 +455,27 @@ try {
   }))
 } catch (error) {
   await reportDeleteAllHelperFailure()
-  const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
-  if (desktopLog) console.error(desktopLog)
+  console.error(JSON.stringify({ event: 'desktop_cleanup_flow_failed', ...(await shutdownDiagnostics()) }))
   throw error
 } finally {
-  await desktopApp?.close().catch(() => {})
-  await rm(root, { recursive: true, force: true }).catch(() => {})
+  let shutdownError = null
+  if (desktopApp) {
+    try {
+      const shutdown = await closeElectronWithDeadline({
+        app: desktopApp,
+        phase: 'cleanup-final-shutdown',
+        timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+        diagnostics: shutdownDiagnostics,
+      })
+      shutdownError = shutdown.error
+    } catch (error) {
+      shutdownError = error
+    }
+  }
+  if (!flowSucceeded || shutdownError) {
+    console.error(JSON.stringify({ event: 'desktop_e2e_evidence_preserved',
+      phase, isolationRoot: root, flowSucceeded, shutdownFailed: shutdownError !== null }))
+  } else await rm(root, { recursive: true, force: true }).catch(() => {})
+  // An existing flow error remains primary even if its bounded cleanup fails.
+  if (flowSucceeded && shutdownError) throw shutdownError
 }
