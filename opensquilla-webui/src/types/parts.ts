@@ -150,7 +150,24 @@ export interface SourcePart {
   fetchStatus?: string
 }
 
+export interface ProviderRecovery {
+  phase: 'requesting' | 'reasoning' | 'retry_wait' | 'retrying' | 'fallback'
+  reason: string
+  /** Actual attempted model; source is supplied only for a known fallback. */
+  model?: string
+  fromModel?: string
+  activityId?: string
+  startedAt?: number
+  retryAfterMs?: number
+  attempt?: number
+  limit?: number
+  httpStatus?: number
+}
+
 export interface StatusPart {
+  providerRecovery?: ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   action: string
   label: string
   at: number

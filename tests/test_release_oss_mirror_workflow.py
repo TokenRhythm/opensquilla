@@ -57,6 +57,7 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
             import json
             import os
             import shutil
+            import subprocess
             import sys
             from pathlib import Path
 
@@ -70,15 +71,13 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
             remote_root = Path(os.environ["FAKE_OSS_ROOT"])
 
             def native_path(value: str) -> Path:
-                if (
-                    os.name == "nt"
-                    and len(value) >= 3
-                    and value[0] == "/"
-                    and value[1].isascii()
-                    and value[1].isalpha()
-                    and value[2] == "/"
-                ):
-                    value = f"{value[1]}:{value[2:]}"
+                if os.name == "nt" and value.startswith("/"):
+                    # Git Bash realpath may use /tmp, not only /c drive paths.
+                    # Use the same runtime's mount mapping for local paths.
+                    value = subprocess.check_output(
+                        [os.environ["FAKE_OSS_CYGPATH"], "-w", value],
+                        text=True,
+                    ).strip()
                 return Path(value)
 
             def mapped(value: str) -> Path:
@@ -209,6 +208,16 @@ def _run_upload_step(
             "TAG": "v0.5.0rc4",
         }
     )
+    if os.name == "nt":
+        bash = Path(_bash_executable())
+        cygpath_candidates = (
+            bash.parent / "cygpath.exe",
+            bash.parent.parent / "usr" / "bin" / "cygpath.exe",
+        )
+        cygpath = next((path for path in cygpath_candidates if path.is_file()), None)
+        if cygpath is None:
+            raise RuntimeError("Git for Windows cygpath.exe is required for this workflow test")
+        env["FAKE_OSS_CYGPATH"] = str(cygpath)
     if race_object is not None:
         env["FAKE_OSS_RACE_OBJECT"] = race_object
     if versioning_status is not None:
@@ -225,6 +234,7 @@ def _run_upload_step(
         [_bash_executable(), script_path.as_posix()],
         cwd=tmp_path,
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,

@@ -1,13 +1,14 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive, ref, type App } from 'vue'
+import { createApp, h, inject, nextTick, onMounted, reactive, ref, type App } from 'vue'
 
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
-import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
+import type { ChatMessageListVirtualizer, ChatViewportSnapshot } from '@/types/chatVirtualizer'
 import { consumeProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import ChatMessageList from './ChatMessageList.vue'
+import { VISUALIZE_MESSAGE_PIN_KEY } from '@/visualize/presentation'
 
 const apps: App<Element>[] = []
 let resizeObservers: { callback: ResizeObserverCallback; targets: Set<Element> }[] = []
@@ -60,6 +61,9 @@ async function mountList(options: {
   withoutScrollContainer?: boolean
   virtualizationDisabled?: boolean
   fitsViewport?: boolean
+  restoredViewport?: ChatViewportSnapshot
+  previewReadOnly?: boolean
+  onCanvasPin?: (release: () => void) => void
 } = {}) {
   const container = document.createElement('div')
   container.dataset.testScroll = 'true'
@@ -88,6 +92,8 @@ async function mountList(options: {
     sessionKey: options.sessionKey,
     scrollEpoch: options.scrollEpoch ?? 0,
     bottomPadding: options.bottomPadding ?? 0,
+    restoredViewport: options.restoredViewport,
+    previewReadOnly: options.previewReadOnly ?? false,
     selectedMessageIds: new Set<string>(),
     stripTimePrefix: (value: string) => value,
     renderMarkdown: (value: string) => value,
@@ -104,9 +110,17 @@ async function mountList(options: {
     downloadAttachment: async () => true,
   })
   const listRef = ref<ChatMessageListVirtualizer | null>(null)
+  const CanvasPinProbe = {
+    setup() {
+      const pins = inject(VISUALIZE_MESSAGE_PIN_KEY)!, el = ref<HTMLElement | null>(null)
+      onMounted(() => options.onCanvasPin?.(pins.pin(el.value!)))
+      return () => h('span', { ref: el }, 'Expanded canvas')
+    },
+  }
   const app = createApp({
     setup: () => () => h(ChatMessageList, { ...componentProps, ref: listRef },
-      options.trailing ? { trailing: () => h('div', 'Streaming answer') } : undefined),
+      { ...(options.trailing ? { trailing: () => h('div', 'Streaming answer') } : {}),
+        ...(options.onCanvasPin ? { 'router-strip': () => h(CanvasPinProbe) } : {}) }),
   })
   app.use(i18n)
   app.mount(host)
@@ -143,6 +157,134 @@ afterEach(() => {
 })
 
 describe('ChatMessageList long-history virtualization', () => {
+  it('captures a detached reading anchor and a bounded set of measured row sizes', async () => {
+    const { api, container } = await mountList({ followLiveEdge: false, sessionKey: 'session-a' })
+    container.scrollTop = 940.25
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    expect(saved.scrollTop).toBe(940.25)
+    expect(saved.width).toBe(800)
+    expect(saved.followLiveEdge).toBe(false)
+    expect(saved.anchor).toEqual({ key: 'message-10', intraOffset: 0.25 })
+    expect(saved.rows.length).toBeGreaterThan(0)
+    expect(saved.rows.length).toBeLessThanOrEqual(201)
+    expect(saved.rows.find(row => row.key === 'message-10')?.size).toBe(94)
+    container.scrollTop = 1_900
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(saved.scrollTop).toBe(940.25)
+    expect(saved.anchor?.key).toBe('message-10')
+  })
+
+  it('retains both a cached viewport anchor and a separately expanded canvas in a virtualized transcript', async () => {
+    let releasePin!: () => void
+    const rows = Array.from({ length: 200 }, (_, index) => message(index))
+    rows[150]!.isRouterStrip = true
+    const { api, host, props } = await mountList({ messages: rows, forceMountMessageKeys: new Set(['message-150']),
+      onCanvasPin: release => { releasePin = release },
+    })
+    expect(api.isVirtualized()).toBe(true)
+    props.restoredViewport = { ...api.captureViewport!(), anchor: { key: 'message-100', intraOffset: 0 } }
+    props.previewReadOnly = true
+    props.forceMountMessageKeys = new Set()
+    await nextTick(); await nextTick()
+    expect(host.querySelector('[data-chat-message-key="message-100"]')?.getAttribute('data-chat-message-forced')).toBe('true')
+    expect(host.querySelector('[data-chat-message-key="message-150"]')?.getAttribute('data-chat-message-forced')).toBe('true')
+    releasePin(); await nextTick(); await nextTick()
+    expect(host.querySelector('[data-chat-message-key="message-150"]')).toBeNull()
+    expect(host.querySelector('[data-chat-message-key="message-100"]')).not.toBeNull()
+  })
+
+  it('restores the same keyed reading location after visiting another session and prepending history', async () => {
+    const original = Array.from({ length: 40 }, (_, index) => message(index))
+    const { api, container, props } = await mountList({
+      messages: original, followLiveEdge: false, sessionKey: 'session-a', scrollEpoch: 1,
+    })
+    container.scrollTop = 977 // 37 px inside message-10.
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    expect(saved.anchor).toEqual({ key: 'message-10', intraOffset: 37 })
+    props.sessionKey = 'session-b'
+    props.scrollEpoch++
+    props.messages = Array.from({ length: 40 }, (_, index) => message(index + 100))
+    container.scrollTop = 0
+    await nextTick()
+    await nextTick()
+    props.sessionKey = 'session-a'
+    props.scrollEpoch++
+    props.messages = [message(-1), ...original]
+    props.restoredViewport = saved
+    props.previewReadOnly = true
+    await nextTick()
+    await nextTick()
+    api.restoreViewport!(saved)
+    await nextTick()
+    expect(container.scrollTop).toBe(977 + 94)
+    expect(api.captureViewport!().anchor).toEqual(saved.anchor)
+  })
+
+  it('restores a followed live edge using the current height instead of its stale absolute offset', async () => {
+    const { api, container } = await mountList({ followLiveEdge: true })
+    const saved = api.captureViewport!()
+    expect(saved.followLiveEdge).toBe(true)
+    Object.defineProperty(container, 'scrollHeight', { configurable: true, value: 21_000 })
+    container.scrollTop = 0
+    api.restoreViewport!(saved)
+    expect(container.scrollTop).toBe(21_000 - container.clientHeight)
+  })
+
+  it('uses the restored offset when row measurement arrives before its native scroll event', async () => {
+    const { api, container, host } = await mountList({
+      messages: Array.from({ length: 40 }, (_, index) => message(index)), followLiveEdge: false,
+    })
+    container.scrollTop = 977
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    // Reused thread now carries the shorter session's offset in both the DOM
+    // and TanStack. Its delayed RO delivery can beat the restore scroll event.
+    container.scrollTop = 205
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    api.restoreViewport!(saved)
+    expect(container.scrollTop).toBe(977)
+    const row = host.querySelector<HTMLElement>('[data-chat-message-index="0"]')!
+    row.getBoundingClientRect = () => ({ height: 95 } as DOMRect)
+    resize(row) // Deliberately no native scroll notification after restoration.
+    expect(container.scrollTop).toBe(978)
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(api.captureViewport!().anchor).toEqual(saved.anchor)
+  })
+
+  it('retires pending remeasurement of the previous position when restoring a saved viewport', async () => {
+    const { api, container } = await mountList({ followLiveEdge: false })
+    container.scrollTop = 977
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const saved = api.captureViewport!()
+    container.scrollTop = 205
+    container.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    api.remeasure()
+    api.restoreViewport!(saved)
+    await nextTick()
+    await new Promise(resolve => window.requestAnimationFrame(resolve))
+    await nextTick()
+    expect(container.scrollTop).toBe(977)
+  })
+
+  it('falls back to a non-negative saved position if the keyed row was removed', async () => {
+    const { api, container } = await mountList({ followLiveEdge: false })
+    const saved = api.captureViewport!()
+    api.restoreViewport!({ ...saved, scrollTop: 500, anchor: { key: 'removed-message', intraOffset: 42 } })
+    expect(container.scrollTop).toBe(500)
+    api.restoreViewport!({ ...saved, scrollTop: -30, anchor: null })
+    expect(container.scrollTop).toBe(0)
+  })
+
   it('settles clamped short-transcript measurements without idle frame polling', async () => {
     vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame'] })
     try {
@@ -211,7 +353,8 @@ describe('ChatMessageList long-history virtualization', () => {
     const { api, host } = await mountList()
 
     const target = await api.ensureMessageVisible(150)
-    expect(target?.id).toBe('chat-turn-150')
+    expect(target?.id).toMatch(/^chat-turn-.+-150$/)
+    expect(target?.id).toBe(api.messageAnchorId(150))
     expect(host.querySelector('[data-chat-message-index="150"]')).toBeTruthy()
     expect(host.querySelectorAll('[data-testid="chat-message-row"]').length).toBeLessThanOrEqual(30)
 
@@ -234,7 +377,7 @@ describe('ChatMessageList long-history virtualization', () => {
     props.messages = [message(-1), ...props.messages]
     const target = await pending
     expect(target?.dataset.chatTurnKey).toBe('message-150')
-    expect(target?.id).toBe('chat-turn-151')
+    expect(target?.id).toMatch(/^chat-turn-.+-151$/)
   })
 
   it('does not hand an old-session destination to a replacement session', async () => {
@@ -693,28 +836,41 @@ describe('ChatMessageList long-history virtualization', () => {
         : row ? index * 94 + (index > 10 ? extra : 0) - offset : 0
       return { top, bottom: top + height, height, width } as DOMRect
     })
-    const { container, host } = await mountList({
+    const { container, host, api } = await mountList({
       messages: Array.from({ length: 48 }, (_, index) => message(index)), followLiveEdge: false,
     })
     container.scrollTop = 1_010 // Row 10 is mostly clipped; row 11 starts 24px below the fold.
     container.dispatchEvent(new Event('scroll'))
     await nextTick() // Reflow immediately, without waiting for scroll-idle/text anchoring.
+    const writes: number[] = []
+    let currentTop = container.scrollTop
+    Object.defineProperty(container, 'scrollTop', {
+      configurable: true, get: () => currentTop,
+      set: (top: number) => { currentTop = top; writes.push(top) },
+    })
     width = 600
     resize(host.querySelector('.chat-message-list')!)
     resize(host.querySelector('[data-chat-message-index="10"]')!)
+    expect(container.scrollTop).toBe(1_052)
     await nextTick()
     await nextTick()
     await new Promise(resolve => window.requestAnimationFrame(resolve))
     await nextTick()
     expect(container.scrollTop).toBe(1_052)
+    expect(writes.every(top => top === 1_052)).toBe(true)
+    expect(api.captureViewport!().rows.find(row => row.key === 'message-10')?.size).toBe(136)
+    writes.length = 0
     width = 800
     resize(host.querySelector('.chat-message-list')!)
     resize(host.querySelector('[data-chat-message-index="10"]')!)
+    expect(container.scrollTop).toBe(1_010)
     await nextTick()
     await nextTick()
     await new Promise(resolve => window.requestAnimationFrame(resolve))
     await nextTick()
     expect(container.scrollTop).toBe(1_010)
+    expect(writes.every(top => top === 1_010)).toBe(true)
+    expect(api.captureViewport!().rows.find(row => row.key === 'message-10')?.size).toBe(94)
   })
 
   it('keeps an oversized current row even when a complete following row is visible', async () => {

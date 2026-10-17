@@ -4,6 +4,7 @@
 // and loads survive tab switches); this component is presentation only.
 // Members mutations commit live — visibly unlike the configuration editor's
 // draft/save model.
+import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -15,6 +16,7 @@ const props = defineProps<{
 }>()
 
 const { t, locale } = useI18n()
+const hasMemberRows = computed(() => props.members.pairings.value.length > 0 || props.members.adminOnlySenders.value.length > 0)
 
 function reload() {
   void props.members.load(props.channelName)
@@ -63,22 +65,22 @@ function formatSince(since?: string | number | null): string {
       <input v-model="members.search.value" type="search" :placeholder="t('console.channels.pairings.searchPlaceholder')" />
     </label>
 
-    <div v-if="members.loading.value && members.pairings.value.length === 0" class="ch-pairing-state" role="status">
+    <div v-if="members.loading.value && !hasMemberRows" class="ch-pairing-state" role="status">
       <LoadingSpinner />
       <span>{{ t('console.channels.pairings.loading') }}</span>
     </div>
-    <div v-else-if="members.error.value" class="ch-pairing-state is-error" role="alert">
+    <div v-else-if="members.error.value" class="ch-pairing-state is-error" :class="{ 'is-inline': hasMemberRows }" role="alert">
       <Icon name="info" :size="17" aria-hidden="true" />
       <span>{{ members.error.value }}</span>
       <button class="btn btn--ghost" type="button" @click="reload">
         {{ t('console.channels.pairings.tryAgain') }}
       </button>
     </div>
-    <div v-else-if="members.pairings.value.length === 0 && members.adminOnlySenders.value.length === 0" class="ch-pairing-state">
+    <div v-else-if="!hasMemberRows" class="ch-pairing-state">
       <Icon name="shield" :size="15" aria-hidden="true" />
       <span><strong>{{ t('console.channels.pairings.emptyTitle') }}</strong> — {{ t('console.channels.pairings.emptyDescription') }}</span>
     </div>
-    <div v-else class="ch-pairing-groups">
+    <div v-if="hasMemberRows" class="ch-pairing-groups">
       <section v-if="members.pendingPairings.value.length" :aria-label="t('console.channels.pairings.pendingRequests')">
         <h4>{{ t('console.channels.pairings.pendingRequests') }}</h4>
         <article v-for="pairing in members.pendingPairings.value" :key="pairing.pairingId" class="ch-pairing-row">
@@ -223,6 +225,7 @@ function formatSince(since?: string | number | null): string {
 .ch-pairing-summary strong { color: var(--text); font-family: var(--font-mono); }
 .ch-pairing-state { align-items: center; color: var(--text-dim); display: flex; flex-direction: column; gap: 8px; justify-content: center; min-height: 180px; padding: var(--sp-4); text-align: center; }
 .ch-pairing-state.is-error { color: var(--danger); }
+.ch-pairing-state.is-inline { flex-direction: row; flex-wrap: wrap; justify-content: flex-start; min-height: 0; text-align: left; }
 .ch-pairing-groups > section + section { border-top: 1px solid var(--border); }
 .ch-pairing-groups h4 { color: var(--text-dim); font-size: 11px; letter-spacing: .04em; margin: 0; padding: 11px 14px 7px; text-transform: uppercase; }
 .ch-pairing-row { align-items: center; display: grid; gap: 10px; grid-template-columns: 32px minmax(0, 1fr) auto auto; padding: 10px 14px; }

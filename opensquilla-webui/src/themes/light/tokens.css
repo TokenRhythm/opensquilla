@@ -1,38 +1,27 @@
 /* Theme: light (value) — L1 token block. See src/themes/light/manifest.ts. */
-/* Light theme — Feishu/Lark structural logic with a warm-orange brand.
-   Neutrals, text hierarchy, and borders follow Lark's published design language
-   (open.feishu.cn/document/design-specification/design-language/color): a
-   near-white field, four levels of grey text carrying the hierarchy, and
-   borders so light they read as separation rather than as frames. Colour is
-   reserved for call-to-action, selected state, and status — never as area.
-   The brand hue is the strike orange shared with the desktop launch sequence,
-   so both surfaces resolve to one family instead of drifting apart. */
+/* Neutral paper surfaces. Text carries the hierarchy; borders separate
+   content without framing every surface. Orange remains the brand/action
+   colour rather than tinting the conversation's reading surfaces. */
 [data-theme="light"] {
-  /* Lark neutrals: #F5F6F7 field, pure-white cards, #EFF0F1 for the recessed
-     step (hover fills, inset wells). Separation is border + soft --elev, never
-     tint stacking. */
-  --bg: #F7F7F8;
+  /* Both conversation columns share white paper. The navigation rail has its
+     own neutral fill below; opening Workbench must not introduce a grey page. */
+  --bg: #FFFFFF;
   --bg-surface: #FFFFFF;
-  --bg-surface-2: #F0F0F2;
+  --bg-surface-2: #F5F5F5;
   --bg-elevated: #FFFFFF;
-  --bg-hover: #EAEAED;
-  /* Four-level text ramp, straight from Lark. --text-dim is #868C95 rather than
-     Lark's #8F959E: the published tertiary lands at 2.79:1 on this field, under
-     the 3:1 floor check-webui-colors.mjs enforces, so it is darkened by the
-     smallest step that clears it (3.13:1). */
-  --text: #1D1D1F;
-  --text-muted: #5F6066;
-  --text-dim: #85868D;
-  /* Card border / control border / disabled, per Lark. */
-  --border: #E6E6E9;
-  --border-strong: #D5D5DA;
+  --bg-hover: #F0F0F0;
+  --text: #202020;
+  --text-muted: #626262;
+  --text-dim: #737373;
+  --border: #E5E5E5;
+  --border-strong: #D4D4D4;
   /* Emphasis border for hover/focus rings. Deliberately NEUTRAL: this token is
      also the hover border on stat cards, the composer, and approval/clarify
      cards, so tying it to the brand turned every hover orange. Brand colour is
      applied explicitly where it belongs, not through this. */
-  --border-focus: #B9BAC1;
+  --border-focus: #A3A3A3;
   --card: #FFFFFF;
-  --hairline: #EFEFF1;
+  --hairline: #ECECEC;
 
   /* Brand orange — the canonical strike accent (the family
      check-cross-surface-tokens.mjs pins for desktop boot). Following Lark's
@@ -48,10 +37,10 @@
   /* Mist elevation — thin hairline ring + soft, wide, low-opacity shadows
      (floating paper, no glare). */
   --elev-highlight: rgba(255,255,255,0.9);
-  --elev-1: 0 1px 2px rgba(16,20,26,0.035), 0 8px 24px -16px rgba(16,20,26,0.14);
-  --elev-1-hover: 0 2px 5px rgba(16,20,26,0.055), 0 14px 34px -18px rgba(16,20,26,0.20);
-  --elev-2: 0 8px 30px -16px rgba(16,20,26,0.22);
-  --elev-3: 0 20px 55px -22px rgba(16,20,26,0.30);
+  --elev-1: 0 1px 2px rgba(0,0,0,0.03), 0 8px 24px -16px rgba(0,0,0,0.12);
+  --elev-1-hover: 0 2px 5px rgba(0,0,0,0.045), 0 14px 34px -18px rgba(0,0,0,0.16);
+  --elev-2: 0 8px 30px -16px rgba(0,0,0,0.18);
+  --elev-3: 0 20px 55px -22px rgba(0,0,0,0.24);
 
   /* Functional hues — AA ink versions (text on bg/surface); brighter siblings
      live in the -fill roles for small non-text marks (dots, bars, chips). */
@@ -76,8 +65,8 @@
   --syntax-title: #1E55C7;
   --syntax-attr: #0E7490;
 
-  --shadow: rgba(0,0,0,0.10);
-  --shadow-color: rgba(0,0,0,0.10);
+  --shadow: rgba(0,0,0,0.08);
+  --shadow-color: rgba(0,0,0,0.08);
   --scrim: rgba(0, 0, 0, 0.40);
   --grain-opacity: 0;
 
@@ -86,18 +75,16 @@
      onboarding, completion) — never behind operational UI. */
   --atmosphere-dawn: linear-gradient(180deg, #D9E5F6 0%, #EEF0F5 48%, #F8E9D8 100%);
 
-  /* Sidebar is the lightest Lark ground (#F8F9FA) with no separate plate; rows
-     step to #EFF0F1 on hover and active. Text reuses the four-level ramp so the
-     rail and the content area share one hierarchy. */
-  --sidebar-bg: #F3F3F5;
+  /* A near-white rail and one neutral step for selected rows. */
+  --sidebar-bg: #F9F9F9;
   --sidebar-control-bg: #FFFFFF;
-  --sidebar-control-hover: #F8F8F9;
-  --sidebar-item-hover: #EAEAED;
-  --sidebar-item-active: #E4E4E8;
-  --sidebar-text-strong: #18181A;
-  --sidebar-text: #56565A;
-  --sidebar-text-soft: #6C6C70;
-  --sidebar-border: #EBEBEE;
+  --sidebar-control-hover: #F5F5F5;
+  --sidebar-item-hover: #F1F1F1;
+  --sidebar-item-active: #EDEDED;
+  --sidebar-text-strong: #202020;
+  --sidebar-text: #525252;
+  --sidebar-text-soft: #707070;
+  --sidebar-border: #EEEEEE;
 }
 
 /* Structural identity — light explicitly re-asserts the foundation type + radius

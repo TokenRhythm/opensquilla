@@ -47,6 +47,9 @@ export type TopbarUpdateState = {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  canInstall?: boolean
+  canAutoDownload?: boolean
+  releaseNotesUrl?: string | null
   installMode: 'native' | 'manual' | 'unsupported'
   releaseUrl: string | null
   source: 'oss' | 'github' | null
@@ -385,7 +388,7 @@ async function installMockGateway(
 }
 
 export async function waitForTopbarStable(page: Page, theme?: string) {
-  await expect(page.locator('.conn-pill.connected').first()).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]').first()).toBeVisible({ timeout: 10_000 })
   await expect(page.getByTestId('route-header-host').locator('.chat-header')).toHaveCount(1)
   await expect(page.locator('.msg-ai-main').last()).toBeVisible({ timeout: 10_000 })
   if (theme) await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
@@ -394,6 +397,52 @@ export async function waitForTopbarStable(page: Page, theme?: string) {
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
     await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
   })
+}
+
+/** Establish the visual fixture's read state through the real acknowledgement action. */
+export async function acknowledgeTopbarDeliverables(page: Page, count: number) {
+  const header = page.getByTestId('chat-header-actions')
+  await expect(header.locator('.chat-header__count-badge').first())
+    .toHaveText(count > 99 ? '99+' : String(count))
+  const readGeometry = () => page.evaluate(() => {
+    const selectors = ['.topbar', '[data-testid="chat-header-actions"]']
+    return selectors.flatMap(selector => {
+      const bounds = document.querySelector(selector)!.getBoundingClientRect()
+      return [bounds.x, bounds.y, bounds.width, bounds.height]
+    })
+  })
+  const originalGeometry = await readGeometry()
+  const layout = await header.getAttribute('data-layout')
+  if (layout === 'wide') {
+    await page.getByTestId('chat-session-action-deliverables').click()
+  } else if (layout === 'compact') {
+    await page.getByTestId('chat-header-primary-action').click()
+  } else {
+    expect(layout).toBe('tight')
+    await page.getByTestId('chat-session-actions-trigger').click()
+    await page.getByTestId('chat-session-action-deliverables').click()
+  }
+  const workbench = page.getByTestId('workbench-host')
+  await expect(workbench).toBeVisible()
+  await expect(workbench.getByRole('tab', { name: `status-report-${count}.csv`, exact: true }))
+    .toHaveAttribute('aria-selected', 'true')
+  if (count > 1) {
+    await expect(workbench.getByRole('combobox').locator('option')).toHaveCount(count)
+  }
+  await workbench.locator('.workbench-host__tab-wrap').hover()
+  await workbench.locator('.workbench-host__tab-close').click()
+  await expect(workbench).toBeHidden()
+  // Opening the panel crosses layout thresholds. The 544–576px hysteresis
+  // band can legitimately return compact after starting wide at the exact
+  // same width; pin the restored geometry and let the original visual/target
+  // assertions verify the final controls without equating pre/post layout names.
+  await expect.poll(async () => {
+    const restoredGeometry = await readGeometry()
+    return Math.max(...restoredGeometry.map((value, index) => Math.abs(value - originalGeometry[index]!)))
+  }).toBeLessThanOrEqual(1)
+  await expect(header.locator('.chat-header__new-badge, .chat-header__new-dot')).toHaveCount(0)
+  await page.mouse.move(0, page.viewportSize()!.height - 1)
+  await waitForTopbarStable(page)
 }
 
 export async function openTopbarSession(page: Page, options: TopbarScenario = {}) {
@@ -416,7 +465,7 @@ export async function openTopbarSession(page: Page, options: TopbarScenario = {}
   await expect(page.locator('html')).toHaveAttribute('lang', locale)
   await waitForTopbarStable(page, theme)
   if (approvalCount > 0) {
-    await expect(page.getByTestId('chat-system-status')).toHaveAttribute('data-severity', 'danger')
+    await expect(page.getByTestId('chat-system-approval')).toBeVisible()
   }
 
   return {

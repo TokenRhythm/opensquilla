@@ -1,3 +1,5 @@
+import { normalizeBrowserNavigationUrl } from './browser-action-contract.js'
+
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION = 1 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V2 = 2 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V3 = 3 as const
@@ -338,7 +340,10 @@ function parseHttpUrl(value: unknown, label: string): URL {
 }
 
 export function parseNativeWorkbenchNavigationUrl(value: unknown): string {
-  return parseHttpUrl(value, 'Workbench address').href
+  const url = typeof value === 'string' && value.length <= 8192
+    && !/[\u0000-\u001f\u007f]/.test(value) ? normalizeBrowserNavigationUrl(value) : undefined
+  if (!url) throw new Error('The Workbench address must be HTTP, HTTPS, or about:blank without embedded credentials.')
+  return url
 }
 
 function parseArtifactPreviewPayload(
@@ -449,9 +454,8 @@ export function parseNativeWorkbenchNavigationRequest(
     throw new Error('Unsupported native Workbench navigation request.')
   }
   const action = request.action as NativeWorkbenchNavigationAction
-  const url = action === 'navigate' || action === 'open-external'
-    ? parseNativeWorkbenchNavigationUrl(request.url)
-    : undefined
+  const url = action === 'open-external' ? parseHttpUrl(request.url, 'Workbench address').href
+    : action === 'navigate' ? parseNativeWorkbenchNavigationUrl(request.url) : undefined
   if (action !== 'navigate' && action !== 'open-external' && request.url !== undefined) {
     throw new Error('This native Workbench navigation action does not accept an address.')
   }

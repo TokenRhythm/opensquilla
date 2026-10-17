@@ -23,11 +23,11 @@ import {
 const source = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8')
 const parsed = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
 const names = [
-  'windowsInstallerActionsSupported', 'windowsUpdateDownloadDirectory',
+  'windowsInstallerActionsSupported', 'desktopUpdateAutomaticDownloadSupported', 'windowsUpdateDownloadDirectory',
   'clearWindowsUpdateCache', 'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache',
   'revalidateReadyWindowsInstaller', 'restoreDownloadedUpdateRetryState',
   'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'applyWindowsInstaller',
-  'downloadDesktopUpdate', 'showUpdateError', 'handleMainWindowClose', 'desktopGatewayConnectionSuspendedForExit',
+  'downloadDesktopUpdate', 'runDesktopUpdateDownload', 'showUpdateError', 'handleMainWindowClose', 'desktopGatewayConnectionSuspendedForExit',
 ]
 const declarations = new Map(parsed.statements.filter(ts.isFunctionDeclaration)
   .filter((statement) => statement.name).map((statement) => [statement.name.text, statement]))
@@ -232,6 +232,7 @@ function fixture(options = {}) {
     windowsUpdateCacheRestoreAttempted: true,
     windowsUpdateCoordinator: new WindowsUpdateCoordinator(1000),
     windowsUpdateRecoveryGeneration: 0,
+    desktopUpdateDownloadTask: null, desktopUpdateDownloadOrigin: null,
     updateApplying: false, isQuitting: false, appExitPhase: 'running', gatewayLateReadyObservation: null,
     updateInstallHandoffReady: false, updateDownloadInProgress: false,
     manualInstallerActionInProgress: false, updateGatewayShutdownProcess: null,

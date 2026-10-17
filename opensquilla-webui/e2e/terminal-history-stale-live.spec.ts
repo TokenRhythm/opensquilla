@@ -1,5 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-terminal-history-stale-live'
@@ -11,15 +16,14 @@ function response(id: unknown, payload: unknown) {
 }
 
 function terminalHistory() {
-  return {
-    messages: [{
+  return chatHistoryPayload([{
       role: 'user',
       text: 'Stop after the provider retry.',
       id: 'user-terminal-history',
       message_id: 'user-terminal-history',
       timestamp: BASE_TIME - 1_000,
       turn_context: { turn_id: TASK_ID },
-    }],
+    }], {
     turn_outcomes: [{
       turn_id: TASK_ID,
       task_id: TASK_ID,
@@ -48,9 +52,7 @@ function terminalHistory() {
         ],
       },
     }],
-    has_more: false,
-    canonical_complete: true,
-  }
+  })
 }
 
 async function installStaleLiveFixture(page: Page) {
@@ -107,8 +109,14 @@ async function installStaleLiveFixture(page: Page) {
               task_id: TASK_ID,
               turn_id: TASK_ID,
               stream_seq: 2,
+              stream_generation: 'stale-terminal-generation',
               emitted_at: BASE_TIME + 1_000,
+              schema_version: 1,
+              activity_id: 'provider-stale-terminal',
               phase: 'reasoning',
+              reason: 'initial',
+              started_at: BASE_TIME + 1_000,
+              heartbeat: false,
             },
           }],
         }))
@@ -134,8 +142,8 @@ async function installStaleLiveFixture(page: Page) {
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-        'sessions.messages.subscribe': staleLiveState,
-        'sessions.messages.hydrate': staleLiveState,
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, staleLiveState),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, staleLiveState),
         'sessions.messages.unsubscribe': { subscribed: false },
         'sessions.subscribe': { subscribed: true },
         'usage.status': { sessions: [] },
@@ -151,7 +159,7 @@ test('terminal history keeps activity-only output and rejects the same task stal
   await installStaleLiveFixture(page)
 
   await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_KEY)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.getByText('Stop after the provider retry.', { exact: true })).toBeVisible()
   await expect(page.getByRole('button', { name: /^Stopped/ })).toBeVisible()
 

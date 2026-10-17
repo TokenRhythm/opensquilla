@@ -12,7 +12,7 @@ async function openSidebar(page: Page) {
   await page.setViewportSize({ width: 1440, height: 900 })
   await installSidebarFixture(page)
   await page.goto(`/control/chat?session=${encodeURIComponent(SIDEBAR_ACTIVE_SESSION_KEY)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect(page.locator(ROW_SELECTOR)).toHaveCount(SIDEBAR_SESSION_KEYS.length)
   await expect(page.getByText('The example tasks are ready.', { exact: false })).toBeVisible()
 }
@@ -61,7 +61,7 @@ test('mouse drag previews, commits once, and preserves order after reload', asyn
   await expect.poll(() => renderedOrder(page)).toEqual(expectedOrder)
 
   await page.reload()
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect.poll(() => renderedOrder(page)).toEqual(expectedOrder)
 })
 
@@ -169,7 +169,7 @@ test('narrow drawer keeps the session hover card out of the list interaction pat
   await page.setViewportSize({ width: 548, height: 844 })
   await installSidebarFixture(page)
   await page.goto(`/control/chat?session=${encodeURIComponent(SIDEBAR_ACTIVE_SESSION_KEY)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 
   const openSidebarButton = page.getByTestId('sidebar-toggle-collapsed')
   if (await openSidebarButton.isVisible()) await openSidebarButton.click()

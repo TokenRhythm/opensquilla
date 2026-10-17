@@ -128,6 +128,8 @@ class ToolResult:
     # the Agent may use it instead of provisional text emitted before the tool ran.
     terminal_response_text: str | None = None
     execution_log_handle: str | None = None
+    # UI-only content captured at execution, excluded from model content blocks.
+    file_snapshot: dict[str, Any] | None = None
 
 
 AgentToolHandler = Callable[[ToolCall], Awaitable[ToolResult]]

@@ -606,6 +606,7 @@ class ArtifactSessionRepository:
         actor: Actor,
         document_id: str | None = None,
         revision_id: str | None = None,
+        validate_session: Callable[[Any], Awaitable[None]] | None = None,
     ) -> CommitResult:
         """Create a document and its generation-one immutable snapshot atomically."""
 
@@ -613,6 +614,8 @@ class ArtifactSessionRepository:
         revision_id = revision_id or self._id_factory("rev")
         created_at = self._clock()
         async with self._transaction("create_document") as conn:
+            if validate_session is not None:
+                await validate_session(conn)
             return await self._create_document_on_conn(
                 conn,
                 session_key=session_key,
@@ -1009,6 +1012,37 @@ class ArtifactSessionRepository:
         async with self._read_transaction("get_document") as conn:
             return await self._get_document_on_conn(conn, document_id)
 
+    async def get_document_for_artifact(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        artifact_id: str,
+    ) -> Document | None:
+        """Find a revision's unique document without adopting or changing it."""
+
+        async with self._read_transaction("get_document_for_artifact") as conn:
+            rows = await _fetchall(
+                conn,
+                """
+                SELECT DISTINCT document.document_id
+                FROM artifact_documents AS document
+                JOIN artifact_revisions AS revision
+                  ON revision.document_id = document.document_id
+                WHERE document.session_key = ?
+                  AND document.session_id = ?
+                  AND revision.artifact_id = ?
+                ORDER BY document.document_id
+                LIMIT 2
+                """,
+                (session_key, session_id, artifact_id),
+            )
+            if len(rows) > 1:
+                raise ArtifactConflictError("artifact is already adopted by multiple documents")
+            if not rows:
+                return None
+            return await self._get_document_on_conn(conn, str(rows[0]["document_id"]))
+
     async def get_document_head(
         self,
         document_id: str,
@@ -1262,6 +1296,17 @@ class ArtifactSessionRepository:
                 (session_id, limit),
             )
             return tuple(_document_source_binding_from_row(row) for row in rows)
+
+    async def get_document_source_binding_for_document(
+        self, *, session_id: str, document_id: str,
+    ) -> DocumentSourceBinding | None:
+        async with self._read_transaction("get_document_source_binding_for_document") as conn:
+            row = await _fetchone(
+                conn,
+                "SELECT * FROM document_source_bindings WHERE session_id = ? AND document_id = ?",
+                (session_id, document_id),
+            )
+            return None if row is None else _document_source_binding_from_row(row)
 
     async def apply_document_import_attempt(
         self,
@@ -1769,6 +1814,18 @@ class ArtifactSessionRepository:
         async with self._read_transaction("get_document_publication") as conn:
             return await self._get_document_publication_on_conn(conn, publication_id)
 
+    async def get_document_publication_for_artifact(
+        self, *, session_id: str, artifact_id: str,
+    ) -> DocumentPublication | None:
+        async with self._read_transaction("get_document_publication_for_artifact") as conn:
+            row = await _fetchone(
+                conn,
+                "SELECT * FROM document_publications "
+                "WHERE session_id = ? AND deliverable_artifact_id = ?",
+                (session_id, artifact_id),
+            )
+            return None if row is None else _document_publication_from_row(row)
+
     async def list_document_publications(
         self,
         *,
@@ -1883,6 +1940,74 @@ class ArtifactSessionRepository:
                     raise ArtifactValidationError("document head belongs to another document")
                 snapshots.append(CommitResult(document=document, revision=revision))
             return tuple(snapshots)
+
+    async def resolve_fork_document_heads(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        source_document_ids: Sequence[str],
+    ) -> dict[str, CommitResult]:
+        """Resolve inherited display references to this session's own fork copies.
+
+        Only generation-one session-fork provenance establishes an alias. Names,
+        paths and shared blob identities never establish ownership. Following the
+        document's initial revision also handles a fork of an edited fork, whose
+        transcript still contains an ancestor's original document id.
+        """
+        requested = set(source_document_ids)
+        if not requested:
+            return {}
+        async with self._read_transaction("resolve_fork_document_heads") as conn:
+            rows = await _fetchall(
+                conn,
+                """
+                WITH RECURSIVE lineage(document_id, source_document_id) AS (
+                    SELECT local.document_id, source.document_id
+                    FROM artifact_documents AS local
+                    JOIN artifact_revisions AS root ON root.document_id = local.document_id
+                    JOIN artifact_revisions AS source
+                        ON source.revision_id = root.copied_from_revision_id
+                    WHERE local.session_key = ? AND local.session_id = ?
+                        AND root.generation = 1 AND root.parent_revision_id IS NULL
+                        AND root.source = 'initial'
+                        AND root.actor_kind = 'system' AND root.actor_id = 'session-fork'
+                    UNION
+                    SELECT lineage.document_id, source.document_id
+                    FROM lineage
+                    JOIN artifact_revisions AS root
+                        ON root.document_id = lineage.source_document_id
+                    JOIN artifact_revisions AS source
+                        ON source.revision_id = root.copied_from_revision_id
+                    WHERE root.generation = 1 AND root.parent_revision_id IS NULL
+                        AND root.source = 'initial'
+                        AND root.actor_kind = 'system' AND root.actor_id = 'session-fork'
+                )
+                SELECT document_id, source_document_id FROM lineage
+                """,
+                (session_key, session_id),
+            )
+            candidates: dict[str, set[str]] = {}
+            for row in rows:
+                source_id = str(row["source_document_id"])
+                if source_id in requested:
+                    candidates.setdefault(source_id, set()).add(str(row["document_id"]))
+            resolved: dict[str, CommitResult] = {}
+            heads: dict[str, CommitResult] = {}
+            for source_id, document_ids in candidates.items():
+                # An ambiguous copy must remain unavailable rather than opening
+                # an arbitrary resource from the current session.
+                if len(document_ids) != 1:
+                    continue
+                document_id = next(iter(document_ids))
+                if document_id not in heads:
+                    document = await self._get_document_on_conn(conn, document_id)
+                    revision = await self._get_revision_on_conn(conn, document.head_revision_id)
+                    if revision.document_id != document_id:
+                        raise ArtifactValidationError("document head belongs to another document")
+                    heads[document_id] = CommitResult(document=document, revision=revision)
+                resolved[source_id] = heads[document_id]
+            return resolved
 
     async def fork_session_heads(
         self,

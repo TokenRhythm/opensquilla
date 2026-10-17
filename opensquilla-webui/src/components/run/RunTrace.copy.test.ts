@@ -5,6 +5,7 @@ import i18n from '@/i18n'
 import type { ChatStreamTimelineItem } from '@/types/chat'
 import type { NodeStep } from '@/types/runTrace'
 import { copyTextWithFallback } from '@/utils/browser'
+import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import RunTrace from './RunTrace.vue'
 
 vi.mock('@/utils/browser', () => ({
@@ -14,7 +15,7 @@ vi.mock('@/utils/browser', () => ({
 async function mountRunTrace(
   initialItems: ChatStreamTimelineItem[],
   options: {
-    isToolItemOpen?: (renderKey: string) => boolean
+    isToolItemOpen?: (renderKey: string) => boolean | undefined
     onShowResult?: (content: string, title: string, context?: unknown) => void
   } = {},
 ) {
@@ -25,8 +26,8 @@ async function mountRunTrace(
     setup() {
       return () => h(RunTrace, {
         items: items.value,
-        isToolGroupOpen: () => false,
-        isToolItemOpen: options.isToolItemOpen ?? (() => false),
+        isToolGroupOpen: () => undefined,
+        isToolItemOpen: options.isToolItemOpen ?? (() => undefined),
         onShowResult: options.onShowResult,
       })
     },
@@ -45,8 +46,8 @@ async function mountFlatRunTrace(steps: NodeStep[]) {
     setup() {
       return () => h(RunTrace, {
         steps,
-        isToolGroupOpen: () => false,
-        isToolItemOpen: () => false,
+        isToolGroupOpen: () => undefined,
+        isToolItemOpen: () => undefined,
       })
     },
   })
@@ -59,6 +60,7 @@ async function mountFlatRunTrace(steps: NodeStep[]) {
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
+  useToolDetailPreference().setMode('collapsed')
   document.body.innerHTML = ''
   vi.mocked(copyTextWithFallback).mockClear()
 })
@@ -121,6 +123,7 @@ describe('RunTrace code block copy control', () => {
     app.unmount()
   })
   it('compacts long tool input sections into a short summary', async () => {
+    useToolDetailPreference().setMode('expanded')
     const prompt = Array.from({ length: 12 }, (_, index) => `line ${index + 1}: detailed image prompt`).join('\n')
     const inputRaw = JSON.stringify({
       filename: 'octopus-3d-clay.png',
@@ -171,6 +174,7 @@ describe('RunTrace code block copy control', () => {
     app.unmount()
   })
   it('uses shell-specific summaries for compacted command input and stdout output', async () => {
+    useToolDetailPreference().setMode('expanded')
     const command = [
       "python - <<'PY'",
       'import json',

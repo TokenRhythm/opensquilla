@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 import { onMounted, ref, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useToasts } from '@/composables/useToasts'
@@ -65,7 +66,7 @@ onMounted(() => { void load() })
       <span v-else-if="saving" class="desktop-preferences__saving" role="status">
         {{ t('setup.runtime.previewModeSaving') }}
       </span>
-      <select
+      <ControlSelect
         id="desktop-preview-mode-select"
         class="control-input desktop-preferences__select"
         data-testid="desktop-preview-mode-select"
@@ -78,7 +79,7 @@ onMounted(() => { void load() })
       >
         <option value="full">{{ t('setup.runtime.previewModeFull') }}</option>
         <option value="offline">{{ t('setup.runtime.previewModeOffline') }}</option>
-      </select>
+      </ControlSelect>
     </div>
   </div>
 </template>

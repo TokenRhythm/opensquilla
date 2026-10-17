@@ -1,29 +1,12 @@
 <template>
-  <div class="chat-slash" role="listbox" :aria-label="t('chat.skillPalette.title')">
+  <div :id="paletteId || 'chat-slash-options'" ref="rootRef" class="chat-slash" :style="availableHeight === null ? undefined : { maxHeight: `${availableHeight}px` }"
+    role="listbox" :aria-label="t('chat.skillPalette.title')" @keydown="onKeydown">
     <div class="chat-slash-list">
-      <template v-for="(cmd, i) in items" :key="`${cmd.kind || 'command'}:${cmd.cmd}`">
-        <div v-if="i === 0 || cmd.kind !== items[i - 1]?.kind" class="chat-slash-group">
-          {{ t(`chat.skillPalette.${cmd.kind || 'command'}`) }}
-          <span class="chat-slash-count">{{ groupSize(i) }}</span>
-        </div>
-        <button
-          type="button"
-          role="option"
-          class="chat-slash-item"
-          :class="{ 'chat-slash-item--active': i === activeIndex }"
-          :aria-selected="i === activeIndex"
-          :data-skill-name="cmd.skill?.name"
-          @mousedown.prevent
-          @click="emit('choose', cmd)"
-        >
-          <span class="chat-slash-name" :class="{ 'chat-slash-name--command': !cmd.kind || cmd.kind === 'command' }">
-            {{ cmd.kind === 'command' || !cmd.kind ? cmd.cmd : cmd.label }}
-          </span>
-          <span class="chat-slash-desc">{{ cmd.desc }}</span>
-          <span v-if="status(cmd)" class="chat-slash-status" :title="cmd.skill?.reason">{{ status(cmd) }}</span>
-        </button>
-      </template>
-      <div v-if="!items.length && !loading" class="chat-slash-empty">{{ t('chat.skillPalette.empty') }}</div>
+      <div v-for="group in groups" :key="group.key" role="group" :aria-label="t(`chat.skillPalette.${group.kind}`)">
+        <div class="chat-slash-group" aria-hidden="true">{{ t(`chat.skillPalette.${group.kind}`) }}</div>
+        <ComposerCapabilityList :items="group.items" role="option" row-class="chat-slash-item" preserve-editor-focus @choose="choose" />
+      </div>
+      <div v-if="!items.length && !loading && !error" class="chat-slash-empty">{{ t('chat.skillPalette.empty') }}</div>
       <div v-if="loading" class="chat-slash-empty" role="status">{{ t('chat.skillPalette.loading') }}</div>
       <div v-if="error" class="chat-slash-empty" role="status">{{ error }}</div>
     </div>
@@ -32,20 +15,64 @@
 </template>
 
 <script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChatSlashCommand } from '@/composables/chat/useChatSlashCommands'
+import type { SelectedSkillRef } from '@/types/selectedSkills'
+import ComposerCapabilityList, { composerCapabilityIcon, type ComposerCapabilityItem } from './ComposerCapabilityList.vue'
 
-const props = defineProps<{ items: ChatSlashCommand[]; activeIndex: number; loading: boolean; error: string }>()
-const emit = defineEmits<{ choose: [command: ChatSlashCommand] }>()
+const props = defineProps<{ items: ChatSlashCommand[]; activeIndex: number; loading: boolean; error: string; paletteId?: string;
+  selectedSkills?: readonly SelectedSkillRef[]; composerElement?: HTMLElement | null }>()
+const emit = defineEmits<{ choose: [command: ChatSlashCommand]; close: [] }>()
 const { t } = useI18n()
-
-function groupSize(start: number): number {
-  const kind = props.items[start]?.kind || 'command'
-  let end = start + 1
-  while (end < props.items.length && (props.items[end]?.kind || 'command') === kind) end += 1
-  return end - start
+const rootRef = ref<HTMLElement | null>(null)
+const availableHeight = ref<number | null>(null)
+let resizeObserver: ResizeObserver | null = null
+function updatePlacement() {
+  const top = props.composerElement?.getBoundingClientRect().top
+  availableHeight.value = top === undefined ? null : Math.max(0, Math.floor(Math.min(
+    400, (window.visualViewport?.height || window.innerHeight) * 0.5,
+    top - (window.visualViewport?.offsetTop || 0) - 16,
+  )))
 }
-
+watch(() => props.composerElement, (element, previous) => {
+  if (previous) resizeObserver?.unobserve(previous)
+  if (element) resizeObserver?.observe(element)
+  updatePlacement()
+})
+onMounted(() => {
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(updatePlacement)
+    if (props.composerElement) resizeObserver.observe(props.composerElement)
+  }
+  window.addEventListener('resize', updatePlacement)
+  window.visualViewport?.addEventListener('resize', updatePlacement)
+  window.visualViewport?.addEventListener('scroll', updatePlacement)
+  updatePlacement()
+})
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
+  window.removeEventListener('resize', updatePlacement)
+  window.visualViewport?.removeEventListener('resize', updatePlacement)
+  window.visualViewport?.removeEventListener('scroll', updatePlacement)
+})
+const groups = computed(() => {
+  const result: { key: string; kind: string; items: ComposerCapabilityItem[] }[] = []
+  props.items.forEach((command, index) => {
+    const kind = command.kind || 'command'
+    if (result[result.length - 1]?.kind !== kind) result.push({ key: `${kind}:${index}`, kind, items: [] })
+    const skill = command.skill
+    result[result.length - 1]!.items.push({ key: String(index), id: `${props.paletteId || 'chat-slash'}-option-${index}`, label: kind === 'command' ? command.cmd : command.label,
+      description: command.desc, icon: kind === 'command' ? 'terminal' : composerCapabilityIcon(skill?.name || command.name), command: kind === 'command',
+      status: status(command), title: skill?.reason, skillName: skill?.name, active: index === props.activeIndex,
+      selected: Boolean(skill && props.selectedSkills?.some(selected => selected.instanceId === skill.instanceId && selected.digest === skill.digest)) })
+  })
+  return result
+})
+function choose(item: ComposerCapabilityItem) {
+  const command = props.items[Number(item.key)]
+  if (command) emit('choose', command)
+}
 function status(command: ChatSlashCommand): string {
   const skill = command.skill
   if (skill?.disabled) return t('chat.skillPalette.disabled')
@@ -54,133 +81,49 @@ function status(command: ChatSlashCommand): string {
   if (skill?.manualOnly) return t('chat.skillPalette.manualOnly')
   return ''
 }
+function onKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) {
+    if (event.key === 'Enter') event.preventDefault()
+    event.stopPropagation()
+    return
+  }
+  if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); emit('close'); return }
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Home' || event.key === 'End') {
+    const rows = [...(rootRef.value?.querySelectorAll<HTMLButtonElement>('[role="option"]') || [])]
+    const active = rows.indexOf(document.activeElement as HTMLButtonElement)
+    if (active < 0 || !rows.length) return
+    event.preventDefault(); event.stopPropagation()
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? rows.length - 1
+      : (active + (event.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length
+    rows[next]?.focus()
+    rows[next]?.scrollIntoView?.({ block: 'nearest' })
+  } else if (event.key === 'Enter' || event.key === ' ') event.stopPropagation()
+}
 </script>
 
 <style scoped>
 .chat-slash {
   position: absolute;
-  bottom: calc(100% + 0.5rem);
+  bottom: calc(100% + 8px);
   left: 0;
   right: 0;
   display: flex;
   flex-direction: column;
-  width: min(calc(100% - 2rem), var(--composer-col));
-  max-height: min(360px, 45vh);
-  margin-inline: auto;
+  width: 100%;
+  max-height: min(400px, 50dvh);
+  box-sizing: border-box;
   overflow: hidden;
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-md);
   z-index: 30;
+  container: composer-capabilities / inline-size;
 }
-
-.chat-slash-list {
-  min-height: 0;
-  padding: 0.25rem;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-
-.chat-slash-group {
-  display: flex;
-  align-items: baseline;
-  gap: 0.375rem;
-  padding: 0.25rem 0.625rem 0.125rem;
-  color: var(--text-muted);
-  font-size: 0.6875rem;
-  font-weight: 600;
-  line-height: 1.4;
-}
-
-.chat-slash-count {
-  font-weight: 400;
-  font-variant-numeric: tabular-nums;
-}
-
-.chat-slash-item {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  width: 100%;
-  min-height: 2rem;
-  padding: 0.375rem 0.625rem;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  font-size: 0.8125rem;
-  line-height: 1.4;
-  text-align: start;
-  cursor: pointer;
-}
-
-.chat-slash-item:hover,
-.chat-slash-item--active {
-  background: var(--bg-hover);
-}
-
-.chat-slash-item:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-.chat-slash-name {
-  flex: 0 0 26%;
-  min-width: 0;
-  max-width: 11rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 600;
-}
-
-.chat-slash-name--command {
-  color: var(--accent);
-  font-family: var(--font-mono);
-}
-
-.chat-slash-desc {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text-muted);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chat-slash-status {
-  flex-shrink: 0;
-  max-width: 6rem;
-  overflow: hidden;
-  color: var(--warn);
-  font-size: 0.6875rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chat-slash-empty,
-.chat-slash-hint {
-  padding: 0.375rem 0.625rem;
-  color: var(--text-muted);
-  font-size: 0.6875rem;
-  line-height: 1.5;
-}
-
-.chat-slash-hint {
-  flex-shrink: 0;
-  border-top: 1px solid var(--border);
-  padding-inline: 1rem;
-}
-
-@media (max-width: 600px) {
-  .chat-slash-item {
-    gap: 0.5rem;
-  }
-
-  .chat-slash-name {
-    flex-basis: 34%;
-  }
-}
+.chat-slash-list { min-height: 0; padding: 5px; overflow-y: auto; overscroll-behavior: contain; }
+.chat-slash-group { padding: 5px 10px 3px; color: var(--text-muted); font-size: var(--fs-xs); font-weight: 500; line-height: 1.4; }
+.chat-slash-list > [role="group"] + [role="group"] { margin-top: 5px; }
+.chat-slash-empty, .chat-slash-hint { padding: 8px 10px; color: var(--text-muted); font-size: var(--fs-xs); line-height: 1.5; }
+.chat-slash-hint { flex-shrink: 0; border-top: 1px solid var(--border); padding-inline: 15px; }
+.chat-slash:has(button:focus-visible) :deep(.composer-capability.is-active:not(:focus-visible)) { background: transparent; }
 </style>

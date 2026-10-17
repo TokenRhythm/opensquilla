@@ -399,21 +399,40 @@ async def test_write_scratch_rejects_paths_outside_scratch(
         await write_scratch("../src/app.py", "print('x')\n")
 
 
+@pytest.mark.parametrize(
+    ("suffix", "content", "preview"),
+    [
+        (
+            ".py",
+            "class Widget:\n"
+            "    def render(self):\n"
+            "        return 1\n\n"
+            "def helper(value):\n"
+            "    return value\n",
+            "def helper(value):",
+        ),
+        (
+            ".cpp",
+            "struct Widget {};\n"
+            "int declared();\n"
+            "int value = call();\n\n"
+            "int helper(int value) {\n"
+            "    return value;\n}\n",
+            "int helper(int value) {",
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_source_symbols_returns_workspace_relative_symbol_receipts(
     workspace_context: tuple[Path, ToolContext],
+    suffix: str,
+    content: str,
+    preview: str,
 ) -> None:
     workspace, _ctx = workspace_context
-    target = workspace / "pkg" / "module.py"
+    target = workspace / "pkg" / f"module{suffix}"
     target.parent.mkdir()
-    target.write_text(
-        "class Widget:\n"
-        "    def render(self):\n"
-        "        return 1\n\n"
-        "def helper(value):\n"
-        "    return value\n",
-        encoding="utf-8",
-    )
+    target.write_text(content, encoding="utf-8")
 
     result = await filesystem.source_symbols(query="helper", path="pkg")
 
@@ -421,11 +440,11 @@ async def test_source_symbols_returns_workspace_relative_symbol_receipts(
     assert payload["status"] == "success"
     assert payload["results"] == [
         {
-            "path": "pkg/module.py",
+            "path": f"pkg/module{suffix}",
             "line": 5,
             "kind": "function",
             "name": "helper",
-            "preview": "def helper(value):",
+            "preview": preview,
         }
     ]
 
@@ -486,50 +505,89 @@ def test_source_symbols_handles_adversarial_c_lines_in_bounded_time(tmp_path: Pa
         encoding="utf-8",
     )
     script = textwrap.dedent("""
-        import asyncio
-        import json
+        import os
         import sys
         from pathlib import Path
-        from opensquilla.tools.builtin.filesystem import source_symbols
-        from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+        from opensquilla.source_symbols import _source_symbol_matches_line
 
-        token = current_tool_context.set(ToolContext(
-            is_owner=True, caller_kind=CallerKind.AGENT,
-            workspace_dir=sys.argv[1], session_key="agent:main:test",
-        ))
-        try:
-            Path(sys.argv[2]).touch()
-            result = json.loads(asyncio.run(source_symbols(path="sample.cpp")))
-            assert result["status"] == "success", result
-            assert [(row["name"], row["line"]) for row in result["results"]] == [
-                ("after_attack", 4)
-            ], result
-        finally:
-            current_tool_context.reset(token)
+        # A parser deadline must not bootstrap unrelated runtime services.
+        assert not {
+            "opensquilla.tools", "opensquilla.scheduler", "opensquilla.session",
+            "opensquilla.gateway",
+        }.intersection(sys.modules)
+        assert sys.prefix == sys.argv[3], "parser child must retain the test venv"
+        ready_tmp = Path(sys.argv[2] + ".tmp")
+        ready_tmp.write_text(str(os.getpid()), encoding="utf-8")
+        ready_tmp.replace(sys.argv[2])
+        target = Path(sys.argv[1]) / "sample.cpp"
+        with target.open(encoding="utf-8") as source:
+            result = [
+                (kind, name, line_number)
+                for line_number, line in enumerate(source, start=1)
+                for kind, name in _source_symbol_matches_line(target, line)
+            ]
+        assert result == [("function", "after_attack", 4)], result
     """)
-    # Start the parsing deadline after imports: full CI also runs other Python
-    # workers compiling cold dependencies. Keep a separate bounded startup phase.
-    # Both deadlines are enforced by the parent, outside the regex engine's GIL.
+    # Exercise the production matcher without registering every tool and loading
+    # gateway/session/provider services in a fresh interpreter. The receipt test
+    # above covers its integration through source_symbols. Keep both original
+    # deadlines in the parent, outside the regex engine's GIL.
     source_root = Path(filesystem.__file__).resolve().parents[3]
     ready = tmp_path / "parser-ready"
-    with subprocess.Popen(
-        [sys.executable, "-c", script, str(tmp_path), str(ready)],
-        env={**os.environ, "PYTHONPATH": str(source_root)},
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ) as child:
+    stdout_path = tmp_path / "parser-stdout.txt"
+    stderr_path = tmp_path / "parser-stderr.txt"
+    environment = {**os.environ, "PYTHONPATH": str(source_root)}
+    interpreter = sys.executable
+    if os.name == "nt":
+        # The watchdog must wait on the interpreter, not its venv redirector.
+        interpreter = sys._base_executable
+        environment["__PYVENV_LAUNCHER__"] = sys.executable
+    # Regular files cannot block the child before readiness if an import fails
+    # noisily. Include their tails for startup, parsing, and assertion failures.
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        child = subprocess.Popen(
+            [interpreter, "-c", script, str(tmp_path), str(ready), sys.prefix],
+            env=environment,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        failure: BaseException | None = None
         try:
             startup_deadline = time.monotonic() + 30
             while not ready.exists() and child.poll() is None:
                 assert time.monotonic() < startup_deadline, "parser child did not finish importing"
                 time.sleep(0.05)
-            stdout, stderr = child.communicate(timeout=15)
-            assert child.returncode == 0, stdout + stderr
+            if ready.exists():
+                assert int(ready.read_text(encoding="utf-8")) == child.pid, (
+                    "parser watchdog must own the interpreter"
+                )
+            child.wait(timeout=15)
+            assert child.returncode == 0
+            assert ready.exists(), "parser child exited without readiness"
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             if child.poll() is None:
-                child.kill()
-                child.communicate()
+                try:
+                    child.kill()
+                    child.wait(timeout=15)
+                except BaseException as cleanup_error:
+                    if failure is None:
+                        raise
+                    failure.add_note(f"parser child cleanup failed: {cleanup_error!r}")
+            if failure is not None:
+                try:
+                    stdout_tail = stdout_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+                    stderr_tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-4096:]
+                    failure.add_note(
+                        f"parser phase={'parsing' if ready.exists() else 'startup'} "
+                        f"pid={child.pid} returncode={child.returncode}\n"
+                        f"stdout: {stdout_tail}\n"
+                        f"stderr: {stderr_tail}"
+                    )
+                except OSError as diagnostic_error:
+                    failure.add_note(f"parser child diagnostics failed: {diagnostic_error!r}")
 
 
 @pytest.mark.asyncio
@@ -564,6 +622,50 @@ async def test_edit_source_applies_revision_gated_line_edit(
     assert receipt["operation"] == "edit_source"
     assert receipt["changed"] is True
     assert receipt["workspace_epoch"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [True, False])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+async def test_edit_source_consumes_compact_worker_receipt_without_losing_semantics(
+    workspace_context: tuple[Path, ToolContext], monkeypatch, changed: bool, newline: str,
+) -> None:
+    from opensquilla.sandbox import filesystem_worker
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+
+    workspace, ctx = workspace_context
+    target = workspace / "src" / "app.py"
+    target.parent.mkdir()
+    original = newline.join(["alpha", "beta", "gamma", ""])
+    replacement = ("BETA" if changed else "beta") + newline
+    updated = original.replace("beta" + newline, replacement)
+    target.write_bytes(original.encode("utf-8"))
+    before_revision = filesystem.source_revision_for_path(target)
+    calls = []
+
+    async def worker(operation, **_kwargs):
+        calls.append(operation)
+        reply = filesystem_worker._run(operation.to_payload())
+        assert "original" not in reply and "updated" not in reply
+        return SandboxOperationResult.from_worker_stdout(json.dumps(reply))
+
+    monkeypatch.setattr(filesystem, "_run_sandbox_operation_if_required", worker)
+    payload = json.loads(await _original_async(filesystem.edit_source)(
+        "src/app.py", expected_revision=before_revision,
+        edits=[{"start_line": 2, "end_line": 2, "replacement": replacement}],
+    ))
+    assert len(calls) == 1
+    assert target.read_bytes().decode("utf-8") == updated
+    assert payload["status"] == "applied"
+    assert payload["path"] == "src/app.py"
+    assert payload["changed"] is changed
+    assert payload["before_revision"] == before_revision
+    assert payload["after_revision"] == filesystem.source_revision_for_path(target)
+    assert payload["diff_summary"] == filesystem.build_diff_summary(
+        original, updated, path="src/app.py",
+    )
+    assert payload["workspace_epoch"] == int(changed)
+    assert ctx.workspace_mutation_receipts[-1]["changed"] is changed
 
 
 @pytest.mark.asyncio

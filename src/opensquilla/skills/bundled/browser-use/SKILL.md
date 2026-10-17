@@ -43,6 +43,9 @@ or web search operated the sidebar. Other task-relevant skills remain available.
 
 ## Page state
 
+- When the live `browser_open` schema makes `url` optional, omit it to open a
+  blank page (`about:blank`). Supply an HTTP(S) URL to open a website; older
+  clients may require it. `browser_navigate` requires a URL for the owned page.
 - Use the current `targetRef` to identify a page. Reuse an owned tab when
   appropriate; closing and reopening it creates a different handle.
 - Inspect or observe before acting when the target is uncertain. Navigation,

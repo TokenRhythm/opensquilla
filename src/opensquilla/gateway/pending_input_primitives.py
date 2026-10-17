@@ -28,6 +28,7 @@ from opensquilla.gateway import attachment_ingest
 from opensquilla.gateway.admission_input import decode_admit_turn, source_hint_from_turn
 from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.paths import media_root_from_config
+from opensquilla.session.sidechat import SidechatAdmissionRejectedError
 from opensquilla.session.storage import (
     PendingChatInput,
     PendingChatInputAlreadyDispatchedError,
@@ -305,6 +306,11 @@ class GatewayPendingInputPrimitives:
             raise PendingEnqueueRejectedError("dispatched") from exc
         except PendingChatInputConflictError as exc:
             raise PendingEnqueueRejectedError("conflict") from exc
+        except SidechatAdmissionRejectedError as exc:
+            # Closing may win after attachment staging but before this write.
+            # Keep the rejection in the queue contract so its application layer
+            # reclaims newly staged material before returning accepted=False.
+            raise PendingEnqueueRejectedError("session-unavailable") from exc
         return stored_pending_input(row), replayed
 
     async def load_pending(self, pending_id: str) -> StoredPendingInput | None:

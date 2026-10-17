@@ -1,11 +1,13 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, h, nextTick, reactive, type App } from 'vue'
-import { setActivePinia } from 'pinia'
+import { computed, createApp, h, nextTick, reactive, type App } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
 import i18n from '@/i18n'
 import { WORKSPACE_FILES_KEY, type WorkspaceFile, type WorkspaceFiles } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
+import { useWorkbenchStore } from '@/workbench/store'
 import TextPart from './TextPart.vue'
 
 const mocks = vi.hoisted(() => ({ platform: { id: 'web', files: {} as Record<string, unknown>,
@@ -17,8 +19,9 @@ const apps: App[] = []
 const file: WorkspaceFile = { requestedPath: '图.svg', path: '图.svg', name: '图.svg', mime: 'image/svg+xml', size: 64,
   kind: 'text', workspaceBinding: 'binding-A' }
 function pending<T>() { let finish!: (value: T) => void; return { promise: new Promise<T>(resolve => { finish = resolve }), finish: (value: T) => finish(value) } }
-async function mount(access: WorkspaceFiles, preferWorkspaceWorkbench = false) {
-  const state = reactive({ sessionKey: 'A', text: '| Result |\n| --- |\n| `图.svg` |' })
+async function mount(access: WorkspaceFiles, preferWorkspaceWorkbench = false,
+  options: { sessionKey?: string; ownerSessionKey?: string; text?: string } = {}) {
+  const state = reactive({ sessionKey: options.sessionKey ?? 'A', text: options.text ?? '| Result |\n| --- |\n| `图.svg` |' })
   const gateway = reactive({ isLocalOwner: true, isAvailable: true, deliveryIdentity: 'owner-A', subscriptionEpoch: 1 })
   const renderer = useChatTextRendering()
   const root = document.createElement('div')
@@ -28,6 +31,7 @@ async function mount(access: WorkspaceFiles, preferWorkspaceWorkbench = false) {
   app.use(i18n)
   app.provide(WORKSPACE_FILES_KEY, access)
   app.provide(GATEWAY_ACCESS_KEY, gateway as unknown as GatewayAccess)
+  if (options.ownerSessionKey) app.provide(CONVERSATION_WORKBENCH_OWNER_KEY, computed(() => options.ownerSessionKey!))
   app.mount(root)
   apps.push(app)
   await nextTick()
@@ -43,6 +47,58 @@ beforeEach(() => {
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.innerHTML = ''; vi.restoreAllMocks() })
 
 describe('TextPart workspace files', () => {
+  it.each(['main', 'side'])('opens non-text document/media links from %s in the shared Workbench rather than the limited modal', async kind => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const store = useWorkbenchStore(pinia)
+    const openItem = vi.spyOn(store, 'openItem').mockReturnValue(true)
+    const sessionKey = kind === 'main' ? 'parent' : 'child'
+    const resources: WorkspaceFile[] = [
+      ['report.pdf', 'application/pdf'], ['report.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+      ['song.mp3', 'audio/mpeg'], ['clip.mp4', 'video/mp4'],
+    ].map(([name, mime]) => ({ ...file, requestedPath: name!, path: name!, name: name!, mime: mime!, kind: 'download' }))
+    const read = vi.fn()
+    const { root } = await mount({ resolve: vi.fn().mockResolvedValue(resources), read }, true, {
+      sessionKey, ownerSessionKey: 'parent', text: resources.map(resource => `[${resource.name}](${resource.path})`).join('\n\n'),
+    })
+    await vi.waitFor(() => expect(root.querySelectorAll('button.workspace-file-link')).toHaveLength(4))
+    for (const [index, link] of [...root.querySelectorAll<HTMLButtonElement>('button.workspace-file-link')].entries()) {
+      link.click()
+      expect(openItem).toHaveBeenLastCalledWith(expect.objectContaining({
+        scope: { type: 'session', id: 'parent' }, payload: { file: resources[index], sessionKey },
+      }))
+    }
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(read).not.toHaveBeenCalled()
+    setActivePinia(undefined)
+  })
+
+  it.each(['main', 'side'])('resolves relative Markdown in the %s session and opens under its visible owner', async kind => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const store = useWorkbenchStore(pinia)
+    const openItem = vi.spyOn(store, 'openItem').mockReturnValue(true)
+    const sessionKey = kind === 'main' ? 'parent' : 'child'
+    const htmlFile: WorkspaceFile = { ...file, requestedPath: 'flappy-bird.html', path: 'flappy-bird.html',
+      name: 'flappy-bird.html', mime: 'text/html', workspaceBinding: `${sessionKey}-binding` }
+    const result = pending<WorkspaceFile[]>()
+    const resolve = vi.fn().mockReturnValue(result.promise)
+    const { root } = await mount({ resolve, read: vi.fn() }, true, {
+      sessionKey, ownerSessionKey: 'parent', text: '[打开游戏](flappy-bird.html)',
+    })
+    expect(resolve).toHaveBeenCalledWith(sessionKey, ['flappy-bird.html'], expect.any(AbortSignal))
+    expect(root.querySelector('[href], button.workspace-file-link')).toBeNull()
+    result.finish([htmlFile])
+    await vi.waitFor(() => expect(root.querySelector('button.workspace-file-link')).not.toBeNull())
+    const link = root.querySelector<HTMLButtonElement>('button.workspace-file-link')!
+    expect(link.textContent).toBe('打开游戏')
+    link.click()
+    expect(openItem).toHaveBeenCalledWith(expect.objectContaining({
+      scope: { type: 'session', id: 'parent' }, payload: { file: htmlFile, sessionKey },
+    }))
+    setActivePinia(undefined)
+  })
+
   it('uses the preview fallback when Workbench is preferred but its store is unavailable', async () => {
     setActivePinia(undefined)
     const { root } = await mount({ resolve: vi.fn().mockResolvedValue([file]),

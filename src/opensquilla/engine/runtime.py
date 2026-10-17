@@ -40,6 +40,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, Literal, SupportsInt, TypeGuard, cast
 from urllib.parse import urlsplit
 
+import httpx
 import structlog
 
 from opensquilla.artifacts import ArtifactSource, artifact_marker
@@ -84,10 +85,10 @@ from opensquilla.contracts.attachments import (
 )
 from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.contracts.turn_execution import TurnExecutionContext
-from opensquilla.engine.agent import Agent, ToolHandler
+from opensquilla.engine.agent import Agent, ToolHandler, _ToolArgumentProgress
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
-from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep, sleep_before_retry
+from opensquilla.engine.fallback import FallbackPolicy, sleep_before_retry
 from opensquilla.engine.hooks import (
     CompactionHook,
     DefaultTraceEmitterHook,
@@ -267,18 +268,14 @@ from opensquilla.provider.protocol import (
     provider_metadata,
     validate_provider_chat_admission,
 )
-from opensquilla.provider.retry_after import (
-    RetryAfterDeferredError,
-    mark_retry_after_physical_start,
-    provider_retry_after_cooldowns,
-    provider_retry_after_scope,
-    record_provider_retry_after,
-)
+from opensquilla.provider.recovery import retry_provider_stream
+from opensquilla.provider.tool_input_preview import preview_file_inputs
 from opensquilla.provider.types import (
     ChatConfig,
     Message,
     ProviderGenerationResetEvent,
     ProviderRequestCorrelation,
+    ToolInputPreviewEvent,
     VisionSupport,
     derive_provider_request_correlation,
 )
@@ -1453,6 +1450,11 @@ def _persisted_tool_result_segment(
         segment["tool_presentation"] = dict(event.tool_presentation)
     if event.execution_log_handle is not None:
         segment["execution_log_handle"] = event.execution_log_handle
+    if event.file_snapshot is not None and not event.is_error:
+        # This is the executed operation's display data, not model context or
+        # an expiring tool-result cache entry. Keep it with the transcript so
+        # archive, fork, and deletion share the session's existing lifecycle.
+        segment["file_snapshot"] = dict(event.file_snapshot)
     if event.execution_status is not None:
         segment["execution_status"] = normalize_execution_status(event.execution_status)
 
@@ -1660,8 +1662,8 @@ _SUBAGENT_TASK_PROTOCOL: Final[str] = (
 def _should_use_selector_fallback(provider_name: str, event: ProviderErrorEvent) -> bool:
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     return decide_recovery_action(kind) in {
@@ -1712,8 +1714,10 @@ def _report_credential_pool_failure(
     try:
         kind = classify_provider_error(
             provider_name=provider_name,
-            status_code=int(event.code) if str(event.code).isdigit() else None,
-            raw_code=event.code,
+            status_code=event.http_status or (
+                int(event.code) if str(event.code).isdigit() else None
+            ),
+            raw_code=event.provider_code or event.code,
             message=event.message,
         )
         from opensquilla.gateway.llm_runtime import profile_credential_pools
@@ -1840,6 +1844,7 @@ class _SelectorPreTextBuffer:
         self._seen_tool_use_ids: set[str] = set()
         self._protocol_error = False
         self._overflowed = False
+        self._tool_argument_progress = _ToolArgumentProgress()
 
     @property
     def has_completed_tool_call(self) -> bool:
@@ -1899,6 +1904,7 @@ class _SelectorPreTextBuffer:
             )
 
     def _mark_overflowed(self) -> None:
+        self._tool_argument_progress.clear()
         self._entries.clear()
         self._reasoning_bytes = 0
         self._buffered_bytes = 0
@@ -1912,6 +1918,7 @@ class _SelectorPreTextBuffer:
     def _mark_protocol_error(self) -> None:
         """Discard a malformed provisional leg without retaining its payload."""
 
+        self._tool_argument_progress.clear()
         self._entries.clear()
         self._reasoning_bytes = 0
         self._buffered_bytes = 0
@@ -1972,19 +1979,20 @@ class _SelectorPreTextBuffer:
                 return False
             self._open_tool_use_ids.remove(tool_use_id)
             self._open_tool_names.pop(tool_use_id, None)
+            self._tool_argument_progress.finish(tool_use_id)
             self._has_completed_tool_call = True
             return True
         return True
 
-    def append(self, event: Any) -> None:
+    def append(self, event: Any) -> ProviderHeartbeatEvent | None:
         if self._overflowed or self._protocol_error:
-            return
+            return None
         if not self._accept_tool_frame(event):
-            return
+            return None
         if isinstance(event, ProviderReasoningDeltaEvent):
             text = str(event.text or "")
             if not text:
-                return
+                return None
             byte_count = len(text.encode("utf-8"))
             tail = self._entries[-1] if self._entries else None
             if not isinstance(tail, _BufferedReasoningDeltas):
@@ -1995,7 +2003,7 @@ class _SelectorPreTextBuffer:
             self._reasoning_bytes += byte_count
             self._buffered_bytes += byte_count
             self._trim_reasoning_prefix()
-            return
+            return None
         if isinstance(event, ProviderToolUseDeltaEvent):
             fragment = str(event.json_fragment or "")
             byte_count = len(event.tool_use_id.encode("utf-8")) + len(fragment.encode("utf-8"))
@@ -2011,12 +2019,22 @@ class _SelectorPreTextBuffer:
             self._trim_reasoning_prefix()
             if self._buffered_bytes > self._reasoning_limit_bytes:
                 self._mark_overflowed()
-            return
+            elif self._tool_argument_progress.record(event.tool_use_id, fragment):
+                # A liveness pulse does not commit the pending tool frames or
+                # expose any identity/arguments from this provisional attempt.
+                return ProviderHeartbeatEvent(
+                    phase="llm_tool_arguments",
+                    message="Receiving tool arguments",
+                    upstream_activity=True,
+                    generation_epoch=getattr(event, "generation_epoch", None),
+                )
+            return None
         self._entries.append(event)
         self._buffered_bytes += self._event_buffer_bytes(event)
         self._trim_reasoning_prefix()
         if self._buffered_bytes > self._reasoning_limit_bytes:
             self._mark_overflowed()
+        return None
 
     @staticmethod
     def _trim_text_prefix_bytes(text: str, count: int) -> tuple[str, int]:
@@ -2052,6 +2070,7 @@ class _SelectorPreTextBuffer:
                     entry.chunks.popleft()
 
     def drain(self, *, successful_leg: bool) -> list[Any]:
+        self._tool_argument_progress.clear()
         drained: list[Any] = []
         notice_pending = successful_leg and self._reasoning_truncated
         for entry in self._entries if successful_leg else ():
@@ -2137,7 +2156,9 @@ async def _selector_safe_stream(
         stream = stream_factory()
         async for event in stream:
             yield event
-    except (asyncio.CancelledError, UsageAccountingUnavailableError):
+    except (asyncio.CancelledError, UsageAccountingUnavailableError, httpx.HTTPStatusError):
+        # The shared provider recovery owner preserves structured HTTP facts
+        # and Retry-After. Do not turn an HTTP response into a network error.
         raise
     except Exception as exc:  # noqa: BLE001 - raw provider prose must stop here
         yield _selector_stream_exception_error(content_started=content_started(), error=exc)
@@ -2210,19 +2231,6 @@ def _provider_retry_after_hint(event: ProviderErrorEvent) -> float:
     return hint
 
 
-def _selector_retry_after_deadline_error(
-    *,
-    retry_after_s: float,
-) -> ProviderErrorEvent:
-    return ProviderErrorEvent(
-        message=(
-            "The model provider requested a retry delay beyond this turn's remaining deadline."
-        ),
-        code="provider_retry_after_deadline",
-        retry_after_s=retry_after_s,
-    )
-
-
 def _provider_activity_reason_for_error(
     provider_name: str,
     event: ProviderErrorEvent,
@@ -2237,8 +2245,8 @@ def _provider_activity_reason_for_error(
 ]:
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     if kind is ProviderFailureKind.RATE_LIMITED:
@@ -2264,8 +2272,8 @@ def _selector_failure_for_hook(
 
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     return RuntimeError(safe_provider_failure_message(kind.value))
@@ -2279,8 +2287,8 @@ def _selector_execution_leg_failure_code(
 
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     return safe_provider_failure_code(event.code, kind.value)
@@ -2358,126 +2366,24 @@ class _SelectorFallbackProvider:
         content_started: Callable[[], bool],
         buffer: _SelectorPreTextBuffer,
     ) -> AsyncGenerator[Any, None]:
-        """Retry the same physical leg before selector fallback sees its failure."""
-        rate_retries = 0
-        connection_retries = 0
-        attempts = 0
-        activity_id = uuid.uuid4().hex
-        physical_limit = max(0, int(getattr(config, "physical_attempt_limit", 0) or 0))
-        while True:
-            try:
-                async for delay in provider_retry_after_cooldowns().wait(
-                    provider,
-                    scope=provider_retry_after_scope(provider),
-                    deadline_at_monotonic=getattr(config, "turn_deadline_at_monotonic", None),
-                    sleep=sleep_before_retry,
-                ):
-                    yield ProviderActivityEvent(
-                        activity_id=activity_id, model=model,
-                        phase="retry_wait",
-                        reason=provider_retry_after_cooldowns().reason(
-                            provider, scope=provider_retry_after_scope(provider),
-                        ),
-                        retry_attempt=rate_retries, retry_limit=self._retry_policy.max_retries,
-                        retry_after_ms=math.ceil(delay * 1000),
-                        started_at=time.time_ns() // 1_000_000,
-                    )
-            except RetryAfterDeferredError as exc:
-                yield ProviderErrorEvent(
-                    message=exc.message, code=exc.code, retry_after_s=exc.remaining_seconds,
-                )
-                return
-            attempts += 1
-            retry_error: ProviderErrorEvent | None = None
-            if not getattr(provider, "owns_retry_after_admission", False):
-                mark_retry_after_physical_start()
-            stream = stream_factory()
-            try:
-                async for event in stream:
-                    if not isinstance(event, ProviderErrorEvent):
-                        yield event
-                        continue
-                    if not getattr(provider, "owns_retry_after_admission", False):
-                        record_provider_retry_after(provider, event)
-                    can_retry = (
-                        event.tool_argument_rejection is None
-                        and not content_started()
-                        and getattr(provider, "retry_failed_call_safe", True) is not False
-                        and (physical_limit == 0 or attempts < physical_limit)
-                    )
-                    if can_retry and event.code == CONNECTION_FAILED_CODE:
-                        delay = min(60.0, 5.0 * 2 ** min(connection_retries, 4))
-                        connection_retries += 1
-                        attempt, limit = connection_retries, 0
-                        reason: Literal["transport_transient", "rate_limited"] = (
-                            "transport_transient"
-                        )
-                    elif (
-                        can_retry
-                        and event.code == "429"
-                        and classify_provider_error(
-                            getattr(provider, "provider_name", ""),
-                            429,
-                            event.code,
-                            event.message,
-                        ) is ProviderFailureKind.RATE_LIMITED
-                    ):
-                        delay = max(
-                            _provider_retry_after_hint(event),
-                            backoff_sleep(
-                                rate_retries,
-                                self._retry_policy.base_backoff_ms,
-                                self._retry_policy.max_backoff_ms,
-                                _fake=True,
-                            ),
-                        )
-                        turn_deadline = getattr(config, "turn_deadline_at_monotonic", None)
-                        if (
-                            isinstance(turn_deadline, int | float)
-                            and not isinstance(turn_deadline, bool)
-                            and asyncio.get_running_loop().time() + delay >= turn_deadline
-                        ):
-                            yield _selector_retry_after_deadline_error(retry_after_s=delay)
-                            return
-                        if (
-                            rate_retries >= self._retry_policy.max_retries
-                            or delay > _SELECTOR_MAX_RETRY_AFTER_SECONDS
-                        ):
-                            yield replace(event, code="rate_limit_retry_exhausted")
-                            return
-                        rate_retries += 1
-                        attempt, limit = rate_retries, self._retry_policy.max_retries
-                        reason = "rate_limited"
-                    else:
-                        yield event
-                        return
-                    retry_error = event
-                    break
-            finally:
-                await stream.aclose()
-            if retry_error is None:
-                return
+        """Use the common one-deployment retry owner before selector fallback."""
+        def reset_attempt() -> None:
             buffer.drain(successful_leg=False)
-            yield ProviderActivityEvent(
-                activity_id=activity_id,
-                model=str(getattr(provider, "active_model_id", model) or ""),
-                phase="retry_wait",
-                reason=reason,
-                retry_attempt=attempt,
-                retry_limit=limit,
-                retry_after_ms=math.ceil(delay * 1000),
-                started_at=time.time_ns() // 1_000_000,
-            )
-            await sleep_before_retry(delay)
-            yield ProviderActivityEvent(
-                activity_id=activity_id,
-                model=str(getattr(provider, "active_model_id", model) or ""),
-                phase="retrying",
-                reason=reason,
-                retry_attempt=attempt,
-                retry_limit=limit,
-                started_at=time.time_ns() // 1_000_000,
-            )
+
+        async for event in retry_provider_stream(
+            lambda: preview_file_inputs(stream_factory()),
+            provider=provider, model=model, config=config,
+            content_started=content_started,
+            reset_attempt=reset_attempt,
+            max_retries=self._retry_policy.max_retries,
+            base_ms=self._retry_policy.base_backoff_ms,
+            max_ms=self._retry_policy.max_backoff_ms,
+            # Preserve selector semantics: overload/transport may choose another
+            # deployment; Agent retains their finite generic recovery budget.
+            retry_transient=False,
+            sleep=sleep_before_retry,
+        ):
+            yield event
 
     def clone_for_model(self, model: str) -> _SelectorFallbackProvider:
         """Freeze an independent child chain at the currently active deployment.
@@ -3372,8 +3278,10 @@ class _SelectorFallbackProvider:
             return
         kind = classify_provider_error(
             provider_name=provider_id,
-            status_code=int(event.code) if str(event.code).isdigit() else None,
-            raw_code=event.code,
+            status_code=event.http_status or (
+                int(event.code) if str(event.code).isdigit() else None
+            ),
+            raw_code=event.provider_code or event.code,
             message=event.message,
         )
         ledger.record_failure(
@@ -3863,6 +3771,7 @@ class _SelectorFallbackProvider:
                         ProviderHeartbeatEvent,
                         ProviderEnsembleProgressEvent,
                         ProviderGenerationResetEvent,
+                        ToolInputPreviewEvent,
                     ),
                 ):
                     # A generation reset is an ordering barrier, not ordinary
@@ -3946,10 +3855,12 @@ class _SelectorFallbackProvider:
                     and not _is_non_empty_provider_text_delta(event)
                     and getattr(event, "kind", "") != "done"
                 ):
-                    pre_text_buffer.append(event)
+                    argument_progress = pre_text_buffer.append(event)
                     if pre_text_buffer.protocol_error:
                         event = _selector_invalid_stream_order_error()
                     elif not pre_text_buffer.overflowed:
+                        if argument_progress is not None:
+                            yield argument_progress
                         continue
                     else:
                         # Re-enter the ordinary pre-content failure path so a
@@ -4022,6 +3933,9 @@ class _SelectorFallbackProvider:
                     )
                     local_candidate_predicate: Callable[[Any], bool] | None = None
                     legacy_selection_mutated = False
+                    fallback_from_model = str(
+                        getattr(active_provider, "active_model_id", active_model) or ""
+                    )
                     try:
                         if local_admission_escalation:
 
@@ -4165,18 +4079,6 @@ class _SelectorFallbackProvider:
                             active_provider_id or self.provider_name,
                             event,
                         )
-                        yield ProviderActivityEvent(
-                            activity_id=primary_activity_id,
-                            model=str(
-                                getattr(active_provider, "active_model_id", active_model) or ""
-                            ),
-                            phase="retry_wait",
-                            reason=retry_reason,
-                            retry_attempt=1,
-                            retry_limit=max(1, physical_attempt_limit - 1),
-                            retry_after_ms=math.ceil(retry_after_hint * 1000),
-                            started_at=time.time_ns() // 1_000_000,
-                        )
                         turn_deadline = getattr(
                             active_config,
                             "turn_deadline_at_monotonic",
@@ -4191,11 +4093,31 @@ class _SelectorFallbackProvider:
                             retry_after_hint > _SELECTOR_MAX_RETRY_AFTER_SECONDS
                             or deadline_exhausted
                         ):
-                            yield _selector_retry_after_deadline_error(
+                            yield replace(
+                                event,
+                                code=("provider_retry_after_deadline"
+                                      if retry_reason == "rate_limited"
+                                      else "provider_overload_retry_after_deadline"),
+                                message="The provider retry delay exceeds this request deadline.",
                                 retry_after_s=retry_after_hint,
+                                recovery_exhausted=True,
                             )
                             return
-                        await asyncio.sleep(retry_after_hint)
+                        yield ProviderActivityEvent(
+                            activity_id=primary_activity_id,
+                            model=str(
+                                getattr(active_provider, "active_model_id", active_model) or ""
+                            ),
+                            phase="retry_wait",
+                            reason=retry_reason,
+                            retry_attempt=1,
+                            retry_limit=max(1, physical_attempt_limit - 1),
+                            retry_after_ms=math.ceil(retry_after_hint * 1000),
+                            http_status=event.http_status,
+                            started_at=time.time_ns() // 1_000_000,
+                        )
+                        async with asyncio.timeout_at(turn_deadline):
+                            await sleep_before_retry(retry_after_hint)
                     self._commit_fallback_hops()
                     if local_admission_escalation and self._turn_metadata is not None:
                         self._turn_metadata["router_fallback_reason"] = "local_admission_escalation"
@@ -4210,6 +4132,7 @@ class _SelectorFallbackProvider:
                             getattr(fallback_provider, "active_model_id", fallback_model) or ""
                         ),
                         phase="fallback",
+                        from_model=fallback_from_model,
                         reason=(
                             "context_overflow"
                             if local_admission_escalation
@@ -4282,6 +4205,7 @@ class _SelectorFallbackProvider:
                                     ProviderActivityEvent,
                                     ProviderHeartbeatEvent,
                                     ProviderEnsembleProgressEvent,
+                                    ToolInputPreviewEvent,
                                 ),
                             ):
                                 yield fallback_event
@@ -4350,13 +4274,15 @@ class _SelectorFallbackProvider:
                                 and not _is_non_empty_provider_text_delta(fallback_event)
                                 and getattr(fallback_event, "kind", "") != "done"
                             ):
-                                fallback_buffer.append(fallback_event)
+                                argument_progress = fallback_buffer.append(fallback_event)
                                 if fallback_buffer.protocol_error:
                                     invalid_order_error = _selector_invalid_stream_order_error()
                                     self._record_health_failure(invalid_order_error)
                                     yield invalid_order_error
                                     return
                                 if not fallback_buffer.overflowed:
+                                    if argument_progress is not None:
+                                        yield argument_progress
                                     continue
                                 overflow_error = _selector_pre_text_buffer_overflow_error()
                                 self._record_health_failure(overflow_error)
@@ -5587,6 +5513,7 @@ class TurnRunner:
         expected_session_epoch: int | None = None,
         telemetry_surface: ClientSurface | None = None,
         telemetry_execution_mode: ExecutionMode | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one public turn and publish exactly one content-free result fact."""
 
@@ -5653,6 +5580,7 @@ class TurnRunner:
                     assistant_message_id=assistant_message_id,
                     expected_session_id=expected_session_id,
                     expected_session_epoch=expected_session_epoch,
+                    on_initial_provider_ready=on_initial_provider_ready,
                 ),
             )
             async with contextlib.aclosing(stream):
@@ -5801,6 +5729,7 @@ class TurnRunner:
         assistant_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -5967,6 +5896,7 @@ class TurnRunner:
                             expected_session_id=expected_session_id,
                             expected_session_epoch=expected_session_epoch,
                             execution_context=execution_context,
+                            on_initial_provider_ready=on_initial_provider_ready,
                         ),
                     )
                     async with contextlib.aclosing(turn_stream):
@@ -6033,6 +5963,7 @@ class TurnRunner:
                                 expected_session_id=expected_session_id,
                                 expected_session_epoch=expected_session_epoch,
                                 execution_context=execution_context,
+                                on_initial_provider_ready=on_initial_provider_ready,
                             ),
                         )
                         async with contextlib.aclosing(turn_stream):
@@ -6082,6 +6013,7 @@ class TurnRunner:
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         mark_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
         # Observability: bracket turn setup + stream loop with monotonic clock
@@ -6498,6 +6430,7 @@ class TurnRunner:
                         expected_session_id=expected_session_id,
                         expected_session_epoch=expected_session_epoch,
                         provider_request_correlation=provider_request_correlation,
+                        on_initial_provider_ready=on_initial_provider_ready,
                     )
                 )
                 if tool_context is not None and tool_context.selected_skills:
@@ -7579,6 +7512,7 @@ class TurnRunner:
                                 error_type=type(exc).__name__,
                             )
             if router_control_replay_event is not None:
+                # 首次部署通知已经消费；同一回合的路由重放不再派发辅助命名。
                 replay_stream = cast(
                     AsyncGenerator[AgentEvent, None],
                     self._run_turn(
@@ -9032,9 +8966,17 @@ class TurnRunner:
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
         )
         if ctx is not None:
+            from opensquilla.session.keys import is_sidechat_key
             from opensquilla.skills.catalog_policy import project_public_catalog
             from opensquilla.skills.install_turn import SkillInstallTurn
 
+            # A side snapshot can be stale by its next turn. Make its existing
+            # history reader discoverable immediately; policy/profile/guest
+            # filtering below still determines whether it is authorized.
+            if is_sidechat_key(ctx.session_key):
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                ctx.surfaced_tools.add("sessions_history")
             skill_tools: set[str] = set()
             if isinstance(ctx.skill_install_turn, SkillInstallTurn):
                 skill_tools.update(ctx.skill_install_turn.surface_tools())
@@ -9573,6 +9515,7 @@ class TurnRunner:
         bootstrap_context_mode: str | None = None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        webui_rendering: bool = False,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -9745,6 +9688,7 @@ class TurnRunner:
             runtime_info=runtime_info,
             docs_path=(self._resolve_docs_path()),
             heartbeat_prompt=(getattr(self._config, "heartbeat_prompt", None)),
+            webui_rendering=webui_rendering,
         )
         # daily_notes, workspace_files, and extra_context are per-turn /
         # per-day volatile content. Keeping them in the cacheable base
@@ -12576,6 +12520,20 @@ class TurnRunner:
 
         summary_started = False
         previous_started = compaction_config.on_summary_call_started
+        previous_recovery = compaction_config.on_summary_recovery
+
+        def on_summary_recovery(event: ProviderActivityEvent) -> None:
+            from opensquilla.session.compaction import summary_recovery_payload
+            if previous_recovery is not None:
+                previous_recovery(event)
+            notify_compaction(
+                session_key, source="automatic", phase="summarizing", status="observed",
+                recovery=summary_recovery_payload(event),
+                **compaction_effect_payload(status="observed"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+
+        compaction_config.on_summary_recovery = on_summary_recovery
 
         def on_summary_started() -> None:
             nonlocal summary_started
@@ -12778,6 +12736,7 @@ class TurnRunner:
             raise
         finally:
             compaction_config.on_summary_call_started = previous_started
+            compaction_config.on_summary_recovery = previous_recovery
         if not result:
             require_parent_time(terminalize=True)
             skip_reason = str(getattr(compaction_result, "skip_reason", None) or "empty_summary")
@@ -12859,6 +12818,7 @@ class TurnRunner:
                 phase="preflight",
                 status=compaction_failure_status(skip_reason),
                 reason=skip_reason,
+                failure_detail=getattr(compaction_result, "failure_detail", {}),
                 tokens_before=total_tokens,
                 context_window_tokens=context_window_tokens,
                 **compaction_effect_payload(

@@ -1,0 +1,15 @@
+Generated from generative-frame 0.0.5 (MIT), adapted for OpenSquilla.
+Copyright (c) 2026 AgentbaseAI Inc. See LICENSE.generative-frame.txt and upstream-guidance.json.
+Do not edit this generated file; run npm run visualize:guidance:write in opensquilla-webui.
+
+## Module: data_viz
+
+- For custom visualizations use native SVG/Canvas, or D3 only if its permitted code is already embedded in the file; the host does not preload D3 and external scripts are unavailable. Size from the container's `clientWidth` and draw into an SVG with a `viewBox` so it scales.
+- Stat tiles: a grid of cards (`--color-surface` fill, 1px `--color-border`, `--radius-md`), each with a muted 13px label, a large value in `font-variant-numeric: tabular-nums`, and a delta that carries its sign and an arrow, colored with `--color-success` or `--color-danger`.
+- Tables: right-align numbers with tabular figures, keep headers muted, show about a dozen rows, and put longer tables in a scroll container with a max height.
+- Categorical color uses `--chart-1` to `--chart-6` in order; fold anything beyond six categories into "Other".
+- Sequential color uses one hue at varying strength, for example `color-mix(in srgb, var(--chart-1) 30%, transparent)` up to 100%. Diverging color runs from `--color-danger` through `--color-surface-muted` to `--color-success`.
+- Every color scale gets a legend with its minimum and maximum, and every encoded value is also available as text (labels, a tooltip, or a table).
+- Tooltips are an absolutely positioned element inside a `position: relative` wrapper, updated on pointer events; keep them inside the frame's bounds.
+- Geographic data cannot be fetched. Draw a map only from shapes you embed, or show the data another way.
+- Dashboards: lead with three or four headline numbers, then one primary chart, then supporting detail.

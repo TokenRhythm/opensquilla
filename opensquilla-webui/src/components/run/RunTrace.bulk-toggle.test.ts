@@ -10,6 +10,7 @@ import type {
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import RunTrace from './RunTrace.vue'
+import { createPinia } from 'pinia'
 
 type ToolGroupItem = Extract<ChatStreamTimelineItem, { type: 'tool-group' }>
 
@@ -60,41 +61,38 @@ function group(
   }
 }
 
-function flip(values: Set<string>, key: string): void {
-  if (values.has(key)) values.delete(key)
-  else values.add(key)
-}
-
 async function mountRunTrace(
   initialItems: ChatStreamTimelineItem[],
   options: {
+    presentation?: 'activity'
     showBulkToggle?: boolean
     stateScope?: string
-    initialGroupToggles?: string[]
-    initialItemToggles?: string[]
+    groupChoices?: Map<string, boolean>
+    itemChoices?: Map<string, boolean>
   } = {},
 ) {
   const el = document.createElement('div')
   document.body.appendChild(el)
 
   const items = ref<ChatStreamTimelineItem[]>(initialItems)
-  const groupToggles = reactive(new Set(options.initialGroupToggles ?? []))
-  const itemToggles = reactive(new Set(options.initialItemToggles ?? []))
-  const onToggleGroup = vi.fn((groupId: string) => flip(groupToggles, groupId))
-  const onToggleItem = vi.fn((renderKey: string) => flip(itemToggles, renderKey))
+  const groupToggles = reactive(options.groupChoices ?? new Map<string, boolean>())
+  const itemToggles = reactive(options.itemChoices ?? new Map<string, boolean>())
+  const onToggleGroup = vi.fn((groupId: string, open: boolean) => groupToggles.set(groupId, open))
+  const onToggleItem = vi.fn((renderKey: string, open: boolean) => itemToggles.set(renderKey, open))
 
   const Host = defineComponent({
     setup() {
       return () => h(RunTrace, {
         items: items.value,
+        presentation: options.presentation,
         ...(options.showBulkToggle === undefined
           ? {}
           : { showBulkToggle: options.showBulkToggle }),
         ...(options.stateScope === undefined
           ? {}
           : { stateScope: options.stateScope }),
-        isToolGroupOpen: (groupId: string) => groupToggles.has(groupId),
-        isToolItemOpen: (renderKey: string) => itemToggles.has(renderKey),
+        isToolGroupOpen: (groupId: string) => groupToggles.get(groupId),
+        isToolItemOpen: (renderKey: string) => itemToggles.get(renderKey),
         onToggleGroup,
         onToggleItem,
       })
@@ -104,6 +102,7 @@ async function mountRunTrace(
   const app = createApp(Host)
   mountedApps.push(app)
   app.use(i18n)
+  app.use(createPinia())
   app.mount(el)
   await nextTick()
 
@@ -135,7 +134,7 @@ function toolRow(el: HTMLElement, operationKey: string): HTMLButtonElement | nul
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
-  useToolDetailPreference().setMode('auto')
+  useToolDetailPreference().setMode('collapsed')
   document.body.innerHTML = ''
 })
 
@@ -145,507 +144,239 @@ afterEach(() => {
 })
 
 describe('RunTrace bulk toggle', () => {
-  it('is opt-in for chat surfaces', async () => {
-    const { el } = await mountRunTrace([
-      group('search-group', [call('search', 'web_search')]),
-      group('shell-group', [call('shell', 'shell')]),
-    ])
-
-    expect(bulkButton(el)).toBeNull()
+  it('is opt-in and counts top-level groups rather than members', async () => {
+    const one = await mountRunTrace([group('batch', [call('a', 'shell'), call('b', 'read_file')])], { showBulkToggle: true })
+    expect(bulkButton(one.el)).toBeNull()
+    const two = await mountRunTrace([group('a', [call('a', 'shell')]), group('b', [call('b', 'read_file')])])
+    expect(bulkButton(two.el)).toBeNull()
   })
 
-  it('counts top-level tool groups instead of calls for the visibility threshold', async () => {
-    const { el } = await mountRunTrace([
-      group('batch', [
-        call('search', 'web_search'),
-        call('read', 'read_file'),
-      ]),
+  it('expands and collapses every single-call detail with explicit choices', async () => {
+    const { el, itemToggles, onToggleItem } = await mountRunTrace([
+      group('search', [call('search', 'web_search')]),
+      group('shell', [call('shell', 'shell')]),
     ], { showBulkToggle: true })
-
-    expect(el.querySelectorAll('.tool-row')).toHaveLength(1)
-    expect(bulkButton(el)).toBeNull()
-  })
-
-  it('uses actual open state and item events for single-call groups', async () => {
-    const { el, onToggleItem, itemToggles } = await mountRunTrace([
-      group('search-group', [call('search', 'web_search')]),
-      group('shell-group', [call('shell', 'shell')]),
-    ], { showBulkToggle: true })
-
-    expect(bodyCount(el)).toBe(1)
-    expect(bulkButton(el)?.textContent?.trim()).toBe('Collapse all')
+    expect(bodyCount(el)).toBe(0)
+    expect(bulkButton(el)?.textContent?.trim()).toBe('Expand all')
     expect(bulkButton(el)?.hasAttribute('aria-expanded')).toBe(false)
-
     bulkButton(el)?.click()
     await nextTick()
-
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual(['shell'])
-    expect([...itemToggles]).toEqual(['shell'])
-    expect(bodyCount(el)).toBe(0)
-    expect(bulkButton(el)?.textContent?.trim()).toBe('Expand all')
-
-    onToggleItem.mockClear()
-    bulkButton(el)?.click()
-    await nextTick()
-
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual(['search', 'shell'])
-    expect(new Set(itemToggles)).toEqual(new Set(['search']))
     expect(bodyCount(el)).toBe(2)
+    expect(onToggleItem.mock.calls).toEqual([['search', true], ['shell', true]])
     expect(bulkButton(el)?.textContent?.trim()).toBe('Collapse all')
+    bulkButton(el)?.click()
+    await nextTick()
+    expect(bodyCount(el)).toBe(0)
+    expect([...itemToggles]).toEqual([['search', false], ['shell', false]])
   })
 
-  it('uses group and member events for multi-call groups', async () => {
-    const { el, onToggleGroup, onToggleItem } = await mountRunTrace([
-      group('read-batch', [
-        call('search', 'web_search'),
-        call('read', 'read_file'),
-      ]),
-      group('write-batch', [
-        call('shell', 'shell'),
-        call('write', 'write_file'),
-      ]),
+  it('applies bulk choices to groups and all members, including rows already matching', async () => {
+    const { el, groupToggles, itemToggles } = await mountRunTrace([
+      group('reads', [call('search', 'web_search'), call('read', 'read_file')]),
+      group('writes', [call('shell', 'shell'), call('write', 'write_file')]),
     ], { showBulkToggle: true })
-
-    expect(groupHeader(el, 'read-batch')?.getAttribute('aria-expanded')).toBe('false')
-    expect(groupHeader(el, 'write-batch')?.getAttribute('aria-expanded')).toBe('true')
-
-    bulkButton(el)?.click()
-    await nextTick()
-
-    expect(onToggleGroup.mock.calls.map(([key]) => key)).toEqual(['write-batch'])
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual(['shell', 'write'])
-    expect(groupHeader(el, 'read-batch')?.getAttribute('aria-expanded')).toBe('false')
-    expect(groupHeader(el, 'write-batch')?.getAttribute('aria-expanded')).toBe('false')
     expect(bodyCount(el)).toBe(0)
-
-    onToggleGroup.mockClear()
-    onToggleItem.mockClear()
     bulkButton(el)?.click()
     await nextTick()
-
-    expect(onToggleGroup.mock.calls.map(([key]) => key)).toEqual([
-      'read-batch',
-      'write-batch',
-    ])
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual([
-      'search',
-      'read',
-      'shell',
-      'write',
-    ])
-    expect(groupHeader(el, 'read-batch')?.getAttribute('aria-expanded')).toBe('true')
-    expect(groupHeader(el, 'write-batch')?.getAttribute('aria-expanded')).toBe('true')
+    expect(bodyCount(el)).toBe(4)
+    expect(groupHeader(el, 'reads')?.getAttribute('aria-expanded')).toBe('true')
     expect(el.querySelectorAll('.tool-row--member[aria-expanded="true"]')).toHaveLength(4)
-    expect(bodyCount(el)).toBe(4)
-  })
-
-  it('routes mixed targets through groups, members, and errors', async () => {
-    const errorCall = call('error', 'custom_tool', {
-      status: 'error',
-      isError: true,
-      result: 'failed',
-      resultPreview: 'failed',
-    })
-    const { el, itemToggles, onToggleGroup, onToggleItem } = await mountRunTrace([
-      group('search-group', [call('single-search', 'web_search')]),
-      group('error-group', [errorCall]),
-      group('mixed-batch', [
-        call('batch-shell', 'shell'),
-        call('batch-search', 'web_search'),
-      ]),
-    ], {
-      showBulkToggle: true,
-      initialItemToggles: ['batch-search'],
-    })
-
-    expect(bodyCount(el)).toBe(3)
-
+    toolRow(el, 'file.inspect')?.click()
+    await nextTick()
+    expect(itemToggles.get('read')).toBe(false)
     bulkButton(el)?.click()
     await nextTick()
-
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual([
-      'error',
-      'batch-shell',
-      'batch-search',
-    ])
-    expect(onToggleGroup.mock.calls.map(([key]) => key)).toEqual(['mixed-batch'])
-    expect(itemToggles.has('batch-search')).toBe(false)
     expect(bodyCount(el)).toBe(0)
-
-    onToggleGroup.mockClear()
-    onToggleItem.mockClear()
-    bulkButton(el)?.click()
+    expect([...groupToggles.values()]).toEqual([false, false])
+    expect([...itemToggles.values()]).toEqual([false, false, false, false])
+    useToolDetailPreference().setMode('expanded')
     await nextTick()
-
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual([
-      'single-search',
-      'error',
-      'batch-shell',
-      'batch-search',
-    ])
-    expect(onToggleGroup.mock.calls.map(([key]) => key)).toEqual(['mixed-batch'])
-    expect(itemToggles.has('batch-search')).toBe(true)
-    expect(bodyCount(el)).toBe(4)
+    expect(bodyCount(el)).toBe(0)
   })
 
-  it('keeps bulk-expanded live targets open when an error changes their defaults', async () => {
-    const { el, items, groupToggles, itemToggles, onToggleGroup, onToggleItem } = await mountRunTrace([
-      group('single-group', [call('single-search', 'web_search')]),
-      group('search-batch', [
-        call('batch-search-1', 'web_search'),
-        call('batch-search-2', 'web_search'),
-      ]),
+  it('keeps a bulk choice through new defaults and late failures', async () => {
+    const { el, items, onToggleItem } = await mountRunTrace([
+      group('single', [call('single', 'web_search')]),
+      group('batch', [call('first', 'web_search'), call('second', 'web_search')]),
     ], { showBulkToggle: true })
-
-    expect(bulkButton(el)?.textContent?.trim()).toBe('Expand all')
     bulkButton(el)?.click()
     await nextTick()
-
-    expect([...itemToggles]).toEqual([
-      'single-search',
-      'batch-search-1',
-      'batch-search-2',
-    ])
-    expect([...groupToggles]).toEqual(['search-batch'])
-    expect(bodyCount(el)).toBe(3)
-
-    onToggleGroup.mockClear()
     onToggleItem.mockClear()
-    const singleGroup = items.value[0] as ToolGroupItem
-    const searchBatch = items.value[1] as ToolGroupItem
-    singleGroup.group.calls[0].status = 'error'
-    singleGroup.group.calls[0].isError = true
-    searchBatch.group.calls[0].status = 'error'
-    searchBatch.group.calls[0].isError = true
+    const batch = items.value[1] as ToolGroupItem
+    batch.group.calls[0].isError = true
+    batch.group.calls[0].status = 'error'
+    useToolDetailPreference().setMode('expanded')
     await nextTick()
-
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual([
-      'single-search',
-      'batch-search-1',
-    ])
-    expect(onToggleGroup.mock.calls.map(([key]) => key)).toEqual(['search-batch'])
-    expect(itemToggles.has('single-search')).toBe(false)
-    expect(groupToggles.has('search-batch')).toBe(false)
-    expect(groupHeader(el, 'search-batch')?.getAttribute('aria-expanded')).toBe('true')
+    useToolDetailPreference().setMode('collapsed')
+    await nextTick()
     expect(bodyCount(el)).toBe(3)
-    expect(bulkButton(el)?.textContent?.trim()).toBe('Collapse all')
+    expect(onToggleItem).not.toHaveBeenCalled()
   })
 
-  it('collapses member details as well as their multi-call group', async () => {
-    useToolDetailPreference().setMode('compact')
-    const { el } = await mountRunTrace([
-      group('first-batch', [
-        call('first-search', 'web_search'),
-        call('first-read', 'read_file'),
-      ]),
-      group('second-batch', [
-        call('second-search', 'web_search'),
-        call('second-read', 'read_file'),
-      ]),
-    ], { showBulkToggle: true })
-
-    bulkButton(el)?.click()
+  it.each(['group', 'item'] as const)('isolates repeated %s ids by message scope', async kind => {
+    const groupChoices = reactive(new Map<string, boolean>())
+    const itemChoices = reactive(new Map<string, boolean>())
+    const entries = kind === 'group'
+      ? [group('shared', [call('one', 'shell'), call('two', 'read_file')])]
+      : [group('shared', [call('one', 'shell')])]
+    const a = await mountRunTrace(entries, { stateScope: 'session:turn-a', groupChoices, itemChoices })
+    const b = await mountRunTrace(entries, { stateScope: 'session:turn-b', groupChoices, itemChoices })
+    const selector = kind === 'group' ? '.tool-row--group' : '.tool-row'
+    a.el.querySelector<HTMLButtonElement>(selector)?.click()
     await nextTick()
-
-    expect(el.querySelectorAll('.tool-row--member[aria-expanded="true"]')).toHaveLength(4)
-    expect(bodyCount(el)).toBe(4)
-
-    bulkButton(el)?.click()
-    await nextTick()
-    expect(bodyCount(el)).toBe(0)
-
-    groupHeader(el, 'first-batch')?.click()
-    await nextTick()
-    expect(el.querySelectorAll('.tool-row--member[aria-expanded="false"]')).toHaveLength(2)
-    expect(bodyCount(el)).toBe(0)
+    expect(a.el.querySelector(selector)?.getAttribute('aria-expanded')).toBe('true')
+    expect(b.el.querySelector(selector)?.getAttribute('aria-expanded')).toBe('false')
   })
 
-  it('isolates repeated provider group ids by message scope', async () => {
-    const el = document.createElement('div')
-    document.body.appendChild(el)
-    const groupToggles = reactive(new Set<string>())
-    const itemToggles = reactive(new Set<string>())
-    const firstItems = [
-      group('shared-first', [call('a-1', 'web_search'), call('a-2', 'web_search')]),
-      group('shared-second', [call('a-3', 'web_search'), call('a-4', 'web_search')]),
-    ]
-    const secondItems = [
-      group('shared-first', [call('b-1', 'web_search'), call('b-2', 'web_search')]),
-      group('shared-second', [call('b-3', 'web_search'), call('b-4', 'web_search')]),
-    ]
-    const onToggleGroup = vi.fn((id: string) => flip(groupToggles, id))
-    const onToggleItem = vi.fn((id: string) => flip(itemToggles, id))
-    const trace = (items: ChatStreamTimelineItem[], stateScope: string) => h(RunTrace, {
-      items,
-      stateScope,
-      showBulkToggle: true,
-      isToolGroupOpen: (id: string) => groupToggles.has(id),
-      isToolItemOpen: (id: string) => itemToggles.has(id),
-      onToggleGroup,
-      onToggleItem,
-    })
-    const Host = defineComponent({
-      setup() {
-        return () => h('div', [
-          h('section', { id: 'message-a' }, [trace(firstItems, 'message-a')]),
-          h('section', { id: 'message-b' }, [trace(secondItems, 'message-b')]),
-        ])
-      },
-    })
-    const app = createApp(Host)
-    mountedApps.push(app)
-    app.use(i18n)
-    app.mount(el)
+  it.each([true, false])('carries a manual %s from a single row to its growing group', async choice => {
+    useToolDetailPreference().setMode(choice ? 'collapsed' : 'expanded')
+    const { el, items, groupToggles } = await mountRunTrace([
+      group('growing', [call('first', 'web_search')]),
+    ], { stateScope: 'turn' })
+    toolRow(el, 'web.search')?.click()
     await nextTick()
-
-    el.querySelector<HTMLButtonElement>('#message-a [data-testid="run-trace-bulk-toggle"]')?.click()
+    items.value = [group('growing', [call('first', 'web_search'), call('second', 'web_search')])]
     await nextTick()
-
-    expect(onToggleGroup.mock.calls.map(([id]) => id)).toEqual([
-      'message-a:shared-first',
-      'message-a:shared-second',
-    ])
-    expect(el.querySelectorAll('#message-a .tool-row--group[aria-expanded="true"]')).toHaveLength(2)
-    expect(el.querySelectorAll('#message-b .tool-row--group[aria-expanded="false"]')).toHaveLength(2)
+    expect(groupToggles.get('turn:growing')).toBe(choice)
+    expect(groupHeader(el, 'growing')?.getAttribute('aria-expanded')).toBe(String(choice))
+    useToolDetailPreference().setMode(choice ? 'expanded' : 'collapsed')
+    await nextTick()
+    expect(groupHeader(el, 'growing')?.getAttribute('aria-expanded')).toBe(String(choice))
   })
 
-  it('isolates repeated provider tool ids by message scope', async () => {
-    const el = document.createElement('div')
-    document.body.appendChild(el)
-    const groupToggles = reactive(new Set<string>())
-    const itemToggles = reactive(new Set<string>())
-    const sharedItems = [
-      group('shared-first', [call('shared-tool-1', 'web_search')]),
-      group('shared-second', [call('shared-tool-2', 'web_search')]),
-    ]
-    const onToggleGroup = vi.fn((id: string) => flip(groupToggles, id))
-    const onToggleItem = vi.fn((id: string) => flip(itemToggles, id))
-    const trace = (stateScope: string) => h(RunTrace, {
-      items: sharedItems,
-      stateScope,
-      showBulkToggle: true,
-      isToolGroupOpen: (id: string) => groupToggles.has(id),
-      isToolItemOpen: (id: string) => itemToggles.has(id),
-      onToggleGroup,
-      onToggleItem,
-    })
-    const Host = defineComponent({
-      setup() {
-        return () => h('div', [
-          h('section', { id: 'tool-message-a' }, [trace('message-a')]),
-          h('section', { id: 'tool-message-b' }, [trace('message-b')]),
-        ])
-      },
-    })
-    const app = createApp(Host)
-    mountedApps.push(app)
-    app.use(i18n)
-    app.mount(el)
+  it('does not overwrite an existing group choice when a batch grows', async () => {
+    const { items, groupToggles } = await mountRunTrace([
+      group('growing', [call('first', 'web_search')]),
+    ], { groupChoices: new Map([['growing', false]]), itemChoices: new Map([['first', true]]) })
+    items.value = [group('growing', [call('first', 'web_search'), call('second', 'web_search')])]
     await nextTick()
-
-    el.querySelector<HTMLButtonElement>('#tool-message-a [data-testid="run-trace-bulk-toggle"]')?.click()
-    await nextTick()
-
-    expect(onToggleItem.mock.calls.map(([id]) => id)).toEqual([
-      'message-a:shared-tool-1',
-      'message-a:shared-tool-2',
-    ])
-    expect(el.querySelectorAll('#tool-message-a .tool-row-body')).toHaveLength(2)
-    expect(el.querySelectorAll('#tool-message-b .tool-row-body')).toHaveLength(0)
+    expect(groupToggles.get('growing')).toBe(false)
   })
 
-  it('preserves an override when a live single-call row becomes a group', async () => {
-    const { el, items, groupToggles, itemToggles, onToggleGroup } = await mountRunTrace([
-      group('growing-group', [call('first-search', 'web_search')]),
-      group('other-group', [call('other-search', 'web_search')]),
-    ], { showBulkToggle: true, stateScope: 'stream' })
-
-    bulkButton(el)?.click()
-    await nextTick()
-    expect(new Set(itemToggles)).toEqual(new Set([
-      'stream:first-search',
-      'stream:other-search',
-    ]))
-
-    onToggleGroup.mockClear()
-    const growingGroup = items.value[0] as ToolGroupItem
-    items.value = [
-      {
-        ...growingGroup,
-        group: {
-          ...growingGroup.group,
-          calls: [
-            ...growingGroup.group.calls,
-            call('second-search', 'web_search'),
-          ],
-        },
-      },
-      items.value[1],
-    ]
-    await nextTick()
-
-    expect(onToggleGroup.mock.calls.map(([key]) => key)).toEqual(['stream:growing-group'])
-    expect(groupToggles.has('stream:growing-group')).toBe(true)
-    expect(groupHeader(el, 'growing-group')?.getAttribute('aria-expanded')).toBe('true')
-    expect(bulkButton(el)?.textContent?.trim()).toBe('Collapse all')
-  })
-
-  it('appears when a second tool group is appended during streaming', async () => {
+  it('inserts the bulk action next to new tools without moving narration', async () => {
     const { el, items } = await mountRunTrace([
-      { type: 'text', key: 'leading-text', html: '<p>Starting the first tool</p>' },
+      { type: 'text', key: 'before', html: '<p>First progress</p>' },
       group('search-group', [call('search', 'web_search')]),
     ], { showBulkToggle: true })
-
     expect(bulkButton(el)).toBeNull()
-
-    items.value = [
-      ...items.value,
-      { type: 'text', key: 'middle-text', html: '<p>Starting the second tool</p>' },
+    items.value = [...items.value,
+      { type: 'text', key: 'between', html: '<p>Next progress</p>' },
       group('shell-group', [call('shell', 'shell')]),
     ]
     await nextTick()
-
-    expect(bulkButton(el)?.textContent?.trim()).toBe('Collapse all')
     expect(el.querySelectorAll('[data-testid="run-trace-bulk-toolbar"]')).toHaveLength(1)
     expect(el.querySelector('.tool-timeline__summary')?.textContent?.trim()).toBe('2 calls')
-    expect(bodyCount(el)).toBe(1)
-
-    const timelineChildren = Array.from(
-      el.querySelector('.tool-row-group')?.children ?? [],
-    ) as HTMLElement[]
-    expect(timelineChildren.map(child => {
-      if (child.matches('.msg-ai-text')) return child.textContent?.trim()
-      if (child.matches('.tool-timeline__toolbar')) return 'bulk-toolbar'
-      return child.querySelector('.tool-row__label')?.textContent?.trim()
-    })).toEqual([
-      'Starting the first tool',
-      'bulk-toolbar',
-      'search-group',
-      'Starting the second tool',
-      'shell-group',
+    const children = Array.from(el.querySelector('.tool-row-group')?.children ?? [])
+    expect(children.map(child => child.matches('.msg-ai-text') ? child.textContent?.trim()
+      : child.matches('.tool-timeline__toolbar') ? 'bulk-toolbar'
+      : child.querySelector('.tool-row__label')?.textContent?.trim())).toEqual([
+      'First progress', 'bulk-toolbar', 'search-group', 'Next progress', 'shell-group',
     ])
-
-    bulkButton(el)?.click()
-    await nextTick()
-    expect(bodyCount(el)).toBe(0)
   })
 
-  it('is enabled by the chat timeline wrapper, including the live checklist variant', async () => {
+  it.each([undefined, 'activity'] as const)('forwards explicit choices through the chat wrapper (%s)', async presentation => {
     const el = document.createElement('div')
     document.body.appendChild(el)
-    const itemToggles = reactive(new Set<string>())
-    const onToggleItem = vi.fn((renderKey: string) => flip(itemToggles, renderKey))
-    const items = [
-      group('search-group', [call('search', 'web_search')]),
-      group('shell-group', [call('shell', 'shell')]),
-    ]
-    const Host = defineComponent({
-      setup() {
-        return () => h(ToolCallTimeline, {
-          items,
-          variant: 'checklist',
-          isToolGroupOpen: () => false,
-          isToolItemOpen: (renderKey: string) => itemToggles.has(renderKey),
-          toolGroupStatusText: () => '',
-          toolStatusText: () => '',
-          toolSecondaryText: () => '',
-          onToggleItem,
-        })
-      },
-    })
-
-    const app = createApp(Host)
+    const choices = reactive(new Map<string, boolean>())
+    const onToggleItem = vi.fn((id: string, open: boolean) => choices.set(id, open))
+    const app = createApp(defineComponent({ setup: () => () => h(ToolCallTimeline, {
+      items: [group('shell', [call('shell', 'shell', { inputRaw: '{"command":"npm test"}' })]), group('read', [call('read', 'read_file')])],
+      presentation, variant: 'checklist',
+      isToolGroupOpen: () => undefined, isToolItemOpen: (id: string) => choices.get(id),
+      toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '', onToggleItem,
+    }) }))
     mountedApps.push(app)
-    app.use(i18n)
-    app.mount(el)
+    app.use(i18n).use(createPinia()).mount(el)
     await nextTick()
-
-    expect(el.querySelector('.tool-timeline--checklist')).not.toBeNull()
-    expect(el.querySelector('.tool-timeline__toolbar')?.nextElementSibling)
-      .toBe(el.querySelector('.step-card'))
-    expect(bulkButton(el)?.textContent?.trim()).toBe('Collapse all')
-    expect(bodyCount(el)).toBe(1)
-
-    bulkButton(el)?.click()
+    expect(Boolean(bulkButton(el))).toBe(presentation !== 'activity')
+    toolRow(el, 'command.run')?.click()
     await nextTick()
-
-    expect(onToggleItem.mock.calls.map(([key]) => key)).toEqual(['shell'])
-    expect(bodyCount(el)).toBe(0)
+    expect(onToggleItem).toHaveBeenLastCalledWith('shell', true)
+    expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe('true')
+    toolRow(el, 'command.run')?.click()
+    await nextTick()
+    expect(onToggleItem).toHaveBeenLastCalledWith('shell', false)
+    expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe('false')
   })
 })
 
-describe('RunTrace tool detail preference', () => {
-  it('keeps the existing per-tool defaults in Auto mode', async () => {
-    const { el } = await mountRunTrace([
-      group('search-group', [call('search', 'web_search')]),
-      group('command-group', [call('command', 'shell')]),
-    ])
-
-    expect(toolRow(el, 'web.search')?.getAttribute('aria-expanded')).toBe('false')
-    expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe('true')
+describe('RunTrace tool detail defaults', () => {
+  it.each(['collapsed', 'expanded'] as const)('uses %s for every tool type including failures', async mode => {
+    useToolDetailPreference().setMode(mode)
+    const { el } = await mountRunTrace([group('mixed', [
+      call('read', 'read_file', { inputRaw: '{"path":"src/a.ts"}', result: 'source' }),
+      call('command', 'shell', { inputRaw: '{"command":"npm test"}' }),
+      call('write', 'write_file', { inputRaw: '{"path":"src/a.ts","content":"source"}', result: 'Written 6 bytes' }),
+      call('failed', 'custom_tool', { status: 'error', isError: true, result: 'Network unavailable' }),
+    ])], { presentation: 'activity' })
+    const expected = String(mode === 'expanded')
+    expect(el.querySelector('.tool-row--group')).toBeNull()
+    expect(el.querySelectorAll('.tool-row')).toHaveLength(4)
+    for (const row of el.querySelectorAll('.tool-row')) expect(row.getAttribute('aria-expanded')).toBe(expected)
+    expect(el.querySelector('.tool-row--error')?.textContent).not.toContain(i18n.global.t('shared.runTrace.activityNotCompleted'))
+    expect(el.querySelector('.tool-row--error .tool-row__status-dot')?.getAttribute('aria-label'))
+      .toContain(i18n.global.t('shared.runTrace.activityNotCompleted'))
+    expect(el.textContent?.includes('Network unavailable')).toBe(mode === 'expanded')
   })
 
-  it('collapses ordinary tools in Compact mode but still opens errors and error groups', async () => {
-    useToolDetailPreference().setMode('compact')
-    const failed = call('failed', 'web_search', {
-      status: 'error',
-      isError: true,
-      result: 'failed',
-      resultPreview: 'failed',
-    })
-    const { el } = await mountRunTrace([
-      group('command-group', [call('command', 'shell')]),
-      group('error-group', [failed]),
-      group('mixed-group', [call('read', 'read_file'), failed]),
-    ])
-
-    expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe('false')
-    expect(toolRow(el, 'web.search')?.getAttribute('aria-expanded')).toBe('true')
-    expect(groupHeader(el, 'mixed-group')?.getAttribute('aria-expanded')).toBe('true')
-  })
-
-  it('opens every ordinary tool in Expanded mode', async () => {
-    useToolDetailPreference().setMode('expanded')
-    const { el } = await mountRunTrace([
-      group('search-group', [call('search', 'web_search')]),
-      group('command-group', [call('command', 'shell')]),
-    ])
-
-    expect(toolRow(el, 'web.search')?.getAttribute('aria-expanded')).toBe('true')
-    expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe('true')
-  })
-
-  it('keeps a manual override stable when the global default changes', async () => {
+  it.each([true, false])('retains manual %s through a complete mode round trip while untouched rows follow defaults', async choice => {
+    useToolDetailPreference().setMode(choice ? 'collapsed' : 'expanded')
     const { el, itemToggles } = await mountRunTrace([
-      group('first-search-group', [call('first-search', 'web_search')]),
-      group('second-search-group', [call('second-search', 'web_search')]),
-    ])
-    const rows = el.querySelectorAll<HTMLButtonElement>('.tool-row[data-op="web.search"]')
-
-    rows[0].click()
+      group('read', [call('read', 'read_file', { inputRaw: '{"path":"src/a.ts"}', result: 'source' })]),
+      group('shell', [call('shell', 'shell', { inputRaw: '{"command":"npm test"}' })]),
+    ], { presentation: 'activity' })
+    toolRow(el, 'file.inspect')?.click()
     await nextTick()
-    expect(rows[0].getAttribute('aria-expanded')).toBe('true')
-    expect(rows[1].getAttribute('aria-expanded')).toBe('false')
-    expect(itemToggles.has('first-search')).toBe(true)
-
-    useToolDetailPreference().setMode('expanded')
-    await nextTick()
-
-    expect(rows[0].getAttribute('aria-expanded')).toBe('true')
-    expect(rows[1].getAttribute('aria-expanded')).toBe('true')
-    expect(itemToggles.has('first-search')).toBe(false)
+    for (const mode of ['collapsed', 'expanded', 'collapsed', 'expanded'] as const) {
+      useToolDetailPreference().setMode(mode)
+      await nextTick()
+      expect(toolRow(el, 'file.inspect')?.getAttribute('aria-expanded')).toBe(String(choice))
+      expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe(String(mode === 'expanded'))
+    }
+    expect(itemToggles.get('read')).toBe(choice)
   })
 
-  it('derives the bulk action from Compact and Expanded defaults', async () => {
-    useToolDetailPreference().setMode('compact')
-    const compact = await mountRunTrace([
-      group('search-group', [call('search', 'web_search')]),
-      group('command-group', [call('command', 'shell')]),
-    ], { showBulkToggle: true })
-    expect(bulkButton(compact.el)?.textContent?.trim()).toBe('Expand all')
-
+  it('keeps an explicitly closed tool closed as its batch grows and execution fails', async () => {
     useToolDetailPreference().setMode('expanded')
+    const first = call('first', 'shell', { inputRaw: '{"command":"npm test"}', isRunning: true })
+    const { el, items } = await mountRunTrace([group('batch', [first])], { presentation: 'activity' })
+    toolRow(el, 'command.run')?.click()
     await nextTick()
-    expect(bulkButton(compact.el)?.textContent?.trim()).toBe('Collapse all')
+    items.value = [group('batch', [
+      { ...first, isRunning: false, status: 'error', isError: true, result: 'Validation failed' },
+      call('next', 'read_file', { inputRaw: '{"path":"src/a.ts"}', result: 'source' }),
+    ])]
+    await nextTick()
+    expect(toolRow(el, 'command.run')?.getAttribute('aria-expanded')).toBe('false')
+    expect(toolRow(el, 'file.inspect')?.getAttribute('aria-expanded')).toBe('true')
+    expect(el.querySelector('.tool-row__error-summary')).toBeNull()
+    expect(el.textContent).not.toContain('Validation failed')
+    expect(toolRow(el, 'command.run')?.querySelector('.tool-row__status-dot')).not.toBeNull()
+  })
+
+  it('retains choices through remounts with a different render key for the same tool', async () => {
+    const choices = reactive(new Map<string, boolean>())
+    const live = await mountRunTrace([group('live', [call('live-key', 'shell', { toolId: 'same-call' })])], {
+      stateScope: 'session:turn', itemChoices: choices,
+    })
+    toolRow(live.el, 'command.run')?.click()
+    await nextTick()
+    expect(choices.get('session:turn:same-call')).toBe(true)
+    const history = await mountRunTrace([group('history', [call('history-key', 'shell', { toolId: 'same-call' })])], {
+      stateScope: 'session:turn', itemChoices: choices,
+    })
+    expect(toolRow(history.el, 'command.run')?.getAttribute('aria-expanded')).toBe('true')
+    toolRow(history.el, 'command.run')?.click()
+    await nextTick()
+    expect(toolRow(live.el, 'command.run')?.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('keeps absent detail bodies non-expandable in expanded mode', async () => {
+    useToolDetailPreference().setMode('expanded')
+    const { el } = await mountRunTrace([group('empty', [call('empty', 'custom_tool', {
+      inputRaw: '', inputPreview: '', result: '', resultPreview: '',
+    })])])
+    expect(el.querySelector('.tool-row')?.hasAttribute('aria-expanded')).toBe(false)
+    expect(bodyCount(el)).toBe(0)
   })
 })

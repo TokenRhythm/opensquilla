@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, reactive } from 'vue'
+import { createApp, h, nextTick, reactive } from 'vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import { MODEL_CAPACITY_KEY, useModelCapacityForm } from '@/composables/setup/useModelCapacityForm'
@@ -1151,7 +1151,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     app.unmount()
   })
 
-  it('opens the selected provider directly below the picker and focuses its API key', async () => {
+  it.each(['mouse', 'keyboard'])('reopens the same cancelled provider using %s and focuses its API key', async (method) => {
     const el = document.createElement('div')
     document.body.appendChild(el)
     const panelState = reactive(panel({
@@ -1165,7 +1165,9 @@ describe('SetupProviderPanel — configured provider management', () => {
     const mutablePanelState = panelState as unknown as Record<string, unknown>
     const app = createApp(SetupProviderPanel, {
       panel: panelState,
-      onAddProvider: (providerId: string) => {
+      onAddProvider: async (providerId: string) => {
+        // The catalog selection handler also awaits the draft-discard check.
+        await Promise.resolve()
         panelState.providerSelected = providerId
         panelState.editingPrimary = true
         mutablePanelState.providerNeeds = ['API key via DEEPSEEK_API_KEY or a one-time paste.']
@@ -1213,7 +1215,59 @@ describe('SetupProviderPanel — configured provider management', () => {
       .toBe(document.body.querySelector(
         '.setup-provider-modal__form input[name="setup_provider_api_key"]',
       ))
+
+    document.body.querySelector<HTMLButtonElement>('.setup-provider-modal__footer .btn--ghost')!.click()
+    await nextTick()
+    expect(panelState.providerSelected).toBe('deepseek')
+    el.querySelector<HTMLButtonElement>('[data-provider-picker-trigger]')!.click()
+    await nextTick()
+    await nextTick()
+    if (method === 'keyboard') {
+      const search = document.body.querySelector<HTMLInputElement>('.provider-picker__search-input')!
+      search.value = 'deepseek'
+      search.dispatchEvent(new Event('input', { bubbles: true }))
+      await nextTick()
+      search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    } else {
+      Array.from(document.body.querySelectorAll<HTMLButtonElement>('.provider-picker__option'))
+        .find(option => option.textContent?.includes('DeepSeek'))!.click()
+    }
+    await nextTick()
+    await nextTick()
+    expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeNull()
+    expect(document.body.querySelector('.setup-provider-modal__form')).toBeTruthy()
+    expect(document.activeElement).toBe(document.body.querySelector(
+      '.setup-provider-modal__form input[name="setup_provider_api_key"]',
+    ))
     app.unmount()
+  })
+
+  it.each(['busy', 'saving'] as const)('does not accept picker selections while %s', async (lock) => {
+    const panelState = reactive(panel({
+      providerSelected: 'deepseek', configuredProviders: [], busy: false,
+      runtimeProviders: [{ providerId: 'deepseek', label: 'DeepSeek' }],
+    }))
+    const state = reactive({ saving: false })
+    const added = vi.fn()
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({ render: () => h(SetupProviderPanel, {
+      panel: panelState as unknown as InstanceType<typeof SetupProviderPanel>['$props']['panel'],
+      saving: state.saving, onAddProvider: added,
+    }) })
+    app.use(i18n)
+    app.mount(host)
+    try {
+      host.querySelector<HTMLButtonElement>('[data-provider-picker-trigger]')!.click()
+      await nextTick()
+      if (lock === 'busy') (panelState as unknown as { busy: boolean }).busy = true
+      else state.saving = true
+      await nextTick()
+      document.body.querySelector<HTMLButtonElement>('.provider-picker__option')!.click()
+      await nextTick()
+      expect(added).not.toHaveBeenCalled()
+      expect(document.body.querySelector('[data-testid="provider-catalog-picker"]')).toBeTruthy()
+    } finally { app.unmount() }
   })
 
   it('shows an explicit Save changes action for a new provider draft', async () => {
@@ -2670,12 +2724,21 @@ describe('primary thinking control', () => {
       editor.querySelector<HTMLButtonElement>('.model-capacity-menu')!.click()
       await Promise.resolve(); await nextTick(); await nextTick()
       const dialog = document.querySelector('.model-capacity-dialog')!
-      const control = dialog.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
-      expect(control.value).toBe('high')
-      expect(Array.from(control.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
-      control.value = ''
-      control.dispatchEvent(new Event('change', { bubbles: true }))
-      await nextTick()
+      const control = dialog.querySelector<HTMLButtonElement>('[data-testid="model-thinking-level"][role="combobox"]')!
+      const native = control.closest('.control-select')!.querySelector('select')!
+      expect(native.value).toBe('high')
+      expect(control.textContent).toContain('high')
+      expect(Array.from(native.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+      control.click(); await nextTick(); await nextTick()
+      const list = document.getElementById(control.getAttribute('aria-controls')!)!
+      const choices = [...list.querySelectorAll<HTMLElement>('[role="option"]')]
+      const defaultLabel = i18n.global.t('setup.provider.thinkingDefault')
+      expect(choices.map(choice => choice.textContent?.trim())).toEqual([defaultLabel, 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+      expect(choices.find(choice => choice.getAttribute('aria-selected') === 'true')?.textContent?.trim()).toBe('high')
+      choices[0]!.click(); await nextTick(); await nextTick()
+      expect(control.getAttribute('aria-expanded')).toBe('false')
+      expect(control.textContent).toContain(defaultLabel)
+      expect(native.value).toBe('')
       expect(onUpdateLlmThinking).not.toHaveBeenCalled()
       dialog.querySelector<HTMLButtonElement>('.btn--primary')!.click()
       expect(onUpdateLlmThinking).toHaveBeenCalledWith('')

@@ -154,11 +154,48 @@ function buildDiagramElement(svg: string, source: string, labels: SvgDiagramLabe
   // than injecting unsanitized markup on the reject path.
   svgWrap.innerHTML = sanitizeDiagramSvg(svg)
   if (svgWrap.querySelector('svg')) {
+    namespaceDiagramIds(svgWrap)
     wrapper.appendChild(svgWrap)
     wrapper.appendChild(buildToolbar(svgWrap, source, labels))
     wireDiagramInteractions(wrapper, svgWrap)
   }
   return wrapper
+}
+
+let diagramIdSequence = 0
+
+// Cached SVGs and repeated DOT output reuse engine IDs. Keep all fragment and
+// accessibility references local to one mounted diagram, including its CSS.
+function namespaceDiagramIds(root: HTMLElement): void {
+  const prefix = `diagram-${++diagramIdSequence}-`
+  const ids = new Map<string, string>()
+  for (const element of root.querySelectorAll<HTMLElement>('[id]')) {
+    const original = element.id
+    if (!ids.has(original)) ids.set(original, `${prefix}${ids.size}`)
+    element.id = ids.get(original)!
+  }
+  if (!ids.size) return
+  const selectorIds = [...ids].map(([id, value]) => [new RegExp(`#${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`, 'g'), `#${value}`] as const)
+  const references = (value: string) => value.replace(/url\(\s*(['"]?)#([^'"\s)]+)\1\s*\)/gi,
+    (original, quote: string, id: string) => ids.has(id) ? `url(${quote}#${ids.get(id)}${quote})` : original)
+  for (const element of root.querySelectorAll('*')) {
+    for (const attribute of [...element.attributes]) {
+      if (attribute.name === 'id') continue
+      let value = references(attribute.value)
+      if (attribute.name === 'href' || attribute.name === 'xlink:href') {
+        if (value.startsWith('#') && ids.has(value.slice(1))) value = `#${ids.get(value.slice(1))}`
+      } else if (attribute.name === 'aria-labelledby' || attribute.name === 'aria-describedby') {
+        value = value.split(/\s+/).map(id => ids.get(id) || id).join(' ')
+      }
+      if (value !== attribute.value) element.setAttribute(attribute.name, value)
+    }
+    if (element.localName === 'style') {
+      // Rewrite selectors only in rule preludes, leaving declaration colors
+      // such as #fff intact even if a source happens to contain id="fff".
+      element.textContent = references(element.textContent || '').replace(/([^{}]+)(?=\{)/g,
+        prelude => selectorIds.reduce((value, [pattern, replacement]) => value.replace(pattern, replacement), prelude))
+    }
+  }
 }
 
 function buildToolbar(svgWrap: HTMLElement, source: string, labels: SvgDiagramLabels): HTMLElement {

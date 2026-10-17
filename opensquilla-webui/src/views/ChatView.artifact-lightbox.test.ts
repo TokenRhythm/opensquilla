@@ -46,8 +46,8 @@ describe('ChatView artifact preview routing', () => {
 
     expect(typedStart).toBeGreaterThan(-1)
     expect(source).toContain("createWorkbenchResourceRef('deliverable', artifactId)")
-    expect(source).toContain('workbenchResourcesStore.resolve(sessionKey.value, ref)')
-    expect(source).toContain('workbenchResourcesStore.openCurrent(sessionKey.value, resource)')
+    expect(source).toContain('workbenchResourcesStore.resolve(key, ref)')
+    expect(source).toContain('workbenchResourcesStore.openCurrent(key, resource)')
     expect(source).toContain("current?.disposition === 'document'")
     expect(source).toContain('artifactPayloadFromRevision(current.revision)')
     expect(source).toContain("initialSection: 'preview'")
@@ -90,10 +90,10 @@ describe('ChatView artifact preview routing', () => {
     const source = chatViewSource.slice(start, end)
 
     expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('workbenchResourcesStore.openCurrent(sessionKey.value, resource)')
+    expect(source).toContain('workbenchResourcesStore.openCurrent(key, resource)')
     expect(source).toContain("current?.disposition === 'document'")
     expect(source).toContain('workbenchResourcesStore.importDocument(')
-    expect(source.indexOf('openCurrent(sessionKey.value, resource)'))
+    expect(source.indexOf('openCurrent(key, resource)'))
       .toBeLessThan(source.indexOf('importDocument('))
     expect(source).toContain("initialSection: 'preview'")
     expect(source).toContain('classifyArtifactProductError(error)')
@@ -112,7 +112,7 @@ describe('ChatView artifact preview routing', () => {
 
   it('treats every user open as a fresh section request without resetting on metadata refresh', () => {
     const explicitOpenCalls = chatViewSource.match(
-      /workbenchStore\.openItem\(artifactPreviewItemForExplicitOpen\(/g,
+      /artifactPreviewItemForExplicitOpen\(\{/g,
     ) || []
     const refreshStart = chatViewSource.indexOf('watch(sessionArtifacts, artifacts => {')
     const refreshEnd = chatViewSource.indexOf('\nfunction openLegacyArtifactWorkbench', refreshStart)
@@ -120,9 +120,10 @@ describe('ChatView artifact preview routing', () => {
 
     expect(explicitOpenCalls).toHaveLength(9)
     expect(chatViewSource).toContain('function artifactPreviewItemForExplicitOpen(')
-    expect(refreshSource).toContain(
-      'initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item)',
-    )
+    expect(refreshSource).toContain('payload: { ...item.payload, navigationArtifacts: [...artifacts] }')
+    expect(refreshSource).toContain('item.scope.id !== workbenchOwnerKey.value')
+    expect(refreshSource).toContain('item.payload.sessionKey !== sessionKey.value')
+    expect(refreshSource).not.toContain('createArtifactPreviewWorkbenchItem(')
     expect(refreshSource).not.toContain('artifactPreviewItemForExplicitOpen(')
   })
 

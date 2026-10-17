@@ -155,7 +155,7 @@ async function expectReceipt(page: Page, label: string) {
   if (!await receipt.isVisible()) {
     const activity = page.getByTestId('assistant-activity').filter({ has: receipt })
     await expect(activity).toHaveCount(1)
-    const summary = activity.locator(':scope > button[aria-controls]')
+    const summary = activity.locator(':scope > .assistant-activity__header > button[aria-controls]')
     await expect(summary).toHaveAttribute('aria-expanded', 'false')
     await summary.click()
     await expect(summary).toHaveAttribute('aria-expanded', 'true')

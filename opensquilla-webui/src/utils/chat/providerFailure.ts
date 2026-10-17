@@ -1,7 +1,7 @@
 /** Stable public taxonomy only; never infer a provider cause from prose or HTTP codes. */
 const FAILURE_KINDS = new Set([
   'rate_limited', 'provider_overloaded', 'auth_invalid', 'context_overflow',
-  'unsupported_feature', 'insufficient_credits', 'model_not_found', 'transport_transient',
+  'unsupported_feature', 'insufficient_credits', 'usage_limit', 'usage_limit_reached', 'model_not_found', 'transport_transient',
   'policy_refusal', 'empty_response', 'malformed_response', 'bad_request',
 ])
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -751,6 +752,19 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
         reset_resolved_run_context_overlays()
 
 
+def _require_directory_symlinks(tmp_path: Path) -> None:
+    """Check capability before opening database connections for link scenarios."""
+    probe = tmp_path / "directory-symlink-probe"
+    try:
+        probe.symlink_to(tmp_path, target_is_directory=True)
+    except OSError as exc:
+        if sys.platform == "win32" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows directory symlink privilege is unavailable (WinError 1314)")
+        raise
+    else:
+        probe.unlink()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["managed", "configured"])
 @pytest.mark.parametrize("root_change", [None, "missing", "symlink", "ancestor_symlink"])
@@ -766,6 +780,8 @@ async def test_task_workspace_spawn_survives_restart_and_revalidates(
     from opensquilla.sandbox.operation_runtime import SandboxOperationResult
     from opensquilla.tools.builtin import filesystem
 
+    if root_change in {"symlink", "ancestor_symlink"}:
+        _require_directory_symlinks(tmp_path)
     reset_resolved_run_context_overlays()
     root = tmp_path / "task-parent" / "task-root"
     fallback = tmp_path / "other-agent-default"
@@ -889,6 +905,8 @@ async def test_task_workspace_spawn_rejects_invalid_root_before_creating_child(
     from opensquilla.execution_workspaces import configured_execution_workspace
     from opensquilla.project_workspaces import ProjectWorkspaceStateError
 
+    if root_change == "symlink":
+        _require_directory_symlinks(tmp_path)
     root = tmp_path / "parent-workspace"
     replacement = tmp_path / "replacement"
     root.mkdir()

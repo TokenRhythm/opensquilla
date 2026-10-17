@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-Hans" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>富文本验收 · OpenSquilla</title>
+    <style>
+      html body #app { display: block; height: auto; min-height: 100vh; overflow: visible; }
+      .richtext-preview { width: min(880px, calc(100% - 40px)); margin: auto; padding: 28px 0 64px; }
+      .richtext-preview > header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 24px; }
+      .richtext-preview h1 { font-size: 20px; margin: 0; }
+      .richtext-preview > header p { flex-basis: 100%; font-size: 12px; color: var(--text-muted); margin: 0; }
+      .richtext-preview select, .richtext-preview > header button { padding: 6px 10px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-control); }
+      .richtext-preview [data-surface='file'] { height: 1000px; }
+      .richtext-preview .msg-ai-text { color: var(--text); line-height: 1.7; }
+    </style>
+  </head>
+  <body><div id="app"></div><script type="module" src="./richtext-preview.ts"></script></body>
+</html>

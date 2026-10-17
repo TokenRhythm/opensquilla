@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -423,6 +424,13 @@ async def _chat_history_turn_outcomes(
         )
         if snapshot is not None:
             projected["activity_snapshot"] = snapshot
+        from opensquilla.provider.failures import safe_http_status
+
+        http_status = (
+            safe_http_status(outcome.get("http_status")) if isinstance(outcome, dict) else None
+        )
+        if status != "succeeded" and http_status is not None:
+            projected["http_status"] = http_status
         error_class = getattr(row, "error_class", None)
         if (
             status != "succeeded"
@@ -750,7 +758,7 @@ async def _chat_history_summaries(
 
     if not include_summaries:
         return []
-    getter = getattr(mgr, "get_summaries", None)
+    getter = getattr(mgr, "get_display_summaries", None) or getattr(mgr, "get_summaries", None)
     if not callable(getter):
         return []
     try:
@@ -764,6 +772,76 @@ async def _chat_history_summaries(
     except Exception:  # noqa: BLE001 - summaries remain optional display metadata
         return []
     return [_session_summary_to_chat_payload(summary) for summary in summaries or []]
+
+
+async def _project_fork_workspace_previews(
+    messages: list[dict[str, Any]], *, session_key: str, manager: Any,
+) -> list[dict[str, Any]]:
+    """Rebind inherited open actions, leaving the stored model transcript intact."""
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for message_index, message in enumerate(messages):
+        for segment_index, segment in enumerate(message.get("tool_calls") or []):
+            if (
+                not isinstance(segment, dict)
+                or segment.get("type") != "tool_result"
+                or segment.get("name") != "open_workspace_preview"
+                or segment.get("is_error")
+                or not isinstance(segment.get("result"), str)
+            ):
+                continue
+            try:
+                result = json.loads(segment["result"])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(result, dict):
+                continue
+            document_id = result.get("documentId")
+            if (
+                not isinstance(document_id, str)
+                or not document_id.startswith("doc_")
+                or result.get("resourceId") != f"document:{document_id}"
+                or result.get("previewStatus") not in ("ready", "registered")
+                or result.get("error") or result.get("is_error") or result.get("isError")
+            ):
+                continue
+            if "open" in result and (
+                not isinstance(result["open"], dict)
+                or result["open"].get("resourceId") != result["resourceId"]
+            ):
+                continue
+            candidates.append((message_index, segment_index, result))
+    storage = get_session_storage(manager)
+    if not candidates or storage is None or not callable(getattr(manager, "get_session", None)):
+        return messages
+    try:
+        session = await manager.get_session(session_key)
+        with bounded_interactive_storage_reads():
+            service = await ArtifactSessionService.from_session_storage(storage)
+            try:
+                mapped = await service.resolve_fork_document_heads(
+                    session_key=session_key,
+                    session_id=session.session_id,
+                    source_document_ids=tuple({item[2]["documentId"] for item in candidates}),
+                )
+            finally:
+                await service.close()
+    except Exception as exc:  # noqa: BLE001 - optional display aliases fail closed
+        log.warning("fork_preview_projection_unavailable", error_type=type(exc).__name__)
+        return messages
+    if not mapped:
+        return messages
+    projected = copy.deepcopy(messages)
+    for message_index, segment_index, result in candidates:
+        head = mapped.get(result["documentId"])
+        if head is None:
+            continue
+        result["documentId"] = head.document.document_id
+        result["revisionId"] = head.revision.revision_id
+        result["resourceId"] = f"document:{head.document.document_id}"
+        if "open" in result:
+            result["open"]["resourceId"] = result["resourceId"]
+        projected[message_index]["tool_calls"][segment_index]["result"] = json.dumps(result)
+    return projected
 
 
 async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
@@ -920,6 +998,9 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
         # bounded; clients can range-read the remainder through
         # ``content.read.v1`` using the emitted contentRef.
         content_mode="bounded",
+    )
+    messages = await _project_fork_workspace_previews(
+        messages, session_key=session_key, manager=mgr,
     )
     turn_outcomes = await _chat_history_turn_outcomes(
         ctx,

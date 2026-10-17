@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,9 +21,24 @@ from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 
 
+@pytest.fixture
+def isolated_approval_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from opensquilla.application.approval_queue import ApprovalQueue
+
+    # Runtime cleanup and the cancellation port share one queue in this test's
+    # event loop, without inheriting a singleton bound by another test's loop.
+    queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
+    monkeypatch.setattr("opensquilla.application.approval_queue.get_approval_queue", lambda: queue)
+    monkeypatch.setattr("opensquilla.gateway.approval_queue.get_approval_queue", lambda: queue)
+    try:
+        yield
+    finally:
+        queue.close()
+
+
 @pytest.mark.asyncio
 async def test_tree_cancellation_completion_does_not_cancel_a_successor_projection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_approval_queue: None,
 ) -> None:
     storage = SessionStorage(str(tmp_path / "tasks.db"))
     await storage.connect()
@@ -111,8 +127,9 @@ async def test_tree_cancellation_completion_does_not_cancel_a_successor_projecti
     finally:
         release_query.set()
         release.set()
-        if cancel_task is not None and not cancel_task.done():
-            cancel_task.cancel()
+        if cancel_task is not None:
+            if not cancel_task.done():
+                cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
         await runtime.shutdown()
         await storage.close()

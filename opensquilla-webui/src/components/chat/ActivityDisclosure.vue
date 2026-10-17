@@ -11,82 +11,51 @@
     data-share-activity="true"
     :data-share-expanded="open ? 'true' : 'false'"
   >
-    <button
-      v-if="isLive"
-      type="button"
-      class="assistant-activity__live-head"
-      data-share-activity-label
-      data-share-control
-      :aria-expanded="open"
-      :aria-controls="bodyId"
-      @click.stop="toggleOpen"
-    >
-      <span
-        class="assistant-activity__live-dot"
-        :class="{ 'is-active': !stale, 'is-stale': stale }"
-        aria-hidden="true"
-      />
-      <span
-        class="assistant-activity__live-announcement"
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
+    <div class="assistant-activity__header">
+      <button
+        v-if="isLive"
+        type="button"
+        class="assistant-activity__live-head"
+        data-share-activity-label
+        data-share-control
+        :aria-expanded="open"
+        :aria-controls="bodyId"
+        @click.stop="toggleOpen"
       >
-        <span class="assistant-activity__live-label" :class="{ 'is-stale': stale }">
-          {{ liveStatusLabel }}
-        </span>
-        <span v-if="stale" class="assistant-activity__sr-only">
-          {{ t('chat.activity.stale') }}
-        </span>
-      </span>
-      <span
-        v-if="elapsedLabel"
-        class="assistant-activity__live-elapsed"
-        aria-hidden="true"
+        <ActivityMotion :active="headerMotionActive">
+          <span class="assistant-activity__live-elapsed">{{ liveElapsedLabel }}</span>
+          <Icon
+            class="assistant-activity__summary-arrow"
+            name="chevronRight"
+            :size="13"
+            aria-hidden="true"
+          />
+        </ActivityMotion>
+      </button>
+      <button
+        v-else
+        type="button"
+        class="assistant-activity__summary"
+        data-share-activity-label
+        data-share-control
+        :aria-expanded="open"
+        :aria-controls="bodyId"
+        @click.stop="toggleOpen"
       >
-        · {{ elapsedLabel }}
-      </span>
-      <span v-if="stepCount > 0" class="assistant-activity__live-step">
-        {{ t('chat.activity.liveStep', { n: stepCount }) }}
-      </span>
-      <Icon
-        class="assistant-activity__summary-arrow"
-        name="chevronRight"
-        :size="13"
-        aria-hidden="true"
-      />
-    </button>
-    <button
-      v-else
-      type="button"
-      class="assistant-activity__summary"
-      data-share-activity-label
-      data-share-control
-      :aria-expanded="open"
-      :aria-controls="bodyId"
-      @click.stop="toggleOpen"
-    >
-      <span class="assistant-activity__label">{{ resolvedSummaryLabel }}</span>
-      <Icon
-        class="assistant-activity__summary-arrow"
-        name="chevronRight"
-        :size="13"
-        aria-hidden="true"
-      />
-    </button>
-    <div
-      v-if="isLive && (phaseElapsedLabel || stale)"
-      class="assistant-activity__live-detail"
-    >
-      <span
-        v-if="phaseElapsedLabel"
-        class="assistant-activity__phase-elapsed"
-        aria-hidden="true"
-      >{{ t('chat.activity.phaseElapsed', { duration: phaseElapsedLabel }) }}</span>
-      <span v-if="stale" class="assistant-activity__stale-note" aria-hidden="true">
-        {{ t('chat.activity.stale') }}
-      </span>
+        <span class="assistant-activity__label">{{ resolvedSummaryLabel }}</span>
+        <Icon
+          class="assistant-activity__summary-arrow"
+          name="chevronRight"
+          :size="13"
+          aria-hidden="true"
+        />
+      </button>
     </div>
+    <!-- Announce phase changes, never the ticking timer. Visible phases belong
+         to the chronological body, outside the total-duration header. -->
+    <span v-if="isLive" class="assistant-activity__sr-only" role="status" aria-live="polite" aria-atomic="true">
+      {{ phaseAnnouncement || liveStatusLabel }}
+    </span>
     <div
       :id="bodyId"
       class="assistant-activity__body"
@@ -108,6 +77,11 @@
 import { computed, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ActivityMotion from './ActivityMotion.vue'
+import {
+  provideActivityDisclosureVisibility,
+  useActivityDisclosureVisibility,
+} from '@/composables/chat/useActivityDisclosureVisibility'
 import {
   readAssistantActivityExpansion,
   readAssistantActivityManualChoice,
@@ -123,9 +97,12 @@ const props = withDefaults(defineProps<{
   summaryLabel?: string
   detailLabel?: string
   phaseLabel?: string
+  phaseAnnouncement?: string
+  phaseWaiting?: boolean
   elapsedLabel?: string
-  phaseElapsedLabel?: string
+  queued?: boolean
   stale?: boolean
+  executing?: boolean
   defaultOpen?: boolean
   stateKey?: string
   continuityKey?: string
@@ -137,8 +114,9 @@ const props = withDefaults(defineProps<{
   detailLabel: '',
   phaseLabel: '',
   elapsedLabel: '',
-  phaseElapsedLabel: '',
+  queued: false,
   stale: false,
+  executing: false,
   defaultOpen: false,
   stateKey: '',
   continuityKey: '',
@@ -153,6 +131,8 @@ const open = ref(readAssistantActivityExpansion(
   initialOpen(),
   props.continuityKey,
 ))
+const parentActivityVisible = useActivityDisclosureVisibility()
+provideActivityDisclosureVisibility(open)
 const manuallyToggled = ref(
   readAssistantActivityManualChoice(props.stateKey, props.continuityKey) !== undefined,
 )
@@ -160,6 +140,9 @@ const manuallyToggled = ref(
 function toggleOpen() {
   manuallyToggled.value = true
   open.value = !open.value
+  // Done can replace this live component before its queued watcher runs.
+  // Persist the click now so the canonical history reads the user's choice.
+  writeAssistantActivityExpansion(props.stateKey, open.value, props.continuityKey, true)
 }
 
 watch(open, expanded => {
@@ -186,7 +169,27 @@ const isLive = computed(() =>
   props.lifecycle === 'working' || props.lifecycle === 'answering',
 )
 
+// A live turn can be queued or waiting for approval. The owner supplies the
+// execution signal; opening details moves motion to the actual current row.
+const headerMotionActive = computed(() =>
+  parentActivityVisible.value && isLive.value && props.executing && !open.value && !props.stale && !props.phaseWaiting,
+)
+
 const liveStatusLabel = computed(() => props.phaseLabel || t('chat.activityWorking'))
+const liveElapsedLabel = computed(() => {
+  // Queued tasks have no authoritative execution clock yet.
+  if (props.queued) return t('chat.status.queued')
+  // The stream clock is a total in seconds; localize it with the same units
+  // as persisted turns so completion does not switch from 107s to 1m 47s.
+  const seconds = props.elapsedLabel.match(/^(\d+)s$/)?.[1]
+  const value = seconds === undefined ? null : Number(seconds)
+  const duration = value === null
+    ? props.elapsedLabel || String(t('chat.activityDurationSeconds', { seconds: 0 }))
+    : value < 60
+      ? String(t('chat.activityDurationSeconds', { seconds: value }))
+      : String(t('chat.activityDurationMinutes', { minutes: Math.floor(value / 60), seconds: value % 60 }))
+  return t('chat.activityElapsed', { duration })
+})
 
 const resolvedSummaryLabel = computed(() => {
   if (props.summaryLabel) return props.summaryLabel
@@ -214,14 +217,9 @@ const resolvedSummaryLabel = computed(() => {
   color: var(--text-muted);
 }
 
-.assistant-activity--settled {
-  margin-bottom: 0.25rem;
-}
-
-.assistant-activity--live {
-  display: grid;
-  gap: 0.25rem;
-  margin-top: 0.25rem;
+.assistant-activity__header {
+  padding-bottom: 0.375rem;
+  border-bottom: 1px solid var(--hairline);
 }
 
 .assistant-activity__live-head {
@@ -231,15 +229,15 @@ const resolvedSummaryLabel = computed(() => {
   max-width: 100%;
   min-width: 0;
   min-height: 1.75rem;
-  gap: 0.5rem;
-  padding: 0.1875rem 0.25rem;
+  gap: 0.375rem;
+  padding: 0.1875rem 0;
   border: 0;
   border-radius: var(--radius-control);
   background: transparent;
-  color: color-mix(in srgb, var(--text) 90%, transparent);
+  color: var(--text-muted);
   cursor: pointer;
   font: inherit;
-  font-size: 0.875rem;
+  font-size: 0.8125rem;
   line-height: 1.5;
   text-align: left;
   transition: background-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
@@ -253,57 +251,6 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__live-head:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
-}
-
-.assistant-activity__live-dot {
-  width: 0.4375rem;
-  height: 0.4375rem;
-  flex: 0 0 auto;
-  border-radius: var(--radius-full);
-  background: var(--accent);
-}
-
-.assistant-activity__live-dot.is-active {
-  animation: assistant-activity-pulse 2.3s var(--ease-standard) infinite;
-}
-
-.assistant-activity__live-dot.is-stale {
-  background: var(--warn-fill);
-}
-
-.assistant-activity__live-announcement {
-  min-width: 0;
-}
-
-.assistant-activity__live-label {
-  display: block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.assistant-activity__live-label.is-stale {
-  color: var(--warn);
-}
-
-.assistant-activity__live-detail {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.25rem 0.625rem;
-  padding-left: 1.1875rem;
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  line-height: 1.5;
-}
-
-.assistant-activity__phase-elapsed {
-  font-variant-numeric: tabular-nums;
-}
-
-.assistant-activity__stale-note {
-  color: var(--warn);
 }
 
 .assistant-activity__sr-only {
@@ -325,17 +272,9 @@ const resolvedSummaryLabel = computed(() => {
   font-variant-numeric: tabular-nums;
 }
 
-.assistant-activity__live-step {
-  flex: 0 0 auto;
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  font-variant-numeric: tabular-nums;
-}
-
-.assistant-activity__live-step::before {
-  content: "·";
-  margin-right: 0.375rem;
-  color: var(--text-dim);
+/* The shared mask supplies the dimming; do not dim small metadata twice. */
+.activity-motion--active .assistant-activity__live-elapsed {
+  color: var(--text);
 }
 
 .assistant-activity__summary {
@@ -344,15 +283,15 @@ const resolvedSummaryLabel = computed(() => {
   max-width: 100%;
   min-height: 1.75rem;
   gap: 0.375rem;
-  padding: 0.1875rem 0.25rem;
+  padding: 0.1875rem 0;
   border: 0;
   border-radius: var(--radius-control);
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
   font: inherit;
-  font-size: 0.75rem;
-  line-height: 1.4;
+  font-size: 0.8125rem;
+  line-height: 1.5;
   text-align: left;
   transition: background-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
 }
@@ -362,30 +301,9 @@ const resolvedSummaryLabel = computed(() => {
   color: var(--text);
 }
 
-/* Completed turns use the outer outcome as the visual anchor. The phase rows
-   underneath are supporting detail, so their previous size relationship is
-   deliberately inverted. */
-.assistant-activity--settled > .assistant-activity__summary {
-  color: color-mix(in srgb, var(--text) 76%, transparent);
-  font-size: 0.875rem;
-}
-
-.assistant-activity--settled > .assistant-activity__summary:hover {
-  color: var(--text);
-}
-
-.assistant-activity--settled :deep(.assistant-activity-status__row),
-.assistant-activity--settled :deep(.tool-row) {
-  font-size: 0.75rem;
-}
-
 .assistant-activity__summary:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
-  color: var(--text);
-}
-
-.assistant-activity--settled > .assistant-activity__summary:focus-visible {
   color: var(--text);
 }
 
@@ -393,12 +311,13 @@ const resolvedSummaryLabel = computed(() => {
   min-width: 0;
   white-space: normal;
   overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
 }
 
 .assistant-activity__summary-arrow {
   flex: 0 0 auto;
   color: currentColor;
-  opacity: 0.34;
+  opacity: 0;
   transform-origin: center;
   transition:
     opacity var(--dur-fast) var(--ease-standard),
@@ -415,7 +334,6 @@ const resolvedSummaryLabel = computed(() => {
 
 .assistant-activity__summary[aria-expanded="true"] .assistant-activity__summary-arrow,
 .assistant-activity__live-head[aria-expanded="true"] .assistant-activity__summary-arrow {
-  opacity: 0.55;
   transform: rotate(90deg);
 }
 
@@ -454,11 +372,21 @@ const resolvedSummaryLabel = computed(() => {
   min-height: 0;
   min-width: 0;
   overflow: hidden;
-  gap: 0.25rem;
-  margin: 0.125rem 0 0.25rem;
-  padding: 0 0 0 0.75rem;
+  gap: 0;
+  margin: 0;
+  padding: 0;
   border: 0;
   background: transparent;
+}
+
+.assistant-activity[data-share-expanded="true"] > .assistant-activity__body > .assistant-activity__body-inner {
+  margin-top: 0.75rem;
+}
+
+/* Older history can render reasoning and the following item batch separately. */
+.assistant-activity__body-inner > :deep(.reasoning-timeline + .assistant-activity-timeline:has(> .activity-narration:first-child)),
+.assistant-activity__body-inner > :deep(.thinking-fold + .assistant-activity-timeline:has(> .activity-narration:first-child)) {
+  margin-top: 0.75rem;
 }
 
 /* Touch users need a larger target, while desktop keeps the compact reading
@@ -467,7 +395,7 @@ const resolvedSummaryLabel = computed(() => {
   .assistant-activity__live-head,
   .assistant-activity__summary {
     min-height: 2.75rem;
-    padding-inline: var(--sp-2);
+    padding-inline: 0;
   }
 }
 
@@ -475,51 +403,6 @@ const resolvedSummaryLabel = computed(() => {
   color: var(--text-muted);
   font-size: 0.75rem;
   line-height: 1.5;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body .assistant-activity__detail,
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row) {
-  animation: assistant-activity-item-enter var(--dur-base) var(--ease-standard) backwards;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block) {
-  animation-delay: 35ms;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(1)),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(1)) {
-  animation-delay: 60ms;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(2)),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(2)) {
-  animation-delay: 90ms;
-}
-
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row:nth-child(n + 3)),
-.assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row:nth-child(n + 3)) {
-  animation-delay: 120ms;
-}
-
-@keyframes assistant-activity-pulse {
-  0%,
-  100% {
-    opacity: 0.7;
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 18%, transparent);
-  }
-  50% {
-    opacity: 1;
-    box-shadow: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 8%, transparent);
-  }
-}
-
-@keyframes assistant-activity-item-enter {
-  from {
-    opacity: 0;
-    transform: translateY(-0.1875rem);
-  }
 }
 
 @media (max-width: 480px) {
@@ -540,20 +423,10 @@ const resolvedSummaryLabel = computed(() => {
 
 @media (prefers-reduced-motion: reduce) {
   .assistant-activity__summary,
+  .assistant-activity__live-head,
   .assistant-activity__summary-arrow,
   .assistant-activity__body {
     transition: none;
-  }
-
-  .assistant-activity__live-dot.is-active {
-    animation: none;
-  }
-
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body .assistant-activity__detail,
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.thinking-block),
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.assistant-activity-status__row),
-  .assistant-activity[data-share-expanded="true"] > .assistant-activity__body :deep(.tool-row) {
-    animation: none;
   }
 }
 </style>

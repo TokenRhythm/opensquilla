@@ -1,3 +1,4 @@
+import { providerHttpStatus } from '@/utils/chat/providerRecovery'
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
 import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { normalizePageContext } from '@/types/pageContext'
@@ -304,7 +305,7 @@ const TURN_OUTCOME_FIELDS = new Set([
   'activitySnapshot', 'usage', 'turn_usage', 'turnUsage', 'usage_call_index',
   'usageCallIndex', 'no_prior_provider_dispatch', 'noPriorProviderDispatch',
   'replay_safe', 'replaySafe', 'retry_after_ms', 'retryAfterMs',
-  'user_message_id', 'userMessageId', 'terminal_message', 'terminalMessage',
+  'user_message_id', 'userMessageId', 'terminal_message', 'terminalMessage', 'http_status',
 ])
 
 export function projectHistoryTurnOutcome(validated: unknown): SessionReadTurnOutcome {
@@ -319,6 +320,7 @@ export function projectHistoryTurnOutcome(validated: unknown): SessionReadTurnOu
     finishedAt: numberValue(value.finished_at),
     outcome: projectObject(value.outcome) ?? Object.freeze({}),
     errorClass: textValue(raw.error_class, raw.errorClass, raw.code),
+    ...(Object.prototype.hasOwnProperty.call(raw, 'http_status') ? { httpStatus: providerHttpStatus(raw.http_status) ?? null } : {}),
     retryable: booleanValue(raw.retryable),
     activitySnapshot: projectObject(raw.activity_snapshot ?? raw.activitySnapshot),
     usage: projectObject(raw.turn_usage ?? raw.turnUsage ?? raw.usage),

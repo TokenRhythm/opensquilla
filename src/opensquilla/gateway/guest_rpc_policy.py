@@ -44,6 +44,7 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "sessions.read.install.v2",
         "sessions.read.close.v2",
         "sessions.history.page.v2",
+        "sessions.messages.search",
         "transport.flow.update",
         "transport.sessionFlow.update.v2",
         "sessions.messages.unsubscribe",
@@ -53,6 +54,19 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "sessions.pending_inputs.reorder",
         "sessions.pending_inputs.cancel",
         "sessions.pending_inputs.dispatch",
+    }
+)
+
+# Interactive PTY control is never guest-safe. Keep an explicit deny set so a
+# future allowlist expansion cannot accidentally grant host execution to an
+# anonymous WebUI session.
+GUEST_RPC_DENYLIST = frozenset(
+    {
+        "terminal.create",
+        "terminal.write",
+        "terminal.resize",
+        "terminal.close",
+        "terminal.consume",
     }
 )
 
@@ -76,6 +90,7 @@ _SESSION_KEY_FIELDS = {
     "sessions.read.install.v2": ("key",),
     "sessions.read.close.v2": ("key",),
     "sessions.history.page.v2": ("key",),
+    "sessions.messages.search": ("key",),
     "sessions.messages.unsubscribe": ("key", "sessionKey"),
     "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
     "sessions.pending_inputs.list": ("key", "sessionKey"),
@@ -172,6 +187,8 @@ class GuestRpcPolicy:
 
         if not cls.is_guest(ctx):
             return params
+        if method in GUEST_RPC_DENYLIST:
+            raise GuestRpcPolicyError("Anonymous guests cannot control interactive terminals")
         if not is_guest_rpc_method_allowed(method):
             raise GuestRpcPolicyError("Anonymous guest RPC method is not allowed")
 
@@ -252,6 +269,7 @@ class GuestRpcPolicy:
 
 __all__ = [
     "GUEST_RPC_ALLOWLIST",
+    "GUEST_RPC_DENYLIST",
     "GuestRpcPolicy",
     "GuestRpcPolicyError",
     "guest_owned_session_key",

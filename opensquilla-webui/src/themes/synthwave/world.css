@@ -10,10 +10,7 @@
 /* Structural tokens (chrome type + arcade-hard corners) live in tokens.css so they
    apply before first paint (no reflow); this world layer is now purely decorative. */
 
-/* Chrome-ish uppercase display headings with a magenta neon bloom. */
-[data-theme="synthwave"] h1,
-[data-theme="synthwave"] h2,
-[data-theme="synthwave"] h3,
+/* Application titles keep the magenta neon bloom; reading headings stay clear. */
 [data-theme="synthwave"] .control-stage__title,
 [data-theme="synthwave"] .view-title {
   font-family: var(--font-display);
@@ -28,9 +25,8 @@
 /* Neon rim on elevated accent surfaces. Sidebar navigation stays flat beside
    the other destinations instead of reading as a floating primary control.
    Semantic topbar states are excluded so stable status stays quiet. */
-[data-theme="synthwave"] .btn--primary,
-[data-theme="synthwave"] .conn-pill:not(.topbar-state) {
-  box-shadow: var(--elev-1), 0 0 16px color-mix(in srgb, var(--accent) 34%, transparent);
+[data-theme="synthwave"] .btn--primary:not(:focus-visible) {
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 [data-theme="synthwave"] .topbar .topbar-state:is(

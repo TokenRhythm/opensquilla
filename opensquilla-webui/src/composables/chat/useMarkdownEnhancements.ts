@@ -1,7 +1,8 @@
 import { onBeforeUnmount, onMounted, shallowRef, watch, type Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { decorateCodeBlocks } from '@/utils/chat/codeBlockChrome'
-import { renderMermaidBlocks, resolvedDiagramThemeId, restoreMermaidSources, updateMermaidLabels } from '@/utils/markdown/mermaidRenderer'
+import { createCodeBlockChrome } from '@/utils/chat/codeBlockChrome'
+import { renderMarkdownDiagrams, resolvedDiagramThemeId, restoreMermaidSources, updateMermaidLabels } from '@/utils/markdown/mermaidRenderer'
+import { bindMarkdownFootnotes } from '@/utils/markdown/footnotes'
 import type { SvgDiagram } from '@/utils/markdown/svgDiagram'
 import { useMarkdownImageLightbox } from './useMarkdownImageLightbox'
 
@@ -11,6 +12,8 @@ export interface MarkdownEnhancementOptions {
   // supplies resetVersion so an earlier stream generation can never commit.
   incremental?: boolean
   resetVersion?: () => unknown
+  /** A trace owns multiple independent Markdown bodies. */
+  selector?: string
 }
 
 // One lifecycle per mounted Markdown surface; parsing remains synchronous and
@@ -18,6 +21,10 @@ export interface MarkdownEnhancementOptions {
 export function useMarkdownEnhancements(root: Ref<HTMLElement | null>, options: MarkdownEnhancementOptions) {
   const { t, locale } = useI18n()
   const images = useMarkdownImageLightbox()
+  const chrome = createCodeBlockChrome()
+  const notes = new Map<HTMLElement, () => void>()
+  let visibility: IntersectionObserver | null = null
+  const visibleJobs = new Map<HTMLElement, AbortController>()
   const ready = shallowRef<Promise<void>>(Promise.resolve())
   const diagrams = new Set<SvgDiagram>()
   let controller = new AbortController()
@@ -55,32 +62,69 @@ export function useMarkdownEnhancements(root: Ref<HTMLElement | null>, options: 
         child = child.nextElementSibling
       }
     } else {
-      decorateBlock(element)
+      const bodies = options.selector ? [...element.querySelectorAll<HTMLElement>(options.selector)] : [element]
+      for (const body of bodies) decorateBlock(body)
     }
   }
 
-  function decorateBlock(element: HTMLElement): void {
-    decorateCodeBlocks(element, { copy: t('chat.copy'), copied: t('chat.copied'), copyFailed: t('chat.toast.copyFailed') })
-    images.decorate(element)
-    const signal = controller.signal
-    const pass = renderMermaidBlocks(element, labels(), {
-      signal,
-      budget,
-      themeId: resolvedDiagramThemeId(),
+  function track(pass: Promise<void>): void {
+    ready.value = Promise.all([ready.value, pass]).then(() => {}, () => {})
+  }
+
+  function render(element: HTMLElement, signal: AbortSignal): Promise<void> {
+    return renderMarkdownDiagrams(element, labels(), {
+      signal, budget, themeId: resolvedDiagramThemeId(),
       onRendered(diagram) {
         if (signal.aborted || disposed) { diagram.dispose(); return }
         diagrams.add(diagram)
       },
     })
-    // Incremental passes can overlap while the Mermaid engine is queued. The
-    // exposed promise covers all work submitted by this owner generation.
-    // A platform/DOM failure can reject outside the per-fence error path.
-    // Keep the escaped source and prevent an unhandled background rejection.
-    ready.value = Promise.all([ready.value, pass]).then(() => {}, () => {})
+  }
+
+  function decorateBlock(element: HTMLElement): void {
+    chrome.decorate(element, { copy: t('chat.copy'), copied: t('chat.copied'), copyFailed: t('chat.toast.copyFailed') })
+    images.decorate(element)
+    if (!notes.has(element)) notes.set(element, bindMarkdownFootnotes(element))
+    const fences = [...element.querySelectorAll<HTMLPreElement>('pre')]
+      .filter(pre => pre.querySelector('code.language-mermaid, code.language-dot, code.language-graphviz'))
+    if (typeof IntersectionObserver === 'undefined' || !fences.length) {
+      track(render(element, controller.signal))
+      return
+    }
+    if (!visibility) {
+      const ownerSignal = controller.signal
+      visibility = new IntersectionObserver(entries => {
+        if (ownerSignal.aborted || disposed) return
+        for (const entry of entries) {
+          const pre = entry.target as HTMLElement
+          if (!entry.isIntersecting) {
+            visibleJobs.get(pre)?.abort()
+            visibleJobs.delete(pre)
+            continue
+          }
+          if (visibleJobs.has(pre)) continue
+          const request = new AbortController()
+          visibleJobs.set(pre, request)
+          track(render(pre, request.signal).finally(() => {
+            if (visibleJobs.get(pre) !== request) return
+            visibleJobs.delete(pre)
+            if (!request.signal.aborted) visibility?.unobserve(pre)
+          }))
+        }
+      })
+    }
+    for (const pre of fences) visibility.observe(pre)
   }
 
   function invalidate(restore = false): void {
     controller.abort()
+    for (const request of visibleJobs.values()) request.abort()
+    visibleJobs.clear()
+    visibility?.disconnect()
+    visibility = null
+    for (const release of notes.values()) release()
+    notes.clear()
+    chrome.reset()
     controller = new AbortController()
     for (const diagram of diagrams) diagram.dispose()
     diagrams.clear()
@@ -109,8 +153,7 @@ export function useMarkdownEnhancements(root: Ref<HTMLElement | null>, options: 
     const element = root.value
     if (!element?.isConnected || disposed) return
     // Rebuild only button chrome; locale changes preserve diagram pan/zoom.
-    for (const button of element.querySelectorAll('pre > .code-copy-btn')) button.remove()
-    decorateCodeBlocks(element, { copy: t('chat.copy'), copied: t('chat.copied'), copyFailed: t('chat.toast.copyFailed') })
+    chrome.updateLabels({ copy: t('chat.copy'), copied: t('chat.copied'), copyFailed: t('chat.toast.copyFailed') })
     updateMermaidLabels(element, labels())
   }, { flush: 'post' })
 
@@ -132,6 +175,7 @@ export function useMarkdownEnhancements(root: Ref<HTMLElement | null>, options: 
     observer?.disconnect()
     observer = null
     images.dispose()
+    chrome.dispose()
   }
   onBeforeUnmount(dispose)
   return { ready, refresh, dispose }

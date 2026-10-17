@@ -7,6 +7,8 @@ export interface SessionLifecycleRequestOptions {
 
 /** The semantic input for creating a durable session. */
 export interface SessionCreateRequest extends SessionLifecycleRequestOptions {
+  /** Materialize an owned provisional key without migrating its composer. */
+  sessionKey?: string
   agentId?: string
   kind?: string
   workspaceId?: string
@@ -33,6 +35,24 @@ export interface SessionForkRequest extends SessionLifecycleRequestOptions {
 /** Durable child identity; wire acknowledgement details stay in the Adapter. */
 export interface ForkedSession {
   key: string
+}
+
+/** A side conversation freezes the parent's model context on the Gateway. */
+export interface SidechatSession extends CreatedSession {
+  parentKey: string
+  inherited: {
+    model: string | null
+    provider: string | null
+    reasoningLevel: string | null
+    modelRoutingMode: string | null
+    modelRoutingRevision: number
+    runMode: string | null
+  }
+}
+
+export interface SidechatCreateRequest extends SessionLifecycleRequestOptions {
+  parentKey: string
+  clientRequestId: string
 }
 
 export interface SessionRenameRequest extends SessionLifecycleRequestOptions {
@@ -80,6 +100,9 @@ export class SessionLifecycleError extends Error {
  * never RPC method names, wire aliases, or transport generations.
  */
 export interface SessionLifecycle {
+  supportsSidechat?(): boolean
+  createSidechat?(request: SidechatCreateRequest): Promise<SidechatSession>
+  closeSidechat?(request: { key: string } & SessionLifecycleRequestOptions): Promise<{ key: string; closed: true }>
   create(request?: SessionCreateRequest): Promise<CreatedSession>
   fork(request: SessionForkRequest): Promise<ForkedSession>
   rename(request: SessionRenameRequest): Promise<SessionRenameResult>

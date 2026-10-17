@@ -12,7 +12,7 @@ test.describe('Append-only live turn', () => {
     test.setTimeout(240000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const textarea = page.locator('.chat-textarea')
     await textarea.fill('Use your web search tool to find one recent headline about space exploration, then answer in one sentence.')

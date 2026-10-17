@@ -9,20 +9,21 @@ import {
 
 describe('useToolDetailPreference', () => {
   beforeEach(() => {
-    useToolDetailPreference().setMode('auto')
+    useToolDetailPreference().setMode('collapsed')
     localStorage.clear()
   })
 
-  it('preserves the legacy auto behavior for missing or unknown values', () => {
-    expect(parseToolDetailDisplayMode(null)).toBe('auto')
-    expect(parseToolDetailDisplayMode('')).toBe('auto')
-    expect(parseToolDetailDisplayMode('open')).toBe('auto')
-    expect(parseToolDetailDisplayMode({ mode: 'compact' })).toBe('auto')
+  it('starts collapsed for missing, legacy, or unknown values', () => {
+    expect(parseToolDetailDisplayMode(null)).toBe('collapsed')
+    expect(parseToolDetailDisplayMode('')).toBe('collapsed')
+    expect(parseToolDetailDisplayMode('open')).toBe('collapsed')
+    expect(parseToolDetailDisplayMode('auto')).toBe('collapsed')
+    expect(parseToolDetailDisplayMode('compact')).toBe('collapsed')
+    expect(parseToolDetailDisplayMode({ mode: 'expanded' })).toBe('collapsed')
   })
 
   it('accepts every supported mode', () => {
-    expect(parseToolDetailDisplayMode('auto')).toBe('auto')
-    expect(parseToolDetailDisplayMode('compact')).toBe('compact')
+    expect(parseToolDetailDisplayMode('collapsed')).toBe('collapsed')
     expect(parseToolDetailDisplayMode('expanded')).toBe('expanded')
   })
 
@@ -30,11 +31,29 @@ describe('useToolDetailPreference', () => {
     const first = useToolDetailPreference()
     const second = useToolDetailPreference()
 
-    first.setMode('compact')
+    first.setMode('expanded')
 
-    expect(first.mode.value).toBe('compact')
-    expect(second.mode.value).toBe('compact')
-    expect(localStorage.getItem(TOOL_DETAIL_DISPLAY_STORAGE_KEY)).toBe('compact')
+    expect(first.mode.value).toBe('expanded')
+    expect(second.mode.value).toBe('expanded')
+    expect(localStorage.getItem(TOOL_DETAIL_DISPLAY_STORAGE_KEY)).toBe('expanded')
+
+    first.setMode('collapsed')
+    expect(second.mode.value).toBe('collapsed')
+    expect(localStorage.getItem(TOOL_DETAIL_DISPLAY_STORAGE_KEY)).toBe('collapsed')
+  })
+
+  it.each([
+    [null, 'collapsed'],
+    ['auto', 'collapsed'],
+    ['compact', 'collapsed'],
+    ['expanded', 'expanded'],
+    ['collapsed', 'collapsed'],
+    ['invalid', 'collapsed'],
+  ])('loads stored %s as %s without losing an explicit expanded preference', async (stored, expected) => {
+    if (stored !== null) localStorage.setItem(TOOL_DETAIL_DISPLAY_STORAGE_KEY, stored)
+    vi.resetModules()
+    const loaded = await import('./useToolDetailPreference')
+    expect(loaded.useToolDetailPreference().mode.value).toBe(expected)
   })
 
   it('keeps the in-memory preference when browser storage is unavailable', () => {

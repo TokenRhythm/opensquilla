@@ -172,6 +172,7 @@ class ArtifactSessionService:
         session_id: str | None = None,
         document_id: str | None = None,
         revision_id: str | None = None,
+        validate_session: Callable[[Any], Awaitable[None]] | None = None,
     ) -> CommitResult:
         return await self.repository.create_document(
             session_key=_required(session_key, "session_key"),
@@ -182,6 +183,7 @@ class ArtifactSessionService:
             actor=_actor(actor),
             document_id=(None if document_id is None else _required(document_id, "document_id")),
             revision_id=(None if revision_id is None else _required(revision_id, "revision_id")),
+            validate_session=validate_session,
         )
 
     async def retire_legacy_html_state(self) -> None:
@@ -190,6 +192,19 @@ class ArtifactSessionService:
 
     async def get_document(self, document_id: str) -> Document:
         return await self.repository.get_document(_required(document_id, "document_id"))
+
+    async def get_document_for_artifact(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        artifact_id: str,
+    ) -> Document | None:
+        return await self.repository.get_document_for_artifact(
+            session_key=_required(session_key, "session_key"),
+            session_id=_required(session_id, "session_id"),
+            artifact_id=_required(artifact_id, "artifact_id"),
+        )
 
     async def get_document_head(
         self,
@@ -419,6 +434,14 @@ class ArtifactSessionService:
             ),
         )
 
+    async def get_document_source_binding_for_document(
+        self, *, session_id: str, document_id: str,
+    ) -> DocumentSourceBinding | None:
+        return await self.repository.get_document_source_binding_for_document(
+            session_id=_bounded_text(session_id, "session_id", max_bytes=512),
+            document_id=_bounded_text(document_id, "document_id", max_bytes=256),
+        )
+
     async def list_document_source_bindings(
         self,
         *,
@@ -590,6 +613,14 @@ class ArtifactSessionService:
             _bounded_text(publication_id, "publication_id", max_bytes=256)
         )
 
+    async def get_document_publication_for_artifact(
+        self, *, session_id: str, artifact_id: str,
+    ) -> DocumentPublication | None:
+        return await self.repository.get_document_publication_for_artifact(
+            session_id=_bounded_text(session_id, "session_id", max_bytes=512),
+            artifact_id=_bounded_text(artifact_id, "artifact_id", max_bytes=256),
+        )
+
     async def list_document_publications(
         self,
         *,
@@ -638,6 +669,22 @@ class ArtifactSessionService:
     async def snapshot_session_heads(self, *, session_id: str) -> tuple[CommitResult, ...]:
         return await self.repository.snapshot_session_heads(
             session_id=_required(session_id, "session_id"),
+        )
+
+    async def resolve_fork_document_heads(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        source_document_ids: Sequence[str],
+    ) -> dict[str, CommitResult]:
+        return await self.repository.resolve_fork_document_heads(
+            session_key=_required(session_key, "session_key"),
+            session_id=_required(session_id, "session_id"),
+            source_document_ids=tuple(
+                _required(document_id, "source_document_id")
+                for document_id in source_document_ids
+            ),
         )
 
     async def fork_session_heads(

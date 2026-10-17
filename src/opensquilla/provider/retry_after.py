@@ -339,11 +339,28 @@ def record_provider_retry_after(provider: object, event: object) -> None:
     """Record the hint immediately on arrival, before retries or conversion."""
 
     code = str(getattr(event, "code", ""))
-    if code not in {"429", "503"} or getattr(event, "tool_argument_rejection", None) is not None:
+    status = getattr(event, "http_status", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = int(code) if code in {"429", "503"} else None
+    if (
+        status not in {429, 503}
+        or getattr(event, "tool_argument_rejection", None) is not None
+    ):
+        return
+    from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+
+    kind = classify_provider_error(
+        provider_name=str(getattr(provider, "provider_name", "")),
+        status_code=status,
+        raw_code=str(getattr(event, "provider_code", "") or code),
+        message=str(getattr(event, "message", "")),
+    )
+    if kind not in {ProviderFailureKind.RATE_LIMITED, ProviderFailureKind.PROVIDER_OVERLOADED}:
         return
     provider_retry_after_cooldowns().record(
         provider,
         getattr(event, "retry_after_s", None),
         scope=provider_retry_after_scope(provider),
-        reason="rate_limited" if code == "429" else "provider_overloaded",
+        reason=("rate_limited" if kind is ProviderFailureKind.RATE_LIMITED
+                else "provider_overloaded"),
     )

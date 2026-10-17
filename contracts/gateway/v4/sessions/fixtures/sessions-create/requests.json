@@ -33,6 +33,22 @@
       }
     },
     {
+      "id": "request.materialize-project-draft",
+      "coverage": "explicit-provisional-webchat-identity",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "create-draft",
+        "method": "sessions.create",
+        "params": {
+          "agentId": "main",
+          "kind": "webchat",
+          "workspaceId": "project-a",
+          "session_key": "agent:main:webchat:provisional-draft"
+        }
+      }
+    },
+    {
       "id": "request.legacy-scalar",
       "coverage": "v4-any-params",
       "expectation": "exact",

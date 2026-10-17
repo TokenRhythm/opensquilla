@@ -17,6 +17,7 @@ import type {
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame, ReasoningBlock } from '@/types/turnlog'
 import {
+  isAnswerTransparentControlTool,
   isEmptyToolPreview,
   toolDisplayName,
   toolOperationKey,
@@ -25,6 +26,8 @@ import {
 import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
 import { toParts, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
+import { reconcileTextSnapshot } from '@/utils/chat/textSnapshot'
+export { reconcileTextSnapshot, type ReconciledTextSnapshot } from '@/utils/chat/textSnapshot'
 
 export interface FoldedTurn {
   // The SAME render surface the legacy live refs expose, rebuilt from frames.
@@ -50,57 +53,27 @@ export interface FoldedTurn {
 // and tool renderKeys exactly (see grouping/ordering identity).
 const LIVE_OWNER_KEY = 'stream'
 
+/** Confirm pre-tool narration only on the published projection. The original
+ * provisional markers must remain available to authoritative text replacement.
+ */
+function markPreToolNarration(segments: ChatStreamSegment[], calls: ChatToolCall[]): void {
+  const ordinaryGroups = new Set(calls
+    .filter(call => !isAnswerTransparentControlTool(call.name))
+    .map(call => call.groupId))
+  for (let index = 1; index < segments.length; index += 1) {
+    const segment = segments[index]
+    const previous = segments[index - 1]
+    if (segment.type === 'tool-group'
+      && ordinaryGroups.has(segment.groupId)
+      && previous.type === 'text'
+      && previous.presentation === 'answer') {
+      previous.presentation = 'intermediate'
+    }
+  }
+}
+
 /** One ordered interrupt accumulated by the fold, keyed by approvalId. */
 type FoldedInterrupt = ToPartsInterrupt
-
-export interface ReconciledTextSnapshot {
-  rawText: string
-  segments: ChatStreamSegment[]
-  changed: boolean
-}
-
-/**
- * Apply an authoritative terminal text snapshot without losing tool history.
- *
- * A strict extension is still an ordinary answer suffix and therefore stays
- * after the last streamed answer segment. A conflicting snapshot supersedes
- * streamed answer text, but keeps tool groups and intermediate commentary in
- * arrival order before the canonical answer. An empty snapshot intentionally
- * clears answer text while retaining that work history.
- */
-export function reconcileTextSnapshot(
-  segments: ChatStreamSegment[],
-  accumulatedText: string,
-  snapshot: string,
-): ReconciledTextSnapshot {
-  if (snapshot === accumulatedText) {
-    return { rawText: accumulatedText, segments, changed: false }
-  }
-
-  if (accumulatedText && snapshot.startsWith(accumulatedText)) {
-    const suffix = snapshot.slice(accumulatedText.length)
-    const next = segments.slice()
-    const last = next[next.length - 1]
-    if (last?.type === 'text' && last.presentation !== 'intermediate') {
-      next[next.length - 1] = {
-        ...last,
-        raw: `${last.raw || ''}${suffix}`,
-        dirty: true,
-      }
-    } else {
-      next.push({ type: 'text', raw: suffix, html: '', dirty: true, presentation: 'answer' })
-    }
-    return { rawText: snapshot, segments: next, changed: true }
-  }
-
-  const next = segments.filter(segment => (
-    segment.type !== 'text' || segment.presentation === 'intermediate'
-  ))
-  if (snapshot) {
-    next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
-  }
-  return { rawText: snapshot, segments: next, changed: true }
-}
 
 // A later requested-frame for the same approvalId (a re-broadcast or the
 // hydration backfill that carries args/warning) merges richer fields onto the
@@ -424,6 +397,7 @@ export class TurnAccumulator {
         call.isError = frame.isError
         call.result = frame.result
         call.executionLogHandle = frame.executionLogHandle
+        call.fileSnapshot = frame.isError ? undefined : frame.fileSnapshot
         call.resultPreview = truncateToolPreview(frame.result, 200)
         const timing = this.toolTimes.get(call.toolId)
         if (timing && !timing.endedAt) timing.endedAt = frame.at
@@ -502,6 +476,9 @@ export class TurnAccumulator {
           label: frame.label,
           at: frame.at,
           activityOrder: frame.activityOrder,
+          providerRecovery: frame.providerRecovery,
+          httpStatus: frame.httpStatus,
+          failureKind: frame.failureKind,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -578,6 +555,7 @@ export class TurnAccumulator {
     // private state between frames; already-published snapshots must stay
     // immutable until the scheduler explicitly publishes the next one.
     const segments = this.segments.map(segment => ({ ...segment }))
+    markPreToolNarration(segments, this.toolCalls)
     const toolCalls = this.toolCalls.map(call => ({
       ...call,
       ...(materializeRunningToolInputs
@@ -866,6 +844,7 @@ export function foldTurn(
         tc.isError = frame.isError
         tc.result = frame.result
         tc.executionLogHandle = frame.executionLogHandle
+        tc.fileSnapshot = frame.isError ? undefined : frame.fileSnapshot
         tc.resultPreview = truncateToolPreview(frame.result, 200)
         const timing = toolTimes.get(tc.toolId)
         if (timing && !timing.endedAt) timing.endedAt = frame.at
@@ -943,6 +922,9 @@ export function foldTurn(
           label: frame.label,
           at: frame.at,
           activityOrder: frame.activityOrder,
+          providerRecovery: frame.providerRecovery,
+          httpStatus: frame.httpStatus,
+          failureKind: frame.failureKind,
           ...(frame.id ? { id: frame.id } : {}),
           ...(frame.category ? { category: frame.category } : {}),
           ...(frame.state ? { state: frame.state } : {}),
@@ -981,6 +963,7 @@ export function foldTurn(
     rawText = reconciled.rawText
     if (reconciled.segments !== segments) segments.splice(0, segments.length, ...reconciled.segments)
   }
+  markPreToolNarration(segments, toolCalls)
 
   // Render text segment html with the same renderer the legacy flush uses, so
   // compared html matches after a flush (synchronous here; ).

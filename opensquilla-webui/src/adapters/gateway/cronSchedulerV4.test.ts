@@ -3,6 +3,15 @@ import { createV4CronScheduler } from './cronSchedulerV4'
 import { CronReadUnavailableError } from '@/modules/cronScheduler'
 
 describe('CronScheduler v4 Adapter', () => {
+  it('retains explicit failure even when a manual-run response has no error text', async () => {
+    const request = vi.fn(async () => ({ success: false, status: 'blocked', reason: 'already_running', runId: null, error: null }))
+    const scheduler = createV4CronScheduler(
+      { generation: 1, request: request as never, ready: vi.fn(async () => undefined) },
+      { subscribe: vi.fn() },
+    )
+    expect(await scheduler.runNow('daily')).toEqual({ success: false, status: 'blocked', reason: 'already_running', runId: undefined, reply: undefined, error: undefined })
+  })
+
   it('projects list and run history shapes without leaking wire envelopes', async () => {
     const request = vi.fn(async (method: string) => {
       if (method === 'cron.list') return [{ id: 'daily', enabled: true }]

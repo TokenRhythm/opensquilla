@@ -44,7 +44,7 @@ function harness() {
     clarificationSubmission: { submit } as never,
     sessionKey, interruptState,
     runStatus: ref({ status: 'running', label: '', task: { task_id: 'task-1' } }),
-    stream: { isStreaming: ref(true), appendInterruptFrame: vi.fn(), ensureInterruptBubble: vi.fn() },
+    stream: { appendInterruptFrame: vi.fn() },
   }))!
   const unsubscribe = approvals.subscribe()
   cleanups.push(() => { unsubscribe(); scope.stop() })

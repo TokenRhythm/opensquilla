@@ -1,6 +1,6 @@
 <template>
-  <div class="sk-stage control-stage control-stage--spacious">
-    <header class="sk-stage__header control-stage__header">
+  <div class="sk-stage control-stage control-stage--spacious control-stage--hub-actions">
+    <header class="sk-stage__header control-stage__header control-stage__header--hub-actions">
       <div class="sk-stage__title-block control-stage__title-block">
         <h1 class="sk-stage__title control-stage__title">{{ t('cronSkills.skillsView.title') }}</h1>
         <p class="sk-stage__subtitle control-stage__subtitle">{{ t('cronSkills.skillsView.subtitle') }}</p>
@@ -53,7 +53,15 @@
     </Transition>
 
     <div class="sk-panel" data-testid="skills-catalog">
-      <div class="sk-installed">
+      <ErrorState v-if="catalogError && !catalogHasLoaded" :message="t('cronSkills.skills.loadFailed')" :on-retry="loadData" />
+      <div v-else-if="!catalogHasLoaded" class="state" aria-busy="true">
+        <LoadingSpinner />
+      </div>
+      <div v-else class="sk-installed">
+        <p v-if="catalogError" class="sk-catalog-status" role="status">
+          <span>{{ t('cronSkills.skills.refreshFailed') }}</span>
+          <button class="btn btn--ghost" type="button" :disabled="catalogLoading" @click="loadData">{{ t('shared.errorState.retry') }}</button>
+        </p>
         <SkillGroup
           v-for="layer in visibleLayerGroups"
           :key="layer.key"
@@ -126,6 +134,8 @@ import { computed, inject, onActivated, onDeactivated, onUnmounted, ref, watch }
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ErrorState from '@/components/ErrorState.vue'
+import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import SkillDetailDialog from '@/components/skills/SkillDetailDialog.vue'
 import SkillGroup from '@/components/skills/SkillGroup.vue'
 import SkillsAddDrawer from '@/components/skills/SkillsAddDrawer.vue'
@@ -161,6 +171,9 @@ const mutationGate = createSkillMutationGate()
 const catalog = useSkillsCatalog(skillCatalog)
 
 const {
+  loading: catalogLoading,
+  hasLoaded: catalogHasLoaded,
+  error: catalogError,
   filterText,
   statusFilter,
   visibleLayerGroups,
@@ -248,7 +261,7 @@ const {
   uninstallSkill,
 } = registry
 
-const skillDetail = useSkillDetailController({ catalog: skillCatalog, installDeps })
+const skillDetail = useSkillDetailController({ catalog: skillCatalog, installDeps, uninstallSkill })
 const {
   selectedSkill,
   selectedSkillLoading,
@@ -257,6 +270,7 @@ const {
   openSkill,
   closeSkill,
   installCurrentDependencies,
+  uninstallCurrentSkill,
 } = skillDetail
 
 const skillLaunchPending = ref(false)
@@ -419,12 +433,21 @@ async function installDepsAndMaybeClose(name: string, installId: string) {
 }
 
 async function uninstallSkillAndClose(name: string, installId: string) {
-  const removed = await uninstallSkill(name, installId)
-  if (removed) closeDialog()
+  await uninstallCurrentSkill(name, installId)
 }
 </script>
 
 <style>
+.sk-catalog-status {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 8px;
+  line-height: 20px;
+  margin: 0;
+}
 /* Compact skills overview */
 .sk-overview-modal {
   align-items: center;

@@ -119,11 +119,10 @@ interface ApprovalResolveResponse {
  */
 /**
  * The slice of the live-turn stream the approvals composable drives: it appends
- * interrupt frames into the turn log and opens a render bubble for approvals that
- * arrive with no live turn streaming.
+ * interrupt frames into the turn log. Execution ownership stays with task events,
+ * even when an approval arrives before a live turn or during recovery.
  */
 export interface ApprovalsStreamSurface {
-  isStreaming: Ref<boolean>
   appendInterruptFrame: (input: {
     interruptKind: 'approval' | 'clarify'
     approvalId: string
@@ -131,7 +130,6 @@ export interface ApprovalsStreamSurface {
     at: number
     activityOrder?: number
   }) => void
-  ensureInterruptBubble: () => void
 }
 
 export interface UseChatApprovalsOptions {
@@ -301,7 +299,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   function acceptClarifyContext(payload: ConversationEventIdentity, reset = false): boolean {
-    if (!isCurrentSessionPayload(payload, sessionKey.value)) return false
+    if (!sessionKey.value || !isCurrentSessionPayload(payload, sessionKey.value)) return false
     const epoch = payload.epoch
     if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) return true
     if (clarifyEpoch !== null && epoch < clarifyEpoch) return false
@@ -377,7 +375,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   async function fetchSnapshot() {
-    if (options.gatewayAvailability.value !== 'available') return
+    if (!sessionKey.value || options.gatewayAvailability.value !== 'available') return
     if (fetchInFlight) {
       // A push event landed mid-fetch; the in-flight response may predate
       // it, so run one more fetch when the current one settles.
@@ -407,6 +405,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   async function reconcile() {
+    if (!sessionKey.value) throw new ApprovalCenterError('invalid', 'Conversation identity is unavailable for approval reconciliation.')
     if (options.gatewayAvailability.value !== 'available') {
       throw new ApprovalCenterError('unavailable', 'Gateway is unavailable for approval reconciliation.')
     }
@@ -451,7 +450,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // `opensquilla.chat.approvalPoll` flag is set. Default behaviour is hydrate-
   // only — the stream carries new approvals, so no interval runs.
   function hydrateApprovals() {
-    if (options.gatewayAvailability.value !== 'available') return Promise.resolve()
+    if (!sessionKey.value || options.gatewayAvailability.value !== 'available') return Promise.resolve()
     const hydration = fetchSnapshot()
     if (approvalPollEnabled() && !pollTimer) {
       pollTimer = setInterval(() => { void fetchSnapshot() }, APPROVAL_POLL_INTERVAL_MS)
@@ -556,6 +555,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   async function resolveApproval(entry: ChatApprovalEntry, decision: ChatApprovalDecision) {
+    if (!sessionKey.value || entry.approval.sessionKey !== sessionKey.value) return
     const id = entry.approval.id
     if (approvalBusyIds.value.has(id) || entry.resolution) return
     setApprovalBusy(id, true)
@@ -584,6 +584,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
    * follow-up user message.
    */
   async function resolveInterrupt(id: string, decision: ChatApprovalDecision) {
+    if (!sessionKey.value) return
     const current = interruptState.value.get(id)
     if (approvalBusyIds.value.has(id) || current?.resolution) return
     setApprovalBusy(id, true)
@@ -609,6 +610,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
   /** Compatibility path for explicitly timed approvals from older Gateways. */
   async function extendInterrupt(id: string, seconds = APPROVAL_EXTEND_SECONDS) {
+    if (!sessionKey.value) return
     const current = interruptState.value.get(id)
     if (approvalBusyIds.value.has(id) || current?.resolution) return
     setApprovalBusy(id, true)
@@ -638,9 +640,9 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     return interruptNamespaces.get(id) || 'exec'
   }
 
-  // Append an approval interrupt frame onto the live turn, opening a render
-  // bubble first when no turn is streaming (queued/background/reload). Remembers
-  // the namespace for resolve, seeds an empty interruptState entry, and dedups in
+  // Approval cards render independently of an executing turn: a recovered or
+  // standalone approval must not create a fake run or elapsed clock. Remember
+  // the namespace for resolve, seed an empty interruptState entry, and dedup in
   // the fold by approvalId — so a re-broadcast or hydration backfill merges richer
   // args/warning rather than duplicating the part.
   function appendApprovalInterrupt(data: InterruptApprovalData, event?: ApprovalEvent) {
@@ -656,7 +658,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (!interruptState.value.has(merged.approvalId)) {
       setInterruptState(merged.approvalId, {})
     }
-    if (!stream.isStreaming.value) stream.ensureInterruptBubble()
     stream.appendInterruptFrame({
       interruptKind: 'approval',
       approvalId: merged.approvalId,
@@ -709,7 +710,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       step: request.step,
     }
     if (!interruptState.value.has(key)) setInterruptState(key, {})
-    if (!stream.isStreaming.value) stream.ensureInterruptBubble()
     stream.appendInterruptFrame({
       interruptKind: 'clarify',
       approvalId: key,
@@ -736,7 +736,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
    */
   function handleApprovalRequested(event: ApprovalEvent) {
     const data = event.approval ? approvalItemToInterruptData(event.approval) : null
-    if (data && (!sessionKey.value || data.sessionKey === sessionKey.value)) {
+    if (sessionKey.value && data && data.sessionKey === sessionKey.value) {
       appendApprovalInterrupt(data, event)
       // New Gateways always include both additive fields, including the explicit
       // null/empty values. Only old lean pushes require a snapshot backfill.
@@ -749,12 +749,13 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
   function handleApprovalUpdated(event: ApprovalEvent) {
     const id = event.approvalId
-    if (!id || interruptState.value.get(id)?.resolution) return
+    if (!sessionKey.value || !id || interruptState.value.get(id)?.resolution) return
     const data = event.approval ? approvalItemToInterruptData(event.approval) : null
     if (data) {
-      if (sessionKey.value && data.sessionKey !== sessionKey.value) return
+      if (data.sessionKey !== sessionKey.value) return
       appendApprovalInterrupt(data, event)
     }
+    if (!interruptApprovals.has(id)) return
     applyApprovalDeadline(id, event.approval?.deadline)
   }
 
@@ -765,6 +766,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
    */
   function handleApprovalResolved(event: ApprovalEvent) {
     const id = event.approvalId
+    // Resolution pushes may be lean/global. They may settle only a request
+    // this conversation already owns, never populate another pane's state.
+    if (!sessionKey.value || !interruptApprovals.has(id)
+      || (event.sessionKey && event.sessionKey !== sessionKey.value)) return
     const resolution = event.resolution === 'expired'
       ? 'expired' : event.approved === false ? 'denied' : 'approved'
     if (id && !interruptState.value.get(id)?.resolution) {
@@ -781,6 +786,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // Reconnect recovers approvals that arrived while the socket was down: a fresh
   // hydration re-surfaces still-pending items as frames (deduped by the fold).
   function handleAvailability(state: ApprovalAvailability) {
+    if (!sessionKey.value) return
     if (state !== 'available') {
       statusGeneration++
       snapshotGeneration++
@@ -796,50 +802,60 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
   /** Register stream listeners; returns the unsubscribe function. */
   function subscribe(): () => void {
-    const toolResultHandle = conversationEvents.open('')
-    const detachToolResults = toolResultHandle.observe((message) => {
-      if (message.kind === 'sessions-changed') {
-        const payload = message.payload
-        if (!acceptClarifyContext(payload)) return
-        const terminalTask = [payload.changed_task, payload.last_task].find(task => (
-          ['succeeded', 'failed', 'timed_out', 'timeout', 'cancelled', 'abandoned', 'interrupted'].includes(
-            String(task?.status || '').toLowerCase(),
-          )
-        ))
-        if (terminalTask) handleClarifyTaskTerminal({ ...payload, task_id: terminalTask.task_id })
-        return
+    let detach = () => {}
+    const stopOwner = watch(sessionKey, key => {
+      detach()
+      detach = () => {}
+      if (!key) return
+      const toolResultHandle = conversationEvents.open(key)
+      const detachToolResults = toolResultHandle.observe((message) => {
+        if (sessionKey.value !== key) return
+        if (message.kind === 'sessions-changed') {
+          const payload = message.payload
+          if (!acceptClarifyContext(payload)) return
+          const terminalTask = [payload.changed_task, payload.last_task].find(task => (
+            ['succeeded', 'failed', 'timed_out', 'timeout', 'cancelled', 'abandoned', 'interrupted'].includes(
+              String(task?.status || '').toLowerCase(),
+            )
+          ))
+          if (terminalTask) handleClarifyTaskTerminal({ ...payload, task_id: terminalTask.task_id })
+          return
+        }
+        if (message.kind !== 'conversation' || message.event.kind !== 'known') return
+        const event = message.event
+        if (event.semanticKind === 'process-completed') return
+        const terminal = CLARIFY_TERMINAL_EVENTS.has(event.semanticKind)
+        if (event.semanticKind !== 'tool-result' && event.semanticKind !== 'session-epoch-changed' && !terminal) return
+        if (!acceptClarifyContext(event.payload, event.semanticKind === 'session-epoch-changed')) return
+        if (event.semanticKind === 'tool-result') handleToolResult(event.payload)
+        else if (terminal) handleClarifyTaskTerminal(event.payload)
+      })
+      const approvalEvents = approvalCenter.subscribe(event => {
+        if (sessionKey.value !== key) return
+        if (event.kind === 'requested') handleApprovalRequested(event)
+        else if (event.kind === 'updated') handleApprovalUpdated(event)
+        else handleApprovalResolved(event)
+      })
+      const connection = approvalCenter.subscribeAvailability(state => { if (sessionKey.value === key) handleAvailability(state) })
+      // One-shot hydration on subscribe recovers any approval already pending
+      // before the listeners attached.
+      hydrateApprovals()
+      detach = () => {
+        detachToolResults()
+        toolResultHandle.close()
+        approvalEvents.close()
+        connection.close()
+        stopFallbackPoll()
       }
-      if (message.kind !== 'conversation' || message.event.kind !== 'known') return
-      const event = message.event
-      if (event.semanticKind === 'process-completed') return
-      const terminal = CLARIFY_TERMINAL_EVENTS.has(event.semanticKind)
-      if (event.semanticKind !== 'tool-result' && event.semanticKind !== 'session-epoch-changed' && !terminal) return
-      if (!acceptClarifyContext(event.payload, event.semanticKind === 'session-epoch-changed')) return
-      if (event.semanticKind === 'tool-result') handleToolResult(event.payload)
-      else if (terminal) handleClarifyTaskTerminal(event.payload)
-    })
-    const approvalEvents = approvalCenter.subscribe(event => {
-      if (event.kind === 'requested') handleApprovalRequested(event)
-      else if (event.kind === 'updated') handleApprovalUpdated(event)
-      else handleApprovalResolved(event)
-    })
-    const connection = approvalCenter.subscribeAvailability(handleAvailability)
-    // One-shot hydration on subscribe recovers any approval already pending
-    // before the listeners attached.
-    hydrateApprovals()
-    return () => {
-      detachToolResults()
-      toolResultHandle.close()
-      approvalEvents.close()
-      connection.close()
-      stopFallbackPoll()
-    }
+    }, { immediate: true, flush: 'sync' })
+    return () => { stopOwner(); detach(); stopFallbackPoll() }
   }
 
   async function submitClarify(
     fields: Record<string, string | boolean>,
     requestOverride?: ChatClarifyRequest,
   ) {
+    if (!sessionKey.value) return
     const request = requestOverride || pendingClarify.value
     if (clarifyBusy.value || !request?.requestId) return
     const key = clarifyFrameKey(request)
@@ -950,7 +966,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       // racing snapshot still contains its pre-submit pending record.
       if (!sameRequest || !clarifyBusy.value) resetClarifyPresentation()
       if (!interruptState.value.has(key)) setInterruptState(key, {})
-      if (!stream.isStreaming.value) stream.ensureInterruptBubble()
       stream.appendInterruptFrame({
         interruptKind: 'clarify',
         approvalId: key,

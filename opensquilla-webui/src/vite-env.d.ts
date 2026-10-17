@@ -104,6 +104,7 @@ declare global {
     importAttachmentSelection?: PlatformFilesApi['importAttachmentSelection']
     cancelAttachmentSelections?: PlatformFilesApi['cancelAttachmentSelections']
     saveArtifact?: PlatformFilesApi['saveArtifact']
+    saveAttachment?: PlatformFilesApi['saveAttachment']
     sourceFileAction?: PlatformFilesApi['sourceFileAction']
     workspaceFileAction?: PlatformFilesApi['workspaceFileAction']
     chooseProjectDirectory: (

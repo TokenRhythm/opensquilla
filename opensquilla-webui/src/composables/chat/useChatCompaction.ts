@@ -1,7 +1,9 @@
+import type { ProviderRecovery } from '@/types/parts'
 import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import {
   compactionCompletedLabelCode,
+  compactionSkippedProviderFailure,
   compactionFailurePresentation,
   compactionSkippedLabelCode,
   compactionSkipIsInformational,
@@ -11,6 +13,9 @@ export type ChatCompactStatusTone = 'info' | 'ok' | 'warn' | 'err' | string
 export type ChatCompactionPlacement = 'activity' | 'standalone'
 
 export interface ChatCompactStatus {
+  providerRecovery?: ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   visible: boolean
   message: string
   detail: string
@@ -24,6 +29,9 @@ export interface ChatCompactStatus {
 }
 
 export interface ShowCompactStatusOptions {
+  providerRecovery?: ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   tone?: ChatCompactStatusTone
   detail?: string
   dismissMs?: number
@@ -40,6 +48,8 @@ export interface UseChatCompactionOptions {
 }
 
 interface ChatCompactPayload extends Record<string, unknown> {
+  compactionRecovery?: ProviderRecovery
+  compactionFailure?: { httpStatus?: number; failureKind?: string }
   key?: string
   status?: string
   compacted?: boolean
@@ -162,6 +172,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       && !(isBusy && !previous.isBusy)
       && (statusOptions.compactionId === undefined
         || statusOptions.compactionId === previous.compactionId)
+    const recovery = isBusy ? statusOptions.providerRecovery ?? (carryMetadata && previous.isBusy ? previous.providerRecovery : undefined) : undefined
     compactStatus.value = {
       visible: true,
       message,
@@ -173,6 +184,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       compactionId: statusOptions.compactionId ?? (carryMetadata ? previous.compactionId : ''),
       durability: statusOptions.durability ?? (carryMetadata ? previous.durability : ''),
       reason: statusOptions.reason ?? (carryMetadata ? previous.reason : ''),
+      providerRecovery: recovery,
+      httpStatus: status === 'failed' ? statusOptions.httpStatus : isBusy ? recovery?.httpStatus : undefined,
+      failureKind: status === 'failed' ? statusOptions.failureKind : undefined,
     }
     if (statusOptions.dismissMs && statusOptions.dismissMs > 0) {
       dismissTimer = setTimeout(() => {
@@ -290,6 +304,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     meta: ChatCompactMeta = {},
   ): false | ChatCompactionPlacement {
     let status = String(payload.status || '').toLowerCase()
+    if (compactionSkippedProviderFailure(status, payload.reason || payload.skip_reason, payload.compactionFailure?.failureKind)) status = 'failed'
     if (!status && Object.prototype.hasOwnProperty.call(payload, 'compacted')) {
       status = payload.compacted ? 'completed' : 'skipped'
     }
@@ -386,6 +401,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
         tone: 'info',
         detail: stage,
+        providerRecovery: payload.compactionRecovery,
       })
       return placement
     }
@@ -424,6 +440,8 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       const failure = compactionFailurePresentation(reason)
       showCompactStatus('failed', i18n.global.t(failure.title), {
         tone: failure.warning ? 'warn' : 'err',
+        httpStatus: payload.compactionFailure?.httpStatus,
+        failureKind: payload.compactionFailure?.failureKind,
         detail: source === 'manual' ? i18n.global.t(failure.detail) : '',
         source,
         compactionId,

@@ -11,6 +11,60 @@ import { installRetainedRpcProbe } from './fixtures/packaged-retained-interactio
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
 import { collectRetainedGatewayDiagnostics, sameLogFileIdentity } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
 import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
+import { rendererConnectionMatches, waitForRendererConnection } from './renderer-connection-probe.mjs'
+
+function rendererStateFixture(states, expected) {
+  return runInNewContext(`(${rendererConnectionMatches.toString()})(expected)`, {
+    expected,
+    // A ready Desktop descriptor and composer deliberately coexist with every
+    // transport state. Neither is sufficient renderer connection evidence.
+    window: { opensquillaDesktop: { getGatewayConnection: () => ({ status: 'ready' }) } },
+    document: {
+      querySelectorAll: selector => selector === '.topbar[data-connection-state]'
+        ? states.map(state => ({ getAttribute: () => state })) : [{ disabled: false }],
+    },
+  })
+}
+
+test('renderer readiness requires the real connected state, not a ready Desktop or composer', () => {
+  for (const state of ['connecting', 'disconnected', 'ready', null]) {
+    assert.equal(rendererStateFixture([state], 'connected'), false)
+  }
+  assert.equal(rendererStateFixture(['connected'], 'connected'), true)
+})
+
+test('a missing, ambiguous or unmounted shell cannot stand in for a child-crash observation', () => {
+  for (const states of [[], [null], ['ready'], ['connected'], ['connected', 'disconnected']]) {
+    assert.equal(rendererStateFixture(states, 'not-connected'), false)
+  }
+  assert.equal(rendererStateFixture(['connecting'], 'not-connected'), true)
+  assert.equal(rendererStateFixture(['disconnected'], 'not-connected'), true)
+})
+
+test('renderer probe observes disconnect and reconnect independently with the caller deadline', async () => {
+  const observations = []
+  let states = ['connected']
+  let disposed = 0
+  const page = { async waitForFunction(predicate, expected, options) {
+    assert.equal(predicate, rendererConnectionMatches)
+    assert.equal(options.timeout, 75)
+    if (!rendererStateFixture(states, expected)) throw new Error('Expected transport state not observed')
+    observations.push(expected)
+    return { dispose: async () => { disposed += 1 } }
+  } }
+  await waitForRendererConnection(page, 'connected', { timeout: 75 })
+  await assert.rejects(waitForRendererConnection(page, 'not-connected', { timeout: 75 }), /not observed/)
+  states = []
+  await assert.rejects(waitForRendererConnection(page, 'not-connected', { timeout: 75 }), /not observed/)
+  states = ['disconnected']
+  await waitForRendererConnection(page, 'not-connected', { timeout: 75 })
+  await assert.rejects(waitForRendererConnection(page, 'connected', { timeout: 75 }), /not observed/)
+  states = ['connected']
+  await waitForRendererConnection(page, 'connected', { timeout: 75 })
+  assert.deepEqual(observations, ['connected', 'not-connected', 'connected'])
+  assert.equal(disposed, 3)
+  await assert.rejects(waitForRendererConnection(page, 'ready'), /Expected connected or not-connected/)
+})
 
 // Pure fixture/loopback tests: never execute the dummy .exe, Electron, Gateway,
 // an installer, or a real profile. These results are not native acceptance.

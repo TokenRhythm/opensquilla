@@ -20,6 +20,7 @@ import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccess
 import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
 import { httpTransportTestDouble } from '@/testing/httpTransport.test-helper'
 import ChatMessageList from './ChatMessageList.vue'
+import * as browser from '@/utils/browser'
 
 const apps: App[] = []
 const sessionKey = 'agent:main:webchat:automatic-content'
@@ -193,10 +194,11 @@ describe('automatic content through the real assistant renderer', () => {
       .toEqual(['普通聊天正文🙂。']))
     expect(host.textContent?.split('完整正文')).toHaveLength(2)
   })
-  it.each(['immediate', 'pending', 'delayed', 'closed', 'replaced', 'failed'])('loads complete details and shares an existing read with the full viewer (%s)', async mode => {
+  it.each(['immediate', 'pending', 'delayed', 'closed', 'replaced', 'failed'])('loads complete details and shares the existing read with inline copy (%s)', async mode => {
     const reasoning = '深入思考🙂'.repeat(3_000)
-    const input = { data: 'long input '.repeat(3_000) }
-    const result = 'full-result-'.repeat(3_000)
+    const input = { data: 'long input '.repeat(300) }
+    const result = 'full-result-'.repeat(300)
+    const copy = vi.spyOn(browser, 'copyTextWithFallback').mockResolvedValue(undefined)
     const segments: RawToolCallPayload[] = [
       { type: 'tool_use', tool_use_id: 'tool', name: 'details_probe', input },
       { type: 'tool_result', tool_use_id: 'tool', name: 'details_probe', result },
@@ -212,7 +214,7 @@ describe('automatic content through the real assistant renderer', () => {
           ? reject(new Error('details unavailable')) : resolve(response()) })
     })
     const bodyRead = vi.spyOn(ContentRangeCache.prototype, 'readDisplay')
-    const { host, canonical, showResult } = await mount([], [{
+    const { host, canonical } = await mount([], [{
       role: 'assistant', text: 'Final answer', messageId: 'answer', ts: 1, previewComplete: true,
       contentRef: { ...message().contentRef!, revision: mode === 'pending' ? 'legacy-v1:active:1:1:0:pending' : 'r1',
         byteLength: mode === 'pending' ? undefined : 32768 }, contentRevision: 'r1',
@@ -230,8 +232,8 @@ describe('automatic content through the real assistant renderer', () => {
       const row = host.querySelector<HTMLButtonElement>('.tool-row')!
       if (row.getAttribute('aria-expanded') !== 'true') row.click()
       await nextTick()
-      host.querySelector<HTMLButtonElement>('.activity-tool-details__view')!.click()
-      expect(showResult).not.toHaveBeenCalled()
+      host.querySelector<HTMLButtonElement>('[data-testid="activity-tool-detail-copy"]')!.click()
+      expect(copy).not.toHaveBeenCalled()
       if (mode === 'closed') activity.click()
       if (mode === 'replaced') canonical.value = []
       await nextTick()
@@ -241,7 +243,7 @@ describe('automatic content through the real assistant renderer', () => {
     expect(fetcher).toHaveBeenCalledOnce()
     expect(fetcher.mock.calls[0]?.[0]).toContain('view=details&export=1')
     if (mode === 'closed' || mode === 'replaced' || mode === 'failed') {
-      expect(showResult).not.toHaveBeenCalled()
+      expect(copy).not.toHaveBeenCalled()
       if (mode !== 'replaced') expect(canonical.value[0]?.reasoning?.text).toBe(reasoning.slice(0, 30))
       return
     }
@@ -252,12 +254,13 @@ describe('automatic content through the real assistant renderer', () => {
       expect(toolRow).not.toBeNull()
       if (toolRow.getAttribute('aria-expanded') !== 'true') toolRow.click()
       await nextTick()
-      const fullButton = host.querySelector<HTMLButtonElement>('.activity-tool-details__view')!
+      const fullButton = host.querySelector<HTMLButtonElement>('[data-testid="activity-tool-detail-copy"]')!
       expect(fullButton).not.toBeNull()
       fullButton.click()
     }
-    expect(showResult.mock.calls[0]?.[0]).toContain(input.data)
-    expect(showResult.mock.calls[0]?.[0]).toContain(result.trimEnd())
+    await vi.waitFor(() => expect(copy).toHaveBeenCalledOnce())
+    expect(copy.mock.calls[0]?.[0]).toContain(input.data)
+    expect(copy.mock.calls[0]?.[0]).toContain(result.trimEnd())
     expect(host.querySelector('.chat-history-content-page')).toBeNull()
     expect(host.querySelector('[data-testid="chat-history-content-hydration"]')).toBeNull()
   })

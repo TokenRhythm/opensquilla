@@ -6,6 +6,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:e2e-idle-recovery'
 const DRAFT = 'Synthetic follow-up preserved while the client is idle.'
@@ -109,12 +110,12 @@ for (const halfOpen of [false, true]) {
       (window as unknown as { __idleRecoveryComposer: Element }).__idleRecoveryComposer
         === document.querySelector('.chat-textarea')
     ))).toBe(true)
-    await expect(input).toHaveValue(DRAFT)
+    await expectComposerValue(input, DRAFT)
     await expect(send).toBeEnabled()
     await input.press('Enter')
     await expect.poll(() => sends.length).toBe(1)
     expect(sends[0]).toMatchObject({ sessionKey: SESSION, message: DRAFT })
-    await expect(input).toHaveValue('')
+    await expectComposerValue(input, '')
     await page.clock.runFor(2_000)
     expect(sends).toHaveLength(1)
   })

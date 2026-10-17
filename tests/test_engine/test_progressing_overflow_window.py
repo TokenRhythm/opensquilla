@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine import ErrorEvent as AgentErrorEvent
 from opensquilla.provider import (
@@ -28,6 +29,12 @@ from opensquilla.session.compaction import CompactionResult
 
 CURRENT = "Continue the current request from the available context."
 RESULT = "Historical archive material. " * 540
+
+
+class _CharacterBudgetEncoding:
+    def encode(self, text: str, *, disallowed_special: tuple[object, ...]) -> range:
+        del disallowed_special
+        return range((len(text) + 7) // 8)
 
 
 class GrowingProvider(OpenAIProvider):
@@ -65,7 +72,12 @@ class GrowingProvider(OpenAIProvider):
         yield DoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
-def setup_case(monkeypatch, *, retries=1, refuse_retry=False):
+def setup_case(monkeypatch, *, retries=1, refuse_retry=False, fallback_estimation=False):
+    # These lifecycle counts require character pressure with token headroom.
+    # Tokenizer loading is environmental; exercise its conservative fallback
+    # separately below, where token pressure changes the recovery boundaries.
+    encoding = None if fallback_estimation else _CharacterBudgetEncoding()
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
     summaries = []
 
     async def compact(request):
@@ -162,6 +174,48 @@ async def test_new_tool_progress_after_failed_summary_gets_local_only_second_rec
     assert_pairs(final.payload)
     assert [m.model_dump(mode="json") for m in history] == before
     assert [m.model_dump(mode="json") for m in agent.history_snapshot()[: len(history)]] == before
+
+
+async def test_tokenizer_fallback_recovers_token_pressure_without_another_paid_summary(monkeypatch):
+    agent, provider, summaries, executed, history, before = setup_case(
+        monkeypatch, fallback_estimation=True,
+    )
+    events = [event async for event in agent.run_turn(CURRENT)]
+
+    token_only_rejections = [
+        projection for projection in provider.projections
+        if not projection.fits
+        and projection.proof["estimated_chars"] <= projection.proof["effective_proof_budget"]
+        and projection.proof["estimated_tokens"] > projection.proof["effective_proof_token_budget"]
+    ]
+    assert token_only_rejections
+    assert all(
+        projection.proof["token_estimate_source"] == "utf8_unicode_conservative"
+        for projection in provider.projections
+    )
+    assert len({
+        (
+            projection.proof["effective_proof_budget"],
+            projection.proof["effective_proof_token_budget"],
+        )
+        for projection in provider.projections
+    }) == 1
+    assert len(summaries) == 1
+    assert executed == ["live-0-0", "live-0-1", "live-1-1"]
+    assert not any(isinstance(event, AgentErrorEvent) for event in events)
+    assert any(
+        getattr(event, "text", "") == "Continued after local window recovery." for event in events
+    )
+    final = provider.projections[-1]
+    assert final.fits
+    assert final.proof["estimated_chars"] <= final.proof["effective_proof_budget"]
+    assert final.proof["estimated_tokens"] <= final.proof["effective_proof_token_budget"]
+    assert CURRENT in json.dumps(final.payload)
+    assert_pairs(final.payload)
+    assert [message.model_dump(mode="json") for message in history] == before
+    assert [
+        message.model_dump(mode="json") for message in agent.history_snapshot()[: len(history)]
+    ] == before
 
 
 async def test_zero_overflow_retry_configuration_remains_disabled(monkeypatch):

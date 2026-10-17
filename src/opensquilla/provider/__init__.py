@@ -107,6 +107,7 @@ from .types import (
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
+    ToolInputPreviewEvent,
     ToolInputSchema,
     ToolUseDeltaEvent,
     ToolUseEndEvent,
@@ -163,6 +164,7 @@ __all__ = [
     "should_refuse",
     # Types
     "StreamEvent",
+    "ToolInputPreviewEvent",
     "TextDeltaEvent",
     "ReasoningDeltaEvent",
     "ToolUseStartEvent",

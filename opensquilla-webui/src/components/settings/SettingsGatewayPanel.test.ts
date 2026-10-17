@@ -58,7 +58,7 @@ describe('SettingsGatewayPanel support entry', () => {
     expect(support?.querySelector('[data-testid="support-view-logs"]')).toBeTruthy()
     expect(Boolean(support?.querySelector('[data-testid="local-log"]'))).toBe(isDesktop)
     const connection = el.querySelector('#settings-gateway-connection')!
-    expect(support!.compareDocumentPosition(connection) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(connection.compareDocumentPosition(support!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(el.querySelector('#settings-gateway-runtime [data-testid="local-log"]')).toBeNull()
     const runtime = el.querySelector('#settings-gateway-runtime')
     const updates = el.querySelector('#settings-gateway-updates')
@@ -66,7 +66,9 @@ describe('SettingsGatewayPanel support entry', () => {
     expect(Boolean(updates?.querySelector('[data-testid="updates"]'))).toBe(isDesktop)
     if (isDesktop) {
       expect(runtime?.querySelector('[data-testid="updates"]')).toBeNull()
+      expect(connection.compareDocumentPosition(runtime!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
       expect(runtime!.compareDocumentPosition(updates!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(updates!.compareDocumentPosition(support!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
       expect(el.textContent).toContain(i18n.global.t('settings.gateway.desktopDesc'))
     } else {
       expect(el.textContent).toContain(i18n.global.t('settings.gateway.desc'))

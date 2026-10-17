@@ -194,8 +194,12 @@ export function preparedPreviewFromWorkbenchItem(
   if (!resource || typeof resource !== 'object') return null
   const ref = resource as Record<string, unknown>
   if (
-    preview.mode !== 'isolated'
-    || preview.sandboxProfile !== 'opaque-offline'
+    !((preview.mode === 'isolated' && preview.sandboxProfile === 'opaque-offline')
+      || (preview.mode === 'local-renderer' && preview.sandboxProfile === 'none'
+        && preview.adapter && typeof preview.adapter === 'object'
+        && (preview.adapter as Record<string, unknown>).id === 'silurus-office'
+        && (preview.adapter as Record<string, unknown>).version === '0.88.0'
+        && ['docx', 'pptx', 'xlsx'].includes(String((preview.adapter as Record<string, unknown>).format))))
     || preview.network !== false
     || typeof preview.protocolVersion !== 'number'
     || typeof ref.type !== 'string'
@@ -261,5 +265,11 @@ export function previewableNavigationArtifactsFromWorkbenchItem(
 
 export function sessionKeyFromWorkbenchItem(item: WorkbenchItem | null): string {
   if (!item || item.scope.type !== 'session') return ''
+  // A side-chat preview or collection is visible in the parent scope, while its
+  // document bytes remain authorized against the ephemeral child session.
+  // Keep those identities separate: scope controls visibility/lifetime and
+  // payload.sessionKey controls artifact/resource reads.
+  if ((item.kind === 'artifact-preview' || item.kind === 'file' || item.kind === 'resource-collection') && typeof item.payload.sessionKey === 'string'
+    && item.payload.sessionKey.trim()) return item.payload.sessionKey
   return item.scope.id
 }

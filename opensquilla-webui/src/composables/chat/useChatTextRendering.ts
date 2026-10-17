@@ -1,3 +1,4 @@
+import { stripChatTimePrefix } from '@/utils/chat/timePrefix'
 import { renderMarkdownCore, type MarkdownCoreOptions } from '@/utils/markdown/renderCore'
 import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
@@ -10,10 +11,12 @@ import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentine
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
-const TIME_PREFIX_RE = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
 
 const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024
-const MARKDOWN_CACHE_MAX_ITEM_BYTES = 256 * 1024
+// Count source and HTML as UTF-16 below. A 128 KiB answer therefore needs more
+// than 512 KiB here; keep it reusable by timeline/answer projections and later
+// history refreshes without allowing one entry to consume the whole cache.
+const MARKDOWN_CACHE_MAX_ITEM_BYTES = MARKDOWN_CACHE_MAX_BYTES / 8
 
 export interface RenderMarkdownOptions extends MarkdownCoreOptions {
   cache?: 'settled' | 'none'
@@ -34,7 +37,7 @@ export function useChatTextRendering() {
   }
 
   function stripTimePrefix(text: string): string {
-    return typeof text === 'string' ? text.replace(TIME_PREFIX_RE, '') : text
+    return stripChatTimePrefix(text)
   }
 
   function renderMarkdown(text: string, opts?: RenderMarkdownOptions): string {
@@ -51,7 +54,8 @@ export function useChatTextRendering() {
     const highlight = opts?.highlight !== false
     const cacheMode = opts?.budget ? 'none' : opts?.cache ?? 'settled'
     const mathMode = opts?.math ?? 'full'
-    const cacheKey = `${highlight ? 'H' : 'P'}${mathMode === 'full' ? 'M' : 'D'}\n${text}`
+    const diagrams = opts?.diagrams !== 'defer'
+    const cacheKey = `${highlight ? 'H' : 'P'}${mathMode === 'full' ? 'M' : 'D'}${diagrams ? 'G' : 'S'}${opts?.images === 'placeholder' ? 'I' : 'N'}\n${text}`
     if (cacheMode === 'settled') {
       const cached = markdownCache.get(cacheKey)
       if (cached !== undefined) {
@@ -63,7 +67,7 @@ export function useChatTextRendering() {
       }
     }
 
-    const html = renderMarkdownCore(text, { highlight, math: mathMode, budget: opts?.budget })
+    const html = renderMarkdownCore(text, opts)
 
     if (cacheMode === 'settled') {
       // UTF-16 code units are a conservative and deterministic approximation

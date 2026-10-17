@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-Hans" data-theme="miami">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>界面一致性验收 · OpenSquilla</title>
+    <style>
+      /* Fixture canvas only. Product components supply all visual styles. */
+      html body #app { display: block; height: auto; min-height: 100vh; overflow: visible; }
+      #app > .main { min-height: 100vh; }
+    </style>
+  </head>
+  <body><div id="app"></div><script type="module" src="./ui-convergence-preview.ts"></script></body>
+</html>

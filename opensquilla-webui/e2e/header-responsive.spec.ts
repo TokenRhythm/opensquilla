@@ -28,12 +28,9 @@ test.describe('Responsive chat header actions', () => {
     const systemStatus = page.getByTestId('chat-system-status')
     await expect(systemStatus).toBeVisible({ timeout: 10000 })
     await expect(systemStatus).toHaveAttribute('data-layout', 'tight')
-    const systemTrigger = page.getByTestId('chat-system-status-trigger')
-    await expect(systemTrigger).toBeVisible()
-    await expect(systemTrigger).toHaveClass(/conn-pill/)
-    await systemTrigger.click()
+    await expect(page.getByTestId('chat-system-status-trigger')).toHaveCount(0)
     await expect(page.getByTestId('chat-system-approval')).toBeVisible()
-    await expect(page.getByTestId('chat-system-connection')).toBeVisible()
+    await expect(page.getByTestId('connection-status')).toHaveCount(0)
     await expect(page.getByTestId('chat-session-actions-trigger')).toBeVisible()
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
   })
@@ -93,7 +90,10 @@ test.describe('Responsive chat header actions', () => {
       await expect(page.getByTestId('chat-session-action-share')).toHaveAccessibleName('分享')
       await expect(page.getByTestId('chat-session-action-copy')).toBeVisible()
       await expect(page.getByTestId('chat-session-action-copy'))
-        .toHaveAccessibleName('复制会话 ID')
+        .toHaveAccessibleName('复制会话链接')
+      await expect(page.getByTestId('chat-session-action-copy-app-link')).toHaveCount(0)
+      await expect(page.getByTestId('chat-session-action-copy-gateway-link')).toHaveCount(0)
+      await expect(menu.getByRole('menuitem', { name: '复制会话 ID', exact: true })).toHaveCount(0)
       await expectTopbarGeometry(page, {
         minimumTargetSize: viewport.width <= 768 ? 44 : undefined,
       })
@@ -110,7 +110,7 @@ test.describe('Responsive chat header actions', () => {
   }
 
   for (const viewport of WIDE_VIEWPORTS) {
-    test(`${viewport.width}px exposes direct actions when the content pane is wide`, async ({ page, context }) => {
+    test(`${viewport.width}px keeps artifacts direct and sharing in the session menu`, async ({ page, context }) => {
       await context.grantPermissions(['clipboard-read', 'clipboard-write'])
       await page.setViewportSize(viewport)
       const harness = await openTopbarSession(page, {
@@ -132,26 +132,33 @@ test.describe('Responsive chat header actions', () => {
       await expect(page.getByTestId('chat-session-action-deliverables'))
         .toHaveAccessibleName('产物（1）')
       await expect(page.getByTestId('chat-session-action-runs')).toHaveCount(0)
-      await expect(page.getByTestId('chat-session-action-share')).toBeVisible()
-      await expect(page.getByTestId('chat-session-action-share')).toHaveAccessibleName('分享')
+      await expect(page.getByTestId('chat-session-action-share')).toHaveCount(0)
       await expect(header.locator('.chat-header__title')).toHaveAttribute('title', TOPBAR_SESSION_TITLE)
       const menuTrigger = page.getByTestId('chat-session-actions-trigger')
       await expect(menuTrigger).toBeVisible()
       await expectTopbarGeometry(page)
 
-      // Wide mode keeps frequent actions direct and copy operations in the
-      // same session menu used by narrower layouts.
+      // Wide mode keeps artifacts direct; sharing and copy operations use
+      // the same session menu as narrower layouts.
       await menuTrigger.click()
       const menu = page.getByTestId('chat-session-actions-menu')
       await expect(menu.getByRole('menuitem')).toHaveCount(3)
-      await expect(page.getByTestId('chat-session-action-copy-app-link')).toBeVisible()
-      await expect(page.getByTestId('chat-session-action-copy-gateway-link')).toBeVisible()
-      await expect(page.getByTestId('chat-session-action-copy')).toHaveAccessibleName('复制会话 ID')
+      await expect(page.getByTestId('chat-session-action-find')).toHaveAccessibleName('在对话中查找 Ctrl+F')
+      await expect(menu.getByRole('menuitem', { name: '分享', exact: true })).toBeVisible()
+      await expect(page.getByTestId('chat-session-action-copy-app-link')).toHaveCount(0)
+      await expect(page.getByTestId('chat-session-action-copy-gateway-link')).toHaveCount(0)
+      await expect(menu.getByRole('menuitem', { name: '复制会话 ID', exact: true })).toHaveCount(0)
+      await expect(page.getByTestId('chat-session-action-copy')).toHaveAccessibleName('复制会话链接')
       await expectTopbarGeometry(page)
       await page.getByTestId('chat-session-action-copy').click()
       await expect(menu).toHaveCount(0)
       await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
-        .toBe(harness.sessionKey)
+        .toBe(await page.evaluate(sessionKey => {
+          const basePath = document.getElementById('opensquilla-data')?.dataset.basePath || '/control'
+          const url = new URL(`${basePath.replace(/\/+$/, '')}/chat`, window.location.origin)
+          url.searchParams.set('session', sessionKey)
+          return url.toString()
+        }, harness.sessionKey))
       await expect(menuTrigger).toBeFocused()
       await expectTopbarGeometry(page)
     })

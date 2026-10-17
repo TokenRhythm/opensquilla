@@ -26,6 +26,10 @@ WORKDIR /build/opensquilla-webui
 COPY opensquilla-webui/package.json opensquilla-webui/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
 COPY opensquilla-webui/ ./
+# The artifact prebuild verifies the checked-in Visualize guidance against the
+# pinned upstream package. Keep that source beside the WebUI in this isolated
+# builder stage; the final image already receives the complete Python source.
+COPY src/opensquilla/skills/bundled/visualize/ /build/src/opensquilla/skills/bundled/visualize/
 RUN npm run build:artifact
 
 

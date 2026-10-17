@@ -30,6 +30,7 @@ _NAMES = [
     "web",
     "web_fetch",
     "workspace_preview",
+    "show_widget",
 ]
 
 log = structlog.get_logger(__name__)

@@ -63,3 +63,20 @@ def test_working_file_open_result_round_trips() -> None:
     assert parsed.model_dump(mode="json", by_alias=True, exclude_unset=True) == result
     with pytest.raises(ValidationError):
         descriptor.result_model.model_validate({**result, "workingFile": {"path": "page.html"}})
+
+
+@pytest.mark.parametrize("module_name", MODULES)
+def test_office_selection_and_version_pin_roundtrip(module_name):
+    module = importlib.import_module(f"opensquilla.contracts.generated.v4.{module_name}")
+    context = {
+        "resourceId": "document:office", "revisionId": "rev-one", "sha256": "a" * 64,
+        "annotations": [{"text": "修改标题", "selection": {
+            "format": "pptx", "kind": "text", "text": "中文标题", "shapeId": "4",
+            "slideIndex": 0, "origin": "slide", "bounds": {"xPt": 10, "widthPt": 20.5},
+        }}],
+    }
+    parsed = module.PageContext.model_validate(context)
+    assert parsed.model_dump(mode="json", by_alias=True, exclude_unset=True) == context
+    context["annotations"][0]["selection"]["writePath"] = "untrusted"
+    with pytest.raises(ValidationError):
+        module.PageContext.model_validate(context)

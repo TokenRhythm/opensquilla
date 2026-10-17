@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from opensquilla.gateway.auth import resolve_auth
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
 
@@ -146,6 +148,32 @@ def test_missing_token_from_public_peer_is_rejected(tmp_path) -> None:
     )
 
     assert principal is None
+
+
+@pytest.mark.parametrize(
+    "cidr",
+    [
+        "0.0.0.0/0",
+        "10.0.0.0/7",
+        "8.8.8.8/32",
+        "::/0",
+        "fc00::/6",
+        "2001:4860::/32",
+    ],
+)
+def test_allowed_client_cidrs_reject_public_or_overbroad_networks(cidr: str) -> None:
+    with pytest.raises(ValueError, match="may only narrow"):
+        AuthConfig(allowed_client_cidrs=[cidr])
+
+
+@pytest.mark.parametrize(
+    ("cidr", "normalized"),
+    [("10.1.2.3/8", "10.0.0.0/8"), ("fd12:3456::1/7", "fc00::/7")],
+)
+def test_allowed_client_cidrs_accept_private_network_boundaries(
+    cidr: str, normalized: str
+) -> None:
+    assert AuthConfig(allowed_client_cidrs=[cidr]).allowed_client_cidrs == [normalized]
 
 
 def test_allowed_client_cidrs_can_narrow_lan_access(tmp_path) -> None:

@@ -26,6 +26,9 @@ from opensquilla.channels.types import (
     IncomingMessage,
     OutgoingMessage,
 )
+from tests.helpers.sqlite_process_probe import run_sqlite_probe
+
+_ACCEPT_CANCEL_PROBE = Path(__file__).parent / "fixtures" / "channel_accept_cancel_probe.py"
 
 
 def message(event: str = "one") -> IncomingMessage:
@@ -160,21 +163,52 @@ async def test_queue_capacity_and_cancel_before_submission(gated):
     assert not {"queued", "waiting"} & {name for name, _ in events}
 
 
-async def test_submitted_accept_cancellation_still_hands_off_exactly_once(gated):
-    worker, _, gate, entered = await gated("after_accept")
-    queue = asyncio.Queue()
-    task = asyncio.create_task(worker.enqueue("channel", message(), queue))
-    await until(entered.is_set)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    gate.set()
-    await until(lambda: queue.qsize() == 1)
-    assert await worker.enqueue("channel", message(), queue) is False
-    assert queue.qsize() == 1
-    await worker.close()
-    with sqlite3.connect(worker.path) as conn:
-        assert conn.execute("SELECT state FROM channel_ingress").fetchone() == ("accepted",)
+def test_submitted_accept_cancellation_still_hands_off_exactly_once(tmp_path, monkeypatch):
+    # This is an ordering/durability contract, not a two-second disk-latency SLO.
+    # The child uses real SQLite and event barriers; its watchdog includes cleanup.
+    # Exercise the redirected stream encoding used by Windows CI explicitly.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    result = run_sqlite_probe(tmp_path, _ACCEPT_CANCEL_PROBE, ("none",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "probe_stdout_utf8=\u2713" in result.output
+    assert "probe_stderr_utf8=\u2713" in result.output
+    assert "accept_cancel_contract=passed" in result.output
+    assert "phase=worker-threads-stopped" in result.output
+
+
+def test_accept_cancel_probe_allows_slow_commit(tmp_path):
+    result = run_sqlite_probe(tmp_path, _ACCEPT_CANCEL_PROBE, ("slow-commit",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "synthetic_commit_delay_seconds=2.1" in result.output
+    assert "accept_cancel_contract=passed" in result.output
+
+
+@pytest.mark.parametrize(("fault", "failure"), [
+    ("duplicate-handoff", "AssertionError: accepted event was handed off more than once"),
+    ("early-error", "RuntimeError: injected accept submission failure"),
+])
+def test_accept_cancel_probe_rejects_broken_contracts(tmp_path, fault, failure):
+    result = run_sqlite_probe(tmp_path, _ACCEPT_CANCEL_PROBE, (fault,))
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert f"fault={fault}" in result.output.splitlines()
+    assert result.output.rstrip().splitlines()[-1] == failure, result.output
+    assert "phase=worker-threads-stopped" in result.output
+    assert "accept_cancel_contract=passed" not in result.output
+
+
+def test_accept_cancel_probe_watchdog_stops_noncooperative_worker(tmp_path):
+    result = run_sqlite_probe(
+        tmp_path, _ACCEPT_CANCEL_PROBE, ("hang-handoff",),
+        ready_signal="CHANNEL_ACCEPT_HANG_READY", execution_seconds=2,
+    )
+    assert result.timed_out == "execution/cleanup", result.output
+    assert result.returncode != 0, result.output
+    assert "phase=noncooperative-accept-thread" in result.output
+    assert f"probe_pid={result.pid}" in result.output.splitlines()
+    assert "accept_cancel_contract=passed" not in result.output
 
 
 async def test_waiting_parameters_and_handoff_are_snapshots(gated):
@@ -681,21 +715,39 @@ async def test_process_crash_recovers_committed_ingress_once_without_resending_u
         "delivery_id": "crash-delivery",
     }
     script = textwrap.dedent("""\
+        import sys
+        import os
+        import time
+
+        started = time.monotonic()
+
+        def phase(name):
+            print(
+                f"phase: {name}; pid={os.getpid()}; "
+                f"elapsed={time.monotonic() - started:.6f}s",
+                file=sys.stderr, flush=True,
+            )
+
+        phase("python-ready")
         import asyncio
         import json
-        import os
-        import sys
         from types import SimpleNamespace
         from opensquilla.channels.delivery_store import deliver_operation_with_outbox
         from opensquilla.channels.storage_worker import AsyncChannelDeliveryStore
         from opensquilla.channels.types import ChannelArtifactDeliveryRequest, IncomingMessage
+        phase("imports-ready")
 
         async def main():
             payload = json.load(sys.stdin)
+            assert os.getpid() == payload["expected_pid"], "watchdog must own the interpreter"
+            assert sys.prefix == payload["expected_prefix"], "probe must retain the test venv"
             store = AsyncChannelDeliveryStore(payload["path"])
+            phase("store-open-start")
             await store.open()
+            phase("store-open-done")
             inbound = IncomingMessage.model_validate(payload["inbound"])
             assert await store.accept_inbound("channel", inbound)
+            phase("inbound-committed")
             channel = SimpleNamespace(_delivery_store=store, _delivery_channel_name="channel")
             request = ChannelArtifactDeliveryRequest(inbound=inbound, **payload["artifact"])
 
@@ -712,36 +764,62 @@ async def test_process_crash_recovers_committed_ingress_once_without_resending_u
                 raise AssertionError("provider must have an ambiguous outcome")
             record = await store.send_record(request.delivery_id)
             assert record["state"] == "unknown"
+            phase("unknown-committed")
             print("accept-and-unknown-committed", flush=True)
             # No worker.close, asyncio teardown, or Python exit handlers may run.
+            phase("before-exit")
             os._exit(31)
 
         asyncio.run(main())
         """)
     root = Path(__file__).resolve().parents[2]
+    environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+    interpreter = sys.executable
+    if os.name == "nt":
+        # Own the interpreter holding SQLite threads, not the venv redirector.
+        # This is also the launch contract in tests.helpers.sqlite_process_probe.
+        interpreter = sys._base_executable
+        environment["__PYVENV_LAUNCHER__"] = sys.executable
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
+        interpreter,
         "-c",
         script,
         cwd=root,
-        env={**os.environ, "PYTHONPATH": str(root / "src")},
+        env=environment,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    communication = asyncio.create_task(process.communicate(json.dumps({
+        "path": str(path),
+        "inbound": inbound.model_dump(mode="json"),
+        "artifact": artifact,
+        "expected_pid": process.pid,
+        "expected_prefix": sys.prefix,
+    }).encode()))
     try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(json.dumps({
-                "path": str(path),
-                "inbound": inbound.model_dump(mode="json"),
-                "artifact": artifact,
-            }).encode()),
-            timeout=20,
-        )
-    finally:
-        if process.returncode is None:
-            process.kill()
-            await process.communicate()
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=20)
+    except BaseException as error:
+        try:
+            if process.returncode is None:
+                process.kill()
+        except OSError as cleanup_error:
+            error.add_note(f"crash child kill failed: {cleanup_error!r}")
+        try:
+            # Preserve the same pipe reader: cancelling communicate discards
+            # already-consumed phase output when a cold import stalls.
+            stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=5)
+        except BaseException as cleanup_error:
+            error.add_note(f"crash child output cleanup failed: {cleanup_error!r}")
+            communication.cancel()
+            await asyncio.gather(communication, return_exceptions=True)
+        else:
+            error.add_note(
+                f"crash child pid={process.pid}, returncode={process.returncode}; "
+                f"stdout={stdout.decode(errors='replace')!r}; "
+                f"stderr={stderr.decode(errors='replace')!r}"
+            )
+        raise
     assert process.returncode == 31, stderr.decode()
     assert b"accept-and-unknown-committed" in stdout.splitlines()
 

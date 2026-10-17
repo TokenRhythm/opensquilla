@@ -17,7 +17,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
@@ -1104,13 +1104,21 @@ class SessionManager:
         self,
         session_key: str,
         agent_id: str = "main",
+        *,
+        reuse_existing: bool = False,
         **kwargs: Any,
     ) -> SessionNode:
-        """Create a new session entry. Raises ValueError if key already exists."""
+        """Create a session; optional reuse atomically preserves a same-key winner.
+
+        Callers using reuse must validate the returned winner's bindings. The
+        default keeps the historical duplicate rejection/create behavior.
+        """
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
         existing = await self._storage.get_session(session_key)
         if existing is not None:
+            if reuse_existing:
+                return existing
             raise ValueError(f"Session already exists: {session_key}")
 
         node = self._build_session_node(
@@ -1119,19 +1127,28 @@ class SessionManager:
             **self._prepare_new_session_kwargs(kwargs),
         )
         preparation = await self._prepare_execution_workspace(node)
-        if preparation is None:
-            await self._storage.upsert_session(node)
+
+        async def persist() -> SessionNode:
+            if reuse_existing:
+                inserted = await self._storage.insert_session(node)
+                if not inserted:
+                    winner = await self._storage.get_session(session_key)
+                    if winner is None:
+                        raise KeyError(f"Session disappeared during creation: {session_key}")
+                    return winner
+            else:
+                await self._storage.upsert_session(node)
+            if preparation is not None:
+                preparation.mark_committed(node.session_id)
             return node
 
-        async def persist() -> None:
-            await self._storage.upsert_session(node)
-            preparation.mark_committed(node.session_id)
+        if preparation is None:
+            return await persist()
 
         try:
-            await _settle_workspace_operation(persist())
+            return await _settle_workspace_operation(persist())
         finally:
             await preparation.close()
-        return node
 
     async def get_or_create(
         self,
@@ -1479,18 +1496,79 @@ class SessionManager:
             with contextlib.suppress(OSError):
                 os.unlink(temporary_path)
 
+    async def _update_session_fields(
+        self,
+        session_key: str,
+        fields: dict[str, Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        operation: str = "update",
+    ) -> SessionNode:
+        """Patch session columns without writing a stale full-row snapshot.
+
+        ``SessionStorage.update_session_fields`` is the production path.  The
+        fallback keeps small in-memory storage adapters used by integrations and
+        tests working until they adopt the field-patch API.
+        """
+        session_key = canonicalize_session_key(session_key)
+        patch = getattr(self._storage, "update_session_fields", None)
+        if callable(patch):
+            try:
+                return cast(
+                    SessionNode,
+                    await patch(
+                        session_key,
+                        fields,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                    ),
+                )
+            except StaleEpochError as exc:
+                # Preserve the legacy manager contract for a generation that
+                # disappeared between the read and the conditional write.
+                if expected_session_id is not None:
+                    raise KeyError(f"Session generation changed: {session_key}") from exc
+                raise
+
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        _require_compatible_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation=operation,
+        )
+        for name, value in fields.items():
+            if hasattr(node, name) and name not in {
+                "session_key",
+                "session_id",
+                "created_at",
+                "updated_at",
+                "model_routing_mode",
+                "model_routing_revision",
+            }:
+                setattr(node, name, value)
+        node.updated_at = _now_ms()
+        owner: dict[str, Any] = {"expected_session_id": node.session_id}
+        if expected_session_epoch is not None:
+            owner["expected_session_epoch"] = expected_session_epoch
+        await self._storage.upsert_session(node, **owner)
+        return node
+
     async def resume(self, session_key: str) -> SessionNode:
         """Load an existing session; touch updated_at."""
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        node.updated_at = _now_ms()
-        await self._storage.upsert_session(
-            node,
+        return await self._update_session_fields(
+            session_key,
+            {},
             expected_session_id=node.session_id,
+            operation="resume",
         )
-        return node
 
     async def update(
         self,
@@ -1511,18 +1589,19 @@ class SessionManager:
             expected_session_epoch=expected_session_epoch,
             operation="update",
         )
-        for k, v in fields.items():
-            if hasattr(node, k):
-                setattr(node, k, v)
-        node.updated_at = _now_ms()
-        upsert_owner: dict[str, Any] = {"expected_session_id": node.session_id}
-        if expected_session_epoch is not None:
-            upsert_owner["expected_session_epoch"] = expected_session_epoch
-        await self._storage.upsert_session(
-            node,
-            **upsert_owner,
+        return await self._update_session_fields(
+            session_key,
+            fields,
+            expected_session_id=expected_session_id or node.session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="update",
         )
-        return node
+
+    async def set_generated_title_if_unchanged(
+        self, expected_session: SessionNode, title: str,
+    ) -> bool:
+        """Commit a background title only to the session/title slot we inspected."""
+        return await self._storage.set_generated_title_if_unchanged(expected_session, title)
 
     async def finish(
         self,
@@ -1544,23 +1623,24 @@ class SessionManager:
             operation="finish",
         )
         now = _now_ms()
-        node.status = status
-        node.ended_at = now
-        node.updated_at = now
+        fields: dict[str, Any] = {
+            "status": status,
+            "ended_at": now,
+        }
         if node.started_at:
-            node.runtime_ms = now - node.started_at
-        upsert_owner: dict[str, Any] = {"expected_session_id": node.session_id}
-        if expected_session_epoch is not None:
-            upsert_owner["expected_session_epoch"] = expected_session_epoch
-        await self._storage.upsert_session(
-            node,
-            **upsert_owner,
+            fields["runtime_ms"] = now - node.started_at
+        persisted = await self._update_session_fields(
+            session_key,
+            fields,
+            expected_session_id=node.session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="finish",
         )
         self.evict_session_runtime_state(
             session_key,
-            session_id=node.session_id,
+            session_id=persisted.session_id,
         )
-        return node
+        return persisted
 
     def evict_session_runtime_state(
         self,
@@ -1819,6 +1899,33 @@ class SessionManager:
             invalid_turn_ids=frozenset(invalid_turn_ids),
         )
 
+    async def create_sidechat(self, parent_session_key: str, client_request_id: str) -> SessionNode:
+        """Create/recover an idempotent parent snapshot without inheriting runtime work."""
+        from opensquilla.session.sidechat import (
+            create_snapshot,
+            finish_preparation,
+            sidechat_metadata,
+        )
+
+        parent_session_key = canonicalize_session_key(parent_session_key)
+        await self.get_session_routing(
+            parent_session_key, fallback_mode=self._default_model_routing_mode(),
+        )
+        child = await create_snapshot(self._storage, parent_session_key, client_request_id)
+        metadata = sidechat_metadata(child)
+        assert metadata is not None
+        if metadata["state"] == "ready":
+            return child
+        parent = await self._storage.get_session(parent_session_key)
+        if parent is None or parent.session_id != metadata["parentSessionId"]:
+            raise ValueError("Parent conversation changed while preparing side conversation")
+        await self._copy_fork_materials(parent.session_id, child.session_id, child.session_key)
+        # Side conversations are ephemeral.  They can inspect the inherited
+        # workspace through the normal scoped runtime, but must not receive a
+        # second mutable working-file tree or worktree attachment binding.
+        # Transcript attachment references remain immutable context only.
+        return await finish_preparation(self._storage, child)
+
     async def branch(
         self,
         parent_session_key: str,
@@ -1882,6 +1989,10 @@ class SessionManager:
         parent = await self._storage.get_session(parent_session_key)
         if parent is None:
             raise KeyError(f"Parent session not found: {parent_session_key}")
+        from opensquilla.session.sidechat import sidechat_metadata
+
+        if sidechat_metadata(parent) is not None:
+            raise ValueError("Side conversations cannot be forked")
         # A fork must never inherit a legacy NULL into the future.  Resolve the
         # parent under its durable row first, then give the child an independent
         # CAS generation for its copied concrete selection.
@@ -2449,9 +2560,16 @@ class SessionManager:
                 parent = await self._storage.get_session(child.parent_session_key or "")
                 if parent is not None and parent.session_id == source_session_id:
                     entries = await self._storage.get_canonical_transcript(target_session_id)
-                    await self._fork_attachment_working_files(
-                        parent, child, allowed_hashes=_fork_material_references(entries)[0],
-                    )
+                    # Ephemeral side conversations deliberately retain only
+                    # immutable attachment references.  Do not materialize a
+                    # second mutable working-file tree for them; regular
+                    # user-visible forks still receive the normal copy.
+                    from opensquilla.session.sidechat import sidechat_metadata
+
+                    if sidechat_metadata(child) is None:
+                        await self._fork_attachment_working_files(
+                            parent, child, allowed_hashes=_fork_material_references(entries)[0],
+                        )
                     current = await self._storage.get_session(target_session_key)
                     if current is None:
                         raise StaleEpochError("Fork target disappeared before material settlement")
@@ -3144,12 +3262,27 @@ class SessionManager:
             after=after,
             content_mode=content_mode,
         )
-        canonical_complete = await self._storage.is_canonical_transcript_complete(node.session_id)
+        from opensquilla.session.sidechat import sidechat_metadata
+
+        canonical_complete = (
+            await self._storage.is_display_transcript_complete(node.session_id)
+            if sidechat_metadata(node) is not None
+            else await self._storage.is_canonical_transcript_complete(node.session_id)
+        )
         return CanonicalTranscriptPage(
             entries=entries,
             has_more=has_more,
             canonical_complete=canonical_complete,
         )
+
+    async def get_display_summaries(self, session_key: str) -> list[SessionSummary]:
+        """Display only checkpoints produced by this side conversation itself."""
+        from opensquilla.session.sidechat import sidechat_metadata
+
+        summaries = await self.get_summaries(session_key)
+        node = await self._storage.get_session(session_key)
+        inherited_ids = set((sidechat_metadata(node) or {}).get("inheritedSummaryIds", ()))
+        return [summary for summary in summaries if summary.id not in inherited_ids]
 
     async def get_summaries(
         self,
@@ -4199,8 +4332,12 @@ class SessionManager:
         for entry in recent:
             await self._storage.append_transcript_entry(entry)
 
-        node.updated_at = _now_ms()
-        await self._storage.upsert_session(node)
+        await self._update_session_fields(
+            session_key,
+            {},
+            expected_session_id=node.session_id,
+            operation="truncate",
+        )
 
         return {"truncated": True, "before_count": before_count, "after_count": len(recent)}
 

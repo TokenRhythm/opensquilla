@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from opensquilla.uninstall import actions
 from opensquilla.uninstall.actions import ActionResult, _safe_remove, execute
@@ -53,7 +56,12 @@ def test_safe_remove_unlinks_symlink_not_target(tmp_path: Path) -> None:
     target_dir.mkdir()
     (target_dir / "keep").write_text("important")
     link = home / "link"
-    link.symlink_to(target_dir)
+    try:
+        link.symlink_to(target_dir)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     ok, detail = _safe_remove(link, home=home, trusted_roots=set(), is_root_removal=False)
     assert ok and detail == "removed-symlink"
     assert not link.exists()

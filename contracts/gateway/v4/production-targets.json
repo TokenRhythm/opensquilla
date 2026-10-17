@@ -3,6 +3,14 @@
   "targets": [
     {
       "kind": "method",
+      "wireName": "sessions.messages.search",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "turns.receipt.get",
       "roles": [
         "params",
@@ -1323,6 +1331,22 @@
     {
       "kind": "method",
       "wireName": "sessions.messages.snapshot.release",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.sidechat.create",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.sidechat.close",
       "roles": [
         "params",
         "result"

@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from opensquilla.paths import native_io_path
+
 _GENERIC_READ = 0x80000000
 _FILE_READ_DATA = 0x0001
 _FILE_READ_ATTRIBUTES = 0x0080
@@ -619,9 +621,10 @@ def _digest_handle(
     digest = hashlib.sha256()
     try:
         if destination is not None:
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            io_destination = native_io_path(destination)
+            io_destination.parent.mkdir(parents=True, exist_ok=True)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | int(getattr(os, "O_BINARY", 0))
-            descriptor = os.open(destination, flags, 0o600)
+            descriptor = os.open(io_destination, flags, 0o600)
         while True:
             chunk = api.read(handle, 1024 * 1024, path=source)
             if not chunk:
@@ -638,7 +641,7 @@ def _digest_handle(
             os.fsync(descriptor)
     except BaseException:
         if destination is not None:
-            destination.unlink(missing_ok=True)
+            native_io_path(destination).unlink(missing_ok=True)
         raise
     finally:
         if descriptor is not None:
@@ -967,7 +970,7 @@ def _copy_with_api(
                     destination=destination,
                 )
                 if digest != entry.digest:
-                    destination.unlink(missing_ok=True)
+                    native_io_path(destination).unlink(missing_ok=True)
                     raise WindowsSourceSnapshotError(
                         f"source file content changed during copy: {entry.source}"
                     )
@@ -980,13 +983,13 @@ def _copy_with_api(
                     else _same_information(current, expected)
                 )
                 if not directory_matches:
-                    destination.unlink(missing_ok=True)
+                    native_io_path(destination).unlink(missing_ok=True)
                     raise WindowsSourceSnapshotError(
                         f"source directory changed during copy: {directory_path}"
                     )
             return digest
     except BaseException:
-        destination.unlink(missing_ok=True)
+        native_io_path(destination).unlink(missing_ok=True)
         raise
     finally:
         close_error: BaseException | None = None

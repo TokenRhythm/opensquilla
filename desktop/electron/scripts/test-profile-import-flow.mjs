@@ -258,6 +258,7 @@ function launchEnvironment(isolatedHome, port) {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
+    APPDATA: join(isolatedHome, 'AppData', 'Roaming'),
     LOCALAPPDATA: join(isolatedHome, 'LocalAppData'),
     TEMP: join(isolatedHome, 'Temp'),
     TMP: join(isolatedHome, 'Temp'),
@@ -284,6 +285,7 @@ function launchEnvironment(isolatedHome, port) {
 }
 
 async function launchDesktop(userData, isolatedHome, port) {
+  await mkdir(join(isolatedHome, 'AppData', 'Roaming'), { recursive: true })
   await mkdir(join(isolatedHome, 'LocalAppData'), { recursive: true })
   await mkdir(join(isolatedHome, 'Temp'), { recursive: true })
   const launched = await electron.launch({
@@ -622,12 +624,29 @@ try {
   await app.evaluate(({ dialog }) => {
     dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false })
   })
-  await settingsControl.evaluate(({ previewId }) => {
-    void window.opensquillaDesktop.migrationRun({ previewId, overwrite: true })
-    return true
-  }, { previewId: settingsPreview.previewId })
+  // Migration may remain pending until onboarding completes. Observe its
+  // outcome without awaiting it or extending the onboarding deadline.
+  let migrationRunOutcome = { status: 'pending' }
+  void settingsControl.evaluate(({ previewId }) => (
+    window.opensquillaDesktop.migrationRun({ previewId, overwrite: true })
+  ), { previewId: settingsPreview.previewId }).then(
+    (result) => { migrationRunOutcome = { status: 'resolved', result } },
+    (error) => { migrationRunOutcome = { status: 'rejected', error: error.message || String(error) } },
+  )
 
-  const requiredKeyOnboarding = await onboardingPage(app)
+  let requiredKeyOnboarding
+  try {
+    requiredKeyOnboarding = await onboardingPage(app)
+  } catch (error) {
+    const savedResult = await readFile(
+      join(settingsUserData, 'migration-last-result.json'), 'utf8',
+    ).catch(() => null)
+    throw new Error(
+      `${error.message}; migrationRun: ${JSON.stringify(migrationRunOutcome)}; `
+      + `saved migration result: ${savedResult || 'unavailable'}`,
+      { cause: error },
+    )
+  }
   await requiredKeyOnboarding.locator('[data-screen="1"].active').waitFor({
     state: 'visible',
     timeout: 90_000,

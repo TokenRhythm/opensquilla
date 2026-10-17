@@ -228,7 +228,7 @@ async function installMeasurements(page) {
 async function openChat(page, config, sessionKey = config.sessionKey) {
   await page.goto(chatUrl(config, sessionKey), { waitUntil: 'domcontentloaded' })
   await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: 30_000 })
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 30_000 })
+  await page.locator('.topbar[data-connection-state="connected"]').waitFor({ state: 'visible', timeout: 30_000 })
 }
 
 async function sendText(page, text) {
@@ -442,7 +442,7 @@ async function requestLifecycle(config, action) {
 
 async function waitForRecovered(page) {
   const started = performance.now()
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 30_000 })
+  await page.locator('.topbar[data-connection-state="connected"]').waitFor({ state: 'visible', timeout: 30_000 })
   return Math.max(0, performance.now() - started)
 }
 
@@ -538,7 +538,7 @@ async function runHidden(page, context, config) {
   await page.waitForTimeout(11 * 60 * 1000)
   const hiddenDuration = performance.now() - started
   await page.bringToFront()
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 30_000 })
+  await page.locator('.topbar[data-connection-state="connected"]').waitFor({ state: 'visible', timeout: 30_000 })
   await waitForTerminal(page, config.marker, config.timeoutMs)
   await cover.close()
   const snapshot = await measurementSnapshot(page)
@@ -579,7 +579,7 @@ async function runQueue(page, context, config) {
       .waitFor({ state: 'visible', timeout: 30_000 })
   } else if (config.scenario === 'queue_switch_session') {
     await page.goto(chatUrl(config, config.alternateSessionKey), { waitUntil: 'domcontentloaded' })
-    await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 30_000 })
+    await page.locator('.topbar[data-connection-state="connected"]').waitFor({ state: 'visible', timeout: 30_000 })
     await page.goto(chatUrl(config, config.sessionKey), { waitUntil: 'domcontentloaded' })
     await page.locator('.chat-pending-card').filter({ hasText: config.queueMarker })
       .waitFor({ state: 'visible', timeout: 30_000 })

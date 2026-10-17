@@ -1,6 +1,8 @@
 // @vitest-environment happy-dom
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref, watch, type Ref } from 'vue'
+import { effectScope, nextTick, ref, watch, type Ref } from 'vue'
+import { useChatSessionViewCache } from './useChatSessionViewCache'
+import chatViewSource from '@/views/ChatView.vue?raw'
 
 import { useChatHistory } from './useChatHistory'
 import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
@@ -235,6 +237,9 @@ function makeHistory(autoScroll = true, overrides: {
   threadRef?: Ref<HTMLElement | null>
   concurrentHistoryReads?: boolean
   onTerminalTask?: (outcome: ChatTurnOutcome) => void
+  onHistoryInstalled?: (key: string) => void
+  deliveryIdentity?: Readonly<Ref<string | null>>
+  initialWindowSize?: () => number
 } = {}) {
   const response: SessionReadHistoryPageFixture = overrides.response || {
     messages: [
@@ -287,6 +292,9 @@ function makeHistory(autoScroll = true, overrides: {
     stripTimePrefix: text => text,
     scrollToBottom,
     onTerminalTask: overrides.onTerminalTask,
+    onHistoryInstalled: overrides.onHistoryInstalled,
+    deliveryIdentity: overrides.deliveryIdentity,
+    initialWindowSize: overrides.initialWindowSize,
   })
   return {
     api,
@@ -307,6 +315,183 @@ function historyMessage(id: string): SessionReadMessage {
     createdAt: `2026-07-06T00:00:${id.replace(/\D/g, '').padStart(2, '0')}Z`,
   }, 0)
 }
+
+describe('history installation for warm session views', () => {
+  // Exercise the real composition-root readiness hook. Copying its watcher
+  // here would let the test and production wiring silently diverge.
+  const readinessWatch = chatViewSource.match(/watch\((?:\(\) => historyState\.value\.initialLoadStatus|\[\s*\(\) => historyState\.value\.initialLoadStatus)[\s\S]*?\}, \{ flush: 'sync' \}\)/)?.[0]
+  if (!readinessWatch) throw new Error('ChatView history readiness watcher is missing')
+  const installReadinessWatch = new Function(
+    'watch', 'historyState', 'historySessionKey', 'sessionKey', 'sessionViewCache', readinessWatch,
+  )
+
+  it.each([
+    ['fallback', 'fallback'], ['fallback', 'read-error'],
+    ['canonical', 'fallback'], ['canonical', 'read-error'],
+  ] as const)(
+    'releases repeated %s to %s history refreshes after epoch invalidation only when the current read finishes', async (initialKind, result) => {
+      const scope = effectScope()
+      const sessionKey = ref('A')
+      let installed: (key: string) => void = () => {}
+      const fallback: SessionReadHistoryPageFixture = {
+        canonicalAvailable: false, canonicalComplete: false,
+        messages: [{ role: 'assistant', messageId: 'fallback', text: 'Readable fallback history' }],
+      }
+      const h = makeHistory(false, { sessionKey,
+        response: { ...fallback, canonicalAvailable: initialKind === 'canonical', canonicalComplete: initialKind === 'canonical' },
+        onHistoryInstalled: key => installed(key),
+      })
+      const cache = scope.run(() => useChatSessionViewCache({
+        sessionKey, deliveryIdentity: ref('gateway'), messages: h.messages, waitForLive: true,
+      }))!
+      installed = cache.historyInstalled
+      scope.run(() => installReadinessWatch(watch, h.api.historyState, h.api.historySessionKey, sessionKey, cache))
+      try {
+        cache.observeEpoch('A', 0)
+        await h.api.loadHistory()
+        cache.liveInstalled('A')
+        expect(cache.ready.value).toBe(true)
+        for (const epoch of [1, 2]) {
+          cache.observeEpoch('A', epoch)
+          let resolve!: (page: SessionReadHistoryPageFixture) => void
+          let reject!: (error: Error) => void
+          h.historyFixture.mockImplementationOnce(() => new Promise((done, fail) => { resolve = done; reject = fail }))
+          const pending = h.api.loadHistory()
+          cache.liveInstalled('A')
+          expect(h.api.historyState.value).toMatchObject({ initialLoadStatus: 'ready', loading: true })
+          expect(cache.ready.value).toBe(false)
+          if (result === 'fallback') resolve(fallback)
+          else reject(new Error('history temporarily unavailable'))
+          await pending
+          expect(h.api.historyState.value).toMatchObject({ initialLoadStatus: 'ready', loading: false,
+            canonicalAvailable: initialKind === 'canonical' && result === 'read-error',
+            recoveryError: result === 'read-error',
+          })
+          expect(h.messages.value.map(message => message.text)).toEqual(['Readable fallback history'])
+          expect(cache.ready.value).toBe(true)
+        }
+        // Readable fallback/error display never becomes an authoritative cache.
+        sessionKey.value = 'B'
+        sessionKey.value = 'A'
+        expect(cache.showingPreview.value).toBe(false)
+      } finally { h.api.cleanup(); scope.stop() }
+    },
+  )
+
+  it('does not release a new session from the prior session history read completion', async () => {
+    const scope = effectScope()
+    const sessionKey = ref('A')
+    const h = makeHistory(false, { sessionKey, response: {
+      canonicalAvailable: false, messages: [{ role: 'assistant', messageId: 'a', text: 'A history' }],
+    } })
+    const cache = scope.run(() => useChatSessionViewCache({
+      sessionKey, deliveryIdentity: ref('gateway'), messages: h.messages, waitForLive: true,
+    }))!
+    scope.run(() => installReadinessWatch(watch, h.api.historyState, h.api.historySessionKey, sessionKey, cache))
+    try {
+      await h.api.loadHistory()
+      cache.liveInstalled('A')
+      expect(cache.ready.value).toBe(true)
+      sessionKey.value = 'B'
+      cache.liveInstalled('B')
+      h.api.historyState.value = { ...h.api.historyState.value, loading: true }
+      h.api.historyState.value = { ...h.api.historyState.value, loading: false }
+      expect(cache.ready.value).toBe(false)
+    } finally { h.api.cleanup(); scope.stop() }
+  })
+
+  it.each([[100, 100], [500, 200], [Number.NaN, 50]])('refreshes the bounded cached window (%s -> %s) without restoring cursors', async (size, limit) => {
+    const h = makeHistory(true, { initialWindowSize: () => size })
+    await h.api.loadHistory()
+    expect(h.readHistory.mock.calls[0]).toMatchObject(['latest', null, { limit }])
+    h.api.cleanup()
+  })
+  it('retires a preview only after current canonical rows are installed', async () => {
+    const installed: string[][] = []
+    const h = makeHistory(true, {
+      onHistoryInstalled: key => installed.push([key, ...h.messages.value.map(m => m.messageId!)]),
+    })
+    await h.api.loadHistory()
+    expect(installed).toEqual([['agent:main:webchat:test', 'm1']])
+    h.api.cleanup()
+  })
+
+  it('keeps the display preview on unavailable history, but retires it for confirmed empty history', async () => {
+    const onHistoryInstalled = vi.fn()
+    const h = makeHistory(true, { onHistoryInstalled, response: {
+      messages: [], canonicalAvailable: false, canonicalComplete: false,
+    } })
+    await h.api.loadHistory()
+    expect(onHistoryInstalled).not.toHaveBeenCalled()
+    h.historyFixture.mockResolvedValue({ messages: [], canonicalAvailable: true, canonicalComplete: true })
+    await h.api.loadHistory()
+    expect(onHistoryInstalled).toHaveBeenCalledOnce()
+    h.api.cleanup()
+  })
+
+  it('cannot publish history from a previous delivery authority even with the same key and lease', async () => {
+    const deliveryIdentity = ref<string | null>('gateway-one:owner')
+    const onHistoryInstalled = vi.fn()
+    const h = makeHistory(true, { deliveryIdentity, onHistoryInstalled })
+    let resolve!: (page: SessionReadHistoryPageFixture) => void
+    h.historyFixture.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    const pending = h.api.loadHistory()
+    deliveryIdentity.value = 'gateway-two:owner'
+    resolve({ messages: [{ role: 'assistant', messageId: 'old-secret', text: 'old profile' }] })
+    expect(await pending).toMatchObject({ cancelled: true })
+    expect(h.messages.value).toEqual([])
+    expect(onHistoryInstalled).not.toHaveBeenCalled()
+    h.api.cleanup()
+  })
+
+  it.each([false, true])('handles late initial delivery identity with a replaced lease: %s', async replacedLease => {
+    const deliveryIdentity = ref<string | null>(null)
+    const onHistoryInstalled = vi.fn()
+    const h = makeHistory(true, { deliveryIdentity, onHistoryInstalled })
+    let resolve!: (page: SessionReadHistoryPageFixture) => void
+    h.historyFixture.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    const pending = h.api.loadHistory()
+    // The durable delivery hash runs alongside the authorized transport. Its
+    // initial completion must not strand an already admitted cold history read.
+    deliveryIdentity.value = 'gateway-one:owner'
+    if (replacedLease) h.replaceReadLease()
+    resolve({ canonicalAvailable: true, messages: [{ role: 'assistant', messageId: 'cold', text: 'cold history' }] })
+    expect(await pending).toMatchObject(replacedLease ? { cancelled: true } : { ok: true })
+    expect(h.messages.value.map(message => message.text)).toEqual(replacedLease ? [] : ['cold history'])
+    expect(onHistoryInstalled).toHaveBeenCalledTimes(replacedLease ? 0 : 1)
+    h.api.cleanup()
+  })
+
+  it('keeps display-only history outside canonical reconciliation after a compaction while away', async () => {
+    const scope = effectScope()
+    const sessionKey = ref('A')
+    let installed: (key: string) => void = () => {}
+    const h = makeHistory(true, { sessionKey, onHistoryInstalled: key => installed(key) })
+    const cache = scope.run(() => useChatSessionViewCache({
+      sessionKey, deliveryIdentity: ref('same-gateway'), messages: h.messages,
+    }))!
+    installed = cache.historyInstalled
+    await h.api.loadHistory()
+    sessionKey.value = 'B'
+    h.messages.value = []
+    h.replaceReadLease()
+    h.historyFixture.mockResolvedValue({ messages: [{ role: 'assistant', messageId: 'b', text: 'B' }] })
+    await h.api.loadHistory()
+    sessionKey.value = 'A'
+    h.messages.value = []
+    h.replaceReadLease()
+    expect(cache.messages.value.map(m => m.messageId)).toEqual(['m1'])
+    h.historyFixture.mockResolvedValue({ scope: 'compacted', canonicalAvailable: true,
+      messages: [{ role: 'assistant', messageId: 'summary', text: 'new canonical summary' }],
+    })
+    await h.api.loadHistory()
+    expect(cache.showingPreview.value).toBe(false)
+    expect(cache.messages.value.map(m => m.messageId)).toEqual(['summary'])
+    expect(h.messages.value.map(m => m.messageId)).toEqual(['summary'])
+    h.api.cleanup()
+    scope.stop()
+  })
+})
 
 function makeLiveEdgeRecovery(overrides: {
   scrollEpoch?: Ref<number>
@@ -3592,7 +3777,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value).toHaveLength(1)
     expect(messages.value[0]).toMatchObject({
-      role: 'error', text: 'The task did not finish. Please try again later.',
+      role: 'error', text: 'This request did not finish.',
       turnId, errorCode: 'future_internal_failure', terminalNotice: true,
     })
   })
@@ -3660,7 +3845,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value).toHaveLength(5)
     expect(messages.value[0]).toMatchObject({
-      role: 'error', terminalNotice: true, text: 'The task did not finish. Please try again later.',
+      role: 'error', terminalNotice: true, text: 'This request did not finish.',
     })
     expect(messages.value.slice(1).map(message => [message.role, message.text])).toEqual([
       ['system', unrelatedText],
@@ -3976,7 +4161,7 @@ describe('useChatHistory optimistic local rows', () => {
         ['assistant', 'Initial summary.'],
         ['user', 'Include the risks'],
         ['assistant', 'Risk analysis in progress.'],
-        ['error', 'The model service is busy. Please try again later.'],
+        ['error', 'The model is temporarily rate limited; this request did not finish.'],
       ])
       const notice = messages.value.filter(message => message.role === 'error')
       expect(notice).toHaveLength(1)
@@ -4146,7 +4331,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'retry this turn'],
-      ['error', 'The task did not finish. Please try again later.'],
+      ['error', 'This request did not finish.'],
     ])
     expect(messages.value[1]).toMatchObject({
       errorCode: 'failed',

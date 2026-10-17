@@ -1,3 +1,6 @@
+import type { OfficeSelection } from './officeSelection'
+import { normalizeOfficeSelection } from './officeSelection'
+
 export type PromptAnnotationStatus = 'draft' | 'sent' | 'discarded'
 export type PromptAnnotationFreshness = 'fresh' | 'stale'
 export type PromptAnnotationTargetStatus = 'ready' | 'contextual'
@@ -6,7 +9,7 @@ export type PromptAnnotationTargetReason = 'no_match' | 'ambiguous'
 /** A user-selected page element. Locators are hints, never edit authority. */
 export interface PromptAnnotationSelection {
   selectionId: string
-  targetRef: string
+  targetRef?: string
   resourceId?: string
   tagName: string
   elementPath: string
@@ -22,6 +25,8 @@ export interface PromptAnnotation {
   documentId: string
   documentName: string
   revisionId?: string
+  sha256?: string
+  selection?: OfficeSelection
   generation?: number | null
   anchorId?: string
   body: string
@@ -55,6 +60,8 @@ export interface PromptAnnotationSnapshot {
   documentId: string
   documentName: string
   revisionId?: string
+  sha256?: string
+  selection?: OfficeSelection
   generation?: number | null
   anchorId?: string
   body: string
@@ -73,12 +80,27 @@ export interface PromptAnnotationSnapshot {
   sentOrder?: number
 }
 
+/** Keep Office context drafts separate from the native DOM annotation gate. */
+export function promptAnnotationAllowed(
+  annotation: Pick<PromptAnnotationSnapshot, 'selection'> | undefined,
+  enabled: { native: boolean; office: boolean },
+): boolean {
+  if (!annotation) return false
+  if (annotation.selection !== undefined) {
+    return enabled.office && normalizeOfficeSelection(annotation.selection) !== null
+  }
+  return enabled.native
+}
+
 export interface PromptAnnotationCreateRequest {
   annotationId: string
   sessionKey: string
   documentId: string
   documentName?: string
   resourceId?: string
+  revisionId?: string
+  sha256?: string
+  officeSelection?: OfficeSelection
   pagePath?: string
   selection: PromptAnnotationSelection
   body?: string

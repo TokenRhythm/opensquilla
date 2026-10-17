@@ -1,11 +1,13 @@
 // @vitest-environment happy-dom
 
 import { createPinia, setActivePinia } from 'pinia'
-import { computed } from 'vue'
+import { computed, nextTick } from 'vue'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRpcStore } from './rpc'
 import { createV4GatewayAccess } from '@/adapters/gateway/gatewayAccessV4'
+import { createRpcWorkbenchResourceProvider } from '@/adapters/gateway/workbenchResourcesV4'
+import { useWorkbenchResourcesStore } from './workbenchResources'
 
 const connectCalls: Array<{ url: string; token?: string }> = []
 const clients: Array<{
@@ -89,6 +91,63 @@ describe('rpc link-token bootstrap', () => {
     sessionStorage.clear()
     delete window.opensquillaDesktop
     window.history.replaceState(null, '', '/control/sessions')
+  })
+
+  it('loads requested attachment inventory when Hello advertises resources after initial mount', async () => {
+    const rpc = useRpcStore()
+    rpc.init()
+    const attachment = {
+      resource: { type: 'attachment', attachmentId: 'hello-attachment' },
+      name: 'report.html', mime: 'text/html',
+      capabilities: { preview: true, download: true }, relations: {},
+    }
+    const call = vi.fn(async (_method: string, _params?: Record<string, unknown>) => ({ resources: [attachment], totalCount: 1,
+      pageSize: 500, returnedCount: 1, hasMore: false, nextCursor: null }))
+    const resources = useWorkbenchResourcesStore()
+    resources.setProvider(createRpcWorkbenchResourceProvider({ hasRpcMethod: rpc.hasRpcMethod, call }))
+
+    await resources.load('main-session')
+    await resources.load('side-session')
+    await resources.load('retired-session')
+    resources.clearSession('retired-session')
+    expect(resources.snapshot('main-session')).toMatchObject({ loaded: true, available: false })
+    expect(call).not.toHaveBeenCalled()
+
+    clients[0].emit('_hello', { ...deliveryHello(), features: { methods: [] } })
+    await nextTick()
+    expect(call).not.toHaveBeenCalled()
+
+    clients[0].emit('_hello', { ...deliveryHello(), features: { methods: ['workbench.resources.list'] } })
+    await vi.waitFor(() => expect(resources.snapshot('main-session').resources).toHaveLength(1))
+    expect(resources.snapshot('side-session').resources).toHaveLength(1)
+    expect(resources.snapshot('main-session').resources[0]?.capabilities.preview).toBe(true)
+    expect(resources.snapshot('retired-session').loaded).toBe(false)
+    expect(call.mock.calls.map(([, params]) => params)).toEqual([
+      expect.objectContaining({ sessionKey: 'main-session' }),
+      expect.objectContaining({ sessionKey: 'side-session' }),
+    ])
+    resources.$dispose()
+    rpc.$dispose()
+  })
+
+  it('does not resurrect a cleared session from a delayed post-Hello resource response', async () => {
+    const rpc = useRpcStore()
+    rpc.init()
+    let resolve!: (value: unknown) => void
+    const call = vi.fn(() => new Promise(done => { resolve = done }))
+    const resources = useWorkbenchResourcesStore()
+    resources.setProvider(createRpcWorkbenchResourceProvider({ hasRpcMethod: rpc.hasRpcMethod, call }))
+    await resources.load('departed-session')
+
+    clients[0].emit('_hello', { ...deliveryHello(), features: { methods: ['workbench.resources.list'] } })
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    resources.clearSession('departed-session')
+    resolve({ resources: [], totalCount: 0, pageSize: 500, returnedCount: 0, hasMore: false, nextCursor: null })
+    await nextTick()
+    await nextTick()
+    expect(resources.snapshot('departed-session')).toMatchObject({ loaded: false, available: false, resources: [] })
+    resources.$dispose()
+    rpc.$dispose()
   })
 
   it('exposes the reactive browser connection target independently of saved endpoint drift', async () => {

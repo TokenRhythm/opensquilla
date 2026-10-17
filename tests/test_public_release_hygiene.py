@@ -277,7 +277,9 @@ def test_tracked_sources_do_not_keep_agent_revision_markers() -> None:
 
 def test_gitignore_does_not_hide_tracked_release_files() -> None:
     raw = subprocess.check_output(
-        ["git", "ls-files", "-c", "-i", "--exclude-standard"],
+        # Check repository ignore policy, including nested .gitignore files.
+        # Personal info/exclude and global excludes are not release policy.
+        ["git", "ls-files", "-c", "-i", "--exclude-per-directory=.gitignore"],
         text=True,
     )
     ignored_tracked = [line for line in raw.splitlines() if line.strip()]

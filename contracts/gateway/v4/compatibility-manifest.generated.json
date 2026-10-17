@@ -29,7 +29,7 @@
       "delivery": "live-only-best-effort",
       "family": "conversation.events",
       "schema": "conversation/conversation-events.schema.json",
-      "schemaSha256": "952ace8aac4aeba3655438191a3d7c9baed037e24455117b369e0591ec600643",
+      "schemaSha256": "2132533c804cbe36e2dddde7ee2101a37a782642a0635b792c71fed918afca63",
       "schemaVersion": 1,
       "wireNames": [
         "chat.done",
@@ -69,6 +69,7 @@
         "session.event.thinking_end",
         "session.event.thinking_start",
         "session.event.tool_result",
+        "session.event.tool_input_preview",
         "session.event.tool_use_delta",
         "session.event.tool_use_end",
         "session.event.tool_use_start",
@@ -329,13 +330,13 @@
       "lifecycle": "stable",
       "name": "chat.history",
       "schema": "conversation/chat-history.schema.json",
-      "schemaSha256": "827ac29b527acaa15ca98ad5d6a4694db235480d15249ef45c8b438763626ade"
+      "schemaSha256": "7a9bd9f0a19ddbdc28143e9eb71892b2c0dd4144bc9504a565600da757dc59d9"
     },
     {
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "bf864ed2edd2f1db03a39cdfc101c531254d42ac5552beaec75d8d867acef460"
+      "schemaSha256": "0b1b81008b159d15f3de1085c13fa497d2537f5e953761b6e8a83356c4af0c67"
     },
     {
       "lifecycle": "stable",
@@ -989,7 +990,7 @@
       "lifecycle": "stable",
       "name": "sessions.create",
       "schema": "sessions/sessions-create.schema.json",
-      "schemaSha256": "4e80959cb02d29321fe6ad59516f542cc9bc941c891770fba7528edcce1e57de"
+      "schemaSha256": "dfb7034ecd271fe9b9287cb7a7bb097d63556b728060089b81443715a7447570"
     },
     {
       "lifecycle": "stable",
@@ -1019,7 +1020,7 @@
       "lifecycle": "stable",
       "name": "sessions.history.page.v2",
       "schema": "sessions/sessions-history-page-v2.schema.json",
-      "schemaSha256": "e54807bac9f9facbe69bb6df2de6aa81f193550520aaa8276ca6b909279ae897"
+      "schemaSha256": "45c47f6c8e439b2bc0f7fc0a12a7dca8d75e54a35a18eaa6b53959adf3d86675"
     },
     {
       "lifecycle": "stable",
@@ -1038,6 +1039,12 @@
       "name": "sessions.messages.resume",
       "schema": "sessions/sessions-messages-resume.schema.json",
       "schemaSha256": "2d136da239eea4653bcd3973e946c76d2a1278698977a9f085e89ea48696f4f8"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.messages.search",
+      "schema": "sessions/sessions-messages-search.schema.json",
+      "schemaSha256": "55962df1536e3825ed02072099eb930c65759ea5a2fe480a0beb268895db3cad"
     },
     {
       "lifecycle": "stable",
@@ -1085,13 +1092,13 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.enqueue",
       "schema": "sessions/sessions-pending-inputs-enqueue.schema.json",
-      "schemaSha256": "47896ecf01187a1485d0d5b6b46017d0b1727c9fb04983c986898ad9bfe97ad9"
+      "schemaSha256": "11bbc18b553dd86c25bfc92b241bc10a25708f85651ebe3fda933b1931562b4a"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.list",
       "schema": "sessions/sessions-pending-inputs-list.schema.json",
-      "schemaSha256": "0840011aeaed13fe50ca4adc89d0dd3a3273d8f6682ca6c370c705b1ef867c06"
+      "schemaSha256": "a8c665cacbf492885d7c8ea5386e0b88093cfc0d3aba0a5abba79b7cedce848e"
     },
     {
       "lifecycle": "stable",
@@ -1211,7 +1218,19 @@
       "lifecycle": "stable",
       "name": "sessions.send",
       "schema": "conversation/sessions-send.schema.json",
-      "schemaSha256": "c06e5a2c566787c6c99dc92ea9752e1b418d7502cb556f3958acf41b9897d1cd"
+      "schemaSha256": "ed604b0b29bdcc0d4345476eb5ba2a535913b74b0381c23a37a35cdfcdfe30e4"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.sidechat.close",
+      "schema": "sessions/sessions-sidechat-close.schema.json",
+      "schemaSha256": "0c61626faafc3591d8c9a13bc6544ef6b95c4ae99d1785c24426397791632fc9"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.sidechat.create",
+      "schema": "sessions/sessions-sidechat-create.schema.json",
+      "schemaSha256": "11190c35d9f028eab73d6a4bd2d5c50d90e2e25c8ae8dc221370d5835bcaea9e"
     },
     {
       "lifecycle": "stable",
@@ -1337,7 +1356,7 @@
       "lifecycle": "stable",
       "name": "turns.receipt.get",
       "schema": "conversation/turns-receipt-get.schema.json",
-      "schemaSha256": "58fe612c20da401e5aae351b8bb2f066e5d5b66d19c4dd29a27fbbbfd791e548"
+      "schemaSha256": "5e7e6a35a060894d11b0cbbc1d8d8f9e0860de8f5336d3abb39c659a9a3fcefe"
     },
     {
       "lifecycle": "stable",
@@ -1379,7 +1398,7 @@
       "lifecycle": "stable",
       "name": "workbench.resources.open",
       "schema": "workbench/workbench-resources-open.schema.json",
-      "schemaSha256": "2215bae0acb01d64933bf76a1685bf051990ce7540c38f528f65d1076f0632c6"
+      "schemaSha256": "c8a47141861ca3074aa1a008991dac6d8d5ac3df7809ac2bdba65187a82a5423"
     },
     {
       "lifecycle": "stable",
@@ -1427,10 +1446,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "37fd3b6d8b66a0ca3a2a60372cf16cf9b4ad7fd9d3766f6720a4c7932fc35253",
-    "methodCount": 209,
-    "schemaCount": 219,
-    "schemaTreeSha256": "60177cf57cc690dbf09080c8d9071da638316c0ab37306fc317d60e4365553d0",
+    "generatorSha256": "5663d69c0f0b761bd637bd6615ae8e262006b703d729d25fd3393ba6322f8012",
+    "methodCount": 212,
+    "schemaCount": 222,
+    "schemaTreeSha256": "31684b504437706d1c3ca3e587229b28b3a975aff4b4f453fed3410a98409ba8",
     "toolchains": {
       "legacyTypes": {
         "python": {

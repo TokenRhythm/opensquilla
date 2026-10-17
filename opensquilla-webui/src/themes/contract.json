@@ -15,6 +15,7 @@
     "chart-2",
     "shadow", "shadow-color", "scrim", "grain-opacity",
     "msg-bubble", "msg-obj-border",
+    "code-block-bg", "code-block-header-bg", "code-block-border",
     "surface-2", "surface-3",
     "color-green", "color-red", "color-blue", "text-secondary",
     "sidebar-bg", "sidebar-control-bg", "sidebar-control-hover", "sidebar-item-hover",

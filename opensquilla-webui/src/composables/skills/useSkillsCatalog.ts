@@ -12,6 +12,9 @@ import type {
 
 export interface SkillsCatalog {
   allSkills: Ref<Skill[]>
+  loading: Ref<boolean>
+  hasLoaded: Ref<boolean>
+  error: Ref<string | null>
   filterText: Ref<string>
   statusFilter: Ref<string>
   filteredSkills: ComputedRef<Skill[]>
@@ -397,6 +400,10 @@ export function useSkillsCatalog(
 ): SkillsCatalog {
   const t = i18n.global.t
   const allSkills = ref<Skill[]>([])
+  const loading = ref(false)
+  const hasLoaded = ref(false)
+  const error = ref<string | null>(null)
+  let loadGeneration = 0
   const filterText = ref('')
   const statusFilter = ref('all')
 
@@ -467,18 +474,28 @@ export function useSkillsCatalog(
   }
 
   async function loadData() {
+    const generation = ++loadGeneration
+    loading.value = true
+    error.value = null
     try {
       const skills = await catalog.list()
+      if (generation !== loadGeneration) return false
       allSkills.value = skills.map(normalizeSkill)
+      hasLoaded.value = true
       return true
     } catch (err) {
-      console.warn('Failed to load skills:', (err as Error).message)
+      if (generation === loadGeneration) error.value = err instanceof Error ? err.message : String(err)
       return false
+    } finally {
+      if (generation === loadGeneration) loading.value = false
     }
   }
 
   return {
     allSkills,
+    loading,
+    hasLoaded,
+    error,
     filterText,
     statusFilter,
     filteredSkills,

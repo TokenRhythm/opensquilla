@@ -293,7 +293,7 @@ watch(() => props.open, open => {
   align-items: center;
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   color: var(--text-muted);
   display: flex;
   gap: var(--sp-2);
@@ -311,7 +311,6 @@ watch(() => props.open, open => {
 .provider-picker__search-control:focus-within {
   background: var(--bg-elevated);
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--accent);
 }
 

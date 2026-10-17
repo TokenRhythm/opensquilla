@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { expectComposerValue } from './utils'
 import { helloOkResponse } from './support/gateway-fixture'
 import {
   chatHistoryPayload,
@@ -73,8 +74,9 @@ async function installWebBrowserUse(page: Page) {
     })
   })
   await page.goto('/control/chat?session=' + encodeURIComponent(SESSION_A))
-  await expect(page.locator('.conn-pill')).toBeVisible()
-  await expect(page.getByTestId('topbar-workbench-toggle')).toHaveCount(0)
+  await expect(page.locator('.topbar[data-connection-state]')).toBeVisible()
+  await expect(page.getByTestId('topbar-workbench-toggle')).toBeVisible()
+  await expect(page.getByTestId('topbar-workbench-toggle')).toHaveAttribute('aria-expanded', 'false')
   await expect(page.getByTestId('workbench-host')).toBeHidden()
   expect(await page.evaluate(() => Boolean(window.opensquillaDesktop))).toBe(false)
 }
@@ -89,9 +91,18 @@ test.describe('Web Browser Use', () => {
       await page.getByRole('button', { name: 'Add', exact: true }).click()
       const menu = page.getByRole('menu', { name: 'Add', exact: true })
       await expect(menu).toBeVisible()
+      await expect(menu.locator('[data-skill-name="browser-use"]')).toHaveCount(0)
       await expect(menu.getByRole('menuitem', { name: /^Browser Use\b/ })).toHaveCount(0)
       await expect(page.getByRole('dialog', { name: 'Browser Use' })).toHaveCount(0)
-      await expect(composer).toHaveValue('Keep this composer draft')
+      await expectComposerValue(composer, 'Keep this composer draft')
+      await page.getByRole('button', { name: 'Add', exact: true }).click()
+      // Other workbench panels remain usable in Web. Only the native browser
+      // option is unavailable without the bridge.
+      await page.getByTestId('topbar-workbench-toggle').click()
+      const start = page.getByTestId('workbench-start-panel')
+      await expect(start).toBeVisible()
+      await expect(start.locator('[data-panel-kind="browser"]')).toBeDisabled()
+      await expect(page.getByTestId('browser-start')).toHaveCount(0)
     })
   }
 })

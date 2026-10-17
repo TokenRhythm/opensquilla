@@ -177,7 +177,7 @@ test('C3 opens shared lineup without changing routing mode', async ({ page }) =>
     await entry.click();
     await expect(page.getByTestId('ensemble-panel')).toBeVisible();
     await shot(page, 'router-shared-lineup');
-    await page.getByRole('button', { name: 'Back to smart routing' }).click();
+    await page.getByRole('button', { name: 'Back to Intelligent model routing', exact: true }).click();
     await expect(entry).toBeFocused();
     expect(calls.some(method => method.includes('configure') || method === 'models.routing.set')).toBe(false);
 });
@@ -195,14 +195,18 @@ for (const width of [1440, 390])
             await shot(page, `provider-${provider}-${width}-collapsed`);
             if (BASELINE)
                 return;
-            const disclosure = modal.locator('.model-capacity-disclosure');
-            await expect(disclosure).not.toHaveAttribute('open');
-            await disclosure.locator('summary').click();
-            const context = disclosure.getByLabel('Context window', { exact: true });
+            const capacity = page.locator('.model-capacity-dialog');
+            await expect(capacity).toBeHidden();
+            await modal.locator('.model-capacity-menu').click();
+            await expect(capacity).toBeVisible();
+            const context = capacity.getByLabel('Context window', { exact: true });
             await context.scrollIntoViewIfNeeded();
             await expect(context).toBeVisible();
             await shot(page, `provider-${provider}-${width}-expanded`);
             await context.fill('262144');
+            await capacity.getByRole('button', { name: 'Done', exact: true }).click();
+            await expect(capacity).toBeHidden();
+            expect(writes).toHaveLength(0);
             const save = modal.locator('.setup-provider-modal__footer .btn--primary');
             await expect(save).toBeEnabled();
             await save.click();

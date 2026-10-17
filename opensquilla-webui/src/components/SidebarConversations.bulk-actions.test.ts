@@ -151,7 +151,7 @@ describe('SidebarConversations bulk actions', () => {
     const menuItems = Array.from(
       document.body.querySelectorAll<HTMLElement>('.sidebar-row-menu__item'),
     ).map(item => item.textContent?.trim())
-    expect(menuItems).toEqual(['Rename', 'Delete'])
+    expect(menuItems).toEqual(['Rename', 'Copy session link', 'Delete'])
   })
 
   it('does not render the conversations region until a session exists', async () => {

@@ -13,6 +13,7 @@ import {
 } from '@/testing/httpTransport.test-helper'
 import {
   ARTIFACT_TEXT_PREVIEW_LIMIT,
+  OFFICE_PREVIEW_MIMES,
 } from '@/utils/workbench/artifactPreview'
 import {
   createArtifactPreviewResource,
@@ -54,6 +55,101 @@ afterEach(() => {
 })
 
 describe('createArtifactPreviewResource', () => {
+  it.each([
+    ['app.js', 'text/javascript', 'export const text = "<script>not executed</script>"'],
+    ['app.ts', 'application/octet-stream', 'const count: number = 1'],
+    ['data.json', 'application/json', '{"message":"你好"}'],
+    ['main.py', 'text/x-python', 'print("hello")'],
+    ['query.sql', 'application/sql', 'SELECT 1;'],
+    ['config.yaml', 'application/yaml', 'enabled: true'],
+    ['style.css', 'text/css', 'body { color: red; }'],
+  ])('loads %s through the authenticated text controller without a browser surface', async (name, mime, source) => {
+    const requestBinary = vi.fn().mockResolvedValue(response(source, mime))
+    const objectUrl = vi.fn()
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), {
+      artifact: () => artifact({ name, mime }), sessionKey: () => 'side-child', createObjectUrl: objectUrl,
+    })
+    await controller.load()
+    expect(controller.state.value).toBe('ready')
+    expect(controller.kind.value).toBe('text')
+    expect(controller.text.value).toBe(source)
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/artifact-1', expect.objectContaining({ sessionKey: 'side-child' }))
+    expect(objectUrl).not.toHaveBeenCalled()
+    controller.dispose()
+  })
+
+  it('rejects binary bytes disguised as a generic code file', async () => {
+    const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(
+      response(new Uint8Array([80, 75, 0, 1, 255]), 'application/octet-stream'),
+    )), { artifact: () => artifact({ name: 'app.js', mime: 'application/octet-stream' }) })
+    await controller.load()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('invalid-content')
+    expect(controller.text.value).toBe('')
+    controller.dispose()
+  })
+
+  it('rejects an untrusted revision preview URL without falling back to the mutable head', async () => {
+    const requestBinary = vi.fn()
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), { artifact: () => artifact({
+      name: 'sample.pptx', mime: OFFICE_PREVIEW_MIMES.pptx,
+      download_url: '/api/v1/artifact-documents/doc-1',
+      revision_download_url: 'https://untrusted.example/document.pptx',
+    }), baseOrigin: () => 'http://localhost' })
+    await controller.load()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('missing-url')
+    expect(requestBinary).not.toHaveBeenCalled()
+    controller.dispose()
+  })
+
+  it('keeps size and hash verification on a pinned Office revision', async () => {
+    const requestBinary = vi.fn().mockResolvedValue(response('modified', OFFICE_PREVIEW_MIMES.pptx))
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), { artifact: () => artifact({
+      name: 'sample.pptx', mime: OFFICE_PREVIEW_MIMES.pptx, size: 3,
+      sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      download_url: '/api/v1/artifact-documents/doc-1',
+      revision_download_url: '/api/v1/artifact-documents/doc-1?revisionId=rev-1',
+    }) })
+    await controller.load()
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifact-documents/doc-1?revisionId=rev-1', expect.anything())
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('integrity-error')
+    expect(controller.binary?.value).toBeNull()
+    controller.dispose()
+  })
+
+  it.each([['html', 'text/html'], ['pdf', 'application/pdf']])('does not change %s download routing for a revision preview field', async (extension, mime) => {
+    const requestBinary = vi.fn().mockResolvedValue(response('sample', mime))
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), { artifact: () => artifact({
+      name: `sample.${extension}`, mime,
+      download_url: '/api/v1/artifact-documents/doc-1',
+      revision_download_url: '/api/v1/artifact-documents/doc-1?revisionId=rev-1',
+    }), createObjectUrl: () => 'blob:preview', revokeObjectUrl: vi.fn() })
+    await controller.load()
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifact-documents/doc-1', expect.anything())
+    controller.dispose()
+  })
+
+  it.each(['docx', 'pptx', 'xlsx'] as const)('verifies downloaded %s bytes against the selected revision hash', async format => {
+    const mime = OFFICE_PREVIEW_MIMES[format]
+    const requestBinary = vi.fn().mockResolvedValue(response('abc', mime))
+    let selected = artifact({ name: `sample.${format}`, mime, size: 3,
+      sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' })
+    const controller = createArtifactPreviewResource(httpTransport(requestBinary), { artifact: () => selected })
+    await controller.load()
+    expect(controller.state.value).toBe('ready')
+    expect(new TextDecoder().decode(controller.binary?.value!)).toBe('abc')
+    expect(controller.objectUrl.value).toBe('')
+    selected = { ...selected, sha256: '0'.repeat(64) }
+    await controller.reload()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('integrity-error')
+    expect(controller.binary?.value).toBeNull()
+    controller.dispose()
+    expect(controller.binary?.value).toBeNull()
+  })
+
   it('aborts the active request synchronously when disposed', () => {
     const observed: { signal?: AbortSignal } = {}
     const requestBinary = vi.fn((_url: string, options?: Parameters<TestHttpTransport['requestBinary']>[1]) => {
@@ -256,7 +352,8 @@ describe('createArtifactPreviewResource', () => {
     )
     expect(controller.state.value).toBe('ready')
     if (mime === 'application/pdf') {
-      expect(controller.objectUrl.value).toMatch(/^data:application\/pdf;base64,JVBERg==$/)
+      expect(controller.objectUrl.value).toBe('')
+      expect(controller.binary?.value?.byteLength).toBe(4)
       expect(createObjectUrl).not.toHaveBeenCalled()
     }
   })
@@ -417,7 +514,7 @@ describe('createArtifactPreviewResource', () => {
     expect(controller.errorCode.value).toBe('integrity-error')
   })
 
-  it('uses an application/pdf Blob for generic PDF responses', async () => {
+  it('provides verified PDF bytes to the shared renderer for generic responses', async () => {
     const observed: { blob?: Blob } = {}
     const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
       new Uint8Array([0x25, 0x50, 0x44, 0x46]),
@@ -437,11 +534,12 @@ describe('createArtifactPreviewResource', () => {
     await controller.load()
 
     expect(controller.state.value).toBe('ready')
-    expect(controller.objectUrl.value).toBe('blob:pdf-preview')
-    expect(observed.blob?.type).toBe('application/pdf')
+    expect(controller.objectUrl.value).toBe('')
+    expect(controller.binary?.value?.byteLength).toBe(4)
+    expect(observed.blob).toBeUndefined()
   })
 
-  it('uses a data URL for PDF previews in the Electron custom renderer origin', async () => {
+  it('uses the same binary PDF path in the Electron custom renderer origin without base64 copies', async () => {
     const createObjectUrl = vi.fn(() => 'blob:should-not-be-used')
     const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
       new Uint8Array([0x25, 0x50, 0x44, 0x46]),
@@ -456,7 +554,8 @@ describe('createArtifactPreviewResource', () => {
     await controller.load()
 
     expect(controller.state.value).toBe('ready')
-    expect(controller.objectUrl.value).toMatch(/^data:application\/pdf;base64,JVBERg==$/)
+    expect(controller.objectUrl.value).toBe('')
+    expect(controller.binary?.value?.byteLength).toBe(4)
     expect(createObjectUrl).not.toHaveBeenCalled()
   })
 

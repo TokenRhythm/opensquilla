@@ -21,7 +21,7 @@ export interface SystemHeaderLayoutOptions {
 }
 
 /**
- * Resolve the chat-only system-control layout from the full topbar width.
+ * Resolve the shared system-control layout from the full topbar width.
  *
  * This observer deliberately remains independent from the session header's
  * observer. System controls can therefore collapse without feeding their new
@@ -61,8 +61,8 @@ export function useSystemHeaderLayout(options: SystemHeaderLayoutOptions) {
 
   watch(options.pressureCount, scheduleLayout)
   watch(options.active, active => {
-    // Non-chat topbars have different geometry and must never seed the chat
-    // hysteresis history when the route changes back.
+    // Callers can suspend observation without carrying stale hysteresis into
+    // the next activation.
     hasMeasuredLayout = false
     if (active) void nextTick(scheduleLayout)
   })

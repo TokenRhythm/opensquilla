@@ -7,6 +7,7 @@ import inspect
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 from typing import Any, cast
@@ -24,6 +25,7 @@ from opensquilla.search.runtime_config import (
     ResolvedSearchRuntime,
     get_resolved_search_runtime,
 )
+from opensquilla.search.turn_state import current_search_turn_state
 from opensquilla.search.types import (
     SearchDiagnostics,
     SearchExecutionPlan,
@@ -82,7 +84,12 @@ async def run_canonical_web_search(
         if use_cache is None
         else use_cache
     )
-    cache_key = _cache_key(options, execution_plan)
+    cache_key = _cache_key(options, execution_plan) + (
+        tuple(
+            name in resolved_runtime.providers and resolved_runtime.providers[name].available
+            for name in provider_names
+        ),
+    )
     if cache_enabled:
         diagnostics.cache_status = "miss"
         cached_payload = _get_cached_payload(cache_key)
@@ -98,14 +105,21 @@ async def run_canonical_web_search(
 
     for attempt_index, provider_name in enumerate(provider_names):
         try:
-            provider = factory(provider_name)
-            search_options, recency_supported, recency_degraded = (
-                _effective_options_for_provider(
-                    options,
-                    resolved_runtime.provider_config(provider_name),
+            resolved_runtime.require_available(provider_name)
+            turn_state = current_search_turn_state.get()
+            async with (
+                turn_state.provider_attempt(provider_name)
+                if turn_state is not None
+                else nullcontext()
+            ):
+                provider = factory(provider_name)
+                search_options, recency_supported, recency_degraded = (
+                    _effective_options_for_provider(
+                        options,
+                        resolved_runtime.provider_config(provider_name),
+                    )
                 )
-            )
-            raw_results = await _search_provider(provider, search_options)
+                raw_results = await _search_provider(provider, search_options)
         except Exception as exc:  # noqa: BLE001 - orchestrator converts provider failures to payloads
             search_error = _coerce_search_error(provider_name, exc)
             diagnostics.provider_attempts.append(
@@ -123,7 +137,11 @@ async def run_canonical_web_search(
                 options,
                 diagnostics,
                 error_kind=search_error.kind,
-                error=_public_error_message(provider_name, search_error.kind),
+                error=_public_error_message(
+                    provider_name,
+                    search_error.kind,
+                    missing_key=_is_missing_key_error(search_error),
+                ),
                 provider_retryable=search_error.retryable,
                 error_class=type(exc).__name__,
             )
@@ -542,9 +560,14 @@ def _failure_payload(
     }
 
 
-def _public_error_message(provider: str, kind: str) -> str:
+def _public_error_message(provider: str, kind: str, *, missing_key: bool = False) -> str:
     provider_name = provider or "search provider"
     if kind == "auth":
+        if missing_key:
+            return (
+                f"{provider_name} search is unavailable: API key is not configured. "
+                "Do not retry this provider until credentials are configured."
+            )
         return f"{provider_name} search authentication failed. Check provider credentials."
     if kind == "network":
         return f"{provider_name} search network request failed."
@@ -553,6 +576,13 @@ def _public_error_message(provider: str, kind: str) -> str:
     if kind == "rate_limit":
         return f"{provider_name} search rate limit was reached."
     if kind == "blocked":
+        if provider == "duckduckgo":
+            return (
+                "duckduckgo search was blocked by an upstream challenge. "
+                "Do not retry DuckDuckGo or rephrase the query in this turn. "
+                "Use another configured search provider, fetch a known URL, "
+                "or continue with available evidence."
+            )
         return f"{provider_name} search was blocked by an upstream challenge."
     if kind == "http":
         return f"{provider_name} search request failed."

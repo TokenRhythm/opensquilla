@@ -73,6 +73,7 @@ def test_detected_portable_kind_reaches_opensquilla_migrator(
     portable.mkdir(parents=True)
     (portable / "config.toml").write_text("port = 18790\n", encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("APPDATA", raising=False)
     monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("LOCALAPPDATA", str(portable_base))
     monkeypatch.delenv("TEMP", raising=False)

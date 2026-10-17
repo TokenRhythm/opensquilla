@@ -72,6 +72,7 @@ def test_manual_envelope_has_real_prompt_and_tools_without_invocation(
         agent.config.system_prompt, agent.config.request_context_prompt,
     ]))
     assert "approved conventions." in prompt
+    assert "## Visual Presentation" not in prompt
     assert "read_file" in prompt
     assert [definition.name for definition in agent.tool_definitions] == ["read_file"]
     assert agent.config.model_id == "fixture-model"
@@ -106,7 +107,8 @@ def test_manual_envelope_copies_explicit_tool_policy_context(
     for name in ("read_file", "write_file"):
         registry.register(ToolSpec(name, name, {}), handler)
     runner = TurnRunner(provider_selector=Mock(), tool_registry=registry)
-    monkeypatch.setattr(runner, "_assemble_prompt", lambda *_args, **_kwargs: "known instructions")
+    assemble = Mock(return_value="known instructions")
+    monkeypatch.setattr(runner, "_assemble_prompt", assemble)
     caller = ToolContext(
         session_key="agent:main:webchat:manual-envelope",
         caller_kind=CallerKind.WEB,
@@ -129,6 +131,7 @@ def test_manual_envelope_copies_explicit_tool_policy_context(
     )
 
     assert [definition.name for definition in agent.tool_definitions] == ["read_file"]
+    assert assemble.call_args.kwargs["webui_rendering"] is True
     assert caller.denied_tools == original_denied
     assert caller.surfaced_tools == original_surfaced
     assert caller.authorized_tool_names is None

@@ -27,6 +27,9 @@ export interface CronJobMutation {
 
 export interface CronRunOutcome {
   readonly runId?: string
+  readonly success?: boolean
+  readonly status?: string
+  readonly reason?: string
   readonly reply?: string
   readonly error?: string
 }

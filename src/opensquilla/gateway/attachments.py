@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,7 +18,12 @@ from opensquilla.application.artifact_workbench import (
     ContentNotFoundError,
 )
 from opensquilla.gateway.adapters.artifact_content import GatewayArtifactContentPort
+from opensquilla.gateway.attachment_text_preview import read_attachment_text_preview
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.legacy_file_snapshot import (
+    LegacyFileSnapshotBusyError,
+    LegacyFileSnapshotRecovery,
+)
 
 
 def _safe_download_name(value: object) -> str:
@@ -44,6 +50,7 @@ def register_attachment_routes(
     content = ArtifactContentApplication(
         GatewayArtifactContentPort(config, session_manager=session_manager)
     )
+    recovery = LegacyFileSnapshotRecovery(config, session_manager)
 
     async def download_handler(request: Request) -> Response:
         sha = str(request.path_params.get("sha256", "")).lower()
@@ -82,14 +89,35 @@ def register_attachment_routes(
             )
         try:
             raw_index = request.query_params.get("attachmentIndex")
-            material = await content.attachment(AttachmentContentQuery(
-                session_key, sha,
-                message_id=request.query_params.get("messageId"),
-                attachment_index=int(raw_index) if raw_index is not None else None,
-                revision=request.query_params.get("revision"),
-                source=request.query_params.get("source"),
-            ))
-        except (ContentNotFoundError, ValueError):
+            message_id = request.query_params.get("messageId")
+            tool_use_id = request.query_params.get("toolUseId")
+            if tool_use_id is not None:
+                if not message_id or not tool_use_id or raw_index is not None:
+                    raise ContentNotFoundError("historical file content unavailable")
+                await recovery.recover(
+                    session_key=session_key, message_id=message_id,
+                    tool_use_id=tool_use_id, sha256=sha,
+                )
+                query = AttachmentContentQuery(session_key, sha)
+            else:
+                query = AttachmentContentQuery(
+                    session_key, sha, message_id=message_id,
+                    attachment_index=int(raw_index) if raw_index is not None else None,
+                    revision=request.query_params.get("revision"),
+                    source=request.query_params.get("source"),
+                )
+            material = await content.attachment(query)
+            if request.query_params.get("preview") == "1":
+                if material.path is None:
+                    raise ContentNotFoundError("historical file content unavailable")
+                preview = await asyncio.to_thread(read_attachment_text_preview, material.path)
+                return JSONResponse(preview)
+        except UnicodeDecodeError:
+            return JSONResponse(
+                {"error": "Attachment is not valid UTF-8 text", "code": "UNSUPPORTED_MEDIA_TYPE"},
+                status_code=415,
+            )
+        except (ContentNotFoundError, ValueError, OSError):
             return JSONResponse(
                 {"error": "Attachment not found", "code": "NOT_FOUND"},
                 status_code=404,
@@ -98,6 +126,12 @@ def register_attachment_routes(
             return JSONResponse(
                 {"error": "Attachment integrity check failed", "code": "INTEGRITY_ERROR"},
                 status_code=409,
+            )
+        except LegacyFileSnapshotBusyError:
+            return JSONResponse(
+                {"error": "Attachment recovery is busy", "code": "TEMPORARILY_UNAVAILABLE"},
+                status_code=503,
+                headers={"Retry-After": "1"},
             )
 
         if material.data is not None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -165,7 +166,13 @@ async def test_page_resource_resolves_to_session_working_file_without_tool_restr
             )
             outside = tmp_path / "outside.html"
             outside.write_bytes(b"private outside source")
-            (binding.root / "linked.html").symlink_to(outside)
+            try:
+                (binding.root / "linked.html").symlink_to(outside)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    await service.close()
+                    pytest.skip("Windows symbolic-link privilege is unavailable")
+                raise
         if html_mime != "text/html":
             collect = WorkingFiles.bundle
 

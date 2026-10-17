@@ -2930,6 +2930,8 @@ def _tool_result_payload(event: ToolResultEvent) -> dict[str, Any]:
     }
     if event.execution_log_handle:
         payload["execution_log_handle"] = event.execution_log_handle
+    if event.file_snapshot is not None and not event.is_error:
+        payload["file_snapshot"] = dict(event.file_snapshot)
     if event.arguments is not None:
         from opensquilla.tools.presentation import project_tool_arguments_payload
 

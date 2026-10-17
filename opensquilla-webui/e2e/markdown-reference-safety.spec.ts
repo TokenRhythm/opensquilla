@@ -31,6 +31,7 @@ async function stubGatewayWithAnswer(page: Page, session: string, text: string, 
     contentType: 'image/png', body: Buffer.from(TINY_PNG, 'base64'),
   }))
   await page.route('**/api/**', route => route.fulfill({ json: {} }))
+  await page.route('**/api/approvals', route => route.fulfill({ json: { mode: 'prompt', pending: [], allowPatterns: [], denyPatterns: [] } }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(message => {
@@ -58,7 +59,7 @@ async function stubGatewayWithAnswer(page: Page, session: string, text: string, 
           permissions: {}, skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sandbox.run_mode.preference.get': { runMode: 'safe', source: 'config' },
+        'sandbox.run_mode.preference.get': { runMode: 'safe', source: 'default' },
         'sandbox.capability.status': { available: false },
         'usage.status': { sessions: [] },
       }

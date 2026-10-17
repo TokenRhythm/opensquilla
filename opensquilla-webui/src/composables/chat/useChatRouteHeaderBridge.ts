@@ -13,12 +13,29 @@ import type { IconName } from '@/utils/icons'
 export type ChatRouteHeaderAction =
   | 'deliverables'
   | 'share'
-  | 'copy-session-key'
   | 'copy-session-link'
-  | 'copy-gateway-link'
+  | 'find'
+
+export interface ChatRouteHeaderFindState {
+  open: boolean
+  query: string
+  resultQuery: string
+  matchCount: number
+  activeMatch: number
+  status: 'idle' | 'loading' | 'ready' | 'error'
+  focusSequence: number
+  complete: boolean
+  coverageComplete?: boolean
+}
 
 export interface ChatRouteHeaderModel {
   sessionKey: Readonly<Ref<string>>
+  sessionDurable?: Readonly<Ref<boolean>>
+  sessionLoading?: Readonly<Ref<boolean>>
+  sessionPreparable?: Readonly<Ref<boolean>>
+  workspaceId?: Readonly<Ref<string | null>>
+  workspaceReady?: Readonly<Ref<boolean>>
+  workspaceResolved?: Readonly<Ref<boolean>>
   visible: Readonly<Ref<boolean>>
   title: Readonly<Ref<string>>
   optimisticTitle: Readonly<Ref<string>>
@@ -29,15 +46,20 @@ export interface ChatRouteHeaderModel {
   hasNewDeliverable: Readonly<Ref<boolean>>
   shareMode: Readonly<Ref<boolean>>
   shareableMessageCount: Readonly<Ref<number>>
+  findState?: Readonly<Ref<ChatRouteHeaderFindState>>
 }
 
 export interface ChatRouteHeaderCommands {
+  prepareWorkbenchSession?: (expectedSessionKey: string) => Promise<string | null>
   openDeliverables: () => void
   startShare: () => void
-  copySessionKey: () => void
-  copySessionLink?: () => void
-  copyGatewayLink?: () => void
+  copySessionLink: () => void
   restoreComposerFocus: () => void
+  openFind?: () => void
+  updateFindQuery?: (query: string) => void
+  searchFind?: (query: string) => void
+  navigateFind?: (direction: 'previous' | 'next') => void
+  closeFind?: () => void
 }
 
 export interface ChatRouteHeaderHostHandle {
@@ -54,6 +76,12 @@ export interface ChatRouteHeaderRegistration {
 export interface ChatRouteHeaderBridge {
   model: {
     sessionKey: ComputedRef<string>
+    sessionDurable: ComputedRef<boolean>
+    sessionLoading: ComputedRef<boolean>
+    sessionPreparable: ComputedRef<boolean>
+    workspaceId: ComputedRef<string | null>
+    workspaceReady: ComputedRef<boolean>
+    workspaceResolved: ComputedRef<boolean>
     visible: ComputedRef<boolean>
     title: ComputedRef<string>
     optimisticTitle: ComputedRef<string>
@@ -64,6 +92,7 @@ export interface ChatRouteHeaderBridge {
     hasNewDeliverable: ComputedRef<boolean>
     shareMode: ComputedRef<boolean>
     shareableMessageCount: ComputedRef<number>
+    findState: ComputedRef<ChatRouteHeaderFindState | null>
   }
   register: (
     model: ChatRouteHeaderModel,
@@ -73,7 +102,11 @@ export interface ChatRouteHeaderBridge {
   setHost: (host: ChatRouteHeaderHostHandle | null) => void
   focusAction: (action: ChatRouteHeaderAction) => boolean
   closeMenu: () => void
-  invoke: (command: keyof ChatRouteHeaderCommands) => void
+  prepareWorkbenchSession: (expectedSessionKey: string) => Promise<string | null>
+  invoke: <K extends keyof ChatRouteHeaderCommands>(
+    command: K,
+    ...args: Parameters<NonNullable<ChatRouteHeaderCommands[K]>>
+  ) => void
 }
 
 interface ChatRouteHeaderOwner {
@@ -99,9 +132,9 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
 
   function ownerValue<K extends keyof ChatRouteHeaderModel>(
     key: K,
-    fallback: ChatRouteHeaderModel[K]['value'],
-  ): ChatRouteHeaderModel[K]['value'] {
-    return activeOwner.value?.model[key].value ?? fallback
+    fallback: NonNullable<ChatRouteHeaderModel[K]>['value'],
+  ): NonNullable<ChatRouteHeaderModel[K]>['value'] {
+    return activeOwner.value?.model[key]?.value ?? fallback
   }
 
   function closeMenu() {
@@ -132,6 +165,12 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
   const bridge: ChatRouteHeaderBridge = {
     model: {
       sessionKey: computed(() => ownerValue('sessionKey', '')),
+      sessionDurable: computed(() => activeOwner.value?.model.sessionDurable?.value ?? false),
+      sessionLoading: computed(() => activeOwner.value?.model.sessionLoading?.value ?? false),
+      sessionPreparable: computed(() => activeOwner.value?.model.sessionPreparable?.value ?? false),
+      workspaceId: computed(() => activeOwner.value?.model.workspaceId?.value ?? null),
+      workspaceReady: computed(() => activeOwner.value?.model.workspaceReady?.value ?? false),
+      workspaceResolved: computed(() => activeOwner.value?.model.workspaceResolved?.value ?? false),
       visible: computed(() => ownerValue('visible', false)),
       title: computed(() => ownerValue('title', '')),
       optimisticTitle: computed(() => ownerValue('optimisticTitle', '')),
@@ -142,6 +181,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
       hasNewDeliverable: computed(() => ownerValue('hasNewDeliverable', false)),
       shareMode: computed(() => ownerValue('shareMode', false)),
       shareableMessageCount: computed(() => ownerValue('shareableMessageCount', 0)),
+      findState: computed(() => activeOwner.value?.model.findState?.value ?? null),
     },
     register(model, commands) {
       closeMenu()
@@ -161,8 +201,20 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
     },
     focusAction: action => focusActionForOwner(action),
     closeMenu,
-    invoke(command) {
-      activeOwner.value?.commands[command]?.()
+    async prepareWorkbenchSession(expectedSessionKey) {
+      const owner = activeOwner.value
+      if (!owner || !expectedSessionKey || owner.model.sessionKey.value !== expectedSessionKey) return null
+      const key = owner.commands.prepareWorkbenchSession
+        ? await owner.commands.prepareWorkbenchSession(expectedSessionKey)
+        : owner.model.sessionDurable?.value ? expectedSessionKey : null
+      // A delayed create belongs to the initiating route owner. A replacement
+      // ChatView must never receive its panel, even if it happens to share a key.
+      return activeOwner.value === owner && key === owner.model.sessionKey.value
+        && owner.model.sessionDurable?.value ? key : null
+    },
+    invoke(command, ...args) {
+      const handler = activeOwner.value?.commands[command] as ((...values: typeof args) => void) | undefined
+      handler?.(...args)
     },
   }
 

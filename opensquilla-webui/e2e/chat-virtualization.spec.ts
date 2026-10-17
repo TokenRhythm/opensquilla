@@ -84,7 +84,7 @@ async function gateway(page: Page, total: number) {
     })
   })
   await page.goto('/control/chat?session=' + encodeURIComponent(SESSION))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect.poll(() => state.offset).toBeLessThan(total)
   return state
 }
@@ -570,7 +570,7 @@ test('live-to-canonical handoff preserves the reading token inside a long answer
     )).join('')).slice(0, 128 * 1024)
 
   await page.goto('/control/chat?session=' + encodeURIComponent(session))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   await expect(page.locator('.chat-message-list')).toHaveAttribute('data-virtualized', 'true')
   send('session.event.text_delta', { text: answer.slice(0, 64 * 1024) })
   await expect(page.locator('.streaming-text-part')).toBeVisible()

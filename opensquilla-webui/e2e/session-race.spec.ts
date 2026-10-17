@@ -110,7 +110,7 @@ test('late chat.send response cannot navigate away from the current session', as
   })
 
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_A))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await expect(page.locator('.chat-textarea')).toBeVisible()
 
   await page.locator('.chat-textarea').fill('hello from A')

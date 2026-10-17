@@ -183,7 +183,14 @@ export function createV4CronScheduler(
     async runNow(jobId) {
       const result = await rpc.request<CronRunResult>(CRON_RUN_METHOD, { id: jobId })
       if (!validateCronRunResult(result)) throw invalid(CRON_RUN_METHOD)
-      return result
+      return {
+        runId: typeof result.runId === 'string' ? result.runId : undefined,
+        success: typeof result.success === 'boolean' ? result.success : undefined,
+        status: typeof result.status === 'string' ? result.status : undefined,
+        reason: typeof result.reason === 'string' ? result.reason : undefined,
+        reply: typeof result.reply === 'string' ? result.reply : undefined,
+        error: typeof result.error === 'string' ? result.error : undefined,
+      }
     },
     async remove(jobId) {
       const result = await rpc.request<CronRemoveResult>(CRON_REMOVE_METHOD, { id: jobId })

@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        probe: [startup-compat, ownership, migration, session]
+        probe: [startup-compat-gateway, startup-compat-desktop, ownership, migration, session]
     defaults:
       run:
         shell: pwsh

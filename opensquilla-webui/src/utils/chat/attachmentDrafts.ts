@@ -266,3 +266,46 @@ export class IndexedDbAttachmentDraftStore implements AttachmentDraftStore {
 export function createAttachmentDraftStore(): AttachmentDraftStore | null {
   try { return globalThis.indexedDB ? new IndexedDbAttachmentDraftStore(globalThis.indexedDB) : null } catch { return null }
 }
+
+/** Ephemeral owners use the same bounded attachment codec and revision fence
+ * without persisting a temporary conversation into browser storage. */
+export function createMemoryAttachmentDraftStore(now: () => number = Date.now): AttachmentDraftStore & { clear(): void } {
+  const records = new Map<string, DraftRecord>()
+  const loadSnapshot: NonNullable<AttachmentDraftStore['loadSnapshot']> = async scope => {
+    const key = attachmentDraftKey(scope)
+    let record = records.get(key)
+    if (record && record.expiresAt <= now()) { records.delete(key); record = undefined }
+    if (!record) return { attachments: [] }
+    record.revision ||= createClientRequestId()
+    return { attachments: restore(record, now()), revision: record.revision }
+  }
+  return {
+    load: async scope => (await loadSnapshot(scope)).attachments,
+    loadSnapshot,
+    save: async (scope, attachments, revision) => {
+      const key = attachmentDraftKey(scope)
+      if (attachments.length > MAX_ATTACHMENT_DRAFT_ITEMS) throw new Error('Too many attachments to save as a draft')
+      if (!attachments.length) { records.delete(key); return }
+      const stored = attachments.map(storedAttachment)
+      const bytes = attachmentDraftPayloadBytes(stored)
+      if (bytes > ATTACHMENT_DRAFT_MAX_BYTES) throw new Error('Attachment draft exceeds its storage limit')
+      for (const [id, record] of records) if (record.expiresAt <= now()) records.delete(id)
+      const others = [...records.values()].filter(record => record.key !== key)
+      if (others.length >= MAX_DRAFTS || others.reduce((sum, record) => sum + record.bytes, bytes) > ATTACHMENT_DRAFT_TOTAL_BYTES) {
+        throw new Error('Attachment draft storage is full; clear older drafts to enable recovery')
+      }
+      records.set(key, { key, version: 1, updatedAt: now(), expiresAt: now() + ATTACHMENT_DRAFT_TTL_MS, bytes, attachments: stored, revision })
+    },
+    consume: async (scope, revision, indexes) => {
+      const key = attachmentDraftKey(scope)
+      const record = records.get(key)
+      if (!record || record.revision !== revision) return false
+      const accepted = new Set(indexes)
+      const attachments = record.attachments.filter((_item, index) => !accepted.has(index))
+      if (!attachments.length) records.delete(key)
+      else records.set(key, { ...record, revision: undefined, attachments, bytes: attachmentDraftPayloadBytes(attachments) })
+      return true
+    },
+    clear: () => records.clear(),
+  }
+}

@@ -1,8 +1,13 @@
 <template>
   <div ref="rootEl" class="msg-ai-text streaming-text-part">
-    <template v-for="block in committedBlocks" :key="block.key">
+    <template v-for="block in displayedBlocks" :key="block.key">
+      <VisualizeCanvas
+        v-if="block.kind === 'visualize'"
+        :receipt="block.receipt"
+        :session-key="sessionKey ?? ''"
+      />
       <div
-        v-if="block.kind === 'rich'"
+        v-else-if="block.kind === 'rich'"
         class="streaming-rich-block"
         v-html="block.html"
       />
@@ -13,7 +18,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import VisualizeCanvas from '@/components/chat/VisualizeCanvas.vue'
+import { splitVisualizeBody, type VisualizeBodySegment } from '@/visualize/receipts'
+import type { VisualizeReceipt } from '@/visualize/types'
+import { computed, ref, watch } from 'vue'
 import type { RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
 import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 import { createMarkdownRenderBudget } from '@/utils/markdown/renderCore'
@@ -23,6 +31,8 @@ const OPEN_BLOCK_LIMIT = 16 * 1024
 const PLAIN_CHUNK_SIZE = 8 * 1024
 
 const props = defineProps<{
+  sessionKey?: string
+  visualizeReceipts?: VisualizeReceipt[]
   rawText: string
   renderMarkdown: (text: string, opts?: RenderMarkdownOptions) => string
 }>()
@@ -40,6 +50,7 @@ interface PlainBlock {
 }
 
 type CommittedBlock = RichBlock | PlainBlock
+type DisplayedBlock = CommittedBlock | { key: string; kind: 'visualize'; receipt: VisualizeReceipt }
 
 // Rich Markdown blocks and bounded plain-text fallbacks share one ordered
 // sequence. A very long open block can be frozen as plain text and later close
@@ -50,12 +61,42 @@ const tail = ref('')
 const rootEl = ref<HTMLDivElement | null>(null)
 const resetEpoch = ref(0)
 let renderBudget = createMarkdownRenderBudget()
+const receiptVersion = computed(() => JSON.stringify(props.visualizeReceipts ?? []))
+const splitCache = new Map<string, { version: string; segments: VisualizeBodySegment[] }>()
+const displayedBlocks = computed<DisplayedBlock[]>(() => {
+  const displayed: DisplayedBlock[] = []
+  const used = new Set<string>()
+  for (const block of committedBlocks.value) {
+    if (block.kind !== 'rich' || !props.visualizeReceipts?.length) {
+      displayed.push(block)
+      continue
+    }
+    let cached = splitCache.get(block.key)
+    if (!cached || cached.version !== receiptVersion.value) {
+      cached = { version: receiptVersion.value, segments: splitVisualizeBody(block.html, props.visualizeReceipts, false) }
+      splitCache.set(block.key, cached)
+    }
+    for (const segment of cached.segments) {
+      if (segment.receipt) {
+        if (used.has(segment.receipt.marker)) continue
+        used.add(segment.receipt.marker)
+        displayed.push({ key: `${block.key}:${segment.key}`, kind: 'visualize', receipt: segment.receipt })
+      } else {
+        displayed.push({ key: `${block.key}:${segment.key}`, kind: 'rich', html: segment.html })
+      }
+    }
+  }
+  return displayed
+})
 
-useMarkdownEnhancements(rootEl, {
+const enhancements = useMarkdownEnhancements(rootEl, {
   version: () => committedBlocks.value.length,
   incremental: true,
   resetVersion: () => resetEpoch.value,
 })
+// A late receipt can split an already committed subtree. Restore existing
+// diagrams before re-admitting it; no Markdown parse or fresh render budget.
+watch(receiptVersion, () => enhancements.refresh(), { flush: 'post' })
 
 let acceptedRaw = ''
 let committedOffset = 0
@@ -74,6 +115,7 @@ function resetState(): void {
   displayMath = null
   resetEpoch.value += 1
   renderBudget = createMarkdownRenderBudget()
+  splitCache.clear()
 }
 
 function appendRichBlock(raw: string, endOffset: number): void {
@@ -186,25 +228,33 @@ watch(() => props.rawText, update, { immediate: true })
   word-break: break-word;
 }
 
-.streaming-rich-block :deep(p) { margin: 0.375rem 0; }
-.streaming-rich-block :deep(p:first-child) { margin-top: 0; }
-.streaming-rich-block :deep(ul),
-.streaming-rich-block :deep(ol) { margin: 0.375rem 0; padding-left: 1.25rem; }
+/* A committed block ends with the shared 12px Markdown margin, including at
+   the boundary with the next block. Do not add a second container gap. */
+.streaming-rich-block :deep(> :first-child) { margin-top: 0; }
 .streaming-rich-block :deep(pre) {
-  margin: 0.375rem 0;
+  margin: 0.75rem 0;
+  padding: 0.75rem 0.875rem 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.65;
   overflow-x: auto;
   border: 1px solid var(--code-block-border);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-control);
   background: var(--code-block-bg);
-  padding: 0.625rem;
 }
-.streaming-rich-block :deep(code) {
+.streaming-rich-block :deep(:not(pre) > code) {
   border-radius: var(--radius-sm);
   background: var(--bg-hover);
   padding: 0.0625rem 0.25rem;
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 0.8125rem;
+  font-size: 0.9em;
+}
+.streaming-rich-block :deep(pre code) {
+  font: inherit;
+  background: transparent;
+  padding: 0;
+  color: var(--text);
 }
 
 .streaming-plain-block,

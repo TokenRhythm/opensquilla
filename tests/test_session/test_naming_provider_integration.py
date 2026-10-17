@@ -316,3 +316,46 @@ async def test_naming_budget_uses_wire_kind_but_ledger_keeps_registry_identity(
     assert len(requests) == 1
     assert json.loads(requests[0].content)["max_tokens"] == 1024
     await _assert_result(naming_runtime, provider=alias, model=_CHAT_MODEL, output_tokens=700)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_selected_keyless_ollama_names_only_when_enabled(
+    naming_runtime, monkeypatch, enabled,
+):
+    ctx = _context(naming_runtime, provider="ollama")
+    ctx.config.naming.enabled = enabled
+    requests = []
+
+    async def respond(request):
+        requests.append(request)
+        assert request.url.path == "/api/chat"
+        assert json.loads(request.content)["model"] == _CHAT_MODEL
+        return httpx.Response(200, text=json.dumps({
+            "model": _CHAT_MODEL,
+            "message": {"role": "assistant", "content": _TITLE},
+            "done": True, "prompt_eval_count": 12, "eval_count": 4,
+        }) + "\n")
+
+    client_class = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(respond)
+        kwargs["trust_env"] = False
+        return client_class(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    await generate_session_title(
+        ctx, _KEY, "Inspect the database connection pool",
+        selected_provider_config=ProviderConfig(
+            provider="ollama", model=_CHAT_MODEL, api_key="",
+            base_url="http://synthetic-ollama.test:11434",
+        ),
+    )
+    assert len(requests) == int(enabled)
+    if enabled:
+        await _assert_result(naming_runtime, provider="ollama", model=_CHAT_MODEL)
+    else:
+        session = await naming_runtime.storage.get_session(_KEY)
+        assert session.derived_title is None
+        naming_runtime.emit.assert_not_awaited()

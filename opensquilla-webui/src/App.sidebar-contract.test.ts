@@ -85,7 +85,7 @@ describe('App sidebar chrome contract', () => {
   })
 
   it('refreshes the sidebar after transport health recovers without availability changing', () => {
-    expect(appSource).toContain('watch(\n  () => gatewayAccess.connectionHealth,')
+    expect(appSource).toMatch(/watch\(\s*\(\) => gatewayAccess\.connectionHealth,/)
     expect(appSource).toContain('previous === \'suspect\'')
     expect(appSource).toContain('automaticAppRpc.connectionHealthChanged(health)')
   })

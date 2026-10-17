@@ -4364,13 +4364,16 @@ async def test_continuation_guardrail_is_checked_before_provider_activation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [
+    ProviderFailureKind.INSUFFICIENT_CREDITS, ProviderFailureKind.USAGE_LIMIT,
+])
 async def test_normalized_provider_credit_failure_maps_goal_to_usage_limited(
-    tmp_path: Path,
+    tmp_path: Path, kind: ProviderFailureKind,
 ) -> None:
     class _ProviderCreditsExhaustedError(RuntimeError):
         code = "402"
         terminal_reason = "error"
-        failure_kind = ProviderFailureKind.INSUFFICIENT_CREDITS.value
+        failure_kind = kind.value
 
     async def handler(_run: TaskRun) -> None:
         raise _ProviderCreditsExhaustedError("synthetic credit balance exhausted")
@@ -4389,7 +4392,7 @@ async def test_normalized_provider_credit_failure_maps_goal_to_usage_limited(
         )
         turn_outcome = (task.details or {}).get("turn_outcome")
         assert isinstance(turn_outcome, dict)
-        assert turn_outcome["failure_kind"] == "insufficient_credits"
+        assert turn_outcome["failure_kind"] == kind.value
         assert limited.pause_reason == "usage_limited"
 
 
@@ -5962,9 +5965,11 @@ async def test_natural_create_attaches_to_ordinary_running_rpc_task(
 
 async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_path: Path) -> None:
     runs: list[TaskRun] = []
+    started_runs: asyncio.Queue[TaskRun] = asyncio.Queue()
 
     async def handler(run: TaskRun) -> None:
         runs.append(run)
+        started_runs.put_nowait(run)
         task = await stack.storage.get_agent_task(run.task_id)
         assert task is not None
         details = dict(task.details)
@@ -5994,6 +5999,14 @@ async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_
     ) as stack:
         paused = _observe_goal_pause(stack)
         await _handle_goals_set(_set_params(), stack.context)
+        # Goal settlement precedes the driver's idle hook. Observe each real
+        # automatic admission and complete terminal settlement instead of
+        # repeatedly polling SQLite while waiting for the next turn.
+        # Ten seconds is a hang watchdog, not a per-turn throughput contract.
+        for _ in range(4):
+            run = await asyncio.wait_for(started_runs.get(), timeout=10.0)
+            task = await stack.runtime.wait(run.task_id, timeout=10.0)
+            assert task.status == AgentTaskStatus.SUCCEEDED
         # A settled turn can still own post-driver cleanup before the next idle
         # notification. Observe the committed pause across all four lifecycles.
         await asyncio.wait_for(paused.wait(), timeout=10.0)

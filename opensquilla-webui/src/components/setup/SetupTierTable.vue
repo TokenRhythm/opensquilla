@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 // The one tier table, extracted from the Router panel so the provider preset
 // card can preview preset tiers with the identical component. Presentational
 // only: props in, events out — no RPC, no form state.
@@ -641,7 +642,7 @@ const allowsFloatingContent = computed(() => (
             : t('setup.router.tierProviderAria', { tier: tier.name })"
         >{{ providerManagedByEnsemble(tier) ? t('setup.router.tierProviderManagedByEnsemble') : tier.provider || '-' }}</span>
         <div v-else class="setup-tier-table__provider-cell">
-          <select
+          <ControlSelect
             :value="tier.provider.trim().toLowerCase()"
             :aria-label="t('setup.router.tierProviderAria', { tier: tier.name })"
             :aria-invalid="credentialFor(tier) && !credentialFor(tier)?.available ? 'true' : undefined"
@@ -657,7 +658,7 @@ const allowsFloatingContent = computed(() => (
             >
               {{ option.label }}
             </option>
-          </select>
+          </ControlSelect>
           <small
             v-if="credentialFor(tier) && !credentialFor(tier)?.available"
             class="setup-tier-table__provider-warning"
@@ -898,7 +899,7 @@ const allowsFloatingContent = computed(() => (
   min-width: 0;
 }
 
-.setup-tier-table__thinking-cell :deep(select) {
+.setup-tier-table__thinking-cell :deep(.control-select) {
   min-width: 0;
   width: 100%;
   max-width: none;
@@ -926,7 +927,7 @@ const allowsFloatingContent = computed(() => (
   min-width: 0;
 }
 
-.setup-tier-table__provider-cell select {
+.setup-tier-table__provider-cell .control-select {
   min-width: 0;
   width: 100%;
 }

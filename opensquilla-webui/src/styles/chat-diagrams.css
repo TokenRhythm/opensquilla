@@ -1,0 +1,41 @@
+/* Diagram content inherits the existing code surface and copy affordance. */
+pre.chat-diagram[data-diagram-state="ready"] > code[hidden] {
+  display: none;
+}
+pre.chat-diagram .chat-diagram-viewport {
+  max-height: 32rem;
+  max-width: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: normal;
+  border-radius: var(--radius-control);
+}
+pre.chat-diagram .chat-diagram-viewport:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+pre.chat-diagram .chat-diagram-image {
+  display: block;
+  width: auto;
+  max-width: none;
+  height: auto;
+  margin: 0 auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+pre.chat-diagram .chat-diagram-note {
+  display: block;
+  margin-top: var(--sp-2);
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: var(--fs-xs);
+  white-space: normal;
+}
+.chat-share-export-stage pre.chat-diagram .chat-diagram-viewport {
+  max-height: none;
+  overflow: visible;
+}
+.chat-share-export-stage pre.chat-diagram .chat-diagram-image {
+  max-width: 100%;
+}

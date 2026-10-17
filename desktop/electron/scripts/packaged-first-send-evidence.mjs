@@ -175,7 +175,9 @@ export function firstSendRendererSnapshot({ document = globalThis.document,
   return {
     pathname: location.pathname,
     sessionMaterialized: new URL(location.href).searchParams.has('session'),
-    connected: Boolean(document.querySelector('.conn-pill.connected')),
+    // The quiet connection UI has no DOM signal proving a WebSocket handshake.
+    // Preserve unknown rather than mistaking an absent status pill for offline.
+    connected: null,
     sendButtonDisabled: sendButton?.disabled ?? null,
     sendButtonAriaBusy: sendButton ? sendButton.getAttribute('aria-busy') === 'true' : null,
     textareaDisabled: document.querySelector('.chat-textarea')?.disabled ?? null,

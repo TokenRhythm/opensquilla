@@ -3,6 +3,7 @@ import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { createServer as createViteServer, type ViteDevServer } from 'vite'
+import { withIsolatedNativeDesktopPage } from './support/native-desktop-fixture'
 
 import {
   startRealGoalGateway,
@@ -103,15 +104,32 @@ export const test = base.extend<{
   isolatedRealGateway: IsolatedRealGateway
   isolatedRealGatewayScenario: RealGoalGatewayScenario
   isolatedRealGatewayAuthMode: 'none' | 'token'
+  isolatedRealGatewayInitialSessionKeys: readonly string[]
+  isolatedRealGatewayNativeDesktop: boolean
 }>({
   isolatedRealGatewayScenario: ['lifecycle', { option: true }],
   isolatedRealGatewayAuthMode: ['none', { option: true }],
-  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode }, use, testInfo) =>
+  isolatedRealGatewayInitialSessionKeys: [[], { option: true }],
+  isolatedRealGatewayNativeDesktop: [false, { option: true }],
+  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode, isolatedRealGatewayInitialSessionKeys }, use, testInfo) =>
     withIsolatedRealGateway({
       outputDir: testInfo.outputPath('isolated-real-gateway'),
       scenario: isolatedRealGatewayScenario,
       authMode: isolatedRealGatewayAuthMode,
+      initialSessionKeys: isolatedRealGatewayInitialSessionKeys,
     }, use),
+  page: async ({ page, isolatedRealGateway, isolatedRealGatewayNativeDesktop }, use, testInfo) => {
+    // Native-capable specs explicitly opt in: other tests may use the browser
+    // context to create additional pages that cannot load the Desktop scheme.
+    if (!isolatedRealGatewayNativeDesktop || process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP !== '1') {
+      await use(page)
+      return
+    }
+    isolatedRealGateway.controlUrl = 'opensquilla-app://desktop/'
+    await withIsolatedNativeDesktopPage(testInfo, use, {
+      gatewayHttpUrl: isolatedRealGateway.wsUrl.replace(/^ws:/, 'http:').replace(/\/ws$/, ''),
+    })
+  },
 })
 
 export { expect }

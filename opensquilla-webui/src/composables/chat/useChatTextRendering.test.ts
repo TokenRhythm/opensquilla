@@ -44,14 +44,37 @@ describe('useChatTextRendering math', () => {
     const inline = renderMarkdown('Inline $x^2$ formula')
     const display = renderMarkdown('Block:\n\n$$\\frac{a}{b}$$')
 
-    expect(inline).toContain('class="katex"')
+    // Native browser coverage asserts the outer KaTeX/display wrappers and SVG.
+    // happy-dom drops an outer sanitized span; verify semantic output here.
+    expect(inline).toContain('class="katex-mathml"')
+    expect(inline).toContain('encoding="application/x-tex">x^2</annotation>')
     expect(inline).not.toContain('$x^2$')
-    expect(display).toContain('class="katex-display"')
+    expect(display).toContain('<mfrac>')
     expect(display).not.toContain('$$\\frac{a}{b}$$')
   })
 })
 
 describe('useChatTextRendering cache bounds', () => {
+  it('reuses a large settled answer across projections while keeping render modes separate', () => {
+    const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
+    const parse = vi.spyOn(Parser, 'parse')
+    const body = ('## Answer\n\n```js\nconst answer = 42\n```\n\n' + 'long answer '.repeat(12_000))
+      .slice(0, 128 * 1024)
+    const highlighted = renderMarkdown(body)
+    expect(renderMarkdown(body)).toBe(highlighted)
+    expect(parse).toHaveBeenCalledTimes(1)
+    expect(highlighted).toContain('hljs-keyword')
+    expect(markdownCacheStats().entries).toBe(1)
+    expect(markdownCacheStats().bytes).toBeLessThanOrEqual(1024 * 1024)
+
+    const plain = renderMarkdown(body, { highlight: false })
+    expect(plain).not.toContain('hljs-keyword')
+    expect(renderMarkdown(body, { highlight: false })).toBe(plain)
+    expect(parse).toHaveBeenCalledTimes(2)
+    expect(renderMarkdown(body)).toBe(highlighted)
+    expect(parse).toHaveBeenCalledTimes(2)
+  })
+
   it('never retains growing live prefixes', () => {
     const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
     for (let index = 1; index <= 200; index += 1) {

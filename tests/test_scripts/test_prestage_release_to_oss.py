@@ -51,6 +51,7 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
             import json
             import os
             import shutil
+            import subprocess
             import sys
             from pathlib import Path
 
@@ -60,14 +61,13 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
             root = Path(os.environ["FAKE_OSS_ROOT"])
 
             def native_path(value: str) -> Path:
-                if (
-                    os.name == "nt"
-                    and len(value) >= 3
-                    and value[0] == "/"
-                    and value[1].isalpha()
-                    and value[2] == "/"
-                ):
-                    value = f"{value[1].upper()}:{value[2:]}"
+                if os.name == "nt" and value.startswith("/"):
+                    # Git Bash realpath may use /tmp, not only /c drive paths.
+                    # Use the same runtime's mount mapping for local paths.
+                    value = subprocess.check_output(
+                        [os.environ["FAKE_OSS_CYGPATH"], "-w", value],
+                        text=True,
+                    ).strip()
                 return Path(value)
 
             def mapped(value: str) -> Path:
@@ -168,6 +168,16 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
             "PYTHON_BIN": (fake_bin / "opensquilla-test-python").as_posix(),
         }
     )
+    if os.name == "nt":
+        bash = Path(_bash_executable())
+        cygpath_candidates = (
+            bash.parent / "cygpath.exe",
+            bash.parent.parent / "usr" / "bin" / "cygpath.exe",
+        )
+        cygpath = next((path for path in cygpath_candidates if path.is_file()), None)
+        if cygpath is None:
+            raise RuntimeError("Git for Windows cygpath.exe is required for this workflow test")
+        env["FAKE_OSS_CYGPATH"] = str(cygpath)
     return subprocess.run(
         [
             _bash_executable(),
@@ -177,6 +187,7 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
         ],
         cwd=Path.cwd(),
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,

@@ -1102,7 +1102,6 @@ def _video_parameters(
         getattr(config, "duration_seconds", None) if duration_seconds is None else duration_seconds
     )
     provider = _video_provider(config)
-    max_duration = int(getattr(config, "max_duration_seconds", 8))
     provider_cap = {
         "gemini": 8,
         "xai": 15,
@@ -1110,7 +1109,6 @@ def _video_parameters(
         "qwen_token_plan": 15,
         "tokenrhythm": 30,
     }.get(provider)
-    effective_max_duration = min(max_duration, provider_cap) if provider_cap else max_duration
     minimum_duration = 1
     if provider == "gemini":
         minimum_duration = 4
@@ -1123,12 +1121,15 @@ def _video_parameters(
     if duration is not None and (
         isinstance(duration, bool)
         or not isinstance(duration, int)
-        or not minimum_duration <= duration <= effective_max_duration
+        or duration < minimum_duration
+        or (provider_cap is not None and duration > provider_cap)
     ):
-        raise ToolError(
-            f"duration_seconds must be between {minimum_duration} and "
-            f"{effective_max_duration} for {provider or 'video generation'}"
+        allowed = (
+            f"between {minimum_duration} and {provider_cap}"
+            if provider_cap is not None
+            else f"at least {minimum_duration}"
         )
+        raise ToolError(f"duration_seconds must be {allowed} for {provider or 'video generation'}")
     aspect = aspect_ratio or str(getattr(config, "aspect_ratio", "16:9"))
     allowed_aspects = tuple(getattr(config, "allowed_aspect_ratios", (aspect,)))
     if aspect not in allowed_aspects:
@@ -1140,11 +1141,8 @@ def _video_parameters(
     if provider == "gemini":
         if duration is not None and duration not in {4, 6, 8}:
             raise ToolError("Gemini Veo duration_seconds must be 4, 6, or 8")
-        if size == "1080p" and (max_duration < 8 or duration not in {None, 8}):
-            raise ToolError("Gemini Veo 1080p requires an 8-second duration limit")
-    if provider in {"qwen", "qwen_token_plan", "tokenrhythm"}:
-        if max_duration < minimum_duration:
-            raise ToolError(f"Selected video model requires at least {minimum_duration} seconds")
+        if size == "1080p" and duration not in {None, 8}:
+            raise ToolError("Gemini Veo 1080p requires an 8-second duration")
     if provider == "xai" and str(getattr(config, "primary", "")) == "grok-imagine-video":
         if size == "1080p":
             raise ToolError("grok-imagine-video supports at most 720p")
@@ -1475,7 +1473,8 @@ def _video_adapter(provider: str) -> tuple[Any, Any]:
         },
         "duration_seconds": {
             "type": "integer",
-            "description": "Optional clip duration, within the operator's configured limit.",
+            "description": "Optional clip duration supported by the configured provider/model. "
+            "Omit to use the configured default, then the provider/model default.",
         },
         "aspect_ratio": {
             "type": "string",
@@ -1570,7 +1569,6 @@ async def video_generate(
                 model=str(config.primary),
                 prompt=prompt.strip(),
                 duration=duration,
-                max_duration_seconds=int(config.max_duration_seconds),
                 aspect_ratio=aspect,
                 resolution=size,
                 output_path=target,

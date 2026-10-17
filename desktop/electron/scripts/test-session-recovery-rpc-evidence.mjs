@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { createSessionRecoveryEvidence, createSessionRecoveryFault, sessionRecoveryFaultDomain } from './session-recovery-rpc-evidence.mjs'
+import { createSessionBootstrapGate, createSessionRecoveryEvidence, createSessionRecoveryFault, sessionRecoveryFaultDomain } from './session-recovery-rpc-evidence.mjs'
 
 const KEY = 'synthetic:recovery'
 const PREFIX = 'sessions.messages.'
@@ -23,6 +23,32 @@ assert.equal(sessionRecoveryFaultDomain({ type: 'req', method: 'chat.history',
 assert.equal(sessionRecoveryFaultDomain({ type: 'req', method: PREFIX + 'hydrate',
   params: { key: KEY } }, KEY), null)
 assert.equal(sessionRecoveryFaultDomain(null, KEY), null)
+
+// A separate cold gate preserves the no-cache case without sharing or changing
+// the later timeout fault. It forwards original requests, never synthetic ACKs.
+const coldGate = createSessionBootstrapGate(KEY)
+const coldForwarded = []
+assert.equal(coldGate.holdRequest(1, faultRequests[0], () => assert.fail('inactive gate')), false)
+coldGate.begin()
+assert.throws(() => coldGate.begin(), /already active/)
+for (const frame of faultRequests) {
+  assert.equal(coldGate.holdRequest(1, frame, () => assert.fail('closed socket forwarded')), true)
+  assert.equal(coldGate.holdRequest(2, frame, () => coldForwarded.push(frame)), true)
+  assert.equal(coldGate.holdRequest(2, { ...frame, params: { key: 'synthetic:peer' } },
+    () => assert.fail('peer must bypass gate')), false)
+}
+assert.equal(coldGate.holdRequest(2, { type: 'req', method: 'chat.send', params: { key: KEY } },
+  () => assert.fail('send must not be swallowed by a history gate')), false)
+assert.equal(coldGate.holdRequest(2, { type: 'event', event: 'tick' },
+  () => assert.fail('tick must bypass gate')), false)
+coldGate.close(1)
+assert.deepEqual(coldGate.methods(), faultRequests.map(frame => frame.method))
+assert.deepEqual(coldForwarded, [])
+coldGate.release()
+coldGate.release()
+assert.deepEqual(coldForwarded, faultRequests, 'cold release must forward both original requests exactly once')
+assert.deepEqual(coldGate.methods(), [])
+assert.equal(coldGate.holdRequest(2, faultRequests[0], () => assert.fail('released gate')), false)
 
 // Replay the current subscribe + snapshot.read exchange. Only the target's
 // successful READ response is held; the Gateway still creates a real proof.

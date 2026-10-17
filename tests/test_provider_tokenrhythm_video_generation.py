@@ -52,7 +52,6 @@ async def _generate(output_path: Path, **overrides: object):
         "model": "wan3.0-video",
         "prompt": "A quiet city street at dawn",
         "duration": 8,
-        "max_duration_seconds": 8,
         "aspect_ratio": "16:9",
         "resolution": "1080p",
         "output_path": output_path,
@@ -110,6 +109,29 @@ async def test_submits_native_request_polls_and_downloads_without_bearer(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("duration", "expected"), [(None, 5), (10, 10), (20, 20), (30, 30)])
+async def test_uses_explicit_duration_or_provider_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, duration: int | None, expected: int
+) -> None:
+    posts: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(json.loads(request.content))
+            return httpx.Response(202, json={"id": _JOB})
+        if request.url.path == f"/proxy/v1/videos/{_JOB}":
+            return _status("succeeded")
+        return httpx.Response(
+            200, headers={"content-type": "video/mp4"}, stream=httpx.ByteStream(_MP4)
+        )
+
+    _install_transport(monkeypatch, handler)
+    await _generate(tmp_path / "clip.mp4", duration=duration)
+    assert len(posts) == 1
+    assert posts[0]["duration"] == expected
+
+
+@pytest.mark.asyncio
 async def test_pending_job_resumes_with_get_without_another_paid_post(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -161,7 +183,7 @@ async def test_pending_job_resumes_with_get_without_another_paid_post(
     [
         {"model": "../wan3.0-video"},
         {"duration": 31},
-        {"duration": 9, "max_duration_seconds": 8},
+        {"duration": 1},
         {"aspect_ratio": "1:1"},
         {"resolution": "4k"},
         {"base_url": "http://untrusted.example/v1"},

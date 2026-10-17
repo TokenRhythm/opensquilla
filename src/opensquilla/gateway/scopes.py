@@ -134,6 +134,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.get": READ_SCOPE,
     SESSIONS_LIST_METHOD: READ_SCOPE,
     SESSIONS_SEARCH_METHOD: READ_SCOPE,
+    "sessions.messages.search": READ_SCOPE,
     "sessions.preview": READ_SCOPE,
     SESSIONS_RESOLVE_METHOD: READ_SCOPE,
     "sessions.bootstrap": READ_SCOPE,
@@ -141,6 +142,13 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.processes.list": READ_SCOPE,
     "sessions.processes.log": READ_SCOPE,
     "sessions.processes.stop": WRITE_SCOPE,
+    # Connection-owned interactive PTY control. The handlers additionally
+    # require the principal's explicit host.execute capability.
+    "terminal.create": WRITE_SCOPE,
+    "terminal.write": WRITE_SCOPE,
+    "terminal.resize": WRITE_SCOPE,
+    "terminal.close": WRITE_SCOPE,
+    "terminal.consume": WRITE_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
@@ -258,6 +266,8 @@ METHOD_SCOPES: dict[str, str] = {
     SESSIONS_CREATE_METHOD: WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
     "sessions.forkThroughTurn": WRITE_SCOPE,
+    "sessions.sidechat.create": WRITE_SCOPE,
+    "sessions.sidechat.close": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
     "sessions.routing.set": WRITE_SCOPE,
     "sessions.pending_inputs.enqueue": WRITE_SCOPE,

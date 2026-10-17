@@ -1,13 +1,147 @@
 // @vitest-environment happy-dom
 
-import { createApp, h } from 'vue'
-import { afterEach, describe, expect, it } from 'vitest'
+import { createApp, h, ref } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
+import ActivityCodeDetails from '@/components/chat/ActivityCodeDetails.vue'
+import ActivityToolDetails from '@/components/chat/ActivityToolDetails.vue'
+import activityCodeSource from '@/components/chat/ActivityCodeDetails.vue?raw'
+import activityToolSource from '@/components/chat/ActivityToolDetails.vue?raw'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
+import type { ActivityToolCodeView } from '@/utils/chat/activityToolDetails'
+import type { ChatToolCallRenderItem } from '@/types/chat'
 import { useChatTextRendering } from './useChatTextRendering'
-import { buildShareDom, staticAssetUrl } from './useChatShareExport'
+import { buildShareDom, staticAssetUrl, useChatShareExport } from './useChatShareExport'
+
+const diagramExportMocks = vi.hoisted(() => ({
+  render: vi.fn(),
+  capture: vi.fn(),
+}))
+vi.mock('@/utils/markdown/mermaidRenderer', () => ({
+  renderMarkdownDiagrams: diagramExportMocks.render,
+  restoreClonedDiagramSources: vi.fn(),
+}))
+vi.mock('html-to-image', () => ({ toCanvas: diagramExportMocks.capture }))
+
+describe('share export diagram preparation', () => {
+  const captureStop = new Error('stop after verifying capture input')
+
+  beforeEach(() => {
+    diagramExportMocks.render.mockReset().mockResolvedValue(undefined)
+    diagramExportMocks.capture.mockReset().mockRejectedValue(captureStop)
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      queueMicrotask(() => callback(0))
+      return 1
+    })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    document.body.innerHTML = ''
+    delete document.documentElement.dataset.theme
+  })
+
+  function createExport() {
+    const thread = document.createElement('div')
+    thread.innerHTML = '<article data-share-message-id="diagram"><div class="msg-ai-text">'
+      + '<pre data-diagram-language="mermaid"><code>graph TD; A--&gt;B</code>'
+      + '<button data-share-control>Copy</button></pre></div></article>'
+    document.body.appendChild(thread)
+    return {
+      thread,
+      ...useChatShareExport({
+        threadRef: ref(thread),
+        title: () => 'Diagrams',
+        aiGeneratedLabel: () => 'AI generated',
+      }),
+    }
+  }
+
+  it('waits for inline diagrams in the export theme and disposes the clone owner after capture', async () => {
+    const { thread, buildShareImage } = createExport()
+    const original = thread.innerHTML
+    let finishRender!: () => void
+    const dispose = vi.fn()
+    diagramExportMocks.render.mockImplementation((stage: HTMLElement, _labels: unknown, options: { onRendered: (value: unknown) => void }) => {
+      expect(stage.isConnected).toBe(true)
+      expect(stage.dataset.theme).toBe('light')
+      expect(stage.querySelector('[data-share-control]')).toBeNull()
+      return new Promise<void>((resolve) => {
+        finishRender = () => {
+          const diagram = document.createElement('div')
+          diagram.className = 'mermaid-diagram'
+          diagram.innerHTML = '<div class="mermaid-svg-wrap"><svg viewBox="0 0 10 10"><text>Done</text></svg></div><div class="mermaid-toolbar"><button>Copy</button></div>'
+          stage.querySelector('pre')!.replaceWith(diagram)
+          options.onRendered({ element: diagram, dispose })
+          resolve()
+        }
+      })
+    })
+    document.documentElement.dataset.theme = 'dark'
+    const result = buildShareImage(new Set(['diagram']), { theme: 'light' })
+    const failure = expect(result).rejects.toBe(captureStop)
+    await vi.waitFor(() => expect(diagramExportMocks.render).toHaveBeenCalledOnce())
+    expect(diagramExportMocks.render.mock.calls[0]?.[1]).toMatchObject({
+      loadFailed: i18n.global.t('chat.mermaid.loadFailed'),
+      tooLarge: i18n.global.t('chat.mermaid.tooLarge'),
+      copyCode: i18n.global.t('chat.mermaid.copyCode'),
+    })
+    expect(diagramExportMocks.render.mock.calls[0]?.[2]).toMatchObject({
+      themeId: 'light',
+      signal: expect.any(AbortSignal),
+      onRendered: expect.any(Function),
+    })
+    expect(diagramExportMocks.capture).not.toHaveBeenCalled()
+
+    finishRender()
+    await failure
+
+    expect(diagramExportMocks.capture).toHaveBeenCalledOnce()
+    const captured = diagramExportMocks.capture.mock.calls[0]?.[0] as HTMLElement
+    expect(captured.style.left).toBe('0px')
+    expect(captured.style.top).toBe('0px')
+    expect(captured.querySelector('.mermaid-svg-wrap > svg')).not.toBeNull()
+    expect(captured.querySelector('.mermaid-toolbar')).toBeNull()
+    expect(dispose).toHaveBeenCalledOnce()
+    expect(diagramExportMocks.render.mock.calls[0]?.[2].signal.aborted).toBe(true)
+    expect(captured.isConnected).toBe(false)
+    expect(document.getElementById('opensquilla-share-export-stage')).toBeNull()
+    expect(thread.innerHTML).toBe(original)
+  })
+
+  it('cleans up the mounted stage when diagram preparation fails', async () => {
+    const { buildShareImage } = createExport()
+    const failure = new Error('renderer initialization failed')
+    diagramExportMocks.render.mockRejectedValue(failure)
+
+    await expect(buildShareImage(new Set(['diagram']))).rejects.toBe(failure)
+
+    expect(diagramExportMocks.capture).not.toHaveBeenCalled()
+    expect(document.getElementById('opensquilla-share-export-stage')).toBeNull()
+  })
+
+  it('preserves diagram source for re-rendering while stripping code-copy controls', () => {
+    const { thread } = createExport()
+    const source = thread.querySelector<HTMLElement>('article')!
+    const code = source.querySelector('code')!
+    code.hidden = true
+    source.querySelector('pre')!.dataset.diagramState = 'ready'
+    const legacyCopy = document.createElement('button')
+    legacyCopy.className = 'code-copy-btn'
+    legacyCopy.textContent = 'Copy source'
+    source.querySelector('pre')!.appendChild(legacyCopy)
+
+    const stage = buildShareDom([source], 'light')
+
+    expect(stage.querySelector('pre')?.dataset.diagramLanguage).toBe('mermaid')
+    expect(stage.querySelector('code')?.textContent).toBe('graph TD; A-->B')
+    expect(stage.querySelector('code')?.hidden).toBe(true)
+    expect(stage.querySelector('button')).toBeNull()
+    expect(source.querySelectorAll('button')).toHaveLength(2)
+  })
+})
 
 describe('buildShareDom protocol-shaped documentation', () => {
   it('clones the complete rendered message into the share image stage', () => {
@@ -225,6 +359,102 @@ describe('buildShareDom protocol-shaped documentation', () => {
     expect(stage.textContent).not.toContain('Hidden legacy output')
     expect(stage.textContent).toContain('Visible legacy output')
     expect(stage.textContent?.match(/Canonical answer/g)).toHaveLength(1)
+  })
+})
+
+describe('share export expanded tool content', () => {
+  const apps: ReturnType<typeof createApp>[] = []
+
+  afterEach(() => {
+    while (apps.length) apps.pop()?.unmount()
+    document.body.innerHTML = ''
+  })
+
+  function mountTool(render: () => ReturnType<typeof h>) {
+    const host = document.createElement('article')
+    host.dataset.shareMessageId = 'expanded-tool'
+    document.body.appendChild(host)
+    // Use the real renderer and its live stylesheet so the export must undo
+    // the actual capped/scrolling treatment, not a synthetic export fixture.
+    const style = document.createElement('style')
+    style.textContent = [activityCodeSource, activityToolSource]
+      .map(source => source.match(/<style[^>]*>([\s\S]*?)<\/style>/)?.[1] || '')
+      .join('\n')
+    document.body.appendChild(style)
+    const app = createApp({ render })
+    app.use(i18n)
+    app.mount(host)
+    apps.push(app)
+    return host
+  }
+
+  const longLine = `long-line-${'abcdef'.repeat(150)}-line-end`
+  const retainedText = ['first-loaded-line', longLine,
+    ...Array.from({ length: 80 }, (_, index) => `loaded line ${index}`), 'last-loaded-line'].join('\n')
+
+  it.each<ActivityToolCodeView>([
+    { kind: 'command', command: `echo ${longLine}`, output: retainedText, exitCode: 1, partial: true },
+    { kind: 'write', path: 'generated.html', language: 'html', content: retainedText },
+    { kind: 'edit', path: 'generated.svg', content: `--- before\n+++ after\n-${longLine}\n+${retainedText}` },
+  ])('exports every loaded $kind line without cropping or changing the live viewport', (view) => {
+    const host = mountTool(() => h(ActivityCodeDetails, { view }))
+    const original = host.querySelector<HTMLElement>('.activity-code-details__viewport')!
+    original.scrollTop = 260
+    original.scrollLeft = 170
+    const originalHtml = host.innerHTML
+    expect(getComputedStyle(original).overflow).toBe('auto')
+
+    const stage = buildShareDom([host])
+    document.body.appendChild(stage)
+    const shared = stage.querySelector<HTMLElement>('.activity-code-details__viewport')!
+    const viewportStyle = getComputedStyle(shared)
+    expect(shared.textContent).toBe(original.textContent)
+    expect(shared.textContent).toContain('first-loaded-line')
+    expect(shared.textContent).toContain('last-loaded-line')
+    expect(shared.textContent).toContain(longLine)
+    expect(viewportStyle.maxHeight).toBe('none')
+    expect(viewportStyle.overflow).toBe('visible')
+    expect(shared.scrollTop).toBe(0)
+    expect(shared.scrollLeft).toBe(0)
+    for (const code of shared.querySelectorAll<HTMLElement>('pre, code')) {
+      const style = getComputedStyle(code)
+      expect(style.whiteSpace).toBe('pre-wrap')
+      expect(style.overflowWrap).toBe('anywhere')
+      expect(style.width).toBe('100%')
+    }
+    // Retained-log incompleteness remains honest; exporting never fetches the
+    // missing pages or pretends the loaded rows are the complete result.
+    if (view.partial) expect(shared.querySelector('.activity-code-details__note')?.textContent)
+      .toBe(original.querySelector('.activity-code-details__note')?.textContent)
+    expect(stage.querySelector('[data-share-control]')).toBeNull()
+    expect(host.innerHTML).toBe(originalHtml)
+    expect(original.scrollTop).toBe(260)
+    expect(original.scrollLeft).toBe(170)
+    expect(getComputedStyle(original).overflow).toBe('auto')
+  })
+
+  it('uncaps both layers of a generic tool result and keeps its last loaded row', () => {
+    const call: ChatToolCallRenderItem = {
+      toolId: 'generic', renderKey: 'generic', name: 'custom_tool', displayName: 'Custom tool',
+      inputRaw: '', inputPreview: '', result: retainedText, resultPreview: retainedText.slice(0, 200),
+      isRunning: false, status: 'success', isError: false, isOpen: true,
+    }
+    const host = mountTool(() => h(ActivityToolDetails, { call, operationKey: 'tool.custom', label: 'Custom tool' }))
+    const original = host.querySelector<HTMLElement>('.activity-tool-details__window')!
+    original.scrollTop = 500
+    const stage = buildShareDom([host])
+    document.body.appendChild(stage)
+
+    for (const selector of ['.activity-tool-details--bounded', '.activity-tool-details__window']) {
+      const element = stage.querySelector<HTMLElement>(selector)!
+      expect(getComputedStyle(element).maxHeight).toBe('none')
+      expect(getComputedStyle(element).overflow).toBe('visible')
+      expect(element.scrollTop).toBe(0)
+    }
+    expect(stage.querySelector('.activity-tool-details__preview')?.textContent).toBe(retainedText)
+    expect(stage.querySelector('[data-share-control]')).toBeNull()
+    expect(original.scrollTop).toBe(500)
+    expect(host.querySelector('[data-testid="activity-tool-detail-copy"]')).not.toBeNull()
   })
 })
 

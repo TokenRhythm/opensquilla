@@ -435,7 +435,10 @@ class FakeSessionManager:
         auth_profile_override_source: str | None = None,
         workspace_id: str | None = None,
         origin: dict[str, Any] | None = None,
+        reuse_existing: bool = False,
     ):
+        if reuse_existing and session_key in self._storage._sessions:
+            return self._storage._sessions[session_key]
         session = FakeSession(
             session_key=session_key,
             session_id=session_key.rsplit(":", 1)[-1],
@@ -915,6 +918,190 @@ def ctx_no_manager():
 
 
 class TestSessionsCreate:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("conflicting_workspace", [False, True])
+    async def test_materialize_draft_does_not_overwrite_concurrent_durable_creation(
+        self, dispatcher, monkeypatch: pytest.MonkeyPatch, conflicting_workspace: bool
+    ):
+        from opensquilla.session.manager import SessionManager
+
+        async with SessionStorage(":memory:") as storage:
+            manager = SessionManager(storage, inject_time_prefix=False)
+            independent_writer = SessionManager(storage, inject_time_prefix=False)
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            key = "agent:main:webchat:creation-race"
+
+            async def pause_after_absence_check(node):
+                entered.set()
+                await release.wait()
+                return None
+
+            monkeypatch.setattr(manager, "_prepare_execution_workspace", pause_after_absence_check)
+            request = asyncio.create_task(dispatcher.dispatch(
+                "race", "sessions.create",
+                {"agentId": "main", "kind": "webchat", "session_key": key, "model": "loser"},
+                make_ctx(session_manager=manager, turn_runner=_RecordingTurnRunner()),
+            ))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                winner = await independent_writer.create(
+                    key, model="winner",
+                    workspace_id="another-project" if conflicting_workspace else None,
+                )
+                await independent_writer.append_message(key, "user", "accepted turn")
+            finally:
+                release.set()
+            response = await request
+            current = await storage.get_session(key)
+            assert current.session_id == winner.session_id
+            assert current.model == "winner"
+            assert [entry.content for entry in await independent_writer.get_transcript(key)] == [
+                "accepted turn"
+            ]
+            if conflicting_workspace:
+                assert response.ok is False
+                assert response.error.code == "INVALID_PARAMS"
+            else:
+                assert response.ok is True
+                assert response.payload["sessionId"] == winner.session_id
+
+    @pytest.mark.asyncio
+    async def test_materialize_project_draft_reuses_key_without_rebinding(
+        self, dispatcher, monkeypatch: pytest.MonkeyPatch
+    ):
+        manager = FakeSessionManager()
+        runner = _RecordingTurnRunner()
+
+        async def resolve_workspace(storage: Any, workspace_id: str) -> Any:
+            return SimpleNamespace(workspace=SimpleNamespace(
+                workspace_id=workspace_id, path=f"/synthetic/{workspace_id}"
+            ))
+
+        monkeypatch.setattr(rpc_sessions, "resolve_validated_project_workspace", resolve_workspace)
+        ctx = make_ctx(session_manager=manager, turn_runner=runner)
+        key = "agent:main:webchat:provisional-draft"
+        params = {"agentId": "main", "kind": "webchat", "session_key": key,
+                  "workspaceId": "project-a", "model": "first-model"}
+        first = await dispatcher.dispatch("first", "sessions.create", params, ctx)
+        assert first.ok is True
+        original = manager._storage._sessions[key]
+        retry = await dispatcher.dispatch(
+            "retry", "sessions.create",
+            {**params, "model": "changed-model", "displayName": "changed"}, ctx,
+        )
+        assert retry.ok is True
+        assert retry.payload == first.payload
+        assert manager._storage._sessions[key] is original
+        assert original.model == "first-model"
+        assert original.display_name is None
+        assert original.origin[RUN_CONTEXT_ORIGIN_KEY]["workspace"] == "/synthetic/project-a"
+        for workspace in ("project-b", None):
+            conflicting = {**params, "workspaceId": workspace}
+            failed = await dispatcher.dispatch("conflict", "sessions.create", conflicting, ctx)
+            assert failed.ok is False
+            assert failed.error.code == "INVALID_PARAMS"
+        assert original.workspace_id == "project-a"
+        assert manager.created_messages == []
+        assert runner.run_calls == []
+
+    @pytest.mark.asyncio
+    async def test_materialize_draft_serializes_retries_with_session_runtime(self, dispatcher):
+        manager = FakeSessionManager()
+        runner = _RecordingTurnRunner()
+        key = "agent:main:webchat:concurrent-draft"
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        create = manager.create
+        calls = 0
+
+        async def delayed_create(**kwargs):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            return await create(**kwargs)
+
+        manager.create = delayed_create
+        ctx = make_ctx(session_manager=manager, turn_runner=runner)
+        params = {"agentId": "main", "kind": "webchat", "session_key": key}
+        lock = runner._get_session_lock(key)
+        await lock.acquire()
+        first = asyncio.create_task(dispatcher.dispatch("first", "sessions.create", params, ctx))
+        await asyncio.sleep(0)
+        assert not entered.is_set()
+        lock.release()
+        await entered.wait()
+        second = asyncio.create_task(dispatcher.dispatch("second", "sessions.create", params, ctx))
+        await asyncio.sleep(0)
+        assert calls == 1
+        release.set()
+        results = await asyncio.gather(first, second)
+        assert all(result.ok for result in results)
+        assert results[0].payload == results[1].payload
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fields", [
+        {"agent_id": "other"},
+        {"guest_owner_id": "guest-owner"},
+    ])
+    async def test_materialize_draft_rejects_incompatible_durable_owner(
+        self, dispatcher, fields
+    ):
+        key = "agent:main:webchat:existing-draft"
+        existing = FakeSession(session_key=key)
+        for name, value in fields.items():
+            setattr(existing, name, value)
+        manager = FakeSessionManager([existing])
+        response = await dispatcher.dispatch(
+            "conflict", "sessions.create",
+            {"agentId": "main", "kind": "webchat", "session_key": key},
+            make_ctx(session_manager=manager, turn_runner=_RecordingTurnRunner()),
+        )
+        assert response.ok is False
+        assert response.error.code == "INVALID_PARAMS"
+        assert manager._storage._sessions[key] is existing
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("params", [
+        {"session_key": "agent:other:webchat:draft"},
+        {"session_key": "agent:main:main"},
+        {"session_key": "agent:main:webchat:guest:owner:draft"},
+        {"session_key": "agent:main:webchat:default"},
+        {"session_key": "agent:main:webchat:draft", "kind": "cli"},
+        {"session_key": "agent:main:webchat:draft", "message": "hello"},
+        {"session_key": ""},
+        {"session_key": 123},
+    ])
+    async def test_materialize_draft_rejects_other_namespaces_and_initial_messages(
+        self, dispatcher, params
+    ):
+        manager = FakeSessionManager()
+        result = await dispatcher.dispatch(
+            "invalid", "sessions.create", {"agentId": "main", "kind": "webchat", **params},
+            make_ctx(session_manager=manager, turn_runner=_RecordingTurnRunner()),
+        )
+        assert result.ok is False
+        assert result.error.code == "INVALID_REQUEST"
+        assert manager._storage._sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_materialize_draft_requires_owner_and_runtime(self, dispatcher):
+        params = {"agentId": "main", "kind": "webchat", "session_key": "agent:main:webchat:draft"}
+        manager = FakeSessionManager()
+        guest = await dispatcher.dispatch(
+            "guest", "sessions.create", params,
+            make_ctx(session_manager=manager, role="guest", scopes=["operator.write"]),
+        )
+        assert guest.ok is False
+        assert guest.error.code == "OWNER_REQUIRED"
+        for ctx in (make_ctx(session_manager=manager), make_ctx(session_manager=None)):
+            unavailable = await dispatcher.dispatch("missing", "sessions.create", params, ctx)
+            assert unavailable.ok is False
+            assert unavailable.error.code == "UNAVAILABLE"
+        assert manager._storage._sessions == {}
+
     @pytest.mark.asyncio
     async def test_create_stub(self, dispatcher, ctx_no_manager):
         res = await dispatcher.dispatch(

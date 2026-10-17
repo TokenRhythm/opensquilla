@@ -86,6 +86,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
+      '@office-preview-fonts': resolve(__dirname, 'node_modules/.cache/office-preview-fonts'),
     },
   },
   // Vitest: pure unit/property tests for the chat reducer and the merge/parity

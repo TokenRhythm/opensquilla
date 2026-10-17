@@ -287,7 +287,7 @@ class _FinalAdmissionContextOverflowProvider(_ContextOverflowProvider):
 class _HangingRetryAfterOverflowProvider(_ContextOverflowProvider):
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
-            yield ProviderError(message="context length exceeded", code="400")
+            yield ProviderError(message="context length exceeded", code="400", http_status=400)
             return
         await asyncio.Event().wait()
         yield ProviderText(text="unreachable")
@@ -2226,6 +2226,7 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
     assert any(
         isinstance(event, ErrorEvent)
         and event.code == "compaction_deadline_exceeded"
+        and event.http_status is None
         for event in events
     )
     terminal = [

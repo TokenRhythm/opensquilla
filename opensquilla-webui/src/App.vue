@@ -4,11 +4,11 @@
     ref="sidebarRef"
     class="sidebar"
     :class="{
-      docked: appStore.sidebarOpen,
+      docked: effectiveSidebarOpen,
       'sidebar--drawer': isSidebarDrawer,
     }"
-    :inert="!appStore.sidebarOpen"
-    :aria-hidden="appStore.sidebarOpen ? undefined : 'true'"
+    :inert="!effectiveSidebarOpen"
+    :aria-hidden="effectiveSidebarOpen ? undefined : 'true'"
     :aria-label="t('chrome.primaryNav')"
     id="sidebar-nav"
   >
@@ -23,7 +23,7 @@
         class="sidebar-dock-toggle"
         :aria-label="t('chrome.collapseSidebar')"
         aria-controls="sidebar-nav"
-        :aria-expanded="appStore.sidebarOpen"
+        :aria-expanded="effectiveSidebarOpen"
         :aria-keyshortcuts="sidebarToggleAriaShortcut"
         aria-describedby="sidebar-toggle-tip-expanded"
         data-testid="sidebar-toggle-expanded"
@@ -53,7 +53,7 @@
         :title="newChatHint ? `${t('chrome.newTaskTitle')} (${newChatHint})` : t('chrome.newTaskTitle')"
         @click="startNewChatInstant"
       >
-        <Icon name="plus" :size="16" />
+        <Icon name="plus" :size="17" />
         <span class="sidebar-new-session__label">{{ t('chrome.newTask') }}</span>
         <!-- Badge tracks the configured binding and hides when the shortcut is
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
@@ -70,7 +70,7 @@
         :aria-current="isPrimaryNavActive(item.path) ? 'page' : undefined"
         @click="handleNavClick"
       >
-        <Icon :name="item.icon" :size="16" />
+        <Icon :name="sidebarNavIcons[item.icon] ?? item.icon" :size="17" />
         <span class="sidebar-fn-label">{{ item.title }}</span>
       </router-link>
     </div>
@@ -94,6 +94,7 @@
       @refresh="loadSidebarData"
       @load-more="loadMoreSessions"
       @rename="onRenameSession"
+      @copy-session-link="onCopySidebarSessionLink"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
       @reorder="onReorderSidebarSession"
@@ -108,24 +109,25 @@
       @search="openCommandPalette"
     />
 
-    <!-- Fixed footer: settings + connection state -->
+    <!-- Fixed footer: settings and the desktop update entry -->
     <div class="sidebar-foot">
+      <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
       <button
         type="button"
         class="sidebar-fn-item"
         data-icon="settings"
         @click="openSettings"
       >
-        <Icon name="settings" :size="16" />
+        <Icon name="settings-2" :size="17" />
         <span class="sidebar-fn-label">{{ t('chrome.settings') }}</span>
       </button>
     </div>
   </nav>
 
   <SidebarResizer
-    v-if="appStore.sidebarOpen && isSidebarResizable"
+    v-if="effectiveSidebarOpen && isSidebarResizable"
     ref="sidebarResizerRef"
-    :enabled="appStore.sidebarOpen && isSidebarResizable"
+    :enabled="effectiveSidebarOpen && isSidebarResizable"
     :width="sidebarEffectiveWidth"
     :min="SIDEBAR_MIN_WIDTH"
     :max="sidebarDynamicMaximum"
@@ -142,7 +144,7 @@
 
   <!-- Drawer scrim is driven by the same runtime mode as JS focus/Escape logic. -->
   <div
-    v-if="appStore.sidebarOpen && isSidebarDrawer"
+    v-if="effectiveSidebarOpen && isSidebarDrawer"
     class="sidebar-scrim"
     role="presentation"
     aria-hidden="true"
@@ -162,32 +164,47 @@
   <div
     id="app-main"
     class="main"
-    :inert="appStore.sidebarOpen && isSidebarDrawer"
+    :inert="effectiveSidebarOpen && isSidebarDrawer"
     :class="{
-      docked: appStore.sidebarOpen,
+      docked: effectiveSidebarOpen,
       'main--sidebar-drawer': isSidebarDrawer,
       'main--sidebar-compact': sidebarLayoutMode === 'compact',
       'main--chat': isChatRoute,
-      'main--chat-sidebar-collapsed': isChatRoute && !appStore.sidebarOpen,
+      'main--chat-sidebar-collapsed': isChatRoute && !effectiveSidebarOpen,
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }">
+    <div ref="workspaceRef" class="app-workspace" :data-workbench-layout="effectiveWorkbenchLayout">
+      <div
+        v-show="!mainPaneHidden"
+        class="app-chat-pane"
+        :class="{ 'app-chat-pane--layout-motion': workbenchMotionEnabled }"
+        :inert="workbenchSinglePane || undefined"
+        :aria-hidden="workbenchSinglePane ? 'true' : undefined"
+      >
+    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }" :data-connection-state="effectiveConnectionState">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
-          v-show="!appStore.sidebarOpen"
+          v-show="!effectiveSidebarOpen"
           ref="topbarSidebarToggleRef"
           class="sidebar-dock-toggle topbar-toggle"
-          :aria-label="t('chrome.expandSidebar')"
+          :aria-label="sidebarExpandLabel"
           aria-controls="sidebar-nav"
-          :aria-expanded="appStore.sidebarOpen"
+          :aria-expanded="effectiveSidebarOpen"
           :aria-keyshortcuts="sidebarToggleAriaShortcut"
           aria-describedby="sidebar-toggle-tip-collapsed"
           data-testid="sidebar-toggle-collapsed"
           @click="toggleDock('topbar-button')"
         >
           <Icon name="sidebar-hidden" :size="18" />
+          <span
+            v-if="desktopUpdate.visible.value"
+            class="sidebar-update-dot"
+            :data-state="desktopUpdateSeverity"
+            data-testid="sidebar-update-dot"
+            aria-hidden="true"
+          ></span>
           <span id="sidebar-toggle-tip-collapsed" class="sidebar-toggle-tip" role="tooltip">
             <span>{{ t('chrome.toggleSidebar') }}</span>
             <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
@@ -213,109 +230,42 @@
           :has-new-deliverable="chatRouteHeaderHasNewDeliverable"
           :share-mode="chatRouteHeaderShareMode"
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
+          :find-state="chatRouteHeaderFindState"
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
-          @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
           @copy-session-link="chatRouteHeader.invoke('copySessionLink')"
-          @copy-gateway-link="chatRouteHeader.invoke('copyGatewayLink')"
+          @open-find="chatRouteHeader.invoke('openFind')"
+          @update-find-query="chatRouteHeader.invoke('updateFindQuery', $event)"
+          @search-find="chatRouteHeader.invoke('searchFind', $event)"
+          @navigate-find="chatRouteHeader.invoke('navigateFind', $event)"
+          @close-find="chatRouteHeader.invoke('closeFind')"
         />
       </div>
-      <div
-        class="topbar-right"
-        :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
-      >
+      <div class="topbar-right">
         <ChatSystemStatus
-          v-if="isChatRoute"
           :layout="systemHeaderLayout"
           :connection-state="effectiveConnectionState"
           :connection-label="connectionStateLabel"
+          :connection-notice-visible="connectionNoticeVisible"
           :approval-count="appStore.approvalCount"
           :can-manage-connection="webConfigEnabled"
           @open-connection="openConnectionSettings"
           @open-approval="openBlockedApprovalSession"
-          @open-update="openDesktopUpdateSettings"
         />
-        <template v-else>
-          <button
-            v-if="appStore.approvalCount > 0"
-            class="approval-inline"
-            @click="openBlockedApprovalSession"
-            :title="t('chrome.openBlockedSession')"
-          >
-            {{ t('chrome.approvalRequired') }}
-          </button>
-          <button
-            v-if="webConfigEnabled"
-            type="button"
-            class="conn-pill conn-pill--link"
-            :class="connectionState"
-            :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
-            :aria-label="t('chrome.manageConnection')"
-            @click="openConnectionSettings"
-          >{{ connectionStateLabel }}</button>
-          <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
-          <DesktopUpdateIndicator />
-        </template>
-        <LanguageSwitcher />
-        <div class="theme-menu-wrap">
-          <button
-            ref="themeButtonRef"
-            class="btn btn--icon btn--ghost"
-            :title="t('chrome.theme')"
-            :aria-label="t('chrome.theme')"
-            aria-haspopup="menu"
-            :aria-expanded="themeMenuOpen"
-            @click.stop="themeMenuOpen = !themeMenuOpen"
-          >
-            <Icon :name="themeIconName" :size="16" />
-          </button>
-          <div
-            v-if="themeMenuOpen"
-            class="theme-menu"
-            role="menu"
-            :aria-label="t('chrome.theme')"
-            data-chat-topbar-popover="theme"
-          >
-            <button
-              v-for="opt in themeOptions"
-              :key="opt.mode"
-              type="button"
-              class="theme-menu__item"
-              role="menuitemradio"
-              :aria-checked="appStore.theme === opt.mode"
-              @click="pickTheme(opt.mode)"
-            >
-              <Icon :name="opt.icon" :size="15" />
-              <span>{{ opt.labelKey ? t(opt.labelKey) : opt.label }}</span>
-              <Icon v-if="appStore.theme === opt.mode" class="theme-menu__check" name="check" :size="14" />
-            </button>
-            <button
-              type="button"
-              class="theme-menu__item theme-menu__item--more"
-              role="menuitem"
-              :title="t('chrome.moreThemesHint')"
-              @click="openMoreThemes"
-            >
-              <Icon name="chevronRight" :size="15" />
-              <span>{{ t('chrome.moreThemes') }}</span>
-              <Icon v-if="isCustomThemeActive" class="theme-menu__check" name="check" :size="14" />
-            </button>
-          </div>
-        </div>
         <WorkbenchToggle
-          v-if="platform.capabilities.hasNativeWorkbenchSurfaces"
+          v-if="!workbenchToggleInPanel"
           :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+          :presentation-visible="false"
           allow-empty
           :session-id="workbenchSessionKey"
           :blocked="workbenchModalBlocked"
         />
       </div>
     </header>
-    <div class="app-workspace">
       <main
-        v-show="!workbenchMaximized"
-        :inert="workbenchMaximized || undefined"
-        :aria-hidden="workbenchMaximized ? 'true' : undefined"
+        v-show="!mainPaneHidden"
+        :inert="workbenchSinglePane || undefined"
+        :aria-hidden="workbenchSinglePane ? 'true' : undefined"
         class="content"
         :class="{ 'content--chat': isChatRoute }"
         id="content"
@@ -344,17 +294,51 @@
           <router-view v-if="settingsBackgroundRoute" />
         </ErrorBoundary>
       </main>
+      </div>
       <AppWorkbench
+        @return-chat="narrowWorkbenchRequested = false"
+        :available-width="workspaceAvailableWidth"
+        :layout-mode="effectiveWorkbenchLayout"
+        :motion-enabled="workbenchMotionEnabled"
+        :animate-layout="workbenchLayoutMotion"
         :enabled="appStore.features.artifactWorkbench === true"
         :workbench-resources-enabled="(
           appStore.features.documentWorkbenchResources === true
           || appStore.features.artifactPromptAnnotations === true
         )"
         :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
+        :office-prompt-annotations-enabled="appStore.features.officePromptAnnotations === true"
         :route-active="isChatRoute"
         :session-id="workbenchSessionKey"
+        :session-loading="chatRouteHeader.model.sessionKey.value !== workbenchSessionKey
+          || chatRouteHeader.model.sessionLoading.value"
+        :session-durable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionDurable.value"
+        :session-preparable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionPreparable.value"
+        :conversation-started="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionDurable.value && chatRouteHeader.model.visible.value
+          && chatRouteHeader.model.shareableMessageCount.value > 0"
+        :prepare-session="chatRouteHeader.prepareWorkbenchSession"
         :modal-blocked="workbenchModalBlocked"
-      />
+        :workspace-id="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          ? chatRouteHeader.model.workspaceId.value : null"
+        :workspace-ready="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.workspaceReady.value"
+        :workspace-resolved="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.workspaceResolved.value"
+      >
+        <template #collapse-control>
+          <WorkbenchToggle
+            v-if="workbenchToggleInPanel"
+            :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+            :presentation-visible="true"
+            allow-empty
+            :session-id="workbenchSessionKey"
+            :blocked="workbenchModalBlocked"
+          />
+        </template>
+      </AppWorkbench>
       <ArtifactImageLightbox />
     </div>
   </div>
@@ -365,7 +349,7 @@
   <nav
     class="mobile-tabbar"
     :class="{ 'is-keyboard-open': mobileKeyboardOpen }"
-    :inert="appStore.sidebarOpen && isSidebarDrawer"
+    :inert="effectiveSidebarOpen && isSidebarDrawer"
     :aria-label="t('chrome.primaryMobile')"
   >
     <router-link
@@ -428,10 +412,12 @@
 
   <ProjectWorkspaceEditDialog
     v-if="gatewayAccess.canManageProjectWorkspaces"
+    :key="projectEditInstance"
     :open="Boolean(editingProject)"
+    :saving="projectEditSaving"
     :initial-name="editingProject?.name || ''"
     :path="editingProject?.path || ''"
-    @close="editingProjectId = ''"
+    @close="closeProjectEditor"
     @save="onProjectRename"
   />
 
@@ -450,7 +436,9 @@ import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/setti
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
-import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
+import { copyTextWithFallback } from '@/utils/browser'
+import { currentSessionLink } from '@/utils/chat/sessionLinks'
+import { useAppStore, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { useProductActivity } from './composables/useProductActivity'
@@ -468,6 +456,7 @@ import {
   type SidebarSectionRow,
 } from './composables/useSessions'
 import Icon from './components/Icon.vue'
+import type { IconName } from './utils/icons'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
@@ -475,27 +464,28 @@ import ProjectWorkspaceCreateDialog from './components/ProjectWorkspaceCreateDia
 import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.vue'
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
-import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
+import SidebarDesktopUpdate from './components/SidebarDesktopUpdate.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
-import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
 import { useWorkbenchStore } from './workbench/store'
+import { WORKBENCH_SPLIT_MIN_WIDTH, workbenchLayoutMode, workbenchShouldYieldSidebar } from './workbench/layout'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
+import { useDesktopUpdatePresentation } from './composables/useDesktopUpdatePresentation'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
+import { CONNECTION_NOTICE_DELAY_MS, useDelayedNotice } from './composables/useDelayedNotice'
 import { useDocumentEvent } from './composables/useDocumentEvent'
-import { hasOpenDialogLayer, useDialogLayer } from './composables/useDialogA11y'
+import { hasOpenDialogLayer } from './composables/useDialogA11y'
 import {
   provideChatTopbarPopoverCoordinator,
-  useChatTopbarPopoverCoordination,
 } from './composables/useChatTopbarPopoverCoordinator'
-import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
+import { provideArtifactImageLightbox, closeImageLightboxOutsideSession } from './composables/chat/useArtifactImageLightbox'
 import {
   provideChatRouteHeaderBridge,
   type ChatRouteHeaderHostHandle,
@@ -505,18 +495,19 @@ import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
 import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
+import { useProjectWorkspaceEditor } from './composables/useProjectWorkspaceEditor'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
-import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
-import { reminderToastPreview } from './utils/cron/notifications'
+import { notifyCronRunFinished } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
 import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
+import { provideSideChatLauncher } from '@/modules/sideChatLauncher'
 import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
 import {
   dispatchLocalSessionsDeleted,
@@ -529,7 +520,6 @@ import {
   optionalSessionRpcAllowed,
   optionalSessionReadOptions,
 } from './composables/chat/sessionBootstrapAdmission'
-import { markCronFinishNotified } from './utils/cron/notifications'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
 import {
   CRON_SCHEDULER_KEY,
@@ -580,14 +570,14 @@ const { backgroundRoute: settingsBackgroundRoute, contentRoute: settingsContentR
 // controls render on chat and non-chat routes, so route-scoped coordination
 // would allow sibling menus such as Language and Theme to overlap.
 const isChatRoute = computed(() => settingsContentRoute.value.path === '/chat' || settingsContentRoute.value.path === '/chat/new')
-const workbenchMaximized = computed(() => isChatRoute.value
-  && appStore.features.artifactWorkbench === true
-  && workbenchStore.expanded && workbenchStore.maximized)
+const workbenchVisible = computed(() => isChatRoute.value
+  && appStore.features.artifactWorkbench === true && workbenchStore.expanded)
 const topbarPopoverCoordinationEnabled = ref(true)
-const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
+provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
+provideSideChatLauncher()
 const {
   sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,
@@ -600,6 +590,7 @@ const {
   hasNewDeliverable: chatRouteHeaderHasNewDeliverable,
   shareMode: chatRouteHeaderShareMode,
   shareableMessageCount: chatRouteHeaderShareableMessageCount,
+  findState: chatRouteHeaderFindState,
 } = chatRouteHeader.model
 const chatHeaderActionsRef = ref<ChatRouteHeaderHostHandle | null>(null)
 watch(chatHeaderActionsRef, host => chatRouteHeader.setHost(host), { flush: 'sync' })
@@ -618,6 +609,7 @@ type SidebarResizerHandle = { cancel: () => boolean }
 const sidebarResizerRef = ref<SidebarResizerHandle | null>(null)
 
 const {
+  viewportWidth: shellWidth,
   mode: sidebarLayoutMode,
   dynamicMax: sidebarDynamicMaximum,
   effectiveWidth: sidebarEffectiveWidth,
@@ -625,6 +617,114 @@ const {
 const isSidebarDrawer = computed(() => sidebarLayoutMode.value === 'drawer')
 const isSidebarResizable = computed(() => sidebarLayoutMode.value === 'resizable')
 const sidebarResizeActive = ref(false)
+const workspaceRef = ref<HTMLElement | null>(null)
+const measuredWorkspaceWidth = ref(0)
+const sidebarRevealOverride = ref(false)
+// Opening a phone drawer is temporary. Window resizing must not rewrite the
+// user's desktop dock preference or unexpectedly open a drawer over the chat.
+const sidebarDrawerOpen = ref(false)
+const sidebarYieldsToWorkbench = computed(() => workbenchShouldYieldSidebar({
+  shellWidth: shellWidth.value,
+  sidebarWidth: sidebarEffectiveWidth.value + 1,
+  workbenchExpanded: workbenchVisible.value,
+  sidebarDrawer: isSidebarDrawer.value,
+}))
+const effectiveSidebarOpen = computed(() => isSidebarDrawer.value
+  ? sidebarDrawerOpen.value
+  : appStore.sidebarOpen && (!sidebarYieldsToWorkbench.value || sidebarRevealOverride.value))
+const workspaceAvailableWidth = computed(() => measuredWorkspaceWidth.value > 0
+  ? measuredWorkspaceWidth.value
+  : Math.max(0, shellWidth.value - (effectiveSidebarOpen.value && !isSidebarDrawer.value ? sidebarEffectiveWidth.value : 0)))
+// Responsive hiding is presentation only. Do not close a child or overwrite
+// the user's expanded/width preference when the primary conversation needs space.
+const narrowWorkbenchRequested = ref(false)
+const workbenchConstrained = computed(() => workspaceAvailableWidth.value < WORKBENCH_SPLIT_MIN_WIDTH)
+watch(workbenchConstrained, () => { narrowWorkbenchRequested.value = false }, { flush: 'sync' })
+watch(() => workbenchStore.revealRequestId, () => {
+  if (workbenchConstrained.value) narrowWorkbenchRequested.value = true
+}, { flush: 'sync' })
+watch(() => workbenchStore.activeSessionId, () => { narrowWorkbenchRequested.value = false })
+watch(() => workbenchStore.expanded, expanded => {
+  if (!expanded) narrowWorkbenchRequested.value = false
+}, { flush: 'sync' })
+const effectiveWorkbenchLayout = computed(() => workbenchLayoutMode({
+  availableWidth: workspaceAvailableWidth.value,
+  maximized: workbenchStore.maximized,
+  explicitReveal: narrowWorkbenchRequested.value,
+}))
+const workbenchSinglePane = computed(() => workbenchVisible.value
+  && effectiveWorkbenchLayout.value === 'single-pane')
+// The pane owns its collapse affordance. When responsive layout yields back to
+// the conversation, its expand affordance returns to the main header instead.
+const workbenchToggleInPanel = computed(() => workbenchVisible.value
+  && effectiveWorkbenchLayout.value !== 'main-only')
+watch(workbenchToggleInPanel, () => {
+  if (!(document.activeElement instanceof HTMLElement)
+    || !document.activeElement.matches('[data-testid="topbar-workbench-toggle"]')) return
+  void nextTick(() => workspaceRef.value?.querySelector<HTMLElement>(
+    '[data-testid="topbar-workbench-toggle"]',
+  )?.focus({ preventScroll: true }))
+})
+const workbenchMotionEnabled = ref(false)
+const workbenchLayoutMotion = ref(false)
+const mainPaneHidden = computed(() => workbenchSinglePane.value && !workbenchLayoutMotion.value)
+let workbenchMotionTimer: ReturnType<typeof setTimeout> | undefined
+let workspaceObserver: ResizeObserver | undefined
+function measureWorkspace() {
+  const width = workspaceRef.value?.getBoundingClientRect().width
+  if (width && Number.isFinite(width)) measuredWorkspaceWidth.value = width
+}
+function stopWorkbenchMotion() {
+  clearTimeout(workbenchMotionTimer)
+  workbenchMotionEnabled.value = false
+  workbenchLayoutMotion.value = false
+}
+function onWorkspaceViewportResize() {
+  stopWorkbenchMotion()
+  measureWorkspace()
+}
+watch(workbenchVisible, visible => {
+  workbenchLayoutMotion.value = false
+  if (!visible) sidebarRevealOverride.value = false
+  if (sidebarResizeActive.value) return
+  clearTimeout(workbenchMotionTimer)
+  workbenchMotionEnabled.value = true
+  workbenchMotionTimer = setTimeout(stopWorkbenchMotion, 240)
+}, { flush: 'sync' })
+watch(() => workbenchStore.maximized, () => {
+  if (!workbenchVisible.value || sidebarResizeActive.value) return
+  clearTimeout(workbenchMotionTimer)
+  workbenchMotionEnabled.value = true
+  workbenchLayoutMotion.value = true
+  workbenchMotionTimer = setTimeout(stopWorkbenchMotion, 240)
+}, { flush: 'sync' })
+watch(effectiveSidebarOpen, (open, previous) => {
+  if (open || !previous) return
+  const focused = document.activeElement
+  const focusWasInSidebar = Boolean(focused && sidebarRef.value?.contains(focused))
+    || focused instanceof HTMLElement && focused.matches('.sidebar-resizer')
+  if (!focusWasInSidebar) return
+  void nextTick(() => {
+    const target = workbenchSinglePane.value
+      ? workspaceRef.value?.querySelector<HTMLElement>('[data-testid="workbench-return-chat"]')
+      : topbarSidebarToggleRef.value
+    target?.focus({ preventScroll: true })
+  })
+})
+watch([effectiveSidebarOpen, sidebarEffectiveWidth], () => void nextTick(measureWorkspace))
+onMounted(() => {
+  measureWorkspace()
+  if (typeof ResizeObserver !== 'undefined' && workspaceRef.value) {
+    workspaceObserver = new ResizeObserver(measureWorkspace)
+    workspaceObserver.observe(workspaceRef.value)
+  }
+  window.addEventListener('resize', onWorkspaceViewportResize, { passive: true })
+})
+onUnmounted(() => {
+  workspaceObserver?.disconnect()
+  window.removeEventListener('resize', onWorkspaceViewportResize)
+  clearTimeout(workbenchMotionTimer)
+})
 
 function setSidebarCssWidth(width: number) {
   if (!Number.isFinite(width)) return
@@ -664,6 +764,14 @@ const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewa
   : gatewayConnectionPhase.value === 'healthy' || gatewayConnectionPhase.value === 'disconnected'
   ? t(`chrome.connectionState.${effectiveConnectionState.value}`)
   : t(`chrome.connectionState.${gatewayConnectionPhase.value}`))
+// Only the presentation waits. RPC readiness, sending and recovery keep using
+// their real state. A rejected connection cannot recover silently, so show it now.
+const connectionNoticeVisible = useDelayedNotice(
+  computed(() => effectiveConnectionState.value !== 'connected'),
+  computed(() => gatewayAccess.connectionBlocked === true),
+  computed(() => gatewayAccess.isRuntimeStarting),
+  CONNECTION_NOTICE_DELAY_MS,
+)
 // afterEach only fires on navigation, so a same-route language switch needs an
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {
@@ -682,6 +790,11 @@ const {
   applyConfirmedTitle,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
+const sidebarNavIcons: Partial<Record<IconName, IconName>> = {
+  skills: 'sparkles',
+  cron: 'clock-3',
+  usage: 'chart-no-axes-column',
+}
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
@@ -693,7 +806,18 @@ const projectCreateBusy = ref(false)
 const projectCreateSourcePicking = ref(false)
 const projectCreateConfirming = ref(false)
 const projectSourcePickerOpen = ref(false)
-const editingProjectId = ref('')
+const {
+  workspaceId: editingProjectId,
+  saving: projectEditSaving,
+  instance: projectEditInstance,
+  open: openProjectEditor,
+  close: closeProjectEditor,
+  save: onProjectRename,
+} = useProjectWorkspaceEditor({
+  allowed: () => gatewayAccess.canManageProjectWorkspaces,
+  rename: (workspaceId, name) => projectWorkspaces.renameWorkspace(workspaceId, name),
+  onError: error => pushToast(t('workspaces.updateFailed', { error: errorMessage(error) }), { tone: 'danger' }),
+})
 const editingProject = computed(() =>
   editingProjectId.value
     ? projectWorkspaces.byId.value.get(editingProjectId.value) || null
@@ -713,48 +837,30 @@ watch(
     projectCreateSourcePicking.value = false
     projectCreateConfirming.value = false
     projectSourcePickerOpen.value = false
-    editingProjectId.value = ''
+    closeProjectEditor()
   },
 )
 const desktopUpdate = useDesktopUpdate()
+const { summary: desktopUpdateSummary, severity: desktopUpdateSeverity } = useDesktopUpdatePresentation(desktopUpdate)
+const sidebarExpandLabel = computed(() => desktopUpdate.visible.value
+  ? `${t('chrome.expandSidebar')}, ${desktopUpdateSummary.value}`
+  : t('chrome.expandSidebar'))
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
 let cronFinishedSubscription: CronSubscription | null = null
 
 function handleCronRunFinished(event: CronRunFinished) {
-  const runId = typeof event.runId === 'string' ? event.runId : ''
-  const jobName = event.jobName?.trim() || t('cronSkills.jobs.unnamedTask')
-  markCronFinishNotified(runId)
-  if (event.success === false) {
-    pushToast(t('cronSkills.jobs.toastBackgroundFailed', { name: jobName }), {
-      tone: 'danger',
-      duration: 9_000,
-    })
-    return
-  }
-  const reminder = event.payloadKind === 'reminder'
-    ? reminderToastPreview(event.summary)
-    : ''
-  if (reminder) {
-    const sessionKey = event.sessionKey?.trim() || ''
-    pushToast(t('cronSkills.jobs.toastBackgroundReminder', {
-      name: jobName,
-      reminder,
-    }), {
-      tone: 'ok',
-      duration: 10_000,
-      action: sessionKey
-        ? {
-            label: t('cronSkills.jobs.toastViewReminder'),
-            onClick: () => switchToSession(sessionKey, 'cron.reminder_toast'),
-          }
-        : undefined,
-    })
-    return
-  }
-  pushToast(t('cronSkills.jobs.toastBackgroundComplete', { name: jobName }), {
-    tone: 'ok',
-    duration: 7_000,
+  notifyCronRunFinished(event, {
+    t,
+    pushToast,
+    openJob: async jobId => {
+      const failure = await router.push({ path: '/cron', query: jobId ? { job: jobId } : {} })
+      return !failure
+    },
+    openSession: async sessionKey => {
+      await switchToSession(sessionKey, 'cron.reminder_toast')
+      return $route.path === '/chat' && $route.query.session === sessionKey
+    },
   })
 }
 
@@ -801,54 +907,6 @@ const sidebarToggleAriaShortcut = computed(() => {
   return parts.join('+')
 })
 
-const themeIconName = computed(() => {
-  if (appStore.theme === 'system') return 'monitor'
-  const active = getManifest(appStore.resolvedTheme)
-  return active?.icon ?? (appStore.resolvedTheme === 'dark' ? 'moon' : 'sun')
-})
-
-const themeMenuOpen = ref(false)
-useChatTopbarPopoverCoordination(
-  'theme',
-  themeMenuOpen,
-  topbarPopoverCoordinator,
-)
-const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
-const themeButtonRef = ref<HTMLButtonElement | null>(null)
-
-// The compact topbar menu deliberately lists only the basic modes (Light / Dark
-// / System). Custom value themes live in Settings → Appearance, reached via the
-// "More themes…" action below — see themePickerOptions({ scope }) in registry.ts.
-const themeOptions = themePickerOptions({ scope: 'basic' })
-
-// A custom value theme (chosen in Settings) is active but not shown in the basic
-// topbar menu; mark "More themes…" instead of leaving no selection indicator.
-const isCustomThemeActive = computed(
-  () => !themeOptions.some((o) => o.mode === appStore.theme),
-)
-
-function pickTheme(mode: ThemeMode) {
-  appStore.setTheme(mode)
-  themeMenuOpen.value = false
-  themeButtonRef.value?.focus()
-}
-
-// "More themes…": the full theme list lives in Settings → Appearance. Close the
-// menu and deep-link straight to that section.
-function openMoreThemes() {
-  themeMenuOpen.value = false
-  handleNavClick()
-  router.push('/settings/interface')
-}
-
-useDocumentEvent('click', (e) => {
-  if (!themeMenuOpen.value) return
-  const wrap = themeButtonRef.value?.closest('.theme-menu-wrap')
-  if (wrap && e.target instanceof Node && !wrap.contains(e.target)) {
-    themeMenuOpen.value = false
-  }
-})
-
 // Current session key from ChatView via URL
 const currentSessionKey = computed(() => {
   return ($route.query.session as string) || ''
@@ -880,15 +938,14 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
   immediate: true,
 })
 
-// Chat layout applies to both the session view and the draft route.
+// Shared status controls use the actual topbar geometry on every route.
 const systemHeaderPressureCount = computed(() => (
-  Number(effectiveConnectionState.value !== 'connected')
+  Number(connectionNoticeVisible.value)
   + Number(appStore.approvalCount > 0)
-  + Number(desktopUpdate.visible.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,
-  active: isChatRoute,
+  active: computed(() => true),
   pressureCount: systemHeaderPressureCount,
 })
 const activeProjectDraftId = computed(() =>
@@ -909,13 +966,10 @@ watch(
   [
     currentSessionKey,
     isChatRoute,
-    () => artifactImageLightbox.request.value?.sessionKey || '',
+    () => artifactImageLightbox.request.value?.ownerSessionKey || artifactImageLightbox.request.value?.sessionKey || '',
   ],
   ([sessionKey, chatRouteActive]) => {
-    const request = artifactImageLightbox.request.value
-    if (request && (!chatRouteActive || request.sessionKey !== sessionKey)) {
-      artifactImageLightbox.close()
-    }
+    closeImageLightboxOutsideSession(artifactImageLightbox, sessionKey, chatRouteActive)
   },
   { flush: 'sync' },
 )
@@ -927,9 +981,8 @@ const settingsOverlayOpen = computed(() =>
   webConfigEnabled && ($route.name === 'settings' || $route.name === 'settings-section'))
 const workbenchModalBlocked = computed(() =>
   commandPaletteOpen.value
-  || themeMenuOpen.value
   || settingsOverlayOpen.value
-  || (appStore.sidebarOpen && isSidebarDrawer.value))
+  || (effectiveSidebarOpen.value && isSidebarDrawer.value))
 
 const contractDebugEnabled = computed(() => appStore.features.contractDebug === true)
 
@@ -943,7 +996,7 @@ const SKILLS_CHANNELS_HUB_PATHS = new Set(['/skills', '/channels'])
 const MOBILE_MORE_PATHS = new Set(['/skills', '/channels', '/cron'])
 const isSkillsChannelsHubActive = computed(() => SKILLS_CHANNELS_HUB_PATHS.has($route.path))
 const isMobileMoreActive = computed(() =>
-  appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
+  effectiveSidebarOpen.value || MOBILE_MORE_PATHS.has($route.path))
 
 function isPrimaryNavActive(path: string): boolean {
   if (path === '/skills') return isSkillsChannelsHubActive.value
@@ -1252,13 +1305,20 @@ type SidebarToggleSource = 'sidebar-button' | 'topbar-button' | 'shortcut'
 
 function toggleDock(source: SidebarToggleSource) {
   sidebarResizerRef.value?.cancel()
-  const wasOpen = appStore.sidebarOpen
+  const wasOpen = effectiveSidebarOpen.value
   const focusWasInsideSidebar = Boolean(
     sidebarRef.value && document.activeElement && sidebarRef.value.contains(document.activeElement),
   )
   const focusWasOnResizer = document.activeElement instanceof HTMLElement
     && document.activeElement.matches('.sidebar-resizer')
-  appStore.toggleSidebar()
+  // An explicit reveal wins over the temporary space-saving presentation.
+  // This override lasts only while the workbench is open; it is not a preference.
+  if (isSidebarDrawer.value) {
+    sidebarDrawerOpen.value = !wasOpen
+  } else {
+    sidebarRevealOverride.value = !wasOpen && sidebarYieldsToWorkbench.value
+    appStore.setSidebarOpen(!wasOpen)
+  }
   if (!wasOpen && (source === 'topbar-button' || isSidebarDrawer.value)) {
     void nextTick(() => sidebarDockToggleRef.value?.focus())
   } else if (wasOpen && (source === 'sidebar-button' || focusWasInsideSidebar || focusWasOnResizer)) {
@@ -1267,24 +1327,25 @@ function toggleDock(source: SidebarToggleSource) {
 }
 
 function handleNavClick() {
-  if (isSidebarDrawer.value && appStore.sidebarOpen) {
+  if (isSidebarDrawer.value && effectiveSidebarOpen.value) {
     closeSidebarDrawer()
   }
 }
 
 function openSidebarDrawer() {
-  if (appStore.sidebarOpen) return
+  if (!isSidebarDrawer.value || effectiveSidebarOpen.value) return
   toggleDock('topbar-button')
 }
 
 function closeSidebarDrawer() {
-  if (!appStore.sidebarOpen || !isSidebarDrawer.value) return
+  if (!effectiveSidebarOpen.value || !isSidebarDrawer.value) return
   sidebarResizerRef.value?.cancel()
-  appStore.setSidebarOpen(false)
+  sidebarDrawerOpen.value = false
   void nextTick(() => topbarSidebarToggleRef.value?.focus())
 }
 
 function handleSidebarResizeStart() {
+  stopWorkbenchMotion()
   sidebarResizeActive.value = true
 }
 
@@ -1318,9 +1379,9 @@ function handleSidebarResizeEnd() {
   setSidebarCssWidth(sidebarEffectiveWidth.value)
 }
 
-// Layout mode is a single state machine shared with Settings. Entering a drawer
-// force-closes the persistent dock; returning to desktop intentionally leaves it
-// closed until the user reopens it. Compact mode keeps the current open state.
+// Layout mode is a single state machine shared with Settings. Each transition
+// starts with a closed drawer; returning to desktop restores the dock preference.
+// Compact mode keeps the current desktop preference as well.
 watch(sidebarLayoutMode, (nextMode, previousMode) => {
   const focusWasOnResizer = document.activeElement instanceof HTMLElement
     && document.activeElement.matches('.sidebar-resizer')
@@ -1328,11 +1389,11 @@ watch(sidebarLayoutMode, (nextMode, previousMode) => {
   sidebarResizeActive.value = false
   setSidebarCssWidth(sidebarEffectiveWidth.value)
 
-  if (nextMode === 'drawer' && appStore.sidebarOpen) {
+  sidebarDrawerOpen.value = false
+  if (nextMode === 'drawer') {
     const focusWasInsideSidebar = Boolean(
       sidebarRef.value && document.activeElement && sidebarRef.value.contains(document.activeElement),
     )
-    appStore.setSidebarOpen(false)
     if (focusWasOnResizer || focusWasInsideSidebar) {
       void nextTick(() => topbarSidebarToggleRef.value?.focus())
     }
@@ -1504,23 +1565,6 @@ async function onProjectPin(payload: { workspaceId: string; pinned: boolean }) {
   }
 }
 
-function openProjectEditor(workspaceId: string) {
-  if (!gatewayAccess.canManageProjectWorkspaces) return
-  editingProjectId.value = workspaceId
-}
-
-async function onProjectRename(name: string) {
-  if (!gatewayAccess.canManageProjectWorkspaces) return
-  const workspaceId = editingProjectId.value
-  if (!workspaceId) return
-  try {
-    await projectWorkspaces.renameWorkspace(workspaceId, name)
-    editingProjectId.value = ''
-  } catch (err) {
-    pushToast(t('workspaces.updateFailed', { error: errorMessage(err) }), { tone: 'danger' })
-  }
-}
-
 async function onProjectDeleteHistory(workspaceId: string) {
   if (!gatewayAccess.canManageProjectWorkspaces) return
   try {
@@ -1570,7 +1614,7 @@ async function onProjectRemove(workspaceId: string) {
   if (!approved) return
   try {
     await projectWorkspaces.removeWorkspace(workspaceId)
-    if (editingProjectId.value === workspaceId) editingProjectId.value = ''
+    if (editingProjectId.value === workspaceId) closeProjectEditor()
     if (
       $route.path === '/chat/new'
       && String($route.query.project || '') === workspaceId
@@ -1600,8 +1644,8 @@ function onPaletteOpenSettings() {
 }
 
 function onPaletteToggleTheme() {
-  // Cycle the appearance mode through the same registry-driven order as the
-  // topbar picker (every selectable value theme + system), so the palette
+  // Cycle the appearance mode through the registry-driven order used by
+  // Settings (every selectable value theme + system), so the palette
   // never resets a custom theme back to 'light'.
   appStore.cycleTheme()
 }
@@ -1619,6 +1663,30 @@ async function switchToSession(key: string, source = 'app.switchToSession') {
   })
   await router.push({ path: '/chat', query: { session: key } })
   if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
+}
+
+let sidebarCopySequence = 0
+let sidebarClipboardWrite: Promise<void> = Promise.resolve()
+async function onCopySidebarSessionLink(key: string) {
+  if (!key) return
+  const sequence = ++sidebarCopySequence
+  const epoch = gatewayAccess.subscriptionEpoch
+  const isCurrent = () => sequence === sidebarCopySequence
+    && gatewayAccess.subscriptionEpoch === epoch
+  try {
+    const link = await currentSessionLink(key, platform)
+    if (!isCurrent()) return
+    // Clipboard fallbacks can settle after a newer click. Serialize the writes,
+    // then recheck ownership so an old fallback cannot overwrite the new link.
+    const write = sidebarClipboardWrite.then(async () => {
+      if (isCurrent()) await copyTextWithFallback(link)
+    })
+    sidebarClipboardWrite = write.catch(() => undefined)
+    await write
+    if (isCurrent()) pushToast(t('chat.copied'), { tone: 'ok' })
+  } catch {
+    if (isCurrent()) pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+  }
 }
 
 // Only the current rename may update local display state. Later authoritative
@@ -1767,9 +1835,9 @@ function openConnectionSettings() {
   router.push('/settings/gateway#connection')
 }
 
-// Compact chat headers hand off to the complete Desktop update workflow rather
-// than recreating update actions inside the status summary.
+// The sidebar entry hands off to the complete Desktop update workflow.
 function openDesktopUpdateSettings() {
+  handleNavClick()
   router.push('/settings/gateway#updates')
 }
 
@@ -1856,6 +1924,9 @@ watch(
 )
 
 function handleKeydown(e: KeyboardEvent) {
+  // Scoped handlers (chat find, editors and IME input) own consumed keys even
+  // when a user has rebound a global action to the same combination.
+  if (e.defaultPrevented) return
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
   // elsewhere — and require the other modifier to be absent — so we never match
   // macOS' Ctrl+K (emacs kill-to-end-of-line inside text fields). preventDefault
@@ -1901,12 +1972,6 @@ function handleKeydown(e: KeyboardEvent) {
   // run later and are covered separately by the shared dialog-layer guard.
   if (e.defaultPrevented) return
 
-  if (e.key === 'Escape' && themeMenuOpen.value && themeMenuIsTopmost.value) {
-    e.preventDefault()
-    themeMenuOpen.value = false
-    themeButtonRef.value?.focus()
-    return
-  }
   // Child topbar controls and routed dialogs install their Escape handlers
   // after App's listener. Let the current dialog-stack owner handle the key
   // instead of pre-emptively collapsing the mobile sidebar beneath it.
@@ -1916,7 +1981,7 @@ function handleKeydown(e: KeyboardEvent) {
   // collapse as a side effect of an Escape meant for an overlay opened on top of
   // it. The shared dialog-layer guard above handles that ordering collision;
   // this branch remains mobile-only because desktop uses a persistent dock.
-  if (e.key === 'Escape' && appStore.sidebarOpen && !settingsOverlayOpen.value && isSidebarDrawer.value) {
+  if (e.key === 'Escape' && effectiveSidebarOpen.value && !settingsOverlayOpen.value && isSidebarDrawer.value) {
     closeSidebarDrawer()
   }
 }
@@ -2064,6 +2129,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  sidebarCopySequence += 1
   appAutomaticRpcMounted = false
   automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
@@ -2088,6 +2154,7 @@ onUnmounted(() => {
 
 <style scoped>
 .app-workspace {
+  --workspace-header-height: 49px;
   position: relative;
   display: flex;
   min-width: 0;
@@ -2095,18 +2162,55 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* Topbar connection pill as a button (web): inherits the base .conn-pill look
-   and state colors, adds button reset + an affordance that it is clickable. */
-.conn-pill--link {
-  cursor: pointer;
-  font-family: inherit;
+.app-chat-pane--layout-motion { overflow: hidden; }
+
+.app-chat-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
-.conn-pill--link:hover {
-  filter: brightness(1.08);
+
+.app-chat-pane > .content {
+  min-height: 0;
 }
-.conn-pill--link:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  outline-offset: 2px;
+
+.topbar--chat {
+  border-bottom: 1px solid var(--border-subtle, var(--border));
+}
+
+.sidebar-core {
+  border-bottom: 1px solid var(--border-subtle, var(--border));
+  margin-bottom: var(--sp-2);
+}
+
+.sidebar-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-1);
+}
+
+.sidebar-foot .sidebar-fn-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sidebar-update-dot {
+  position: absolute;
+  top: 5px;
+  inset-inline-end: 5px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  border: 1px solid var(--bg-surface);
+}
+
+.sidebar-update-dot[data-state='danger'] {
+  background: var(--danger);
 }
 
 /* Off-screen but screen-reader-reachable announcer for the approval count. */

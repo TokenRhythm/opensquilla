@@ -301,3 +301,203 @@ def test_failed_probe_preserves_available_evidence_and_original_failure(
     else:
         assert audit.report["freshInteractionDiagnostics"]["errors"]
     assert "freshInteraction" not in audit.report
+
+
+def _candidate_arguments(tmp_path, *, case="baseline"):
+    arguments = [
+        "--case", case, "--install-path", "default", "--node", sys.executable,
+        "--candidate-source-sha", "a" * 40, "--evidence-root", str(tmp_path / "evidence"),
+    ]
+    if case != "fresh":
+        arguments += ["--baseline-installer", str(tmp_path / "baseline.exe"),
+                      "--baseline-version", "0.5.3"]
+    return arguments
+
+
+def _direct_candidate_arguments(tmp_path):
+    return [
+        "--candidate-installer", str(tmp_path / "candidate.exe"),
+        "--candidate-asar-sha256", "b" * 64,
+        "--candidate-executable-sha256", "c" * 64,
+        "--candidate-dependency-inventory-sha256", "d" * 64,
+        "--candidate-installer-sha256", "e" * 64,
+    ]
+
+
+def test_direct_candidate_cli_retains_default_and_normalizes_windows_version(nsis, tmp_path):
+    arguments = _candidate_arguments(tmp_path) + _direct_candidate_arguments(tmp_path)
+    assert nsis.parse_args(arguments).candidate_version == "0.5.4"
+    normalized = nsis.parse_args(arguments + ["--candidate-version", "0.6.1.0"])
+    assert normalized.candidate_version == "0.6.1"
+
+
+@pytest.mark.parametrize("version", ["", "0.6.1.1", "0.6.1-beta"])
+def test_direct_candidate_cli_rejects_invalid_explicit_version(nsis, tmp_path, version):
+    arguments = _candidate_arguments(tmp_path) + _direct_candidate_arguments(tmp_path)
+    with pytest.raises(SystemExit):
+        nsis.parse_args(arguments + ["--candidate-version", version])
+
+
+@pytest.mark.parametrize("option,value", [
+    ("--candidate-installer", "candidate.exe"),
+    ("--candidate-version", "0.5.4"),
+    ("--candidate-asar-sha256", "b" * 64),
+    ("--candidate-executable-sha256", "c" * 64),
+    ("--candidate-dependency-inventory-sha256", "d" * 64),
+    ("--candidate-installer-sha256", "e" * 64),
+])
+def test_deferred_candidate_cli_rejects_mixed_identity(nsis, tmp_path, option, value):
+    arguments = _candidate_arguments(tmp_path) + ["--candidate-artifact-name", "candidate"]
+    assert nsis.parse_args(arguments).candidate_version is None
+    with pytest.raises(SystemExit):
+        nsis.parse_args(arguments + [option, value])
+
+
+@pytest.mark.parametrize("extra", [[], ["--candidate-artifact-name", "  "]])
+def test_candidate_cli_requires_exactly_one_complete_mode(nsis, tmp_path, extra):
+    with pytest.raises(SystemExit):
+        nsis.parse_args(_candidate_arguments(tmp_path) + extra)
+
+
+def _preparation_audit(nsis, tmp_path, monkeypatch, *, case="baseline"):
+    """Exercise the real orchestration without invoking installers or Windows APIs."""
+    audit = nsis.Audit.__new__(nsis.Audit)
+    audit.args = nsis.parse_args(_candidate_arguments(tmp_path, case=case)
+                                 + ["--candidate-artifact-name", "candidate"])
+    audit.evidence = tmp_path / "evidence"
+    audit.evidence.mkdir()
+    audit.root = tmp_path / "task"
+    audit.root.mkdir()
+    audit.install = audit.root / "installed"
+    audit.short_temp = audit.root / "short-temp"
+    audit.normal_temp = audit.root / "normal-temp"
+    audit.user_data = audit.root / "profile"
+    audit.sentinels = {}
+    audit.report = {"inputs": {}, "proofs": {}}
+    audit.save = lambda: None
+    events = []
+    monkeypatch.setattr(nsis, "installed_registry", lambda: [])
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "user"))
+    repository = tmp_path / "repository"
+    monkeypatch.setattr(nsis, "REPOSITORY", repository)
+    dist = repository / "desktop/electron/dist"
+    dist.mkdir(parents=True)
+    for name in ("desktop-gateway-ownership.js", "gateway-lifecycle.js"):
+        (dist / name).write_text("fixture", encoding="utf-8")
+    probe = repository / "probe.js"
+    probe.write_text("fixture", encoding="utf-8")
+    monkeypatch.setattr(nsis, "INTERACTION_PROBE", probe)
+    monkeypatch.setattr(nsis, "FIRST_SEND_PROBE", probe)
+    baseline = tmp_path / "baseline.exe"
+    baseline.write_bytes(b"baseline fixture")
+    monkeypatch.setitem(nsis.OFFICIAL_BASELINE_SHA256, "0.5.3", nsis.digest(baseline))
+    audit.require_no_product_processes = lambda label: events.append(("processes", label))
+    audit.seed_retained_profile = lambda: events.append(("seed",))
+    audit.state = lambda label: events.append(("state", label)) or {"version": "0.5.3"}
+    audit.assert_version = lambda state, version: events.append(("version", version))
+    audit.check_profiles = lambda label: events.append(("profiles", label))
+    audit.verify_retained_profile = lambda label: events.append(("retained", label))
+    audit.check_environment_registry = lambda label: events.append(("registry", label))
+
+    def run(label, *_args):
+        events.append(("run", label))
+        return {"exitCode": 0}
+
+    audit.run = run
+    return audit, events
+
+
+@pytest.mark.parametrize("case", ["baseline", "readlock", "longpath"])
+def test_deferred_candidate_waits_until_old_installation_is_verified(
+    nsis, tmp_path, monkeypatch, case,
+):
+    audit, events = _preparation_audit(nsis, tmp_path, monkeypatch, case=case)
+
+    def resolve():
+        events.append(("resolve",))
+        raise RuntimeError("candidate handoff reached")
+
+    audit.resolve_candidate = resolve
+    with pytest.raises(RuntimeError, match="candidate handoff reached"):
+        audit.execute()
+    assert events == [
+        ("processes", "initial"), ("seed",), ("run", "install-baseline"),
+        ("processes", "afterBaseline"), ("state", "baseline-installed"),
+        ("version", "0.5.3"), ("profiles", "afterBaseline"),
+        ("retained", "afterBaseline"), ("registry", "afterBaseline"), ("resolve",),
+    ]
+    assert len(audit.sentinels) == 3
+
+
+def _downloaded_candidate(tmp_path):
+    installer = tmp_path / "candidate.exe"
+    installer.write_bytes(b"candidate fixture")
+    manifest = {
+        "sourceSha": "a" * 40, "version": "0.6.1.0",
+        "installerSha256": hashlib.sha256(installer.read_bytes()).hexdigest(),
+        "asarSha256": "b" * 64, "executableSha256": "c" * 64,
+        "dependencyInventorySha256": "d" * 64,
+    }
+    return installer, manifest
+
+
+def test_deferred_fresh_candidate_does_not_install_or_seed_baseline(nsis, tmp_path, monkeypatch):
+    audit, events = _preparation_audit(nsis, tmp_path, monkeypatch, case="fresh")
+    installer, manifest = _downloaded_candidate(tmp_path)
+
+    def wait(artifact_name, destination, source_sha):
+        assert (artifact_name, destination, source_sha) == (
+            "candidate", audit.evidence / "candidate", "a" * 40,
+        )
+        events.append(("wait",))
+        return installer, manifest
+
+    monkeypatch.setattr(nsis, "wait_for_candidate", wait)
+    audit.execute_fresh = lambda candidate: events.append(("fresh", candidate))
+    audit.execute()
+    assert events == [("processes", "initial"), ("wait",), ("fresh", installer)]
+    assert not audit.sentinels
+    assert audit.args.candidate_version == audit.report["candidateVersion"] == "0.6.1"
+    assert audit.args.candidate_installer == str(installer)
+    assert audit.args.candidate_asar_sha256 == manifest["asarSha256"]
+    assert audit.args.candidate_executable_sha256 == manifest["executableSha256"]
+    assert audit.args.candidate_dependency_inventory_sha256 == manifest["dependencyInventorySha256"]
+    assert audit.report["inputs"]["candidateInstallerSha256"] == manifest["installerSha256"]
+    assert audit.report["candidateManifest"] == manifest
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("sourceSha", "f" * 40, "Candidate source mismatch"),
+    ("installerSha256", "f" * 64, "Candidate installer differs"),
+    ("dependencyInventorySha256", None, "valid SHA-256"),
+    ("version", "0.6.1-beta", "Versions must be stable"),
+])
+def test_deferred_identity_failure_prevents_fault_injection_and_upgrade(
+    nsis, tmp_path, monkeypatch, field, value, error,
+):
+    audit, events = _preparation_audit(nsis, tmp_path, monkeypatch, case="readlock")
+    installer, manifest = _downloaded_candidate(tmp_path)
+    manifest[field] = value
+    monkeypatch.setattr(nsis, "wait_for_candidate", lambda *_args: (installer, manifest))
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        audit.execute()
+    assert [event for event in events if event[0] == "run"] == [
+        ("run", "install-baseline"),
+    ]
+    assert events[-1] == ("registry", "afterBaseline")
+    assert audit.args.candidate_installer is None
+    assert "fault" not in audit.report
+
+
+def test_direct_candidate_identity_failure_precedes_baseline_installation(
+    nsis, tmp_path, monkeypatch,
+):
+    audit, events = _preparation_audit(nsis, tmp_path, monkeypatch)
+    arguments = _candidate_arguments(tmp_path) + _direct_candidate_arguments(tmp_path)
+    audit.args = nsis.parse_args(arguments)
+    _downloaded_candidate(tmp_path)
+    with pytest.raises(RuntimeError, match="Candidate installer differs"):
+        audit.execute()
+    assert events == [("processes", "initial")]
+    assert not audit.sentinels

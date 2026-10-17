@@ -22,9 +22,7 @@ body::before {
 }
 
 /* Controls: filled surfaces carry hierarchy; outlines are reserved for focus. */
-input:not([type="radio"]):not([type="checkbox"]),
-textarea,
-select,
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select),
 .control-input {
   background: var(--bg-surface-2);
   border-color: transparent;
@@ -33,19 +31,19 @@ select,
   padding: 9px 13px;
 }
 
-input:not([type="radio"]):not([type="checkbox"]):focus,
-textarea:focus,
-select:focus,
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select):focus,
 .control-input:focus {
   background: var(--bg-surface);
   border-color: transparent;
-  box-shadow: var(--focus-ring);
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+  box-shadow: none;
 }
 
 .btn {
   border: 0;
   border-radius: var(--radius-control);
-  font-weight: 560;
+  font-weight: 500;
   min-height: 36px;
   padding: 8px 14px;
 }
@@ -58,13 +56,14 @@ select:focus,
   background: transparent !important;
 }
 
-.btn--ghost:not(:disabled):hover,
-.btn--icon:not(:disabled):hover {
+/* Icon geometry must not replace the primary or danger action's hover fill. */
+.btn--ghost:not(.btn--primary):not(.btn--danger):not(:disabled):hover,
+.btn--icon:not(.btn--primary):not(.btn--danger):not(:disabled):hover {
   background: var(--bg-hover) !important;
 }
 
 .btn--primary {
-  box-shadow: 0 5px 16px -9px color-mix(in srgb, var(--accent) 70%, transparent);
+  box-shadow: none;
 }
 
 /* One tactile vocabulary: controls compress a fraction on press, then return
@@ -164,7 +163,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 .sidebar-brand-text {
   font-family: var(--font-sans);
   font-size: 0.9375rem;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: -0.02em;
 }
 
@@ -226,6 +225,12 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   padding: 9px 11px;
 }
 
+.sidebar-core .sidebar-new-session,
+.sidebar-core .sidebar-fn-item,
+.sidebar-foot .sidebar-fn-item {
+  gap: 12px;
+}
+
 .sidebar-core .sidebar-fn-item,
 .sidebar-core .sidebar-new-session {
   border: 0;
@@ -251,7 +256,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 .sidebar-core .sidebar-fn-item.is-active {
   box-shadow: none;
-  font-weight: 400;
+  font-weight: 500;
 }
 
 .sidebar-core .sidebar-fn-item.is-active:hover {
@@ -262,13 +267,22 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 .sidebar-zone-heading {
   align-items: center;
   gap: var(--sp-1);
-  min-height: 40px;
-  padding: 4px 10px;
+  min-height: 30px;
+  padding: 1px 10px;
 }
 
 .sidebar-recents-eyebrow,
 .sidebar-zone-heading__label {
-  font-size: var(--fs-sm);
+  font-size: 0.75rem;
+  font-weight: 400;
+  line-height: 20px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.sidebar-group__header {
+  min-height: 30px;
+  font-size: 0.75rem;
   font-weight: 400;
   line-height: 20px;
   letter-spacing: 0;
@@ -296,6 +310,15 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   min-height: 32px;
   padding: 0;
   width: 32px;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .sidebar:not(.sidebar--drawer) .sidebar-zone-heading .sidebar-cmd-btn,
+  .sidebar:not(.sidebar--drawer) .sidebar-zone-heading .sidebar-bulk-mode-btn {
+    height: 28px;
+    min-height: 28px;
+    width: 28px;
+  }
 }
 
 .sidebar-task-search-btn {
@@ -343,17 +366,21 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .sidebar-task-search:focus-within {
-  box-shadow: var(--focus-ring);
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
 }
 
 .sidebar-task-search input {
   background: transparent;
   border: 0;
+  border-radius: 0;
+  box-shadow: none;
   color: var(--sidebar-text-strong);
   flex: 1;
   font: inherit;
   font-size: var(--fs-xs);
   min-width: 0;
+  min-height: 0;
   outline: 0;
   padding: 0;
 }
@@ -396,7 +423,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   color: var(--sidebar-text-soft);
   cursor: pointer;
   font: inherit;
-  font-size: 10px;
+  font-size: 0.75rem;
   min-width: 0;
   padding: 6px 2px;
   white-space: nowrap;
@@ -406,7 +433,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   background: var(--sidebar-control-bg);
   box-shadow: var(--shadow-xs);
   color: var(--sidebar-text-strong);
-  font-weight: 620;
+  font-weight: 600;
 }
 
 .sidebar-task-statuses button:focus-visible {
@@ -416,9 +443,9 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 .sidebar-history-item {
   border-radius: var(--radius-control);
-  min-height: 42px;
+  min-height: 38px;
   overflow: hidden;
-  padding: 10px 11px;
+  padding: 8px 11px;
   position: relative;
 }
 
@@ -433,7 +460,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
       color-mix(in srgb, var(--accent) 9%, var(--sidebar-item-active)),
       var(--sidebar-item-active) 42%
     );
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .sidebar-history-item.is-current::before {
@@ -466,11 +493,11 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 /* Shared page hierarchy. */
 .control-stage {
-  gap: var(--sp-8);
+  gap: var(--sp-6);
 }
 
 .control-stage--spacious {
-  gap: calc(var(--sp-8) + var(--sp-1));
+  gap: calc(var(--sp-5) + var(--sp-2));
 }
 
 .control-stage__header {
@@ -480,10 +507,10 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 .control-stage__title {
   font-family: var(--font-display);
-  font-size: clamp(2rem, 1.75rem + 0.65vw, 2.625rem);
-  font-weight: 680;
-  letter-spacing: -0.045em;
-  line-height: 1.08;
+  font-size: clamp(1.625rem, 1.5rem + 0.25vw, 1.75rem);
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.25;
 }
 
 .control-stage__subtitle {
@@ -521,15 +548,15 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .control-stat__label {
-  font-weight: 550;
+  font-weight: 500;
   letter-spacing: 0;
   margin-bottom: var(--sp-2);
 }
 
 .control-stat__value {
-  font-size: 1.9rem;
-  font-weight: 650;
-  letter-spacing: -0.035em;
+  font-size: 1.875rem;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 .control-panel {
@@ -543,7 +570,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .control-row__label {
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .control-row__desc {
@@ -568,7 +595,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 .control-segmented__btn,
 .route-hub__tab {
   border-radius: var(--radius-sm);
-  font-weight: 540;
+  font-weight: 500;
   min-height: 32px;
   padding: 7px 13px;
 }
@@ -628,7 +655,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .content .hub .hub-attention-clear__text {
-  font-weight: 560;
+  font-weight: 500;
 }
 
 .content .hub .hub-list {
@@ -739,25 +766,16 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   border-color: transparent;
 }
 
-/* Chat keeps the same interaction model with softer containers. */
-.chat {
-  --thread-col: 860px;
-  --composer-col: 860px;
-}
-
 .chat-composer {
   filter: none;
 }
 
-/* The composer is a single floating work surface. A quiet hairline, a top
-   highlight, and two shadow depths create separation without a heavy frame. */
+/* Keep the composer quiet in both landing and conversation layouts. Focus
+   strengthens the outline without adding an accent halo or elevation. */
 #app .chat .chat-input-panel {
   background: color-mix(in srgb, var(--bg-surface) 97%, var(--bg-surface-2));
   border-color: color-mix(in srgb, var(--text) 9%, transparent);
-  box-shadow:
-    inset 0 1px 0 var(--elev-highlight),
-    0 1px 2px color-mix(in srgb, var(--text) 7%, transparent),
-    0 16px 38px -26px color-mix(in srgb, var(--text) 30%, transparent);
+  box-shadow: none;
   min-height: 120px;
   transition: border-color var(--transition), box-shadow var(--transition), background var(--transition);
 }
@@ -766,11 +784,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 #app .chat .chat-composer--new-landing .chat-input-panel:focus-within {
   background: var(--bg-surface);
   border-color: color-mix(in srgb, var(--text) 18%, transparent);
-  box-shadow:
-    inset 0 1px 0 var(--elev-highlight),
-    0 0 0 3px color-mix(in srgb, var(--accent) 7%, transparent),
-    0 2px 5px color-mix(in srgb, var(--text) 8%, transparent),
-    0 18px 42px -26px color-mix(in srgb, var(--text) 34%, transparent);
+  box-shadow: 0 0 0 1px var(--hairline);
 }
 
 /* Only the opted-in conversation composer is translucent. Landing and other
@@ -781,6 +795,14 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 
 #app .chat .chat-composer--floating .chat-input-panel:focus-within {
   background: color-mix(in srgb, var(--bg-surface) 85%, transparent);
+}
+
+/* Light paper already separates the composer from the canvas. Strengthen its
+   existing border on focus without drawing a second outline. */
+[data-theme="light"] #app .chat .chat-input-panel:focus-within,
+[data-theme="light"] #app .chat .chat-composer--new-landing .chat-input-panel:focus-within {
+  border-color: var(--border-strong);
+  box-shadow: none;
 }
 
 @supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
@@ -827,14 +849,10 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   background: color-mix(in srgb, var(--text) 6%, transparent);
 }
 
-#app .chat .chat-send-btn.btn--primary {
-  box-shadow: inset 0 1px 0 var(--elev-highlight);
-}
-
-#app .chat .chat-send-btn.btn--primary.is-ready {
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, var(--accent-foreground) 24%, transparent),
-    0 4px 12px -6px color-mix(in srgb, var(--accent) 72%, transparent);
+/* Ready state already has a solid accent fill. Keep its surface flat without
+   covering the shared keyboard focus ring. */
+#app .chat .chat-send-btn.btn--primary:not(:focus-visible) {
+  box-shadow: none;
 }
 
 #app .chat .chat-ai-disclaimer {
@@ -875,9 +893,9 @@ body > .settings-overlay .settings-modal .settings-modal__head {
 }
 
 body > .settings-overlay .settings-modal .settings-modal__title {
-  font-size: 1.25rem;
-  font-weight: 680;
-  letter-spacing: -0.025em;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0;
 }
 
 body > .settings-overlay .settings-modal .settings-body {

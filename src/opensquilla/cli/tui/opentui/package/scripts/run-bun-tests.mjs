@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
+import { constants } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = fileURLToPath(new URL("../", import.meta.url));
@@ -35,6 +36,9 @@ for (const testFile of testFiles) {
     throw result.error;
   }
   if (result.status !== 0) {
-    process.exit(result.status ?? 1);
+    // spawnSync reports signal termination separately from the exit status.
+    // Preserve the shell convention so CI can recognize SIGILL (132).
+    const signalNumber = constants.signals[result.signal];
+    process.exit(result.status ?? (Number.isInteger(signalNumber) ? 128 + signalNumber : 1));
   }
 }

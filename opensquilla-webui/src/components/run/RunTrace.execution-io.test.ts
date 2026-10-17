@@ -4,6 +4,8 @@ import { createApp, defineComponent, h, nextTick, type App } from 'vue'
 import i18n from '@/i18n'
 import type { ChatStreamTimelineItem, ChatToolCallRenderItem } from '@/types/chat'
 import RunTrace from './RunTrace.vue'
+import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
+import { createPinia } from 'pinia'
 
 const mountedApps: App[] = []
 
@@ -50,20 +52,22 @@ async function mountRunTrace(items: ChatStreamTimelineItem[]) {
       return () => h(RunTrace, {
         items,
         presentation: 'activity',
-        isToolGroupOpen: () => false,
-        isToolItemOpen: () => false,
+        isToolGroupOpen: () => undefined,
+        isToolItemOpen: () => undefined,
       })
     },
   })
   const app = createApp(Host)
   mountedApps.push(app)
   app.use(i18n)
+  app.use(createPinia())
   app.mount(el)
   await nextTick()
   return { app, el }
 }
 
 beforeEach(() => {
+  useToolDetailPreference().setMode('collapsed')
   i18n.global.locale.value = 'en'
   document.body.innerHTML = ''
 })
@@ -110,7 +114,7 @@ describe('RunTrace execution I/O presentation', () => {
     expect(row?.classList.contains('tool-row--member')).toBe(false)
   })
 
-  it('shows PTY fallback on a collapsed multi-call group header', async () => {
+  it('keeps PTY fallback on each collapsed call after flattening a group', async () => {
     const { el } = await mountRunTrace([group('fallback-group', [
       call('fallback-1', {
         execution_id: 'fallback-1', io_mode_requested: 'pty', io_mode_used: 'pipe',
@@ -122,19 +126,23 @@ describe('RunTrace execution I/O presentation', () => {
       }),
     ])])
 
-    const header = el.querySelector('.tool-row--group')
-    expect(header?.getAttribute('aria-expanded')).toBe('false')
-    expect(header?.textContent).toContain('TTY unavailable; using a regular pipe')
+    expect(el.querySelector('.tool-row--group')).toBeNull()
+    const rows = [...el.querySelectorAll('.tool-row')]
+    expect(rows).toHaveLength(2)
+    expect(rows.every(row => row.getAttribute('aria-expanded') === 'false')).toBe(true)
+    expect(rows.every(row => row.textContent?.includes('TTY unavailable; using a regular pipe'))).toBe(true)
   })
 
-  it('never labels a mixed group as a TTY', async () => {
+  it('keeps each real I/O mode visible in a mixed group', async () => {
     const { el } = await mountRunTrace([group('mixed-group', [
       call('pty-call', { execution_id: 'pty-1', io_mode_used: 'pty' }),
       call('pipe-call', { execution_id: 'pipe-1', io_mode_used: 'pipe' }),
     ])])
 
-    const header = el.querySelector('.tool-row--group')
-    expect(header?.textContent).toContain('Mixed terminal modes')
-    expect(header?.textContent).not.toContain('Real terminal (TTY)')
+    expect(el.querySelector('.tool-row--group')).toBeNull()
+    const rows = el.querySelectorAll('.tool-row')
+    expect(rows[0]?.textContent).toContain('Real terminal (TTY)')
+    expect(rows[1]?.textContent).toContain('Regular pipe')
+    expect(rows[1]?.textContent).not.toContain('Real terminal (TTY)')
   })
 })

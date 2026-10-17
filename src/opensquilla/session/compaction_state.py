@@ -7,12 +7,15 @@ state, not in this structured summary payload.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+from opensquilla.execution_status import execution_status_for_tool_result
 
 
 class StructuredCompactionSummary(BaseModel):
@@ -146,6 +149,7 @@ _OBLIGATION_CONTINUITY_PRIORITY: dict[str, int] = {
     "do_not_repeat_action": 5,
     "decision_or_rationale": 7,
     "command": 8,
+    "command_reference": 8,
     "tool_result_fact": 9,
     "tool_result_id": 10,
     "important_identifier": 11,
@@ -357,6 +361,7 @@ def _extract_rendered_structured_obligations(
                 "tool_result_fact",
                 "failed_command_or_error",
                 "command",
+                "command_reference",
                 "pending_tool_or_approval_id",
                 "decision_or_rationale",
                 "important_identifier",
@@ -408,6 +413,7 @@ def extract_compaction_obligations(
     seen: set[tuple[str, str]] = set()
     issued_tool_call_ids: dict[str, int] = {}
     completed_tool_call_ids: set[str] = set()
+    command_calls: dict[str, str] = {}
     tool_call_order = 0
     for entry in entries:
         role = _string_value(_entry_value(entry, "role")) or None
@@ -427,6 +433,19 @@ def extract_compaction_obligations(
         cleaned_tool_result_id = _clean_obligation_text(tool_call_id)
         if cleaned_tool_result_id:
             completed_tool_call_ids.add(cleaned_tool_result_id)
+            if (
+                role == "tool"
+                and cleaned_tool_result_id in command_calls
+                and _command_result_proves_execution(
+                    content, _entry_value(entry, "execution_status"),
+                )
+            ):
+                _add_obligation(
+                    obligations, seen, kind="command",
+                    value=command_calls[cleaned_tool_result_id],
+                    source_role=role, source_entry_id=source_entry_id,
+                    max_obligations=max_obligations,
+                )
         _add_obligation(
             obligations,
             seen,
@@ -510,6 +529,10 @@ def extract_compaction_obligations(
                     call_id = call.get("id") or call.get("tool_use_id")
                     cleaned_call_id = _clean_obligation_text(call_id)
                     is_result = call.get("type") == "tool_result" or "result" in call
+                    if not is_result and role == "assistant" and cleaned_call_id:
+                        command = _command_input(call)
+                        if command:
+                            command_calls[cleaned_call_id] = command
                     execution_status = call.get("execution_status")
                     if isinstance(execution_status, Mapping):
                         status_name = _string_value(
@@ -580,6 +603,16 @@ def extract_compaction_obligations(
                         result_text = _string_value(
                             call.get("result") or call.get("content")
                         )
+                        if (
+                            cleaned_call_id in command_calls
+                            and _command_result_proves_execution(result_text, execution_status)
+                        ):
+                            _add_obligation(
+                                obligations, seen, kind="command",
+                                value=command_calls[cleaned_call_id],
+                                source_role=role, source_entry_id=source_entry_id,
+                                max_obligations=max_obligations,
+                            )
                         _add_obligation(
                             obligations,
                             seen,
@@ -617,7 +650,7 @@ def extract_compaction_obligations(
                             _add_obligation(
                                 obligations,
                                 seen,
-                                kind="command",
+                                kind="command_reference",
                                 value=match.group(0).rstrip("."),
                                 source_role=role,
                                 source_entry_id=source_entry_id,
@@ -671,7 +704,7 @@ def extract_compaction_obligations(
             _add_obligation(
                 obligations,
                 seen,
-                kind="command",
+                kind="command_reference",
                 value=match.group(0).rstrip("."),
                 source_role=role,
                 source_entry_id=source_entry_id,
@@ -692,6 +725,39 @@ def extract_compaction_obligations(
             max_obligations=max_obligations,
         )
     return obligations.values()
+
+
+def _command_input(call: Mapping[str, Any]) -> str:
+    """Use the actual shell input, never commands mentioned in prose/output."""
+    function = call.get("function")
+    source = function if isinstance(function, Mapping) else call
+    if source.get("name") != "exec_command":
+        return ""
+    arguments = source.get("arguments", source.get("input"))
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return ""
+    if not isinstance(arguments, Mapping):
+        return ""
+    command = arguments.get("command", arguments.get("cmd"))
+    return command if isinstance(command, str) else ""
+
+
+def _command_result_proves_execution(content: str, status: Any) -> bool:
+    if not isinstance(status, Mapping) or status.get("reason") == "legacy_missing_status":
+        status = execution_status_for_tool_result("exec_command", content)
+    if not isinstance(status, Mapping):
+        return False
+    # Approval, validation/runtime errors and cancellation may occur before a
+    # child process starts. A terminal tool record alone is not execution proof.
+    exit_code = status.get("exit_code")
+    return (
+        type(exit_code) is int
+        or status.get("status") == "success"
+        or (status.get("status") == "error" and status.get("reason") == "nonzero_exit")
+    )
 
 
 def verify_summary_coverage(

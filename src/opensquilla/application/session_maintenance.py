@@ -105,6 +105,7 @@ class SessionCompactionExecutionResult:
     quality_report: Mapping[str, object] = field(default_factory=dict)
     # Internal recovery classification; the existing transport payload stays unchanged.
     failure_kind: str = ""
+    failure_detail: Mapping[str, object] | None = None
 
 
 class SessionCompactionMilestone(StrEnum):

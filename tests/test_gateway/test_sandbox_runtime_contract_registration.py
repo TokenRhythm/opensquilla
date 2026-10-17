@@ -159,8 +159,23 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    # The v2 recovery contracts and video discovery add seven methods to the 269-method surface.
-    assert len(registry.list_methods()) == 276
+    # V2 recovery, video discovery, message search, five interactive terminal
+    # methods and side create/close add fifteen to the previous 269-method surface.
+    assert len(registry.list_methods()) == 284
+    for method in (
+        "terminal.create", "terminal.write", "terminal.resize", "terminal.close",
+        "terminal.consume",
+    ):
+        terminal_entry = registry.get_entry(method)
+        assert terminal_entry is not None
+        assert terminal_entry.required_scope == "operator.write"
+    for method in ("sessions.sidechat.create", "sessions.sidechat.close"):
+        sidechat_entry = registry.get_entry(method)
+        assert sidechat_entry is not None
+        assert sidechat_entry.required_scope == "operator.write"
+        assert sidechat_entry.generated_contract_name == method
+        assert sidechat_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    assert registry.get_entry("sessions.messages.search") is not None
     assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
     for method in (
         "transport.sessionFlow.update.v2",

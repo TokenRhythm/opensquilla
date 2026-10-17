@@ -40,7 +40,7 @@ function stableValue(value: unknown): string {
 
 const TIMEOUTS = new Set([
   'timeout', 'llm_timeout', 'iteration_timeout', 'stream_idle_timeout',
-  'hard_deadline_exceeded', 'provider_retry_after_deadline', 'agent_runtime_timeout',
+  'hard_deadline_exceeded', 'agent_runtime_timeout',
 ])
 const STOPPED = new Set(['cancelled', 'cancelled_before_start', 'user_cancelled'])
 const INTERRUPTED = new Set(['abandoned', 'interrupted', 'shutdown_timeout', 'dropped_by_overflow'])
@@ -65,13 +65,14 @@ const INCOMPLETE_RESPONSES = new Set([
   'silent_reply_not_allowed', 'model_repetition_loop_detected',
 ])
 const PROVIDER_PRESENTATIONS = new Map<string, ChatErrorPresentation>([
-  ['rate_limited', presentation('busy')],
+  ['rate_limited', presentation('rateLimited')],
   ['provider_overloaded', presentation('busy')],
   ['auth_invalid', presentation('credentials', 'open-provider-settings')],
   ['context_overflow', presentation('contextLimit', 'choose-model')],
   ['unsupported_feature', presentation('unsupported', 'choose-model')],
   ['insufficient_credits', presentation('credits', 'open-provider-settings')],
-  ['usage_limit_reached', presentation('credits', 'open-provider-settings')],
+  ['usage_limit', presentation('usageLimit')],
+  ['usage_limit_reached', presentation('usageLimit')],
   ['model_not_found', presentation('modelUnavailable', 'choose-model')],
   ['transport_transient', presentation('unavailable')],
   ['policy_refusal', presentation('refused')],
@@ -96,6 +97,9 @@ export function chatErrorPresentation(input: ChatErrorPresentationInput): ChatEr
   if (causes.some(value => STOPPED.has(value))) return presentation('stopped')
   if (causes.some(value => INTERRUPTED.has(value))) return presentation('interrupted')
   if (kind === 'interrupted') return presentation('interrupted')
+
+  if (causes.some(value => ['provider_retry_after_deadline', 'rate_limit_retry_exhausted', 'provider_retry_after_wait_ceiling'].includes(value))) return presentation('rateLimitWaitEnded')
+  if (causes.some(value => ['provider_overload_retry_after_deadline', 'provider_overload_retry_wait_exhausted'].includes(value))) return presentation('busyWaitEnded')
 
   if (causes.some(isUsageAccountingBarrier)) {
     return input.replaySafe === true

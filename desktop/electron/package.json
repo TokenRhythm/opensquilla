@@ -36,11 +36,13 @@
     "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs && node scripts/test-secret-decryption-cache.mjs",
     "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
+    "test:update-background": "npm run build && node scripts/test-native-update-background.mjs && node scripts/test-windows-update-network.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",
     "test:windows-update": "npm run build && node scripts/test-windows-update-security.mjs && node scripts/test-windows-update-cache.mjs && node scripts/test-windows-update-handoff.mjs && node scripts/test-windows-update-coordinator.mjs && node scripts/test-windows-update-integration.mjs && node scripts/test-windows-update-refresh.mjs && node scripts/test-windows-update-network.mjs",
     "test:windows-update-electron": "npm run build && node scripts/test-windows-update-electron.mjs",
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
     "test:desktop-renderer-protocol": "npm run build && node scripts/test-desktop-renderer-protocol.mjs",
+    "test:office-preview-csp": "node scripts/test-office-preview-csp.mjs",
     "test:desktop-zoom": "npm run build && node scripts/test-desktop-zoom-shortcuts.mjs",
     "test:desktop-reload": "npm run build && node scripts/test-desktop-reload-shortcuts.mjs",
     "test:image-clipboard": "node scripts/test-image-clipboard-electron.mjs",
@@ -57,7 +59,7 @@
     "test:theme-flow": "npm run build && node scripts/test-desktop-theme-flow.mjs",
     "test:deep-link": "npm run build && node scripts/test-desktop-single-instance.mjs && node scripts/test-desktop-deep-link.mjs && node scripts/test-desktop-deep-link-startup.mjs",
     "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
-    "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-consolidation.mjs",
+    "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-consolidation.mjs && node scripts/test-desktop-startup-preflight.mjs && node scripts/test-desktop-startup-toml.mjs",
     "test:profile-consolidation-flow": "npm run build && node scripts/test-profile-consolidation-flow.mjs",
     "test:primary-repair-accessibility": "npm run build && node scripts/test-primary-repair-accessibility.mjs",
     "test:profile-import-flow": "npm run build && node scripts/test-profile-import-flow.mjs",
@@ -144,6 +146,10 @@
       "package.json"
     ],
     "extraResources": [
+      {
+        "from": "../../THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      },
       {
         "from": "src/boot.html",
         "to": "boot.html"

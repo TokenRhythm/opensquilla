@@ -13,6 +13,31 @@ afterEach(() => {
   i18n.global.locale.value = 'en'
 })
 
+it('stays absent for healthy sends and offers a quiet check only while delivery is unresolved', async () => {
+  const entries = ref<DeliverySnapshot[]>([])
+  const onCheck = vi.fn()
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const app = createApp({ setup: () => () => h(ChatDeliveryRecoveryStatus, {
+    entries: entries.value, checkingIds: [], onCheck,
+  }) })
+  app.use(i18n); app.mount(host); apps.push(app)
+  expect(host.children).toHaveLength(0)
+
+  entries.value = [{ id: 'original', sessionKey: 'session', phase: 'unknown',
+    isCurrentIdentity: true, stopPending: false, waitReason: 'budget', preview: 'Original message' }]
+  await nextTick()
+  expect(host.textContent).toContain('Automatic checks have paused')
+  expect(host.querySelector('[role="alert"]')).toBeNull()
+  expect(onCheck).not.toHaveBeenCalled()
+  host.querySelector<HTMLButtonElement>('button')!.click()
+  expect(onCheck).toHaveBeenCalledExactlyOnceWith('original')
+
+  entries.value = []
+  await nextTick()
+  expect(host.children).toHaveLength(0)
+})
+
 it('renders a separate check for each current conversation request and reflects pending actions', async () => {
   i18n.global.setLocaleMessage('zh-Hans', zhHans)
   i18n.global.locale.value = 'zh-Hans'

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from opensquilla.uninstall import safety
 
@@ -30,7 +33,12 @@ def test_is_within_rejects_symlink_escape(tmp_path: Path) -> None:
     outside = tmp_path / "secret"
     outside.mkdir()
     link = root / "link"
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     # The link lives under root, but it resolves outside it → not contained.
     assert not safety.is_within(link, root)
 

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,7 +64,11 @@ def test_text_part_reports_missing_citations_from_decorator() -> None:
     text_part = _read(TEXT_PART)
     citations = _read(CITATIONS)
 
-    assert "Some citations do not map to available sources" in text_part
+    assert "t('chat.missingCitationSources', { citations: missingCitationLabel })" in text_part
+    english = json.loads(_read(ROOT / "opensquilla-webui/src/locales/en.json"))
+    assert english["chat"]["missingCitationSources"] == (
+        "Some citations do not map to available sources: {citations}"
+    )
     assert "onMissingCitations" in text_part
     assert "missingCitationIds" in text_part
     assert "onMissingCitations?: (sourceIds: number[]) => void" in citations

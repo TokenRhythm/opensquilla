@@ -29,6 +29,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { WORKSPACE_REFERENCES_KEY, workspaceReferenceErrorKey } from '@/modules/workspaceReferences'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
 import type { WorkspaceFileReferenceV1 } from '@/types/references'
 import { copyTextWithFallback } from '@/utils/browser'
 import { useWorkbenchStore } from '@/workbench/store'
@@ -38,6 +39,7 @@ const props = defineProps<{ reference: WorkspaceFileReferenceV1; sessionKey: str
 const { t } = useI18n()
 const access = inject(WORKSPACE_REFERENCES_KEY, null)
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
+const workbenchOwner = inject(CONVERSATION_WORKBENCH_OWNER_KEY, null)
 const referenceGatewayEndpoint = gateway?.loadConnectionEndpoint() ?? null
 const store = useWorkbenchStore()
 const busy = ref(false)
@@ -63,6 +65,7 @@ function cancel() { pending?.abort(); pending = null; busy.value = false; errorK
 // only when the resource identity, permissions, or Gateway context changes.
 watch([
   () => props.sessionKey,
+  () => workbenchOwner?.value,
   () => props.reference.id,
   () => props.reference.scope.sessionKey,
   () => props.reference.scope.workspaceId,
@@ -89,6 +92,8 @@ async function open() {
   errorKey.value = ''
   copied.value = false
   const sessionKey = props.sessionKey
+  const ownerSessionKey = workbenchOwner?.value || sessionKey
+  const activeWorkbenchSession = store.activeSessionId
   const gatewayEpoch = gateway?.subscriptionEpoch
   try {
     const snapshot = await access.read(sessionKey, props.reference, attempt.signal)
@@ -96,11 +101,14 @@ async function open() {
       attempt.signal.aborted
       || pending !== attempt
       || sessionKey !== props.sessionKey
+      || ownerSessionKey !== (workbenchOwner?.value || props.sessionKey)
+      || activeWorkbenchSession !== store.activeSessionId
       || blocked.value
       || gateway?.subscriptionEpoch !== gatewayEpoch
       || (gateway && gateway.loadConnectionEndpoint() !== referenceGatewayEndpoint)
     ) return
-    store.openItem(createWorkspaceFileItem(sessionKey, snapshot.reference))
+    const item = createWorkspaceFileItem(sessionKey, snapshot.reference, ownerSessionKey)
+    if (store.openItem(item) && store.activeItemId === item.id) store.requestReveal()
   } catch (error) {
     if (!attempt.signal.aborted) errorKey.value = workspaceReferenceErrorKey(error)
   } finally {

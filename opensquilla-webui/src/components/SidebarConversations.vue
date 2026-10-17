@@ -41,6 +41,7 @@ export type { SidebarSection as SidebarSectionType }
 <script setup lang="ts">
 import {
   computed,
+  inject,
   nextTick,
   onMounted,
   onUnmounted,
@@ -58,7 +59,9 @@ import SidebarSessionHoverCard, {
 } from './SidebarSessionHoverCard.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
-import { usePlatform } from '@/platform'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { WORKSPACE_FILES_KEY, type WorkspaceRoot } from '@/modules/workspaceFiles'
+import { copyTextWithFallback } from '@/utils/browser'
 import { useSidebarVirtualizer } from '@/composables/useSidebarVirtualizer'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
 import { buildSidebarTaskHierarchy } from '@/utils/sidebarTaskHierarchy'
@@ -92,14 +95,13 @@ const props = withDefaults(defineProps<{
   canCreateProjects: false,
 })
 
-const isDesktop = usePlatform().capabilities.isDesktop
-
 const emit = defineEmits<{
   (e: 'select', key: string): void
   (e: 'refresh'): void
   (e: 'load-more'): void
   (e: 'rename', payload: { key: string; title: string }): void
   (e: 'delete', key: string): void
+  (e: 'copy-session-link', key: string): void
   (e: 'bulk-delete', keys: string[]): void
   (e: 'reorder', payload: { draggedKey: string; targetKey: string; position: 'before' | 'after' }): void
   (e: 'session-pin', payload: { key: string; pinned: boolean }): void
@@ -116,6 +118,8 @@ const emit = defineEmits<{
 const { confirm } = useConfirm()
 const { t } = useI18n()
 const historyList = ref<HTMLElement | null>(null)
+const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
+const gatewayAccess = inject(GATEWAY_ACCESS_KEY, null)
 
 function maybeLoadMore() {
   const element = historyList.value
@@ -744,6 +748,117 @@ async function requestBulkDelete() {
 /* ── Per-row ⋯ menu + inline rename ────────────────────────────────── */
 
 const openMenuKey = ref('')
+const projectDirectory = ref<WorkspaceRoot | null>(null)
+const projectDirectoryState = ref<'loading' | 'open' | 'copy' | 'error' | 'unavailable'>('unavailable')
+const projectDirectoryReason = ref('')
+const projectDirectoryError = ref('')
+const projectDirectoryBusy = ref(false)
+let projectDirectoryGeneration = 0
+let projectDirectoryAbort: AbortController | null = null
+const projectDirectoryTarget = computed(() => displayProjection.value.allRows.find(
+  row => row.key === openMenuKey.value && row.rowKind === 'workspace',
+))
+const projectDirectoryConnected = computed(() => !gatewayAccess || gatewayAccess.isAuthenticated
+  && gatewayAccess.availability === 'available' && gatewayAccess.isAvailable
+  && gatewayAccess.connectionHealth === 'healthy' && !gatewayAccess.isResuming
+  && (!gatewayAccess.connectionPhase || gatewayAccess.connectionPhase === 'healthy'))
+const projectDirectoryMayLaunch = computed(() => !gatewayAccess
+  || gatewayAccess.canExecuteHost && gatewayAccess.isLocalOwner)
+const projectDirectoryLabel = computed(() => t(projectDirectoryState.value === 'loading'
+  ? 'workbench.workspaceFiles.checkingApplications'
+  : projectDirectoryState.value === 'error' ? 'workbench.workspaceFiles.retryApplications'
+    : projectDirectoryState.value === 'copy' ? 'workspaces.copyDirectoryPath' : 'workspaces.openDirectory'))
+const projectDirectoryHint = computed(() => {
+  if (!projectDirectoryConnected.value) return t('workbench.newPanel.requiresConnection')
+  if (projectDirectoryTarget.value?.workspaceAvailable === false) return t('workspaces.unavailable')
+  const key = projectDirectoryReason.value === 'remote-client' ? 'remoteApplicationsUnavailable'
+    : projectDirectoryReason.value === 'host-permission-required' ? 'applicationsPermissionRequired'
+      : projectDirectoryReason.value === 'desktop-unavailable' ? 'applicationsDesktopUnavailable'
+        : 'applicationsUnavailable'
+  return ['copy', 'unavailable'].includes(projectDirectoryState.value) ? t(`workbench.workspaceFiles.${key}`) : ''
+})
+
+function cancelProjectDirectory() {
+  projectDirectoryGeneration++
+  projectDirectoryAbort?.abort()
+  projectDirectoryAbort = null
+  projectDirectory.value = null
+  projectDirectoryState.value = 'unavailable'
+  projectDirectoryReason.value = ''
+  projectDirectoryError.value = ''
+  projectDirectoryBusy.value = false
+}
+
+async function loadProjectDirectory() {
+  cancelProjectDirectory()
+  const row = projectDirectoryTarget.value
+  if (!row?.workspaceId || !props.canManageProjects || !projectDirectoryConnected.value
+    || row.workspaceAvailable === false) return
+  if (!workspaceFiles?.root) return
+  const generation = projectDirectoryGeneration
+  const request = new AbortController()
+  projectDirectoryAbort = request
+  const scope = { projectId: row.workspaceId }
+  projectDirectoryState.value = 'loading'
+  const current = () => generation === projectDirectoryGeneration && !request.signal.aborted
+  try {
+    const root = await workspaceFiles.root(scope, request.signal)
+    if (!current()) return
+    projectDirectory.value = root
+    if (!projectDirectoryMayLaunch.value || !workspaceFiles.rootApps || !workspaceFiles.openRoot) {
+      projectDirectoryReason.value = projectDirectoryMayLaunch.value ? '' : 'host-permission-required'
+      projectDirectoryState.value = 'copy'
+      return
+    }
+    try {
+      const catalogue = await workspaceFiles.rootApps(scope, request.signal)
+      if (!current()) return
+      projectDirectoryReason.value = catalogue.reason || ''
+      projectDirectoryState.value = catalogue.available && catalogue.apps.some(app => app.id === 'reveal')
+        ? 'open' : 'copy'
+    } catch {
+      if (current()) projectDirectoryState.value = 'copy'
+    }
+  } catch {
+    if (!current()) return
+    projectDirectoryState.value = 'error'
+    projectDirectoryError.value = t('workspaces.openDirectoryFailed')
+  }
+}
+
+async function performProjectDirectory() {
+  if (projectDirectoryBusy.value || !projectDirectoryConnected.value) return
+  if (projectDirectoryState.value === 'error') { await loadProjectDirectory(); return }
+  const row = projectDirectoryTarget.value, root = projectDirectory.value
+  const action = projectDirectoryState.value
+  if (!row?.workspaceId || !root || !['open', 'copy'].includes(action)) return
+  if (action === 'open' && (!projectDirectoryMayLaunch.value || !workspaceFiles?.openRoot)) return
+  const generation = projectDirectoryGeneration
+  const trigger = menuTriggerEl.value
+  const signal = projectDirectoryAbort?.signal
+  projectDirectoryBusy.value = true
+  projectDirectoryError.value = ''
+  try {
+    if (action === 'copy') await copyTextWithFallback(root.path)
+    else await workspaceFiles!.openRoot!({ projectId: row.workspaceId }, root, 'reveal', signal)
+    if (generation !== projectDirectoryGeneration || signal?.aborted) return
+    closeMenu()
+    nextTick(() => trigger?.isConnected && trigger.focus())
+  } catch {
+    if (generation === projectDirectoryGeneration && !signal?.aborted) {
+      projectDirectoryError.value = t(action === 'copy' ? 'workspaces.copyDirectoryFailed' : 'workspaces.openDirectoryFailed')
+      if (action === 'open') projectDirectoryState.value = 'error'
+    }
+  } finally {
+    if (generation === projectDirectoryGeneration) projectDirectoryBusy.value = false
+  }
+}
+
+watch(() => [openMenuKey.value, projectDirectoryTarget.value?.workspaceId,
+  projectDirectoryTarget.value?.workspace, projectDirectoryTarget.value?.workspaceAvailable,
+  props.canManageProjects, projectDirectoryConnected.value, projectDirectoryMayLaunch.value,
+  gatewayAccess?.deliveryIdentity, gatewayAccess?.subscriptionEpoch], () => { void loadProjectDirectory() }, { flush: 'sync' })
+onUnmounted(cancelProjectDirectory)
 // The ⋯ trigger that opened the active menu, captured so Escape can return
 // focus to it. A function-ref on the single open .sidebar-row-menu scopes the
 // roving-focus queries (only one menu renders at a time).
@@ -783,8 +898,21 @@ function canOpenSessionMenu(row: SidebarDisplayRow): boolean {
 
 function focusOpenMenu() {
   nextTick(() => {
-    const items = openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item')
+    const menu = openMenuEl.value
+    const items = menu?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item:not(:disabled)')
     items?.[0]?.focus()
+    if (!menu) return
+    const rect = menu.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    const edge = 8
+    // Localized labels and optional reorder actions change the measured size.
+    // Clamp the actual menu rather than relying on the opening estimate alone.
+    menuStyle.value = {
+      position: 'fixed',
+      left: `${Math.max(edge, Math.min(rect.left, window.innerWidth - rect.width - edge))}px`,
+      top: `${Math.max(edge, Math.min(rect.top, window.innerHeight - rect.height - edge))}px`,
+      transform: 'none',
+    }
   })
 }
 
@@ -819,9 +947,9 @@ function toggleMenu(key: string, event?: Event) {
 }
 
 function openSessionContextMenu(row: SidebarDisplayRow, event: MouseEvent) {
-  // Keep the browser's native context menu on the web build. The desktop shell
-  // owns right-click behavior and reuses the same actions as the row's ⋯ menu.
-  if (!isDesktop || !canOpenSessionMenu(row)) return
+  // Only session rows own this context menu; the rest of WebUI keeps the
+  // browser's native menu. Desktop and WebUI expose the same row actions.
+  if (!canOpenSessionMenu(row)) return
   event.preventDefault()
   event.stopPropagation()
   closeSessionPreview()
@@ -841,6 +969,22 @@ function openSessionContextMenu(row: SidebarDisplayRow, event: MouseEvent) {
   focusOpenMenu()
 }
 
+function onSessionKeydown(row: SidebarDisplayRow, event: KeyboardEvent) {
+  if (!canOpenSessionMenu(row)) return
+  if (event.key !== 'ContextMenu' && !(event.key === 'F10' && event.shiftKey)) return
+  event.preventDefault()
+  event.stopPropagation()
+  closeSessionPreview()
+  toggleMenu(row.key, event)
+}
+
+function copySessionLink(row: SidebarDisplayRow) {
+  closeMenu()
+  emit('copy-session-link', row.key)
+  restoreRowFocus(row.key)
+  void nextTick(closeSessionPreview)
+}
+
 function closeMenu() {
   openMenuKey.value = ''
   openMenuEl.value = null
@@ -851,34 +995,63 @@ const sessionPreview = ref<{
   row: SidebarDisplayRow
   position: { left: string; top: string }
 } | null>(null)
+let sessionPreviewTimer: ReturnType<typeof setTimeout> | undefined
+let sessionPreviewDismissTimer: ReturnType<typeof setTimeout> | undefined
+
+function canPreviewSession(row: SidebarDisplayRow): boolean {
+  return row.rowKind === 'session'
+    && !selectionMode.value
+    && !draggedRowKey.value
+    && !openMenuKey.value
+    && renamingKey.value !== row.key
+    && canShowSessionPreview(window.innerWidth)
+}
 
 function openSessionPreview(row: SidebarDisplayRow, event: Event) {
-  if (
-    row.rowKind !== 'session'
-    || selectionMode.value
-    || draggedRowKey.value
-    || openMenuKey.value
-    || renamingKey.value === row.key
-  ) return
-  // On narrow/mobile layouts the sidebar fills the viewport. A fixed preview
-  // would cover neighboring rows and make the list hard to operate.
-  if (!canShowSessionPreview(window.innerWidth)) {
-    closeSessionPreview()
-    return
-  }
+  keepSessionPreview()
+  if (sessionPreview.value?.row.key === row.key) return
+  closeSessionPreview()
+  if (!canPreviewSession(row)) return
   const anchor = event.currentTarget
   if (!(anchor instanceof HTMLElement)) return
-  sessionPreview.value = {
-    row,
-    position: sessionPreviewPosition(
-      anchor.getBoundingClientRect(),
-      { width: window.innerWidth, height: window.innerHeight },
-    ),
-  }
+  sessionPreviewTimer = setTimeout(() => {
+    sessionPreviewTimer = undefined
+    const current = findSessionRow(row.key)
+    if (!anchor.isConnected || !current || !canPreviewSession(current)) return
+    sessionPreview.value = {
+      row: current,
+      position: sessionPreviewPosition(
+        anchor.getBoundingClientRect(),
+        { width: window.innerWidth, height: window.innerHeight },
+      ),
+    }
+  }, 400)
+}
+
+function keepSessionPreview() {
+  if (sessionPreviewDismissTimer) clearTimeout(sessionPreviewDismissTimer)
+  sessionPreviewDismissTimer = undefined
+}
+
+function scheduleSessionPreviewClose() {
+  if (sessionPreviewTimer) clearTimeout(sessionPreviewTimer)
+  sessionPreviewTimer = undefined
+  keepSessionPreview()
+  sessionPreviewDismissTimer = setTimeout(closeSessionPreview, 130)
 }
 
 function closeSessionPreview() {
+  if (sessionPreviewTimer) clearTimeout(sessionPreviewTimer)
+  sessionPreviewTimer = undefined
+  keepSessionPreview()
   sessionPreview.value = null
+}
+
+function sessionPreviewStatus(row: SidebarDisplayRow): string {
+  // "Idle" is not evidence of successful completion. Only expose a status
+  // already supplied by the directory or the existing task-attention state.
+  return taskAttentionLabel(row.taskAttention)
+    || (row.runStatus && row.runStatus !== 'idle' ? row.runLabel : '')
 }
 
 function onSessionFocusOut(event: FocusEvent) {
@@ -889,12 +1062,31 @@ function onSessionFocusOut(event: FocusEvent) {
 }
 
 watch([selectionMode, openMenuKey], closeSessionPreview)
-useDocumentEvent('scroll', closeSessionPreview, true)
+watch(displayProjection, () => {
+  if (!sessionPreview.value) return
+  const row = findSessionRow(sessionPreview.value.row.key)
+  if (row) sessionPreview.value = { ...sessionPreview.value, row }
+  else closeSessionPreview()
+})
+useDocumentEvent('scroll', (event) => {
+  if (event.target instanceof Element && event.target.closest('.sidebar-session-preview')) return
+  closeSessionPreview()
+}, true)
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || (!sessionPreview.value && !sessionPreviewTimer)) return
+  event.preventDefault()
+  closeSessionPreview()
+})
 onMounted(() => {
   window.addEventListener('resize', closeSessionPreview)
+  window.addEventListener('blur', closeSessionPreview)
   void nextTick(maybeLoadMore)
 })
-onUnmounted(() => window.removeEventListener('resize', closeSessionPreview))
+onUnmounted(() => {
+  window.removeEventListener('resize', closeSessionPreview)
+  window.removeEventListener('blur', closeSessionPreview)
+  closeSessionPreview()
+})
 watch(
   [displayBlocks, () => props.hasMore, () => props.loadingMore],
   () => nextTick(maybeLoadMore),
@@ -909,18 +1101,22 @@ function onMenuKeydown(e: KeyboardEvent) {
     const trigger = menuTriggerEl.value
     focusedItemKey.value = `row:${openMenuKey.value}`
     closeMenu()
-    nextTick(() => trigger?.focus())
+    nextTick(() => {
+      trigger?.focus()
+      closeSessionPreview()
+    })
     return
   }
-  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return
   const items = Array.from(
-    openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item') ?? [],
+    openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item:not(:disabled)') ?? [],
   )
   if (!items.length) return
   e.preventDefault()
   const current = items.indexOf(document.activeElement as HTMLElement)
   const delta = e.key === 'ArrowDown' ? 1 : -1
-  const next = (current + delta + items.length) % items.length
+  const next = e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1
+    : (current + delta + items.length) % items.length
   items[next]?.focus()
 }
 
@@ -1357,7 +1553,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                 :style="{ '--row-depth': row.depth }"
                 @pointerdown="onRowPointerDown(row, $event)"
                 @mouseenter="openSessionPreview(row, $event)"
-                @mouseleave="closeSessionPreview"
+                @mouseleave="scheduleSessionPreviewClose"
                 @focusin="openSessionPreview(row, $event)"
                 @focusout="onSessionFocusOut"
               >
@@ -1375,7 +1571,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                         count: row.workspaceTaskCount ?? 0,
                       })"
                     >
-                      <Icon name="folder" :size="15" />
+                      <Icon name="folder-outline" :size="17" />
                     </button>
                     <div class="sidebar-project-info-popover" role="tooltip">
                       <span class="sidebar-project-info-path">
@@ -1478,6 +1674,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                   :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
                   @click="onSelectRow(row, $event)"
                   @contextmenu="openSessionContextMenu(row, $event)"
+                  @keydown="onSessionKeydown(row, $event)"
                 >
                   <span
                     v-if="selectionMode && !row.provisional"
@@ -1579,6 +1776,20 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                     <button
                       type="button"
                       class="sidebar-row-menu__item"
+                      data-project-action="open-directory"
+                      role="menuitem"
+                      :disabled="projectDirectoryBusy || ['loading', 'unavailable'].includes(projectDirectoryState)"
+                      :title="projectDirectoryHint || undefined"
+                      :aria-busy="projectDirectoryBusy || projectDirectoryState === 'loading'"
+                      @click.stop="performProjectDirectory"
+                    >
+                      <Icon :name="projectDirectoryState === 'copy' ? 'copy' : 'folder'" :size="13" />
+                      <span>{{ projectDirectoryLabel }}</span>
+                    </button>
+                    <p v-if="projectDirectoryError" class="sidebar-project-menu__error" role="alert">{{ projectDirectoryError }}</p>
+                    <button
+                      type="button"
+                      class="sidebar-row-menu__item"
                       data-project-action="delete-history"
                       role="menuitem"
                       @click.stop="requestProjectHistoryDelete(row)"
@@ -1667,6 +1878,16 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                     </button>
                     <button
                       type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      data-session-action="copy-link"
+                      @click.stop="copySessionLink(row)"
+                    >
+                      <Icon name="copy" :size="14" />
+                      <span>{{ t('chat.copySessionLink') }}</span>
+                    </button>
+                    <button
+                      type="button"
                       class="sidebar-row-menu__item sidebar-row-menu__item--danger"
                       role="menuitem"
                       @click.stop="requestDelete(row)"
@@ -1705,7 +1926,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
           </div>
       </div>
       <div
-        v-if="loadingMore || loadMoreError || (!hasMore && totalRows > 0)"
+        v-if="loadingMore || loadMoreError"
         class="sidebar-history-page-state"
         role="status"
       >
@@ -1718,7 +1939,6 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
         >
           {{ t('shared.errorState.retry') }}
         </button>
-        <span v-else>{{ t('shared.sidebar.allLoaded') }}</span>
       </div>
     </div>
     <Teleport to="body">
@@ -1728,13 +1948,30 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
         :title="sessionPreview.row.title"
         :updated-at="sessionPreview.row.updatedAt"
         :project-name="sessionPreview.row.displayProjectName"
+        :status="sessionPreviewStatus(sessionPreview.row)"
         :position="sessionPreview.position"
+        @mouseenter="keepSessionPreview"
+        @mouseleave="scheduleSessionPreviewClose"
       />
     </Teleport>
   </div>
 </template>
 
 <style scoped>
+.sidebar-project-menu__error {
+  max-width: 240px;
+  margin: var(--sp-1) var(--sp-2);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.sidebar-row-menu {
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+
 .sidebar-history-list {
   padding-top: 0;
 }

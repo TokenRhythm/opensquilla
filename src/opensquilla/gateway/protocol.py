@@ -158,6 +158,7 @@ _INTERNAL_TERMINAL_RESET_FIELDS = frozenset(
         "terminal_error_message",
         "terminal_error_code",
         "terminal_failure_kind",
+        "terminal_http_status",
     }
 )
 

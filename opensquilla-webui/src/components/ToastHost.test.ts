@@ -28,7 +28,7 @@ describe('ToastHost actions', () => {
     app.use(createI18n({
       legacy: false,
       locale: 'en',
-      messages: { en: { shared: { toast: { dismiss: 'Dismiss' } } } },
+      messages: { en: { shared: { toast: { dismiss: 'Dismiss', actionPending: 'Working…', actionFailed: 'Try again' } } } },
     }))
     app.mount(host)
     mountedApps.push(app)

@@ -3,11 +3,288 @@ import type { ChatToolCallRenderItem } from '@/types/chat'
 import { toolSecondaryText } from './toolDisplay'
 import {
   activityDisplayPath,
+  activityToolCodeContent,
+  canReadActivityExecutionLog,
+  hasActivityToolCodeContent,
+  isOmittedActivityPayload,
+  projectActivityToolSummary,
   hasActivityToolDetail,
   projectActivityToolDetail,
+  projectActivityToolErrorSummary,
   projectActivityToolTargets,
   redactActivityDetail,
 } from './activityToolDetails'
+
+describe('external retained file body disclosure', () => {
+  it('offers lazy disclosure for a recoverable write but never for an unfinished or failed call', () => {
+    const item = call({ name: 'write_file', status: 'success', isRunning: false,
+      fileSnapshot: { kind: 'write', path: 'snake.html', content: '', legacy_ref: {
+        message_id: 'message-1', tool_use_id: 'write-1', sha256: 'a'.repeat(64), original_chars: 16000 } } })
+    expect(hasActivityToolDetail(item, 'file.write')).toBe(true)
+    expect(projectActivityToolDetail(item, 'file.write').codeView).toMatchObject({ content: '', unavailable: true })
+    expect(hasActivityToolDetail({ ...item, isRunning: true, status: '' }, 'file.write')).toBe(false)
+    expect(hasActivityToolDetail({ ...item, isError: true, status: 'error' }, 'file.write')).toBe(false)
+  })
+  it('offers one disclosure for a saved reference and never displays its preview as full content', () => {
+    const item = call({ name: 'write_file', status: 'success', isRunning: false,
+      inputRaw: '{"path":"large.txt","content":"old inferred text"}',
+      fileSnapshot: { kind: 'write', path: 'large.txt', content: 'preview only', sha256_ref: 'a'.repeat(64), bytes: 100_000 } })
+    expect(hasActivityToolDetail(item, 'file.write')).toBe(true)
+    expect(projectActivityToolDetail(item, 'file.write').codeView).toMatchObject({ content: '', unavailable: true })
+  })
+
+  it('keeps a storage failure as a successful summary without fabricated or empty details', () => {
+    const item = call({ name: 'write_file', status: 'success', isRunning: false,
+      inputRaw: '{"path":"large.txt","content":"old inferred text"}',
+      fileSnapshot: { kind: 'write', path: 'large.txt', content: 'preview only', content_unavailable: true } })
+    expect(hasActivityToolDetail(item, 'file.write')).toBe(false)
+    expect(projectActivityToolDetail(item, 'file.write').codeView?.content).toBe('')
+  })
+})
+
+describe('collapsed tool error summaries', () => {
+  const summary = (result: string) => projectActivityToolErrorSummary(call({
+    name: 'custom_tool', status: 'error', isError: true, result, resultPreview: result,
+  }))
+
+  it.each([
+    '{"ok":false,"code":"INVALID_REQUEST","diagnostics":',
+    '  {"ok":false,"message":"truncated user hint',
+    '{"ok":false,"code":"INVALID_REQUEST"}',
+    '[{"ok":false,"message":"an array member"}]',
+    '[ {"ok":false,"message":',
+    '[',
+    '[]',
+    '["raw diagnostic array"]',
+    '{"message":"{\\"raw\\":true}"}',
+  ])('does not dump a structured payload into the row: %s', (result) => {
+    expect(summary(result)).toBe('')
+  })
+
+  it('extracts an explicit structured user message without its diagnostic envelope', () => {
+    expect(summary(JSON.stringify({
+      ok: false, code: 'INVALID_REQUEST',
+      user_message: 'Request failed; token=private-value\nInternal diagnostic continuation',
+      diagnostics: { request: 'private payload' },
+    }))).toBe('Request failed; token=[redacted]')
+  })
+
+  it('keeps a normal bracketed error log and redacts only the displayed first line', () => {
+    expect(summary('[error] Request failed; token=private-value\nFull diagnostic continuation'))
+      .toBe('[error] Request failed; token=[redacted]')
+  })
+})
+
+describe('retained typed tool history', () => {
+  const omitted = '[historical_tool_argument_omitted]\ntool: write_file\nhead: <html>partial'
+
+  it('uses the complete saved write instead of a projected argument or result preview', () => {
+    const content = `${'<p>retained source</p>\n'.repeat(1200)}<!-- last line -->`
+    const item = call({ inputRaw: JSON.stringify({ path: 'index.html', content: omitted,
+      _opensquilla_compacted_tool_input: true }), result: 'Written 26418 bytes',
+      fileSnapshot: { kind: 'write', path: 'index.html', content } })
+    const view = projectActivityToolDetail(item, 'file.write').codeView!
+    expect(view).toEqual({ kind: 'write', path: 'index.html', content, language: 'html' })
+    expect(hasActivityToolDetail(item, 'file.write')).toBe(true)
+    expect(activityToolCodeContent(view)).toBe(content)
+  })
+
+  it('prefers the actual applied diff over requested replacements and abbreviated result diffs', () => {
+    const applied = '--- a/a.ts\n+++ b/a.ts\n@@ -7 +7 @@\n-actual old\n+actual new'
+    const item = call({ name: 'edit_file', inputRaw: JSON.stringify({ path: 'a.ts',
+      old_text: 'requested old', new_text: 'requested new' }),
+      result: JSON.stringify({ diff_summary: 'truncated result diff' }),
+      fileSnapshot: { kind: 'edit', path: 'a.ts', content: applied } })
+    expect(projectActivityToolDetail(item, 'file.edit').codeView)
+      .toEqual({ kind: 'edit', path: 'a.ts', content: applied, language: 'diff' })
+  })
+
+  it('keeps an empty recorded write expandable even when arguments have been omitted', () => {
+    const item = call({ inputRaw: JSON.stringify({ path: 'empty.txt', content: omitted }),
+      fileSnapshot: { kind: 'write', path: 'empty.txt', content: '' } })
+    expect(hasActivityToolDetail(item, 'file.write')).toBe(true)
+    expect(projectActivityToolDetail(item, 'file.write').codeView)
+      .toMatchObject({ kind: 'write', content: '' })
+  })
+
+  it.each([
+    { isError: true, status: 'error' as const, result: 'Permission denied' },
+    { result: '{"ok":false,"message":"Permission denied"}' },
+    { result: '{"status":"blocked"}' },
+  ])('never presents a successful snapshot for a failed or unapplied mutation', overrides => {
+    const item = call({ ...overrides, fileSnapshot: { kind: 'edit', path: 'a.ts', content: '-old\n+new' } })
+    const view = projectActivityToolDetail(item, 'file.edit').codeView!
+    expect(view.error).toBe(true)
+    expect(view.content).toBe('')
+    expect(activityToolCodeContent(view)).not.toContain('+new')
+  })
+
+  it('never treats an omission envelope as file content or a fabricated diff', () => {
+    const item = call({ inputRaw: JSON.stringify({ path: 'index.html', content: omitted }), result: 'Written 5000 bytes' })
+    const view = projectActivityToolDetail(item, 'file.write').codeView!
+    expect(view.unavailable).toBe(true)
+    expect(hasActivityToolDetail(item, 'file.write')).toBe(false)
+    expect(activityToolCodeContent(view)).toBe('')
+    expect(projectActivityToolSummary(item, 'file.write')).toBe('index.html')
+  })
+
+  it('refuses compacted object arguments even if their content looks like a source fragment', () => {
+    const item = call({ inputRaw: JSON.stringify({ path: 'a.ts', content: 'a fragment', _opensquilla_compacted_tool_input: 'true' }) })
+    expect(hasActivityToolDetail(item, 'file.write')).toBe(false)
+  })
+
+  it('accepts an authoritative result diff despite compacted arguments', () => {
+    const diff = '--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new'
+    const item = call({ inputRaw: JSON.stringify({ path: 'a.ts', content: omitted, _opensquilla_compacted_tool_input: true }),
+      result: JSON.stringify({ status: 'applied', diff_summary: diff }) })
+    expect(projectActivityToolDetail(item, 'file.edit').codeView).toMatchObject({ kind: 'edit', content: diff })
+  })
+
+  it('retains full redacted file-mutation failures without claiming attempted input was written', () => {
+    const result = `failed to write\n${'diagnostic\n'.repeat(50)}token=secret\nlast line`
+    const view = projectActivityToolDetail(call({ status: 'error', isError: true,
+      inputRaw: '{"path":"a.ts","content":"attempted source"}', result,
+    }), 'file.write').codeView!
+    expect(view.error).toBe(true)
+    expect(activityToolCodeContent(view)).toBe(redactActivityDetail(result))
+    expect(activityToolCodeContent(view)).not.toContain('attempted source')
+  })
+
+  it('does not silently drop an omitted replacement from a multi-edit change', () => {
+    const item = call({ name: 'edit_file', inputRaw: JSON.stringify({ path: 'a.ts', edits: [
+      { old_text: 'before', new_text: 'after' }, { old_text: omitted, new_text: 'later' },
+    ] }) })
+    expect(hasActivityToolDetail(item, 'file.edit')).toBe(false)
+    const missing = call({ name: 'edit_file', inputRaw: JSON.stringify({ path: 'a.ts', edits: [
+      { old_text: 'before', new_text: 'after' }, { new_text: 'missing before' },
+    ] }) })
+    expect(hasActivityToolDetail(missing, 'file.edit')).toBe(false)
+    expect(hasActivityToolCodeContent({ kind: 'edit', content: '' })).toBe(false)
+  })
+
+  it('distinguishes explicitly empty writes from missing content', () => {
+    const empty = projectActivityToolDetail(call({ inputRaw: '{"path":"a.txt","content":""}' }), 'file.write').codeView!
+    const absent = projectActivityToolDetail(call({ inputRaw: '{"path":"a.txt"}' }), 'file.write').codeView!
+    expect(hasActivityToolCodeContent(empty)).toBe(true)
+    expect(hasActivityToolCodeContent(absent)).toBe(false)
+  })
+
+  it('unwraps revision read receipts and preserves partial evidence', () => {
+    const view = projectActivityToolDetail(call({ name: 'read_source', inputRaw: '{"path":"a.ts"}',
+      result: JSON.stringify({ revision: 'private-hash', lines: [{ text: 'line one' }, { text: 'line two' }], range: [2, 3], total_lines: 10 }),
+    }), 'file.inspect').codeView!
+    expect(view).toMatchObject({ kind: 'read', content: 'line one\nline two', partial: true })
+    expect(activityToolCodeContent(view)).not.toContain('private-hash')
+  })
+
+  it('preserves JSON file contents that resemble a read_source revision receipt', () => {
+    const content = JSON.stringify({ revision: 'schema-v1', lines: [{ text: 'important row', other: 'retained field' }],
+      metadata: 'important metadata', range: [2, 3], total_lines: 10 })
+    for (const name of ['read_file', 'mcp__files__read_file']) {
+      const view = projectActivityToolDetail(call({ name, inputRaw: '{"path":"receipt.json"}', result: content }), 'file.inspect').codeView!
+      expect(view.content).toBe(content)
+      expect(view.partial).not.toBe(true)
+      expect(activityToolCodeContent(view)).toBe(content)
+    }
+  })
+
+  it('carries persisted truncation metadata without truncating the retained text again', () => {
+    const content = Array.from({ length: 400 }, (_, i) => `line ${i}`).join('\n')
+    const view = projectActivityToolDetail(call({ name: 'read_file', inputRaw: '{"path":"a.ts"}',
+      result: content, resultTruncated: true, resultOriginalChars: 99_000,
+    }), 'file.inspect').codeView!
+    expect(view.partial).toBe(true)
+    expect(activityToolCodeContent(view)).toBe(content)
+  })
+
+  it('retains both command streams and the nonzero exit code in display/copy data', () => {
+    const view = projectActivityToolDetail(call({ name: 'exec', inputRaw: '{"command":"npm test"}',
+      result: JSON.stringify({ stdout: 'started', stderr: 'full failure', exit_code: 2 }),
+    }), 'command.run').codeView!
+    expect(view).toMatchObject({ command: 'npm test', output: 'started\nfull failure', exitCode: 2, error: true })
+    expect(activityToolCodeContent(view)).toBe('$ npm test\n\nstarted\nfull failure\n\nexit_code=2')
+  })
+
+  it('retains authoritative execute_code source and output without a shell prompt', () => {
+    const view = projectActivityToolDetail(call({ name: 'execute_code',
+      inputRaw: JSON.stringify({ code: 'print("next")\napi_key = "secret"', command: 'unrelated' }),
+      result: JSON.stringify({ stdout: 'next', stderr: '', exit_code: 0 }),
+    }), 'command.run').codeView!
+    expect(view).toMatchObject({ language: 'python', command: 'print("next")\napi_key = [redacted]', output: 'next' })
+    expect(activityToolCodeContent(view)).toBe('print("next")\napi_key = [redacted]\n\nnext\n\nexit_code=0')
+    expect(view.unavailable).toBeUndefined()
+  })
+
+  it('retains full structured command errors when no output stream contains the diagnostics', () => {
+    const result = JSON.stringify({ exit_code: 1, error: `first error\nsecond detail\n${'diagnostic '.repeat(30)}last detail`, token: 'secret' })
+    for (const isError of [true, false]) {
+      const view = projectActivityToolDetail(call({ name: 'exec_command', inputRaw: '{"command":"test"}',
+        status: isError ? 'error' : 'success', isError, result,
+      }), 'command.run').codeView!
+      expect(view.error).toBe(true)
+      expect(view.output).toBe(redactActivityDetail(result))
+      expect(activityToolCodeContent(view)).toContain('second detail')
+      expect(activityToolCodeContent(view)).toContain('last detail')
+      expect(activityToolCodeContent(view)).not.toContain('"token":"secret"')
+    }
+  })
+
+  it('keeps commands readable when their historical output is omitted', () => {
+    const view = projectActivityToolDetail(call({ name: 'exec', inputRaw: '{"command":"pwd"}',
+      result: '[historical_tool_result_compacted]\nhead: partial',
+    }), 'command.run').codeView!
+    expect(hasActivityToolCodeContent(view)).toBe(true)
+    expect(activityToolCodeContent(view)).toBe('$ pwd')
+    const withLog = call({ name: 'exec', inputRaw: '{}', result: '', executionLogHandle: 'saved-log-handle' })
+    expect(hasActivityToolDetail(withLog, 'command.run')).toBe(true)
+  })
+
+  it('keeps pending reads summary-only and does not present omitted commands as row labels', () => {
+    const item = call({ name: 'read_file', isRunning: true, status: '', result: '' })
+    expect(hasActivityToolDetail(item, 'file.inspect')).toBe(false)
+    expect(projectActivityToolSummary(call({ inputRaw: JSON.stringify({ command: omitted }) }), 'command.run')).toBe('')
+    expect(projectActivityToolDetail(call({ inputRaw: JSON.stringify({ command: 'fragment', _opensquilla_compacted_tool_input: true }) }), 'command.run').codeView?.command).toBe('')
+  })
+
+  it('requires evidence before labelling an empty read as an empty file', () => {
+    const unknown = call({ name: 'read_file', inputRaw: '{"path":"a.txt"}', result: '' })
+    expect(hasActivityToolDetail(unknown, 'file.inspect')).toBe(false)
+    expect(hasActivityToolDetail({ ...unknown, resultOriginalChars: 0 }, 'file.inspect')).toBe(true)
+    const receipt = { ...unknown, name: 'read_source', result: JSON.stringify({ revision: 'rev', lines: [], total_lines: 0 }) }
+    expect(projectActivityToolDetail(receipt, 'file.inspect').codeView).toMatchObject({ content: '' })
+    expect(hasActivityToolDetail(receipt, 'file.inspect')).toBe(true)
+  })
+
+  it('recognizes concrete provider omission markers, not prose mentioning their names', () => {
+    expect(isOmittedActivityPayload('[provider_request_base64_image_omitted]')).toBe(true)
+    expect(isOmittedActivityPayload('The historical_tool_argument_omitted prefix is documented.')).toBe(false)
+    const source = 'const marker = "[opensquilla_compacted:source:100:0123456789abcdef]"\n// [provider_request_base64_image_omitted]\n// [provider_request_text_compacted:original_chars=1000]'
+    const view = projectActivityToolDetail(call({ inputRaw: JSON.stringify({ path: 'markers.ts', content: source }) }), 'file.write').codeView!
+    expect(hasActivityToolCodeContent(view)).toBe(true)
+    expect(activityToolCodeContent(view)).toBe(source)
+  })
+
+  it('does not read optional execution logs for complete or unknown historical output', () => {
+    const complete = call({ name: 'exec', result: 'Python 3.12.10\n', executionLogHandle: 'expired' })
+    expect(canReadActivityExecutionLog(complete, 'command.run')).toBe(false)
+    expect(canReadActivityExecutionLog({ ...complete, result: '', resultPreview: 'Python 3.12.10\n' }, 'command.run')).toBe(false)
+    expect(canReadActivityExecutionLog({ ...complete, result: '{"stdout":"","stderr":"","exit_code":0}' }, 'command.run')).toBe(false)
+    expect(canReadActivityExecutionLog({ ...complete, result: '', resultOriginalChars: 0 }, 'command.run')).toBe(false)
+    expect(canReadActivityExecutionLog({ ...complete, result: ' \n' }, 'command.run')).toBe(false)
+  })
+
+  it('recovers saved logs only with evidence that output is missing or incomplete', () => {
+    const item = call({ name: 'exec', result: 'prefix', executionLogHandle: 'saved-log' })
+    expect(canReadActivityExecutionLog({ ...item, resultTruncated: true }, 'command.run')).toBe(true)
+    expect(canReadActivityExecutionLog({ ...item, resultOriginalChars: 1000 }, 'command.run')).toBe(true)
+    expect(canReadActivityExecutionLog({ ...item, result: '' }, 'command.run')).toBe(true)
+    expect(canReadActivityExecutionLog({ ...item, result: '[historical_tool_result_compacted]\nhead: prefix' }, 'command.run')).toBe(true)
+    for (const key of ['truncated', 'stdout_truncated', 'stderr_truncated', 'output_truncated']) {
+      expect(canReadActivityExecutionLog({ ...item, result: JSON.stringify({ stdout: 'prefix', [key]: true }) }, 'command.run')).toBe(true)
+    }
+    expect(canReadActivityExecutionLog({ ...item, result: '{"output":"prefix","total_chars":1000}' }, 'tool.process')).toBe(true)
+  })
+})
 
 function call(
   overrides: Partial<ChatToolCallRenderItem> = {},
@@ -153,7 +430,9 @@ describe('activity tool detail projection', () => {
     for (const name of ['read_file', 'edit_file', 'browser', 'document_patch_preview']) {
       const entry = call({ name, result: 'ordinary result', resultPreview: 'ordinary result' })
       expect(projectActivityToolDetail(entry, 'tool.unknown').rawContent).toContain('ordinary result')
-      expect(toolSecondaryText({ ...entry, inputPreview: '' })).toBe('ordinary result')
+      // An unknown browser tool retains its result in details and identifies
+      // itself verbatim in the row instead of borrowing its result as a title.
+      expect(toolSecondaryText({ ...entry, inputPreview: '' })).toBe(name === 'browser' ? name : 'ordinary result')
     }
   })
 
@@ -279,9 +558,9 @@ describe('activity tool detail projection', () => {
     ])
     expect(JSON.stringify(projection.lines)).not.toContain('/private/')
     expect(JSON.stringify(projection.lines)).not.toContain('private body')
-    expect(projection.detailMode).toBe('changes')
-    expect(projection.rawContent).toContain('+++ resulting content')
-    expect(projection.rawContent).toContain('+<html>private body</html>')
+    expect(projection.detailMode).toBe('result')
+    expect(projection.rawContent).toBe('<html>private body</html>')
+    expect(projection.codeView).toMatchObject({ kind: 'write', content: '<html>private body</html>' })
     expect(projection.rawContent).not.toContain('/private/tmp/opensquilla-test')
   })
 
@@ -455,7 +734,7 @@ describe('activity tool detail projection', () => {
     expect(projection.rawContent).not.toContain('resulting content')
   })
 
-  it('hides read-shaped details and reports content size for generic operations', () => {
+  it('shows retained file reads but keeps network projection and generic size semantics', () => {
     const longOutput = Array.from({ length: 42 }, (_, i) => `line ${i}`).join('\n')
 
     expect(projectActivityToolDetail(call({
@@ -476,7 +755,7 @@ describe('activity tool detail projection', () => {
       inputRaw: '{"path":"src/App.vue"}',
       result: longOutput,
       resultPreview: longOutput,
-    }), 'file.inspect')).toEqual({ lines: [], rawContent: '' })
+    }), 'file.inspect').codeView).toMatchObject({ kind: 'read', content: longOutput })
 
     // Generic tools (MCP servers and custom integrations) rarely carry a
     // name-like input key, so the size line is their only signal.
@@ -498,9 +777,10 @@ describe('activity tool detail projection', () => {
       resultPreview: 'Unable to open /Users/example/private/project/file.txt: permission denied',
     }), 'file.inspect')
 
-    expect(projection).toEqual({
+    expect(projection).toMatchObject({
       lines: [{ kind: 'error', text: 'Unable to open …/file.txt: permission denied' }],
       rawContent: '',
+      codeView: { error: true, output: 'Unable to open …/file.txt: permission denied' },
     })
     expect(JSON.stringify(projection)).not.toContain('/Users/example/private/project')
   })

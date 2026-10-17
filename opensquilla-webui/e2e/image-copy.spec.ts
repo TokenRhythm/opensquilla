@@ -236,12 +236,17 @@ test.describe('Image copy through the system clipboard', () => {
   test('generated SVG copies a transparent PNG and exact UTF-8 source', async ({ page }, testInfo) => {
     const { resource } = await openFixture(page, { body: SVG_SOURCE, name: 'drawing.svg', mime: 'image/svg+xml' })
     await copyImage(page, resource)
-    await resource.getByTestId('image-copy-more').click()
+    await expect(resource.locator('button[aria-haspopup="menu"]')).toHaveCount(1)
+    await expect(resource.getByTestId('image-copy-more')).toHaveCount(0)
+    await resource.locator('.resource-actions-trigger').click()
+    await expect(page.getByRole('menuitem', { name: 'Copy SVG source', exact: true })).toHaveCount(1)
     await page.screenshot({ path: testInfo.outputPath('svg-copy-menu.png') })
-    await page.getByTestId('copy-svg-source').click()
-    await expect(resource.locator('.image-copy-actions')).toHaveAttribute('data-state', 'ok')
+    await page.getByRole('menuitem', { name: 'Copy SVG source', exact: true }).click()
+    await expect(page.getByText('SVG source copied', { exact: true })).toBeVisible()
     const pasted = await pasteSyntheticClipboard(page)
-    expect(pasted.text).toBe(SVG_SOURCE)
+    // Windows native text paste exposes CRLF line endings.
+    const pastedSource = process.platform === 'win32' ? pasted.text.replace(/\r\n/g, '\n') : pasted.text
+    expect(pastedSource).toBe(SVG_SOURCE)
     expect(pasted.files).toEqual([])
   })
 

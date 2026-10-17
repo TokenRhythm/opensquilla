@@ -213,15 +213,18 @@ async def prepare_route(
 
     workspace_dir = run_context.workspace or workspace_dir
     page_context_text = None
+    office_candidate = None
     if command.page_context is not None:
         from opensquilla.gateway.page_context import render_page_context
 
         resolved_context = await page_context_resolver(
             command.page_context,
+            candidate_id=turn_id,
             session_key=key,
             session_id=session_id,
             workspace=workspace_dir,
         )
+        office_candidate = resolved_context.pop("_officeCandidate", None)
         page_context_text = render_page_context(resolved_context)
     host_execute_allowed = principal_has_host_execute(principal)
     session_epoch = int(getattr(session, "epoch", 0) or 0)
@@ -261,6 +264,8 @@ async def prepare_route(
         principal_is_owner=principal.is_owner,
     )
     route_envelope.metadata["sandbox_mode_resolution"] = mode_resolution.to_payload()
+    if office_candidate is not None:
+        route_envelope.metadata["office_candidate"] = office_candidate
     if command.selected_skills:
         route_envelope.metadata["selected_skills"] = list(command.selected_skills)
     if guest_profile is not None:

@@ -23,6 +23,7 @@ PUBLIC_BUNDLED_SKILLS: tuple[str, ...] = (
     "pptx",
     "skill-creator",
     "xlsx",
+    "visualize",
 )
 
 _LAYER_RANK: dict[SkillLayer, int] = {

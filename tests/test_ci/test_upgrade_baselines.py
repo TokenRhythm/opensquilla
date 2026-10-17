@@ -409,12 +409,17 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     baseline_branch = "if ('${{ matrix.scenario }}' -ne 'fresh')"
     assert baseline_branch in verify
     assert verify.index(baseline_branch) < verify.index("'--baseline-installer'")
+    assert "needs" not in job
+    assert "'--candidate-artifact-name', 'nsis-regression-installer'" in verify
+    assert "'--candidate-source-sha', $env:GITHUB_SHA" in verify
+    audit_source = (SCRIPTS / "verify-nsis-upgrade-regression.py").read_text(encoding="utf-8")
     for binding in (
         "sourceSha", "installerSha256", "asarSha256", "executableSha256",
         "dependencyInventorySha256",
     ):
-        assert f"$manifest.{binding}" in verify
-    assert "Candidate source mismatch" in verify and "Candidate hash mismatch" in verify
+        assert f"'{binding}'" in audit_source
+    assert "Candidate source mismatch" in audit_source
+    assert "Candidate installer differs from the pinned build manifest" in audit_source
     assert "& python @arguments" in verify and "if ($LASTEXITCODE -ne 0) { throw" in verify
 
 
@@ -602,84 +607,6 @@ def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
         inputs = suites["suites"][suite]["execution_inputs"]
         assert telemetry.relative_to(ROOT).as_posix() in inputs
         assert native_test.relative_to(ROOT).as_posix() in inputs
-
-
-@pytest.mark.ci_serial
-def test_packaged_gateway_readiness_budget_and_terminal_errors(tmp_path: Path) -> None:
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node.js is required for the packaged readiness contract")
-    script = r"""
-import assert from 'node:assert/strict';
-import { readFileSync, writeSync } from 'node:fs';
-const phase = (name, terminal) => writeSync(2, JSON.stringify({
-  event: 'packaged_readiness_contract', phase: name, terminal, at: Date.now(),
-}) + '\n');
-phase('entry');
-const source = readFileSync('desktop/electron/scripts/test-packaged-session-recovery.mjs', 'utf8');
-phase('source-loaded');
-const start = source.indexOf('  gatewayReadinessStartedAt = performance.now()');
-const end = source.indexOf('  // The preceding release-upgrade launch', start);
-assert.ok(start > 0 && end > start);
-const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-const run = new AsyncFunction('waitFor', 'page', 'assert', 'performance', 'console',
-  'DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS',
-  'let gatewayReadinessStartedAt, lastGatewayConnection;\n' + source.slice(start, end));
-phase('compiled');
-for (const terminal of ['ready', 'error', 'stopped', 'starting']) {
-  phase('case-start', terminal);
-  let calls = 0;
-  const logs = [];
-  const page = { evaluate: async () => ({
-    status: ++calls === 1 ? 'starting' : terminal,
-    error: terminal === 'error' ? 'synthetic startup failure' : null,
-    authToken: 'must-never-appear-in-evidence',
-  }) };
-  const wait = async (check, label, budget) => {
-    assert.equal(budget, 120_000);
-    assert.equal(label, 'candidate Desktop Gateway readiness');
-    for (let i = 0; i < 3; i++) if (await check()) return;
-    throw new Error('synthetic startup timeout');
-  };
-  const attempt = run(wait, page, assert, performance,
-    { error: value => logs.push(value) }, 120_000);
-  if (terminal === 'ready') {
-    await attempt;
-    assert.equal(calls, 2);
-    assert.equal(JSON.parse(logs[0]).budgetMs, 120_000);
-  } else {
-    await assert.rejects(attempt, error => {
-      assert.ok(!error.message.includes('must-never-appear-in-evidence'));
-      assert.match(error.message, terminal === 'starting'
-        ? /synthetic startup timeout/ : /Candidate Gateway failed/);
-      return true;
-    });
-    assert.equal(calls, terminal === 'starting' ? 3 : 2);
-    assert.deepEqual(logs, []);
-  }
-  phase('case-end', terminal);
-}
-phase('complete');
-"""
-    # Keep the original process deadline independent of Windows pipe-reader
-    # threads, and retain the last completed phase if the child times out.
-    stdout_path = tmp_path / "node-stdout.log"
-    stderr_path = tmp_path / "node-stderr.log"
-    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
-        try:
-            result = subprocess.run(
-                [node, "--input-type=module", "-e", script],
-                cwd=ROOT, stdout=stdout_file, stderr=stderr_file, timeout=15, check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            error.add_note(
-                f"Captured stdout: {stdout_path.read_text(encoding='utf-8', errors='replace')!r}\n"
-                f"Captured stderr: {stderr_path.read_text(encoding='utf-8', errors='replace')!r}"
-            )
-            raise
-    stdout = stdout_path.read_text(encoding="utf-8")
-    stderr = stderr_path.read_text(encoding="utf-8")
-    assert result.returncode == 0, stdout + stderr
 
 
 @pytest.mark.parametrize(

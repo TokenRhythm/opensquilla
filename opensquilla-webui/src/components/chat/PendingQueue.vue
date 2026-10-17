@@ -48,7 +48,7 @@
       <span
         v-if="item.pendingDeliveryIdentity && item.pendingPersistenceState !== 'saving'
           && item.pendingPersistenceState !== 'cancelling'
-          && (offline || item.pendingDeliveryIdentity !== deliveryIdentity)"
+          && showRetainedStatus(item)"
         class="chat-pending-save-status"
         role="status"
       >{{ t(item.pendingDeliveryIdentity !== deliveryIdentity
@@ -168,6 +168,7 @@ import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { CONNECTION_NOTICE_DELAY_MS, useDelayedNotice } from '@/composables/useDelayedNotice'
 import type { Attachment, PendingSteerAttempt } from '@/types/chat'
 import {
   hasSendableModelInputImageAttachment,
@@ -230,6 +231,41 @@ const emit = defineEmits<{
   send: [pendingUiId: string]
   resume: []
 }>()
+
+const offlineNoticeVisible = useDelayedNotice(
+  computed(() => props.offline === true), undefined, undefined, CONNECTION_NOTICE_DELAY_MS,
+)
+const passiveOfflineItemIds = shallowRef<ReadonlySet<string>>(new Set())
+watch([
+  () => props.offline === true,
+  () => props.items.map(item => ({
+    id: item.pendingUiId,
+    hasActionFeedback: item.pendingPersistenceState === 'saving'
+      || item.pendingPersistenceState === 'retryable'
+      || Boolean(item.deliveryState || item.steerAttempt),
+  })),
+], ([offline, items], previous) => {
+  // Only existing, settled rows wait out a brief connection interruption.
+  // New local submissions and persistence/delivery outcomes stay immediate.
+  if (!offline || !previous?.[1]) {
+    passiveOfflineItemIds.value = new Set()
+    return
+  }
+  const [wasOffline, previousItems] = previous
+  const candidates = wasOffline
+    ? passiveOfflineItemIds.value
+    : new Set(previousItems.filter(item => !item.hasActionFeedback).map(item => item.id))
+  passiveOfflineItemIds.value = new Set(items
+    .filter(item => candidates.has(item.id) && !item.hasActionFeedback)
+    .map(item => item.id))
+}, { immediate: true })
+
+function showRetainedStatus(item: PendingQueueItem): boolean {
+  return item.pendingDeliveryIdentity !== props.deliveryIdentity
+    || Boolean(props.offline && (
+      offlineNoticeVisible.value || !passiveOfflineItemIds.value.has(item.pendingUiId)
+    ))
+}
 
 const LONG_PRESS_MS = 750
 const LONG_PRESS_DEADZONE_PX = 7
@@ -615,7 +651,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .chat-pending {
   position: relative;
-  z-index: 1;
+  /* Keep queue menus/drag layers local, below the later composer surface.
+     Its backdrop-filter creates a level-zero stacking context: raising this
+     sibling above zero would paint cards over every inline composer popover. */
+  z-index: 0;
   display: grid;
   gap: 8px;
   width: min(calc(100% - 3rem), calc(var(--composer-col, 820px) - 1rem));

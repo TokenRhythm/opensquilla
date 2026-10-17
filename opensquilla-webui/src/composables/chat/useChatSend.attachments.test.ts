@@ -3547,10 +3547,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.inputText.value).toBe('')
     expect(pendingSessionIntent.value).toBe('NEW')
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
-    expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
-      role: 'error',
-      text: 'The task did not finish. Please try again later.',
-    })
+    expect(options.messages.value.filter(message => message.role === 'error')).toEqual([])
 
     await flushDelivery()
     await api.onSend()
@@ -4696,7 +4693,7 @@ describe('useChatSend attachment payloads', () => {
     expect(stream.endStreaming).toHaveBeenCalledTimes(1)
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The task did not finish. Please try again later.',
+      text: 'This request did not finish.',
       errorCode: 'activation_failed',
       terminalNotice: true,
     })
@@ -4772,7 +4769,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.activeStreamSessionKey.value).toBe('')
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The task did not finish. Please try again later.',
+      text: 'This request did not finish.',
       errorCode: 'activation_failed',
       terminalNotice: true,
     })
@@ -4809,7 +4806,7 @@ describe('useChatSend attachment payloads', () => {
     expect(adoptResponseSession).toHaveBeenCalledWith(childSessionKey, expect.any(String))
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The task did not finish. Please try again later.',
+      text: 'This request did not finish.',
       errorCode: 'activation_failed',
       terminalNotice: true,
     })
@@ -7393,7 +7390,7 @@ describe('useChatSend image admission', () => {
     await unknown.api.onSend()
     expect(unknown.options.messages.value[unknown.options.messages.value.length - 1]).toMatchObject({
       errorCode: 'provider_custom_failure',
-      text: 'The task did not finish. Please try again later.',
+      text: 'This request did not finish.',
     })
   })
 

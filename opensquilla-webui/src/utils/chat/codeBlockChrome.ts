@@ -18,7 +18,7 @@ export interface CodeBlockChromeLabels {
 }
 
 export function codeText(pre: HTMLPreElement): string {
-  const code = pre.querySelector('code')
+  const code = Array.from(pre.children).find(child => child.tagName === 'CODE')
   return code?.textContent || ''
 }
 
@@ -39,6 +39,8 @@ function setCopyButtonState(
   button.replaceChildren(copyIconSvg(state))
   button.title = label
   button.setAttribute('aria-label', label)
+  button.classList.toggle('is-copied', state === 'copied')
+  button.classList.toggle('is-error', state === 'error')
 }
 
 export function copyIconSvg(state: 'idle' | 'copied' | 'error'): SVGSVGElement {
@@ -75,40 +77,91 @@ function svgNode(tag: string, attrs: Record<string, string>): SVGElement {
   return node
 }
 
-export function decorateCodeBlocks(root: HTMLElement | null, labels: CodeBlockChromeLabels): void {
-  if (!root) return
-  for (const pre of root.querySelectorAll<HTMLPreElement>('pre')) {
-    if (hasCodeCopyButton(pre)) continue
-    const text = codeText(pre)
-    if (!text) continue
+// One owner per mounted Markdown surface. Incremental decoration only scans the
+// newly committed block; resets release the whole generation without revisiting
+// earlier blocks on every streaming append.
+export function createCodeBlockChrome() {
+  const controls = new Map<HTMLButtonElement, { refresh: () => void; dispose: () => void }>()
+  let labels: CodeBlockChromeLabels = { copy: '', copied: '', copyFailed: '' }
+  let disposed = false
 
-    pre.classList.add('code-block')
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'code-copy-btn'
-    setCopyButtonState(button, labels, 'idle')
-    button.addEventListener('click', async event => {
-      event.preventDefault()
-      event.stopPropagation()
-      try {
-        await copyTextWithFallback(codeText(pre))
-        setCopyButtonState(button, labels, 'copied')
-        button.classList.add('is-copied')
-        window.setTimeout(() => {
-          if (!button.isConnected) return
-          setCopyButtonState(button, labels, 'idle')
-          button.classList.remove('is-copied')
-        }, 1600)
-      } catch {
-        setCopyButtonState(button, labels, 'error')
-        button.classList.add('is-error')
-        window.setTimeout(() => {
-          if (!button.isConnected) return
-          setCopyButtonState(button, labels, 'idle')
-          button.classList.remove('is-error')
+  function decorate(root: HTMLElement | null, nextLabels: CodeBlockChromeLabels, selector = 'pre'): void {
+    if (disposed || !root) return
+    labels = nextLabels
+    for (const pre of root.querySelectorAll<HTMLPreElement>(selector)) {
+      if (hasCodeCopyButton(pre) || !codeText(pre)) continue
+      pre.classList.add('code-block', 'markdown-code-block')
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'code-copy-btn'
+      button.dataset.shareControl = 'true'
+      let state: 'idle' | 'copied' | 'error' = 'idle'
+      let active = true
+      let request = 0
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const refresh = () => setCopyButtonState(button, labels, state)
+      async function onClick(event: MouseEvent) {
+        event.preventDefault()
+        event.stopPropagation()
+        const current = ++request
+        clearTimeout(timer)
+        let result: typeof state = 'copied'
+        try { await copyTextWithFallback(codeText(pre)) }
+        catch { result = 'error' }
+        if (!active || current !== request || !root?.contains(button)) return
+        state = result
+        refresh()
+        timer = setTimeout(() => {
+          if (!active || current !== request || !root?.contains(button)) return
+          state = 'idle'
+          refresh()
+          timer = undefined
         }, 1600)
       }
-    })
-    pre.appendChild(button)
+      refresh()
+      button.addEventListener('click', onClick)
+      pre.appendChild(button)
+      controls.set(button, {
+        refresh,
+        dispose() {
+          active = false
+          request += 1
+          clearTimeout(timer)
+          button.removeEventListener('click', onClick)
+          button.remove()
+        },
+      })
+    }
   }
+
+  function updateLabels(nextLabels: CodeBlockChromeLabels): void {
+    labels = nextLabels
+    for (const control of controls.values()) control.refresh()
+  }
+
+  function reset(): void {
+    for (const control of controls.values()) control.dispose()
+    controls.clear()
+  }
+
+  function dispose(): void {
+    reset()
+    disposed = true
+  }
+
+  return { decorate, updateLabels, reset, dispose }
+}
+
+// Compatibility for standalone decoration. Mounted surfaces use an explicit
+// owner above so their unmount/reset can release callbacks and timers.
+const standaloneOwners = new WeakMap<HTMLElement, ReturnType<typeof createCodeBlockChrome>>()
+export function decorateCodeBlocks(root: HTMLElement | null, labels: CodeBlockChromeLabels): void {
+  if (!root) return
+  let owner = standaloneOwners.get(root)
+  if (!owner) {
+    owner = createCodeBlockChrome()
+    standaloneOwners.set(root, owner)
+  }
+  owner.updateLabels(labels)
+  owner.decorate(root, labels)
 }

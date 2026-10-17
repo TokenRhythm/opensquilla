@@ -27,6 +27,7 @@ _GENERATION_LOSSY_EVENTS = frozenset(
         "session.event.text_delta",
         "session.event.thinking",
         "session.event.tool_use_delta",
+        "session.event.tool_input_preview",
         "session.event.tool_use_end",
     }
 )
@@ -199,6 +200,7 @@ class SessionStreamRegistry:
             "session.event.text_delta",
             "session.event.run_heartbeat",
             "session.event.tool_use_delta",
+            "session.event.tool_input_preview",
         }:
             return True
         return bool(
@@ -829,6 +831,16 @@ class SessionStreamRegistry:
                     field="text",
                 )
                 return
+        elif event.event_name == "session.event.tool_input_preview":
+            preview_id = event.payload.get("preview_id")
+            for index in range(len(events) - 1, reset_index, -1):
+                existing = events[index]
+                if (
+                    existing.event_name == event.event_name
+                    and existing.payload.get("preview_id") == preview_id
+                ):
+                    events[index] = event
+                    return
         elif event.event_name == "session.event.run_heartbeat":
             for index in range(len(events) - 1, -1, -1):
                 if events[index].event_name == event.event_name:

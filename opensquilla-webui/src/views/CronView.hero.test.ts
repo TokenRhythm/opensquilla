@@ -14,10 +14,13 @@ const testState = vi.hoisted(() => ({
   error: null as string | null,
   waitingForCapacity: false,
   openPanel: vi.fn(),
+  route: { path: '/cron', query: {} as Record<string, string> },
+  replaceRoute: vi.fn(async () => undefined),
 }))
 
 vi.mock('vue-router', () => ({
-  useRouter: () => ({ push: vi.fn() }),
+  useRouter: () => ({ push: vi.fn(), replace: testState.replaceRoute }),
+  useRoute: () => testState.route,
   onBeforeRouteLeave: vi.fn(),
 }))
 
@@ -158,6 +161,8 @@ beforeEach(() => {
   testState.error = null
   testState.waitingForCapacity = false
   testState.openPanel.mockReset()
+  testState.route.query = {}
+  testState.replaceRoute.mockClear()
 })
 
 afterEach(() => {
@@ -166,6 +171,49 @@ afterEach(() => {
 })
 
 describe('CronView automation hero states', () => {
+  it('opens the existing history for the notification job and consumes its query', async () => {
+    testState.hasLoaded = true
+    testState.jobs = [{ id: 'target', name: 'Target' }]
+    testState.route.query = { job: 'target', unrelated: 'keep' }
+    const host = mountCronView()
+    await nextTick()
+    await nextTick()
+    expect(host.querySelector('[data-testid="run-history"]')).not.toBeNull()
+    expect(testState.replaceRoute).toHaveBeenCalledWith({ path: '/cron', query: { unrelated: 'keep' } })
+  })
+
+  it('returns a deleted task to the existing list with feedback', async () => {
+    testState.hasLoaded = true
+    testState.jobs = [{ id: 'other', name: 'Other' }]
+    testState.route.query = { job: 'deleted' }
+    const host = mountCronView()
+    await nextTick()
+    expect(host.querySelector('[data-testid="run-history"]')).toBeNull()
+    expect(host.querySelector('[data-testid="cron-job-list"]')).not.toBeNull()
+    expect(host.querySelector('.cron-refresh-status')?.textContent).toBe(i18n.global.t('cronSkills.jobs.toastTaskUnavailable'))
+    expect(testState.replaceRoute).toHaveBeenCalledWith({ path: '/cron', query: {} })
+  })
+
+  it('does not misreport a missing task while its list is loading or failed', async () => {
+    testState.hasLoaded = true
+    testState.error = 'offline'
+    testState.route.query = { job: 'target' }
+    const host = mountCronView()
+    await nextTick()
+    expect(host.textContent).not.toContain(i18n.global.t('cronSkills.jobs.toastTaskUnavailable'))
+    expect(testState.replaceRoute).not.toHaveBeenCalled()
+  })
+
+  it('keeps the last loaded jobs and summary when a refresh fails', () => {
+    testState.hasLoaded = true
+    testState.jobs = [{ id: 'daily', name: 'Daily summary', enabled: true }]
+    testState.error = 'refresh offline'
+    const host = mountCronView()
+    expect(host.querySelector('[data-testid="error-state"]')).toBeNull()
+    expect(host.querySelector('.automation-launch--compact')).not.toBeNull()
+    expect(host.querySelector('[data-testid="cron-job-list"]')).not.toBeNull()
+    expect(host.querySelector('.cron-refresh-status button')).not.toBeNull()
+  })
   it('shows a neutral loading state before the first list response', () => {
     const host = mountCronView()
 
@@ -254,7 +302,8 @@ describe('CronView automation hero states', () => {
     testState.jobs = [{ id: 'daily', enabled: true }]
     testState.error = 'Permission denied'
     const host = mountCronView()
-    expect(host.querySelector('[data-testid="error-state"]')).not.toBeNull()
+    expect(host.querySelector('.cron-refresh-status[role="status"]')).not.toBeNull()
+    expect(host.querySelector('.cron-refresh-status button')).not.toBeNull()
     expect(host.querySelector('[data-testid="cron-job-list"]')).not.toBeNull()
     expect(host.querySelector('[data-testid="loading-spinner"]')).toBeNull()
   })

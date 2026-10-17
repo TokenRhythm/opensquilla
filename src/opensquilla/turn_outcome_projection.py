@@ -49,7 +49,12 @@ def terminal_turn_outcome(status: str, outcome: object) -> dict[str, Any] | None
     if status not in TERMINAL_AGENT_TASK_STATUSES:
         return None
     if isinstance(outcome, Mapping):
-        return deepcopy(dict(outcome))
+        result = deepcopy(dict(outcome))
+        http_status = result.pop("http_status", None)
+        # This transcript projection stays independent of provider imports.
+        if status != "succeeded" and type(http_status) is int and 400 <= http_status <= 599:
+            result["http_status"] = http_status
+        return result
     legacy_kind = {
         "succeeded": "completed",
         "failed": "failed",

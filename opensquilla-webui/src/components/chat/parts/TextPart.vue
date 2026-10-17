@@ -21,7 +21,7 @@
       @action="handleWorkspaceFileAction"
     />
     <ResourceActionsMenu ref="fileMenu" :session-key="sessionKey" @open="emit('openResource', $event)" />
-    <div v-if="part.html" ref="rootEl" class="msg-ai-text" v-html="part.html" />
+    <div v-if="part.html || visualizeReceipts.length" ref="rootEl" class="msg-ai-text" data-chat-find-body><VisualizeBody :html="part.html" :receipts="visualizeReceipts" :session-key="sessionKey" /></div>
     <p v-if="unmentionedPreviews.length" class="workspace-preview-fallback">
       <span>{{ t('workbench.artifactDocument.preview') }}: </span>
       <template v-for="(preview, index) in unmentionedPreviews" :key="workspacePreviewIdentity(preview)">
@@ -39,18 +39,21 @@
       </template>
     </p>
     <p v-if="missingCitationLabel" class="msg-ai-citation-warning">
-      Some citations do not map to available sources: {{ missingCitationLabel }}
+      {{ t('chat.missingCitationSources', { citations: missingCitationLabel }) }}
     </p>
   </div>
 </template>
 
 <script setup lang="ts">
+import VisualizeBody from '@/components/chat/VisualizeBody.vue'
+import type { VisualizeReceipt } from '@/visualize/types'
 import { computed, inject, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { getActivePinia } from 'pinia'
 import WorkspaceFilePreview from '@/components/chat/WorkspaceFilePreview.vue'
 import WorkspaceFileActionsMenu from '@/components/chat/WorkspaceFileActionsMenu.vue'
 import { WORKSPACE_FILES_KEY, type WorkspaceFile } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
 import { clearWorkspaceFileLinks, decorateWorkspaceFileLinks, workspaceFileCandidates } from '@/utils/chat/workspaceFiles'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import type { ArtifactPayload } from '@/types/artifacts'
@@ -76,11 +79,12 @@ const props = withDefaults(
   defineProps<{
     part: Extract<ChatPart, { type: 'text' }>
     sources?: SourcePart[]
+    visualizeReceipts?: VisualizeReceipt[]
     workspacePreviews?: WorkspacePreviewLink[]
     sessionKey?: string
     preferWorkspaceWorkbench?: boolean
   }>(),
-  { sources: () => [], workspacePreviews: () => [], preferWorkspaceWorkbench: false },
+  { sources: () => [], visualizeReceipts: () => [], workspacePreviews: () => [], preferWorkspaceWorkbench: false },
 )
 
 const emit = defineEmits<{
@@ -99,6 +103,7 @@ const pinia = props.preferWorkspaceWorkbench ? getActivePinia() : undefined
 const workbench = pinia ? useWorkbenchStore(pinia) : null
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
+const workbenchOwner = inject(CONVERSATION_WORKBENCH_OWNER_KEY, null)
 const selectedWorkspaceFile = shallowRef<WorkspaceFile | null>(null)
 const workspaceWorkbenchAvailable = computed(() => Boolean(
   props.preferWorkspaceWorkbench && workbench,
@@ -109,7 +114,7 @@ const nativeWorkspaceActionsAvailable = computed(() => platform.id === 'desktop'
   && Boolean(platform.gateway.getConnection)
   && Boolean(gateway?.isLocalOwner && gateway.isAvailable))
 const workspaceFileScope = computed(() => JSON.stringify([
-  props.sessionKey, gateway?.deliveryIdentity, gateway?.subscriptionEpoch,
+  props.sessionKey, workbenchOwner?.value, gateway?.deliveryIdentity, gateway?.subscriptionEpoch,
   gateway?.isLocalOwner, gateway?.isAvailable,
 ]))
 let fileRequest: AbortController | null = null
@@ -126,9 +131,14 @@ function applyWorkspaceFiles(root: HTMLElement, scope: string) {
 }
 
 function openWorkspaceFile(file: WorkspaceFile) {
-  if (file.kind === 'text' && workspaceWorkbenchAvailable.value && props.sessionKey && workbench?.openItem(
-    createResolvedWorkspaceFileItem(props.sessionKey, file),
-  )) { selectedWorkspaceFile.value = null; return }
+  if (workspaceWorkbenchAvailable.value && props.sessionKey && workbench) {
+    const item = createResolvedWorkspaceFileItem(props.sessionKey, file, workbenchOwner?.value || props.sessionKey)
+    if (workbench.openItem(item)) {
+      if (workbench.activeItemId === item.id) workbench.requestReveal()
+      selectedWorkspaceFile.value = null
+      return
+    }
+  }
   selectedWorkspaceFile.value = file
 }
 
@@ -412,26 +422,26 @@ onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
   color: inherit;
 }
 
-.msg-ai-text :deep(p) { margin: 0.375rem 0; }
-.msg-ai-text :deep(p:first-child) { margin-top: 0; }
-.msg-ai-text :deep(ul), .msg-ai-text :deep(ol) { margin: 0.375rem 0; padding-left: 1.25rem; }
-.msg-ai-text :deep(li) { margin: 0.125rem 0; }
-.msg-ai-text :deep(code) {
+/* Paragraph/list rhythm is shared with narration and streaming Markdown. */
+.msg-ai-text :deep(:not(pre) > code) {
   background: var(--bg-hover);
   padding: 0.0625rem 0.25rem;
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
-  font-size: 0.8125rem;
+  font-size: 0.9em;
   color: var(--text-muted);
 }
 .msg-ai-text :deep(pre) {
   background: var(--code-block-bg);
   border: 1px solid var(--code-block-border);
-  border-radius: var(--radius-md);
-  padding: 0.625rem;
+  border-radius: var(--radius-control);
+  padding: 0.75rem 0.875rem 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.65;
   overflow-x: auto;
-  margin: 0.375rem 0;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
+  margin: 0.75rem 0;
+  box-shadow: none;
 }
 .msg-ai-text :deep(pre.code-block) {
   /* Chrome for fenced code (header gradient, language label, copy button)
@@ -465,8 +475,10 @@ onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
 }
 
 .msg-ai-text :deep(pre code) {
+  font: inherit;
   background: transparent;
   padding: 0;
+  color: var(--text);
 }
 
 .msg-ai-citation-warning {

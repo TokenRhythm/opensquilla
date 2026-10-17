@@ -38,6 +38,8 @@ import type { WorkspaceReferences } from '@/modules/workspaceReferences'
 import { createV4WorkspaceReferences } from './workspaceReferencesV4'
 import type { WorkspaceFiles } from '@/modules/workspaceFiles'
 import { createV4WorkspaceFiles } from './workspaceFilesV4'
+import type { TerminalAccess } from '@/modules/terminal'
+import { createV4TerminalAccess } from './terminalV4'
 import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 import type { UsageReporting } from '@/modules/usageReporting'
@@ -77,6 +79,8 @@ import { createSessionReadLifecycleFactory } from '@/modules/sessionReadLifecycl
 import { createV4SessionReadPort } from './sessionReadPortV4'
 import type { SessionInspection } from '@/modules/sessionInspection'
 import { createV4SessionInspection } from './sessionInspectionV4'
+import type { SessionMessageSearch } from '@/modules/sessionMessageSearch'
+import { createV4SessionMessageSearch } from './sessionMessageSearchV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
   & Parameters<typeof createV4GatewayAccess>[0]
@@ -87,6 +91,7 @@ export interface GatewayAdapters {
   readonly conversationEvents: ConversationEvents
   readonly sessionReadLifecycleFactory: SessionReadLifecycleFactory
   readonly sessionInspection: SessionInspection
+  readonly sessionMessageSearch: SessionMessageSearch
   readonly sessionDirectory: SessionDirectory
   readonly sessionDirectoryChanges: SessionDirectoryChanges
   readonly sessionLifecycle: SessionLifecycle
@@ -105,6 +110,7 @@ export interface GatewayAdapters {
   readonly workspaceCatalog: WorkspaceCatalog
   readonly workspaceReferences: WorkspaceReferences
   readonly workspaceFiles: WorkspaceFiles
+  readonly terminal: TerminalAccess
   readonly sandboxRuntime: SandboxRuntime
   readonly usageReporting: UsageReporting
   readonly commandCatalog: CommandCatalog
@@ -161,6 +167,7 @@ export function createGatewayAdapters(
     gatewayAccess,
     conversationEvents,
     sessionReadLifecycleFactory,
+    sessionMessageSearch: createV4SessionMessageSearch(transports.rpc),
     sessionInspection: createV4SessionInspection(
       transports.rpc,
       { concurrentHistoryReads },
@@ -186,6 +193,7 @@ export function createGatewayAdapters(
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
     workspaceReferences: createV4WorkspaceReferences(transports.rpc),
     workspaceFiles: createV4WorkspaceFiles(http),
+    terminal: createV4TerminalAccess(transports.rpc, transports.events),
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     usageReporting: createV4UsageReporting(transports.rpc),
     commandCatalog: createV4CommandCatalog(transports.rpc),

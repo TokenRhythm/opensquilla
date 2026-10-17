@@ -1,6 +1,7 @@
 import { renderMarkdownCore } from '@/utils/markdown/renderCore'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactMime, artifactName } from '@/utils/chat/artifacts'
+import { isSourceTextFile, isSourceTextMime } from '@/utils/textFilePreview'
 
 // Markdown previews share parsing, sanitization, budgets and escaped-source
 // failure isolation with chat. Resource transport stays in the workbench.
@@ -16,7 +17,20 @@ export type ArtifactWorkbenchPreviewKind =
   | 'markdown'
   | 'pdf'
   | 'text'
+  | 'docx'
+  | 'pptx'
+  | 'xlsx'
   | 'unsupported'
+
+export type OfficePreviewFormat = 'docx' | 'pptx' | 'xlsx'
+export const OFFICE_PREVIEW_MIMES: Record<OfficePreviewFormat, string> = {
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+}
+export function isOfficePreviewFormat(kind: string): kind is OfficePreviewFormat {
+  return kind === 'docx' || kind === 'pptx' || kind === 'xlsx'
+}
 
 const HTML_EXTENSIONS = new Set(['htm', 'html', 'xhtml'])
 const MARKDOWN_EXTENSIONS = new Set(['markdown', 'md', 'mdown', 'mkd'])
@@ -35,13 +49,19 @@ export function artifactWorkbenchPreviewKind(
   const mime = artifactMime(artifact).split(';', 1)[0].trim()
   const extension = artifactExtension(artifactName(artifact))
 
+  for (const format of ['docx', 'pptx', 'xlsx'] as const) {
+    if (mime === OFFICE_PREVIEW_MIMES[format]) return format
+  }
+
   if (mime === 'text/html' || mime === 'application/xhtml+xml') return 'html'
   if (mime === 'application/pdf') return 'pdf'
   if (mime === 'text/markdown') return 'markdown'
   if (mime === 'text/plain' || mime === 'text/x-log') return 'text'
   if (mime.startsWith('image/')) return 'image'
+  if (isSourceTextFile(artifactName(artifact), mime)) return 'text'
 
   if (!mime || mime === 'application/octet-stream') {
+    if (isOfficePreviewFormat(extension)) return extension
     if (HTML_EXTENSIONS.has(extension)) return 'html'
     if (extension === 'pdf') return 'pdf'
     if (MARKDOWN_EXTENSIONS.has(extension)) return 'markdown'
@@ -73,13 +93,14 @@ export function responseMatchesArtifactPreviewKind(
   if (kind === 'html') return mime === 'text/html' || mime === 'application/xhtml+xml'
   if (kind === 'pdf') return mime === 'application/pdf'
   if (kind === 'markdown') return mime === 'text/markdown' || mime === 'text/plain'
-  if (kind === 'text') return mime === 'text/plain' || mime === 'text/x-log'
+  if (kind === 'text') return mime === 'text/plain' || mime === 'text/x-log' || isSourceTextMime(mime)
   if (kind === 'image') return mime.startsWith('image/')
+  if (isOfficePreviewFormat(kind)) return mime === OFFICE_PREVIEW_MIMES[kind]
   return false
 }
 
 export function renderArtifactMarkdown(markdown: string): string {
-  return renderMarkdownCore(markdown)
+  return renderMarkdownCore(markdown, { images: 'placeholder' })
 }
 
 const RESOURCE_ATTRIBUTE_PATTERN =
@@ -475,7 +496,7 @@ export function buildOfflineArtifactHtml(source: string): string {
   const sanitizedNavigation = stripUnsafeNavigationMarkup(source)
   const csp = `<meta http-equiv="Content-Security-Policy" content="${ARTIFACT_HTML_OFFLINE_CSP}">`
   const referrer = '<meta name="referrer" content="no-referrer">'
-  const keyboardBridge = `<script>addEventListener("keydown",function(event){if(event.key==="Escape")parent.postMessage(${JSON.stringify(ARTIFACT_PREVIEW_ESCAPE_MESSAGE)},"*")})</script>`
+  const keyboardBridge = '<script>addEventListener("keydown",function(event){if(event.key==="Escape")parent.postMessage("opensquilla:artifact-preview:escape","*")})</script>'
   // Keep the policy ahead of every byte of untrusted markup. Parsing first can
   // start image/frame fetches in some DOM implementations before the CSP node
   // is inserted. A top-level metadata prelude is placed in the implicit head by

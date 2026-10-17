@@ -133,6 +133,8 @@ export interface DisplayAttachment {
   sha256_ref?: string
   /** Bounded server display diagnostic; it does not revoke a usable read source. */
   missingReason?: string
+  /** Exact historical write to recover lazily when its saved material is absent. */
+  fileSnapshotRef?: { messageId: string; toolUseId: string }
   /** Session-scoped opaque identity for Workbench preview/import actions. */
   attachmentId?: string
   origin?: 'paste'
@@ -217,15 +219,30 @@ export interface ChatRouterCell {
   tiers: string[]
   displayName: string
   model?: string
+  provider?: string
   executionKind?: 'single_model' | 'ensemble'
 }
 
 export interface ChatRouterTierConfig {
   model: string
+  provider?: string
   /** Accepted from legacy snapshots, not used to determine capability. */
   supportsImage?: boolean
   imageOnly: boolean
   ensembleEnabled?: boolean
+}
+
+/** UI-only immutable content captured by a successful filesystem operation. */
+export interface ToolFileSnapshot {
+  kind: 'write' | 'edit'
+  path: string
+  content: string
+  /** Large bodies use session-owned material; content is only a transport preview. */
+  sha256_ref?: string
+  bytes?: number
+  /** Verified display marker; the backend validates original replay only on access. */
+  legacy_ref?: { message_id: string; tool_use_id: string; sha256: string; original_chars: number }
+  content_unavailable?: true
 }
 
 export interface ChatToolCall {
@@ -240,7 +257,11 @@ export interface ChatToolCall {
   isError: boolean
   result: string
   resultPreview: string
+  /** Persisted history may contain an excerpt instead of the full output. */
+  resultTruncated?: boolean
+  resultOriginalChars?: number
   executionLogHandle?: string
+  fileSnapshot?: ToolFileSnapshot
   sources?: unknown
   isOpen: boolean
   activityOrder?: number
@@ -399,6 +420,8 @@ export interface ChatTurnOutcome {
   documentMutationOutcome?: DocumentMutationOutcome
   errorClass?: string
   failureKind?: string
+  /** null prevents conflicting/invalid HTTP evidence from being restored by merges. */
+  httpStatus?: number | null
   /** null retains invalid/conflicting evidence across notice merges. */
   errorId?: string | null
   terminalMessage?: string
@@ -462,6 +485,11 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   tool_name?: string
   input?: unknown
   result?: unknown
+  file_snapshot?: ToolFileSnapshot
+  result_truncated?: boolean
+  result_original_chars?: number
+  resultTruncated?: boolean
+  resultOriginalChars?: number
   user_input_request?: unknown
   content?: unknown
   output?: unknown
@@ -657,6 +685,9 @@ export interface ActivitySnapshotV2 {
 
 /** A non-conversational maintenance event rendered inside transcript chronology. */
 export interface ChatMaintenanceEvent {
+  providerRecovery?: import('./parts').ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   kind: 'context_compaction'
   compactionId: string
   source: string
@@ -689,8 +720,6 @@ export interface ChatMessage {
   reasoning?: ChatReasoning
   /** Structured physical-call reasoning retained across live-to-history sync. */
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
-  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
-  reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
   /** Live physical execution model; never overwrites the logical route decision. */
@@ -816,6 +845,8 @@ export interface ChatCreatedSessionLink {
 }
 
 export interface ChatRenderedMessage {
+  /** Ephemeral input drafts, attached by the live owner only; absent in history. */
+  toolInputPreviews?: import('./toolInputPreview').LiveToolInputPreview[]
   id?: string
   clientId?: string
   sourceIndex?: number
@@ -873,8 +904,6 @@ export interface ChatRenderedMessage {
   reasoning?: ChatReasoning
   /** Structured physical-call reasoning retained across live-to-history sync. */
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
-  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
-  reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
   interrupted?: boolean

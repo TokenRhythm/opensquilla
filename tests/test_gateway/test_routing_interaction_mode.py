@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 from opensquilla.channels.types import IncomingMessage
@@ -22,6 +23,28 @@ from opensquilla.scheduler.handlers import _build_cron_tool_context
 from opensquilla.scheduler.types import CronJob, SessionTarget
 from opensquilla.tools.policy import ToolSurfaceCapabilities, resolve_runtime_tool_surface
 from opensquilla.tools.types import CallerKind, InteractionMode
+
+
+def test_side_route_keeps_normal_tools_but_does_not_expose_goal_control_service() -> None:
+    goal_service = object()
+    for key, expected_goal in (
+        ("agent:main:webchat:normal", goal_service),
+        ("agent:main:sidechat:child", None),
+    ):
+        envelope = replace(
+            build_web_route_envelope(session_key=key),
+            runtime_services={"goal_service": goal_service, "goal_context": {"goal_id": "legacy"}},
+        )
+        ctx = resolve_runtime_tool_surface(
+            tool_context_from_envelope(envelope, is_owner=True),
+            capabilities=ToolSurfaceCapabilities(session_manager=True, task_runtime=True),
+        )
+        assert ctx.goal_service is expected_goal
+        if expected_goal is None:
+            assert ctx.goal_context is None
+        assert ctx.caller_kind is CallerKind.WEB
+        assert ctx.interaction_mode is InteractionMode.INTERACTIVE
+        assert "sessions_spawn" not in ctx.denied_tools
 
 
 def test_route_envelopes_assign_expected_interaction_modes() -> None:

@@ -48,7 +48,6 @@ async def _generate(path: Path, **overrides):
         "model": _MODEL,
         "prompt": "A paper boat on a quiet river",
         "duration": None,
-        "max_duration_seconds": 8,
         "aspect_ratio": "16:9",
         "resolution": "720p",
         "output_path": path,
@@ -60,8 +59,9 @@ async def _generate(path: Path, **overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("duration", [8, 9, 15])
 async def test_generate_submits_polls_and_downloads_without_forwarding_key(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, duration: int
 ) -> None:
     requests: list[httpx.Request] = []
     polls = 0
@@ -75,7 +75,7 @@ async def test_generate_submits_polls_and_downloads_without_forwarding_key(
             assert json.loads(request.content) == {
                 "model": _MODEL,
                 "prompt": "A paper boat on a quiet river",
-                "duration": 8,
+                "duration": duration,
                 "aspect_ratio": "16:9",
                 "resolution": "720p",
             }
@@ -98,7 +98,7 @@ async def test_generate_submits_polls_and_downloads_without_forwarding_key(
 
     _install_transport(monkeypatch, handler)
     path = tmp_path / "clip.mp4"
-    result = await _generate(path)
+    result = await _generate(path, duration=duration)
     assert result.provider == "xai"
     assert result.job_id == _JOB
     assert result.bytes_written == len(_MP4)
@@ -197,7 +197,7 @@ async def test_ambiguous_submission_is_not_retried(
         {"base_url": "http://evil.example/v1"},
         {"model": "../unsafe"},
         {"duration": 16},
-        {"duration": 9},
+        {"duration": 0},
         {"model": "grok-imagine-video", "resolution": "1080p"},
     ],
 )

@@ -69,34 +69,21 @@ def _validate_request(
     model: str,
     prompt: str,
     duration: int | None,
-    max_duration_seconds: int | None,
     aspect_ratio: str | None,
     resolution: str | None,
     output_path: Path,
     timeout_seconds: float,
     poll_interval_seconds: float,
     max_bytes: int,
-) -> int | None:
+) -> int:
     if model not in GEMINI_VIDEO_MODELS:
         raise VideoGenerationError("Unsupported Gemini Veo video model")
     if not isinstance(prompt, str) or not prompt.strip():
         raise VideoGenerationError("Video prompt must not be empty")
-    if max_duration_seconds is not None and (
-        isinstance(max_duration_seconds, bool)
-        or not isinstance(max_duration_seconds, int)
-        or max_duration_seconds < 1
-    ):
-        raise VideoGenerationError("Video duration limit must be a positive whole number")
     if duration is not None and (
         isinstance(duration, bool) or not isinstance(duration, int) or duration not in _DURATIONS
     ):
         raise VideoGenerationError("Gemini Veo duration must be 4, 6, or 8 seconds")
-    if (
-        duration is not None
-        and max_duration_seconds is not None
-        and duration > max_duration_seconds
-    ):
-        raise VideoGenerationError("Video duration exceeds the configured limit")
     if aspect_ratio is not None and aspect_ratio not in {"16:9", "9:16"}:
         raise VideoGenerationError("Unsupported Gemini Veo aspect ratio")
     if resolution is not None and resolution not in {"720p", "1080p"}:
@@ -109,15 +96,8 @@ def _validate_request(
         raise VideoGenerationError("Video polling interval must be positive and finite")
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
         raise VideoGenerationError("Video byte limit must be positive")
-    if max_duration_seconds is None:
-        return None
     if duration is None:
-        options = [item for item in _DURATIONS if item <= max_duration_seconds]
-        if resolution == "1080p":
-            options = [item for item in options if item == 8]
-        if not options:
-            raise VideoGenerationError("Gemini Veo has no duration within the configured limit")
-        return min(options)
+        return 8 if resolution == "1080p" else min(_DURATIONS)
     if resolution == "1080p" and duration != 8:
         raise VideoGenerationError("Gemini Veo 1080p requires an 8-second duration")
     return duration
@@ -501,7 +481,6 @@ async def generate_gemini_video(
     model: str,
     prompt: str,
     duration: int | None,
-    max_duration_seconds: int,
     aspect_ratio: str | None,
     resolution: str | None,
     output_path: Path,
@@ -521,7 +500,6 @@ async def generate_gemini_video(
         model=model,
         prompt=prompt,
         duration=duration,
-        max_duration_seconds=max_duration_seconds,
         aspect_ratio=aspect_ratio,
         resolution=resolution,
         output_path=destination,
@@ -582,7 +560,6 @@ async def resume_gemini_video(
         model=model,
         prompt="resume",
         duration=None,
-        max_duration_seconds=None,
         aspect_ratio=None,
         resolution=None,
         output_path=destination,

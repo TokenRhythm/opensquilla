@@ -6,7 +6,7 @@ const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 test.describe('Compaction maintenance card', () => {
   test('idle chat renders no maintenance card', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.chat-compact-status')).toHaveCount(0)
   })
@@ -16,7 +16,7 @@ test.describe('Compaction maintenance card', () => {
     test.setTimeout(300000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // Seed the session with one short exchange so compaction has messages.
     const textarea = page.locator('.chat-textarea')

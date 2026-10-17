@@ -71,6 +71,9 @@ class _QuestionProvider:
         yield DoneEvent(stop_reason="tool_use", input_tokens=1, output_tokens=1)
 
 
+# Exercise real turn settlement, continuation and interactive tool publication
+# with bounded gates isolated from unrelated CI worker filesystem load.
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("source_kind", ["cli", "web"])
 @pytest.mark.parametrize("automatic", [False, True], ids=["initial", "continuation"])
 @pytest.mark.parametrize("cancel", [False, True], ids=["answer", "cancel"])

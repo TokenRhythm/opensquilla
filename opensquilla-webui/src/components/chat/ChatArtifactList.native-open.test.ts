@@ -48,6 +48,7 @@ async function mountList(options: {
   isOwner: boolean
   artifact?: ArtifactPayload
   preferWorkbench?: boolean
+  shareMode?: boolean
   onDownload?: (artifact: ArtifactPayload) => void
   onOpen?: (artifact: ArtifactPayload) => void
 }) {
@@ -59,6 +60,7 @@ async function mountList(options: {
     artifacts: [options.artifact || htmlArtifact],
     sessionKey: 'agent:main:webchat:ok',
     preferWorkbench: options.preferWorkbench,
+    shareMode: options.shareMode,
     onDownload: options.onDownload,
     onOpen: options.onOpen,
   })
@@ -94,6 +96,76 @@ beforeEach(() => {
 })
 
 describe('ChatArtifactList native HTML open', () => {
+  it.each(['image/png', 'audio/mpeg', 'video/mp4'])('does not add a native script opener through a spoofed %s card', async mime => {
+    platformState.id = 'desktop'
+    platformState.capabilities.canOpenArtifactsNatively = true
+    const { app, el } = await mountList({ http: httpTransportTestDouble(), isOwner: false,
+      artifact: { id: 'spoofed-media', name: 'run.ps1', mime } })
+    el.querySelector<HTMLButtonElement>('.resource-actions-trigger')?.click()
+    await settle()
+    const labels = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].map(button => button.textContent?.trim())
+    expect(labels).not.toContain(i18n.global.t('resourceActions.openCopy'))
+    expect(labels).toContain(i18n.global.t('chat.download'))
+    expect(platformState.files.openArtifact).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it.each([
+    ['image.png', 'image/png'], ['audio.mp3', 'audio/mpeg'], ['video.mp4', 'video/mp4'],
+  ])('offers the existing authenticated file menu on %s without loading media first', async (name, mime) => {
+    platformState.id = 'desktop'
+    platformState.capabilities.canOpenArtifactsNatively = true
+    platformState.files.openArtifact.mockResolvedValue({ ok: true })
+    const requestBinary = vi.fn(async () => httpBinaryResponse('original media', { contentType: mime }))
+    const { app, el } = await mountList({ http: httpTransportTestDouble({ requestBinary }), isOwner: false,
+      artifact: { id: 'original-media', name, mime, download_url: '/api/v1/artifacts/original-media' } })
+    el.querySelector<HTMLButtonElement>('.resource-actions-trigger')?.click()
+    await settle()
+    const open = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(button => button.textContent?.trim() === i18n.global.t('resourceActions.openCopy'))
+    expect(open).toBeTruthy()
+    open?.click()
+    await vi.waitFor(() => expect(platformState.files.openArtifact).toHaveBeenCalledOnce())
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/original-media', expect.objectContaining({ sessionKey: 'agent:main:webchat:ok' }))
+    const received = platformState.files.openArtifact.mock.calls[0]?.[0]
+    expect(received).toMatchObject({ name, mime })
+    expect(new TextDecoder().decode(received.data)).toBe('original media')
+    app.unmount()
+  })
+
+  it.each([
+    ['image.png', 'image/png'], ['drawing.svg', 'image/svg+xml'], ['audio.mp3', 'audio/mpeg'], ['video.mp4', 'video/mp4'],
+  ])('keeps the new %s file menu out of share mode', async (name, mime) => {
+    const { app, el } = await mountList({ http: httpTransportTestDouble(), isOwner: false, shareMode: true,
+      artifact: { id: 'shared-media', name, mime } })
+    expect(el.querySelector('.resource-actions-trigger')).toBeNull()
+    expect(el.querySelector('[data-testid="image-copy-more"]')).toBeNull()
+    expect(el.querySelector('button[aria-label^="Download"]')).not.toBeNull()
+    app.unmount()
+  })
+
+  it.each(['web', 'desktop'] as const)('keeps SVG copying in a single file menu on %s', async platform => {
+    platformState.id = platform
+    const artifact = { id: 'svg-card', name: 'drawing.svg', mime: 'image/svg+xml' }
+    const onDownload = vi.fn()
+    const { app, el } = await mountList({ http: httpTransportTestDouble(), isOwner: false, artifact, onDownload })
+    try {
+      expect(el.querySelector('.msg-media-card')).not.toBeNull()
+      expect(el.querySelectorAll('[data-testid="copy-image"]')).toHaveLength(1)
+      expect(el.querySelectorAll('button[aria-haspopup="menu"]')).toHaveLength(1)
+      expect(el.querySelector('[data-testid="image-copy-more"]')).toBeNull()
+      el.querySelector<HTMLButtonElement>('.resource-actions-trigger')!.click()
+      await settle()
+      const items = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      expect(items.filter(item => item.textContent?.trim() === i18n.global.t('imageClipboard.copySource'))).toHaveLength(1)
+      expect(items.some(item => item.textContent?.trim() === i18n.global.t('chat.download'))).toBe(true)
+      el.querySelector<HTMLButtonElement>('.msg-media-card__download')!.click()
+      expect(onDownload).toHaveBeenCalledWith(artifact)
+    } finally {
+      app.unmount()
+    }
+  })
+
   it('offers image copy for SVG delivered with a text MIME without changing its file presentation', async () => {
     const { app, el } = await mountList({
       http: httpTransportTestDouble(), isOwner: false,

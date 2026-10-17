@@ -33,6 +33,8 @@ async function mountPanel(options: {
     connectedGatewayHost: options.connectedGatewayHost,
     requiresCredential: options.requiresCredential ?? false,
     isAvailable: options.availability === 'available',
+    canExecuteHost: false,
+    hostExecuteUnavailableReason: 'disconnected',
     isLocalOwner: false,
     isAuthenticated: false,
     guestSessionOwnerId: null,

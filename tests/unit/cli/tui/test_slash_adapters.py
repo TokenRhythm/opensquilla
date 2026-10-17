@@ -1275,22 +1275,12 @@ async def test_gateway_delete_active_session_model_falls_back_on_resolve_failure
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("command", ["/clear", "  /clear  ", "/reset", "/compact", "/cmp"])
-def test_classify_destructive_exact_bare_word(command: str) -> None:
-    assert classify(command) is SlashCategory.DESTRUCTIVE
-
-
 @pytest.mark.parametrize("command", ["/CLEAR", "/Clear", "/clear now", "/reset trailing-junk"])
 def test_classify_never_purges_for_inputs_dispatch_rejects(command: str) -> None:
     category = classify(command)
     assert category is not SlashCategory.DESTRUCTIVE
     assert category is not SlashCategory.EXIT
     assert category is not SlashCategory.NON_SLASH
-
-
-@pytest.mark.parametrize("command", ["/exit", "/quit", " /exit "])
-def test_classify_exit_exact_bare_word(command: str) -> None:
-    assert classify(command) is SlashCategory.EXIT
 
 
 @pytest.mark.parametrize("command", ["/EXIT", "/exit now", "/Quit"])

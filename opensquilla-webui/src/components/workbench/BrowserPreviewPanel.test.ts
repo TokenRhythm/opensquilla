@@ -16,6 +16,8 @@ afterEach(() => {
 function mountPanel() {
   const props = reactive({
     currentUrl: 'https://example.test/',
+    loading: false,
+    errorMessage: '',
     findOpen: false,
     findQuery: '',
     findMatches: null as number | null,
@@ -48,6 +50,26 @@ function mountPanel() {
   const button = (label: string) => element.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!
   return { element, props, onEvent, button }
 }
+
+it('keeps the native slot mounted during refresh and exposes stop then retry', async () => {
+  const { element, props, onEvent, button } = mountPanel()
+  const slot = element.querySelector('[data-workbench-native-surface-slot]')
+  button('Refresh').click()
+  expect(onEvent).toHaveBeenLastCalledWith({ type: 'browser-action', payload: { action: 'reload' } })
+  props.loading = true
+  await nextTick()
+  expect(element.querySelector('[data-workbench-native-surface-slot]')).toBe(slot)
+  expect(element.querySelector('.browser-preview')?.getAttribute('aria-busy')).toBe('true')
+  button('Stop loading').click()
+  expect(onEvent).toHaveBeenLastCalledWith({ type: 'browser-action', payload: { action: 'stop' } })
+  props.loading = false
+  props.errorMessage = 'Page unavailable'
+  await nextTick()
+  expect(button('Refresh')).not.toBeNull()
+  expect(element.querySelector('[role="alert"]')?.textContent).toContain('Page unavailable')
+  element.querySelector<HTMLButtonElement>('.browser-preview__error button')!.click()
+  expect(onEvent).toHaveBeenLastCalledWith({ type: 'browser-action', payload: { action: 'reload' } })
+})
 
 it('opens page find from the keyboard, reports matches, navigates and closes', async () => {
   vi.useFakeTimers()

@@ -1,4 +1,4 @@
-import { computed, ref, type Ref } from 'vue'
+import { computed, getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type {
   UsageContextStatus,
   UsageReporting,
@@ -19,6 +19,7 @@ export interface UseChatUsageWidgetOptions {
   usageReporting: UsageReporting
   readOptions?: UsageReportingRequestOptions
   sessionKey: Ref<string>
+  connectionIdentity?: () => unknown
   tokenVizEnabled: () => boolean
 }
 
@@ -54,6 +55,17 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   const savingsPopupLastTs = ref(0)
   const lastSavingsPopupIdentity = ref('')
   const contextStatus = ref<UsageContextStatus | null>(null)
+  let disposed = false
+  let requestGeneration = 0
+  // A key can return to its previous value while an earlier read is pending.
+  // Retire that read on each ownership change, not just at response time.
+  watch([options.sessionKey, () => options.connectionIdentity?.()], () => {
+    requestGeneration += 1
+  }, { flush: 'sync' })
+  if (getCurrentScope()) onScopeDispose(() => {
+    disposed = true
+    requestGeneration += 1
+  })
 
   // Surfaced as a topbar chip only once the session's context window crosses the
   // gateway's warning ratio (0.85) — a proactive heads-up before compaction,
@@ -79,6 +91,7 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   }
 
   function saveWidgetState() {
+    if (disposed) return
     if (!options.tokenVizEnabled()) return
     if (!options.sessionKey.value) return
     try {
@@ -94,6 +107,7 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   }
 
   function restoreWidgetState() {
+    if (disposed) return
     if (!options.tokenVizEnabled()) return
     if (!options.sessionKey.value) return
     try {
@@ -111,13 +125,18 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   }
 
   async function loadCurrentSessionUsage() {
-    if (!options.sessionKey.value) return
+    const key = options.sessionKey.value
+    if (disposed || !key) return
+    const identity = options.connectionIdentity?.()
+    const request = ++requestGeneration
     try {
       const usage = await usageReporting.status(
-        options.sessionKey.value,
+        key,
         options.readOptions,
       )
-      const current = usage.sessions.find(s => s.sessionKey === options.sessionKey.value)
+      if (disposed || request !== requestGeneration || key !== options.sessionKey.value
+        || identity !== options.connectionIdentity?.()) return
+      const current = usage.sessions.find(s => s.sessionKey === key)
       if (current) {
         usageAccum.value.input = current.inputTokens ?? 0
         usageAccum.value.output = current.outputTokens ?? 0

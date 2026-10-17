@@ -1,3 +1,4 @@
+import { waitForRendererConnection } from './renderer-connection-probe.mjs'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
@@ -68,7 +69,7 @@ async function screenshot(page, name) {
   report.screenshots.push({ path, sha256: sha256(await readFile(path)) })
 }
 async function ready(page) {
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: timeoutMs })
+  await waitForRendererConnection(page, 'connected', { timeout: timeoutMs })
   await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: timeoutMs })
 }
 async function launch(name) {
@@ -84,7 +85,8 @@ async function launch(name) {
     args: ['--use-mock-keychain', `--user-data-dir=${plan.userDataDir}`],
     // This synthetic fixture enables existing payload-free transaction timings
     // (256 records per storage instance); SQL and probe budgets stay unchanged.
-    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_STORAGE_DIAGNOSTICS: '1', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
+    // Its strict provider accepts only the audited conversation/tool turns.
+    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_STORAGE_DIAGNOSTICS: '1', OPENSQUILLA_NAMING_ENABLED: 'false', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
     timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs,
   })
   active = { app, name }
@@ -96,7 +98,7 @@ async function launch(name) {
   const page = await app.firstWindow()
   active.page = page
   await page.waitForURL(url => url.protocol === 'opensquilla-app:' && url.hostname === 'desktop', { timeout: timeoutMs })
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs })
+  await waitForRendererConnection(page, 'connected', { timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs })
   const pageErrors = []
   page.on('pageerror', error => pageErrors.push(error.message))
   active.pageErrors = pageErrors

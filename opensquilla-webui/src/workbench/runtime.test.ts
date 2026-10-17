@@ -72,6 +72,7 @@ describe('workbench runtime registry', () => {
     manager.handle({ type: 'open', item: descriptor })
     manager.handle({ type: 'activate', item: descriptor })
     manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
     manager.handle({ type: 'suspend', item: descriptor })
     manager.handle({ type: 'dispose', item: descriptor, reason: 'closed' })
     await manager.flush()
@@ -134,6 +135,8 @@ describe('workbench runtime registry', () => {
     const descriptor = item('a', 'dispose-on-suspend')
 
     manager.handle({ type: 'open', item: descriptor })
+    manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
     manager.handle({ type: 'suspend', item: descriptor })
     manager.handle({ type: 'resume', item: descriptor })
     await manager.flush()
@@ -163,6 +166,7 @@ describe('workbench runtime registry', () => {
       }
 
       manager.handle({ type: 'open', item: original })
+      manager.handle({ type: 'resume', item: original })
       await manager.flush()
       manager.handle({ type: 'suspend', item: original })
       if (!queuedSuspend) await manager.flush()
@@ -188,6 +192,189 @@ describe('workbench runtime registry', () => {
       expect(runtimes[1]?.update).toHaveBeenCalledWith(visibleUpdate)
     },
   )
+
+  it('keeps background and collapsed descriptors cold until visible or explicitly acted on', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const performAction = vi.fn()
+    const createRuntime = vi.fn(() => ({ performAction }))
+    registry.register({ kind: 'artifact-preview', createRuntime })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor = item('cold', 'dispose-on-suspend')
+    manager.handle({ type: 'open', item: descriptor })
+    manager.handle({ type: 'activate', item: descriptor })
+    manager.setComponentHandle(descriptor, { stale: true })
+    manager.handleComponentEvent(descriptor, { type: 'late-input' })
+    manager.handleSurfaceRect({ itemId: descriptor.id, x: 0, y: 0, width: 30, height: 40, visible: false })
+    manager.handleNativeSurfaceEvent({ version: 1, surfaceId: descriptor.id, type: 'ready' })
+    await manager.flush()
+    await expect(manager.beforeClose(descriptor)).resolves.toBe(true)
+    expect(createRuntime).not.toHaveBeenCalled()
+
+    manager.performAction(descriptor, 'authorized-background-action')
+    await manager.flush()
+    expect(createRuntime).toHaveBeenCalledOnce()
+    expect(performAction).toHaveBeenCalledWith('authorized-background-action', descriptor)
+    await manager.disposeAll()
+  })
+
+  it('checkpoints input queued before a same-tick switch and drops input after release', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const restored: Readonly<Record<string, unknown>>[] = []
+    registry.register({ kind: 'artifact-preview', createRuntime: (_descriptor, context) => {
+      restored.push(context.getViewState!())
+      return { handleComponentEvent: event => context.saveViewState!(event.payload as Record<string, unknown>) }
+    } })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor = item('checkpoint', 'dispose-on-suspend')
+    manager.handle({ type: 'open', item: descriptor })
+    manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
+    manager.handleComponentEvent(descriptor, { type: 'reading-state', payload: { line: 420 } })
+    manager.handle({ type: 'suspend', item: descriptor })
+    manager.handleComponentEvent(descriptor, { type: 'late-reading-state', payload: { line: 999 } })
+    manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
+    expect(restored).toEqual([{}, { line: 420 }])
+    await manager.disposeAll()
+  })
+
+  it('checks a cold business owner without recreating its released renderer', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const beforeClose = vi.fn(async () => false)
+    const createRuntime = vi.fn(() => ({}))
+    registry.register({ kind: 'artifact-preview', beforeClose, createRuntime })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor = item('cold-owner', 'dispose-on-suspend')
+    manager.handle({ type: 'open', item: descriptor })
+    await manager.flush()
+    await expect(manager.beforeClose(descriptor)).resolves.toBe(false)
+    expect(beforeClose).toHaveBeenCalledWith(descriptor, undefined)
+    expect(createRuntime).not.toHaveBeenCalled()
+    beforeClose.mockResolvedValue(true)
+    await expect(manager.beforeClose(descriptor)).resolves.toBe(true)
+    expect(createRuntime).not.toHaveBeenCalled()
+    await manager.disposeAll()
+  })
+
+  it('retains bounded reading state across release while rejecting old generation writes and native cleanup', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const contexts: WorkbenchRuntimeContext[] = []
+    const restored: Readonly<Record<string, unknown>>[] = []
+    const nativeApi: NativeWorkbenchApi = {
+      createSurface: vi.fn(async () => ({ ok: true })),
+      setSurfaceRect: vi.fn(async () => ({ ok: true })),
+      activateSurface: vi.fn(async () => ({ ok: true })),
+      destroySurface: vi.fn(async () => ({ ok: true })),
+      onSurfaceEvent: vi.fn(() => () => undefined),
+    }
+    const onError = vi.fn()
+    registry.register({ kind: 'artifact-preview', createRuntime: (_item, context) => {
+      contexts.push(context)
+      restored.push(context.getViewState!())
+      return { suspend: () => context.saveViewState!({ page: 7, mode: 'source' }) }
+    } })
+    const manager = new WorkbenchRuntimeManager(registry, { nativeWorkbenchApi: nativeApi, onError })
+    const descriptor = { ...item('reading', 'dispose-on-suspend'), hostKind: 'native-webcontents' as const }
+    manager.handle({ type: 'open', item: descriptor })
+    manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
+    contexts[0]!.updateRenderState({ bytes: new Uint8Array(512) })
+    manager.handle({ type: 'suspend', item: descriptor })
+    await manager.flush()
+    expect(manager.getRenderState(descriptor.id)).toEqual({})
+    contexts[0]!.updateRenderState({ stale: true })
+    contexts[0]!.saveViewState!({ page: 99 })
+    manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
+    expect(restored).toEqual([{}, { page: 7, mode: 'source' }])
+    expect(contexts[0]!.isItemOpen()).toBe(false)
+    expect(contexts[1]!.isItemOpen()).toBe(true)
+    await contexts[0]!.nativeWorkbenchApi!.destroySurface(descriptor.id)
+    expect(nativeApi.destroySurface).not.toHaveBeenCalled()
+    contexts[1]!.saveViewState!({ page: 8 })
+    contexts[1]!.saveViewState!({ text: 'x'.repeat(33 * 1024) })
+    contexts[1]!.saveViewState!({ resource: new Blob(['not reading state']) })
+    expect(contexts[1]!.getViewState!()).toEqual({ page: 8 })
+    expect(onError).toHaveBeenCalledTimes(2)
+    manager.handle({ type: 'dispose', item: descriptor, reason: 'closed' })
+    await manager.flush()
+    const reopened = { ...descriptor }
+    manager.handle({ type: 'open', item: reopened })
+    manager.handle({ type: 'resume', item: reopened })
+    await manager.flush()
+    expect(restored[2]).toEqual({})
+    await manager.disposeAll()
+  })
+
+  it('drops obsolete queued restores and admits the current pane without delaying existing owner actions', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const contexts = new Map<string, WorkbenchRuntimeContext>()
+    const performAction = vi.fn()
+    registry.register({ kind: 'artifact-preview', createRuntime: (descriptor, context) => {
+      contexts.set(descriptor.id, context)
+      return { performAction }
+    } })
+    const manager = new WorkbenchRuntimeManager(registry, { maxConcurrentRestores: 1 })
+    const descriptors = ['a', 'b', 'c'].map(id => item(id, 'dispose-on-suspend'))
+    for (const descriptor of descriptors) {
+      manager.handle({ type: 'open', item: descriptor })
+      manager.handle({ type: 'resume', item: descriptor })
+      await manager.flush()
+    }
+    let finishRead!: () => void
+    const read = new Promise<void>(resolve => { finishRead = resolve })
+    const first = contexts.get('a')!.runRestore!(() => read)
+    const staleRead = vi.fn(async () => undefined)
+    const stale = contexts.get('b')!.runRestore!(staleRead)
+    expect(manager.getRestoreActivity()).toEqual({ running: 1, queued: 1 })
+    manager.handle({ type: 'suspend', item: descriptors[1]! })
+    await stale
+    const currentRead = vi.fn(async () => undefined)
+    const current = contexts.get('c')!.runRestore!(currentRead)
+    manager.performAction(descriptors[2]!, 'save-owner')
+    await manager.flush()
+    expect(performAction).toHaveBeenCalledWith('save-owner', descriptors[2])
+    expect(staleRead).not.toHaveBeenCalled()
+    expect(currentRead).not.toHaveBeenCalled()
+    finishRead()
+    await Promise.all([first, current])
+    await vi.waitFor(() => expect(manager.getRestoreActivity()).toEqual({ running: 0, queued: 0 }))
+    expect(currentRead).toHaveBeenCalledOnce()
+    await manager.disposeAll()
+  })
+
+  it('keeps two legacy slow factories from blocking a newly visible resource', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const finishCreates: Array<(runtime: WorkbenchPanelRuntime) => void> = []
+    const readCurrent = vi.fn(async () => undefined)
+    const createRuntime = vi.fn((descriptor: WorkbenchItem, context: WorkbenchRuntimeContext) => {
+      if (descriptor.id !== 'current') return new Promise<WorkbenchPanelRuntime>(resolve => finishCreates.push(resolve))
+      return { resume: () => { void context.runRestore!(readCurrent) } }
+    })
+    registry.register({ kind: 'artifact-preview', createRuntime })
+    const manager = new WorkbenchRuntimeManager(registry, { maxConcurrentRestores: 2 })
+    const legacy = ['legacy-a', 'legacy-b'].map(id => item(id, 'dispose-on-suspend'))
+    for (const descriptor of legacy) {
+      manager.handle({ type: 'open', item: descriptor })
+      manager.handle({ type: 'resume', item: descriptor })
+    }
+    await vi.waitFor(() => expect(finishCreates).toHaveLength(2))
+    for (const descriptor of legacy) manager.handle({ type: 'suspend', item: descriptor })
+    const current = item('current', 'dispose-on-suspend')
+    manager.handle({ type: 'open', item: current })
+    manager.handle({ type: 'resume', item: current })
+    await manager.flush(current.id)
+    await vi.waitFor(() => expect(readCurrent).toHaveBeenCalledOnce())
+    expect(manager.hasRuntime(current.id)).toBe(true)
+    expect(manager.getRestoreActivity()).toEqual({ running: 0, queued: 0 })
+    const lateResume = vi.fn()
+    const lateDispose = vi.fn()
+    for (const finish of finishCreates) finish({ resume: lateResume, dispose: lateDispose })
+    await manager.flush()
+    expect(lateResume).not.toHaveBeenCalled()
+    expect(lateDispose).toHaveBeenCalledTimes(2)
+    await manager.disposeAll()
+  })
 
   it('contains provider failures and reports the affected descriptor', async () => {
     const registry = new WorkbenchPanelRegistry()

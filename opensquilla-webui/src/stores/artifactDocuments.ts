@@ -19,6 +19,7 @@ import {
 } from '@/utils/artifactProductErrors'
 import { PendingMutationRequestIds } from '@/utils/mutationRequestIdentity'
 import { resolveArtifactMutationBounded } from '@/workbench/artifactMutationRecovery'
+import { MetadataCacheBudget } from '@/workbench/metadataCacheBudget'
 import {
   createLegacyArtifactWorkspace,
 } from '@/workbench/artifactDocumentProvider'
@@ -66,8 +67,21 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
   const snapshots = ref<Record<string, ArtifactDocumentWorkspaceSnapshot>>({})
   const provider = shallowRef<ArtifactDocumentProvider | null>(null)
   const requests = new Map<string, AbortController>()
-  const generations = new Map<string, number>()
   const mutationRequestIds = new PendingMutationRequestIds(64)
+  const cacheBudget = new MetadataCacheBudget(32, 2 * 1024 * 1024)
+  const pendingMutationOwners = new Map<string, string>()
+
+  function pruneMetadata() {
+    cacheBudget.prune(key => requests.has(key) || [...pendingMutationOwners.values()].includes(key), key => {
+      const next = { ...snapshots.value }
+      delete next[key]
+      snapshots.value = next
+    })
+  }
+  function retain(artifact: ArtifactPayload, sessionKey: string) {
+    const release = cacheBudget.retain(artifactDocumentWorkspaceKey(artifact, sessionKey))
+    return () => { release(); pruneMetadata() }
+  }
 
   function setProvider(next: ArtifactDocumentProvider | null) {
     if (provider.value === next) return
@@ -80,19 +94,19 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
     sessionKey: string,
   ): ArtifactDocumentWorkspaceSnapshot {
     const key = artifactDocumentWorkspaceKey(artifact, sessionKey)
+    cacheBudget.touch(key)
     return snapshots.value[key] || emptySnapshot(key)
   }
 
   function setSnapshot(key: string, value: ArtifactDocumentWorkspaceSnapshot) {
     snapshots.value = { ...snapshots.value, [key]: value }
+    cacheBudget.set(key, value)
+    pruneMetadata()
   }
 
-  function retireRequest(key: string): number {
+  function retireRequest(key: string) {
     requests.get(key)?.abort()
     requests.delete(key)
-    const generation = (generations.get(key) || 0) + 1
-    generations.set(key, generation)
-    return generation
   }
 
   async function load(
@@ -102,9 +116,9 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
   ): Promise<ArtifactDocumentWorkspace> {
     const key = artifactDocumentWorkspaceKey(artifact, sessionKey)
     const current = snapshots.value[key]
-    if (!options.force && current?.loaded && current.workspace) return current.workspace
+    if (!options.force && current?.loaded && current.workspace) { cacheBudget.touch(key); return current.workspace }
 
-    const generation = retireRequest(key)
+    retireRequest(key)
     const controller = new AbortController()
     requests.set(key, controller)
     setSnapshot(key, {
@@ -120,7 +134,7 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       const workspace = provider.value
         ? await provider.value.loadWorkspace(artifact, sessionKey, controller.signal)
         : createLegacyArtifactWorkspace(artifact, sessionKey)
-      if (generations.get(key) === generation) {
+      if (requests.get(key) === controller && !controller.signal.aborted) {
         // Adoption is monotonic for the lifetime of a workbench snapshot. A
         // temporarily unavailable document RPC must never replace the stable
         // document head with the original immutable ArtifactRef.
@@ -154,7 +168,7 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       // legacy workspace is safe only before this artifact has ever loaded.
       const workspace = current?.workspace
         ?? createLegacyArtifactWorkspace(artifact, sessionKey)
-      if (generations.get(key) === generation) {
+      if (requests.get(key) === controller && !controller.signal.aborted) {
         setSnapshot(key, {
           key,
           loading: false,
@@ -167,6 +181,7 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       return workspace
     } finally {
       if (requests.get(key) === controller) requests.delete(key)
+      pruneMetadata()
     }
   }
 
@@ -199,6 +214,15 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
   async function runDocumentMutation<
     TCommand extends RestoreArtifactRevision | RevertArtifactChangeSet,
     TResult,
+  >(...args: Parameters<typeof runDocumentMutationImpl<TCommand, TResult>>): Promise<ArtifactDocumentWorkspace> {
+    const release = retain(args[0], args[1])
+    try { return await runDocumentMutationImpl(...args) }
+    finally { release() }
+  }
+
+  async function runDocumentMutationImpl<
+    TCommand extends RestoreArtifactRevision | RevertArtifactChangeSet,
+    TResult,
   >(
     artifact: ArtifactPayload,
     sessionKey: string,
@@ -226,7 +250,10 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       clientRequestId,
       options.buildPayload(clientRequestId) as TCommand & Readonly<Record<string, unknown>>,
     )
-    const release = () => mutationRequestIds.release(options.logicalKey, clientRequestId)
+    const release = () => {
+      mutationRequestIds.release(options.logicalKey, clientRequestId)
+      pendingMutationOwners.delete(options.logicalKey)
+    }
     const pendingError = () => artifactProductClientError('MUTATION_OUTCOME_PENDING')
     const notApplied = async (): Promise<never> => {
       release()
@@ -277,6 +304,7 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
         throw error
       }
       mutationRequestIds.markPending(options.logicalKey, clientRequestId)
+      pendingMutationOwners.set(options.logicalKey, artifactDocumentWorkspaceKey(artifact, sessionKey))
       if (!wasPending && options.currentProvider.resolveMutation) {
         const resolution = await resolve()
         if (resolution?.status === 'not_applied') return notApplied()
@@ -386,6 +414,7 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
     for (const [key, value] of Object.entries(snapshots.value)) {
       if (key.startsWith(prefix)) {
         retireRequest(key)
+        cacheBudget.remove(key)
       } else {
         next[key] = value
       }
@@ -400,12 +429,14 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
   function reset() {
     abortAll()
     mutationRequestIds.clear()
+    pendingMutationOwners.clear()
+    cacheBudget.clear()
     snapshots.value = {}
-    generations.clear()
   }
 
   return {
     snapshots,
+    retain,
     provider,
     setProvider,
     snapshot,

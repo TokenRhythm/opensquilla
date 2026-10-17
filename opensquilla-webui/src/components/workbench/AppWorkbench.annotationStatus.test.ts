@@ -46,16 +46,21 @@ describe('AppWorkbench annotation mode status', () => {
     expect(appWorkbenchSource).toContain("? 'workbench-annotation-mode-status'")
   })
 
-  it('marks the annotation action as beta without changing its accessible label', () => {
+  it('shows the annotation action label with no beta badge and preserves its accessible state', () => {
     expect(appWorkbenchSource).toContain(
       "v-if=\"toolbarItem.id === 'toggle-annotation-mode'\"",
     )
-    expect(appWorkbenchSource).toContain('class="app-workbench__action-beta"')
+    expect(appWorkbenchSource).toContain('class="app-workbench__action-label"')
     expect(appWorkbenchSource).toMatch(
-      /app-workbench__action-beta[\s\S]*aria-hidden="true"[\s\S]*>\s*β\s*<\/span>/,
+      /app-workbench__action-label[\s\S]*aria-hidden="true"[\s\S]*>\s*\{\{ toolbarItem.label \}\}\s*<\/span>/,
     )
+    expect(appWorkbenchSource).not.toContain('app-workbench__action-beta')
+    expect(appWorkbenchSource).not.toContain('β')
+    expect(appWorkbenchSource).toContain(':aria-label="toolbarItem.label"')
+    expect(appWorkbenchSource).toContain(':aria-pressed="toolbarItem.pressed"')
+    expect(appWorkbenchSource).toContain(':disabled="toolbarItem.disabled"')
     expect(appWorkbenchSource).toMatch(
-      /\.app-workbench__action-beta\s*\{[\s\S]*font-size: 7px;[\s\S]*opacity: 0\.58;/,
+      /\.app-workbench__action--annotation\s*\{\s*width: auto;\s*flex: 0 0 auto;/,
     )
   })
 
@@ -155,7 +160,7 @@ describe('AppWorkbench annotation mode status', () => {
       .toBeLessThan(source.indexOf("artifactProductClientError('RESOURCE_UNSUPPORTED'"))
   })
 
-  it('opens current and silently materialized HTML documents on Preview', () => {
+  it('opens current and silently materialized HTML documents on Preview in the owning workbench', () => {
     const openStart = appWorkbenchSource.indexOf('async function openWorkbenchResource(')
     const importStart = appWorkbenchSource.indexOf(
       '\nasync function importWorkbenchResourceForSession',
@@ -169,20 +174,30 @@ describe('AppWorkbench annotation mode status', () => {
     const importSource = appWorkbenchSource.slice(importStart, publishStart)
 
     expect(openSource).toContain(
-      'openResourceArtifact(current.resource, artifact, sessionKey)',
+      "openResourceArtifact(current.resource, artifact, sessionKey, undefined, 'preview', item)",
     )
     expect(openSource).not.toContain("undefined, 'source'")
-    expect(importSource).toContain('}, artifact, sessionKey)')
+    expect(importSource).toContain("}, artifact, sessionKey, undefined, 'preview', ownerItem)")
     expect(importSource).not.toContain("undefined, 'source'")
   })
 
   it('creates a fresh section request for every explicit artifact open path', () => {
-    const explicitOpenCalls = appWorkbenchSource.match(
-      /store\.openItem\(artifactPreviewItemForExplicitOpen\(/g,
-    ) || []
-
-    expect(appWorkbenchSource).toContain('function artifactPreviewItemForExplicitOpen(')
-    expect(explicitOpenCalls).toHaveLength(2)
+    const helperStart = appWorkbenchSource.indexOf('function artifactPreviewItemForExplicitOpen(')
+    const helperEnd = appWorkbenchSource.indexOf('\nfunction confirmWorkbenchPermission', helperStart)
+    expect(appWorkbenchSource.slice(helperStart, helperEnd)).toContain('requestInitialSectionForWorkbenchItem(')
+    // Scope is applied after the fresh section request is allocated. Verify
+    // each entry path still uses that helper, without requiring nested calls
+    // that would drop the child resource's parent-owned visible scope.
+    const resourceStart = appWorkbenchSource.indexOf('function openResourceArtifact(')
+    const resourceEnd = appWorkbenchSource.indexOf('\nasync function openWorkbenchResource(', resourceStart)
+    const resourceOpen = appWorkbenchSource.slice(resourceStart, resourceEnd)
+    expect(resourceOpen).toContain('const previewItem = artifactPreviewItemForExplicitOpen(')
+    expect(resourceOpen).toContain('store.openItem(ownerItem ? { ...previewItem, scope: ownerItem.scope } : previewItem)')
+    const navigationStart = appWorkbenchSource.indexOf('async function selectNavigationArtifact(')
+    const navigationEnd = appWorkbenchSource.indexOf('\nfunction panelHeader(', navigationStart)
+    const navigationOpen = appWorkbenchSource.slice(navigationStart, navigationEnd)
+    expect(navigationOpen).toContain('const previewItem = artifactPreviewItemForExplicitOpen(')
+    expect(navigationOpen).toContain('store.openItem({ ...previewItem, scope: item.scope })')
     expect(appWorkbenchSource).not.toContain('let artifactSectionRequestId')
   })
 

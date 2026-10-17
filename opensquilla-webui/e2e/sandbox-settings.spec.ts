@@ -4,21 +4,23 @@ test.describe.configure({ mode: 'serial' })
 
 test('Web Settings opens the Sandbox overview and file-safety details', async ({ page }) => {
   await page.goto('/control/')
-  await page.waitForSelector('.conn-pill', { timeout: 10_000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10_000 })
 
   await page.locator('.sidebar-fn-item[data-icon="settings"]').click()
   const settings = page.getByRole('dialog', { name: 'Settings' })
   await expect(settings).toBeVisible()
 
-  const sandboxTab = settings.getByRole('tab', { name: 'Sandbox', exact: true })
+  const sandboxTab = settings.getByRole('tab', { name: /^Security & Privacy:/ })
   await expect(sandboxTab).toBeVisible()
   await sandboxTab.click()
-  await expect(page).toHaveURL(/\/settings\/sandbox$/)
+  await expect(page).toHaveURL(/\/settings\/securityPrivacy$/)
 
   await expect(page.getByTestId('sandbox-overview')).toBeVisible()
   await expect(page.getByTestId('sandbox-safe-mode')).toBeVisible()
   await expect(page.getByTestId('sandbox-full-mode')).toBeVisible()
-  await expect(page.locator('.sandbox-settings__status')).toBeVisible()
+  // WebUI exposes readiness without claiming the isolated host has native Safe installed.
+  const safeAvailable = await page.getByTestId('sandbox-safe-mode').isEnabled()
+  await expect(page.locator('.sandbox-settings__status')).toHaveCount(safeAvailable ? 1 : 0)
 
   await page.getByTestId('sandbox-open-files').click()
   await expect(page.getByTestId('sandbox-detail')).toBeVisible()
@@ -32,7 +34,7 @@ test('Web Settings opens the Sandbox overview and file-safety details', async ({
 test('Sandbox settings stay within the panel at medium window widths', async ({ page }) => {
   await page.setViewportSize({ width: 1078, height: 880 })
   await page.goto('/control/settings/sandbox')
-  await page.waitForSelector('.conn-pill', { timeout: 10_000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10_000 })
 
   const settings = page.getByRole('dialog', { name: 'Settings' })
   await expect(settings).toBeVisible()

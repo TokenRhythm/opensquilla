@@ -4,7 +4,7 @@ const CONTROL_URL = '/control/'
 
 async function openControl(page: Page, path = '') {
   await page.goto(CONTROL_URL + path)
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 }
 
 const settingsDialog = (page: Page) => page.getByRole('dialog', { name: 'Settings' })
@@ -98,9 +98,10 @@ test.describe('Console clarity', () => {
     }
   })
 
-  test('Channels aligns its refresh action with the hub tabs only on desktop', async ({ page }) => {
+  test('Channels aligns its refresh action only when the content container has room', async ({ page }) => {
     for (const scenario of [
-      { width: 900, height: 800, inline: true },
+      { width: 1280, height: 900, inline: true },
+      { width: 900, height: 800, inline: false },
       { width: 390, height: 844, inline: false },
     ]) {
       await page.setViewportSize({ width: scenario.width, height: scenario.height })
@@ -111,11 +112,14 @@ test.describe('Console clarity', () => {
       expect(tabs).not.toBeNull()
       expect(actions).not.toBeNull()
 
+      const hubWidth = await page.locator('.route-hub').evaluate(element => element.clientWidth)
       if (scenario.inline) {
+        expect(hubWidth).toBeGreaterThanOrEqual(720)
         const tabsCenter = tabs!.y + tabs!.height / 2
         const actionsCenter = actions!.y + actions!.height / 2
         expect(Math.abs(tabsCenter - actionsCenter)).toBeLessThanOrEqual(2)
       } else {
+        expect(hubWidth).toBeLessThan(720)
         expect(actions!.y).toBeGreaterThanOrEqual(tabs!.y + tabs!.height)
       }
 

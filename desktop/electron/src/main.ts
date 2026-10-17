@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
+import { parse as parseToml } from 'smol-toml'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
@@ -11,7 +12,7 @@ import { performance } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
 import { chooseLocalFilePaths } from './native-path-picker.js'
-import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
+import { saveArtifactFile, saveAttachmentFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SaveAttachmentRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -25,6 +26,7 @@ import {
   primaryProfilePaths,
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
+import { configuredDesktopDataDirectory, inspectDesktopStartupMetadata } from './desktop-startup-preflight.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import {
   DESKTOP_QUIT_TERMINATION_MS,
@@ -76,6 +78,7 @@ import {
 } from './onboarding-flow-coordinator.js'
 import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
 import { renderUnconfiguredDesktopConfig } from './desktop-unconfigured-profile.js'
+import { desktopControlUiBasePath } from './desktop-control-ui-config.js'
 import {
   applyDesktopTelemetryConsentPayload,
   desktopPrivacyTomlLines,
@@ -286,6 +289,7 @@ interface DesktopGatewayConnection {
   instanceId: string | null
   profileFingerprint: string
   httpUrl: string | null
+  controlUiBasePath?: string
   wsUrl: string | null
   authToken: string | null
   error: string | null
@@ -649,7 +653,7 @@ let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
-const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F7F7F8'
+const DESKTOP_LIGHT_BACKGROUND_COLOR = '#FFFFFF'
 const DESKTOP_DARK_BACKGROUND_COLOR = '#18181A'
 
 function desktopWindowBackgroundColor(): string {
@@ -955,6 +959,7 @@ let desktopOpenFlowPromise: Promise<void> | null = null
 let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
 let gatewayConnectionRevision = 0
 let gatewayConnectionInstanceId: string | null = null
+let ownedGatewayControlUiBasePath = '/control'
 
 function invalidateDesktopOpenFlow(): number {
   gatewayLateReadyObservation = null
@@ -1007,6 +1012,10 @@ function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
     instanceId: gatewayConnectionInstanceId,
     profileFingerprint: desktopProfileFingerprint(activeDesktopProfile().home),
     httpUrl: gatewayState.url || null,
+    // Only an owned launch supplies an authoritative Control UI mount. An
+    // external Gateway may use a different profile; leave legacy fallback to
+    // the renderer instead of publishing this profile's stale mount prefix.
+    ...(gatewayState.owned ? { controlUiBasePath: ownedGatewayControlUiBasePath } : {}),
     wsUrl: ready ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : null,
     authToken: authToken ? desktopGatewayAuthToken(authToken) : null,
     error: gatewayState.error || null,
@@ -1620,6 +1629,7 @@ async function proxyDesktopRendererRequest(
     method,
     headers,
     body,
+    signal: request.signal,
     redirect: 'manual',
     bypassCustomProtocolHandlers: true,
   })
@@ -1648,7 +1658,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "base-uri opensquilla-app://desktop",
       "object-src 'none'",
       "frame-ancestors 'none'",
-      "script-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "script-src 'self' opensquilla-app://desktop 'unsafe-inline' 'wasm-unsafe-eval'",
       "style-src 'self' opensquilla-app://desktop 'unsafe-inline'",
       "img-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "font-src 'self' opensquilla-app://desktop data:",
@@ -1667,7 +1677,11 @@ function secureDesktopRendererDocument(response: Response): Response {
 }
 
 async function handleDesktopRendererRequest(request: Request): Promise<Response> {
-  const route = routeDesktopRendererRequest(request.url, request.method)
+  const route = routeDesktopRendererRequest(
+    request.url,
+    request.method,
+    gatewayState.owned ? ownedGatewayControlUiBasePath : '',
+  )
   if (route.kind === 'reject') return new Response('Not found', { status: 404 })
   if (route.kind === 'gateway') return proxyDesktopRendererRequest(request, route.pathAndQuery)
 
@@ -1681,7 +1695,12 @@ async function handleDesktopRendererRequest(request: Request): Promise<Response>
   const response = await electronNet.fetch(pathToFileURL(assetPath).href, {
     bypassCustomProtocolHandlers: true,
   })
-  return route.kind === 'spa' ? secureDesktopRendererDocument(response) : response
+  // Module workers get their CSP from the script response rather than the
+  // parent document. Keep local diagram workers under the same narrow WASM
+  // permission while continuing to disallow JavaScript string evaluation.
+  return route.kind === 'spa' || /\.m?js$/i.test(route.relativePath)
+    ? secureDesktopRendererDocument(response)
+    : response
 }
 
 function installDesktopRendererProtocol(): void {
@@ -2385,25 +2404,9 @@ function configuredDesktopStateDirectory(
   configRaw: string | null,
 ): string {
   if (configRaw !== null) {
-    for (const rawLine of configRaw.split(/\r?\n/)) {
-      if (/^\s*\[/.test(rawLine)) break
-      const match = rawLine.match(/^\s*state_dir\s*=\s*(["'])(.*?)\1\s*(?:#.*)?$/)
-      if (!match) continue
-      let configured = match[2] ?? ''
-      if (match[1] === '"') {
-        try {
-          const parsed: unknown = JSON.parse(`${match[1]}${configured}${match[1]}`)
-          if (typeof parsed === 'string') configured = parsed
-        } catch {
-          return join(profile.home, 'state')
-        }
-      }
-      if (configured === '~') configured = homedir()
-      else if (configured.startsWith('~/') || configured.startsWith('~\\')) {
-        configured = join(homedir(), configured.slice(2))
-      }
-      return resolve(profile.home, configured)
-    }
+    const configured = configuredDesktopDataDirectory(profile.home, parseToml(configRaw).state_dir, 'state')
+    if (!configured) throw new Error('The configured Desktop state directory is not a supported path.')
+    return configured
   }
   return join(profile.home, 'state')
 }
@@ -2414,10 +2417,6 @@ function desktopTelemetryDirectory(profile: DesktopProfilePaths, configRaw: stri
 
 function desktopConsentMirrorPath(profile: DesktopProfilePaths, configRaw: string | null): string {
   return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-consent-mirror.json')
-}
-
-function desktopEarlyTelemetrySpoolPath(profile: DesktopProfilePaths, configRaw: string | null): string {
-  return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-early-spool')
 }
 
 function mirroredScopeConsent(
@@ -2468,16 +2467,19 @@ async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promi
   const credential = credentialRaw === null
     ? null
     : normalizeDesktopCredential(JSON.parse(credentialRaw) as Partial<DesktopConnection>)
+  const telemetryDirectory = desktopTelemetryDirectory(profile, configRaw)
+  const spoolRoot = join(telemetryDirectory, 'desktop-early-spool')
+  const consentMirrorPath = join(telemetryDirectory, 'desktop-consent-mirror.json')
   desktopTelemetryRuntimeGate.openAfterConsentSync()
   desktopReliabilityTelemetry.synchronize({
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    spoolRoot,
+    consentMirrorPath,
   })
   desktopGrowthTelemetry.synchronize({
     profileKey: profile.home,
-    telemetryDirectory: desktopTelemetryDirectory(profile, configRaw),
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    telemetryDirectory,
+    spoolRoot,
+    consentMirrorPath,
   }, credential?.configAuthority === 'generated' ? credential.growthOnboardingReceipt : null)
   refreshDesktopReliabilityForegroundState()
 }
@@ -7420,7 +7422,9 @@ function dismissOnboardingFlow(flow: OnboardingFlow): void {
   const window = flow.window
   if (window && !window.isDestroyed()) window.close()
   resolve?.(null)
-  focusMainWindow()
+  // During app.quit(), the parent may have destroyed its webContents while
+  // still closing this child. Revealing that half-closed native window is unsafe.
+  if (!isQuitting && appExitPhase !== 'committed') focusMainWindow()
 }
 
 async function runOnboarding(): Promise<DesktopConnection | null> {
@@ -7640,9 +7644,15 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
     const detail = error instanceof Error ? error.message : String(error)
     throw new Error(`runtime_root_missing: ${detail}`)
   }
+  const entry = join(repoRoot, 'desktop', 'electron', 'scripts', 'gateway-entry.py')
+  if (!(await pathIsFile(entry))) {
+    throw new Error(`runtime_root_missing: Desktop Gateway entry not found at ${entry}`)
+  }
   return await validateGatewayRuntime({
     command: 'uv',
-    args: ['run', 'opensquilla', 'gateway', 'run'],
+    // Match the packaged dispatcher, including its lightweight offline recovery
+    // path, while continuing to execute Python from the selected checkout.
+    args: ['run', 'python', entry, 'gateway', 'run'],
     cwd: repoRoot,
     mode: 'dev',
   })
@@ -9646,6 +9656,10 @@ async function startGateway(): Promise<GatewayState> {
     // capability disabled instead of weakening the transport boundary.
     desktopLog('desktop_browser_transport_unavailable')
   }
+  const controlUiBasePath = desktopControlUiBasePath(
+    await readOptionalDesktopText(join(activeProfile.home, 'config.toml')),
+    process.env,
+  )
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
   // close writer/lifecycle admission before draining current children; an
@@ -9685,6 +9699,7 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.url = url
   gatewayState.port = port
   gatewayState.owned = true
+  ownedGatewayControlUiBasePath = controlUiBasePath
   gatewayState.status = 'starting'
   gatewayState.logPath = logPath
   gatewayState.error = undefined
@@ -9721,6 +9736,7 @@ async function startGateway(): Promise<GatewayState> {
   })
 
   const gatewaySpawnRequestedAt = Date.now()
+  desktopStartupLog('gateway_spawn_requested', { port, runtimeMode: runtime.mode })
   const child = spawn(
     runtime.command,
     [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
@@ -10035,6 +10051,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  desktopStartupLog('window_created')
   installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
@@ -10295,6 +10312,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
 
   window.once('ready-to-show', () => {
+    desktopStartupLog('window_ready_to_show')
     if (!window.isDestroyed()) window.show()
   })
 
@@ -10483,8 +10501,11 @@ async function stopOwnedGatewayAndWait(): Promise<void> {
 }
 
 async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
-  const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
   const active = activeDesktopProfile()
+  const metadata = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+  let consolidationFailure = metadata.canSkipMaintenance
+    ? null
+    : await consolidateLegacyRecoveryProfilesBeforeStartup()
   // On a hard Electron crash, the Python Gateway can remain healthy and keep
   // the profile writer lease. Prove and stop that exact prior Desktop instance
   // before profile inspection; otherwise the inspector reports profile_lock_busy
@@ -10495,6 +10516,26 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     await recoverVerifiedOrphanGatewayBeforeSpawn(active)
   }
   recoveryOperationError = null
+  if (metadata.canSkipMaintenance) {
+    // Orphan drain can await another process. Re-check metadata afterwards so a
+    // transaction or config edit during that wait takes the original path.
+    const current = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+    if (current.canSkipMaintenance) {
+      recoveryInspection = null
+      primaryRecoveryInspection = null
+      desktopGrowthTelemetry.observeProfileInspection({
+        profileKey: active.home,
+        stableCode: resolvedPathsEqual(current.workspaceDirectory, join(active.home, 'workspace'))
+          ? 'canonical_workspace' : 'configured_workspace',
+        importedOrMigrated: false,
+      })
+      desktopLog('desktop_profile_startup_fastpath', { maintenanceHelpersSkipped: true })
+      publishRecoveryState()
+      createApplicationMenu()
+      return true
+    }
+    consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
+  }
   let inspection = await inspectDesktopProfile(active)
   const growthInspection = {
     profileKey: active.home,
@@ -10677,7 +10718,23 @@ async function openOrResumeDesktopApp(): Promise<void> {
         await createMainWindow()
         focusMainWindow()
         observeDesktopStartupStage('profile-inspect', { operation: 'startup' })
-        const profileReady = await inspectActiveProfileBeforeStartup()
+        const profileInspectStartedAt = Date.now()
+        desktopStartupLog('profile_inspect_started')
+        let profileReady: boolean
+        try {
+          profileReady = await inspectActiveProfileBeforeStartup()
+        } catch (error) {
+          desktopStartupLog('profile_inspect_finished', {
+            ready: false,
+            failed: true,
+            durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+          })
+          throw error
+        }
+        desktopStartupLog('profile_inspect_finished', {
+          ready: profileReady,
+          durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+        })
         // Only trust config.state_dir after profile inspection/recovery has
         // bounded the active profile. Sync before publishing that inspection's
         // terminal result so existing opt-in users retain profile-start facts;
@@ -11039,6 +11096,8 @@ const { autoUpdater } = electronUpdater
 
 let autoUpdaterReady = false
 let updateDownloadInProgress = false
+let desktopUpdateDownloadTask: Promise<DesktopUpdateState> | null = null
+let desktopUpdateDownloadOrigin: 'automatic' | 'user' | null = null
 let manualInstallerActionInProgress = false
 let updateApplying = false
 // A user/system quit that arrives while an update is still draining writers or
@@ -11095,8 +11154,10 @@ interface DesktopUpdateState {
   canCheck: boolean
   canNativeInstall: boolean
   canInstall?: boolean
+  canAutoDownload: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  releaseNotesUrl: string | null
   source: DesktopUpdateSource | null
   fallbackUsed: boolean
 }
@@ -11259,6 +11320,10 @@ function windowsInstallerActionsSupported(): boolean {
   return process.platform === 'win32' && process.arch === 'x64'
     && desktopUpdateManaged() && desktopUpdateInstallMode() === 'manual'
     && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '0'
+}
+
+function desktopUpdateAutomaticDownloadSupported(): boolean {
+  return nativeAutoUpdateEnabled() || windowsInstallerActionsSupported()
 }
 
 function windowsUpdateDownloadDirectory(): string {
@@ -11425,8 +11490,13 @@ function desktopUpdateSnapshot(): DesktopUpdateState {
     canCheck: desktopUpdateManaged() || mockUpdateVersion() !== null,
     canNativeInstall: installMode === 'native',
     canInstall: installMode === 'native' || windowsInstallerActionsSupported(),
+    canAutoDownload: desktopUpdateAutomaticDownloadSupported(),
     installMode,
     releaseUrl: desktopUpdateReleaseUrl,
+    // The release page belongs to this exact candidate, never to the transport
+    // URL (which is the .exe on Windows) or a previously selected version.
+    releaseNotesUrl: desktopUpdateCandidate?.version === latestVersion
+      ? desktopUpdateCandidate.releaseUrl : null,
     source: desktopUpdateSource,
     fallbackUsed: desktopUpdateFallbackUsed,
   }
@@ -11554,10 +11624,12 @@ function showUpdateError(
   err: unknown,
   silentFallback: DesktopUpdateFailureFallback | null = null,
 ): void {
-  const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest() || updateDownloadInProgress
+  const wasDownload = desktopUpdateDownloadOrigin !== null
+  const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest()
+    || desktopUpdateDownloadOrigin === 'user'
   const errorCode = classifyDesktopUpdateError(err)
   updateDownloadInProgress = false
-  if (!shouldNotify) {
+  if (!shouldNotify && !wasDownload) {
     if (silentFallback && !['checking', 'downloading', 'applying'].includes(silentFallback.state.status)) {
       desktopUpdateCandidate = silentFallback.candidate
       setDesktopUpdateState({
@@ -11596,6 +11668,15 @@ async function runMockUpdateFlow(version: string): Promise<void> {
   if (mockUpdatePromptActive) return
   mockUpdatePromptActive = true
   try {
+    const parsed = parseOpenSquillaReleaseTag(version)
+    if (parsed) {
+      const tag = `v${parsed.base}${parsed.rc === null ? '' : `rc${parsed.rc}`}`
+      desktopUpdateCandidate = {
+        tag, version, baseVersion: parsed.base, prerelease: parsed.rc !== null,
+        releaseUrl: `https://github.com/${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}/releases/tag/${tag}`,
+        feed: '', installer: '',
+      }
+    }
     if (downloadedUpdateVersion === version) {
       setDesktopUpdateState({
         status: 'downloaded',
@@ -11619,7 +11700,29 @@ async function runMockUpdateFlow(version: string): Promise<void> {
   }
 }
 
-async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
+function downloadDesktopUpdate(origin: 'automatic' | 'user' = 'user'): Promise<DesktopUpdateState> {
+  if (desktopUpdateDownloadTask) {
+    if (origin === 'user') desktopUpdateDownloadOrigin = 'user'
+    return desktopUpdateDownloadTask
+  }
+  if (origin === 'automatic' && (!desktopUpdateAutomaticDownloadSupported()
+    || desktopUpdateStatus !== 'available' || !desktopUpdateCandidate)) {
+    return Promise.resolve(desktopUpdateSnapshot())
+  }
+  desktopUpdateDownloadOrigin = origin
+  // Reserve the flight before any cache/signature/network await. A renderer
+  // retry joins background preparation instead of starting another download.
+  const task = Promise.resolve().then(() => runDesktopUpdateDownload(origin))
+    .finally(() => {
+      if (desktopUpdateDownloadTask !== task) return
+      desktopUpdateDownloadTask = null
+      desktopUpdateDownloadOrigin = null
+    })
+  desktopUpdateDownloadTask = task
+  return task
+}
+
+async function runDesktopUpdateDownload(origin: 'automatic' | 'user'): Promise<DesktopUpdateState> {
   try {
     await restoreWindowsUpdateCache(true)
   } catch (error) {
@@ -11635,7 +11738,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     manualInstallerActionInProgress = true
     try {
       await revalidateReadyWindowsInstaller()
-      shell.showItemInFolder(verifiedManualInstallerPath)
+      if (origin === 'user') shell.showItemInFolder(verifiedManualInstallerPath)
     } catch (err) {
       const errorCode = classifyDesktopUpdateError(err)
       if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
@@ -11674,7 +11777,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       error: null,
     })
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 100)
+      setTimeout(resolve, 600)
     })
     updateDownloadInProgress = false
     downloadedUpdateVersion = version
@@ -11701,8 +11804,9 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     manualInstallerActionInProgress = true
     let finishTelemetry: ((outcome: 'success' | 'fail', errorCode: UpdateErrorCode | null) => void) | undefined
     try {
-      if (desktopUpdateStatus === 'checking') await checkForUpdates(true)
-      if (!desktopUpdateCandidate) await checkForUpdates(true)
+      if (origin === 'user' && (desktopUpdateStatus === 'checking' || !desktopUpdateCandidate)) {
+        await checkForUpdates(true)
+      }
       const candidate = desktopUpdateCandidate
       if (!candidate || !['available', 'error'].includes(desktopUpdateStatus)) return desktopUpdateSnapshot()
       const telemetryStartedAt = Date.now()
@@ -11826,6 +11930,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   initAutoUpdater()
   let candidate = desktopUpdateCandidate
   if (!candidate || !nativeUpdateReadyFor(candidate)) {
+    if (origin === 'automatic') return desktopUpdateSnapshot()
     await checkForUpdates(true)
     candidate = desktopUpdateCandidate
   }
@@ -11841,6 +11946,9 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   })
   try {
     await downloadNativeDesktopUpdateWithFallback()
+    if (desktopUpdateSnapshot().status !== 'downloaded' || downloadedUpdateVersion !== candidate.version) {
+      throw new UpdateChannelError('manifest_invalid', 'The selected update has not reached verified readiness.')
+    }
     desktopReliabilityTelemetry.recordUpdateResult({
       outcome: 'success',
       durationMs: Math.max(0, Date.now() - telemetryStartedAt),
@@ -11870,9 +11978,9 @@ function initAutoUpdater(): void {
   if (autoUpdaterReady || !autoUpdateSupported()) return
   autoUpdaterReady = true
 
-  // Consent-based: the bundled gateway + ML runtime make updates large, so we
-  // never download without asking. We also keep installation on the explicit
-  // restart path so applyDownloadedUpdate() can drain the owned gateway first.
+  // OpenSquilla owns download scheduling after its exact candidate/feed checks,
+  // including source fallback. Installation remains an explicit user action so
+  // applyDownloadedUpdate() can drain the owned gateway first.
   autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = false
   // electron-updater generates a persistent per-install staging UUID even
@@ -11907,8 +12015,13 @@ function initAutoUpdater(): void {
   })
 
   autoUpdater.on('update-downloaded', (info) => {
-    updateDownloadInProgress = false
     const version = String(info?.version ?? '')
+    if (!desktopUpdateCandidate || version !== desktopUpdateCandidate.version
+      || !nativeUpdateReadyFor(desktopUpdateCandidate)) {
+      showUpdateError(new UpdateChannelError('manifest_invalid', 'Downloaded update does not match the selected release.'))
+      return
+    }
+    updateDownloadInProgress = false
     downloadedUpdateVersion = version
     mockDownloadedUpdate = false
     createApplicationMenu()
@@ -12479,6 +12592,17 @@ function desktopUpdateCheckAllowed(): boolean {
 }
 
 async function runDesktopUpdateCheck(): Promise<void> {
+  await checkDesktopUpdateCandidate()
+  if (desktopUpdateStatus === 'available' && desktopUpdateAutomaticDownloadSupported()) {
+    // Do not await here: an explicit Download may already be awaiting this
+    // check. Both routes join the same flight once the verified candidate exists.
+    void downloadDesktopUpdate('automatic').catch((error) => {
+      console.error('[updater] background preparation failed', error)
+    })
+  }
+}
+
+async function checkDesktopUpdateCandidate(): Promise<void> {
   try {
     await restoreWindowsUpdateCache(desktopUpdateCheckScheduler.manualRequestPending)
   } catch (error) {
@@ -13181,6 +13305,35 @@ ipcMain.handle('desktop:artifact:save', async (event, payload: SaveArtifactReque
     const choice = await dialog.showSaveDialog(window, { defaultPath: name })
     return choice.canceled ? null : choice.filePath || null
   })
+})
+ipcMain.handle('desktop:attachment:save', async (event, payload: SaveAttachmentRequest) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted attachment save request.')
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  event.sender.once('destroyed', abort)
+  try {
+    return await saveAttachmentFile(payload, {
+      signal: controller.signal,
+      connection: () => {
+        if (!trustedMainWindowControlIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+        const snapshot = desktopGatewayConnectionSnapshot()
+        if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken) return null
+        return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+          url: snapshot.httpUrl, authToken: snapshot.authToken }
+      },
+      choosePath: async name => {
+        const window = currentMainWindow()
+        if (!window) throw new Error('Main window unavailable')
+        const choice = await dialog.showSaveDialog(window, { defaultPath: name })
+        return choice.canceled ? null : choice.filePath || null
+      },
+    })
+  } catch {
+    // Local filesystem errors can contain host paths; keep them out of renderer IPC.
+    throw new Error('Attachment save failed')
+  } finally {
+    event.sender.removeListener('destroyed', abort)
+  }
 })
 ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileActionRequest) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted source file request.')
@@ -16659,6 +16812,7 @@ if (!gotSingleInstanceLock) {
   })
 
   void app.whenReady().then(async () => {
+    desktopStartupLog('app_ready')
     // An OS wake is an observation, not permission to restart or reload.
     const notifySystemResume = () => {
       for (const window of BrowserWindow.getAllWindows()) {

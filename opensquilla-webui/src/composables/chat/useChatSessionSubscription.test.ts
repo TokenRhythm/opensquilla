@@ -8,6 +8,7 @@ import {
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
 import { useChatHistory } from './useChatHistory'
 import { useChatCompaction } from './useChatCompaction'
+import { useChatStream } from './useChatStream'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import {
   createSessionReadLifecycle,
@@ -253,6 +254,28 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it.each([false, true])('preserves reader follow=%s when metadata restores an active task without a live bubble', async follow => {
+    const autoScroll = ref(follow)
+    const stream = useChatStream({
+      messages: ref([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll,
+      applySessionRunState: vi.fn(), renderMarkdown: text => text,
+      stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text,
+      scrollToBottom: vi.fn(),
+    })
+    const initialMetadata = metadata({
+      runStatus: 'running', activeTask: { taskId: 'task-restored', status: 'running', startedAt: 90_000 },
+    })
+    const subject = harness(leaseFixture({
+      live: live({ activity: 'foreground', initialMetadata }), metadata: initialMetadata,
+    }).lease, { isStreaming: stream.isStreaming, startStreaming: stream.startStreaming })
+    try {
+      await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: true, live: true })
+      expect(stream.isStreaming.value).toBe(true)
+      expect(subject.activeStreamTaskId.value).toBe('task-restored')
+      expect(autoScroll.value).toBe(follow)
+    } finally { subject.api.cancelActiveSubscription(); stream.cleanup() }
+  })
+
   it('waits for a rejected history cursor to recover before confirming reconciliation', async () => {
     const confirmInstalled = vi.fn(async () => {})
     const page: SessionReadHistoryPage = {
@@ -346,6 +369,35 @@ describe('useChatSessionSubscription domain lease', () => {
       live: false,
       backgroundOnly: false,
     })
+  })
+
+  it.each(['rpc-abort', 'local-cancel', 'session-replaced'])('does not warn for an intentionally cancelled subscription (%s)', async reason => {
+    const pendingLive = deferred<SessionReadLive>()
+    const sessionKey = ref(KEY)
+    const subject = harness(leaseFixture({ live: pendingLive.promise }).lease, { sessionKey })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pending = subject.api.subscribeSession()
+      if (reason === 'local-cancel') subject.api.cancelActiveSubscription()
+      if (reason === 'session-replaced') sessionKey.value = 'agent:main:webchat:successor'
+      pendingLive.reject(reason === 'rpc-abort'
+        ? new SessionReadFailure('aborted', 'ready was aborted', false)
+        : new Error('Previous read ended'))
+      await expect(pending).resolves.toMatchObject({ authoritative: false, cancelled: true })
+      expect(warn).not.toHaveBeenCalled()
+    } finally { warn.mockRestore() }
+  })
+
+  it('still warns when the current subscription genuinely fails', async () => {
+    const pendingLive = deferred<SessionReadLive>()
+    const subject = harness(leaseFixture({ live: pendingLive.promise }).lease)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pending = subject.api.subscribeSession()
+      pendingLive.reject(new Error('Gateway unavailable'))
+      await expect(pending).resolves.toMatchObject({ authoritative: false, cancelled: false })
+      expect(warn).toHaveBeenCalledExactlyOnceWith('Session stream subscription failed:', 'Gateway unavailable')
+    } finally { warn.mockRestore() }
   })
 
   it('projects only a current domain missing failure as terminal session absence', async () => {
@@ -600,6 +652,21 @@ describe('useChatSessionSubscription domain lease', () => {
     })
     expect(subject.resetStreamLiveTurnState).toHaveBeenCalledOnce()
     expect(subject.onAuthoritativeIdle).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a standalone approval actionable without promoting idle metadata into execution', async () => {
+    const subject = harness(leaseFixture().lease, {
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(true),
+    })
+
+    await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: true, live: true })
+
+    expect(subject.startStreaming).not.toHaveBeenCalled()
+    expect(subject.resetStreamLiveTurnState).not.toHaveBeenCalled()
+    expect(subject.runStatus.value.status).toBe('idle')
+    expect(subject.isStreaming.value).toBe(false)
+    expect(subject.activeStreamTaskId.value).toBe('')
   })
 
   it('clears a stale exact Stop after a complete current idle read, without requiring its terminal row', async () => {

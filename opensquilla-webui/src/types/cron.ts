@@ -65,6 +65,8 @@ export interface FailureDestination {
 }
 
 export interface CronRun {
+  id?: string
+  error?: string
   started_at?: string
   status?: string
   duration_ms?: number

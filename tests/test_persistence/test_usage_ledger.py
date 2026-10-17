@@ -268,6 +268,162 @@ async def test_initialize_cutover_is_set_based_and_repairs_legacy_components(
         await storage.close()
 
 
+@pytest.mark.parametrize("missing_current_checkpoint", [False, True])
+async def test_initialize_recovers_imported_cutover_without_resnapshotting_usage(
+    tmp_path: Path, missing_current_checkpoint: bool,
+) -> None:
+    """Old recovery copies kept ledger rows but discarded their global state."""
+
+    from opensquilla.gateway.usage_query import query_usage_ledger
+
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    key = "agent:main:webchat:recovered-ledger"
+    try:
+        await storage.upsert_session(
+            SessionNode(
+                session_key=key, session_id="session-1",
+                input_tokens=12, output_tokens=4, total_tokens=16,
+                total_cost_usd=0.001, estimated_cost_component_usd=0.001,
+                cost_source="opensquilla_estimate",
+            )
+        )
+        await storage.initialize_usage_ledger(100)
+        # Initial cutover and the first live event can share a millisecond.
+        await storage.start_usage_event(_start(started_at_ms=100))
+        await storage.finalize_usage_event("event-1", _completion(), items=(_item(),))
+        await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=key, expected_epoch=0,
+        )
+        assert await storage.advance_reset_epoch(key) == 1
+        # A second current generation missing its checkpoint must use ancestry,
+        # not compatibility totals that already contain the finalized event.
+        if missing_current_checkpoint:
+            await storage.conn.execute(
+                "UPDATE sessions SET epoch = 2 WHERE session_key = ?", (key,),
+            )
+            await storage.conn.commit()
+        baselines_before = await storage.list_usage_legacy_baselines()
+        restored_at = max(row.captured_at_ms for row in baselines_before) + 1_000
+        events_before = await storage.query_usage_events(None, None)
+        query = {"range": {"preset": "all"}, "timezone": "UTC"}
+        totals_before = (await query_usage_ledger(storage, query, now_ms=1_000))["totals"]
+        assert totals_before["totalTokens"] == 136
+        assert totals_before["costNanos"] == 10_200_000
+
+        await storage.conn.execute("DELETE FROM usage_ledger_state")
+        await storage.conn.commit()
+        state = await storage.initialize_usage_ledger(restored_at)
+        assert state.ledger_started_at_ms == 100
+        baselines_after = await storage.list_usage_legacy_baselines()
+        assert [row for row in baselines_after if row.session_epoch < 2] == baselines_before
+        if missing_current_checkpoint:
+            assert baselines_after[2].session_epoch == 2
+            assert baselines_after[2].total_tokens == 136
+        assert await storage.query_usage_events(None, None) == events_before
+        assert (await query_usage_ledger(storage, query, now_ms=3_000))["totals"] == totals_before
+        reconciled = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=key, expected_epoch=2 if missing_current_checkpoint else 1,
+        )
+        assert reconciled is not None
+        assert reconciled.total_tokens == 136
+        assert reconciled.total_cost_usd == pytest.approx(0.0102)
+        await storage.close()
+        storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+        assert await storage.initialize_usage_ledger(restored_at + 1_000) == state
+        assert await storage.list_usage_legacy_baselines() == baselines_after
+    finally:
+        await storage.close()
+
+
+async def test_imported_cutover_repair_is_atomic(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(SessionNode(session_key="agent:main:one", session_id="one"))
+        await storage.initialize_usage_ledger(100)
+        baselines_before = await storage.list_usage_legacy_baselines()
+        await storage.conn.executescript(
+            """
+            DELETE FROM usage_ledger_state;
+            UPDATE sessions SET epoch = 1;
+            CREATE TRIGGER fail_recovered_baseline BEFORE INSERT ON usage_legacy_baselines
+            WHEN NEW.session_epoch = 1
+            BEGIN SELECT RAISE(ABORT, 'injected repair failure'); END;
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected repair failure"):
+            await storage.initialize_usage_ledger(200)
+        assert await storage.get_usage_ledger_state() is None
+        assert await storage.list_usage_legacy_baselines() == baselines_before
+        assert not storage.conn.in_transaction
+        await storage.conn.execute("DROP TRIGGER fail_recovered_baseline")
+        await storage.conn.commit()
+        assert (await storage.initialize_usage_ledger(300)).ledger_started_at_ms == 100
+        assert len(await storage.list_usage_legacy_baselines()) == 2
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("checkpoint_ms", [None, 105, 110])
+async def test_imported_cutover_with_only_post_cutover_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint_ms: int | None,
+) -> None:
+    from opensquilla.gateway.usage_query import query_usage_ledger
+
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    key = "agent:main:late-session"
+    has_later_checkpoint = checkpoint_ms is not None
+    try:
+        await storage.initialize_usage_ledger(100)
+        # Historical generation creation did not always write a checkpoint.
+        await storage.conn.execute(
+            """INSERT INTO sessions (session_key, session_id, created_at, updated_at)
+               VALUES (?, 'session-1', 105, 105)""", (key,),
+        )
+        await storage.conn.commit()
+        await storage.start_usage_event(_start(started_at_ms=110))
+        await storage.finalize_usage_event(
+            "event-1", _completion(completed_at_ms=110), items=(_item(),),
+        )
+        await storage.conn.execute(
+            """UPDATE sessions SET input_tokens=100, output_tokens=20, total_tokens=120,
+               total_cost_usd=0.0092, estimated_cost_component_usd=0.0092,
+               cost_source='opensquilla_estimate' WHERE session_key=?""", (key,),
+        )
+        await storage.conn.commit()
+        if has_later_checkpoint:
+            # The checkpoint can share a millisecond with live usage, or have
+            # an earlier wall-clock timestamp after a system clock adjustment.
+            monkeypatch.setattr("opensquilla.session.storage._now_ms", lambda: checkpoint_ms)
+            assert await storage.advance_reset_epoch(key) == 1
+        prior = await storage.list_usage_legacy_baselines()
+        assert len(prior) == int(has_later_checkpoint)
+        restored_at = max([row.captured_at_ms for row in prior] + [200]) + 1_000
+        await storage.conn.execute("DELETE FROM usage_ledger_state")
+        await storage.conn.commit()
+
+        state = await storage.initialize_usage_ledger(restored_at)
+        assert state.ledger_started_at_ms == (checkpoint_ms - 1 if has_later_checkpoint else 110)
+        after = await storage.list_usage_legacy_baselines()
+        if has_later_checkpoint:
+            assert after == prior
+        else:
+            assert after[0].total_tokens == 0
+        totals = (await query_usage_ledger(
+            storage, {"range": {"preset": "all"}, "timezone": "UTC"}, now_ms=restored_at,
+        ))["totals"]
+        assert totals["totalTokens"] == 120
+        assert totals["costNanos"] == 9_200_000
+        reconciled = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=key, expected_epoch=int(has_later_checkpoint),
+        )
+        assert reconciled is not None
+        assert reconciled.total_tokens == 120
+        assert await storage.initialize_usage_ledger(restored_at + 1_000) == state
+        assert await storage.list_usage_legacy_baselines() == after
+    finally:
+        await storage.close()
+
+
 async def test_event_lifecycle_is_atomic_idempotent_and_half_open(tmp_path: Path) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
     try:

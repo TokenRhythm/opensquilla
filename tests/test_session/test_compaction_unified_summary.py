@@ -29,6 +29,7 @@ from opensquilla.session.compaction import (
     CompactionRequestContext,
     _api_round_requires_raw,
     _build_suffix_compaction_call,
+    _fit_compaction_input_to_target,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
     call_compaction_provider,
@@ -627,15 +628,28 @@ async def test_indivisible_round_revises_only_when_checkpoint_causes_pressure(
     monkeypatch,
     oversized_checkpoint,
 ):
+    from opensquilla import token_estimation
+
+    class CharacterBudgetEncoding:
+        def encode(self, text, *, disallowed_special):
+            return range((len(text) + 7) // 8)
+
+    # Exercise character-budget pressure with stable cheap tokens. A sticky
+    # tokenizer fallback can otherwise make the source alone exceed capacity,
+    # invalidating the checkpoint-only pressure premise of the True branch.
+    encoding = CharacterBudgetEncoding()
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
     provider = OpenAIProvider(api_key="synthetic", model="synthetic-model")
     calls = []
+    large_checkpoint = "Checkpoint. " * 100
+    short_checkpoint = "Recorded work completed; continue remaining tasks."
 
     async def chat(messages, tools=None, config=None):
         calls.append((messages, tools, config))
         yield TextDeltaEvent(
-            text="Checkpoint. " * 100
+            text=large_checkpoint
             if oversized_checkpoint and len(calls) == 1
-            else "Recorded work completed; continue remaining tasks."
+            else short_checkpoint
         )
         yield DoneEvent()
 
@@ -664,15 +678,37 @@ async def test_indivisible_round_revises_only_when_checkpoint_causes_pressure(
         llm_plan=CompactionExecutionPlan(candidates=(target,)),
         request_context=CompactionRequestContext(chat_config=ChatConfig(max_tokens=4096)),
     )
-    result = await compact_context(
-        CompactionRequest(
-            session_id="indivisible-round",
-            entries=entries,
-            context_window_tokens=4000,
-            forced_prefix_cut=len(entries),
-            config=config,
-        )
+    request = CompactionRequest(
+        session_id="indivisible-round",
+        entries=entries,
+        context_window_tokens=4000,
+        forced_prefix_cut=len(entries),
+        config=config,
     )
+
+    def fits(source, checkpoint="", *, reduce_generation=False):
+        # Keep the real serializer, request proof and generation-budget guard.
+        return _fit_compaction_input_to_target(
+            request=request,
+            target=target,
+            previous_summary=checkpoint,
+            chunk=source,
+            allow_generation_reduction=reduce_generation,
+        ) is not None
+
+    source_round = entries[:2]
+    if oversized_checkpoint:
+        assert fits(source_round)
+        assert not fits(source_round, large_checkpoint.strip())
+        assert fits(source_round, short_checkpoint)
+        assert fits([], large_checkpoint.strip())
+    else:
+        assert not fits(source_round)
+        assert not fits(source_round, short_checkpoint)
+        assert fits(source_round, reduce_generation=True)
+        assert fits(source_round, short_checkpoint, reduce_generation=True)
+
+    result = await compact_context(request)
     assert result.chunks_processed == round_count
     if oversized_checkpoint:
         # Source alone admits the full allowance: revise the actual oversized

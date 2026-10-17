@@ -87,9 +87,6 @@ function mockCatalog() {
     capabilitiesPanel: ref({}),
     hasSetupAction: ref(false),
     actionItems: ref([]),
-    fixCommands: ref([]),
-    handoffCommands: ref([]),
-    recipeCommands: ref([]),
     configSummary: ref([]),
     configPath: ref('/tmp/config.toml'),
     selectInitialSection: noop,
@@ -286,6 +283,34 @@ describe('SettingsDialog save-all pending state', () => {
     expect(controls.saveDirtySections).toHaveBeenCalledOnce()
   })
 
+  it('preserves the existing draft bar while locking its actions during routing autosave', async () => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    catalogApi.modelStrategyRoutingBusy = ref(false)
+    const el = await mountDialog()
+    const bar = el.querySelector('.settings-dirtybar')!
+    const draftText = bar.textContent
+    const buttons = Array.from(bar.querySelectorAll<HTMLButtonElement>('button'))
+
+    catalogApi.modelStrategyRoutingBusy.value = true
+    await nextTick()
+
+    expect(el.querySelector('.settings-dirtybar')).toBe(bar)
+    expect(bar.textContent).toBe(draftText)
+    expect(bar.textContent).not.toContain('Saving changes')
+    expect(el.querySelector<HTMLFieldSetElement>('.settings-panel__interactions')?.disabled).toBe(true)
+    expect(buttons.every(button => button.disabled)).toBe(true)
+    buttons.forEach(button => button.click())
+    expect(controls.saveDirtySections).not.toHaveBeenCalled()
+    expect(controls.discardChanges).not.toHaveBeenCalled()
+
+    catalogApi.modelStrategyRoutingBusy.value = false
+    await nextTick()
+    expect(el.querySelector('.settings-dirtybar')).toBe(bar)
+    expect(bar.textContent).toBe(draftText)
+    expect(buttons.every(button => !button.disabled)).toBe(true)
+  })
+
   it('localizes the dirty section name instead of exposing its internal English label', async () => {
     const controls = mockCatalog()
     controls.saveAllPending.value = false
@@ -398,8 +423,112 @@ describe('SettingsDialog video draft exit guard', () => {
     model.value = 'google/veo-3.1-fast'
     model.dispatchEvent(new Event('input', { bubbles: true }))
     await nextTick()
-    return { el, patch }
+    return { el, patch, controls }
   }
+
+  it('includes a video-only draft in the shared save bar and capability rail', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    const bar = el.querySelector('.settings-dirtybar')!
+    expect(bar.textContent).toContain(i18n.global.t('settings.rail.capabilities'))
+    expect(el.querySelector('#settings-rail-capabilities .settings-rail__dirty')).not.toBeNull()
+    expect(el.querySelector('.video-settings__actions')).toBeNull()
+    bar.querySelector<HTMLButtonElement>('button.btn--primary')!.click()
+
+    await vi.waitFor(() => expect(el.querySelector('.settings-dirtybar')).toBeNull())
+    expect(patch).toHaveBeenCalledExactlyOnceWith([
+      { path: 'video_generation.provider', value: 'openrouter' },
+      { path: 'video_generation.primary', value: 'google/veo-3.1-fast' },
+    ])
+    expect(controls.saveDirtySections).not.toHaveBeenCalled()
+  })
+
+  it('discards a video-only draft from the shared bar without reloading or writing', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button')!.click()
+    await nextTick()
+
+    expect(el.querySelector('.settings-dirtybar')).toBeNull()
+    expect(el.querySelector<HTMLSelectElement>('[name="setup_video_provider"]')?.value).toBe('')
+    expect(controls.discardChanges).not.toHaveBeenCalled()
+    expect(patch).not.toHaveBeenCalled()
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(true)
+    expect(confirmChoiceAction).not.toHaveBeenCalled()
+  })
+
+  it('counts image and video edits as one capability section and locks both save stages', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    controls.hasUnsavedChanges.value = true
+    catalogApi.dirtySections.value = [{ id: 'capabilities', label: 'Capabilities' }]
+    let finishCatalogSave!: () => void
+    controls.saveDirtySections.mockImplementation(() => new Promise<void>(resolve => {
+      finishCatalogSave = () => {
+        controls.hasUnsavedChanges.value = false
+        catalogApi.dirtySections.value = []
+        resolve()
+      }
+    }))
+    let finishVideoSave!: () => void
+    patch.mockImplementation(() => new Promise(resolve => {
+      finishVideoSave = () => resolve({ restartRequired: false })
+    }))
+    await nextTick()
+    const bar = el.querySelector('.settings-dirtybar')!
+    expect(bar.textContent).toContain(i18n.global.t('settings.dialog.unsavedIn', {
+      sections: i18n.global.t('settings.rail.capabilities'),
+    }))
+    const save = bar.querySelector<HTMLButtonElement>('button.btn--primary')!
+    save.click()
+    await nextTick()
+    expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+    expect(patch).not.toHaveBeenCalled()
+    expect(save.disabled).toBe(true)
+    expect(el.querySelector<HTMLFieldSetElement>('.settings-panel__interactions')?.disabled).toBe(true)
+    save.click()
+    expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+
+    finishCatalogSave()
+    await vi.waitFor(() => expect(patch).toHaveBeenCalledOnce())
+    expect(save.disabled).toBe(true)
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(false)
+    finishVideoSave()
+    await vi.waitFor(() => expect(el.querySelector('.settings-dirtybar')).toBeNull())
+    expect(el.querySelector<HTMLFieldSetElement>('.settings-panel__interactions')?.disabled).toBe(false)
+  })
+
+  it('retains the video draft when a shared capability save does not complete', async () => {
+    const { el, patch, controls } = await mountVideoDraft()
+    controls.hasUnsavedChanges.value = true
+    catalogApi.dirtySections.value = [{ id: 'capabilities', label: 'Capabilities' }]
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')!.click()
+    await nextTick()
+    await nextTick()
+
+    expect(controls.saveDirtySections).toHaveBeenCalledOnce()
+    expect(patch).not.toHaveBeenCalled()
+    expect(el.querySelector('.settings-dirtybar')).not.toBeNull()
+    await vi.waitFor(() => expect(el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')?.disabled).toBe(false))
+  })
+
+  it('keeps a failed video save editable and protected by the exit guard', async () => {
+    const { el, patch } = await mountVideoDraft()
+    catalogApi.section.value = 'general'
+    routeState.params.section = 'general'
+    await nextTick()
+    patch.mockRejectedValueOnce(new Error('Video settings could not be saved'))
+    el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')!.click()
+    await vi.waitFor(() => expect(el.textContent).toContain('Video settings could not be saved'))
+    await vi.waitFor(() => expect(catalogApi.section.value).toBe('capabilities'))
+    expect(el.querySelector<HTMLDetailsElement>('[data-testid="video-generation-settings"]')?.open).toBe(true)
+    expect(el.querySelector<HTMLDetailsElement>('[data-testid="video-generation-settings"]')?.hidden).toBe(false)
+    expect(document.activeElement?.textContent).toContain('Video settings could not be saved')
+    expect(el.querySelector('.settings-dirtybar')).not.toBeNull()
+    expect(el.querySelector<HTMLButtonElement>('.settings-dirtybar button.btn--primary')?.disabled).toBe(false)
+
+    confirmChoiceAction.mockResolvedValueOnce('cancel')
+    expect(await leaveGuard!({ path: '/sessions' })).toBe(false)
+    expect(confirmChoiceAction).toHaveBeenCalledOnce()
+    expect(patch).toHaveBeenCalledOnce()
+  })
 
   it('preserves an unsaved video draft across sections and saves it on exit', async () => {
     const { el, patch } = await mountVideoDraft()
@@ -545,6 +674,135 @@ describe('SettingsDialog search navigation', () => {
   })
 })
 
+describe('SettingsDialog rail keyboard navigation', () => {
+  async function mountRail(mobile = false) {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.loaded.value = false
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: mobile && query === '(max-width: 768px)',
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    })
+    const el = await mountDialog()
+    return { el, controls }
+  }
+
+  async function pressKey(element: HTMLElement, key: string) {
+    element.focus()
+    const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+    element.dispatchEvent(event)
+    await nextTick()
+    return event
+  }
+
+  it.each([
+    { mobile: false, forward: 'ArrowDown', backward: 'ArrowUp', ignored: 'ArrowRight' },
+  ])('uses the visible rail orientation and one tab stop (mobile=$mobile)', async ({ mobile, forward, backward, ignored }) => {
+    const { el } = await mountRail(mobile)
+    const rail = el.querySelector<HTMLElement>('.settings-rail')!
+    const tabs = Array.from(rail.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+    expect(rail.getAttribute('aria-orientation')).toBe(mobile ? 'horizontal' : 'vertical')
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1])
+
+    expect((await pressKey(tabs[0], ignored)).defaultPrevented).toBe(false)
+    expect(catalogApi.section.value).toBe('general')
+    expect((await pressKey(tabs[0], forward)).defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(tabs[1])
+    expect(catalogApi.section.value).toBe('gateway')
+    expect(tabs[1].getAttribute('aria-selected')).toBe('true')
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([-1, 0, -1, -1])
+    expect(routerMock.replace).toHaveBeenLastCalledWith({ path: '/settings/gateway' })
+
+    await pressKey(tabs[1], 'End')
+    expect(document.activeElement).toBe(tabs[3])
+    expect(catalogApi.section.value).toBe('capabilities')
+    await pressKey(tabs[3], forward)
+    expect(document.activeElement).toBe(tabs[0])
+    await pressKey(tabs[0], backward)
+    expect(document.activeElement).toBe(tabs[3])
+    await pressKey(tabs[3], 'Home')
+    expect(document.activeElement).toBe(tabs[0])
+    expect(tabs.map(tab => tab.tabIndex)).toEqual([0, -1, -1, -1])
+  })
+
+  it('does not navigate by keyboard while settings writes are pending', async () => {
+    const { el, controls } = await mountRail()
+    controls.saveAllPending.value = true
+    await nextTick()
+    const selected = el.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')!
+    await pressKey(selected, 'End')
+    expect(catalogApi.section.value).toBe('general')
+    expect(routerMock.replace).not.toHaveBeenCalled()
+  })
+
+  it('uses a mobile category list and keeps the detail form mounted on return', async () => {
+    const { el, controls } = await mountRail(true)
+    controls.hasUnsavedChanges.value = false
+    await nextTick()
+    const panel = el.querySelector<HTMLElement>('.settings-panel')!
+    const form = panel.querySelector('.settings-panel__interactions')!
+    panel.scrollTop = 120
+    catalogApi.behaviorPanel.value.autoSessionTitles = true
+    el.querySelector<HTMLButtonElement>('.settings-modal__back')!.click()
+    await nextTick()
+    const rail = el.querySelector<HTMLElement>('.settings-rail')!
+    const categories = Array.from(rail.querySelectorAll<HTMLButtonElement>('.settings-rail__item'))
+    expect(rail.getAttribute('role')).toBeNull()
+    expect(categories.every(item => item.tabIndex === 0)).toBe(true)
+    expect(panel.hasAttribute('inert')).toBe(true)
+    expect(document.activeElement).toBe(categories[0])
+    await pressKey(categories[0], 'ArrowDown')
+    expect(document.activeElement).toBe(categories[1])
+    expect(catalogApi.section.value).toBe('general')
+    categories[0].click()
+    await nextTick()
+    expect(panel.hasAttribute('inert')).toBe(false)
+    expect(rail.hasAttribute('inert')).toBe(true)
+    expect(panel.querySelector('.settings-panel__interactions')).toBe(form)
+    expect(panel.scrollTop).toBe(120)
+    expect(catalogApi.behaviorPanel.value.autoSessionTitles).toBe(true)
+    expect(document.activeElement).toBe(panel)
+  })
+
+  it('opens generic mobile Settings on categories, while a deep link opens its detail', async () => {
+    mockCatalog().saveAllPending.value = false
+    catalogApi.loaded.value = false
+    routeState.params.section = undefined
+    routeState.path = '/settings'
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() })),
+    })
+    const el = await mountDialog()
+    expect(el.querySelector('.settings-panel')?.hasAttribute('inert')).toBe(true)
+    expect(el.querySelector('.settings-rail')?.hasAttribute('inert')).toBe(false)
+    routeState.params.section = 'gateway'
+    routeState.hash = '#connection'
+    await nextTick()
+    await nextTick()
+    expect(el.querySelector('.settings-panel')?.hasAttribute('inert')).toBe(false)
+    expect(el.querySelector('.settings-rail')?.hasAttribute('inert')).toBe(true)
+    expect(document.activeElement?.id).toBe('settings-gateway-connection')
+  })
+
+  it('excludes hidden categories from the mobile detail focus loop', async () => {
+    const { el, controls } = await mountRail(true)
+    controls.hasUnsavedChanges.value = false
+    await nextTick()
+    const back = el.querySelector<HTMLButtonElement>('.settings-modal__back')!
+    back.focus()
+    back.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }))
+    expect(document.activeElement?.closest('.settings-panel')).not.toBeNull()
+    expect(document.activeElement?.closest('.settings-rail')).toBeNull()
+    expect(document.activeElement?.closest('[inert]')).toBeNull()
+  })
+})
+
 describe('SettingsDialog keyboard focus loop', () => {
   async function mountHealthyGateway() {
     const controls = mockCatalog()
@@ -579,7 +837,7 @@ describe('SettingsDialog keyboard focus loop', () => {
       disclosure.dispatchEvent(new Event('toggle'))
       await nextTick()
     }
-    const first = el.querySelector<HTMLButtonElement>('#settings-rail-general')!
+    const first = el.querySelector<HTMLButtonElement>('#settings-rail-gateway')!
     const last = disclosure.querySelector<HTMLElement>(open ? '.conn-actions button:last-child' : 'summary')!
     expect(last).not.toBeNull()
 
@@ -598,7 +856,7 @@ describe('SettingsDialog keyboard focus loop', () => {
       <summary tabindex="0">Hidden later summary</summary>
     `
     el.querySelector('.settings-modal')!.appendChild(disclosure)
-    const first = el.querySelector<HTMLButtonElement>('#settings-rail-general')!
+    const first = el.querySelector<HTMLButtonElement>('#settings-rail-gateway')!
     const last = disclosure.querySelector<HTMLButtonElement>('summary button')!
 
     pressTab(first, true)
@@ -609,6 +867,27 @@ describe('SettingsDialog keyboard focus loop', () => {
 })
 
 describe('SettingsDialog exit protection', () => {
+  it.each(['inert', 'hidden', 'cold'])('restores the sidebar opener when the Settings entry is %s', async (state) => {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    const sidebar = document.createElement('div')
+    sidebar.className = 'sidebar-foot'
+    sidebar.innerHTML = '<button data-icon="settings">Settings</button>'
+    const invoker = sidebar.querySelector<HTMLButtonElement>('button')!
+    const opener = document.createElement('button')
+    opener.dataset.testid = 'sidebar-toggle-collapsed'
+    document.body.append(sidebar, opener)
+    if (state !== 'cold') invoker.focus()
+    const el = await mountDialog()
+    if (state === 'hidden') sidebar.style.display = 'none'
+    else sidebar.setAttribute('inert', '')
+    el.querySelector<HTMLButtonElement>('.settings-modal__head button')?.click()
+    await nextTick()
+    expect(document.activeElement).toBe(opener)
+  })
+
   it('does not leave a keyboard focus ring on Settings after a pointer close', async () => {
     const controls = mockCatalog()
     controls.saveAllPending.value = false

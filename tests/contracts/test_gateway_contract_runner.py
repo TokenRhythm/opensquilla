@@ -484,6 +484,23 @@ def test_legacy_method_lifecycle_requires_one_legal_canonical_alias(
         runner.load_contract(schema, contract_root=tmp_path)
 
 
+def test_codegen_provenance_inputs_use_lf_line_endings() -> None:
+    # Provenance hashes use raw bytes. A clean Git status can still hide CRLF
+    # worktree inputs that generate different hashes from an LF CI checkout.
+    inputs = [
+        Path(runner.__file__),
+        runner.AJV_GENERATOR,
+        runner.PRODUCTION_TARGET_MANIFEST,
+        *(spec.schema for spec in runner.discover_contracts()),
+    ]
+    non_lf_inputs = [
+        path.relative_to(runner.ROOT).as_posix()
+        for path in inputs
+        if b"\r" in path.read_bytes()
+    ]
+    assert non_lf_inputs == [], "Normalize Contract provenance inputs to LF before codegen"
+
+
 def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     specs = runner.discover_contracts()
 
@@ -497,8 +514,8 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
     assert manifest["wireVersion"] == 4
     assert manifest["source"] == {
-        "schemaCount": 219,
-        "methodCount": 209,
+        "schemaCount": 222,
+        "methodCount": 212,
         "eventFamilyCount": 10,
         "schemaTreeSha256": runner._schema_tree_digest(specs),
         "generatorSha256": runner._generator_digest(),
@@ -527,11 +544,14 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         },
     }
     assert any(entry["name"] == "skills.install.status" for entry in manifest["methods"])
-    assert {"skills.candidates", "skills.setEnabled"}.issubset(
+    assert {
+        "skills.candidates", "skills.setEnabled",
+        "sessions.sidechat.create", "sessions.sidechat.close",
+    }.issubset(
         {entry["name"] for entry in manifest["methods"]}
     )
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
-        "stable": 206,
+        "stable": 209,
         "legacy": 3,
     }
     assert [

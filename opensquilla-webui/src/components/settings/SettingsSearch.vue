@@ -49,6 +49,21 @@ function select(result: (typeof results.value)[number]) {
   focused.value = false
   emit('select', result.id, result.matchKey)
 }
+function onKeydown(event: KeyboardEvent) {
+  // The IME owns candidate confirmation/navigation. Do not prevent its default,
+  // and keep Escape from reaching the settings dialog while it is composing.
+  if (event.isComposing || event.keyCode === 229) {
+    event.stopPropagation()
+    return
+  }
+  if (event.key === 'Escape') clearSearch(event)
+  else if (event.key === 'ArrowDown') moveResult(event, 1)
+  else if (event.key === 'ArrowUp') moveResult(event, -1)
+  else if (event.key === 'Enter' && event.target === input.value && results.value[0]) {
+    event.preventDefault()
+    select(results.value[0])
+  }
+}
 function clearSearch(event: KeyboardEvent) {
   if (!query.value && !input.value?.value) return
   event.preventDefault()
@@ -75,9 +90,9 @@ function onFocusOut(event: FocusEvent) {
 </script>
 
 <template>
-  <div ref="root" class="settings-search" @focusin="focused = true" @focusout="onFocusOut" @keydown.esc="clearSearch" @keydown.down="moveResult($event, 1)" @keydown.up="moveResult($event, -1)">
+  <div ref="root" class="settings-search" @focusin="focused = true" @focusout="onFocusOut" @keydown="onKeydown">
     <Icon name="search" :size="15" aria-hidden="true" />
-    <input ref="input" v-model="query" type="search" :disabled="disabled" :aria-label="t('settings.search.label')" :placeholder="t('settings.search.label')" autocomplete="off" @keydown.enter.prevent="results[0] && select(results[0])">
+    <input ref="input" v-model="query" type="search" :disabled="disabled" :aria-label="t('settings.search.label')" :placeholder="t('settings.search.label')" autocomplete="off">
     <div v-if="showResults" role="group" class="settings-search__results" :aria-label="t('settings.search.results')">
       <button v-for="result in results" :key="result.id" type="button" class="settings-search__result" @keydown.enter.stop @click="select(result)">
         <Icon :name="result.icon" :size="16" aria-hidden="true" />
@@ -91,8 +106,7 @@ function onFocusOut(event: FocusEvent) {
 <style scoped>
 .settings-search { align-items: center; display: flex; flex: 1 1 220px; gap: 8px; max-width: 360px; min-width: 0; position: relative; }
 .settings-search > .icon { left: 10px; pointer-events: none; position: absolute; color: var(--text-dim); }
-.settings-search input[type="search"] { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-md); color: var(--text); font: inherit; font-size: var(--fs-sm); min-height: 40px; padding: 8px 10px 8px 32px; width: 100%; }
-.settings-search input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.settings-search input[type="search"] { background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius-control); color: var(--text); font: inherit; font-size: var(--fs-sm); min-height: 40px; padding: 8px 10px 8px 32px; width: 100%; }
 .settings-search__results { background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); left: 0; max-height: min(45vh, 340px); overflow-y: auto; padding: 4px; position: absolute; right: 0; top: calc(100% + 6px); z-index: 5; }
 .settings-search__result { align-items: center; background: transparent; border: 0; border-radius: var(--radius-sm); color: var(--text); cursor: pointer; display: flex; font: inherit; gap: 10px; min-height: 44px; padding: 8px; text-align: left; width: 100%; }
 .settings-search__result:hover, .settings-search__result:focus-visible { background: var(--bg-hover); outline: 2px solid var(--accent); outline-offset: -2px; }

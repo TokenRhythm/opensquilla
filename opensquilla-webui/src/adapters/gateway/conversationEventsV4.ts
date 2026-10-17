@@ -76,6 +76,7 @@ const SEMANTIC_EVENT_KIND_BY_WIRE_NAME = new Map<string, ConversationSemanticEve
   ['session.event.thinking_end', 'thinking-ended'],
   ['session.event.thinking_start', 'thinking-started'],
   ['session.event.tool_result', 'tool-result'],
+  ['session.event.tool_input_preview', 'tool-input-preview'],
   ['session.event.tool_use_delta', 'tool-use-delta'],
   ['session.event.tool_use_end', 'tool-use-ended'],
   ['session.event.tool_use_start', 'tool-use-started'],

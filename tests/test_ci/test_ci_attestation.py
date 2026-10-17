@@ -608,6 +608,10 @@ def test_validate_candidate_rejects_non_green_or_mismatched_runs(tmp_path: Path)
         ("execution-digest", "execution digest"),
         ("platform-matrix", "platform matrix"),
         ("legacy-windows-matrix", "platform matrix"),
+        ("missing-windows-bundle-cell", "platform matrix"),
+        ("missing-windows-profile-flow", "platform matrix"),
+        ("missing-windows-gateway-split", "platform matrix"),
+        ("missing-nsis-security-check", "platform matrix"),
         ("missing-contract-comparison", "platform matrix"),
     ),
 )
@@ -658,6 +662,32 @@ def test_validate_candidate_rejects_independent_evidence_contract_mismatches(
         tampered["platform_matrix"] = sorted(
             cells, key=lambda cell: (cell["suite"], cell["os"], cell["shard"])
         )
+    elif mismatch == "missing-windows-bundle-cell":
+        omitted = {
+            "suite": "windows-high-risk", "os": "windows-latest", "shard": "bundle-4",
+        }
+        assert omitted in tampered["platform_matrix"]
+        tampered["platform_matrix"].remove(omitted)
+    elif mismatch == "missing-windows-profile-flow":
+        omitted = {
+            "suite": "desktop-recovery-e2e", "os": "windows-latest",
+            "shard": "profiles-desktop-cleanup-flow",
+        }
+        assert omitted in tampered["platform_matrix"]
+        tampered["platform_matrix"].remove(omitted)
+    elif mismatch == "missing-windows-gateway-split":
+        omitted = {
+            "suite": "windows-high-risk", "os": "windows-latest", "shard": "gateway-sqlite-11",
+        }
+        assert omitted in tampered["platform_matrix"]
+        tampered["platform_matrix"].remove(omitted)
+    elif mismatch == "missing-nsis-security-check":
+        omitted = {
+            "suite": "windows-nsis-regression", "os": "windows-2022",
+            "shard": "packaged-security-first-interaction",
+        }
+        assert omitted in tampered["platform_matrix"]
+        tampered["platform_matrix"].remove(omitted)
     elif mismatch == "missing-contract-comparison":
         tampered["platform_matrix"] = [
             cell for cell in tampered["platform_matrix"]
@@ -724,8 +754,8 @@ def test_validate_candidate_rejects_self_reported_incomplete_suite_coverage(
 
 
 @pytest.mark.parametrize(("changed", "case_count"), [
-    ("opensquilla-webui/package-lock.json", 11),
-    ("desktop/electron/package-lock.json", 21),
+    ("opensquilla-webui/package-lock.json", 17),
+    ("desktop/electron/package-lock.json", 27),
 ])
 def test_exact_dependency_evidence_cannot_omit_native_acceptance_or_one_install_case(
     tmp_path: Path, changed: str, case_count: int,
@@ -748,7 +778,12 @@ def test_exact_dependency_evidence_cannot_omit_native_acceptance_or_one_install_
         "current_pull_request": {"number": 42, **event["pull_request"]}, "repo": repo,
     }
     validate_candidate(attestation=evidence, **arguments)
-    for mutation in ("omitted-suite", "omitted-fresh", "changed-execution", "changed-profile"):
+    for mutation in (
+        "omitted-suite", "omitted-fresh", "omitted-startup-gateway", "omitted-startup-desktop",
+        "omitted-security-dependency-audit", "omitted-security-gateway-smoke",
+        "omitted-security-first-interaction",
+        "changed-execution", "changed-profile",
+    ):
         tampered = json.loads(json.dumps(evidence))
         if mutation == "omitted-suite":
             tampered["successful_suites"].remove(suite)
@@ -759,11 +794,21 @@ def test_exact_dependency_evidence_cannot_omit_native_acceptance_or_one_install_
             tampered["platform_matrix"] = [c for c in tampered["platform_matrix"]
                                             if not (c["suite"] == suite
                                                     and c["shard"] == "fresh-custom-fresh")]
+        elif mutation.startswith("omitted-startup-"):
+            omitted = "candidate-startup-compat-" + mutation.removeprefix("omitted-startup-")
+            tampered["platform_matrix"] = [c for c in tampered["platform_matrix"]
+                                            if not (c["suite"] == suite
+                                                    and c["shard"] == omitted)]
+        elif mutation.startswith("omitted-security-"):
+            omitted = "packaged-security-" + mutation.removeprefix("omitted-security-")
+            tampered["platform_matrix"] = [c for c in tampered["platform_matrix"]
+                                            if not (c["suite"] == suite
+                                                    and c["shard"] == omitted)]
         elif mutation == "changed-profile":
             full = MODULE["_plan_paths"](repo, [".ci/run-all"])
             other = (
                 [c for c in full["platform_matrix"] if c["suite"] == suite]
-                if case_count == 11 else [
+                if case_count == 17 else [
                     c for c in evidence["platform_matrix"]
                     if c["suite"] == suite and c["shard"] != "0.5.3-default-readlock"
                 ]
@@ -1236,7 +1281,7 @@ def test_partial_queue_supplements_only_invalidated_allowlisted_suites(
     assert "windows-nsis-regression" in plan["required_suites"]
     native_cells = [c for c in plan["platform_matrix"]
                     if c["suite"] == "windows-nsis-regression"]
-    assert len(native_cells) == 21
+    assert len(native_cells) == 27
     assert plan["windows_nsis_profile"] == "full"
 
 

@@ -116,6 +116,34 @@ function editableWorkspace(): ArtifactDocumentWorkspace {
 beforeEach(() => setActivePinia(createPinia()))
 
 describe('artifact documents store', () => {
+  it('bounds unowned metadata while retaining open document heads until their owner releases', async () => {
+    const store = useArtifactDocumentsStore()
+    store.setProvider(providerWithLoad(async (value, session) => createLegacyArtifactWorkspace(value, session)))
+    const release = store.retain(artifact, 'protected')
+    await store.load(artifact, 'protected')
+    for (let index = 0; index < 48; index++) await store.load(artifact, `session-${index}`)
+    expect(Object.keys(store.snapshots)).toHaveLength(32)
+    expect(store.snapshot(artifact, 'protected').loaded).toBe(true)
+    expect(store.snapshot(artifact, 'session-0').loaded).toBe(false)
+    release()
+    for (let index = 48; index < 81; index++) await store.load(artifact, `session-${index}`)
+    expect(store.snapshot(artifact, 'protected').loaded).toBe(false)
+  })
+
+  it('does not evict an in-flight revision mutation when its renderer releases its owner', async () => {
+    const workspace = editableWorkspace()
+    let finish!: () => void
+    const provider = providerWithLoad(async () => workspace)
+    vi.mocked(provider.restoreRevision).mockImplementation(() => new Promise(resolve => { finish = () => resolve(workspace.revisions[0]!) }))
+    const store = useArtifactDocumentsStore()
+    store.setProvider(provider)
+    await store.load(artifact, 'session-a')
+    const mutation = store.restoreRevision(artifact, 'session-a', 'revision-old')
+    for (let index = 0; index < 40; index++) await store.load(artifact, `other-${index}`)
+    expect(store.snapshot(artifact, 'session-a').workspace?.document.headRevisionId).toBe('revision-head')
+    finish(); await mutation
+    expect(provider.restoreRevision).toHaveBeenCalledOnce()
+  })
   it('restores the current revision on each explicit request to discard unsaved file changes', async () => {
     const workspace = editableWorkspace()
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))

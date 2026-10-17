@@ -38,6 +38,32 @@ const attachment: WorkbenchResource = {
 describe('workbench resources store', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
+  it('bounds inactive inventories without evicting a publication owner or its request identity', async () => {
+    let finish!: () => void
+    const provider: WorkbenchResourceProvider = {
+      available: () => true, canImportDocuments: () => true,
+      list: vi.fn(async () => ({ resources: [attachment], totalCount: 1 })),
+      get: vi.fn(), importDocument: vi.fn(),
+      publishDocument: vi.fn<WorkbenchResourceProvider['publishDocument']>(() => new Promise(resolve => {
+        finish = () => resolve({ deliverable: { id: 'published-a' },
+          publication: { publicationId: 'pub-a', documentId: 'doc-a', revisionId: 'revision-a', artifactId: 'published-a' },
+          receipt: { attemptId: 'attempt-a', requestId: 'request-a', idempotencyKey: 'publish-a', status: 'applied', replayed: false } })
+      })),
+    }
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+    const release = store.retain('visible')
+    await store.load('visible'); await store.load('publishing')
+    const publication = store.publishDocument('publishing', 'doc-a', 'revision-a')
+    for (let index = 0; index < 24; index++) await store.load(`session-${index}`)
+    expect(Object.keys(store.snapshots)).toHaveLength(12)
+    expect(store.snapshot('visible').loaded).toBe(true)
+    expect(store.snapshot('publishing').loaded).toBe(true)
+    expect(store.snapshot('session-0').loaded).toBe(false)
+    finish(); await publication; release()
+    expect(provider.publishDocument).toHaveBeenCalledOnce()
+  })
+
   it('loads read-only projections without manufacturing fallback resources', async () => {
     const provider: WorkbenchResourceProvider = {
       available: () => true,

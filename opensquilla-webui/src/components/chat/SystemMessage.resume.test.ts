@@ -69,6 +69,21 @@ afterEach(() => {
 })
 
 describe('SystemMessage runtime errors', () => {
+  it('shows only an explicit HTTP fact and clears it on cancellation without a new action', async () => {
+    const { app, el, setMessage } = await mountMsg(errorMessage({ turnOutcome: { turnId: 't', status: 'failed', failureKind: 'rate_limited', httpStatus: 429 } }))
+    try {
+      expect(el.querySelector('.msg-error__http')?.textContent).toBe('(HTTP 429)')
+      expect(el.querySelectorAll('button,a')).toHaveLength(0)
+      setMessage(errorMessage({ turnOutcome: { turnId: 't', status: 'cancelled', failureKind: 'rate_limited', httpStatus: 429 } }))
+      await nextTick()
+      expect(el.querySelector('.msg-error__http')).toBeNull()
+      setMessage(errorMessage({ restoredFromHistory: true, turnOutcome: { turnId: 't', status: 'failed', httpStatus: 503 } }))
+      await nextTick()
+      expect(el.querySelector('.msg-error')?.hasAttribute('role')).toBe(false)
+      expect(el.querySelector('.msg-error__http')?.textContent).toBe('(HTTP 503)')
+    } finally { app.unmount() }
+  })
+
   it('keeps the partial note and safe action without an additional error timestamp', async () => {
     const { app, el } = await mountMsg(errorMessage({
       errorCode: 'no_provider',
@@ -181,7 +196,7 @@ describe('SystemMessage runtime errors', () => {
       text: 'safe fallback', errorCode: '429', turnId: 't',
       turnOutcome: { turnId: 't', status: 'failed', failureKind: 'rate_limited', errorId: 'abcdef01', retryable: true },
     }), undefined, undefined, true)
-    expect(el.textContent).toContain('The model service is busy.')
+    expect(el.textContent).toContain('The model is temporarily rate limited; this request did not finish.')
     expect(el.textContent).not.toContain('abcdef01')
     expect(el.querySelectorAll('a, button')).toHaveLength(0)
     app.unmount()

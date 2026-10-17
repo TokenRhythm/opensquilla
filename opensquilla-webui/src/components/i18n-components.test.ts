@@ -6,7 +6,6 @@ import i18n from '@/i18n'
 import { useAppStore } from '@/stores/app'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsLanguageControl from '@/components/settings/SettingsLanguageControl.vue'
-import LanguageSwitcher from '@/components/LanguageSwitcher.vue'
 import {
   TOOL_DETAIL_DISPLAY_STORAGE_KEY,
   useToolDetailPreference,
@@ -31,32 +30,33 @@ async function mount(Comp: Component) {
 
 beforeEach(() => {
   i18n.global.locale.value = 'en'
-  useToolDetailPreference().setMode('auto')
+  useToolDetailPreference().setMode('collapsed')
   localStorage.clear()
   document.documentElement.removeAttribute('lang')
 })
 
 describe('SettingsAppearancePanel — Tool details row', () => {
-  it('offers all three defaults and persists the selection immediately', async () => {
-    const { el } = await mount(SettingsAppearancePanel)
+  it('offers only two defaults, starts collapsed, and persists the selection immediately', async () => {
+    const { el, app } = await mount(SettingsAppearancePanel)
     const group = el.querySelector('[data-testid="settings-tool-details-group"]')
-    const auto = el.querySelector('[data-testid="settings-tool-details-auto"]') as HTMLInputElement
-    const compact = el.querySelector('[data-testid="settings-tool-details-compact"]') as HTMLInputElement
+    const collapsed = el.querySelector('[data-testid="settings-tool-details-collapsed"]') as HTMLInputElement
     const expanded = el.querySelector('[data-testid="settings-tool-details-expanded"]') as HTMLInputElement
 
-    expect(group?.textContent).toContain('Auto')
-    expect(group?.textContent).toContain('Compact')
-    expect(group?.textContent).toContain('Expanded')
-    expect(auto.checked).toBe(true)
+    expect(group?.querySelectorAll('input')).toHaveLength(2)
+    expect(group?.textContent).toContain('Collapsed by default')
+    expect(group?.textContent).toContain('Expanded by default')
+    expect(collapsed.checked).toBe(true)
+    expect(expanded.checked).toBe(false)
 
-    compact.checked = true
-    compact.dispatchEvent(new Event('change', { bubbles: true }))
+    expanded.checked = true
+    expanded.dispatchEvent(new Event('change', { bubbles: true }))
     await nextTick()
 
-    expect(compact.checked).toBe(true)
-    expect(expanded.checked).toBe(false)
-    expect(useToolDetailPreference().mode.value).toBe('compact')
-    expect(localStorage.getItem(TOOL_DETAIL_DISPLAY_STORAGE_KEY)).toBe('compact')
+    expect(collapsed.checked).toBe(false)
+    expect(expanded.checked).toBe(true)
+    expect(useToolDetailPreference().mode.value).toBe('expanded')
+    expect(localStorage.getItem(TOOL_DETAIL_DISPLAY_STORAGE_KEY)).toBe('expanded')
+    app.unmount()
   })
 })
 
@@ -88,74 +88,5 @@ describe('SettingsLanguageControl — General language row', () => {
     // The General row re-renders in Chinese (reactive t()).
     await vi.waitFor(() =>
       expect(el.querySelector('.control-row__label')!.textContent).toContain('语言'))
-  })
-})
-
-describe('LanguageSwitcher — topbar dropdown', () => {
-  it('shows the active locale label and opens a menu of options', async () => {
-    const { el } = await mount(LanguageSwitcher)
-    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
-    expect(trigger).toBeTruthy()
-    expect(trigger.textContent).toContain('English')
-    expect(trigger.getAttribute('aria-expanded')).toBe('false')
-
-    trigger.click()
-    await nextTick()
-    expect(trigger.getAttribute('aria-expanded')).toBe('true')
-    expect(el.querySelector('[data-testid="language-option-en"]')).toBeTruthy()
-    expect(el.querySelector('[data-testid="language-option-zh-Hans"]')).toBeTruthy()
-  })
-
-  it('picking 中文 sets the locale and closes the menu', async () => {
-    const { el } = await mount(LanguageSwitcher)
-    const store = useAppStore()
-    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
-
-    trigger.click()
-    await nextTick()
-    ;(el.querySelector('[data-testid="language-option-zh-Hans"]') as HTMLButtonElement).click()
-    await vi.waitFor(() => expect(store.locale).toBe('zh-Hans'))
-    await nextTick()
-
-    await vi.waitFor(() => expect(trigger.textContent).toContain('中文'))
-    expect(trigger.getAttribute('aria-expanded')).toBe('false')
-  })
-
-  it('closes on Escape and restores focus to the language trigger', async () => {
-    const { el } = await mount(LanguageSwitcher)
-    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
-    trigger.focus()
-    trigger.click()
-    await nextTick()
-    const option = el.querySelector('[data-testid="language-option-en"]') as HTMLButtonElement
-    option.focus()
-    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeTruthy()
-
-    const escape = new KeyboardEvent('keydown', {
-      key: 'Escape',
-      bubbles: true,
-      cancelable: true,
-    })
-    document.dispatchEvent(escape)
-    await nextTick()
-
-    expect(escape.defaultPrevented).toBe(true)
-    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeNull()
-    expect(document.activeElement).toBe(trigger)
-  })
-
-  it('closes on outside click without taking focus back from the outside target', async () => {
-    const { el } = await mount(LanguageSwitcher)
-    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
-    trigger.click()
-    await nextTick()
-    const outside = document.createElement('button')
-    document.body.appendChild(outside)
-    outside.focus()
-    outside.click()
-    await nextTick()
-
-    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeNull()
-    expect(document.activeElement).toBe(outside)
   })
 })

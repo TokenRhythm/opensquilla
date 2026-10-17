@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { chatHistoryPayload, sessionMessagesSubscribePayload, sessionMessagesSnapshotPayload, sessionMessagesHydratePayload } from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-keepalive-contrast'
@@ -82,27 +83,17 @@ async function installMockGateway(page: Page) {
       }
 
       if (method === 'chat.history') {
-        ws.send(response(frame.id, {
-          messages: [{
+        ws.send(response(frame.id, chatHistoryPayload([{
             role: 'assistant',
             text: 'Synthetic keepalive settings conversation.',
             message_id: 'keepalive-contrast-message',
             timestamp: '2026-08-16T00:00:00Z',
-          }],
-          has_more: false,
-          canonical_complete: true,
-        }))
+          }])))
         return
       }
 
       if (method === 'sessions.messages.subscribe') {
-        ws.send(response(frame.id, {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-          active_task: null,
-        }))
+        ws.send(response(frame.id, sessionMessagesSubscribePayload(SESSION_KEY)))
         return
       }
 
@@ -129,6 +120,8 @@ async function installMockGateway(page: Page) {
       }
 
       const payloads: Record<string, unknown> = {
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY),
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
         'config.get': {
@@ -151,10 +144,10 @@ async function openDisabledDialog(page: Page, theme: 'dark' | 'light') {
   await page.addInitScript(value => localStorage.setItem('opensquilla-theme', value), theme)
   await installMockGateway(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   await expect(page.getByText('Synthetic keepalive settings conversation.')).toBeVisible()
-  await page.locator('.chat-composer').getByRole('button', { name: 'More' }).click()
-  await page.getByTestId('chat-composer-action-keepalive').click()
+  await page.locator('.chat-composer').getByRole('button', { name: 'Add', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Prompt cache keepalive', exact: true }).click()
   await expect(page.getByRole('dialog')).toBeVisible()
   await expect(page.locator('.keepalive-dialog__timing')).toHaveClass(/is-disabled/)
   await page.waitForTimeout(250)

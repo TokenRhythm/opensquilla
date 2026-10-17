@@ -52,7 +52,13 @@ from .error_redaction import (
     redacted_httpx_error,
 )
 from .extra_body import merge_extra_body, normalize_extra_body
-from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+    structured_provider_error_code,
+)
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
 from .model_catalog import shared_catalog
 from .model_identity import (
@@ -4203,6 +4209,10 @@ class OpenAIProvider:
                             yield ErrorEvent(
                                 message=message,
                                 code=str(response.status_code),
+                                http_status=safe_http_status(response.status_code),
+                                provider_code=structured_provider_error_code(
+                                    response.text
+                                ),
                                 retry_after_s=retry_after_from_headers(
                                     response.status_code,
                                     getattr(response, "headers", None),
@@ -4227,6 +4237,8 @@ class OpenAIProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            http_status=safe_http_status(response.status_code),
+                            provider_code=structured_provider_error_code(response.text),
                             retry_after_s=retry_after_from_headers(
                                 response.status_code,
                                 getattr(response, "headers", None),
@@ -5863,6 +5875,8 @@ class OpenAIProvider:
             yield ErrorEvent(
                 message=safe_message,
                 code=str(response.status_code),
+                http_status=safe_http_status(response.status_code),
+                provider_code=structured_provider_error_code(response.text),
                 retry_after_s=retry_after_from_headers(
                     response.status_code,
                     getattr(response, "headers", None),

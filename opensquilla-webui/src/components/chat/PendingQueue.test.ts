@@ -9,9 +9,16 @@ import { useChatPendingQueue } from '@/composables/chat/useChatPendingQueue'
 import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
 
 afterEach(() => {
+  vi.useRealTimers()
   document.body.innerHTML = ''
   i18n.global.locale.value = 'en'
 })
+
+function identifyQueueItems<T extends { pendingUiId?: string }>(items: T[]): asserts items is Array<T & { pendingUiId: string }> {
+  items.forEach((item, index) => {
+    item.pendingUiId ||= `pending-ui-${index}`
+  })
+}
 
 async function mountQueue(
   listeners: Partial<{
@@ -53,21 +60,20 @@ async function mountQueue(
 ) {
   const el = document.createElement('div')
   document.body.appendChild(el)
-  items.forEach((item, index) => {
-    item.pendingUiId ||= `pending-ui-${index}`
-  })
-  const app = createApp(PendingQueue, {
+  identifyQueueItems(items)
+  const liveProps = reactive(props)
+  const app = createApp(defineComponent(() => () => h(PendingQueue, {
     items,
     maxPending: 5,
     steerAvailable: true,
     hasActiveTurn: true,
     ...listeners,
-    ...props,
-  })
+    ...liveProps,
+  })))
   app.use(i18n)
   app.mount(el)
   await nextTick()
-  return { app, el }
+  return { app, el, props: liveProps }
 }
 
 function primaryActions(el: ParentNode): HTMLButtonElement[] {
@@ -227,6 +233,99 @@ describe('PendingQueue', () => {
     surface_id: 'webui',
     _source: { runMode: 'safe' as const },
   }
+
+  it('silences a brief offline notice for existing rows while immediately blocking delivery', async () => {
+    vi.useFakeTimers()
+    const { app, el, props } = await mountQueue({}, [{
+      text: 'Existing queued message', pendingDeliveryIdentity: 'owner', pendingPersistenceState: 'staged',
+    }], { offline: false, deliveryIdentity: 'owner', hasActiveTurn: false, followupAvailable: true })
+    try {
+      props.offline = true
+      await nextTick()
+      expect(primaryActions(el)[0]!.disabled).toBe(true)
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(el.textContent).not.toContain('Saved locally')
+      props.offline = false
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(el.textContent).not.toContain('Saved locally')
+      expect(primaryActions(el)[0]!.disabled).toBe(false)
+
+      props.offline = true
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(el.textContent).not.toContain('Saved locally')
+      await vi.advanceTimersByTimeAsync(1)
+      expect(el.textContent).toContain('Saved locally')
+      props.offline = false
+      await nextTick()
+      expect(el.textContent).not.toContain('Saved locally')
+    } finally { app.unmount() }
+  })
+
+  it('immediately acknowledges a new offline submission and its WAL result during the quiet interval', async () => {
+    vi.useFakeTimers()
+    const items = reactive<Array<NonNullable<Parameters<typeof mountQueue>[1]>[number]>>([{
+      pendingUiId: 'existing', text: 'Existing', pendingDeliveryIdentity: 'owner', pendingPersistenceState: 'staged',
+    }])
+    const { app, el, props } = await mountQueue({}, items, {
+      offline: false, deliveryIdentity: 'owner', hasActiveTurn: false, followupAvailable: true,
+    })
+    try {
+      props.offline = true
+      await nextTick()
+      items.push({ pendingUiId: 'new', text: 'New local submission', pendingDeliveryIdentity: 'owner', pendingPersistenceState: 'saving' })
+      await nextTick()
+      const row = () => el.querySelector('[data-pending-ui-id="new"]')!
+      expect(row().textContent).toContain('Saving')
+      expect(row().textContent).not.toContain('Saved locally')
+      items[1]!.pendingPersistenceState = 'local_only'
+      await nextTick()
+      expect(row().textContent).toContain('Saved locally')
+      expect(el.querySelector('[data-pending-ui-id="existing"]')!.textContent).not.toContain('Saved locally')
+      expect(primaryActions(el).every(button => button.disabled)).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('does not delay a WAL completion that was already saving when the connection dropped', async () => {
+    vi.useFakeTimers()
+    const items = reactive([{
+      text: 'Saving locally', pendingDeliveryIdentity: 'owner',
+      pendingPersistenceState: 'saving' as 'saving' | 'local_only',
+    }])
+    const { app, el, props } = await mountQueue({}, items, { offline: false, deliveryIdentity: 'owner' })
+    try {
+      props.offline = true
+      items[0]!.pendingPersistenceState = 'local_only'
+      await nextTick()
+      expect(el.textContent).toContain('Saved locally')
+    } finally { app.unmount() }
+  })
+
+  it('keeps persistence failure, identity change, and acceptance-unknown feedback immediate', async () => {
+    vi.useFakeTimers()
+    const items = reactive<Array<NonNullable<Parameters<typeof mountQueue>[1]>[number]>>([{
+      pendingUiId: 'existing', text: 'Existing', pendingDeliveryIdentity: 'owner', pendingPersistenceState: 'staged',
+    }])
+    const { app, el, props } = await mountQueue({}, items, { offline: false, deliveryIdentity: 'owner' })
+    try {
+      props.offline = true
+      await nextTick()
+      expect(el.textContent).not.toContain('Saved locally')
+      props.deliveryIdentity = 'other-owner'
+      await nextTick()
+      expect(el.textContent).toContain('Connection identity changed')
+      props.deliveryIdentity = 'owner'
+      await nextTick()
+      expect(el.textContent).not.toContain('Saved locally')
+      items[0]!.pendingPersistenceState = 'retryable'
+      await nextTick()
+      expect(el.textContent).toContain(String(i18n.global.t('chat.pending.offlineRejected')))
+      items[0]!.steerAttempt = { phase: 'acceptance_unknown', request: steerRequest }
+      await nextTick()
+      expect(el.textContent).toContain('Delivery status unknown · Retry confirmation')
+    } finally { app.unmount() }
+  })
 
   it('keeps one primary button while a draft changes from busy through Stop to idle and back', async () => {
     const state = reactive({ hasActiveTurn: true, stopping: false, steerAvailable: true, followupAvailable: false })

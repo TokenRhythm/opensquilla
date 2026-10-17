@@ -10,9 +10,10 @@ import pytest
 from opensquilla.gateway import boot
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
-from opensquilla.gateway.task_runtime import TaskDependencyError, TaskRuntime
+from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.session.models import AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
+from tests.helpers.sqlite_process_probe import run_sqlite_probe
 from tests.test_gateway.test_steer_restart_recovery import _seed_steering_input
 
 KEY = "agent:main:webchat:deferred-restart"
@@ -249,52 +250,61 @@ async def test_optional_dependency_does_not_block_independent_restart_input(tmp_
         await storage.close()
 
 
-@pytest.mark.asyncio
-async def test_resumed_post_reservation_error_releases_lease_without_busy_retry(
+_DEFERRED_PROBE = Path(__file__).with_name("fixtures") / "steer_restart_deferred_probe.py"
+
+
+def test_resumed_post_reservation_error_releases_lease_without_busy_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    storage = await _open_restarted(tmp_path / "sessions.db", resumed=True)
-    services = {"desktop_browser": {"status": "starting"}}
-    runs: list[Any] = []
-    failed = asyncio.Event()
-    attempts = 0
+    # This correctness scenario owns real SQLite writes, not a two-second SLO.
+    # The existing process watchdog bounds cold setup and then all execution /
+    # cleanup, including a stuck task or native SQLite thread.
+    # Exercise the redirected stream encoding used by Windows CI explicitly.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    result = run_sqlite_probe(tmp_path, _DEFERRED_PROBE, ("none",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "probe_stdout_utf8=\u2713" in result.output
+    assert "probe_stderr_utf8=\u2713" in result.output
+    assert "phase=cleanup-complete" in result.output
+    assert "steer_restart_deferred_contract=passed" in result.output
 
-    async def handler(run: Any) -> None:
-        runs.append(run)
 
-    runtime = TaskRuntime(storage=storage, turn_handler=handler, service_snapshot=lambda: services)
-    original = runtime._restore_durable_accepted_model_routing
+@pytest.mark.parametrize(("fault", "failure"), [
+    ("leak-reservation", "aborted reservation retained its resident lease"),
+    ("self-retry", "recovery retried without an external notification"),
+    ("duplicate-dispatch", "accepted restart input executed more than once"),
+])
+def test_deferred_restart_probe_rejects_broken_recovery(
+    tmp_path: Path, fault: str, failure: str,
+) -> None:
+    result = run_sqlite_probe(tmp_path, _DEFERRED_PROBE, (fault,))
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert f"fault={fault}" in result.output
+    assert "phase=cleanup-complete" in result.output
+    assert result.output.rstrip().splitlines()[-1] == f"AssertionError: {failure}", result.output
+    assert "steer_restart_deferred_contract=passed" not in result.output
 
-    async def fail_after_reservation(*_args: Any) -> None:
-        nonlocal attempts
-        attempts += 1
-        assert runtime._resident_count == 1
-        failed.set()
-        # A downstream error with this type must not enter the pre-reservation
-        # defer branch and bypass cleanup of the now-held resident lease.
-        raise TaskDependencyError(
-            session_key=KEY, kind="DEPENDENCY_STARTING", services=("desktop_browser",),
-        )
 
-    try:
-        assert (await runtime.recover_stranded_steers())["deferred"] == 1
-        worker = runtime._steer_recovery_task
-        assert worker is not None
-        monkeypatch.setattr(
-            runtime, "_restore_durable_accepted_model_routing", fail_after_reservation
-        )
-        services["desktop_browser"]["status"] = "ready"
-        runtime.notify_recovery_dependencies_changed()
-        await asyncio.wait_for(failed.wait(), timeout=2)
-        for _ in range(5):
-            await asyncio.sleep(0)
-        assert attempts == 1 and runtime._resident_count == 0
-        assert runtime._reservations_by_session == {} and runs == []
-        assert not worker.done()
-        monkeypatch.setattr(runtime, "_restore_durable_accepted_model_routing", original)
-        runtime.notify_recovery_dependencies_changed()
-        await asyncio.wait_for(worker, timeout=2)
-        await _assert_executed_once(storage, runtime, runs)
-    finally:
-        await runtime.shutdown(cancel=True, timeout=2)
-        await storage.close()
+def test_deferred_restart_probe_preserves_real_slow_terminal_write(tmp_path: Path) -> None:
+    # A controlled delay proves separation of semantics from the old test-only
+    # completion budget; it does not diagnose the cause of a historical CI delay.
+    result = run_sqlite_probe(tmp_path, _DEFERRED_PROBE, ("slow-terminal",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "terminal_commit_delay=2.1" in result.output
+    assert "phase=cleanup-complete" in result.output
+    assert "steer_restart_deferred_contract=passed" in result.output
+
+
+def test_deferred_restart_probe_bounds_noncooperative_terminal(tmp_path: Path) -> None:
+    result = run_sqlite_probe(
+        tmp_path, _DEFERRED_PROBE, ("hang-terminal",),
+        ready_signal="STEER_TERMINAL_HANG_ENTERED", execution_seconds=3,
+    )
+    assert result.timed_out == "execution/cleanup", result.output
+    assert result.returncode != 0
+    assert "phase=terminal-persistence-blocked" in result.output
+    assert "STEER_TERMINAL_HANG_ENTERED" in result.output
+    assert "steer_restart_deferred_contract=passed" not in result.output

@@ -11,8 +11,8 @@ const CONTROL_URL = '/control/'
 
 async function openControl(page: Page) {
   await page.goto(CONTROL_URL)
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
-  await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 10000 }).catch(() => {})
   await expect(page.locator('#sidebar-nav')).toBeVisible()
 }
 
@@ -23,6 +23,8 @@ interface ProjectLifecycleState {
   requestMethods: string[]
   subscriptions: RpcParams[]
   pendingInitialSubscription: (() => void) | null
+  pendingInitialWorkspaceLists: Array<() => void>
+  initialWorkspaceListsReleased: boolean
   pathListRequests: RpcParams[]
   workspaceListRequests: number
   sends: RpcParams[]
@@ -62,6 +64,8 @@ async function installProjectLifecycleRpc(
     requestMethods: [],
     subscriptions: [],
     pendingInitialSubscription: null,
+    pendingInitialWorkspaceLists: [],
+    initialWorkspaceListsReleased: false,
     pathListRequests: [],
     workspaceListRequests: 0,
     sends: [],
@@ -234,13 +238,16 @@ async function installProjectLifecycleRpc(
           state.workspaceName = String(params.name || state.workspaceName)
           respond(frame.id, { workspace: workspace() })
           return
-        case 'workspaces.list':
+        case 'workspaces.list': {
           state.workspaceListRequests += 1
           if (state.historyDeleted) state.postDeleteWorkspaceLists += 1
-          respond(frame.id, {
+          const reply = () => respond(frame.id, {
             workspaces: state.projectPresent ? [workspace(), ...state.additionalWorkspaces] : [],
           })
+          if (options.deferInitialSubscription && !state.initialWorkspaceListsReleased) state.pendingInitialWorkspaceLists.push(reply)
+          else reply()
           return
+        }
         case 'chat.send':
           state.sends.push(params)
           state.sessionKey = String(params.sessionKey)
@@ -404,7 +411,7 @@ test.describe('Project workspaces', () => {
     await chooseDraftDirectory(page)
     await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
     await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
-    await expect(message).toHaveValue('Review the attached files')
+    await expect(message).toHaveText('Review the attached files')
     await expect(page.locator('.attachment-chip')).toHaveCount(2)
     expect(await draftKey(page)).toBe(key)
     expect(state.subscriptions).toHaveLength(subscriptions)
@@ -432,7 +439,7 @@ test.describe('Project workspaces', () => {
     await page.getByRole('button', { name: 'Use the default workspace', exact: true }).click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
     await expect(page.locator('.chat-project-chip')).toHaveCount(0)
-    await expect(message).toHaveValue('Keep my default-workspace draft')
+    await expect(message).toHaveText('Keep my default-workspace draft')
     await expect(page.locator('.attachment-chip')).toHaveCount(2)
     expect(await draftKey(page)).toBe(key)
     await page.getByRole('button', { name: 'Send', exact: true }).click()
@@ -441,44 +448,35 @@ test.describe('Project workspaces', () => {
     expect(state.sends[0]).toMatchObject({ sessionKey: key, attachments: expect.any(Array) })
   })
 
-  for (const outcome of ['picker cancel', 'trust cancel', 'open error'] as const) {
-    test(`restores the route project after ${outcome} during initial subscription`, async ({ page }) => {
-      const state = await installProjectLifecycleRpc(page, { deferInitialSubscription: true })
-      state.projectPresent = true
-      await page.goto('/control/chat/new?agent=main&project=project-demo')
-      await expect.poll(() => state.pendingInitialSubscription).not.toBeNull()
-      const message = page.getByRole('textbox', { name: 'Message to send' })
-      await message.fill('Keep the original project and draft')
-      const key = await draftKey(page)
-      expect(key).not.toBe('')
+  test('initial route project restore prevents replacement and preserves the draft through its first send', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page, { deferInitialSubscription: true })
+    state.projectPresent = true
+    await page.goto('/control/chat/new?agent=main&project=project-demo')
+    await expect.poll(() => state.pendingInitialSubscription).not.toBeNull()
+    await expect.poll(() => state.pendingInitialWorkspaceLists.length).toBeGreaterThan(0)
+    const message = page.getByRole('textbox', { name: 'Message to send' })
+    await message.fill('Keep the original project and draft')
+    const key = await draftKey(page)
+    expect(key).not.toBe('')
 
-      if (outcome === 'picker cancel') {
-        await page.getByRole('button', { name: 'Choose project', exact: true }).click()
-        await page.getByRole('dialog', { name: 'Choose project' })
-          .getByRole('button', { name: 'Cancel', exact: true }).click()
-      } else {
-        await chooseDraftDirectory(page, 'project-01')
-        if (outcome === 'trust cancel') {
-          await page.getByRole('dialog').getByRole('button', { name: 'Cancel', exact: true }).click()
-        } else {
-          state.workspaceOpenError = 'synthetic open failure'
-          await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
-          await expect(page.getByTestId('toast')).toContainText('synthetic open failure')
-        }
-      }
-
-      state.pendingInitialSubscription!()
-      await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
-      await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=project-demo$/)
-      await expect(message).toHaveValue('Keep the original project and draft')
-      expect(await draftKey(page)).toBe(key)
-      await page.getByRole('button', { name: 'Send', exact: true }).click()
-      await expect.poll(() => state.sends.length).toBe(1)
-      expect(state.sends[0]).toMatchObject({
-        message: 'Keep the original project and draft', sessionKey: key, workspaceId: 'project-demo',
-      })
+    // A route already owns this project; unresolved metadata must not expose
+    // a second picker that can replace it before the binding is established.
+    await expect(page.getByRole('button', { name: 'Choose project', exact: true })).toHaveCount(0)
+    await expect(page.locator('.chat-project-chip')).toHaveCount(0)
+    expect(state.sends).toHaveLength(0)
+    state.initialWorkspaceListsReleased = true
+    state.pendingInitialWorkspaceLists.splice(0).forEach(reply => reply())
+    state.pendingInitialSubscription!()
+    await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
+    await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=project-demo$/)
+    await expect(message).toHaveText('Keep the original project and draft')
+    expect(await draftKey(page)).toBe(key)
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect.poll(() => state.sends.length).toBe(1)
+    expect(state.sends[0]).toMatchObject({
+      message: 'Keep the original project and draft', sessionKey: key, workspaceId: 'project-demo',
     })
-  }
+  })
 
   test('restores the same draft text, attachment bytes and project after a page reload', async ({ page }) => {
     const state = await installProjectLifecycleRpc(page, { durableDraftIdentity: true })
@@ -491,12 +489,12 @@ test.describe('Project workspaces', () => {
     await chooseDraftDirectory(page)
     await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
     await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
-    await expect(message).toHaveValue('Continue this draft after refresh')
+    await expect(message).toHaveText('Continue this draft after refresh')
 
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
-    await expect(message).toHaveValue('Continue this draft after refresh')
+    await expect(message).toHaveText('Continue this draft after refresh')
     await expect(page.locator('.attachment-chip')).toHaveCount(2)
     await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
     expect(await draftKey(page)).toBe(key)
@@ -527,11 +525,11 @@ test.describe('Project workspaces', () => {
       await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
       await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
       await expect(indicator).toBeVisible()
-      await expect(message).toHaveValue(`Keep this ${mode} draft`)
+      await expect(message).toHaveText(`Keep this ${mode} draft`)
       expect(await draftKey(page)).toBe(key)
 
       await page.locator('.sidebar-new-session').click()
-      await expect(message).toHaveValue('')
+      await expect(message).toHaveText('')
       await expect(indicator).toHaveCount(0)
       await expect(page.locator('.chat-project-chip')).toHaveCount(0)
     })
@@ -561,7 +559,7 @@ test.describe('Project workspaces', () => {
         }
       }
       await expect(page.getByRole('button', { name: 'Choose project', exact: true })).toBeEnabled()
-      await expect(message).toHaveValue('Keep this unfinished task')
+      await expect(message).toHaveText('Keep this unfinished task')
       await expect(page.locator('.attachment-chip')).toHaveCount(2)
       await expect(page.locator('.chat-project-chip')).toHaveCount(0)
       expect(await draftKey(page)).toBe(key)
@@ -595,7 +593,7 @@ test.describe('Project workspaces', () => {
     state.pendingWorkspaceOpens[0]()
     await expect.poll(() => state.workspaceListRequests).toBeGreaterThan(listsBeforeLateResponse)
     await expect(page).toHaveURL(selectedUrl)
-    await expect(page.getByRole('textbox', { name: 'Message to send' })).toHaveValue('Existing session B')
+    await expect(page.getByRole('textbox', { name: 'Message to send' })).toHaveText('Existing session B')
     await page.getByRole('button', { name: 'Send', exact: true }).click()
     await expect.poll(() => state.sends.length).toBe(1)
     expect(state.sends[0]).toMatchObject({ message: 'Existing session B', sessionKey: existingSessionKey })
@@ -627,7 +625,7 @@ test.describe('Project workspaces', () => {
     state.pendingWorkspaceOpens[0]()
     await expect.poll(() => state.workspaceListRequests).toBeGreaterThan(listsBeforeLateResponse)
     await expect(page.locator('.chat-project-chip')).toContainText('project-01')
-    await expect(page.getByRole('textbox', { name: 'Message to send' })).toHaveValue('Draft B owns the newer choice')
+    await expect(page.getByRole('textbox', { name: 'Message to send' })).toHaveText('Draft B owns the newer choice')
     expect(await draftKey(page)).toBe(secondKey)
     await page.getByRole('button', { name: 'Send', exact: true }).click()
     await expect.poll(() => state.sends.length).toBe(1)
@@ -640,7 +638,7 @@ test.describe('Project workspaces', () => {
     state.sent = true
 
     await page.goto(`/control/chat?session=${encodeURIComponent(state.sessionKey)}`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(page.locator('.chat-project-chip')).toHaveCount(0)
     await expect(page.getByRole('button', { name: 'Choose project' })).toHaveCount(0)
 
@@ -661,10 +659,10 @@ test.describe('Project workspaces', () => {
     state.projectPresent = true
 
     await page.goto('/control/chat/new?agent=main&project=project-demo')
-    await expect(page.locator('.conn-pill.connecting')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connecting"]')).toBeVisible()
     await page.waitForTimeout(100)
     expect(await page.getByTestId('toast').count()).toBe(0)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect.poll(() => state.workspaceListRequests).toBeGreaterThan(0)
     expect(await page.getByTestId('toast').count()).toBe(0)
   })

@@ -2,6 +2,8 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { ArtifactPayload } from '@/types/artifacts'
+import { canPreview } from '@/utils/chat/artifacts'
+import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
 import {
   ARTIFACT_HTML_OFFLINE_CSP,
   ARTIFACT_HTML_REFERENCE_SCAN_LIMIT,
@@ -34,7 +36,17 @@ describe('artifactWorkbenchPreviewKind', () => {
     ['notes.md', 'text/markdown', 'markdown'],
     ['server.log', 'application/octet-stream', 'text'],
     ['photo.png', 'image/png', 'image'],
-    ['data.json', 'application/json', 'unsupported'],
+    ['data.json', 'application/json', 'text'],
+    ['app.js', 'text/javascript', 'text'],
+    ['app.ts', 'application/octet-stream', 'text'],
+    ['app.tsx', '', 'text'],
+    ['main.py', 'text/x-python', 'text'],
+    ['query.sql', 'application/sql', 'text'],
+    ['config.yaml', 'application/yaml', 'text'],
+    ['config.yml', 'application/octet-stream', 'text'],
+    ['style.css', 'text/css', 'text'],
+    ['movie.ts', 'video/mp2t', 'unsupported'],
+    ['archive.js', 'application/zip', 'unsupported'],
   ])('classifies %s (%s) as %s', (name, mime, expected) => {
     expect(artifactWorkbenchPreviewKind(artifact({ name, mime }))).toBe(expected)
   })
@@ -42,6 +54,7 @@ describe('artifactWorkbenchPreviewKind', () => {
   it('uses the smaller bounded limit for active text documents', () => {
     expect(artifactPreviewLimit('html')).toBe(ARTIFACT_TEXT_PREVIEW_LIMIT)
     expect(artifactPreviewLimit('markdown')).toBe(ARTIFACT_TEXT_PREVIEW_LIMIT)
+    expect(artifactPreviewLimit('text')).toBe(ARTIFACT_TEXT_PREVIEW_LIMIT)
     expect(artifactPreviewLimit('image')).toBeGreaterThan(ARTIFACT_TEXT_PREVIEW_LIMIT)
   })
 
@@ -61,17 +74,44 @@ describe('artifactWorkbenchPreviewKind', () => {
     expect(artifactUsesWorkbenchPreview(artifact({
       name: 'slides.pptx',
       mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    }))).toBe(false)
+    }))).toBe(true)
   })
 
   it('rejects a response MIME that does not match the selected renderer', () => {
     expect(responseMatchesArtifactPreviewKind('image', 'text/html')).toBe(false)
     expect(responseMatchesArtifactPreviewKind('pdf', 'application/pdf; charset=binary')).toBe(true)
     expect(responseMatchesArtifactPreviewKind('html', 'application/octet-stream')).toBe(true)
+    expect(responseMatchesArtifactPreviewKind('text', 'application/json; charset=utf-8')).toBe(true)
+    expect(responseMatchesArtifactPreviewKind('text', 'text/javascript')).toBe(true)
+    expect(responseMatchesArtifactPreviewKind('text', 'text/html')).toBe(false)
+    expect(responseMatchesArtifactPreviewKind('text', 'application/zip')).toBe(false)
   })
+
+  it.each(['js', 'ts', 'json', 'py', 'sql', 'yaml', 'css'])(
+    'exposes the same Open affordance and bounded preview for %s deliveries', extension => {
+      const source = artifact({ name: `source.${extension}`, mime: 'application/octet-stream' })
+      expect(canPreview(source)).toBe(true)
+      expect(artifactUsesWorkbenchPreview(source)).toBe(true)
+      expect(createLegacyArtifactWorkspace(source, 'child').document.capabilities.preview).toBe(true)
+    },
+  )
 })
 
 describe('artifact HTML isolation', () => {
+  it.each([
+    '<p>ordinary document</p>',
+    '</script><script>parent.postMessage("untrusted", "*")</script>',
+    '<!-- "\\\n\u2028\u2029 --><p>untrusted delimiters</p>',
+  ])('keeps the Escape bridge fixed and ahead of artifact markup', (source) => {
+    const output = buildOfflineArtifactHtml(source)
+    const bridge = '<script>addEventListener("keydown",function(event){if(event.key==="Escape")'
+      + `parent.postMessage("${ARTIFACT_PREVIEW_ESCAPE_MESSAGE}","*")})</script>`
+    const bridgeStart = output.indexOf('<script>')
+    expect(output.slice(bridgeStart, bridgeStart + bridge.length)).toBe(bridge)
+    expect(output.slice(bridgeStart + bridge.length)).toBe(source)
+    expect(output.indexOf('Content-Security-Policy')).toBeLessThan(bridgeStart)
+  })
+
   it('detects local document, stylesheet, image and CSS references', () => {
     const source = `
       <link rel="stylesheet" href="./style.css">

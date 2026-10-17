@@ -40,6 +40,8 @@ def _ctx(loader: SkillLoader) -> TurnContext:
             SimpleNamespace(name="background_process"),
             SimpleNamespace(name="exec_command"),
             SimpleNamespace(name="process"),
+            SimpleNamespace(name="open_workspace_preview"),
+            SimpleNamespace(name="show_widget"),
             *(
                 SimpleNamespace(name=f"mcp__desktop-browser__{name}")
                 for name in BROWSER_MCP_REQUIRED_TOOLS
@@ -92,6 +94,22 @@ async def test_browser_skill_requires_its_browser_tools_in_the_turn(tmp_path: Pa
     ]
     assert "browser-use" not in _rendered_names(
         (await resolve_skill_catalog(missing)).system_prompt[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_visualize_requires_show_widget_capability(tmp_path: Path) -> None:
+    loader = _loader(tmp_path)
+    available = _ctx(loader)
+    assert "visualize" in _rendered_names(
+        (await resolve_skill_catalog(available)).system_prompt[0]
+    )
+    unavailable = _ctx(loader)
+    unavailable.tool_defs = [
+        tool for tool in unavailable.tool_defs if tool.name != "show_widget"
+    ]
+    assert "visualize" not in _rendered_names(
+        (await resolve_skill_catalog(unavailable)).system_prompt[0]
     )
 
 

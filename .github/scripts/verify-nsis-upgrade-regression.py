@@ -87,6 +87,31 @@ def profile_helper():
     return module
 
 
+def wait_for_candidate(artifact_name: str, destination: Path, source_sha: str) -> tuple[Path, dict]:
+    # Load relative to this script so importlib-based tests and direct CLI use
+    # resolve the same helper, without requiring .github/scripts on sys.path.
+    path = Path(__file__).with_name('wait_ci_candidate.py')
+    spec = importlib.util.spec_from_file_location('nsis_ci_candidate', path)
+    require(spec is not None and spec.loader is not None, 'Missing candidate artifact helper')
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module.wait_for_candidate(artifact_name, destination, source_sha)
+
+
+def stable_candidate_version(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError('Versions must be stable X.Y.Z')
+    if re.fullmatch(r'\d+\.\d+\.\d+\.0', value):
+        value = value[:-2]
+    if not re.fullmatch(r'\d+\.\d+\.\d+', value):
+        raise ValueError('Versions must be stable X.Y.Z')
+    return value
+
+
 def digest(path: Path) -> str:
     result = hashlib.sha256()
     with path.open('rb') as stream:
@@ -1416,23 +1441,68 @@ class Audit:
         self.uninstall_candidate(retained_profile=False)
         self.save()
 
+    def resolve_candidate(self) -> Path:
+        args = self.args
+        artifact_name = getattr(args, 'candidate_artifact_name', None)
+        candidate_digest = None
+        if artifact_name:
+            self.report['stage'] = 'await-candidate'
+            self.report['candidateArtifactName'] = artifact_name
+            self.save()
+            print(json.dumps({'stage': 'await-candidate', 'event': 'start',
+                              'artifact': artifact_name}), flush=True)
+            candidate, candidate_manifest = wait_for_candidate(
+                artifact_name, self.evidence / 'candidate', args.candidate_source_sha,
+            )
+            require(candidate_manifest.get('sourceSha') == args.candidate_source_sha,
+                    'Candidate source mismatch')
+            version = stable_candidate_version(candidate_manifest.get('version'))
+            fields = {
+                'candidate_installer_sha256': 'installerSha256',
+                'candidate_asar_sha256': 'asarSha256',
+                'candidate_executable_sha256': 'executableSha256',
+                'candidate_dependency_inventory_sha256': 'dependencyInventorySha256',
+            }
+            for field in fields.values():
+                value = candidate_manifest.get(field)
+                require(isinstance(value, str) and re.fullmatch(r'[a-fA-F0-9]{64}', value),
+                        f'Candidate manifest lacks a valid SHA-256: {field}')
+            require(candidate.is_file(), 'Complete candidate installer file must exist')
+            candidate_digest = digest(candidate)
+            require(candidate_digest == candidate_manifest['installerSha256'].lower(),
+                    'Candidate installer differs from the pinned build manifest')
+            args.candidate_installer = str(candidate)
+            args.candidate_version = version
+            for argument, field in fields.items():
+                setattr(args, argument, candidate_manifest[field])
+            self.report['candidateManifest'] = candidate_manifest
+            self.report['candidateVersion'] = version
+        candidate = Path(args.candidate_installer).resolve()
+        require(candidate.is_file(), 'Complete candidate installer file must exist')
+        self.report['inputs'].update({
+            'candidateInstaller': str(candidate),
+            'candidateInstallerSha256': candidate_digest or digest(candidate),
+            'expectedCandidateAsarSha256': args.candidate_asar_sha256,
+            'expectedCandidateExecutableSha256': args.candidate_executable_sha256,
+            'expectedCandidateInstallerSha256': args.candidate_installer_sha256,
+            'expectedCandidateDependencyInventorySha256': args.candidate_dependency_inventory_sha256,
+        })
+        require(self.report['inputs']['candidateInstallerSha256']
+                == args.candidate_installer_sha256.lower(),
+                'Candidate installer differs from the pinned build manifest')
+        self.save()
+        return candidate
+
     def execute(self) -> None:
         args = self.args
         baseline = Path(args.baseline_installer).resolve() if args.baseline_installer else None
-        candidate = Path(args.candidate_installer).resolve()
-        require(candidate.is_file() and (baseline is None or baseline.is_file()),
-                'Complete installer files must exist')
+        require(baseline is None or baseline.is_file(), 'Complete baseline installer file must exist')
         require(not installed_registry(), 'Preexisting OpenSquilla registration: use a fresh runner')
         require(not within(Path(sys.executable), self.install), 'Lock-holder Python must be outside the installation directory')
         self.require_no_product_processes('initial')
         self.report['inputs'] = {
             'baselineInstaller': str(baseline) if baseline else None,
             'baselineInstallerSha256': digest(baseline) if baseline else None,
-            'candidateInstaller': str(candidate), 'candidateInstallerSha256': digest(candidate),
-            'expectedCandidateAsarSha256': args.candidate_asar_sha256,
-            'expectedCandidateExecutableSha256': args.candidate_executable_sha256,
-            'expectedCandidateInstallerSha256': args.candidate_installer_sha256,
-            'expectedCandidateDependencyInventorySha256': args.candidate_dependency_inventory_sha256,
             'candidateSourceSha': args.candidate_source_sha,
         }
         if args.case != 'fresh':
@@ -1441,7 +1511,11 @@ class Audit:
             require(self.report['inputs']['baselineInstallerSha256']
                     == OFFICIAL_BASELINE_SHA256[args.baseline_version],
                     'Baseline bytes do not match the pinned official GitHub asset')
-        require(self.report['inputs']['candidateInstallerSha256'] == args.candidate_installer_sha256.lower(), 'Candidate installer differs from the pinned build manifest')
+        # Direct CLI callers retain the original fail-before-install validation.
+        # Artifact consumers can prepare the real baseline while the package is
+        # still being built, on this same runner and in this same audit process.
+        candidate = (None if getattr(args, 'candidate_artifact_name', None)
+                     else self.resolve_candidate())
         interaction_probe = FIRST_SEND_PROBE if args.case == 'fresh' else INTERACTION_PROBE
         require(Path(args.node).is_file() and interaction_probe.is_file(),
                 'Node or interaction probe is missing')
@@ -1455,7 +1529,7 @@ class Audit:
             self.report['freshStandardProfilesBeforeInstall'] = [
                 {'path': str(root), 'exists': False} for root in roots
             ]
-            self.execute_fresh(candidate)
+            self.execute_fresh(candidate or self.resolve_candidate())
             return
         for root in roots:
             root.mkdir(parents=True)
@@ -1473,6 +1547,9 @@ class Audit:
         self.check_profiles('afterBaseline')
         self.verify_retained_profile('afterBaseline')
         self.check_environment_registry('afterBaseline')
+        # Never acquire the read lock or inject a long-path fixture while
+        # waiting for the producer; the upgrade still uses one pinned candidate.
+        candidate = candidate or self.resolve_candidate()
         asar = self.install / 'resources' / 'app.asar'
         fault = None
         if args.case == 'longpath':
@@ -1585,13 +1662,16 @@ class Audit:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline-installer')
-    parser.add_argument('--candidate-installer', required=True)
+    parser.add_argument('--candidate-installer')
+    parser.add_argument('--candidate-artifact-name',
+                        help='Wait for this run\'s candidate artifact after preparing '
+                             'the old installation')
     parser.add_argument('--baseline-version')
-    parser.add_argument('--candidate-version', default='0.5.4')
-    parser.add_argument('--candidate-asar-sha256', required=True)
-    parser.add_argument('--candidate-executable-sha256', required=True)
-    parser.add_argument('--candidate-dependency-inventory-sha256', required=True)
-    parser.add_argument('--candidate-installer-sha256', required=True)
+    parser.add_argument('--candidate-version')
+    parser.add_argument('--candidate-asar-sha256')
+    parser.add_argument('--candidate-executable-sha256')
+    parser.add_argument('--candidate-dependency-inventory-sha256')
+    parser.add_argument('--candidate-installer-sha256')
     parser.add_argument('--candidate-source-sha', required=True)
     parser.add_argument('--case', required=True,
                         choices=['fresh', 'baseline', 'readlock', 'longpath'])
@@ -1605,14 +1685,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error('Fresh installation must not specify an old baseline')
     elif not args.baseline_installer or args.baseline_version not in OFFICIAL_BASELINE_SHA256:
         parser.error('Upgrade cases require a baseline installer and pinned 0.5.3 or 0.5.4 version')
-    if re.fullmatch(r'\d+\.\d+\.\d+\.0', args.candidate_version):
-        args.candidate_version = args.candidate_version[:-2]
-    if not re.fullmatch(r'\d+\.\d+\.\d+', args.candidate_version):
-        parser.error('Versions must be stable X.Y.Z')
-    for value in [args.candidate_asar_sha256, args.candidate_executable_sha256,
-                  args.candidate_installer_sha256, args.candidate_dependency_inventory_sha256]:
-        if not re.fullmatch(r'[a-fA-F0-9]{64}', value):
-            parser.error('Expected hashes must be SHA-256 hex')
+    hashes = [args.candidate_asar_sha256, args.candidate_executable_sha256,
+              args.candidate_installer_sha256, args.candidate_dependency_inventory_sha256]
+    if args.candidate_artifact_name is not None:
+        if not args.candidate_artifact_name.strip():
+            parser.error('Candidate artifact name must not be empty')
+        supplied = [args.candidate_installer, args.candidate_version, *hashes]
+        if any(value is not None for value in supplied):
+            parser.error('Candidate artifact mode must not specify candidate installer, '
+                         'version, or hashes')
+    else:
+        if not args.candidate_installer or any(value is None for value in hashes):
+            parser.error('Direct candidate mode requires an installer and all candidate hashes')
+        try:
+            version = args.candidate_version if args.candidate_version is not None else '0.5.4'
+            args.candidate_version = stable_candidate_version(version)
+        except ValueError as error:
+            parser.error(str(error))
+        for value in hashes:
+            if not re.fullmatch(r'[a-fA-F0-9]{64}', value):
+                parser.error('Expected hashes must be SHA-256 hex')
     if not re.fullmatch(r'[a-f0-9]{40}', args.candidate_source_sha):
         parser.error('Candidate source must be a full lowercase Git commit SHA')
     if not args.node or not Path(args.node).is_file():

@@ -1,0 +1,10 @@
+{
+  "sourceRevision": "f8d157532fbfaeda587e826d4cd5b21a49186f7c",
+  "sourceRepository": "https://github.com/notofonts/noto-cjk",
+  "fonts": [
+    { "name": "NotoSansSC-Regular.otf", "path": "Sans/SubsetOTF/SC/NotoSansSC-Regular.otf", "bytes": 8331336, "gitBlobSha1": "fc0fda9394367c16c1af7555a2ae4d5e2e6a6f02", "sha256": "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9" },
+    { "name": "NotoSansSC-Bold.otf", "path": "Sans/SubsetOTF/SC/NotoSansSC-Bold.otf", "bytes": 8543168, "gitBlobSha1": "bcc11bc30e65b69b9e5a508c3e2138197c5543cf", "sha256": "c6cb5a93abaa9edc8ee7463b7ebb7f42d618d40e6ed2f7a5371c97b0b64767c0" },
+    { "name": "NotoSerifSC-Regular.otf", "path": "Serif/SubsetOTF/SC/NotoSerifSC-Regular.otf", "bytes": 11625800, "gitBlobSha1": "be55fbdf3fe53bfc99779389f3f0b875707bf496", "sha256": "e8f396decc1f0963a016a989c3d8852e863d1350996f573860a80767c83a1cd3" },
+    { "name": "NotoSerifSC-Bold.otf", "path": "Serif/SubsetOTF/SC/NotoSerifSC-Bold.otf", "bytes": 12094336, "gitBlobSha1": "7d1928abb3f71b0a4a233cce96211d18f878bdf7", "sha256": "24693d48bdb9152f0a06b02af625638a1097abd6de4010ebba027f6e82710527" }
+  ]
+}

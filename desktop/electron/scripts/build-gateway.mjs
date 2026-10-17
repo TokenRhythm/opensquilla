@@ -303,6 +303,14 @@ function externalizeControlUiArtifact() {
   }
 }
 
+const gatewayBuildStarted = performance.now()
+function recordStage(stage, started) {
+  console.log(`[gateway-build-timing] ${JSON.stringify({
+    stage,
+    seconds: Number(((performance.now() - started) / 1000).toFixed(3)),
+  })}`)
+}
+
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
 assertRouterIntegrity(routerBundleDir)
@@ -426,6 +434,8 @@ const args = [
   entryPath,
 ]
 
+recordStage('prepare', gatewayBuildStarted)
+const freezeStarted = performance.now()
 const result = spawnSync('uv', args, {
   cwd: repoRoot,
   env: {
@@ -443,9 +453,13 @@ if (result.error) {
 if (result.status !== 0) {
   process.exit(result.status ?? 1)
 }
+recordStage('pyinstaller', freezeStarted)
 
+const externalizeStarted = performance.now()
 patchMacLightgbmRuntime()
 externalizeControlUiArtifact()
+recordStage('externalize-ui', externalizeStarted)
+const inventoryStarted = performance.now()
 const dependencyInventory = spawnSync('uv', [
   ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'release_dependency_inventory.py'),
   '--repo', repoRoot, '--kind', 'pyinstaller',
@@ -454,4 +468,8 @@ const dependencyInventory = spawnSync('uv', [
 ], { cwd: repoRoot, stdio: 'inherit', windowsHide: true })
 if (dependencyInventory.error) throw dependencyInventory.error
 if (dependencyInventory.status !== 0) process.exit(dependencyInventory.status ?? 1)
+recordStage('dependency-inventory', inventoryStarted)
+const provenanceStarted = performance.now()
 writeGatewayBuildRecord(repoRoot, runtimeGatewayDir, buildInputs)
+recordStage('provenance', provenanceStarted)
+recordStage('total', gatewayBuildStarted)

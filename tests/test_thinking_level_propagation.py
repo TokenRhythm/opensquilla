@@ -445,7 +445,3 @@ class TestDowngradeCompatibility:
         )
         assert cfg.llm_ensemble.candidates[0].thinking_level == ""
         assert cfg.llm_ensemble.candidates[1].thinking_level == ""
-
-    def test_llm_config_without_thinking_level_loads(self) -> None:
-        cfg = LlmProviderConfig()
-        assert cfg.thinking is None

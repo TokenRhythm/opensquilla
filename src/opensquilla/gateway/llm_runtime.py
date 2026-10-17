@@ -369,6 +369,7 @@ _REPORTABLE_FAILURE_KINDS = frozenset(
     {
         ProviderFailureKind.RATE_LIMITED,
         ProviderFailureKind.INSUFFICIENT_CREDITS,
+        ProviderFailureKind.USAGE_LIMIT,
         ProviderFailureKind.AUTH_INVALID,
     }
 )
@@ -590,7 +591,7 @@ class ProfileCredentialPools:
         pins = self._pins.get(provider_id, {})
         if kind is ProviderFailureKind.AUTH_INVALID:
             cooldown = float("inf")
-        elif kind is ProviderFailureKind.INSUFFICIENT_CREDITS:
+        elif kind in {ProviderFailureKind.INSUFFICIENT_CREDITS, ProviderFailureKind.USAGE_LIMIT}:
             cooldown = INSUFFICIENT_CREDITS_COOLDOWN_SECONDS
         else:
             cooldown = (

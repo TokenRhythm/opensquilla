@@ -1816,7 +1816,8 @@ async def test_provider_failure_classification_survives_private_logging() -> Non
     provider = _Provider(
         lambda: _Stream(
             [
-                ErrorEvent(code="400", message=f"MODEL_NOT_AVAILABLE: {private_detail}"),
+                ErrorEvent(code="400", http_status=400,
+                           message=f"MODEL_NOT_AVAILABLE: {private_detail}"),
             ]
         )
     )

@@ -1,6 +1,8 @@
 import type { Ref } from 'vue'
 import i18n from '@/i18n'
 import { downloadBlob } from '@/utils/browser'
+import { renderMarkdownDiagrams, restoreClonedDiagramSources } from '@/utils/markdown/mermaidRenderer'
+import type { SvgDiagram } from '@/utils/markdown/svgDiagram'
 
 export type ShareExportTheme = 'light' | 'dark'
 
@@ -60,6 +62,7 @@ const SHARE_CLONE_STRIP_SELECTORS = [
   '.step-view-btn',
   '.msg-artifact-actions',
   '.msg-artifact-download',
+  '.code-copy-btn',
   '[data-tooltip]',
   '[role="tooltip"]',
 ]
@@ -87,9 +90,36 @@ export function useChatShareExport(options: ChatShareExportOptions) {
     await document.fonts?.ready
     const aiGeneratedLabel = options.aiGeneratedLabel()
     const stage = buildShareDom(sourceElements, theme, aiGeneratedLabel)
+    const diagramController = new AbortController()
+    const diagrams = new Set<SvgDiagram>()
 
     try {
       document.body.appendChild(stage)
+      // A cloned diagram may still use the live chat's dark palette, or have
+      // been outside its lazy-render viewport. Render against the mounted
+      // stage's forced theme before measuring or taking the static image.
+      await renderMarkdownDiagrams(stage, {
+        zoomIn: i18n.global.t('chat.mermaid.zoomIn'),
+        zoomOut: i18n.global.t('chat.mermaid.zoomOut'),
+        reset: i18n.global.t('chat.mermaid.reset'),
+        copyCode: i18n.global.t('chat.mermaid.copyCode'),
+        copied: i18n.global.t('chat.copied'),
+        copyFailed: i18n.global.t('chat.toast.copyFailed'),
+        exportPng: i18n.global.t('chat.mermaid.exportPng'),
+        exportFailed: i18n.global.t('chat.mermaid.exportFailed'),
+        loadFailed: i18n.global.t('chat.mermaid.loadFailed'),
+        tooLarge: i18n.global.t('chat.mermaid.tooLarge'),
+        blockedResource: i18n.global.t('chat.mermaid.blockedResource'),
+        viewSource: i18n.global.t('chat.mermaid.viewSource'),
+        syntaxErrorAt: (line, excerpt) => i18n.global.t('chat.mermaid.syntaxErrorAt', { line, excerpt }),
+      }, {
+        signal: diagramController.signal,
+        themeId: theme,
+        onRendered: diagram => diagrams.add(diagram),
+      })
+      // The export owns its freshly rendered static diagrams, never the live
+      // chat's handlers or pan/zoom state. Keep source errors but drop controls.
+      stage.querySelectorAll('.mermaid-toolbar, .mermaid-err-copy').forEach(node => node.remove())
       await waitForStablePaint()
       const contentCanvas = await captureStageWithDom(stage)
       const { blob, width, height } = await composeShareTemplate(
@@ -100,6 +130,8 @@ export function useChatShareExport(options: ChatShareExportOptions) {
       const filename = shareExportFilename(options.title())
       return { blob, filename, width, height }
     } finally {
+      diagramController.abort()
+      for (const diagram of diagrams) diagram.dispose()
       stage.remove()
     }
   }
@@ -187,8 +219,10 @@ export function buildShareDom(
   const tokens = shareThemeTokens(stage)
   stage.style.cssText = [
     'position:fixed',
-    'left:16px',
-    'top:16px',
+    // Keep physical and computed logical insets at the capture origin.
+    // html-to-image copies both; a viewport offset would clip the right edge.
+    'left:0',
+    'top:0',
     `width:${stageWidth}px`,
     `max-width:${stageWidth}px`,
     'padding:0',
@@ -208,7 +242,9 @@ export function buildShareDom(
   const stack = document.createElement('div')
   stack.className = 'chat-share-export-stack'
   sourceElements.forEach((element) => {
-    const clone = cleanupShareClone(element.cloneNode(true) as HTMLElement)
+    const clone = element.cloneNode(true) as HTMLElement
+    restoreClonedDiagramSources(element, clone)
+    cleanupShareClone(clone)
     inlineBlobBackedImages(element, clone)
     stack.appendChild(clone)
   })
@@ -370,6 +406,10 @@ function cleanupShareClone(clone: HTMLElement): HTMLElement {
     .forEach(element => element.remove())
 
   clone.querySelectorAll<HTMLElement>('*').forEach((element) => {
+    // The share is a document, not a snapshot of a scrolled tool viewport.
+    // Reset only the clone; the reader's live position stays untouched.
+    element.scrollTop = 0
+    element.scrollLeft = 0
     element.classList.remove(
       'msg-user--share-mode',
       'msg-user--share-selected',
@@ -460,6 +500,32 @@ function shareExportCss(): string {
       overflow-y: visible !important;
     }
 
+    /* Include all currently rendered tool content. Retained log pagination is
+       deliberately not fetched here: any existing partial-content note stays
+       beside the loaded rows in the static image. */
+    #${SHARE_STAGE_ID} .activity-code-details,
+    #${SHARE_STAGE_ID} .activity-code-details__viewport,
+    #${SHARE_STAGE_ID} .activity-tool-details--bounded,
+    #${SHARE_STAGE_ID} .activity-tool-details__window {
+      height: auto !important;
+      max-height: none !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+      overflow: visible !important;
+      scrollbar-gutter: auto !important;
+    }
+
+    #${SHARE_STAGE_ID} .activity-code-details pre,
+    #${SHARE_STAGE_ID} .activity-code-details code,
+    #${SHARE_STAGE_ID} .activity-tool-details__preview {
+      width: 100% !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+      white-space: pre-wrap !important;
+      overflow-wrap: anywhere !important;
+      overflow: visible !important;
+    }
+
     /* The live meta line is hover-dimmed; the static image has no hover. */
     #${SHARE_STAGE_ID} .msg-ai-meta > span {
       opacity: 1 !important;
@@ -488,6 +554,12 @@ function shareExportCss(): string {
     #${SHARE_STAGE_ID} .msg-ai-text th {
       background: var(--bg-elevated);
       font-weight: 600;
+    }
+    #${SHARE_STAGE_ID} .msg-ai-text :is(th, td)[align='center'] {
+      text-align: center;
+    }
+    #${SHARE_STAGE_ID} .msg-ai-text :is(th, td)[align='right'] {
+      text-align: right;
     }
     #${SHARE_STAGE_ID} .msg-ai-text h1,
     #${SHARE_STAGE_ID} .msg-ai-text h2,

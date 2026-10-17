@@ -1,0 +1,37 @@
+Parameter simulation — optional design example
+OpenSquilla original, Apache-2.0. Adapt the idea; this is not a fixed template.
+
+Question: How does team size and duration change a project estimate?
+Use one compact controls row and a linked result/chart. State units explicitly:
+people x days x currency/person/day = currency. For 3 people, 10 days and 800
+currency/person/day, the result is 24000. Show assumptions beside the result;
+do not label days as hours or quietly omit a conversion factor.
+
+State example: { people: 3, days: 10, dailyRate: 800, selectedBreakdown: "labor" }.
+Validate restored values before use, then derive every output from this state.
+The same update function should update labels, bars and the explanation. A
+visible choice that changes the breakdown must change the view, not only the
+text submitted to the conversation.
+
+An implementation sketch (adapt the range, DOM and labels to the actual task):
+
+  const visual = window.opensquillaVisualize;
+  await visual.ready;
+  const saved = visual.getState();
+  const clamp = (v, low, high, fallback) =>
+    typeof v === "number" && Number.isFinite(v)
+      ? Math.min(high, Math.max(low, v)) : fallback;
+  const state = {
+    people: clamp(saved?.people, 1, 20, 3),
+    days: clamp(saved?.days, 1, 90, 10),
+    dailyRate: clamp(saved?.dailyRate, 100, 5000, 800)
+  };
+  // On each input: update state, redraw using state, then visual.setState(state).
+The inputs and linked result are a complete interaction; no continue-discussion
+button is needed. If the user's task explicitly includes subsequent analysis of
+chosen conditions, read the optional setContext contract in SKILL.md and expose
+that selection to the host. Preparing conditions never sends a message.
+
+Check: 3 x 10 x 800 = 24000; changing days to 20 gives 48000. Restore after
+reload and confirm all inputs/results agree. Reset returns inputs, chart and
+saved state to defaults. At 360 px let controls wrap and keep values readable.

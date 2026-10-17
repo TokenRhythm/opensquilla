@@ -1,0 +1,18 @@
+Generated from generative-frame 0.0.5 (MIT), adapted for OpenSquilla.
+Copyright (c) 2026 AgentbaseAI Inc. See LICENSE.generative-frame.txt and upstream-guidance.json.
+Do not edit this generated file; run npm run visualize:guidance:write in opensquilla-webui.
+
+## Module: diagram
+
+Diagrams are standalone SVG. Lay them out on paper first, then write coordinates.
+
+- Root: `<svg viewBox="0 0 680 H" width="100%" role="img">`, then `<title>`, `<desc>`, and `<defs>`. Compute `H` from the last row plus a 16px margin; leave 16px clear on every side.
+- Put nodes on a grid: equal widths per row, equal heights (about 44px for one line, 60px for two), and at least 32px between nodes. Center rows on the canvas.
+- SVG text does not wrap. At 13px, budget about 7px per character and break long labels into `<tspan x="…" dy="1.2em">` lines; widen the box rather than shrinking text below 12px.
+- Center labels with `text-anchor="middle"` and `dominant-baseline="central"`.
+- Color through CSS, not presentation attributes: define classes in a `<style>` inside the SVG, such as `.node{fill:var(--color-surface);stroke:var(--color-border-strong)}` and `.label{fill:var(--color-text);font:13px var(--font-sans)}`.
+- Draw in this order so lines tuck under boxes: grouping zones, then edges, then nodes, then edge labels.
+- Route edges with straight or orthogonal paths (`M`, `H`, `V`) that end at box edges, not centers. Define one arrowhead `<marker>` with `orient="auto-start-reverse"` and reuse it.
+- Give edge labels a knockout so lines do not cross the text: `paint-order="stroke"` with a 4px stroke in `--color-background`.
+- Highlight at most one path or node with `--color-accent`; everything else stays neutral. Use dashed outlines and `--color-surface-muted` fills for groupings.
+- Prefer left-to-right for processes and top-to-bottom for hierarchies; keep crossings to zero where you can by reordering nodes.

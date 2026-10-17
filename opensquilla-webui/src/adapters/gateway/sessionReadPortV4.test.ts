@@ -1123,7 +1123,7 @@ describe('v4 SessionReadPort Adapter', () => {
       clarificationSubmission: { submit: vi.fn() } as never,
       sessionKey: ref('alpha'), interruptState,
       runStatus: ref({ status: 'running', label: '', task: { task_id: 'task-1' } }),
-      stream: { isStreaming: ref(true), appendInterruptFrame: vi.fn(), ensureInterruptBubble: vi.fn() },
+      stream: { appendInterruptFrame: vi.fn() },
     }))!
     const unsubscribe = approvals.subscribe()
     const applyMetadata = (metadata: SessionReadMetadata) => approvals.applyUserInputBootstrap({

@@ -6,6 +6,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:modern-recovery'
 const OTHER = 'agent:main:webchat:modern-recovery-other'
@@ -303,7 +304,7 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await expect(page.getByText('Outdated recovery proposal', { exact: true })).toHaveCount(0)
   await expect(notice).toHaveCount(0)
   await expect(send).toBeEnabled()
-  await expect(input).toHaveValue(DRAFT)
+  await expectComposerValue(input, DRAFT)
   expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
   expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
   expect(page.url()).toBe(originalUrl)
@@ -315,7 +316,7 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(2)
   expect(gateway.hydratedPlanRevisions).toEqual(['initial-plan', 'recovered-plan'])
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
-  await expect(input).toHaveValue(DRAFT)
+  await expectComposerValue(input, DRAFT)
   expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
   expect(page.url()).toBe(originalUrl)
 
@@ -324,7 +325,7 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await input.press('Enter')
   await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
   expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
-  await expect(input).toHaveValue('')
+  await expectComposerValue(input, '')
   gateway.beginReply()
   const reply = page.locator('.msg-ai-text').filter({ hasText: REPLY })
   await expect(reply).toHaveCount(1)
@@ -367,7 +368,7 @@ test('stays degraded beyond the foreground deadline and does not resurrect a dis
     })
     await advance(page, 5_000)
     await expect(notice).toHaveCount(0)
-    await expect(page.locator('.chat-textarea')).toHaveValue(DRAFT)
+    await expectComposerValue(page.locator('.chat-textarea'), DRAFT)
   }
   expect(gateway.sockets).toHaveLength(1)
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
@@ -406,7 +407,7 @@ test('finishes a progressing 48 second transfer with its original sync revision'
   await expect.poll(() => calls(gateway.requests, RESUME).length).toBe(1)
   expect(calls(gateway.requests, RESUME)[0]!.params.sync_revision).toBe(revision)
   await expect(notice).toHaveCount(0)
-  await expect(page.locator('.chat-textarea')).toHaveValue(DRAFT)
+  await expectComposerValue(page.locator('.chat-textarea'), DRAFT)
   expect(calls(gateway.requests, READ)).toHaveLength(8)
   expect(calls(gateway.requests, RELEASE)).toHaveLength(0)
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
@@ -428,7 +429,7 @@ test('reconnects through modern resume while preserving the draft and sends it e
   await advance(page, 2_000)
   await expect.poll(() => calls(gateway.requests, RESUME, 2).length).toBe(1)
   await expect(send).toBeEnabled()
-  await expect(input).toHaveValue(DRAFT)
+  await expectComposerValue(input, DRAFT)
   expect(page.url()).toBe(originalUrl)
   expect(calls(gateway.requests, READ, 2)[0]!.params.sync_revision).not.toBe(firstRevision)
   expect(calls(gateway.requests, RELEASE, 2).some(item => item.params.sync_revision === firstRevision)).toBe(false)
@@ -436,7 +437,7 @@ test('reconnects through modern resume while preserving the draft and sends it e
   await input.press('Enter')
   await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
   expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
-  await expect(input).toHaveValue('')
+  await expectComposerValue(input, '')
   await advance(page, 10_000)
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
   expect(gateway.sockets).toHaveLength(2)

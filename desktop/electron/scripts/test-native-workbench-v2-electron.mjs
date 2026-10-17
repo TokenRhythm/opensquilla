@@ -2713,7 +2713,7 @@ try {
         state: window.__capacityState,
         draft: document.getElementById('capacity-draft')?.value,
       })`)
-      const lastCapacityContents = manager.surfaces.get('browser:capacity-8')?.view.webContents
+      const lastCapacityContents = manager.surfaces.get('browser:capacity-7')?.view.webContents
       const capacityLastPageStorage = lastCapacityContents
         ? await lastCapacityContents.executeJavaScript(
             "localStorage.getItem('capacity-isolation-probe')",
@@ -2749,6 +2749,9 @@ try {
         && (event.type === 'error' || event.type === 'crashed' || event.type === 'unresponsive')
       ).length
       const failedCapacityDetached = !owner.contentView.children.includes(failedCapacityView)
+      // Admission retains the slot until both renderer destruction and its
+      // asynchronous session cleanup complete, not just removal from the map.
+      await failedCapacityRecord.cleanupPromise
       const capacityReuse = await manager.createSurface({
         version: 2,
         surfaceId: 'browser:capacity-reused',
@@ -3498,11 +3501,12 @@ try {
   )
   assert.equal(
     result.liveSurfaceCountAfterOpen,
-    result.capacityResults.length,
-    'opening previews beyond eight must retain every existing surface',
+    8,
+    'rejecting new previews beyond eight must retain every existing surface',
   )
-  assert.equal(result.capacityResults.every(entry => entry.ok), true, 'the ninth preview must open')
-  assert.equal(result.capacitySessions, result.capacityResults.length, 'each preview must remain isolated')
+  assert.equal(result.capacityResults.slice(0, 8).every(entry => entry.ok), true)
+  assert.equal(result.capacityResults[8].code, 'RESOURCE_LIMIT', 'the ninth preview must not allocate a renderer')
+  assert.equal(result.capacitySessions, 8, 'each retained preview must remain isolated')
   assert.deepEqual(result.capacityFirstPageState, { state: 'retained', draft: 'unsaved draft' },
     'opening more previews must preserve existing page state and unsaved input')
   assert.equal(result.capacityLastPageStorage, null, 'new previews must not inherit another page storage')
@@ -3524,7 +3528,7 @@ try {
   )
   assert.equal(
     result.liveSurfaceCountAfterReuse,
-    result.capacityResults.length,
+    8,
     'replacing a failed preview must leave all healthy previews intact',
   )
   assert.equal(

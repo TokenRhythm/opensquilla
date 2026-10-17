@@ -1,4 +1,5 @@
 import { expect, test } from './real-gateway.fixture'
+import { expectComposerValue } from './utils'
 
 test('real Gateway accepts the next chat turn without changing sessions', async ({
   page,
@@ -9,7 +10,7 @@ test('real Gateway accepts the next chat turn without changing sessions', async 
   page.on('pageerror', error => rendererErrors.push(error.message))
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 20_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 20_000 })
 
   const input = page.locator('.chat-textarea')
   const send = page.locator('.chat-send-btn[aria-label="Send"]')
@@ -29,7 +30,7 @@ test('real Gateway accepts the next chat turn without changing sessions', async 
   )
   await expect(stop).toHaveCount(0)
   await expect(send).toBeEnabled()
-  await expect(input).toHaveValue('Continue with a second synthetic chat turn.')
+  await expectComposerValue(input, 'Continue with a second synthetic chat turn.')
   const sessionUrl = page.url()
 
   await send.click()

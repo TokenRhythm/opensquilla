@@ -56,6 +56,9 @@ export function dedupeTerminalErrorNotices(messages: ChatMessage[]): ChatMessage
     if (turnOutcome && lifecycle?.turnOutcome) {
       const authority = lifecycle.turnOutcome
       turnOutcome.status = authority.status
+      if (['timeout', 'cancelled', 'abandoned', 'interrupted'].includes(authority.status)) {
+        turnOutcome.httpStatus = undefined
+      }
       if (authority.reason !== undefined) turnOutcome.reason = authority.reason
       if (authority.kind !== undefined) turnOutcome.kind = authority.kind
       turnOutcome.statusSource = authority.statusSource

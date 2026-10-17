@@ -17,6 +17,8 @@ import {
 } from '@/utils/chat/activitySnapshot'
 import { diagnosticErrorId, providerFailureKind } from '@/utils/chat/providerFailure'
 
+import { providerHttpStatus } from '@/utils/chat/providerRecovery'
+
 type RawOutcomeRecord = Record<string, unknown>
 
 function text(value: unknown): string {
@@ -205,6 +207,7 @@ export function normalizeTurnOutcome(
   const containers = outcomeContainers(record)
   const nested = containers.records[0] ?? {}
   const sources = [record, ...containers.records]
+  const httpStatusState = fieldStateAcross(sources, ['http_status', 'httpStatus'], providerHttpStatus)
   const errorIdState = fieldStateAcross(sources, ['error_id', 'errorId'], diagnosticErrorId)
   const failureKindState = fieldStateAcross(sources, ['failure_kind', 'failureKind'], providerFailureKind)
   const turnIdState = fieldStateAcross(sources, ['turn_id', 'turnId'], nonEmptyText)
@@ -347,6 +350,7 @@ export function normalizeTurnOutcome(
     ...(errorIdState.present
       ? { errorId: errorIdState.valid && turnIdState.valid && !containers.invalid ? errorIdState.value : null }
       : {}),
+    ...(httpStatusState.present ? { httpStatus: httpStatusState.valid && !containers.invalid ? httpStatusState.value : null } : {}),
     ...(failureKindState.valid && !containers.invalid ? { failureKind: failureKindState.value } : {}),
     ...(kind ? { kind } : {}),
     ...(reason ? { reason } : {}),

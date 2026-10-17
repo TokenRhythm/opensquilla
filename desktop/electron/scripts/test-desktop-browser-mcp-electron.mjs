@@ -173,6 +173,10 @@ try {
     const body = await response.json()
     if (process.env.OPENSQUILLA_MCP_TRACE) console.log('MCP fixture result', id, name, body.result?.structuredContent?.code ?? body.result?.structuredContent?.execution?.state ?? 'received')
     assert.equal(body.id, id)
+    if (options.expectArgumentError) {
+      assert.equal(body.error?.code, -32602, JSON.stringify(body))
+      return body.error
+    }
     assert.equal(body.error, undefined, JSON.stringify(body))
     return body.result
   }
@@ -201,6 +205,41 @@ try {
     assert.ok(found, `Missing synthetic control ${name}: ${JSON.stringify(observation)}`)
     return found.ref
   }
+  const blankOptions = { sessionKey: 'session-blank-browser', mode: 'dom' }
+  const blank = success(await call('browser_open', {}, blankOptions))
+  assert.equal(blank.url, 'about:blank')
+  assert.equal(typeof blank.targetRef, 'string')
+  await waitFor(async () => success(await call('browser_tabs', {}, blankOptions)).targets,
+    targets => targets.find(target => target.targetRef === blank.targetRef)?.pageState === 'ready',
+    'The blank browser target did not become ready')
+  const blankObservation = success(await call('browser_observe', { targetRef: blank.targetRef }, blankOptions)).observation
+  assert.equal(blankObservation.consistency, 'consistent')
+  assert.equal(blankObservation.tabs.find(target => target.targetRef === blank.targetRef).url, 'about:blank')
+  const blankScreenshot = success(await call('browser_screenshot', { targetRef: blank.targetRef }, blankOptions))
+  assert.ok(blankScreenshot.width > 0 && blankScreenshot.height > 0)
+  const explicitBlank = success(await call('browser_open', { url: 'about:blank' }, blankOptions))
+  assert.notEqual(explicitBlank.targetRef, blank.targetRef)
+  assert.equal(await app.evaluate(({}, targetRefs) => {
+    const records = targetRefs.map(targetRef => [...globalThis.mcpFixture.manager.surfaces.values()]
+      .find(record => record.targetRef === targetRef))
+    return records[0].previewSession !== records[1].previewSession
+  }, [blank.targetRef, explicitBlank.targetRef]), true, 'Independent blank tabs must keep isolated browser sessions')
+  success(await call('browser_navigate', { targetRef: blank.targetRef, url: origin }, blankOptions))
+  assert.match(success(await call('browser_inspect', { targetRef: blank.targetRef }, blankOptions)).text, /First document/)
+  success(await call('browser_navigate', { targetRef: blank.targetRef, url: 'about:blank' }, blankOptions))
+  success(await call('browser_reload', { targetRef: blank.targetRef }, blankOptions))
+  const returnedBlank = success(await call('browser_tabs', {}, blankOptions)).targets.find(target => target.targetRef === blank.targetRef)
+  assert.equal(returnedBlank.url, 'about:blank', 'Returning to a blank document must not retain the previous HTTP URL')
+  assert.equal(returnedBlank.pageState, 'ready')
+  assert.equal(success(await call('browser_observe', { targetRef: blank.targetRef }, blankOptions)).observation.consistency, 'consistent')
+  const blankEvents = await app.evaluate(({}, surfaceId) => globalThis.mcpFixture.events
+    .filter(event => event.surfaceId === surfaceId && event.type === 'browser-opened'), blank.surfaceId)
+  assert.equal(blankEvents[0].detail.url, 'about:blank')
+  for (const targetRef of [blank.targetRef, explicitBlank.targetRef]) {
+    success(await call('browser_tab', { targetRef, tabAction: 'close' }, blankOptions))
+  }
+  assert.equal(success(await call('browser_tabs', {}, blankOptions)).targets.length, 0)
+
   // A page opened through the trusted renderer before the first chat turn
   // must be controllable on that draft's existing session identity.
   const manualSession = 'session-manual-draft'
@@ -556,7 +595,13 @@ try {
   inspected = success(await call('browser_inspect', { targetRef: first.targetRef }))
   assert.match(inspected.text, /Second document/)
   success(await call('browser_reload', { targetRef: first.targetRef }))
-  assert.equal((await call('browser_navigate', { targetRef: first.targetRef, url: 'file:///etc/passwd' })).isError, true)
+  const invalidNavigation = await call('browser_navigate', {
+    targetRef: first.targetRef, url: 'file:///synthetic/blocked',
+  }, { expectArgumentError: true })
+  assert.equal(invalidNavigation.data.code, 'INVALID_REQUEST')
+  assert.equal(invalidNavigation.data.phase, 'argument_validation')
+  assert.equal(invalidNavigation.data.outcome, 'not_started')
+  assert.equal(success(await call('browser_tabs')).targets.find(target => target.targetRef === first.targetRef).url, origin + '/next')
   const setActivity = (taskId, active, sessionKey = 'session-a') => app.evaluate(
     ({}, state) => globalThis.mcpFixture.manager.setBrowserAutomationState(state),
     { sessionKey, taskId, active },

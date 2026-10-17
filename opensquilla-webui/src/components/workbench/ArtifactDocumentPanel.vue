@@ -48,6 +48,7 @@
 
     <div
       v-if="annotationFallback"
+      ref="annotationFallbackDialog"
       class="artifact-document__annotation-fallback"
       role="dialog"
       aria-modal="true"
@@ -58,9 +59,13 @@
         @submit.prevent="submitAnnotationFallback"
       >
         <strong :id="`${instanceId}-annotation-fallback-title`">
-          {{ t('workbench.artifactAnnotation.fallbackTitle') }}
+          {{ t(annotationFallback.reason === 'office-selection'
+            ? 'workbench.office.requestChange'
+            : 'workbench.artifactAnnotation.fallbackTitle') }}
         </strong>
-        <p>{{ t('workbench.artifactAnnotation.fallbackDetail') }}</p>
+        <p>{{ t(annotationFallback.reason === 'office-selection'
+          ? 'workbench.office.requestHint'
+          : 'workbench.artifactAnnotation.fallbackDetail') }}</p>
         <textarea
           ref="annotationFallbackInput"
           v-model="annotationFallbackBody"
@@ -132,6 +137,8 @@
         :session-key="sessionKey"
         :show-header="showHeader"
         :suspended="suspended || activeTab !== 'preview'"
+        :office-annotation-enabled="officeAnnotationEnabled"
+        :reading-state="previewReading?.identity === artifactReadingIdentity(headArtifact, sessionKey) ? previewReading.reading : undefined"
         @workbench-event="forwardWorkbenchEvent"
       />
     </div>
@@ -261,7 +268,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, useId, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import Icon from '@/components/Icon.vue'
@@ -283,6 +290,7 @@ import type {
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
 import ArtifactSourcePreview from './ArtifactSourcePreview.vue'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
+import { artifactReadingIdentity, type ArtifactReadingCheckpoint } from './resourceReadingState'
 
 type DocumentTab = 'preview' | 'source' | 'versions' | 'changes'
 type PreviewHandle = { reload: () => Promise<void> }
@@ -306,11 +314,13 @@ const props = withDefaults(defineProps<{
   previewLaunchUrl?: string
   previewMode?: 'full' | 'offline'
   previewNetworkAllowed?: boolean
-  previewSandboxProfile?: 'default' | 'opaque-offline'
+  previewSandboxProfile?: 'default' | 'opaque-offline' | 'none'
   publishing?: boolean
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
+  previewReading?: ArtifactReadingCheckpoint
+  officeAnnotationEnabled?: boolean
   annotationFallback?: {
     annotationId: string
     body: string
@@ -359,6 +369,9 @@ const annotationNewlineHint = computed(() => t(
 ))
 const annotationFallbackBody = ref('')
 const annotationFallbackInput = ref<HTMLTextAreaElement | null>(null)
+const annotationFallbackDialog = ref<HTMLElement | null>(null)
+let annotationReturnFocus: HTMLElement | null = null
+let annotationFocusGeneration = 0
 const annotationFallbackTooLong = computed(() => (
   !promptAnnotationBodyWithinLimit(annotationFallbackBody.value)
 ))
@@ -374,15 +387,34 @@ watch(activeTab, tab => {
 })
 
 watch(() => props.annotationFallback, (fallback, previous) => {
+  const focusGeneration = ++annotationFocusGeneration
   if (!fallback) {
     annotationFallbackBody.value = ''
+    const target = annotationReturnFocus
+    const dialog = annotationFallbackDialog.value
+    annotationReturnFocus = null
+    void nextTick(() => {
+      if (focusGeneration !== annotationFocusGeneration || !target?.isConnected) return
+      const active = target.ownerDocument.activeElement
+      // Closing a dialog removes its focused control. Restore the preview's
+      // scoped keyboard handling, without stealing focus moved elsewhere.
+      if (!active || active === target.ownerDocument.body || dialog?.contains(active)) {
+        target.focus({ preventScroll: true })
+      }
+    })
     return
+  }
+  if (!previous && typeof document !== 'undefined') {
+    annotationReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
   }
   if (fallback.annotationId !== previous?.annotationId) {
     annotationFallbackBody.value = fallback.body
   }
-  void nextTick(() => annotationFallbackInput.value?.focus())
+  void nextTick(() => {
+    if (focusGeneration === annotationFocusGeneration) annotationFallbackInput.value?.focus()
+  })
 }, { immediate: true })
+onBeforeUnmount(() => { annotationFocusGeneration += 1; annotationReturnFocus = null })
 
 function annotationFallbackPayload() {
   return {
@@ -450,7 +482,8 @@ const headArtifact = computed(() => documentFeatures.value
   : props.artifact)
 const downloadOnly = computed(() => {
   if (isOfficeArtifact(headArtifact.value)) {
-    return documentModel.value?.capabilities.preview !== true
+    return artifactWorkbenchPreviewKind(headArtifact.value) === 'unsupported'
+      || (documentModel.value !== null && documentModel.value.capabilities.preview !== true)
   }
   return artifactWorkbenchPreviewKind(headArtifact.value) === 'unsupported'
 })

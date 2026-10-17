@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
+import { normalizeOfficeSelection } from '@/types/officeSelection'
 import type {
   PromptAnnotation,
   PromptAnnotationCreateRequest,
@@ -42,6 +43,9 @@ function snapshotOf(annotation: PromptAnnotation, sentOrder: number): PromptAnno
     annotationId: annotation.annotationId,
     documentId: annotation.documentId,
     documentName: annotation.documentName,
+    revisionId: annotation.revisionId,
+    sha256: annotation.sha256,
+    selection: annotation.selection ? normalizeOfficeSelection(annotation.selection) || undefined : undefined,
     body: annotation.body,
     tagName: annotation.tagName,
     quote: annotation.quote,
@@ -74,21 +78,25 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
   function setActiveDocument(sessionKey: string, documentId: string) {
     activeDocumentBySession.value[sessionKey] = documentId
   }
-  function activeDraftsForSession(sessionKey: string) {
-    const items = draftsForSession(sessionKey)
-    const documentId = activeDocumentBySession.value[sessionKey] || items[items.length - 1]?.documentId
+  function activeDraftsForSession(sessionKey: string, allowed?: (item: PromptAnnotation) => boolean) {
+    const items = draftsForSession(sessionKey).filter(item => !allowed || allowed(item))
+    const activeId = activeDocumentBySession.value[sessionKey]
+    const documentId = (allowed && !items.some(item => item.documentId === activeId)
+      ? undefined : activeId) || items[items.length - 1]?.documentId
     return items.filter(item => (
       item.documentId === documentId && !overlayOwnerSessions.value[item.annotationId]
     ))
   }
-  function sendableDraftsForSession(sessionKey: string) {
-    return activeDraftsForSession(sessionKey).filter(item => (
+  function sendableDraftsForSession(sessionKey: string, allowed?: (item: PromptAnnotation) => boolean) {
+    return activeDraftsForSession(sessionKey, allowed).filter(item => (
       item.body.trim() && promptAnnotationBodyWithinLimit(item.body)
     ))
   }
-  function sendBlockedReason(sessionKey: string): 'editing' | 'too-long' | null {
-    if (Object.values(overlayOwnerSessions.value).includes(sessionKey)) return 'editing'
-    const items = activeDraftsForSession(sessionKey)
+  function sendBlockedReason(sessionKey: string, allowed?: (item: PromptAnnotation) => boolean): 'editing' | 'too-long' | null {
+    if (Object.entries(overlayOwnerSessions.value).some(([id, owner]) => (
+      owner === sessionKey && (!allowed || !annotations.value[id] || allowed(annotations.value[id]))
+    ))) return 'editing'
+    const items = activeDraftsForSession(sessionKey, allowed)
     return items.some(item => !promptAnnotationBodyWithinLimit(item.body)) ? 'too-long' : null
   }
   function beginOverlayEdit(annotationId: string, sessionKey: string) {
@@ -104,7 +112,13 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     return draftsForSession(sessionKey)
   }
   async function create(request: PromptAnnotationCreateRequest): Promise<PromptAnnotation> {
-    if (!request.selection.targetRef) throw new Error('The selected page is unavailable.')
+    if (!request.selection.targetRef && !request.resourceId && !request.selection.resourceId) {
+      throw new Error('The selected page is unavailable.')
+    }
+    const selection = request.officeSelection ? normalizeOfficeSelection(request.officeSelection) : null
+    if (request.officeSelection && (!selection || !request.revisionId || !/^[a-f0-9]{64}$/i.test(request.sha256 || ''))) {
+      throw new Error('The selected document version is unavailable.')
+    }
     if (!promptAnnotationBodyWithinLimit(request.body || '')) throw new Error('The annotation is too long.')
     if (draftsForSession(request.sessionKey).length >= PROMPT_ANNOTATION_MAX_COUNT) {
       throw new Error('The annotation limit has been reached.')
@@ -113,6 +127,9 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
       annotationId: request.annotationId, sessionKey: request.sessionKey,
       documentId: request.documentId, documentName: request.documentName || 'artifact',
       resourceId: request.resourceId || request.selection.resourceId,
+      revisionId: request.revisionId,
+      sha256: request.sha256,
+      ...(selection ? { selection } : {}),
       pagePath: request.pagePath,
       targetRef: request.selection.targetRef, locatorHint: request.selection.locatorHint,
       body: request.body || '', status: 'draft', tagName: request.selection.tagName,
@@ -163,6 +180,9 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
       if (current?.body === snapshot.body
         && current.targetRef === snapshot.targetRef
         && current.resourceId === snapshot.resourceId
+        && current.revisionId === snapshot.revisionId
+        && current.sha256 === snapshot.sha256
+        && JSON.stringify(current.selection) === JSON.stringify(snapshot.selection)
         && current.pagePath === snapshot.pagePath) {
         delete next[snapshot.annotationId]
         removedIds.push(snapshot.annotationId)

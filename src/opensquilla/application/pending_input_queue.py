@@ -176,7 +176,9 @@ class PendingQueueRejectedError(RuntimeError):
 
 
 class PendingEnqueueRejectedError(RuntimeError):
-    def __init__(self, reason: Literal["full", "cancelled", "dispatched", "conflict"]) -> None:
+    def __init__(
+        self, reason: Literal["full", "cancelled", "dispatched", "conflict", "session-unavailable"]
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
 

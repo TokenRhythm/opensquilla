@@ -2618,8 +2618,10 @@ class GoalService:
                             getattr(self.config, "runtime_budget_seconds", 3600)
                         ),
                         usage_limited=(
-                            failure_kind
-                            == ProviderFailureKind.INSUFFICIENT_CREDITS.value
+                            failure_kind in {
+                                ProviderFailureKind.INSUFFICIENT_CREDITS.value,
+                                ProviderFailureKind.USAGE_LIMIT.value,
+                            }
                         ),
                         successor_expected=successor_expected,
                         process_restart=cancellation_source == "gateway_shutdown",

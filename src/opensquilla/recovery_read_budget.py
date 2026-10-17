@@ -70,6 +70,12 @@ class ReadBudget:
         self._tasks.add(task)
         task.add_done_callback(self._finished)
 
+    @property
+    def has_pending_work(self) -> bool:
+        """Whether cancelled callers still own physical child work."""
+
+        return any(not task.done() for task in self._tasks)
+
     def _finished(self, task: asyncio.Task[Any]) -> None:
         self._tasks.discard(task)
         with contextlib.suppress(BaseException):

@@ -416,6 +416,7 @@ def migrate_config_payload(
     builder = _MigrationBuilder(payload=copy.deepcopy(data), original=copy.deepcopy(data))
 
     _strip_retired_product_features(builder)
+    _strip_video_duration_limit(builder)
     _strip_removed_sandbox_fields(builder)
     _normalize_memory_fields(builder, emit_diagnostics=emit_diagnostics)
     _normalize_agent_token_saving_fields(
@@ -444,6 +445,14 @@ def migrate_config_payload(
     builder.payload["config_version"] = LATEST_CONFIG_VERSION
 
     return builder.result()
+
+
+def _strip_video_duration_limit(builder: _MigrationBuilder) -> None:
+    """Discard the retired operator cap while preserving provider defaults."""
+    video = builder.payload.get("video_generation")
+    if isinstance(video, dict) and "max_duration_seconds" in video:
+        video.pop("max_duration_seconds")
+        builder.removed_fields.append("video_generation.max_duration_seconds")
 
 
 def _strip_retired_product_features(builder: _MigrationBuilder) -> None:

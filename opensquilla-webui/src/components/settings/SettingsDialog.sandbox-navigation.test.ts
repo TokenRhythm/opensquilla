@@ -214,7 +214,7 @@ afterEach(() => {
 })
 
 describe('SettingsDialog Sandbox navigation through the exposed save contract', () => {
-  it.each(['push', 'back', 'section'] as const)('saves a debounced edit before %s navigation unmounts Sandbox', async kind => {
+  it.each(['push', 'back', 'section', 'keyboard'] as const)('saves a debounced edit before %s navigation unmounts Sandbox', async kind => {
     await mountDialog()
     await editPath('C:/sandbox/edited')
     await vi.advanceTimersByTimeAsync(100)
@@ -223,6 +223,8 @@ describe('SettingsDialog Sandbox navigation through the exposed save contract', 
     let navigation: ReturnType<Router['push']> | undefined
     if (kind === 'push') navigation = router.push('/outside')
     else if (kind === 'back') router.back()
+    else if (kind === 'keyboard') document.querySelector<HTMLButtonElement>('#settings-rail-securityPrivacy')!
+      .dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }))
     else document.querySelector<HTMLButtonElement>('#settings-rail-general')!.click()
     await settle()
 

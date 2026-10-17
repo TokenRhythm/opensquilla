@@ -1,3 +1,6 @@
+import { compactionSkippedProviderFailure } from '@/utils/chat/compactionStatus'
+import { normalizeProviderRecovery, providerActivityModel, providerHttpStatus } from '@/utils/chat/providerRecovery'
+import { providerFailureKind } from '@/utils/chat/providerFailure'
 import type {
   ActivitySnapshotEntry,
   ActivitySnapshotV2,
@@ -20,7 +23,7 @@ const PHASES: Readonly<Record<string, ReadonlySet<string>>> = {
 const MAINTENANCE_STATES = new Set([
   'running', 'completed', 'skipped', 'stale', 'cancelled', 'failed',
 ])
-const MAINTENANCE_REASONS = new Set(['within_budget', 'within_compaction_budget'])
+const MAINTENANCE_REASONS = new Set(['within_budget', 'within_compaction_budget', 'summary_failed', 'suffix_summary_failed'])
 const RESOLUTIONS = new Set([
   'approved', 'denied', 'expired', 'unavailable', 'replied',
 ])
@@ -75,7 +78,8 @@ function parsePhase(
 ): ActivitySnapshotEntry | undefined {
   if (!onlyKeys(raw, [
     'type', 'id', 'order', 'kind', 'phase', 'at', 'ended_at', 'reason',
-    'retry_after_ms', 'retry_attempt', 'retry_limit', 'round',
+    'retry_after_ms', 'retry_attempt', 'retry_limit', 'round', 'http_status',
+    'model', 'from_model',
   ])) return undefined
   const kind = safeText(raw.kind, 32)
   const phase = safeText(raw.phase, 32)
@@ -94,9 +98,17 @@ function parsePhase(
     ended_at: endedAt,
   }
   if (kind === 'provider') {
+    for (const field of ['model', 'from_model'] as const) {
+      if (raw[field] === undefined) continue
+      const model = providerActivityModel(raw[field])
+      if (!model || field === 'from_model' && phase !== 'fallback') return undefined
+      entry[field] = model
+    }
+    if (phase === 'retry_wait' && providerHttpStatus(raw.http_status) !== undefined) entry.http_status = raw.http_status
     if (raw.reason !== undefined) {
-      if (raw.reason !== 'rate_limited') return undefined
-      entry.reason = 'rate_limited'
+      const reason = normalizeProviderRecovery({ phase, reason: raw.reason })?.reason
+      if (!reason || reason === 'unknown' && raw.reason !== 'unknown') return undefined
+      entry.reason = reason
     }
     for (const [field, maximum] of [
       ['retry_after_ms', 900_000],
@@ -116,11 +128,13 @@ function parsePhase(
     if (
       raw.reason !== undefined || raw.retry_after_ms !== undefined
       || raw.retry_attempt !== undefined || raw.retry_limit !== undefined
+      || raw.model !== undefined || raw.from_model !== undefined
     ) return undefined
   } else if (
     raw.reason !== undefined || raw.retry_after_ms !== undefined
     || raw.retry_attempt !== undefined || raw.retry_limit !== undefined
     || raw.round !== undefined
+    || raw.model !== undefined || raw.from_model !== undefined
   ) return undefined
   return entry
 }
@@ -222,9 +236,10 @@ function parseMaintenance(
   if (!onlyKeys(raw, [
     'type', 'id', 'order', 'maintenance_type', 'state', 'at',
     'ended_at', 'source', 'durability',
-    'reason',
+    'reason', 'recovery', 'failure_detail',
   ])) return undefined
-  const state = safeText(raw.state, 32)
+  const rawState = safeText(raw.state, 32)
+  const state = compactionSkippedProviderFailure(rawState, raw.reason, record(raw.failure_detail)?.failure_kind) ? 'failed' : rawState
   const at = safeInteger(raw.at, 1, MAX_TIMESTAMP)
   const endedAt = safeInteger(raw.ended_at, 1, MAX_TIMESTAMP)
   if (
@@ -239,6 +254,16 @@ function parseMaintenance(
     state,
     at,
     ended_at: endedAt,
+  }
+  if (state === 'running') {
+    const recovery = normalizeProviderRecovery(raw.recovery)
+    if (recovery) entry.recovery = recovery
+  }
+  if (state === 'failed') {
+    const failure = record(raw.failure_detail)
+    if (failure) entry.failure_detail = {
+      failure_kind: providerFailureKind(failure.failure_kind), http_status: providerHttpStatus(failure.http_status),
+    }
   }
   for (const field of ['source', 'durability'] as const) {
     if (raw[field] === undefined) continue
@@ -404,6 +429,8 @@ function phaseStatus(entry: ActivitySnapshotEntry): StatusPart | undefined {
     endedAt,
     activityOrder: entry.order,
     durability: 'durable',
+    providerRecovery: kind === 'provider' ? normalizeProviderRecovery({ ...entry, started_at: entry.at, activity_id: entry.id }) : undefined,
+    httpStatus: phase === 'retry_wait' ? providerHttpStatus(entry.http_status) : undefined,
   }
   if (kind === 'router') return { ...common, action: 'router:decided', label: 'Selecting model' }
   if (kind === 'state' && phase === 'thinking') {
@@ -482,6 +509,9 @@ export function activityStatusHistory(snapshot: ActivitySnapshotV2): StatusPart[
       source: safeText(entry.source, 64),
       durability: safeText(entry.durability, 64),
       reason: safeText(entry.reason, 64),
+      providerRecovery: state === 'running' ? normalizeProviderRecovery(entry.recovery) : undefined,
+      httpStatus: state === 'failed' ? providerHttpStatus(record(entry.failure_detail)?.http_status) : undefined,
+      failureKind: state === 'failed' ? providerFailureKind(record(entry.failure_detail)?.failure_kind) : undefined,
     }]
   })
 }
@@ -531,12 +561,17 @@ export function activityReasoningBlocks(
   return blocks
 }
 
-function transcriptTextSegments(message: ChatMessage): string[] {
+interface TranscriptTextSpan {
+  text: string
+  presentation?: 'intermediate' | 'answer'
+}
+
+function transcriptTextSegments(message: ChatMessage): TranscriptTextSpan[] {
   if (Array.isArray(message.timeline) && message.timeline.length) {
     const timelineTexts = message.timeline.flatMap(segment => {
       if (segment?.type !== 'text') return []
       const value = segment.raw ?? segment.text
-      return typeof value === 'string' && value ? [value] : []
+      return typeof value === 'string' && value ? [{ text: value, presentation: segment.presentation }] : []
     })
     if (timelineTexts.length) return timelineTexts
   }
@@ -544,9 +579,9 @@ function transcriptTextSegments(message: ChatMessage): string[] {
   const segmentTexts = persisted.flatMap(segment => {
     if (segment?.type !== 'text') return []
     const value = segment.text ?? segment.raw
-    return typeof value === 'string' && value ? [value] : []
+    return typeof value === 'string' && value ? [{ text: value, presentation: segment.presentation }] : []
   })
-  return segmentTexts.length ? segmentTexts : message.text ? [message.text] : []
+  return segmentTexts.length ? segmentTexts : message.text ? [{ text: message.text }] : []
 }
 
 function transcriptTools(message: ChatMessage): Map<string, string> | undefined {
@@ -590,6 +625,46 @@ function transcriptClarifyIds(message: ChatMessage): Set<string> {
   return ids
 }
 
+/**
+ * Persistence can coalesce a final answer and an appended delivery note.
+ * Only the last explicitly marked answer span may consume adjacent snapshot
+ * text spans, and only write phases may separate them. All other activity is
+ * a hard boundary. Retain the first authoritative order without splitting or
+ * moving content and never infer order from timestamps.
+ */
+function activityTextOrders(snapshot: ActivitySnapshotV2, texts: TranscriptTextSpan[], originalLengths?: readonly number[]): number[] | undefined {
+  if (originalLengths && (originalLengths.length !== texts.length
+    || originalLengths.some((length, index) => !Number.isSafeInteger(length) || length < texts[index]!.text.length))) return undefined
+  const entries = snapshot.entries.flatMap((entry, position) => (
+    entry.type === 'segment' && entry.segment_type === 'text'
+      ? [{ entry, position }] : []
+  ))
+  const orders: number[] = []
+  let cursor = 0
+  for (const [textIndex, span] of texts.entries()) {
+    const expectedLength = originalLengths?.[textIndex] ?? span.text.length
+    const first = entries[cursor]
+    if (!first) return undefined
+    let length = 0
+    let previousPosition = first.position
+    while (length < expectedLength) {
+      const current = entries[cursor]
+      if (!current || Number(current.entry.text_index) !== cursor) return undefined
+      if (length > 0) {
+        if (textIndex !== texts.length - 1 || span.presentation !== 'answer') return undefined
+        if (snapshot.entries.slice(previousPosition + 1, current.position)
+          .some(entry => entry.type !== 'phase' || entry.kind !== 'write')) return undefined
+      }
+      length += Number(current.entry.text_utf16_length)
+      previousPosition = current.position
+      cursor += 1
+    }
+    if (length !== expectedLength) return undefined
+    orders.push(first.entry.order)
+  }
+  return cursor === entries.length ? orders : undefined
+}
+
 /** Validate every transcript reference before allowing a complete v2 to render. */
 export function activitySnapshotMatchesMessage(
   snapshot: ActivitySnapshotV2,
@@ -599,20 +674,8 @@ export function activitySnapshotMatchesMessage(
   if (activityReasoningBlocks(snapshot, message.reasoning?.text ?? '', message.historyPayloadPreview?.reasoningUtf16Length) === undefined) {
     return false
   }
-  const textEntries = snapshot.entries
-    .filter(entry => entry.type === 'segment' && entry.segment_type === 'text')
-    .sort((a, b) => Number(a.text_index) - Number(b.text_index))
   const transcriptTexts = transcriptTextSegments(message)
-  const originalLengths = message.historyPayloadPreview?.textUtf16Lengths
-  if (
-    textEntries.length !== transcriptTexts.length
-    || (originalLengths !== undefined && originalLengths.length !== transcriptTexts.length)
-    || textEntries.some((entry, index) => (
-      (originalLengths !== undefined && (!Number.isSafeInteger(originalLengths[index])
-        || originalLengths[index]! < transcriptTexts[index]!.length))
-      || Number(entry.text_utf16_length) !== (originalLengths?.[index] ?? transcriptTexts[index]!.length)
-    ))
-  ) return false
+  if (activityTextOrders(snapshot, transcriptTexts, message.historyPayloadPreview?.textUtf16Lengths) === undefined) return false
 
   const transcriptToolMap = transcriptTools(message)
   if (!transcriptToolMap) return false
@@ -633,15 +696,17 @@ export function activitySnapshotMatchesMessage(
 export function applyActivityOrdersToTimeline(
   items: ChatStreamTimelineItem[],
   snapshot: ActivitySnapshotV2 | undefined,
+  originalTextLengths?: readonly number[],
 ): ChatStreamTimelineItem[] {
   if (!snapshot?.complete) return items
-  const textOrder = new Map<number, number>()
+  const textOrder = activityTextOrders(snapshot, items.flatMap(item => (
+    item.type === 'text' ? [{ text: item.rawText ?? '', presentation: item.presentation }] : []
+  )), originalTextLengths)
+  if (!textOrder) return items
   const toolOrder = new Map<string, number>()
   const interruptOrder = new Map<string, number>()
   for (const entry of snapshot.entries) {
-    if (entry.type === 'segment' && entry.segment_type === 'text') {
-      textOrder.set(Number(entry.text_index), entry.order)
-    } else if (entry.type === 'segment' && entry.segment_type === 'tool') {
+    if (entry.type === 'segment' && entry.segment_type === 'tool') {
       toolOrder.set(String(entry.tool_use_id), entry.order)
     } else if (entry.type === 'interrupt') {
       interruptOrder.set(String(entry.reference_id), entry.order)
@@ -650,7 +715,7 @@ export function applyActivityOrdersToTimeline(
   let textIndex = 0
   return items.map((item): ChatStreamTimelineItem => {
     if (item.type === 'text') {
-      const activityOrder = textOrder.get(textIndex++)
+      const activityOrder = textOrder[textIndex++]
       return activityOrder === undefined ? item : { ...item, activityOrder }
     }
     if (item.type === 'interrupt') {

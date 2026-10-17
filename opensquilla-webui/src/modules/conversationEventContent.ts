@@ -6,6 +6,7 @@ import type {
   ChatSteerDisposition,
   ChatUsagePayload,
   ToolPresentation,
+  ToolFileSnapshot,
 } from '@/types/chat'
 
 /** Presentation facts accepted by the existing conversation reducer. Each fact
@@ -30,10 +31,12 @@ export type ConversationEventIdentity = {
 }
 
 export type ConversationEventData = ConversationEventIdentity & {
+  toolInputPreview?: import('@/types/toolInputPreview').ToolInputPreview
   skillLoad?: import('@/types/skillLoads').SkillLoadReceipt
   progress?: TaskProgressSnapshot
   modelCapacity?: import('./providerConfiguration').ModelCapacityFailure
   execution_log_handle?: string
+  file_snapshot?: ToolFileSnapshot
   reason?: string
   status?: string
   run_status?: string
@@ -65,6 +68,7 @@ export type ConversationEventData = ConversationEventIdentity & {
   cache_write?: number
   cost_usd?: number
   model?: string
+  from_model?: string
   usage?: ConversationUsage
   /** Adapter-resolved terminal text: null means no authoritative replacement. */
   finalText?: string | null
@@ -84,6 +88,9 @@ export type ConversationEventData = ConversationEventIdentity & {
   sequence?: number
   terminal?: boolean
   terminal_text_snapshot?: string | null
+  httpStatus?: number
+  compactionRecovery?: import('@/types/parts').ProviderRecovery
+  compactionFailure?: { failureKind?: string; httpStatus?: number }
   activity_id?: string
   phase?: string
   retry_attempt?: number
@@ -200,11 +207,11 @@ export type ConversationEventContext = {
 
 type WithIdentity<K extends keyof ConversationEventData> = Pick<ConversationEventData, keyof ConversationEventIdentity | K>
 export type ConversationTextContent = WithIdentity<'text' | 'presentation' | 'model_call_id' | 'iteration' | 'text_truncated'>
-export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration' | 'execution_log_handle'>
+export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration' | 'execution_log_handle' | 'file_snapshot'>
 export type ConversationThinkingContent = WithIdentity<'text' | 'model_call_id' | 'iteration' | 'block_id' | 'block_index' | 'content_kind' | 'ended_at' | 'status'>
-export type ConversationCompactionContent = WithIdentity<'status' | 'compacted' | 'detail' | 'reason' | 'skip_reason' | 'source' | 'phase' | 'compaction_id' | 'sequence' | 'heartbeat' | 'heartbeat_at' | 'elapsed_ms' | 'stage' | 'refused' | 'safe_to_send' | 'applied' | 'durability' | 'user_visible' | 'intent'>
+export type ConversationCompactionContent = WithIdentity<'compactionRecovery' | 'compactionFailure' | 'status' | 'compacted' | 'detail' | 'reason' | 'skip_reason' | 'source' | 'phase' | 'compaction_id' | 'sequence' | 'heartbeat' | 'heartbeat_at' | 'elapsed_ms' | 'stage' | 'refused' | 'safe_to_send' | 'applied' | 'durability' | 'user_visible' | 'intent'>
 /** The physical request model is optional for older Gateway producers. */
-export type ConversationProviderActivity = WithIdentity<'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat' | 'model'>
+export type ConversationProviderActivity = WithIdentity<'httpStatus' | 'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat' | 'model' | 'from_model'>
 export type ConversationEnsembleProgress = WithIdentity<'event_type' | 'proposer_index' | 'proposer_label' | 'proposer_model' | 'proposer_provider' | 'watchdogMemberId' | 'sample_index' | 'elapsed_ms' | 'input_tokens' | 'output_tokens' | 'cost_usd' | 'error' | 'error_code'>
 export type ConversationAnswerReset = WithIdentity<'old_generation_epoch' | 'new_generation_epoch' | 'preserve_completed_tools' | 'authoritative_text_snapshot' | 'authoritative_reasoning_snapshot' | 'sequence' | 'terminal' | 'terminal_text_snapshot'>
 export type ConversationSubagentCompletion = WithIdentity<'type' | 'parent_session_key' | 'child_session_key' | 'status' | 'terminal_reason' | 'message_id'> & { result?: { text?: string; [key: string]: unknown } }

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-Hans" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>正式通知组件验收 · OpenSquilla</title>
+    <style>
+      html body #app { display: block; min-height: 100vh; height: auto; overflow: visible; }
+      .notification-fixture { width: min(900px, calc(100% - 40px)); margin: auto; padding: 28px 0 180px; }
+      .notification-fixture h1 { margin: 0 0 8px; font-size: 20px; }
+      .notification-fixture h2 { margin: 24px 0 12px; font-size: 16px; }
+      .notification-fixture p { color: var(--text-muted); font-size: var(--fs-sm); line-height: 1.6; }
+      .fixture-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+      .fixture-controls button, .fixture-controls select { color: var(--text); background: var(--bg-elevated); font: inherit; border: 1px solid var(--border); padding: 7px 10px; border-radius: var(--radius-control); }
+      .fixture-controls button:focus-visible, .fixture-controls select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .notification-fixture output { display: block; color: var(--text-muted); overflow-wrap: anywhere; font: 12px/1.6 var(--font-mono); }
+    </style>
+  </head>
+  <body><div id="app"></div><script type="module" src="./notification-feedback.ts"></script></body>
+</html>

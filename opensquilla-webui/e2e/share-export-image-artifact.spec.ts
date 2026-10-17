@@ -1,4 +1,6 @@
 import { test, expect, type Page, type Route } from '@playwright/test'
+import { chatHistoryPayload } from './support/session-read-fixtures'
+import { installSidebarFixture } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eshareimage'
@@ -20,61 +22,33 @@ const PNG_MAGENTA = Buffer.from(
   'base64',
 )
 
-// Seed one finished assistant turn that carries a single image artifact with a
-// thumbnail variant, rewriting chat.history in flight.
+// Use a complete synthetic conversation; this key is not owned by a real Gateway.
 async function seedHistory(page: Page) {
-  await page.routeWebSocket(/\/ws$/, ws => {
-    const server = ws.connectToServer()
-    const historyIds = new Set<string>()
-    ws.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
-          historyIds.add(String(frame.id))
-        }
-      } catch {}
-      server.send(message)
-    })
-    server.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
-          historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
-          frame.payload = {
-            messages: [
-              {
-                role: 'user',
-                text: '画一张蚂蚁搬砖',
-                id: 'msg-share-img-user',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: 'Here is the image.',
-                id: 'msg-share-img-assistant',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                artifacts: [
-                  {
-                    id: 'art-share-img',
-                    name: 'render.png',
-                    mime: 'image/png',
-                    size: 744448,
-                    download_url: '/api/v1/artifacts/art-share-img',
-                    thumbnail_url: '/api/v1/artifacts/art-share-img?variant=thumb',
-                  },
-                ],
-              },
-            ],
-            has_more: false,
-          }
-          ws.send(JSON.stringify(frame))
-          return
-        }
-      } catch {}
-      ws.send(message)
-    })
+  await installSidebarFixture(page, {
+    'chat.history': chatHistoryPayload([
+      {
+        role: 'user',
+        text: '画一张蚂蚁搬砖',
+        id: 'msg-share-img-user',
+        timestamp: Math.floor(Date.now() / 1000) - 120,
+      },
+      {
+        role: 'assistant',
+        text: 'Here is the image.',
+        id: 'msg-share-img-assistant',
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        artifacts: [
+          {
+            id: 'art-share-img',
+            name: 'render.png',
+            mime: 'image/png',
+            size: 744448,
+            download_url: '/api/v1/artifacts/art-share-img',
+            thumbnail_url: '/api/v1/artifacts/art-share-img?variant=thumb',
+          },
+        ],
+      },
+    ]),
   })
 }
 
@@ -90,7 +64,7 @@ test.describe('Share export with an image artifact', () => {
     await page.route('**/api/v1/artifacts/**', route => fulfillPng(route))
     await seedHistory(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // The assistant thumbnail must be a real, loaded <img> (its src is the
     // blob: URL) before we capture — otherwise the clone has nothing to embed.
@@ -102,7 +76,9 @@ test.describe('Share export with an image artifact', () => {
     const toast = page.getByText('Share export failed')
 
     // Enter share mode and select both bubbles, including the one with the image.
-    await page.getByRole('button', { name: /^Share/ }).first().focus()
+    await page.getByTestId('chat-session-actions-trigger').focus()
+    await page.keyboard.press('Enter')
+    await page.getByRole('menuitem', { name: 'Share', exact: true }).focus()
     await page.keyboard.press('Enter')
     const pickers = page.getByRole('button', { name: 'Add to share image' })
     await expect(pickers.first()).toBeVisible()

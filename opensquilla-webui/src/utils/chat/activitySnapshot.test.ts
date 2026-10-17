@@ -10,7 +10,7 @@ import {
   normalizeActivitySnapshot,
   restoreActivityInterruptTimeline,
 } from './activitySnapshot'
-import { projectAssistantActivityTimeline } from './assistantActivity'
+import { projectAssistantActivityTimeline, providerActivityLabel } from './assistantActivity'
 
 const snapshot: ActivitySnapshotV2 = {
   version: 2,
@@ -40,6 +40,50 @@ const snapshot: ActivitySnapshotV2 = {
 }
 
 describe('activitySnapshot v2', () => {
+  it('restores factual fallback legs and retains legacy snapshots without model names', () => {
+    const raw = { version: 2, task_id: 'turn-1', turn_id: 'turn-1', complete: true, reasoning_utf16_length: 0, entries: [
+      { type: 'phase', id: 'fallback-1', order: 1, kind: 'provider', phase: 'fallback', at: 1000, ended_at: 2000, model: 'model-b', from_model: 'model-a' },
+      { type: 'phase', id: 'fallback-2', order: 2, kind: 'provider', phase: 'fallback', at: 2000, ended_at: 3000, model: 'model-c', from_model: 'model-b' },
+      { type: 'phase', id: 'fallback-3', order: 3, kind: 'provider', phase: 'fallback', at: 3000, ended_at: 4000 },
+    ] }
+    const normalized = normalizeActivitySnapshot(raw)!
+    expect(normalized).toBeDefined()
+    const history = activityStatusHistory(normalized)
+    expect(history[0]?.providerRecovery).toMatchObject({ model: 'model-b', fromModel: 'model-a' })
+    expect(activityStatusHistory(normalizeActivitySnapshot({ ...raw, entries: normalized.entries })!)).toEqual(history)
+    const steps = projectAssistantActivityTimeline([], { lifecycle: 'failed', statusHistory: history }).statusSteps
+    expect(steps.map(step => providerActivityLabel(step).code)).toEqual(['chat.activity.provider.fallbackModelsPast', 'chat.activity.provider.fallbackModelsPast', 'chat.activity.provider.fallbackPast'])
+    expect(providerActivityLabel(steps[1]!).params).toEqual({ from: 'model-b', to: 'model-c' })
+    for (const fields of [{ model: 'a\nb' }, { from_model: 'a'.repeat(257) }, { phase: 'requesting', from_model: 'model-a' }]) {
+      expect(normalizeActivitySnapshot({ ...raw, entries: [{ ...raw.entries[0], ...fields }] })).toBeUndefined()
+    }
+  })
+  it('retains explicit HTTP provenance in history but never revives terminal recovery', () => {
+    const raw = { version: 2, task_id: 'turn-1', turn_id: 'turn-1', complete: true, reasoning_utf16_length: 0, entries: [
+      { type: 'phase', id: 'wait', order: 1, kind: 'provider', phase: 'retry_wait', at: 10_000, ended_at: 45_000, reason: 'provider_overloaded', retry_after_ms: 35_000, http_status: 503 },
+      { type: 'maintenance', id: 'cmp', order: 2, maintenance_type: 'context_compaction', state: 'skipped', reason: 'summary_failed', at: 50_000, ended_at: 60_000, failure_detail: { failure_kind: 'rate_limited', http_status: 429 } },
+    ] }
+    const normalized = normalizeActivitySnapshot(raw)!
+    expect(normalized).toBeDefined()
+    const history = activityStatusHistory(normalized)
+    expect(history[0]?.providerRecovery).toMatchObject({ reason: 'provider_overloaded', httpStatus: 503, startedAt: 10_000 })
+    expect(history[1]).toMatchObject({ state: 'failed', httpStatus: 429, failureKind: 'rate_limited' })
+    expect(history[1]?.providerRecovery).toBeUndefined()
+    expect(activityStatusHistory(normalizeActivitySnapshot({ ...raw, entries: normalized.entries })!)).toEqual(history)
+  })
+
+  it.each(['summary_failed', 'suffix_summary_failed'])('retains an unclassified HTTP failure for refused compaction %s', reason => {
+    const raw = { version: 2, task_id: 'turn-1', turn_id: 'turn-1', complete: true, reasoning_utf16_length: 0, entries: [
+      { type: 'maintenance', id: 'cmp-unknown', order: 1, maintenance_type: 'context_compaction', state: 'skipped', reason, at: 50_000, ended_at: 60_000, failure_detail: { failure_kind: 'unknown', http_status: 418 } },
+    ] }
+    const normalized = normalizeActivitySnapshot(raw)!
+    const history = activityStatusHistory(normalized)
+    expect(history[0]).toMatchObject({ state: 'failed', httpStatus: 418 })
+    expect(history[0]?.failureKind).toBeUndefined()
+    expect(history[0]?.providerRecovery).toBeUndefined()
+    expect(activityStatusHistory(normalizeActivitySnapshot({ ...raw, entries: normalized.entries })!)).toEqual(history)
+  })
+
   it('keeps original chronology for explicitly shortened reasoning and text previews', () => {
     const message: ChatMessage = {
       role: 'assistant', text: 'fi', ts: 1,
@@ -55,7 +99,7 @@ describe('activitySnapshot v2', () => {
       { text: 'A', activityOrder: 6, id: 'reasoning-1' },
     ])
     const timeline: ChatStreamTimelineItem[] = [{ type: 'text', key: 'first', rawText: 'fi', html: 'fi' }]
-    expect(applyActivityOrdersToTimeline(timeline, snapshot)[0]?.activityOrder).toBe(31)
+    expect(applyActivityOrdersToTimeline(timeline, snapshot, message.historyPayloadPreview?.textUtf16Lengths)[0]?.activityOrder).toBe(31)
     expect(activitySnapshotMatchesMessage(snapshot, { ...message, historyPayloadPreview: undefined })).toBe(false)
     expect(activitySnapshotMatchesMessage(snapshot, {
       ...message, historyPayloadPreview: { ...message.historyPayloadPreview, textUtf16Lengths: [6] },
@@ -76,6 +120,56 @@ describe('activitySnapshot v2', () => {
     ])
     expect(activityReasoningBlocks(physical, 'A😀 wrong', 10)).toBeUndefined()
   })
+  it('retains chronology when persistence joins adjacent final answer and delivery text', () => {
+    const coalesced: ActivitySnapshotV2 = {
+      ...snapshot,
+      entries: [...snapshot.entries,
+        { type: 'segment', id: 'text:1', order: 51, segment_type: 'text', text_index: 1, text_utf16_length: 8 },
+        { type: 'phase', id: 'write:3:61', order: 61, kind: 'write', phase: 'writing', round: 3 },
+        { type: 'segment', id: 'text:2', order: 61, segment_type: 'text', text_index: 2, text_utf16_length: 4 },
+      ],
+    }
+    const message: ChatMessage = {
+      role: 'assistant', text: 'firstanswer😀note', ts: 1,
+      reasoning: { text: 'A😀', seconds: 2 },
+      tool_calls: [
+        { type: 'text', text: 'first', presentation: 'intermediate' },
+        { type: 'tool_use', tool_use_id: 'tool-1', name: 'skill_view', input: {} },
+        { type: 'tool_result', tool_use_id: 'tool-1', name: 'skill_view', result: 'ok' },
+        { type: 'text', text: 'answer😀note', presentation: 'answer' },
+      ],
+    }
+    expect(activitySnapshotMatchesMessage(coalesced, message)).toBe(true)
+    expect(activityReasoningBlocks(coalesced, 'A😀')?.[0]?.activityOrder).toBe(6)
+    const textItems: ChatStreamTimelineItem[] = ['first', 'answer😀note'].map((rawText, index) => ({
+      type: 'text', key: `text-${index}`, rawText, html: rawText,
+      presentation: index === 1 ? 'answer' : 'intermediate',
+    }))
+    expect(applyActivityOrdersToTimeline(textItems, coalesced).map(item => item.activityOrder)).toEqual([31, 51])
+    expect(textItems.map(item => item.type === 'text' ? item.rawText : '')).toEqual(['first', 'answer😀note'])
+
+    // Matching lengths never authorizes crossing another kind of activity.
+    for (const barrier of [
+      { type: 'phase', kind: 'provider', phase: 'reasoning' },
+      { type: 'segment', segment_type: 'tool' },
+      { type: 'reasoning' }, { type: 'interrupt' }, { type: 'maintenance' },
+    ] as const) {
+      const separated = { ...coalesced, entries: coalesced.entries.map(entry =>
+        entry.id === 'write:3:61' ? { ...entry, ...barrier } : entry) }
+      expect(applyActivityOrdersToTimeline(textItems, separated)).toBe(textItems)
+    }
+    for (const presentation of ['intermediate', undefined] as const) {
+      expect(activitySnapshotMatchesMessage(coalesced, {
+        ...message, tool_calls: message.tool_calls?.map(segment =>
+          segment.text === 'answer😀note' ? { ...segment, presentation } : segment),
+      })).toBe(false)
+    }
+    expect(activitySnapshotMatchesMessage(coalesced, {
+      ...message, tool_calls: message.tool_calls?.map(segment =>
+        segment.text === 'answer😀note' ? { ...segment, text: 'answer😀' } : segment),
+    })).toBe(false)
+  })
+
   it('restores temporary maintenance without promoting it to a saved summary', () => {
     const normalized = normalizeActivitySnapshot({
       version: 2, task_id: 'turn-1', turn_id: 'turn-1',

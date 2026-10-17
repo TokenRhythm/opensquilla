@@ -36,6 +36,7 @@ interface ResizeObserverFixture {
 }
 
 const mountedApps: App<Element>[] = []
+let fixtureId = 0
 
 function stubResizeObservers(): ResizeObserverFixture[] {
   const observers: ResizeObserverFixture[] = []
@@ -105,6 +106,8 @@ function makeThread(
   dimensions: ThreadDimensions = {},
 ): ThreadFixture {
   const container = document.createElement('div')
+  const anchorPrefix = `chat-turn-fixture-${++fixtureId}`
+  const messageAnchorId = (index: number) => `${anchorPrefix}-${index}`
   const clientHeight = dimensions.clientHeight ?? 600
   const offsets = rendered
     .map((entry, sourceIndex) => ({ entry, sourceIndex }))
@@ -126,7 +129,7 @@ function makeThread(
     if (entry.displayRole !== 'user') return
     const turnIndex = rendered.slice(0, sourceIndex).filter(item => item.displayRole === 'user').length
     const anchor = document.createElement('div')
-    anchor.id = `chat-turn-${sourceIndex}`
+    anchor.id = messageAnchorId(sourceIndex)
     anchor.dataset.chatTurnKey = chatMessageKey(entry, sourceIndex)
     anchor.tabIndex = -1
     anchor.getBoundingClientRect = () => rect(offsets[turnIndex] - container.scrollTop, 80)
@@ -140,7 +143,8 @@ function makeThread(
   container.scrollTo = scrollTo as unknown as typeof container.scrollTo
   const geometryVersion = ref(0)
   const virtualizer: ChatMessageListVirtualizer = {
-    ensureMessageVisible: vi.fn(async index => container.querySelector<HTMLElement>(`#chat-turn-${index}`)),
+    messageAnchorId,
+    ensureMessageVisible: vi.fn(async index => container.querySelector<HTMLElement>(`#${messageAnchorId(index)}`)),
     releaseEnsuredMessage: vi.fn(),
     messageIndexAtOffset: vi.fn(offset => Math.max(0, Math.floor(offset / 200))),
     scrollToMessage: vi.fn((index, options) => {
@@ -375,7 +379,7 @@ describe('ConversationMinimap', () => {
     const releaseEnsuredMessage = vi.fn()
     const ensureMessageVisible = vi.fn(async (sourceIndex: number) => {
       const anchor = document.createElement('div')
-      anchor.id = `chat-turn-${sourceIndex}`
+      anchor.id = mounted.thread.virtualizer.messageAnchorId(sourceIndex)
       anchor.dataset.chatTurnKey = `user-${sourceIndex / 2}`
       anchor.tabIndex = -1
       anchor.getBoundingClientRect = () => rect((sourceIndex / 2) * 400 - (threadContainer?.scrollTop || 0), 80)
@@ -396,6 +400,29 @@ describe('ConversationMinimap', () => {
     expect(mounted.thread.scrollTo).toHaveBeenLastCalledWith({ top: 1_184, behavior: 'smooth' })
     mounted.thread.container.dispatchEvent(new Event('scrollend'))
     await vi.waitFor(() => expect(releaseEnsuredMessage).toHaveBeenCalledWith(6))
+  })
+
+  it('uses each list anchor identity for controls and arrival when two conversations coexist', async () => {
+    const mainEnd = vi.fn()
+    const sideEnd = vi.fn()
+    const main = await mountMinimap(8, { sessionKey: 'parent', onNavigateEnd: mainEnd })
+    const side = await mountMinimap(8, { sessionKey: 'child', onNavigateEnd: sideEnd })
+    const mainTarget = main.thread.container.querySelector<HTMLElement>('[data-chat-turn-key="user-3"]')!
+    const sideTarget = side.thread.container.querySelector<HTMLElement>('[data-chat-turn-key="user-3"]')!
+    expect(mainTarget.id).not.toBe(sideTarget.id)
+    expect(markers(main.host)[3].getAttribute('aria-controls')).toBe(mainTarget.id)
+    expect(markers(side.host)[3].getAttribute('aria-controls')).toBe(sideTarget.id)
+
+    markers(side.host)[3].click()
+    await vi.waitFor(() => expect(sideEnd).toHaveBeenCalledOnce())
+    expect(sideTarget.classList.contains('is-history-target')).toBe(true)
+    expect(mainTarget.classList.contains('is-history-target')).toBe(false)
+    expect(main.thread.scrollTo).not.toHaveBeenCalled()
+    expect(mainEnd).not.toHaveBeenCalled()
+
+    markers(main.host)[3].click()
+    await vi.waitFor(() => expect(mainEnd).toHaveBeenCalledOnce())
+    expect(mainTarget.classList.contains('is-history-target')).toBe(true)
   })
 
   it('pairs navigation lifecycle when deferred materialization is cancelled', async () => {
@@ -570,7 +597,7 @@ describe('ConversationMinimap', () => {
 
     messageState.value = [message('user', 99), message('assistant', 99), ...initialMessages]
     thread.container.querySelectorAll<HTMLElement>('[data-chat-turn-key]').forEach((anchor, index) => {
-      anchor.id = `chat-turn-${index * 2 + 2}`
+      anchor.id = thread.virtualizer.messageAnchorId(index * 2 + 2)
       thread.offsets[index] += 400
     })
     await nextTick()
@@ -598,7 +625,7 @@ describe('ConversationMinimap', () => {
 
     messageState.value = [message('user', 99), message('assistant', 99), ...initialMessages]
     thread.container.querySelectorAll<HTMLElement>('[data-chat-turn-key]').forEach((anchor, index) => {
-      anchor.id = `chat-turn-${index * 2 + 2}`
+      anchor.id = thread.virtualizer.messageAnchorId(index * 2 + 2)
       thread.offsets[index] += 400
     })
     await nextTick()

@@ -65,7 +65,7 @@ async function openHistory(
     })
   })
   await page.goto('/control/chat?session=' + encodeURIComponent(SESSION))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 }
 
 test('ordinary assistant history hydrates automatically and offers local retry after failure', async ({ page }) => {
@@ -215,6 +215,11 @@ test('ordinary user history hydrates ranges into one message without manual page
   })
   await openHistory(page, { view: 'raw', byteLength: body.byteLength }, 'user')
   const thread = page.locator('.chat-thread')
+  await expect(thread.locator('.msg-user[data-message-id="answer"]')).toBeVisible()
+  // Content ranges are fetched after the initial preview is mounted. Wait for
+  // the explicit hydration status to disappear before asserting the complete
+  // body, otherwise a slow runner races the preview replacement.
+  await expect(page.getByTestId('chat-history-content-hydration')).toHaveCount(0, { timeout: 30_000 })
   await expect(thread.locator('.msg-user[data-message-id="answer"]')).toContainText(body.toString('utf-8'))
   await expect(thread).not.toContainText('Visible preview.')
   await expect(page.getByTestId('chat-history-content-hydration')).toHaveCount(0)

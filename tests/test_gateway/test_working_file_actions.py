@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -175,12 +176,23 @@ async def test_auth_origin_and_session_are_required(files):
     assert (await get(client, documents[0], format="other")).status_code == 400
 
 
-async def test_deleted_source_and_symlink_never_fall_back_to_snapshot(files):
+async def test_deleted_source_never_falls_back_to_snapshot(files):
     client, documents, root, *_ = files
     page = root / "one/editorial.html"
     page.unlink()
     assert (await get(client, documents[0], pagePath="editorial.html")).status_code == 404
-    page.symlink_to(root / "two/index.html")
+
+
+async def test_symlink_source_never_falls_back_to_snapshot(files):
+    client, documents, root, *_ = files
+    page = root / "one/editorial.html"
+    page.unlink()
+    try:
+        page.symlink_to(root / "two/index.html")
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     assert (await get(client, documents[0], pagePath="editorial.html")).status_code == 404
 
 

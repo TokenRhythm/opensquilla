@@ -1,3 +1,6 @@
+import { compactionSkippedProviderFailure } from '@/utils/chat/compactionStatus'
+import type { ProviderRecovery } from '@/types/parts'
+import { providerActivityStatus } from '@/utils/chat/conversationActivity'
 import { mergeSkillLoad, skillLoadsFromSegments, type SkillLoadReceipt } from '@/types/skillLoads'
 import type {
   ConversationAnswerReset,
@@ -78,6 +81,7 @@ export interface ChatUsageAccumulator {
 }
 
 export interface ChatRpcStreamApi {
+  applyToolInputPreview?: (preview: import('@/types/toolInputPreview').ToolInputPreview, activityOrder: number, existingOnly?: boolean) => boolean
   isStreaming: Ref<boolean>
   streamBubble: Ref<boolean>
   streamHasVisibleOutput: Ref<boolean>
@@ -108,7 +112,7 @@ export interface ChatRpcStreamApi {
     finalText: string | null | undefined,
     modelCallSegments?: ChatModelCallSegment[] | null,
   ) => void
-  resetLiveTurnState?: () => void
+  resetLiveTurnState?: (options?: { preservePendingInterrupts?: boolean }) => void
   resetAnswerGeneration?: (options?: {
     textSnapshot?: string
     preserveCompletedTools?: boolean
@@ -117,7 +121,7 @@ export interface ChatRpcStreamApi {
   resetStreamIdleTimer: (opts?: { progress?: boolean }) => void
   clearStreamIdleTimer: () => void
   setStreamActivity: (label: string, key?: string) => void
-  recordActivityPhase?: (label: string, key?: string) => void
+  recordActivityPhase?: (label: string, key?: string, recovery?: ProviderRecovery) => void
   setAcceptedActivityStartedAt?: (value: number | undefined) => void
   restoreStatusHistory?: (entries: readonly StatusPart[]) => void
   recordCompactionActivity?: (payload: ConversationCompactionContent) => void
@@ -126,7 +130,6 @@ export interface ChatRpcStreamApi {
   // Accepted reasoning events enter the stream-owned turn log.
   appendFrame: (frame: FrameInput) => void
   setAcceptedActivityOrder?: (order: number | undefined) => void
-  noteReasoningPresentationDelta?: (text: string) => void
   getThinkingText?: () => string
 }
 
@@ -240,26 +243,6 @@ const MAX_TRACKED_COMMITTED_TURNS = 64
 const TURN_COMMIT_TIMEOUT_MS = 5_000
 const SERVER_CLOCK_TOLERANCE_MS = 5_000
 const MAX_TRUSTED_REASONING_AGE_MS = 60 * 60 * 1_000
-const PROVIDER_ACTIVITY_PHASES = new Set([
-  'requesting',
-  'reasoning',
-  'retry_wait',
-  'retrying',
-  'fallback',
-])
-const PROVIDER_ACTIVITY_REASONS = new Set([
-  'initial',
-  'rate_limited',
-  'provider_overloaded',
-  'transport_transient',
-  'reasoning_only',
-  'empty_response',
-  'stream_incomplete',
-  'invalid_response',
-  'context_overflow',
-  'unknown',
-])
-
 const COMPACTION_TERMINAL_STATUSES = new Set([
   'completed',
   'skipped',
@@ -564,7 +547,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function settleCommittedCompactionActivity(payload: ConversationCompactionContent): boolean {
     const id = payloadCompactionId(payload)
-    const state = compactionTerminalActivityState(compactionStatus(payload))
+    const state = compactionSkippedProviderFailure(compactionStatus(payload), payload.reason || payload.skip_reason, payload.compactionFailure?.failureKind)
+      ? 'failed' : compactionTerminalActivityState(compactionStatus(payload))
     if (!id || !state) return false
 
     for (let messageIndex = messages.value.length - 1; messageIndex >= 0; messageIndex -= 1) {
@@ -580,6 +564,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
             ? 'request_scoped'
             : String(payload.durability || marker.durability || ''),
           reason: String(payload.reason || payload.skip_reason || marker.reason || ''),
+          providerRecovery: undefined,
+          httpStatus: state === 'failed' ? payload.compactionFailure?.httpStatus : undefined,
+          failureKind: state === 'failed' ? payload.compactionFailure?.failureKind : undefined,
           // The lifecycle stays anchored where its started frame first appeared.
           at: marker.at,
         }
@@ -861,6 +848,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         handleSkillLoad(payload)
       } else if (event === 'tool-use-started') {
         handleRpcToolUseStart(payload)
+      } else if (event === 'tool-input-preview') {
+        handleRpcToolInputPreview(payload, entry.replayed)
       } else if (event === 'tool-use-delta') {
         handleRpcToolUseDelta(payload)
       } else if (event === 'tool-use-ended') {
@@ -912,7 +901,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     recoveryDirty = false
 
     steerDelivery.resetTransientBoundaries()
-    stream.resetLiveTurnState?.()
+    // Approval hydration is independent of this session's live snapshot and
+    // may finish first. Replacing the stream projection must not discard an
+    // actionable request; session/epoch retirement still uses a full reset.
+    stream.resetLiveTurnState?.({ preservePendingInterrupts: true })
     clearLiveThinking()
     clearGenerationTracking()
     pendingTerminalEvents.clear()
@@ -969,7 +961,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         event: entry.event,
         payload: { ...entry.payload },
         replayWithoutSeq: true,
-        replayed: true,
+        // A coalesced authoritative live draft is a current base; ordinary
+        // reconnect replay still cannot create a generating draft.
+        replayed: entry.event !== 'tool-input-preview',
       })
     }
     if (snapshot.streamGeneration && options.streamGeneration) options.streamGeneration.value = snapshot.streamGeneration
@@ -1069,7 +1063,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function appendThinkingDelta(text: string, payload: ConversationEventData) {
     if (!text) return
     if (!stream.isStreaming.value) stream.startStreaming()
-    stream.noteReasoningPresentationDelta?.(text)
+    // Actual reasoning owns the current phase even when a compatibility
+    // stream omits provider_activity, or resumes reasoning between its pulses.
+    recordActivityPhase('Thinking deeply', 'provider:reasoning')
     const current = streamThinking.value
     if (!current) {
       const now = Date.now()
@@ -1342,9 +1338,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     return payload.activityStartedAt
   }
 
-  function recordActivityPhase(label: string, key = label) {
+  function recordActivityPhase(label: string, key = label, recovery?: ProviderRecovery) {
     if (stream.recordActivityPhase) {
-      stream.recordActivityPhase(label, key)
+      stream.recordActivityPhase(label, key, recovery)
     } else {
       stream.setStreamActivity(label, key)
     }
@@ -1614,6 +1610,27 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.appendToolCall(payload)
   }
 
+  function handleRpcToolInputPreview(payload: ConversationEventData, replayed = false) {
+    if (isStaleEpoch(payload) || aborted.value || !payload.toolInputPreview) return
+    const preview = payload.toolInputPreview
+    if (replayed && preview.state === 'generating') return
+    // This is a new live-only contract: unlike legacy deltas, an unscoped or
+    // unsequenced draft must never be allowed to reopen a completed turn.
+    const activityOrder = replayActivityOrder ?? payload.stream_seq
+    if (!payloadTurnId(payload) || !payload.key || !Number.isSafeInteger(activityOrder) || Number(activityOrder) <= 0) return
+    if (bufferPendingStreamEvent('tool-input-preview', payload, replayed)) return
+    if (!isCurrentTaskPayload(payload) || !isCurrentGenerationPayload(payload)) return
+    if (!acceptStreamSeq(payload)) return
+    if (!stream.isStreaming.value) {
+      if (preview.state !== 'generating') return
+      stream.startStreaming()
+    }
+    // Replayed terminal facts may close an already visible draft, but cannot
+    // create a row or tombstone an unrelated/new preview identity.
+    if (stream.applyToolInputPreview?.(preview, Number(activityOrder), replayed)
+      && preview.state === 'generating') stream.resetStreamIdleTimer()
+  }
+
   function handleRpcToolUseDelta(payload: ConversationToolContent) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
@@ -1697,7 +1714,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     if (!stream.isStreaming.value) stream.startStreaming()
-    // This phase is emitted only when buffered tool arguments grow by 4096 characters.
+    // This phase follows actual parameter growth: the first fragment, then
+    // byte-volume/time-throttled updates while new fragments keep arriving.
     // It proves model output progress, but not a committed/executing tool call.
     // All periodic heartbeats remain transport liveness only.
     if (payload.phase === 'llm_tool_arguments') {
@@ -1711,12 +1729,6 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }
 
-  function providerActivityCounter(raw: unknown, maximum: number): number {
-    const value = Number(raw)
-    if (!Number.isFinite(value)) return 0
-    return Math.min(maximum, Math.max(0, Math.floor(value)))
-  }
-
   function handleRpcProviderActivity(payload: ConversationProviderActivity) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
@@ -1725,14 +1737,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
 
-    const phase = String(payload.phase || '')
-    const reason = String(payload.reason || 'unknown')
-    if (!PROVIDER_ACTIVITY_PHASES.has(phase)) return
-    const safeReason = PROVIDER_ACTIVITY_REASONS.has(reason) ? reason : 'unknown'
-    const attempt = providerActivityCounter(payload.retry_attempt, 10_000)
-    const limit = providerActivityCounter(payload.retry_limit, 10_000)
-    const retryAfterMs = providerActivityCounter(payload.retry_after_ms, 900_000)
-    const retryAfterSeconds = Math.ceil(retryAfterMs / 1000)
+    const status = providerActivityStatus(payload)
+    if (!status) return
     const model = String(payload.model || '').trim()
     const turnId = String(payload.turn_id || payload.task_id || '').trim() || undefined
 
@@ -1741,28 +1747,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.markEnsembleHandoff(turnId)
     if (model) options.updateRouterExecutionModel?.(model, turnId)
 
-    if (phase === 'requesting') {
-      recordActivityPhase('Waiting for model', 'provider:requesting')
-    } else if (phase === 'reasoning') {
-      recordActivityPhase('Thinking deeply', 'provider:reasoning')
-    } else if (phase === 'retry_wait' && safeReason === 'rate_limited') {
-      recordActivityPhase(
-        `Rate limited · ${retryAfterSeconds}s`,
-        `provider:rate_limited:${retryAfterSeconds}`,
-      )
-    } else if (phase === 'retry_wait') {
-      recordActivityPhase(
-        `Waiting to retry · ${retryAfterSeconds}s`,
-        `provider:retry_wait:${retryAfterSeconds}`,
-      )
-    } else if (phase === 'retrying') {
-      recordActivityPhase(
-        limit > 0 ? `Retrying ${attempt}/${limit}` : `Retrying · attempt ${attempt}`,
-        `provider:retrying:${attempt}:${limit}`,
-      )
-    } else if (phase === 'fallback') {
-      recordActivityPhase('Switching to backup model', 'provider:fallback')
-    }
+    recordActivityPhase(status.label, status.action, status.providerRecovery)
   }
 
   function handleRpcCompaction(payload: ConversationCompactionContent, meta: ConversationEventContext = {}) {
@@ -2276,6 +2261,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       eventKind === 'approval-requested'
     ) {
       if (!isCurrentSessionPayload(payloadObj)) return
+      // Approval requests can exist independently of a running conversation
+      // (for example a recovered request in the approval queue). They own an
+      // interrupt, not a task. Only mark an existing execution as interrupted;
+      // otherwise an unscoped request leaves the composer locked forever after
+      // resolution, since no task terminal event will follow it.
+      if (!stream.isStreaming.value && !options.taskOwnership?.runningTaskId.value) return
+      if (!isCurrentTaskPayload(payloadObj)) return
       options.applySessionRunState({
         run_status: 'approval_pending',
         active_task: { ...(payloadObj || {}), status: 'approval_pending' },
@@ -2605,6 +2597,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         case 'tool-use-started':
           handleRpcToolUseStart(event.payload)
           break
+        case 'tool-input-preview':
+          handleRpcToolInputPreview(event.payload, event.meta.replayed === true)
+          break
         case 'tool-use-delta':
           handleRpcToolUseDelta(event.payload)
           break
@@ -2755,6 +2750,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     onAnswerGenerationReset: handleRpcAnswerGenerationReset,
     onTextDelta: handleRpcTextDelta,
     onToolUseStart: handleRpcToolUseStart,
+    onToolInputPreview: handleRpcToolInputPreview,
     onToolUseDelta: handleRpcToolUseDelta,
     onToolUseEnd: handleRpcToolUseEnd,
     onToolResult: handleRpcToolResult,

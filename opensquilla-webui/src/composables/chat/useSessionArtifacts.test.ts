@@ -56,7 +56,7 @@ function makeHarness(options: {
     rememberUnsupportedMethod: vi.fn(),
     call: callMock as unknown as RpcCall,
   }
-  const catalog: ArtifactCatalog = {
+  const catalog: Pick<ArtifactCatalog, 'listSession'> = {
     async listSession(key, request = {}) {
       try {
         await rpc.ready(10_000, request.signal, {

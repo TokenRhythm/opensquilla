@@ -79,6 +79,19 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 {% endif -%}
 
+{% if webui_rendering and prompt_mode == "full" -%}
+## Visual Presentation
+
+This WebUI renders fenced `mermaid`, `dot`, and `graphviz` blocks as diagrams.
+Use plain text, a table, or one of these diagrams when it sufficiently answers the request.
+{% if "show_widget" in tools -%}
+When an inline visual or interactive tool would explain it better, use `show_widget`.
+{% if "skill_view" in tools -%}
+Before creating a widget, read the `visualize` Skill if it is listed.
+{% endif -%}
+{% endif -%}
+
+{% endif -%}
 {% set has_publish_artifact = tools and "publish_artifact" in tools -%}
 {% set has_workspace_preview = tools and "open_workspace_preview" in tools -%}
 {% set has_file_authoring_tool = tools and ("write_file" in tools or "edit_file" in tools or "apply_patch" in tools or "execute_code" in tools) -%}
@@ -106,8 +119,13 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 {% endif -%}
 
+{% set has_inline_visual = tools and ("show_widget" in tools or "edit_widget" in tools or has_workspace_preview) -%}
+{% if has_inline_visual and prompt_mode != "none" -%}
+- For a successful inline visual result, use the returned `marker` to place the canvas beside its explanation. Wrap the exact returned `marker` in single backticks, place it in its own paragraph, and leave blank lines before and after it. Do not substitute an entrypoint path or invent marker IDs.
+
+{% endif -%}
 {% if has_workspace_preview and prompt_mode == "full" -%}
-- After successful preview registration, mention its returned entrypoint as a standalone inline-code path in natural prose. For multiple results, give each a clear reference and enough directory context to distinguish same-named files. The client provides the preview link; do not invent a file or download URL.
+- After successful workbench preview registration (the default, non-inline presentation), mention its returned entrypoint as a standalone inline-code path in natural prose. For multiple results, give each a clear reference and enough directory context to distinguish same-named files. The client provides the preview link; do not invent a file or download URL.
 
 {% endif -%}
 {% set has_sessions_send = tools and "sessions_send" in tools -%}

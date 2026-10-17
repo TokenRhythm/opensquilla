@@ -343,7 +343,23 @@ try {
   },origin)
   assert.notEqual(replacement.targetRef,first.targetRef)
   assert.equal((await invoke({operation:'screenshot',targetRef:first.targetRef})).status,404)
-  assert.equal((await invoke({operation:'open',url:'file:///synthetic/denied.html'})).status,409)
+  const targetsBeforeInvalidUrls = (await invoke({operation:'list'})).targets
+  for (const url of ['synthetic.test', 'https://', 'file:///synthetic/denied.html',
+    'about:blank#fragment', 'https://synthetic-user:synthetic-secret@synthetic.test/']) {
+    for (const targetRef of [undefined, replacement.targetRef]) {
+      const failure = await invoke({operation:'open',url,targetRef})
+      assert.equal(failure.status,400)
+      assert.equal(failure.code,'INVALID_REQUEST')
+      assert.equal(failure.phase,'argument_validation')
+      assert.equal(failure.contractVersion,1)
+      assert.equal(failure.outcome,'not_started')
+      assert.equal(failure.retryable,false)
+      assert.deepEqual(failure.issues,[{field:'url',rule:'enum',expected:'supported_value'}])
+      assert.equal(JSON.stringify(failure).includes(url),false)
+    }
+  }
+  assert.deepEqual((await invoke({operation:'list'})).targets,targetsBeforeInvalidUrls,
+    'invalid URLs must neither create pages nor navigate retained targets')
   const foregroundBeforeOpen = await app.evaluate(() => {
     const { manager, owner } = globalThis.browserFixture
     const record = manager.surfaces.get(manager.activeSurfaceId)
@@ -638,6 +654,8 @@ try {
   assert.deepEqual(actionState,{below:1,covered:0,obstruction:0})
   const crashTarget = await app.evaluate(async ({}, origin) => {
     const { manager } = globalThis.browserFixture
+    // This completed fixture no longer needs a native preview slot.
+    await manager.destroySurface('same-url', true)
     const created = await manager.createSurface({ version: 4, surfaceId: 'crash-target', kind: 'artifact-preview',
       payload: { launchUrl: origin+'/', expectedOrigin: origin, scopeId: 'session-a', mode: 'full' } })
     if (!created.ok) throw new Error(created.message || 'Crash target did not load.')
@@ -710,3 +728,5 @@ try {
   await new Promise(resolve=>server.close(resolve))
   await rm(root,{recursive:true,force:true})
 }
+
+await import('./test-workbench-retention-electron.mjs')

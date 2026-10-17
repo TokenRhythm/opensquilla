@@ -1,5 +1,9 @@
 import { test, expect, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload, sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload, sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
@@ -111,7 +115,7 @@ async function seedHistoryWithTwoTurns(
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(helloOkResponse())
+          ws.send(helloOkResponse({ features: { methods: ['sessions.forkThroughTurn'] } }))
           return
         }
         if (method === 'sessions.forkThroughTurn') {
@@ -126,6 +130,7 @@ async function seedHistoryWithTwoTurns(
             ok: true,
             payload: {
               key: THROUGH_TURN_CHILD_KEY,
+              parentKey: SESSION_KEY,
               forkMode: 'through_turn',
               throughTurnId: frame.params?.throughTurnId,
             },
@@ -145,7 +150,7 @@ async function seedHistoryWithTwoTurns(
             type: 'res',
             id: frame.id,
             ok: true,
-            payload,
+            payload: chatHistoryPayload(payload.messages, payload),
           }))
           return
         }
@@ -154,13 +159,7 @@ async function seedHistoryWithTwoTurns(
             type: 'res',
             id: frame.id,
             ok: true,
-            payload: {
-              subscribed: true,
-              replay_complete: true,
-              current_stream_seq: 0,
-              hydration_complete: true,
-              run_status: 'idle',
-            },
+            payload: sessionMessagesSubscribePayload(String(frame.params?.key)),
           }))
           return
         }
@@ -169,11 +168,7 @@ async function seedHistoryWithTwoTurns(
             type: 'res',
             id: frame.id,
             ok: true,
-            payload: {
-              key: THROUGH_TURN_CHILD_KEY,
-              events: [],
-              current_stream_seq: 0,
-            },
+            payload: sessionMessagesSnapshotPayload(String(frame.params?.key)),
           }))
           return
         }
@@ -196,6 +191,7 @@ async function seedHistoryWithTwoTurns(
           ...extra,
         })
         const payloads: Record<string, unknown> = {
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(String(frame.params?.key)),
           'agents.list': { agents: [] },
           'commands.list_for_surface': { commands: [] },
           'config.get': {
@@ -323,11 +319,7 @@ async function mockBranchingEditRpc(
             type: 'res',
             id: frame.id,
             ok: true,
-            payload: {
-              messages: key === EDIT_CHILD_KEY ? childMessages : parentMessages,
-              history_scope: 'complete',
-              has_more: false,
-            },
+            payload: chatHistoryPayload(key === EDIT_CHILD_KEY ? childMessages : parentMessages),
           }))
           return
         }
@@ -341,12 +333,9 @@ async function mockBranchingEditRpc(
             skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(String(frame.params?.key)),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(String(frame.params?.key)),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(String(frame.params?.key)),
           'usage.status': { sessions: [] },
         }
         ws.send(JSON.stringify({
@@ -365,7 +354,7 @@ async function mockBranchingEditRpc(
 test.describe('Conversation fork', () => {
   test('empty draft offers no fork action', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.chat-textarea')).toBeVisible()
     await expect(page.locator(FORK_BUTTON)).toHaveCount(0)
@@ -374,7 +363,7 @@ test.describe('Conversation fork', () => {
   test('fork renders on every completed assistant turn', async ({ page }) => {
     await seedHistoryWithTwoTurns(page)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.msg-ai')).toHaveCount(2, { timeout: 10000 })
     await expect(page.locator(FORK_BUTTON)).toHaveCount(2)
@@ -389,7 +378,7 @@ test.describe('Conversation fork', () => {
     const capturedForks: CapturedForkRequest[] = []
     await seedHistoryWithTwoTurns(page, capturedForks)
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page.locator('.msg-ai')).toHaveCount(2, { timeout: 10000 })
 
     const firstAnswer = page.locator('.msg-ai').first()
@@ -427,7 +416,7 @@ test.describe('Conversation fork', () => {
     await mockBranchingEditRpc(page, capturedSends, historyRequests)
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(EDIT_PARENT_KEY))
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect(page.locator('.msg-user')).toHaveCount(3, { timeout: 10000 })
     await expect(page.locator('.msg-user').last()).toContainText('C marker must stay only on parent')
 
@@ -437,7 +426,7 @@ test.describe('Conversation fork', () => {
 
     // Editing B rewinds the local transcript to the point before B. Neither
     // B's old answer nor the later C turn may be carried into the new branch.
-    await expect(page.locator('.chat-textarea')).toHaveValue('B marker')
+    await expect(page.locator('.chat-textarea')).toHaveText('B marker')
     await expect(page.locator('.msg-user')).toHaveCount(1)
     await expect(page.locator('.chat-thread')).not.toContainText('ack B')
     await expect(page.locator('.chat-thread')).not.toContainText('C marker')
@@ -462,7 +451,7 @@ test.describe('Conversation fork', () => {
     // A fresh load proves the URL now addresses the child transcript, whose
     // canonical history ends at the edited B rather than replaying parent C.
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await expect.poll(() => historyRequests.filter(key => key === EDIT_CHILD_KEY).length).toBeGreaterThan(0)
     await expect(page.locator('.msg-user')).toHaveCount(2, { timeout: 10000 })
     await expect(page.locator('.chat-thread')).toContainText('B edited')
@@ -475,7 +464,7 @@ test.describe('Conversation fork', () => {
     test.setTimeout(300000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     // One real turn so the session exists with a transcript.
     const prompt = 'Reply with the single word: ok'
@@ -511,7 +500,7 @@ test.describe('Conversation fork', () => {
     // Hub: the fork lists under its parent with the FORK badge and indent,
     // and the parent still lists independently as a root row.
     await page.goto(CONTROL_URL + 'sessions')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await page.waitForTimeout(800)
     await expect(page.locator('.hub-ledger')).toBeVisible()
 

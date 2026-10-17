@@ -47,7 +47,10 @@ function harness(over: {
   canQueueMore?: boolean
   safari?: boolean
   slashOpen?: boolean
+  isStreaming?: boolean
   filteredSlashCmds?: ChatSlashCommand[]
+  getEditorSelection?: () => { start: number; end: number; length: number } | null
+  composing?: boolean
   cancelMessageEdit?: () => boolean
   handleLongPaste?: (text: string) => boolean
 } = {}) {
@@ -68,14 +71,15 @@ function harness(over: {
     localPathReferences: over.draft?.localPaths,
     restoreInput: over.draft?.restoreInput,
     textareaText: over.draft?.composerText,
-    composing: ref(false),
+    composing: ref(over.composing ?? false),
+    getEditorSelection: over.getEditorSelection,
     messages: ref<ChatMessage[]>(over.messages ?? []),
     pendingQueue: ref<ChatPendingItem[]>(over.pendingQueue ?? []),
     canQueueMore: ref(over.canQueueMore ?? true),
     slashOpen: ref(over.slashOpen ?? false),
     slashIdx: ref(0),
     filteredSlashCmds: ref(over.filteredSlashCmds ?? []),
-    isStreaming: ref(false),
+    isStreaming: ref(over.isStreaming ?? false),
     isSafariWebKit: () => over.safari ?? false,
     handleLongPaste: over.handleLongPaste,
     ...spies,
@@ -160,6 +164,30 @@ describe('useChatComposerShortcuts', () => {
     expect(spies.handleSlashInput).not.toHaveBeenCalled()
   })
 
+  it('passes only the visible inline editor text to the long-paste fallback', () => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = '原有指令 ' + '资料'.repeat(10_000)
+    draft.appendLocalPaths('C:\\资料\\report.pdf')
+    const handleLongPaste = vi.fn(() => true)
+    const { api, spies } = harness({ draft, handleLongPaste })
+    const event = inputEvent('insertFromPasteAsQuotation', {})
+
+    api.onTextareaInput(event)
+
+    expect(handleLongPaste).toHaveBeenCalledExactlyOnceWith(draft.composerText.value, event)
+    expect(spies.handleSlashInput).not.toHaveBeenCalled()
+    expect(draft.localPaths.value).toEqual(['C:\\资料\\report.pdf'])
+  })
+
+  it('still updates slash suggestions when an inline paste is not consumed', () => {
+    const handleLongPaste = vi.fn(() => false)
+    const { api, spies } = harness({ inputText: '说明 /visual', handleLongPaste })
+    api.onTextareaInput(inputEvent('insertFromPaste', {}))
+
+    expect(handleLongPaste).toHaveBeenCalledWith('说明 /visual', expect.anything())
+    expect(spies.handleSlashInput).toHaveBeenCalledOnce()
+  })
+
   describe('Slash completion safety', () => {
     const compact = {
       name: '/compact',
@@ -203,6 +231,21 @@ describe('useChatComposerShortcuts', () => {
   })
 
   describe('IME composition guard', () => {
+    it('leaves Chinese candidate confirmation to an inline editor while the composition ref is set', () => {
+      const candidate = { name: 'visualize', cmd: '/visualize', label: 'Visualize', desc: '', aliases: [] }
+      const { api, spies } = harness({ inputText: '你好 /可视化', composing: true, slashOpen: true,
+        filteredSlashCmds: [candidate], getEditorSelection: () => ({ start: 8, end: 8, length: 8 }) })
+      const event = keydown({ key: 'Enter', target: {} })
+
+      api.onTextareaKeydown(event)
+      api.onTextareaInput(inputEvent('insertCompositionText', {}))
+
+      expect(event.preventDefault).not.toHaveBeenCalled()
+      expect(spies.activateSlashCmd).not.toHaveBeenCalled()
+      expect(spies.sendCurrentInput).not.toHaveBeenCalled()
+      expect(spies.handleSlashInput).not.toHaveBeenCalled()
+    })
+
     it('does not send on Enter while the IME is composing (isComposing)', () => {
       const { api, spies } = harness({ inputText: '你好' })
       api.onTextareaKeydown(keydown({ key: 'Enter', isComposing: true, target: field('你好', 'end') }))
@@ -225,6 +268,40 @@ describe('useChatComposerShortcuts', () => {
   })
 
   describe('Alt+Arrow queue chords are caret-gated (preserve macOS paragraph nav)', () => {
+    it('uses inline editor offsets for boundary chords and keeps a selection or middle caret native', () => {
+      let selection: { start: number; end: number; length: number } | null = { start: 2, end: 2, length: 4 }
+      const { api, spies } = harness({ inputText: '中文草稿', pendingQueue: QUEUE,
+        getEditorSelection: () => selection })
+      const press = (key: string) => {
+        const event = keydown({ key, altKey: true, target: {} })
+        api.onTextareaKeydown(event)
+        return event
+      }
+
+      expect(press('ArrowDown').preventDefault).not.toHaveBeenCalled()
+      selection = { start: 0, end: 4, length: 4 }
+      expect(press('ArrowDown').preventDefault).not.toHaveBeenCalled()
+      expect(press('ArrowUp').preventDefault).not.toHaveBeenCalled()
+      selection = null
+      expect(press('ArrowDown').preventDefault).not.toHaveBeenCalled()
+      selection = { start: 4, end: 4, length: 4 }
+      expect(press('ArrowDown').preventDefault).toHaveBeenCalledOnce()
+      expect(spies.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('中文草稿')
+      selection = { start: 0, end: 0, length: 4 }
+      expect(press('ArrowUp').preventDefault).toHaveBeenCalledOnce()
+      expect(spies.popPendingTail).toHaveBeenCalledOnce()
+    })
+
+    it('prefers native textarea offsets when an inline editor selection is also provided', () => {
+      const getEditorSelection = vi.fn(() => ({ start: 4, end: 4, length: 4 }))
+      const { api, spies } = harness({ inputText: 'text', getEditorSelection })
+      const event = keydown({ key: 'ArrowDown', altKey: true, target: field('text', 'middle') })
+      api.onTextareaKeydown(event)
+      expect(getEditorSelection).not.toHaveBeenCalled()
+      expect(spies.enqueuePendingInput).not.toHaveBeenCalled()
+      expect(event.preventDefault).not.toHaveBeenCalled()
+    })
+
     it('queues the full canonical text for a paths-only draft with an empty textarea', () => {
       const draft = useLocalPathDraft()
       draft.appendLocalPaths('C:\\Downloads\\report.pdf')
@@ -468,15 +545,27 @@ describe('Escape and message edits', () => {
     expect(inputText.value).toBe('draft')
   })
 
-  it('still clears the draft when there is no edit to cancel', () => {
+  it('preserves an ordinary draft and leaves Escape unclaimed when no edit is live', () => {
     const { api, inputText, spies } = harness({ inputText: 'just a draft' })
 
     const e = keydown({ key: 'Escape', target: field('just a draft', 'end') })
     api.onTextareaKeydown(e)
 
     expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
-    expect(inputText.value).toBe('')
-    expect(e.preventDefault).toHaveBeenCalledOnce()
+    expect(inputText.value).toBe('just a draft')
+    expect(spies.autoResizeTextarea).not.toHaveBeenCalled()
+    expect(e.preventDefault).not.toHaveBeenCalled()
+  })
+
+  it('leaves streaming Escape to Stop without changing the queued draft', () => {
+    const { api, inputText, spies } = harness({ inputText: 'next request', isStreaming: true })
+    const e = keydown({ key: 'Escape', target: field('next request', 'end') })
+
+    api.onTextareaKeydown(e)
+
+    expect(inputText.value).toBe('next request')
+    expect(spies.cancelMessageEdit).not.toHaveBeenCalled()
+    expect(e.preventDefault).not.toHaveBeenCalled()
   })
 
   it('leaves the slash menu Escape alone', () => {

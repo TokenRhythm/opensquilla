@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NotRequired, Protocol, TypedDict
@@ -362,6 +362,15 @@ class ContentIntegrityError(RuntimeError):
     """Stored Workbench content failed its integrity check."""
 
 
+class ContentExportError(RuntimeError):
+    """A bounded HTML archive cannot be exported safely."""
+
+    def __init__(self, code: str, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
 class AttachmentClaimError(ValueError):
     """A strict attachment admission policy rejected the claimed MIME."""
 
@@ -393,10 +402,13 @@ class ArtifactContentQuery:
     session_key: str
     artifact_id: str
     thumbnail: bool = False
+    format: str = "content"
 
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
         _identity(self.artifact_id, "artifact id")
+        if self.format not in {"content", "zip"} or (self.thumbnail and self.format == "zip"):
+            raise ValueError("invalid artifact content format")
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,9 +416,12 @@ class DocumentContentQuery:
     session_key: str
     document_id: str
     revision_id: str | None = None
+    format: str = "content"
 
     def __post_init__(self) -> None:
         DocumentIdentity(self.session_key, self.document_id)
+        if self.format not in {"content", "zip"}:
+            raise ValueError("invalid document content format")
         if self.revision_id is not None:
             _identity(self.revision_id, "revision id")
 
@@ -445,11 +460,14 @@ class WorkingFileQuery:
     session_key: str
     document_id: str
     page_path: str | None = None
+    format: str = "content"
 
     def __post_init__(self) -> None:
         from opensquilla.html_format import is_html_preview_path
 
         DocumentIdentity(self.session_key, self.document_id)
+        if self.format not in {"content", "zip"}:
+            raise ValueError("invalid working file format")
         if self.page_path is not None and not is_html_preview_path(self.page_path):
             raise ValueError("Invalid working page path")
 
@@ -470,6 +488,7 @@ class ContentMaterial:
     media_type: str
     filename: str | None = None
     data: bytes | None = None
+    cleanup: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -664,6 +683,12 @@ class ResourceProjection(TypedDict, total=False):
     mime: str | None
     size: int | None
     sha256: str | None
+    # Optional presentation semantics.  Internal inline Visualize documents
+    # remain addressable for recovery/download but are omitted from the Files
+    # inventory by the Workbench adapter.
+    source: str
+    visibility: str
+    presentation: str
 
 
 class BindingProjection(TypedDict, total=False):
@@ -877,7 +902,9 @@ class ArtifactContentPort(Protocol):
 
     async def attachment_content(self, query: AttachmentContentQuery) -> ContentMaterial: ...
 
-    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial: ...
+    async def working_file(
+        self, query: WorkingFileQuery,
+    ) -> WorkingFileMaterial | ContentMaterial: ...
 
 
 class AttachmentStagingPort(Protocol):
@@ -1054,7 +1081,7 @@ class ArtifactContentApplication:
     async def attachment(self, query: AttachmentContentQuery) -> ContentMaterial:
         return await self._port.attachment_content(query)
 
-    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial:
+    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial | ContentMaterial:
         return await self._port.working_file(query)
 
 

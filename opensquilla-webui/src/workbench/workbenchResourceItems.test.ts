@@ -5,9 +5,11 @@ import {
   artifactPayloadFromWorkbenchResource,
   canonicalWorkbenchResources,
   createResourceCollectionWorkbenchItem,
+  refreshResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
   resourceUsesNativeHtmlPreview,
   resourcesFromWorkbenchItem,
+  isInternalVisualizeResource,
   workbenchResourceKey,
 } from './workbenchResourceItems'
 
@@ -37,6 +39,21 @@ function resource(
 }
 
 describe('workbench resource items', () => {
+  it('preserves parent visibility and child authority when a side inventory refreshes', () => {
+    const child = 'agent:main:sidechat:child'
+    const before = resource('deliverable', 'art_old')
+    const after = resource('document', 'doc_new', { documentId: 'doc_new' })
+    const item = createResourceCollectionWorkbenchItem({ resources: [before], sessionKey: child, title: 'Old' })
+    item.scope = { type: 'session', id: 'agent:main:webchat:parent' }
+    const refreshed = refreshResourceCollectionWorkbenchItem(item, [after], 'Resources')
+    expect(refreshed.id).toBe(item.id)
+    expect(refreshed.scope).toEqual({ type: 'session', id: 'agent:main:webchat:parent' })
+    expect(refreshed.payload.sessionKey).toBe(child)
+    expect(refreshed.payload.resourceCount).toBe(1)
+    expect(refreshed.payload.resources).toBeUndefined()
+    expect(item.payload.resources).toBeUndefined()
+  })
+
   it('keeps same-name resources distinct by typed stable identity', () => {
     const attachment = resource('attachment', 'att_1')
     const document = resource('document', 'doc_1')
@@ -47,7 +64,8 @@ describe('workbench resource items', () => {
       title: 'Workbench',
     })
 
-    expect(resourcesFromWorkbenchItem(item)).toEqual([attachment, document, deliverable])
+    expect(item.payload.resourceCount).toBe(3)
+    expect(resourcesFromWorkbenchItem(item)).toEqual([])
     expect(new Set([
       workbenchResourceKey(attachment.resource),
       workbenchResourceKey(document.resource),
@@ -75,7 +93,32 @@ describe('workbench resource items', () => {
       sessionKey: 'agent:main:webchat:test',
       title: 'Workbench',
     })
-    expect(resourcesFromWorkbenchItem(item)).toEqual([document, sameLookingUnbound])
+    expect(item.payload.resourceCount).toBe(2)
+    expect(item.payload.resources).toBeUndefined()
+  })
+
+  it('keeps persisted inline Visualize widgets out of the Files projection', () => {
+    const widget = resource('document', 'widget-doc')
+    widget.source = 'show-widget'
+    widget.visibility = 'internal'
+    widget.presentation = 'inline'
+    const workspaceFile = resource('document', 'workspace-doc')
+    workspaceFile.source = 'workspace-preview'
+    workspaceFile.visibility = 'internal'
+    const otherInlineInternal = resource('document', 'other-inline-doc')
+    otherInlineInternal.visibility = 'internal'
+    otherInlineInternal.presentation = 'inline'
+
+    expect(isInternalVisualizeResource(widget)).toBe(true)
+    widget.source = 'show_widget:edit'
+    expect(isInternalVisualizeResource(widget)).toBe(true)
+    widget.source = 'show-widget'
+    expect(isInternalVisualizeResource(workspaceFile)).toBe(false)
+    expect(isInternalVisualizeResource(otherInlineInternal)).toBe(false)
+    expect(canonicalWorkbenchResources([widget, workspaceFile, otherInlineInternal])).toEqual([
+      workspaceFile,
+      otherInlineInternal,
+    ])
   })
 
   it('does not disguise a bound attachment as its mutable Document head', () => {

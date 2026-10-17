@@ -17,7 +17,7 @@ from opensquilla.sandbox.run_context import (
     run_context_for_subagent,
     run_context_from_origin_payload,
 )
-from opensquilla.session.keys import normalize_agent_id, parse_agent_id
+from opensquilla.session.keys import is_sidechat_key, normalize_agent_id, parse_agent_id
 from opensquilla.tools.policy import apply_tool_policy_layer
 from opensquilla.tools.types import (
     CRON_AGENT_ALLOW,
@@ -735,8 +735,14 @@ def tool_context_from_envelope(
         usage_root_turn_id=envelope.metadata.get("usage_root_turn_id"),
         plan_revision=envelope.runtime_services.get("plan_revision"),
         plan_run=envelope.runtime_services.get("plan_run"),
-        goal_context=envelope.runtime_services.get("goal_context"),
-        goal_service=envelope.runtime_services.get("goal_service"),
+        goal_context=(
+            None if is_sidechat_key(envelope.session_key)
+            else envelope.runtime_services.get("goal_context")
+        ),
+        goal_service=(
+            None if is_sidechat_key(envelope.session_key)
+            else envelope.runtime_services.get("goal_service")
+        ),
         generated_artifact_adopter=generated_artifact_adopter,
         artifact_source_paths=getattr(generated_artifact_adopter, "source_paths", {}),
         desktop_browser=desktop_browser,

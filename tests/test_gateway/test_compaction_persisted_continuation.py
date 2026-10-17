@@ -51,6 +51,15 @@ async def test_twenty_persisted_window_turns_reopen_and_recover_durable_summary(
 ):
     from opensquilla import token_estimation
 
+    retry_delays = []
+
+    async def skip_retry_wait(delay):
+        retry_delays.append(delay)
+
+    # Exercise every retry and its persisted state without wall-clock backoff
+    # accumulating across twenty process-local failure-circuit resets.
+    monkeypatch.setattr("opensquilla.session.compaction.sleep_before_retry", skip_retry_wait)
+    monkeypatch.setattr("opensquilla.provider.recovery.random.randint", lambda *_args: 0)
     monkeypatch.setattr(token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE)
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "profile"))
     database = tmp_path / "turns.sqlite"
@@ -208,7 +217,9 @@ async def test_twenty_persisted_window_turns_reopen_and_recover_durable_summary(
             canonical = after
             await _assert_idle(case)
     assert len(ordinary_requests) == 20
-    assert auxiliary_failures >= 20
+    assert auxiliary_failures >= 80
+    assert auxiliary_failures % 4 == 0
+    assert retry_delays == [1, 2, 4] * (auxiliary_failures // 4)
     assert any("HIDDEN_HISTORY_00" not in request for request in ordinary_requests)
 
     summary_available = True

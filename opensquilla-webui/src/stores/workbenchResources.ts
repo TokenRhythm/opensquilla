@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { markRaw, ref, shallowRef } from 'vue'
+import { markRaw, ref, shallowRef, watch } from 'vue'
 
 import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 import type {
@@ -24,6 +24,7 @@ import {
 import { PendingMutationRequestIds } from '@/utils/mutationRequestIdentity'
 import { resolveArtifactMutationBounded } from '@/workbench/artifactMutationRecovery'
 import { canonicalWorkbenchResources } from '@/workbench/workbenchResourceItems'
+import { MetadataCacheBudget } from '@/workbench/metadataCacheBudget'
 
 export interface WorkbenchResourceSnapshot {
   sessionKey: string
@@ -143,7 +144,6 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
   const snapshots = ref<Record<string, WorkbenchResourceSnapshot>>({})
   const provider = shallowRef<WorkbenchResourceProvider | null>(null)
   const requests = new Map<string, AbortController>()
-  const generations = new Map<string, number>()
   const imports = new Map<string, {
     provider: WorkbenchResourceProvider
     promise: Promise<DocumentImportResponse>
@@ -153,8 +153,41 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     promise: Promise<WorkbenchResourceOpenResponse | null>
   }>()
   const mutationRequestIds = new PendingMutationRequestIds(64)
+  const cacheBudget = new MetadataCacheBudget(12, 2 * 1024 * 1024)
+  const pendingMutationOwners = new Map<string, string>()
+  function pruneMetadata() {
+    cacheBudget.prune(key => requests.has(key) || [...pendingMutationOwners.values()].includes(key), key => {
+      const next = { ...snapshots.value }
+      delete next[key]
+      snapshots.value = next
+    })
+  }
+  function retain(sessionKey: string) {
+    const release = cacheBudget.retain(sessionKey)
+    return () => { release(); pruneMetadata() }
+  }
 
-  async function runRecoverableMutation<
+  // A session may request its inventory before Hello advertises the resource
+  // methods. Retry that deferred read when the same provider becomes available;
+  // unchanged/empty artifact history must not leave attachments download-only.
+  // Cleared sessions are absent here, and load retains the normal request fences.
+  watch(() => provider.value?.available() === true, available => {
+    if (!available) return
+    for (const current of Object.values(snapshots.value)) {
+      if (current.loaded && !current.available && !current.loading) {
+        void load(current.sessionKey, true).catch(() => undefined)
+      }
+    }
+  })
+
+  async function runRecoverableMutation<T, P extends Readonly<Record<string, unknown>>>(
+    options: Parameters<typeof runRecoverableMutationImpl<T, P>>[0],
+  ): Promise<T> {
+    const release = retain(options.sessionKey)
+    try { return await runRecoverableMutationImpl(options) }
+    finally { release() }
+  }
+  async function runRecoverableMutationImpl<
     T,
     P extends Readonly<Record<string, unknown>>,
   >(options: {
@@ -191,6 +224,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
 
     const release = () => {
       mutationRequestIds.release(options.logicalKey, requestId)
+      pendingMutationOwners.delete(options.logicalKey)
       options.onRelease?.()
     }
     const pendingError = () => artifactProductClientError('MUTATION_OUTCOME_PENDING')
@@ -242,6 +276,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
         throw error
       }
       mutationRequestIds.markPending(options.logicalKey, requestId)
+      pendingMutationOwners.set(options.logicalKey, options.sessionKey)
       if (!wasPending && options.currentProvider.resolveMutation) {
         const resolution = await resolve()
         if (resolution?.status === 'not_applied') return notApplied()
@@ -259,19 +294,19 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
   }
 
   function snapshot(sessionKey: string): WorkbenchResourceSnapshot {
+    cacheBudget.touch(sessionKey)
     return snapshots.value[sessionKey] || emptySnapshot(sessionKey)
   }
 
   function setSnapshot(sessionKey: string, value: WorkbenchResourceSnapshot) {
     snapshots.value = { ...snapshots.value, [sessionKey]: value }
+    cacheBudget.set(sessionKey, value)
+    pruneMetadata()
   }
 
-  function retire(sessionKey: string): number {
+  function retire(sessionKey: string) {
     requests.get(sessionKey)?.abort()
     requests.delete(sessionKey)
-    const generation = (generations.get(sessionKey) || 0) + 1
-    generations.set(sessionKey, generation)
-    return generation
   }
 
   async function load(sessionKey: string, force = false): Promise<WorkbenchResourceSnapshot> {
@@ -285,7 +320,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
       return unavailable
     }
 
-    const generation = retire(sessionKey)
+    retire(sessionKey)
     const controller = new AbortController()
     requests.set(sessionKey, controller)
     setSnapshot(sessionKey, {
@@ -308,7 +343,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
         resources: result.resources,
         totalCount: result.totalCount,
       }
-      if (generations.get(sessionKey) === generation) setSnapshot(sessionKey, loaded)
+      if (requests.get(sessionKey) === controller && !controller.signal.aborted) setSnapshot(sessionKey, loaded)
       return loaded
     } catch (error) {
       if (controller.signal.aborted) throw error
@@ -319,10 +354,11 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
         loaded: current.loaded,
         error: message(error),
       }
-      if (generations.get(sessionKey) === generation) setSnapshot(sessionKey, failed)
+      if (requests.get(sessionKey) === controller && !controller.signal.aborted) setSnapshot(sessionKey, failed)
       return failed
     } finally {
       if (requests.get(sessionKey) === controller) requests.delete(sessionKey)
+      pruneMetadata()
     }
   }
 
@@ -586,6 +622,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
 
   function clearSession(sessionKey: string) {
     retire(sessionKey)
+    cacheBudget.remove(sessionKey)
     const next = { ...snapshots.value }
     delete next[sessionKey]
     snapshots.value = next
@@ -599,11 +636,14 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     abortAll()
     opens.clear()
     mutationRequestIds.clear()
+    pendingMutationOwners.clear()
+    cacheBudget.clear()
     snapshots.value = {}
   }
 
   return {
     snapshots,
+    retain,
     setProvider,
     snapshot,
     load,

@@ -4,7 +4,7 @@ import type { ChatRouterTierConfig } from '@/types/chat'
 // reserve twin can size and hold its slot on the first turn — before the async
 // `config.get` that normally populates it resolves. `config.get` stays
 // authoritative and overwrites these values once it lands; the cache only
-// bridges the pre-resolve window. Tier names + model ids only — never secrets.
+// bridges the pre-resolve window. Route identities only — never secrets.
 export interface RouterShape {
   enabled: boolean
   slots: string[]
@@ -78,8 +78,10 @@ function asTierConfigRecord(value: unknown): Record<string, ChatRouterTierConfig
   const out: Record<string, ChatRouterTierConfig> = {}
   for (const [key, val] of Object.entries(value)) {
     if (!isRecord(val)) return null
+    const provider = typeof val.provider === 'string' ? val.provider.trim().toLowerCase() : ''
     out[key] = {
       model: typeof val.model === 'string' ? val.model : '',
+      ...(provider ? { provider } : {}),
       imageOnly: val.imageOnly === true,
       ...(typeof val.ensembleEnabled === 'boolean'
         ? { ensembleEnabled: val.ensembleEnabled }

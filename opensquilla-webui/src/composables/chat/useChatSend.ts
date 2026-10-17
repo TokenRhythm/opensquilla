@@ -200,6 +200,8 @@ interface SendAttempt {
   acceptanceInFlight?: boolean
   acceptedSessionKey?: string
   onAccepted?: () => void
+  /** Original delivery owner; retained when a manual retry replaces its UI callback. */
+  onDeliveryAccepted?: () => void
   stopOwner?: symbol
 }
 
@@ -264,6 +266,7 @@ interface DispatchSendOptions {
   /** Queue permission remains revocable while the durable owner prepares admission. */
   beforeDispatch?: () => boolean
   onAccepted?: () => void
+  onDeliveryAccepted?: () => void
   /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
   requirePreparedHandoff?: boolean
   /** Stable cross-tab identity for one protocol-owned replay. */
@@ -1209,8 +1212,11 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function notifySendAccepted(attempt: SendAttempt) {
+    const onDeliveryAccepted = attempt.onDeliveryAccepted
     const onAccepted = attempt.onAccepted
+    attempt.onDeliveryAccepted = undefined
     attempt.onAccepted = undefined
+    onDeliveryAccepted?.()
     onAccepted?.()
   }
 
@@ -2002,20 +2008,6 @@ export function useChatSend(options: UseChatSendOptions) {
     return true
   }
 
-  function abortStaleAcceptedTask(
-    response: TurnSendResponse | null | undefined,
-    requestSessionKey: string,
-  ) {
-    if (disposed || options.sessionKey.value !== requestSessionKey) return
-    const taskId = acceptedTaskId(response)
-    if (!taskId) return
-    void options.turnCommands.cancel({
-      sessionKey: response?.sessionKey || requestSessionKey,
-      taskId,
-      source: 'webui_stale_send',
-    }).catch(() => {})
-  }
-
   async function dispatchSteerV2(
     text: string,
     optionsForSteer: {
@@ -2271,8 +2263,17 @@ export function useChatSend(options: UseChatSendOptions) {
     bypassSlashCommand?: boolean
     composerText?: string
     textOverride?: string
+    /** An explicit composer attachment enriches text but still consumes the draft after queue persistence. */
+    consumeComposerOnQueue?: boolean
     cancelIfComposerChanged?: boolean
     resumeQueueOnSuccess?: boolean
+    /** Invocation-owned UI response; automatic sends leave it unset. */
+    onAccepted?: () => void
+    /** Delivery-owned response; follows this immutable attempt through manual/receipt retries. */
+    onDeliveryAccepted?: () => void
+    preflightGuard?: () => boolean
+    /** Additional scope check that remains valid after the sender consumes the composer. */
+    preDispatchGuard?: () => boolean
   }
 
   function currentExactReplayAttempt(): SendAttempt | null {
@@ -2295,9 +2296,12 @@ export function useChatSend(options: UseChatSendOptions) {
     composerSubmissions.set(token, { sessionKey: key, identity, snapshot: captureComposerSnapshot() })
     composerSubmissionVersion.value += 1
     try {
-      const onAccepted = invocation.resumeQueueOnSuccess
+      const resumeQueue = invocation.resumeQueueOnSuccess
         ? options.capturePendingAutoSendResume?.() : undefined
-      await sendComposerInput(invocation, onAccepted)
+      const onAccepted = invocation.onAccepted
+        ? () => { resumeQueue?.(); invocation.onAccepted?.() }
+        : resumeQueue
+      return await sendComposerInput(invocation, onAccepted)
     } finally {
       composerSubmissions.delete(token)
       if (!disposed) composerSubmissionVersion.value += 1
@@ -2353,8 +2357,9 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (!deliveryStillMatches()) return
+      if (invocation.preflightGuard?.() === false) return
       if (replayBlockedReason?.value) return
-      await dispatchSend(exactReplayAttempt.text, {
+      return await dispatchSend(exactReplayAttempt.text, {
         composerText,
         draftIds: exactReplayAttempt.draftIds,
         queueMode: exactReplayAttempt.queueMode,
@@ -2362,8 +2367,8 @@ export function useChatSend(options: UseChatSendOptions) {
         idempotentReplay: true,
         preDispatchGuard: deliveryStillMatches,
         onAccepted,
+        onDeliveryAccepted: invocation.onDeliveryAccepted,
       })
-      return
     }
 
     const matchesRecoveredComposer = () => Boolean(recoveredAttempt && matchesRecoveredDraft(recoveredAttempt, {
@@ -2419,6 +2424,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (!deliveryStillMatches()) return
+      if (invocation.preflightGuard?.() === false) return
       if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
@@ -2438,17 +2444,17 @@ export function useChatSend(options: UseChatSendOptions) {
       recoveredAttempt &&
       matchesRecoveredComposer()
     ) {
-      await dispatchSend(text, {
+      return await dispatchSend(text, {
         composerText,
         draftIds: recoveredAttempt.draftIds,
         queueMode: recoveredAttempt.queueMode,
         payload: payloadFromSnapshot(composerSnapshot),
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
-        preDispatchGuard: deliveryStillMatches,
+        preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
         onAccepted,
+        onDeliveryAccepted: invocation.onDeliveryAccepted,
       })
-      return
     }
 
     const slashClassification = !bypassSlashCommand
@@ -2531,7 +2537,10 @@ export function useChatSend(options: UseChatSendOptions) {
             composerSnapshot.forkBeforeMessageId,
           )
         ) {
-          await dispatchSteerV2(text, { composerSnapshot })
+          const outcome = await dispatchSteerV2(text, { composerSnapshot })
+          // A Steer can return the explicit sender to its live turn without
+          // granting permission to resume unrelated queued follow-ups.
+          if (outcome === 'accepted') invocation.onAccepted?.()
           return
         }
         // Surface a full queue instead of silently dropping the send: the draft is
@@ -2552,7 +2561,7 @@ export function useChatSend(options: UseChatSendOptions) {
             : {}),
         }
         const queued = await Promise.resolve(
-          composerChanged || invocation.textOverride !== undefined
+          composerChanged || (invocation.textOverride !== undefined && !invocation.consumeComposerOnQueue)
             ? options.enqueuePendingPayload?.({
               text: durableText,
               ...(composerSnapshot.selectedSkills.length ? { selectedSkills: composerSnapshot.selectedSkills } : {}),
@@ -2599,14 +2608,15 @@ export function useChatSend(options: UseChatSendOptions) {
 
     if (!hasPayload || !deliveryStillMatches()) return
 
-    await dispatchSend(text, {
+    return await dispatchSend(text, {
       composerText,
       draftIds: composerSnapshot.draftIds,
       payload: payloadFromSnapshot(composerSnapshot),
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
-      preDispatchGuard: deliveryStillMatches,
+      preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
       onAccepted,
+      onDeliveryAccepted: invocation.onDeliveryAccepted,
     })
   }
 
@@ -3134,6 +3144,7 @@ export function useChatSend(options: UseChatSendOptions) {
         requestSessionKey,
         deliveryIdentity: requestDeliveryIdentity,
         onAccepted: sendOpts.onAccepted,
+        onDeliveryAccepted: sendOpts.onDeliveryAccepted,
         draftIds: [...attemptAnnotationDraftIds],
         promptAnnotations: sentSnapshots,
         pageContext: attemptPageContext,
@@ -3398,8 +3409,6 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (stoppedByUser) {
           observePendingAcceptance(attempt)
-        } else {
-          abortStaleAcceptedTask(res, requestSessionKey)
         }
         if (
           stoppedByUser
@@ -3676,7 +3685,14 @@ export function useChatSend(options: UseChatSendOptions) {
       if (disposed) return acceptedError ? 'accepted' : 'retryable_failure'
       rememberRetryableAttempt(true)
       if (stoppedBeforeAdmission) return retainStoppedDraft()
-      if (!preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
+      // Transient delivery failures are still owned by receipt recovery. Its
+      // request-scoped check action survives the budget; do not claim a turn
+      // failed while it may be running. Domain rejections can omit accepted,
+      // so keep their actionable feedback even when admission is unknown.
+      const recoveringDelivery = !acceptedError && commandError?.retryable !== false
+        && ['transport', 'timeout', 'aborted', 'session-changed', 'unavailable'].includes(commandError?.kind || '')
+        && (hasUnknownAcceptance(err) || attempt.requiresIdempotentReplay === true)
+      if (!recoveringDelivery && !preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
         const restoredSnapshot = captureComposerSnapshot()
         const separateExplicitDraft = explicitComposerChanged(attempt)
           || (options.selectedSkills?.value.length
@@ -3712,20 +3728,40 @@ export function useChatSend(options: UseChatSendOptions) {
           duration: 8000,
           ...(canRetry ? { action: {
             label: i18n.global.t('chat.retry'),
-            onClick: () => {
-              if (
-                recoveredAttempt !== attempt
-                || options.sessionKey.value !== requestSessionKey
-                || attempt.deliveryIdentity !== options.deliveryIdentity?.value
-                || !composerMatchesSnapshot(restoredSnapshot)
-                || options.sendBlockedReason?.value
-                || options.offlineQueueIdentity?.value
-                || options.stream.isStreaming.value
-                || hasAuthoritativeWork()
-              ) return
+            onClick: async () => {
+              const unavailable = (key: string) => ({
+                handled: false as const,
+                message: i18n.global.t(key),
+                tone: 'info' as const,
+                removeAction: true,
+              })
+              if (disposed || options.sessionKey.value !== requestSessionKey) {
+                return unavailable('chat.toast.retryOriginalSession')
+              }
+              if (!composerMatchesSnapshot(restoredSnapshot)) {
+                return unavailable('chat.toast.retryDraftChanged')
+              }
+              const canStillRetry = () => !disposed
+                && options.sessionKey.value === requestSessionKey
+                && composerMatchesSnapshot(restoredSnapshot)
+                && recoveredAttempt === attempt
+                && attempt.deliveryIdentity === options.deliveryIdentity?.value
+                && !options.sendBlockedReason?.value
+                && !options.offlineQueueIdentity?.value
+                && !options.stream.isStreaming.value
+                && !hasAuthoritativeWork()
+                && (!options.taskOwnership || options.taskOwnership.hydrationResolved.value)
+              if (!canStillRetry()) return unavailable('chat.toast.retryUnavailable')
+              const handled = (outcome: ChatSendOutcome | undefined) => outcome && outcome !== 'not_sent'
+                ? true : unavailable('chat.toast.retryUnavailable')
               if (separateExplicitDraft) {
-                void dispatchSend(attempt.text, {
+                if (options.validateActiveProjectBeforeSend && await refreshedActiveProjectBlocksSend()) {
+                  return unavailable('chat.toast.retryUnavailable')
+                }
+                if (!canStillRetry()) return unavailable('chat.toast.retryUnavailable')
+                return dispatchSend(attempt.text, {
                   retryAttempt: attempt, preserveComposer: true, draftIds: attempt.draftIds,
+                  preDispatchGuard: () => options.sessionKey.value === requestSessionKey,
                   payload: {
                     selectedSkills: copySelectedSkills(attempt.selectedSkills),
                     localPathReferences: [...attempt.localPathReferences],
@@ -3735,15 +3771,18 @@ export function useChatSend(options: UseChatSendOptions) {
                     initialCollaborationMode: attempt.initialCollaborationMode,
                     initialRoutingMode: attempt.initialRoutingMode,
                   },
-                })
+                }).then(handled)
               } else {
-                void onSend()
+                return onSend({
+                  cancelIfComposerChanged: true,
+                  preflightGuard: canStillRetry,
+                }).then(handled)
               }
             },
           } } : {}),
         })
       }
-      if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
+      if (!recoveringDelivery && (acceptedError || !sendOpts.suppressRejectedFailureMessage)) {
         options.messages.value.push({
           role: 'error',
           text: sendFailureMessage(err),

@@ -1,4 +1,4 @@
-import { computed, nextTick, type ComputedRef, type Ref } from 'vue'
+import { computed, nextTick, onScopeDispose, type ComputedRef, type Ref } from 'vue'
 import { defaultRangeExtractor, observeElementRect, useVirtualizer, type VirtualizerOptions } from '@tanstack/vue-virtual'
 import type { SidebarDisplayRow } from '@/utils/sidebarDisplayProjection'
 import { readDistanceFromEnd } from '@/utils/virtualizerLayout'
@@ -9,9 +9,65 @@ interface SidebarVirtualBlock {
   collapsed: boolean
 }
 
-const observeSidebarRect: VirtualizerOptions<HTMLElement, HTMLElement>['observeElementRect'] =
-  (instance, callback) => observeElementRect(instance,
-    rect => callback({ ...rect, height: Math.max(1, rect.height) }))
+function createSidebarRectObserver() {
+  let cancelPendingRestore: (() => void) | undefined
+  const observeSidebarRect: VirtualizerOptions<HTMLElement, HTMLElement>['observeElementRect'] =
+    (instance, callback) => {
+      let pendingAnchor: { key: string | number | bigint; offset: number } | undefined
+      let disposed = false
+      let restoreFrame: number | undefined
+      const view = instance.targetWindow
+      const element = instance.scrollElement
+      const cancelRestore = () => {
+        pendingAnchor = undefined
+        if (restoreFrame !== undefined) view?.cancelAnimationFrame(restoreFrame)
+        restoreFrame = undefined
+      }
+      cancelPendingRestore = cancelRestore
+      const inputEvents = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const
+      for (const event of inputEvents) element?.addEventListener(event, cancelRestore, { passive: true })
+      const cleanup = observeElementRect(instance, rect => {
+        const previousWidth = instance.scrollRect?.width
+        let restoreAfterCommit = false
+        if (!pendingAnchor && previousWidth && rect.width && previousWidth !== rect.width) {
+          const offset = instance.scrollOffset ?? 0
+          const item = instance.getVirtualItemForOffset(offset)
+          if (item) {
+            pendingAnchor = { key: item.key, offset: offset - item.start }
+            restoreAfterCommit = true
+          }
+        }
+        callback({ ...rect, height: Math.max(1, rect.height) })
+        if (!restoreAfterCommit) return
+        // Drawer layouts change several measured row heights at once. Keep
+        // ordinary backward-scroll behavior. Container and row observers may
+        // deliver in separate microtasks; wait for the frame's entire batch and
+        // Vue's DOM commit, unless a new user gesture takes over the position.
+        restoreFrame = view?.requestAnimationFrame(() => {
+          restoreFrame = undefined
+          void nextTick(() => {
+            const anchor = pendingAnchor
+            pendingAnchor = undefined
+            if (disposed || !anchor) return
+            const current = instance.getVirtualItems().find(item => item.key === anchor.key)
+            if (!current) return
+            const target = current.start + anchor.offset
+            if (Math.abs(target - (instance.scrollOffset ?? 0)) > 0.5) {
+              instance.scrollToOffset(target, { behavior: 'auto' })
+            }
+          })
+        })
+      })
+      return () => {
+        disposed = true
+        cancelRestore()
+        if (cancelPendingRestore === cancelRestore) cancelPendingRestore = undefined
+        for (const event of inputEvents) element?.removeEventListener(event, cancelRestore)
+        cleanup?.()
+      }
+    }
+  return { observe: observeSidebarRect, cancel: () => cancelPendingRestore?.() }
+}
 
 /** One geometry owner across Pinned, Projects and Recents. Headers stay mounted
  * for navigation/accessibility; only expanded rows enter the virtual sequence.
@@ -41,6 +97,7 @@ export function useSidebarVirtualizer<T extends SidebarVirtualBlock>(
     }
   })
   const virtualized = computed(() => projection.value.rowIndexes.size >= 100)
+  const layoutObserver = createSidebarRectObserver()
   const virtualizer = useVirtualizer<HTMLElement, HTMLElement>(computed(() => {
     const { entries, indexes, rowIndexes, sections } = projection.value
     const retained = new Set(sections.map(section => section.headingIndex))
@@ -69,7 +126,7 @@ export function useSidebarVirtualizer<T extends SidebarVirtualBlock>(
       initialRect: { width: 260, height: 600 },
       // A closed mobile drawer has zero height. Keep a minimal virtual range
       // so its retained headings still describe the correct scroll extent.
-      observeElementRect: observeSidebarRect,
+      observeElementRect: layoutObserver.observe,
       overscan: 5,
       anchorTo: 'end' as const,
       followOnAppend: false,
@@ -102,14 +159,39 @@ export function useSidebarVirtualizer<T extends SidebarVirtualBlock>(
     })
   })
 
+  const pendingMeasurements = new Set<HTMLElement>()
+  let measurementQueued = false
+  let disposed = false
+  onScopeDispose(() => {
+    disposed = true
+    pendingMeasurements.clear()
+  })
   function measureElement(element: Element | null) {
-    if (virtualized.value) virtualizer.value.measureElement(element as HTMLElement | null)
+    if (!virtualized.value) return
+    if (element) pendingMeasurements.add(element as HTMLElement)
+    if (measurementQueued) return
+    measurementQueued = true
+    // Vue calls function refs during its patch. A layout read after an old
+    // keyed spacer is removed can clamp scrollTop before its replacement is
+    // inserted. Measure the complete window after the DOM commit instead.
+    void nextTick(() => {
+      measurementQueued = false
+      const elements = [...pendingMeasurements]
+      pendingMeasurements.clear()
+      if (disposed || !virtualized.value) return
+      virtualizer.value.measureElement(null)
+      for (const item of elements) {
+        if (item.isConnected) virtualizer.value.measureElement(item)
+      }
+    })
   }
 
   async function revealRow(key: string) {
     await nextTick()
     const index = projection.value.rowIndexes.get(key)
     if (virtualized.value && index !== undefined) {
+      // Explicit navigation takes precedence over the previous reading anchor.
+      layoutObserver.cancel()
       virtualizer.value.scrollToIndex(index, { align: 'auto', behavior: 'auto' })
     }
   }

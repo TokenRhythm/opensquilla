@@ -12,242 +12,183 @@ test.afterEach(({ page }) => {
 })
 
 test.describe('Chat topbar global controls', () => {
-  test('non-chat language and theme popovers are mutually exclusive', async ({ page }) => {
+  test('non-chat stays quiet while language and themes remain reachable in Settings', async ({ page }) => {
     await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-non-chat`,
-      locale: 'en',
+      sessionKey: `${TOPBAR_SESSION_KEY}-non-chat`, locale: 'en',
     })
     await page.goto('/control/usage')
     await expect(page.getByTestId('route-header-host').locator('.chat-header')).toHaveCount(0)
     await expect(page.locator('.topbar').getByRole('link', { name: /^(Overview|Logs)$/ })).toHaveCount(0)
+    await expect(page.getByTestId('language-switcher-trigger')).toHaveCount(0)
+    await expect(page.locator('.topbar .theme-menu-wrap')).toHaveCount(0)
+    await expect(page.getByTestId('connection-status')).toHaveCount(0)
 
-    const language = page.getByTestId('language-switcher-trigger')
-    const theme = page.getByRole('button', { name: 'Theme', exact: true })
-    await expect(language).toBeVisible()
-    await language.click()
-    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(1)
-
-    await theme.click()
-    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(0)
-    await expect(page.locator('[data-chat-topbar-popover="theme"]')).toHaveCount(1)
-    await expect(page.locator('[data-chat-topbar-popover]')).toHaveCount(1)
-
-    await language.click()
-    await expect(page.locator('[data-chat-topbar-popover="theme"]')).toHaveCount(0)
-    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(1)
+    await page.locator('.sidebar-foot button[data-icon="settings"]').click()
+    await page.locator('#settings-rail-general').click()
+    await expect(page.getByTestId('settings-language-group').getByRole('radio')).toHaveCount(6)
+    await expect(page.getByTestId('settings-language-en')).toBeChecked()
+    await page.locator('#settings-rail-interface').click()
+    await expect(page.locator('input[name="appearance-theme"]')).toHaveCount(10)
+    await expect(page.locator('.settings-modal')).toHaveCount(1)
     await page.keyboard.press('Escape')
-    await expect(page.locator('[data-chat-topbar-popover]')).toHaveCount(0)
+    await expect(page.locator('.settings-modal')).toHaveCount(0)
+    await expect(page.locator('.sidebar-foot button[data-icon="settings"]')).toBeFocused()
   })
 
-  test('web keeps Desktop updates absent while wide connection and approval stay direct', async ({ page }) => {
+  test('web has no desktop update entry and wide approval stays direct', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1000 })
     await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-web-wide`,
-      locale: 'en',
-      approvalCount: 1,
+      sessionKey: `${TOPBAR_SESSION_KEY}-web-wide`, locale: 'en', approvalCount: 1,
     })
-
-    const system = page.getByTestId('chat-system-status')
-    await expect(system).toHaveAttribute('data-layout', 'wide')
-    await expect(page.getByTestId('connection-status')).toBeVisible()
+    await expect(page.getByTestId('chat-system-status')).toHaveAttribute('data-layout', 'wide')
+    await expect(page.getByTestId('connection-status')).toHaveCount(0)
     await expect(page.getByTestId('chat-system-approval')).toHaveCount(1)
+    await expect(page.getByTestId('chat-system-approval')).toBeVisible()
+    await expect(page.getByTestId('sidebar-desktop-update')).toHaveCount(0)
     await expect(page.getByTestId('desktop-update-indicator')).toHaveCount(0)
-    await expect(page.getByTestId('chat-system-update')).toHaveCount(0)
     await expectTopbarGeometry(page)
   })
 
-  test('compact keeps connection and approval reachable exactly once', async ({ page }) => {
+  test('compact keeps approval direct and closes the session menu on activation', async ({ page }) => {
     await page.setViewportSize({ width: 768, height: 900 })
-    await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-compact-pressure`,
-      locale: 'zh-Hans',
-      approvalCount: 2,
-    })
-
-    const system = page.getByTestId('chat-system-status')
-    const systemTrigger = page.getByTestId('chat-system-status-trigger')
-    const sessionTrigger = page.getByTestId('chat-session-actions-trigger')
-    await expect(system).toHaveAttribute('data-layout', 'compact')
-    await expect(page.getByTestId('connection-status')).toHaveCount(1)
-
-    await sessionTrigger.click()
+    const sessionKey = `${TOPBAR_SESSION_KEY}-compact-pressure`
+    await openTopbarSession(page, { sessionKey, locale: 'zh-Hans', approvalCount: 2 })
+    await expect(page.getByTestId('chat-system-status')).toHaveAttribute('data-layout', 'compact')
+    await expect(page.getByTestId('connection-status')).toHaveCount(0)
+    await expect(page.getByTestId('chat-system-status-trigger')).toHaveCount(0)
+    await page.getByTestId('chat-session-actions-trigger').click()
     await expect(page.getByTestId('chat-session-actions-menu')).toBeVisible()
-    await systemTrigger.click()
+    await page.getByTestId('chat-system-approval').click()
     await expect(page.getByTestId('chat-session-actions-menu')).toHaveCount(0)
-    await expect(page.getByTestId('chat-system-status-menu')).toBeVisible()
     await expect(page.getByTestId('chat-system-approval')).toHaveCount(1)
-    await expect(page.getByTestId('chat-system-connection')).toHaveCount(0)
-    await page.keyboard.press('Escape')
-    await expect(page.getByTestId('chat-system-status-menu')).toHaveCount(0)
-    await expect(systemTrigger).toBeFocused()
+    await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(sessionKey)
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
   })
 
-  test('tight combines connection, approval, and update', async ({ page }) => {
+  test('tight keeps approval direct and update reachable through the sidebar', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 })
     await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-tight-pressure`,
-      locale: 'de',
-      approvalCount: 3,
-      update: {
-        status: 'available',
-        latestVersion: '2.0.0',
-      },
+      sessionKey: `${TOPBAR_SESSION_KEY}-tight-pressure`, locale: 'de', approvalCount: 3,
+      update: { status: 'available', latestVersion: '2.0.0' },
     })
-
-    const system = page.getByTestId('chat-system-status')
-    const trigger = page.getByTestId('chat-system-status-trigger')
-    await expect(system).toHaveAttribute('data-layout', 'tight')
+    await expect(page.getByTestId('chat-system-status')).toHaveAttribute('data-layout', 'tight')
     await expect(page.getByTestId('connection-status')).toHaveCount(0)
+    await expect(page.getByTestId('chat-system-approval')).toBeVisible()
     await expect(page.getByTestId('desktop-update-indicator')).toHaveCount(0)
-    await trigger.click()
-    await expect(page.getByTestId('chat-system-connection')).toHaveCount(1)
-    await expect(page.getByTestId('chat-system-approval')).toHaveCount(1)
-    await expect(page.getByTestId('chat-system-update')).toHaveCount(1)
+    await expect(page.getByTestId('sidebar-update-dot')).toBeVisible()
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
+    await page.getByTestId('sidebar-toggle-collapsed').click()
+    await page.getByTestId('sidebar-desktop-update').click()
+    await expect(page).toHaveURL(/\/settings\/gateway#updates$/)
+    await expect(page.locator('#settings-gateway-updates')).toBeFocused()
+    await expect(page.getByTestId('settings-update-download')).toBeVisible()
+  })
 
-    await page.getByTestId('chat-system-update').click()
+  test('background update preparation stays quiet and only readiness adds a sidebar row', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 1000 })
+    const harness = await openTopbarSession(page, {
+      sessionKey: `${TOPBAR_SESSION_KEY}-update-lifecycle`, locale: 'en',
+      update: { status: 'available', latestVersion: '2.0.0', canAutoDownload: true },
+    })
+    const header = page.locator('.chat-header')
+    const update = page.getByTestId('sidebar-desktop-update')
+    const settings = page.locator('.sidebar-foot button[data-icon="settings"]')
+    const originalSettings = await settings.boundingBox()
+    const initialSessionLayout = await header.getAttribute('data-layout')
+    for (const status of ['available', 'downloading', 'error'] as const) {
+      await harness.pushUpdate({ status, progress: status === 'downloading' ? 37 : null })
+      await expect(update).toHaveCount(0)
+      await expect(page.getByTestId('sidebar-update-dot')).toHaveCount(0)
+      await expect(header).toHaveAttribute('data-layout', initialSessionLayout || '')
+    }
+    await harness.pushUpdate({ status: 'downloaded', canInstall: true, progress: 100 })
+    await expect(update).toHaveAccessibleName('Update ready 2.0.0')
+    const readySettings = await settings.boundingBox()
+    expect(readySettings?.y).toBeCloseTo(originalSettings!.y, 0)
+    expect((await update.boundingBox())!.y).toBeLessThan(readySettings!.y)
+    await expectTopbarGeometry(page)
+    await harness.pushUpdate({ errorCode: 'signature_invalid' })
+    await expect(update).toHaveCount(0)
+  })
+
+  test('disconnection stays direct while the sidebar update remains reachable', async ({ page }) => {
+    await page.setViewportSize({ width: 480, height: 800 })
+    const harness = await openTopbarSession(page, {
+      sessionKey: `${TOPBAR_SESSION_KEY}-disconnected`, locale: 'en',
+      update: { status: 'available', latestVersion: '2.0.0' },
+    })
+    await harness.disconnect()
+    await expect(page.getByTestId('connection-status')).toHaveAttribute('data-state', 'danger', { timeout: 10_000 })
+    await expect(page.getByTestId('connection-status')).toHaveClass(/disconnected/)
+    await expect(page.locator('.topbar')).toHaveAttribute('data-connection-state', 'disconnected')
+    await expectTopbarGeometry(page, { minimumTargetSize: 44 })
+    await page.getByTestId('sidebar-toggle-collapsed').click()
+    await page.getByTestId('sidebar-desktop-update').click()
     await expect(page).toHaveURL(/\/settings\/gateway#updates$/)
     await expect(page.locator('#settings-gateway-updates')).toBeFocused()
   })
 
-  test('Desktop update lifecycle preserves wide layout and focused control', async ({ page }) => {
-    await page.setViewportSize({ width: 1440, height: 1000 })
-    const harness = await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-update-lifecycle`,
-      locale: 'en',
-      update: {
-        status: 'available',
-        latestVersion: '2.0.0',
-      },
-    })
-    const system = page.getByTestId('chat-system-status')
-    const header = page.locator('.chat-header')
-    const update = page.getByTestId('desktop-update-indicator')
-    const initialSystemLayout = await system.getAttribute('data-layout')
-    const initialSessionLayout = await header.getAttribute('data-layout')
-    await expect(system).toHaveAttribute('data-layout', 'wide')
-    await update.focus()
-
-    const states = [
-      { status: 'downloading' as const, progress: 37 },
-      { status: 'downloaded' as const, progress: 100 },
-      {
-        status: 'error' as const,
-        progress: null,
-        errorCode: 'download_failed',
-        error: 'synthetic raw error that must not become the control label',
-      },
-    ]
-    for (const state of states) {
-      await harness.pushUpdate(state)
-      await expect(update).toBeVisible()
-      await expect(update).toBeFocused()
-      await expect(system).toHaveAttribute('data-layout', initialSystemLayout || '')
-      await expect(header).toHaveAttribute('data-layout', initialSessionLayout || '')
-      await expectTopbarGeometry(page)
-    }
-  })
-
-  test('disconnection remains dominant while update stays reachable', async ({ page }) => {
-    await page.setViewportSize({ width: 480, height: 800 })
-    const harness = await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-disconnected`,
-      locale: 'en',
-      update: {
-        status: 'available',
-        latestVersion: '2.0.0',
-      },
-    })
-
-    await harness.disconnect()
-    const system = page.getByTestId('chat-system-status')
-    await expect(system).toHaveAttribute('data-severity', 'danger', { timeout: 10_000 })
-    await expect(page.getByTestId('connection-status')).toHaveClass(/disconnected/)
-    await page.getByTestId('chat-system-status-trigger').click()
-    await expect(page.getByTestId('chat-system-update')).toHaveCount(1)
-    await expectTopbarGeometry(page, { minimumTargetSize: 44 })
-  })
-
-  test('wide update, language, and theme popovers are mutually exclusive', async ({ page }) => {
+  test('update, language, and theme destinations share the existing Settings dialog', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 1000 })
     await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-popover-update`,
-      locale: 'en',
-      update: {
-        status: 'available',
-        latestVersion: '2.0.0',
-      },
+      sessionKey: `${TOPBAR_SESSION_KEY}-settings-update`, locale: 'en',
+      update: { status: 'available', latestVersion: '2.0.0' },
     })
-
-    const update = page.getByTestId('desktop-update-indicator')
-    const language = page.getByTestId('language-switcher-trigger')
-    const theme = page.locator(
-      '.topbar-right > .theme-menu-wrap:not(.lang-menu-wrap) > button',
-    )
-    await update.click()
-    await expect(page.locator('[data-chat-topbar-popover="desktop-update"]')).toHaveCount(1)
-    await language.click()
-    await expect(page.locator('[data-chat-topbar-popover="desktop-update"]')).toHaveCount(0)
-    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(1)
-    await theme.click()
-    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(0)
-    await expect(page.locator('[data-chat-topbar-popover="theme"]')).toHaveCount(1)
-    await page.keyboard.press('Escape')
+    await page.getByTestId('sidebar-desktop-update').click()
+    await expect(page).toHaveURL(/\/settings\/gateway#updates$/)
+    await expect(page.locator('#settings-gateway-updates')).toBeFocused()
+    await expect(page.getByTestId('settings-update-download')).toBeVisible()
+    await page.locator('#settings-rail-general').click()
+    await expect(page.getByTestId('settings-language-group')).toBeVisible()
+    await page.locator('#settings-rail-interface').click()
+    await expect(page.locator('.appearance-theme:has(input[name="appearance-theme"])')).toBeVisible()
+    await expect(page.locator('.settings-modal')).toHaveCount(1)
     await expect(page.locator('[data-chat-topbar-popover]')).toHaveCount(0)
-    await expect(theme).toBeFocused()
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.settings-modal')).toHaveCount(0)
+    await expect(page.getByTestId('sidebar-desktop-update')).toBeFocused()
   })
 
   test('200% zoom-equivalent metrics keep every essential control reachable', async ({ page, context }) => {
     const cdp = await context.newCDPSession(page)
     await cdp.send('Emulation.setDeviceMetricsOverride', {
-      width: 720,
-      height: 500,
-      deviceScaleFactor: 2,
-      mobile: false,
-      screenWidth: 1440,
-      screenHeight: 1000,
+      width: 720, height: 500, deviceScaleFactor: 2, mobile: false,
+      screenWidth: 1440, screenHeight: 1000,
     })
     await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-zoom-200`,
-      locale: 'de',
-      approvalCount: 1,
+      sessionKey: `${TOPBAR_SESSION_KEY}-zoom-200`, locale: 'de', approvalCount: 1,
       update: { status: 'available', latestVersion: '2.0.0' },
     })
-
     await expect.poll(() => page.evaluate(() => ({
-      width: window.innerWidth,
-      scale: window.devicePixelRatio,
+      width: window.innerWidth, scale: window.devicePixelRatio,
     }))).toEqual({ width: 720, scale: 2 })
-    await expect(page.getByTestId('chat-system-status-trigger')).toBeVisible()
+    await expect(page.getByTestId('chat-system-approval')).toBeVisible()
+    await expect(page.getByTestId('sidebar-update-dot')).toBeVisible()
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
   })
 
-  test('forced colors and reduced motion preserve severity and geometry', async ({ page }) => {
+  test('forced colors and reduced motion preserve independent severity and geometry', async ({ page }) => {
     await page.emulateMedia({ forcedColors: 'active', reducedMotion: 'reduce' })
     await page.setViewportSize({ width: 400, height: 800 })
-    await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-forced-colors`,
-      locale: 'en',
-      approvalCount: 1,
+    const harness = await openTopbarSession(page, {
+      sessionKey: `${TOPBAR_SESSION_KEY}-forced-colors`, locale: 'en', approvalCount: 1,
       update: { status: 'error', errorCode: 'download_failed' },
     })
-
-    const trigger = page.getByTestId('chat-system-status-trigger')
-    await expect(trigger).toHaveAttribute('data-state', 'danger')
-    const stateStyle = await trigger.evaluate(element => {
+    const approval = page.getByTestId('chat-system-approval')
+    await expect(approval).toHaveAttribute('data-state', 'warning')
+    await expectTopbarGeometry(page, { minimumTargetSize: 44 })
+    await harness.disconnect()
+    const connection = page.getByTestId('connection-status')
+    // Passive disconnect feedback intentionally stays quiet for five seconds.
+    await expect(connection).toHaveAttribute('data-state', 'danger', { timeout: 10_000 })
+    // Availability loss retires approval data until the next authoritative seed.
+    await expect(approval).toHaveCount(0)
+    const stateStyle = await connection.evaluate(element => {
       const style = getComputedStyle(element)
-      return {
-        animationName: style.animationName,
-        forcedColorAdjust: style.forcedColorAdjust,
-        borderWidth: style.borderTopWidth,
-      }
+      return { animationName: style.animationName, forcedColorAdjust: style.forcedColorAdjust,
+        borderWidth: style.borderTopWidth }
     })
-    expect(stateStyle).toEqual({
-      animationName: 'none',
-      forcedColorAdjust: 'none',
-      borderWidth: '2px',
-    })
+    expect(stateStyle).toEqual({ animationName: 'none', forcedColorAdjust: 'none', borderWidth: '2px' })
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
   })
 })

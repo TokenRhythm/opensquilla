@@ -15,6 +15,7 @@ import { chatTaskId, useChatTaskOwnership } from './useChatTaskOwnership'
 import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
 import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
 import type { ConversationEventData } from '@/modules/conversationEventContent'
+import { FINISHED_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
 
 const SESSION = 'agent:main:webchat:task-ownership'
 
@@ -832,6 +833,51 @@ describe('task ownership event races', () => {
       scope.stop()
     },
   )
+
+  it.each(['', FINISHED_STREAM_TASK_ID])('does not create a task for a standalone approval with owner %s', (owner) => {
+    const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
+    stream.isStreaming.value = false
+    activeStreamTaskId.value = owner
+    taskOwnership.reset(true)
+
+    api.handlers.onWireEventFixture('exec.approval.requested', {
+      approval_id: 'standalone', session_key: SESSION, tool_name: 'shell',
+    })
+    api.handlers.onWireEventFixture('exec.approval.resolved', {
+      approval_id: 'standalone', session_key: SESSION, approved: false,
+    })
+
+    expect(options.applySessionRunState).not.toHaveBeenCalled()
+    expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+    expect(activeStreamTaskId.value).toBe(owner)
+    expect(stream.startStreaming).not.toHaveBeenCalled()
+    scope.stop()
+  })
+
+  it('preserves the existing execution and Stop target while its approval is pending', () => {
+    const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()
+    api.handlers.onWireEventFixture('exec.approval.requested', {
+      approval_id: 'running', session_key: SESSION, task_id: 'task-A', tool_name: 'shell',
+    })
+    expect(options.applySessionRunState).toHaveBeenCalledWith(expect.objectContaining({
+      run_status: 'approval_pending', active_task: expect.objectContaining({ task_id: 'task-A' }),
+    }))
+    expect(taskOwnership.stopTargetTaskId.value).toBe('task-A')
+    expect(activeStreamTaskId.value).toBe('task-A')
+    expect(stream.isStreaming.value).toBe(true)
+    expect(stream.startStreaming).not.toHaveBeenCalled()
+    scope.stop()
+  })
+
+  it('does not let another task approval replace the running task', () => {
+    const { api, options, taskOwnership, scope } = makeHarness()
+    api.handlers.onWireEventFixture('exec.approval.requested', {
+      approval_id: 'stale', session_key: SESSION, task_id: 'task-B', tool_name: 'shell',
+    })
+    expect(options.applySessionRunState).not.toHaveBeenCalled()
+    expect(taskOwnership.stopTargetTaskId.value).toBe('task-A')
+    scope.stop()
+  })
 
   it('does not let a stale-epoch approval event replace the current run state', () => {
     const { api, options, stream, activeStreamTaskId, taskOwnership, scope } = makeHarness()

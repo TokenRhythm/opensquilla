@@ -236,6 +236,75 @@ async def test_v2_replay_batches_converge_from_lane_delivery_ack(v2_connection):
     assert v2_connection.installed_snapshot_proof(receipt(payload)) is not None
 
 
+@pytest.fixture(params=["connection", "v2_connection"])
+def resumable_connection(request):
+    return request.getfixturevalue(request.param)
+
+
+async def test_pending_resume_retry_preserves_replay_owner_and_batch_progress(
+    resumable_connection,
+):
+    conn = resumable_connection
+    key = f"agent:main:resume-retry-{conn.conn_id}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    for index in range(17):
+        get_session_streams().record(key, "session.event.text_delta", {"text": str(index)})
+    first = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert first.ok, first.error
+    pending = conn._pending_replays[key]
+    batch_count = 0
+    while key in conn._pending_replays:
+        await asyncio.sleep(0.01)
+        ids = set(pending.pending_delivery_ids)
+        batch_index = pending.batch_index
+        # Simulate an observer retry after a missing/late control reply, both
+        # before the first ACK and after later batches have started.
+        repeated = await request(conn, "sessions.messages.resume", receipt(payload))
+        assert repeated.ok, repeated.error
+        assert repeated.payload == first.payload
+        assert conn._pending_replays[key] is pending
+        assert pending.pending_delivery_ids == ids
+        assert pending.batch_index == batch_index
+        end = max(ids)
+        if conn._session_flow_v2_enabled:
+            lane_epoch = conn._flow.deliveries[end].lane_epoch
+            update = await request(conn, "transport.sessionFlow.update.v2", {
+                "connection_epoch": conn._flow.epoch,
+                "consumed": [{"subscription_epoch": lane_epoch, "through_delivery_id": end}],
+                "staged_recovery": [], "discarded_lanes": [],
+            })
+        else:
+            update = await request(conn, "transport.flow.update", {
+                "delivery_epoch": conn._flow.epoch, "ack_delivery_id": end,
+            })
+        assert update.ok, update.error
+        batch_count += 1
+        assert batch_count <= 3
+    assert batch_count == 3
+    assert conn.installed_snapshot_proof(receipt(payload)) == first.payload
+    replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
+    assert len(replayed) == 17
+
+
+async def test_pending_resume_retry_does_not_bypass_new_dirty_barrier(resumable_connection):
+    conn = resumable_connection
+    key = f"agent:main:resume-retry-dirty-{conn.conn_id}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    get_session_streams().record(key, "session.event.text_delta", {"text": "tail"})
+    first = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert first.ok, first.error
+    pending = conn._pending_replays[key]
+    conn._mark_flow_dirty({"session_key": key})
+    repeated = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert not repeated.ok and repeated.error.code == "SNAPSHOT_STALE"
+    assert conn._pending_replays[key] is pending
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+
+
 async def test_replay_final_cas_rejects_output_arriving_during_consumption(
     connection, monkeypatch,
 ):
@@ -513,6 +582,60 @@ async def test_batch_mutation_from_legacy_connection_fences_each_modern_owner(co
     await asyncio.sleep(0)
     assert scheduler.mutation_tail(runtime, "agent:main:a") is None
     assert scheduler.mutation_tail(runtime, "agent:main:b") is None
+
+
+@pytest.mark.parametrize("method", ["sessions.reset", "sessions.delete", "sessions.truncate"])
+async def test_identity_mutations_still_retire_snapshot_and_fence_live_delivery(connection, method):
+    runtime = object()
+    key = "agent:main:webchat:identity-fence"
+    connection._recovery_runtime = runtime
+    token = subscribe(connection, key)
+    transfer = connection.snapshot_registry().admit(key, "before", token)
+    _, completed = _admit_session_mutation(
+        method, {"key": key}, RpcContext(conn_id="mutation-owner", session_manager=runtime),
+    )
+    try:
+        assert transfer.closed
+        assert key in connection._flow.dirty
+        assert get_recovery_scheduler().mutation_tail(runtime, key) is not None
+    finally:
+        completed.set_result(None)
+        await asyncio.sleep(0)
+
+
+async def test_manual_compaction_keeps_live_retry_progress_while_ordered_mutation_is_pending(
+    connection,
+):
+    runtime = object()
+    key = "agent:main:webchat:manual-live-progress"
+    connection._recovery_runtime = runtime
+    token = subscribe(connection, key)
+    transfer = connection.snapshot_registry().admit(key, "before", token)
+    _, completed = _admit_session_mutation(
+        "sessions.contextCompact", {"key": key},
+        RpcContext(conn_id="mutation-owner", session_manager=runtime),
+    )
+    try:
+        assert not transfer.closed
+        assert key not in connection._flow.dirty
+        assert get_recovery_scheduler().mutation_tail(runtime, key) is not None
+        payload = get_session_streams().record(key, "session.event.compaction", {
+            "source": "manual", "status": "observed", "epoch": 0,
+            "compaction_id": "cmp-live-review", "phase": "summarizing",
+            "recovery": {"phase": "retry_wait", "reason": "rate_limited",
+                         "retry_after_ms": 35000, "http_status": 429},
+        })
+        await connection.send_event("session.event.compaction", payload)
+        await asyncio.sleep(0)
+        frames = [frame for frame in connection.ws.frames
+                  if frame.get("event") == "session.event.compaction"]
+        assert len(frames) == 1
+        assert frames[0]["payload"]["recovery"]["http_status"] == 429
+        assert frames[0]["payload"]["recovery"]["phase"] == "retry_wait"
+        assert not completed.done(), "Progress must arrive before the operation finishes"
+    finally:
+        completed.set_result(None)
+        await asyncio.sleep(0)
 
 
 async def test_dirty_notice_successor_survives_old_send_finally(connection, monkeypatch):

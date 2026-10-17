@@ -640,20 +640,50 @@ def _is_reparse_point(path: Path) -> bool:
     return reparse_tag_redirects(int(getattr(value, "st_reparse_tag", 0)))
 
 
-def _read_regular_bundle_file(path: Path) -> bytes:
+def _read_regular_bundle_file(path: Path, *, max_bytes: int | None = None) -> bytes:
+    """Read one stable regular file, with an optional allocation bound.
+
+    The preflight size check is only an optimization: the bounded read also
+    catches growth after stat. Keep path and open-handle identity checks so a
+    replacement cannot turn collection into a read of another file.
+    """
+    if max_bytes is not None and (
+        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
+    ):
+        raise ValueError("max_bytes must be a non-negative integer")
     native_path = native_io_path(path)
     before = native_path.lstat()
     if stat.S_ISLNK(before.st_mode) or _is_reparse_point(path):
         raise ArtifactPathError("artifact bundle cannot contain links or reparse points")
     if not stat.S_ISREG(before.st_mode):
         raise ArtifactPathError("artifact bundle can contain regular files only")
-    data = native_path.read_bytes()
+    if max_bytes is not None and before.st_size > max_bytes:
+        raise ArtifactBudgetError("artifact material exceeds the read size limit")
+
+    def identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode),
+                value.st_size, value.st_mtime_ns)
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(native_path, flags), "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before):
+            raise ArtifactPathError("artifact bundle file changed while it was collected")
+        # Do not reserve the entire policy limit for tiny files. An extra byte
+        # detects growth, and the final stat also rejects concurrent expansion.
+        data = stream.read() if max_bytes is None else stream.read(opened.st_size + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ArtifactBudgetError("artifact material exceeds the read size limit")
+        finished = os.fstat(stream.fileno())
+        if max_bytes is not None and finished.st_size > max_bytes:
+            raise ArtifactBudgetError("artifact material exceeds the read size limit")
     after = native_path.lstat()
     if (
         stat.S_ISLNK(after.st_mode)
         or _is_reparse_point(path)
-        or before.st_size != after.st_size
-        or before.st_mtime_ns != after.st_mtime_ns
+        or identity(before) != identity(finished)
+        or identity(before) != identity(after)
         or len(data) != after.st_size
     ):
         raise ArtifactPathError("artifact bundle file changed while it was collected")
@@ -1092,8 +1122,10 @@ def collect_artifact_bundle(
     entrypoint = _normalize_bundle_logical_path(entry.relative_to(root).as_posix())
     files: list[ArtifactBundleSourceFile] = []
     seen_collision_keys: dict[str, tuple[str, Path]] = {}
+    total_bytes = 0
 
     def append_source(source: Path, logical_path: str) -> None:
+        nonlocal total_bytes
         normalized = _normalize_bundle_logical_path(logical_path)
         if _is_sensitive_bundle_path(normalized):
             raise ArtifactPathError("artifact bundle contains a sensitive path")
@@ -1107,21 +1139,21 @@ def collect_artifact_bundle(
         _ensure_no_bundle_link_components(root, source)
         if read_guard is not None:
             read_guard(source)
-        data = _read_regular_bundle_file(source)
-        if normalized == entrypoint and len(data) > DEFAULT_ARTIFACT_MAX_BYTES:
-            raise ArtifactBudgetError(
-                "artifact bundle entrypoint exceeds per-file budget "
-                f"({len(data)} > {DEFAULT_ARTIFACT_MAX_BYTES})"
-            )
         if len(files) + 1 > max_files:
             raise ArtifactBudgetError(
                 f"artifact bundle exceeds file-count budget ({len(files) + 1} > {max_files})"
             )
-        next_total = sum(len(item.data) for item in files) + len(data)
-        if next_total > max_bytes:
+        remaining = max(0, max_bytes - total_bytes)
+        entry_limited = normalized == entrypoint and DEFAULT_ARTIFACT_MAX_BYTES < remaining
+        read_limit = DEFAULT_ARTIFACT_MAX_BYTES if entry_limited else remaining
+        try:
+            data = _read_regular_bundle_file(source, max_bytes=read_limit)
+        except ArtifactBudgetError as exc:
+            budget = "entrypoint per-file" if entry_limited else "total"
             raise ArtifactBudgetError(
-                f"artifact bundle exceeds total budget ({next_total} > {max_bytes})"
-            )
+                f"artifact bundle exceeds {budget} budget"
+            ) from exc
+        total_bytes += len(data)
         files.append(
             ArtifactBundleSourceFile(
                 path=normalized,
@@ -1628,6 +1660,82 @@ class ArtifactStore:
             raise
         return ref
 
+    def read_verified_material(
+        self,
+        artifact_id: str,
+        *,
+        session_id: str,
+        max_bytes: int | None = None,
+        validate_bundle: bool = False,
+    ) -> tuple[ArtifactRef, bytes, ArtifactBundleManifest | None]:
+        """Read the scoped material once and optionally verify its whole bundle.
+
+        The returned bytes belong to this exact verified ref. Callers may reuse
+        them within their request, but this is not an authorization cache and
+        does not imply that an internal revision is a public deliverable.
+        """
+        ref = self.get_ref(session_id=session_id, artifact_id=artifact_id)
+        if max_bytes is not None and ref.size > max_bytes:
+            raise ArtifactBudgetError("artifact material exceeds the read size limit")
+        path, exists = self._preferred_material_path_for_ref(ref)
+        if not exists or path is None:
+            raise ArtifactNotFoundError("artifact material not found")
+        try:
+            payload = _read_regular_bundle_file(path, max_bytes=max_bytes)
+        except ArtifactPathError as exc:
+            raise ArtifactIntegrityError("artifact material is unsafe or changed") from exc
+        if len(payload) != ref.size or hashlib.sha256(payload).hexdigest() != ref.sha256:
+            raise ArtifactIntegrityError("artifact material hash or size mismatch")
+        manifest = self._describe_preview_bundle_for_ref(ref, path) if validate_bundle else None
+        if manifest is not None:
+            for item in manifest.files:
+                self._resolve_preview_bundle_member(ref, path, item)
+        return ref, payload, manifest
+
+    def read_verified_bundle(
+        self,
+        artifact_id: str,
+        *,
+        session_id: str,
+        max_bytes: int = DEFAULT_ARTIFACT_BUNDLE_MAX_BYTES,
+    ) -> ArtifactBundle:
+        """Capture one immutable version without repeatedly reading its entrypoint.
+
+        Authorization remains with the caller. Every returned byte is bounded
+        and checked against the scoped ref or its manifest before export.
+        """
+        ref, payload, _ = self.read_verified_material(
+            artifact_id, session_id=session_id,
+            max_bytes=min(max_bytes, DEFAULT_ARTIFACT_MAX_BYTES),
+        )
+        material_path, exists = self._preferred_material_path_for_ref(ref)
+        if not exists or material_path is None:
+            raise ArtifactNotFoundError("artifact material not found")
+        manifest = self._describe_preview_bundle_for_ref(ref, material_path)
+        if manifest is None:
+            return ArtifactBundle(entrypoint=ref.name, files=(
+                ArtifactBundleSourceFile(path=ref.name, mime=ref.mime, data=payload),
+            ))
+        if manifest.total_size > max_bytes:
+            raise ArtifactBudgetError("artifact bundle exceeds total budget")
+        files: list[ArtifactBundleSourceFile] = []
+        for item in manifest.files:
+            if item.path == manifest.entrypoint:
+                data = payload
+            else:
+                blob_path = material_path.parent / ARTIFACT_BUNDLE_BLOBS_DIR / item.sha256
+                try:
+                    data = _read_regular_bundle_file(blob_path, max_bytes=item.size)
+                except (OSError, ArtifactPathError, ArtifactBudgetError) as exc:
+                    raise ArtifactIntegrityError("artifact bundle blob is unavailable") from exc
+                if len(data) != item.size or hashlib.sha256(data).hexdigest() != item.sha256:
+                    raise ArtifactIntegrityError("artifact preview resource hash mismatch")
+            files.append(ArtifactBundleSourceFile(path=item.path, mime=item.mime, data=data))
+        return ArtifactBundle(
+            entrypoint=manifest.entrypoint, files=tuple(files),
+            collection_status=manifest.collection_status, warning_codes=manifest.warning_codes,
+        )
+
     def resolve_for_download(
         self,
         artifact_id: str,
@@ -1753,6 +1861,17 @@ class ArtifactStore:
             raise ArtifactNotFoundError("artifact not found")
         material_path, material_exists = self._preferred_material_path_for_ref(ref)
         if not material_exists or material_path is None:
+            raise ArtifactNotFoundError("artifact not found")
+        return ref
+
+    def get_public_ref(self, *, session_id: str, artifact_id: str) -> ArtifactRef:
+        """Resolve one listed deliverable without enumerating its session."""
+        ref = self.get_ref(session_id=session_id, artifact_id=artifact_id)
+        layout = self._preferred_artifact_layout(session_id, artifact_id)
+        if layout is None or not layout[2]:
+            raise ArtifactNotFoundError("artifact not found")
+        artifact_dir, _material_name, _safe = layout
+        if native_io_path(artifact_dir / ARTIFACT_INTERNAL_MARKER_NAME).exists():
             raise ArtifactNotFoundError("artifact not found")
         return ref
 
@@ -1935,13 +2054,16 @@ class ArtifactStore:
         if not native_manifest_path.exists():
             return None
         try:
-            manifest_bytes = _read_regular_bundle_file(native_manifest_path)
+            manifest_bytes = _read_regular_bundle_file(
+                native_manifest_path, max_bytes=DEFAULT_ARTIFACT_BUNDLE_MAX_BYTES,
+            )
             raw = json.loads(manifest_bytes.decode("utf-8"))
         except (
             OSError,
             UnicodeDecodeError,
             json.JSONDecodeError,
             ArtifactPathError,
+            ArtifactBudgetError,
         ) as exc:
             raise ArtifactIntegrityError("artifact bundle manifest is unreadable") from exc
         if not isinstance(raw, dict):
@@ -1975,8 +2097,8 @@ class ArtifactStore:
         blob_path = material_path.parent / ARTIFACT_BUNDLE_BLOBS_DIR / item.sha256
         native_blob_path = native_io_path(blob_path)
         try:
-            payload = _read_regular_bundle_file(native_blob_path)
-        except (FileNotFoundError, OSError, ArtifactPathError) as exc:
+            payload = _read_regular_bundle_file(native_blob_path, max_bytes=item.size)
+        except (FileNotFoundError, OSError, ArtifactPathError, ArtifactBudgetError) as exc:
             # The manifest already declared this content-addressed member.
             # Its absence or replacement is corruption, not an unknown URL.
             raise ArtifactIntegrityError("artifact bundle blob is unavailable") from exc

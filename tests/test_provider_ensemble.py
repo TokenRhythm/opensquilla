@@ -6559,6 +6559,7 @@ def _aggregator_timeout_harness(
 @pytest.mark.asyncio
 async def test_aggregator_no_output_timeout_uses_fixed_aggregator_and_preserves_usage(
     monkeypatch: pytest.MonkeyPatch,
+    ensemble_clock: list[float],
 ) -> None:
     proposer_receipt = ProviderBillingReceipt(
         currency="USD",
@@ -6574,9 +6575,10 @@ async def test_aggregator_no_output_timeout_uses_fixed_aggregator_and_preserves_
     )
 
     async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
-        # Never produce a terminal event: the test exercises the idle-timeout
-        # takeover, so a delayed DoneEvent would make cancellation scheduling
-        # decide whether the fallback path is entered.
+        # Expire only the admitted aggregator's idle window. Keep this clock
+        # fixed during fallback so runner scheduling cannot time out that
+        # successful stream and add an unrelated retry to the usage receipt.
+        ensemble_clock[0] += provider.aggregator_timeout_seconds + 1.0
         await asyncio.Event().wait()
         yield DoneEvent(model="agg")
 
@@ -6610,7 +6612,7 @@ async def test_aggregator_no_output_timeout_uses_fixed_aggregator_and_preserves_
         selection_plan=selection_plan,
     )
 
-    events = await _collect(provider)
+    events = await asyncio.wait_for(_collect(provider), timeout=10)
 
     assert [call["model"] for call in registry.calls] == ["p1"]
     # A completed idle budget immediately selects the safe fallback path;
@@ -7032,6 +7034,13 @@ async def test_aggregator_error_finish_fallback_retains_reported_usage_without_r
     assert aggregator_attempts == 1
     assert len(aggregator.calls) == 1
     assert fallback is not None and len(fallback.calls) == 1
+    fallback_activity = [
+        event for event in events
+        if isinstance(event, ProviderActivityEvent) and event.phase == "fallback"
+    ]
+    assert [(event.from_model, event.model) for event in fallback_activity] == [
+        ("agg", "fallback"),
+    ]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert (done.input_tokens, done.output_tokens) == (31, 9)
     assert done.terminal_request_input_tokens == 11
@@ -8266,6 +8275,13 @@ async def test_default_quorum_with_zero_successful_proposers_uses_all_failed_pol
     called_models = [call["model"] for call in registry.calls]
     assert called_models.count("fallback") == 1
     assert "agg" not in called_models
+    fallback_activity = [
+        event for event in events
+        if isinstance(event, ProviderActivityEvent) and event.phase == "fallback"
+    ]
+    assert [(event.from_model, event.model) for event in fallback_activity] == [
+        ("", "fallback"),
+    ]
     assert isinstance(next(event for event in events if isinstance(event, DoneEvent)), DoneEvent)
 
 

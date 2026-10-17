@@ -1166,7 +1166,25 @@ async def _accept_turn_in_scope(
         and callable(storage.accept_turn if storage.capabilities.atomic_acceptance else None)
     )
     persisted_entry = None
-    expected_epoch = 0
+    expected_epoch = int(getattr(session, "epoch", 0) or 0)
+
+    def _install_auto_title(reservation: AdmissionReservation | None = None) -> None:
+        if not generate_title:
+            return
+        try:
+            ports.install_auto_title(
+                route_envelope,
+                key,
+                title_message_text,
+                enabled=True,
+                session_id=session_id,
+                session_epoch=expected_epoch,
+                root_turn_id=turn_id,
+                reservation=reservation,
+            )
+        except Exception:  # noqa: BLE001 - naming must not block an accepted turn.
+            log.exception("sessions.send.post_accept_title_failed", session_key=key)
+
     if plan_run is not None and not atomic_runtime_acceptance:
         raise AdmissionUnavailableError(
             "Plan implementation requires atomic TaskRuntime acceptance"
@@ -1398,7 +1416,10 @@ async def _accept_turn_in_scope(
                     _handle, collected_acceptance = collected
                     return collected_acceptance
 
+            title_reservation: AdmissionReservation | None = None
+
             async def _freeze(reservation: AdmissionReservation) -> None:
+                nonlocal title_reservation
                 await ports.freeze_acceptance(
                     atomic_task_runtime,
                     reservation,
@@ -1408,6 +1429,7 @@ async def _accept_turn_in_scope(
                         else None
                     ),
                 )
+                title_reservation = reservation
 
             def _before_activate(_acceptance: AdmissionAcceptance) -> None:
                 if (
@@ -1415,6 +1437,7 @@ async def _accept_turn_in_scope(
                     and session_manager.capabilities.cache_epoch
                 ):
                     session_manager.set_cached_epoch(key, expected_epoch)
+                _install_auto_title(title_reservation)
 
             outcome = await commit_reserved_turn(
                 runtime=atomic_task_runtime,
@@ -1731,21 +1754,6 @@ async def _accept_turn_in_scope(
                     await upload_store.evict(file_uuid)
                 except Exception:  # noqa: BLE001 - eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", file_uuid[:8])
-        if not acceptance.replayed and generate_title:
-            try:
-                ports.schedule_auto_title(
-                    key,
-                    title_message_text,
-                    enabled=generate_title,
-                    session_id=session_id,
-                    root_turn_id=acceptance.receipt.task_id,
-                )
-            except Exception:  # noqa: BLE001 - turn is already accepted.
-                log.exception(
-                    "sessions.send.post_accept_title_failed",
-                    session_key=key,
-                    task_id=acceptance.receipt.task_id,
-                )
         response = await ports.accepted_response(
             acceptance,
             client_request_id=ingress_identity.client_request_id,
@@ -1831,6 +1839,7 @@ async def _accept_turn_in_scope(
                 )
                 if callable(set_cached_epoch):
                     set_cached_epoch(key, expected_epoch)
+            _install_auto_title()
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
@@ -1971,18 +1980,6 @@ async def _accept_turn_in_scope(
                             "uploads.evict_failed_post_turn uuid=%s",
                             file_uuid[:8],
                         )
-            if generate_title:
-                try:
-                    ports.schedule_auto_title(
-                        key,
-                        title_message_text,
-                        enabled=generate_title,
-                    )
-                except Exception:  # noqa: BLE001 - turn is already accepted.
-                    log.exception(
-                        "sessions.send.post_accept_title_failed",
-                        session_key=key,
-                    )
         return await ports.accepted_response(
             acceptance,
             client_request_id=ingress_identity.client_request_id,
@@ -2059,6 +2056,7 @@ async def _accept_turn_in_scope(
         async with direct_registry.admission(key):
             await _persist_user_message_with_lock()
             user_message_id = getattr(legacy_persisted_entry, "message_id", None)
+            _install_auto_title()
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
@@ -2091,12 +2089,6 @@ async def _accept_turn_in_scope(
                     await _store.evict(_u)
                 except Exception:  # noqa: BLE001 — eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        if generate_title:
-            ports.schedule_auto_title(
-                key,
-                title_message_text,
-                enabled=generate_title,
-            )
         return {
             "status": "accepted",
             "key": key,
@@ -2146,6 +2138,7 @@ async def _accept_turn_in_scope(
             else "interrupt" if requested_mode == "steer" else requested_mode
         )
         try:
+            _install_auto_title()
             handle = await ports.start_turn(
                 task_runtime,
                 route_envelope,
@@ -2301,14 +2294,6 @@ async def _accept_turn_in_scope(
                     await _store.evict(_u)
                 except Exception:  # noqa: BLE001 — eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        if generate_title:
-            ports.schedule_auto_title(
-                key,
-                title_message_text,
-                enabled=generate_title,
-                session_id=session_id,
-                root_turn_id=turn_id,
-            )
         await ports.publish_disposition(
             key,
             {

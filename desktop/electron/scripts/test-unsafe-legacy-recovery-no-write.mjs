@@ -42,6 +42,7 @@ function launchEnvironment(isolatedHome) {
     const upperName = name.toUpperCase()
     if (
       upperName.startsWith('OPENSQUILLA_')
+      || upperName === 'ELECTRON_RUN_AS_NODE'
       || ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY'].includes(upperName)
       || /(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)/i.test(name)
       || /^(?:AWS|AZURE|GOOGLE|ANTHROPIC|OPENAI|OPENROUTER|MINIMAX|DEEPSEEK|GROQ|MISTRAL|COHERE|GEMINI|OLLAMA|XAI|MOONSHOT|DASHSCOPE|SILICONFLOW|ZHIPU|BAIDU|VOLCENGINE|TENCENT|ALIYUN|HF|HUGGINGFACE)_/i.test(name)
@@ -53,6 +54,11 @@ function launchEnvironment(isolatedHome) {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
+    APPDATA: join(isolatedHome, 'AppData', 'Roaming'),
+    LOCALAPPDATA: join(isolatedHome, 'AppData', 'Local'),
+    TEMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
+    TMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
+    TMPDIR: join(isolatedHome, 'AppData', 'Local', 'Temp'),
     OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
@@ -75,6 +81,8 @@ const selectedRoot = join(recoveryRoot, recoveryId)
 
 await mkdir(recoveryRoot, { recursive: true })
 await mkdir(isolatedHome, { recursive: true })
+await mkdir(join(isolatedHome, 'AppData', 'Roaming'), { recursive: true })
+await mkdir(join(isolatedHome, 'AppData', 'Local', 'Temp'), { recursive: true })
 await mkdir(outside, { recursive: true })
 const unsafeUpdateState = join(outside, 'opensquilla', 'state', 'desktop-update.json')
 const unsafeUpdateBytes = JSON.stringify({

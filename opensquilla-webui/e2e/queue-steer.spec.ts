@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 
 import {
   chatHistoryPayload,
@@ -242,7 +243,7 @@ async function installMockGateway(
 
 async function openRunningSession(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   await expect(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })).toBeEditable()
   await expect(page.getByRole('button', { name: /^(Stop .*response|停止.*回复)$/ })).toBeVisible()
   await expect(page.getByText(ORIGINAL_TEXT, { exact: true })).toBeVisible()
@@ -287,6 +288,64 @@ function acceptedSteer(
 }
 
 test.describe('Queue/Steer composer semantics', () => {
+  for (const theme of ['dark', 'light', 'miami']) {
+    for (const floating of [true, false]) {
+      test(`composer menu covers queued cards in ${theme} with floating=${floating}`, async ({ page }, testInfo) => {
+        await page.setViewportSize({ width: 1100, height: 850 })
+        await page.addInitScript(({ theme, floating }) => {
+          localStorage.setItem('opensquilla-locale', 'en')
+          localStorage.setItem('opensquilla-theme', theme)
+          localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: floating }))
+        }, { theme, floating })
+        const state = await installMockGateway(page)
+        await openRunningSession(page)
+        const composer = page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })
+        for (const text of ['Queued first', 'Queued second', 'Queued third']) {
+          await composer.fill(text)
+          await composer.press('Enter')
+          await expect(page.locator('.chat-pending-card').filter({ hasText: text })).toBeVisible()
+        }
+        await page.locator('.chat-plus-btn').click()
+        const menu = page.locator('.composer-add-menu')
+        await expect(menu).toBeVisible()
+        // Inspect actual painting/hit-testing, not the numerical z-index of a
+        // child trapped inside its parent's backdrop-filter stacking context.
+        const overlap = () => menu.evaluate(menu => {
+          const bounds = menu.getBoundingClientRect()
+          return [...document.querySelectorAll('.chat-pending-card')].flatMap(card => {
+            const rect = card.getBoundingClientRect()
+            const left = Math.max(bounds.left, rect.left) + 4
+            const right = Math.min(bounds.right, rect.right) - 4
+            const top = Math.max(bounds.top, rect.top) + 4
+            const bottom = Math.min(bounds.bottom, rect.bottom) - 4
+            if (left >= right || top >= bottom) return []
+            return [0.1, 0.5, 0.9].map(fraction => {
+              const hit = document.elementFromPoint(left + (right - left) * fraction, (top + bottom) / 2)
+              return { covered: Boolean(hit && menu.contains(hit)), hit: hit?.className }
+            })
+          })
+        })
+        await expect.poll(async () => (await overlap()).length).toBeGreaterThan(0)
+        const hits = await overlap()
+        await page.screenshot({ path: testInfo.outputPath('queue-add-menu.png') })
+        expect(hits.every(hit => hit.covered), JSON.stringify(hits)).toBe(true)
+        await page.keyboard.press('Escape')
+        await expect(menu).toHaveCount(0)
+        // The queue's own upward menu must remain usable after its layer moves.
+        await page.locator('.chat-pending-more-wrap').last().getByRole('button').click()
+        await expect(page.locator('.chat-pending-menu')).toBeVisible()
+        expect(await page.locator('.chat-pending-menu').evaluate(menu => {
+          const rect = menu.getBoundingClientRect()
+          const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+          return Boolean(hit && menu.contains(hit))
+        })).toBe(true)
+        expect(state.chatSendCalls).toBe(0)
+        expect(state.steerRequests).toHaveLength(0)
+        await expect(page.locator('.chat-pending-card')).toHaveCount(3)
+      })
+    }
+  }
+
   for (const legacyHistory of [false, true]) {
     const title = legacyHistory
       ? 'preserves the router and first segment when legacy history refreshes after a steer'
@@ -550,7 +609,7 @@ test.describe('Queue/Steer composer semantics', () => {
     await expect(card).toHaveCount(0)
     await expect(userBubble).toHaveCount(1)
     await expect(userBubble.locator('.msg-user-steer-status--applied')).toHaveText(/^(Steer|引导)$/)
-    await expect(composer).toHaveValue(unrelatedDraft)
+    await expectComposerValue(composer, unrelatedDraft)
     expect(state.steerRequests).toHaveLength(2)
     expect(state.receiptRequests).toHaveLength(1)
     expect(state.chatSendCalls).toBe(0)
@@ -660,7 +719,7 @@ test.describe('Queue/Steer composer semantics', () => {
     await expect(card).toContainText(steerText)
     await expect(card.getByRole('button', { name: STEER_ACTION_NAME })).toBeEnabled()
     await expect(card.getByRole('button', { name: /Retry|重试/ })).toHaveCount(0)
-    await expect(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })).toHaveValue('')
+    await expectComposerValue(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME }), '')
     expect(state.chatSendCalls).toBe(0)
   })
 })

@@ -70,7 +70,7 @@
             <span class="msg-prompt-annotation__text">{{ annotation.body }}</span>
           </span>
           <button
-            v-if="canReusePromptAnnotations && !shareMode"
+            v-if="canReusePromptAnnotations && !shareMode && !annotation.selection"
             type="button"
             class="msg-prompt-annotation__reuse"
             :title="t('chat.promptAnnotations.reuseDescription')"
@@ -217,7 +217,7 @@
           <span class="msg-file-chip__name">{{ localPathName(path) }}</span>
         </span>
       </div>
-      <div v-if="visibleMessageText" class="msg-user-bubble">
+      <div v-if="visibleMessageText" class="msg-user-bubble" data-chat-find-body>
         {{ visibleMessageText }}
       </div>
       <span v-if="isGoalSource" class="msg-user-goal-origin" role="status">
@@ -249,6 +249,7 @@
       </button>
       <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
       <button
+        v-if="editAvailable !== false"
         type="button"
         class="msg-action"
         :class="{ 'msg-action--disabled': isStreaming }"
@@ -286,6 +287,8 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageAttachmentMime, isImageDisplayAttachment } from '@/utils/chat/attachments'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactPreviewController } from '@/modules/artifactWorkbench'
+import { attachmentImagePreviewKey, type AttachmentImagePreviewSource } from '@/composables/chat/useArtifactImageLightbox'
+import { artifactUsesWorkbenchPreview } from '@/utils/workbench/artifactPreview'
 import { fileTypeLabel } from '@/utils/fileType'
 import { localPathName, localPathPresentation } from '@/types/localPathReferences'
 import {
@@ -301,7 +304,7 @@ import {
 const { t } = useI18n()
 const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY, null)
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   message: ChatRenderedMessage
   sessionKey?: string
   shareMode: boolean
@@ -312,18 +315,19 @@ const props = defineProps<{
   downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
   showTurnOutcome?: boolean
   isStreaming?: boolean
+  editAvailable?: boolean
   isGoalSource?: boolean
   canReusePromptAnnotations?: boolean
   workbenchResourcePreviewEnabled?: boolean
   workbenchResourceEditEnabled?: boolean
   workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
-}>()
+}>(), { editAvailable: true })
 
 const emit = defineEmits<{
   edit: [message: ChatRenderedMessage]
   editAttachment: [attachment: DisplayAttachment]
   previewAttachment: [attachment: DisplayAttachment]
-  previewImage: [attachment: DisplayAttachment]
+  previewImage: [attachment: DisplayAttachment, preview?: AttachmentImagePreviewSource]
   toggleShare: [messageId: string]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
 }>()
@@ -438,7 +442,7 @@ function remoteImagePreview(attachment: DisplayAttachment): boolean {
 }
 
 function attachmentPreviewKey(attachment: DisplayAttachment): string {
-  return JSON.stringify([props.sessionKey, attachment.renderKey, attachment.download_url, attachment.sha256_ref])
+  return attachmentImagePreviewKey(attachment, props.sessionKey || '')
 }
 
 function attachmentPreviewController(attachment: DisplayAttachment): ArtifactPreviewController | undefined {
@@ -449,6 +453,7 @@ function attachmentPreviewController(attachment: DisplayAttachment): ArtifactPre
     const sessionKey = props.sessionKey
     controller = artifactWorkbench.previews.create({
       fullSize: false,
+      retainLoadedBlob: true,
       maxBytes: IMAGE_PREVIEW_MAX_BYTES,
       loadBlob: async signal => {
         const result = await artifactWorkbench.content.fetchAttachment(attachment, {
@@ -537,10 +542,7 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 
 function workbenchAttachment(attachment: DisplayAttachment): boolean {
   if (!attachment.attachmentId) return false
-  const mime = attachment.mime.split(';', 1)[0].trim().toLowerCase()
-  const name = attachment.name.trim().toLowerCase()
-  return mime === 'text/html' || mime === 'application/xhtml+xml'
-    || name.endsWith('.html') || name.endsWith('.htm') || name.endsWith('.xhtml')
+  return artifactUsesWorkbenchPreview({ name: attachment.name, mime: attachment.mime })
 }
 
 function workbenchAttachmentResource(attachment: DisplayAttachment): WorkbenchResource | null {
@@ -591,7 +593,15 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
 function previewImage(attachment: DisplayAttachment, event: MouseEvent) {
   // Establish the return target even when pointer clicks do not focus buttons.
   if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true })
-  emit('previewImage', attachment)
+  const key = attachmentPreviewKey(attachment)
+  const preview = attachmentPreviews.get(key)
+  const source: AttachmentImagePreviewSource | undefined = preview?.readLoadedBlob() ? {
+    key,
+    readBlob: () => attachmentPreviews.get(key) === preview && attachmentPreviewKey(attachment) === key
+      ? preview.readLoadedBlob() : null,
+  } : undefined
+  if (source) emit('previewImage', attachment, source)
+  else emit('previewImage', attachment)
 }
 
 function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {
@@ -998,6 +1008,9 @@ function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {
 }
 
 .msg-user-actions {
+  /* Paragraph selections must not copy toolbar icons into clipboard HTML. */
+  -webkit-user-select: none;
+  user-select: none;
   display: flex;
   gap: 0.125rem;
   margin-top: 0.125rem;

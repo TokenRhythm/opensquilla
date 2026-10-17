@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -98,7 +99,12 @@ def test_recover_config_ignores_link_shaped_backups(tmp_path: Path) -> None:
     good = _valid_config(home)
     target = tmp_path / "outside.toml"
     target.write_text(good, encoding="utf-8")
-    (home / "config.toml.backup.20260301000000000000").symlink_to(target)
+    try:
+        (home / "config.toml.backup.20260301000000000000").symlink_to(target)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
 
     report = recover_config(home)

@@ -11,8 +11,11 @@
     </div>
     <div class="cron-detail__runs">
       <p v-if="waiting" class="cron-muted" role="status">{{ t('cronSkills.jobs.waitingForCapacity') }}</p>
-      <p v-else-if="error" class="cron-muted" role="alert">{{ error }}</p>
-      <p v-else-if="loading" class="cron-muted">{{ t('cronSkills.runHistory.loading') }}</p>
+      <p v-else-if="error" class="cron-runs__error" role="status">
+        <span>{{ t('cronSkills.runHistory.loadFailed') }}</span>
+        <button type="button" class="btn btn--ghost" :disabled="loading" @click="emit('retry')">{{ t('shared.errorState.retry') }}</button>
+      </p>
+      <p v-else-if="loading && runs.length === 0" class="cron-muted">{{ t('cronSkills.runHistory.loading') }}</p>
       <p v-else-if="runs.length === 0" class="cron-muted">{{ t('cronSkills.runHistory.empty') }}</p>
       <DataTable
         v-if="runs.length > 0"
@@ -22,7 +25,7 @@
         :empty-text="t('cronSkills.runHistory.empty')"
       >
         <template #status="{ row }">
-          <span :class="`status status--${row.status === 'ok' ? 'ok' : 'err'}`">{{ row.statusLabel }}</span>
+          <span :class="`status status--${row.status === 'ok' ? 'ok' : 'err'}`" :data-cron-failed-run="row.status === 'error' || row.status === 'fail' ? row.id : undefined">{{ row.statusLabel }}</span>
         </template>
         <template #reply="{ row }">
           <span class="cron-runs__reply">{{ row.reply }}</span>
@@ -53,6 +56,8 @@ interface CronRunHistoryJob {
 }
 
 interface CronRunHistoryRun {
+  id?: string
+  error?: string
   started_at?: string
   status?: string
   duration_ms?: number
@@ -72,6 +77,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
+  retry: []
   openChat: [sessionKey: string]
 }>()
 
@@ -86,12 +92,13 @@ const runColumns = computed(() => [
 
 const runRows = computed(() =>
   props.runs.map(run => ({
+    id: run.id,
     time: run.started_at ? relTime(run.started_at) : '—',
     status: run.status || 'unknown',
     statusLabel: run.status || t('cronSkills.runHistory.unknown'),
     duration: run.duration_ms != null ? run.duration_ms + 'ms' : '—',
     delivery: deliveryStatusText(run),
-    reply: run.summary ? run.summary.substring(0, 120) : '—',
+    reply: (run.error || run.summary || '').substring(0, 120) || '—',
     sessionKey: run.sessionKey ?? null,
   })),
 )
@@ -111,6 +118,16 @@ function stringField(source: Record<string, unknown>, key: string): string {
 </script>
 
 <style scoped>
+.cron-runs__error {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 8px;
+  line-height: 20px;
+  margin: 0;
+}
 .cron-detail {
   background: var(--bg-surface);
   border: 1px solid var(--border);

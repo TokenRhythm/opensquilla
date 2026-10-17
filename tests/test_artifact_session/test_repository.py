@@ -614,6 +614,64 @@ async def test_restore_no_op_receipts_do_not_consume_change_history_limit(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_fork_document_aliases_follow_only_provenance_and_current_session(tmp_path: Path):
+    service = await open_service(tmp_path / "fork-aliases.db", FakeClock())
+    fork_actor = Actor(ActorKind.SYSTEM, "session-fork")
+    try:
+        parent = await service.create_document(
+            session_key="parent", session_id="parent-epoch", name="Same name",
+            kind=ArtifactKind.DOCUMENT, initial_artifact=blob("original"), actor=USER,
+        )
+        child, = await service.fork_session_heads(
+            source_session_id="parent-epoch", target_session_key="child",
+            target_session_id="child-epoch", snapshots=(parent,), actor=fork_actor,
+        )
+        edited = await service.commit_revision(
+            document_id=child.document.document_id,
+            expected_head_revision_id=child.revision.revision_id,
+            expected_state_revision=child.document.state_revision,
+            artifact=blob("child-edited"), actor=AGENT,
+        )
+        grandchild, = await service.fork_session_heads(
+            source_session_id="child-epoch", target_session_key="grandchild",
+            target_session_id="grandchild-epoch", snapshots=(edited,), actor=fork_actor,
+        )
+        parent_id = parent.document.document_id
+        child_id = child.document.document_id
+        assert await service.resolve_fork_document_heads(
+            session_key="child", session_id="child-epoch", source_document_ids=(parent_id,),
+        ) == {parent_id: edited}
+        assert await service.resolve_fork_document_heads(
+            session_key="grandchild", session_id="grandchild-epoch",
+            source_document_ids=(parent_id, child_id),
+        ) == {parent_id: grandchild, child_id: grandchild}
+        for key, epoch in (("other", "child-epoch"), ("child", "replaced-epoch")):
+            assert await service.resolve_fork_document_heads(
+                session_key=key, session_id=epoch, source_document_ids=(parent_id,),
+            ) == {}
+
+        # Identical filename, display name and immutable blob do not grant an alias.
+        await service.create_document(
+            session_key="unrelated", session_id="unrelated-epoch", name="Same name",
+            kind=ArtifactKind.DOCUMENT, initial_artifact=blob("original"), actor=USER,
+        )
+        assert await service.resolve_fork_document_heads(
+            session_key="unrelated", session_id="unrelated-epoch",
+            source_document_ids=(parent_id,),
+        ) == {}
+        # Even a valid lineage is not enough to select between two local copies.
+        await service.fork_session_heads(
+            source_session_id="parent-epoch", target_session_key="child",
+            target_session_id="child-epoch", snapshots=(parent,), actor=fork_actor,
+        )
+        assert await service.resolve_fork_document_heads(
+            session_key="child", session_id="child-epoch", source_document_ids=(parent_id,),
+        ) == {}
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_session_fork_copies_only_current_heads_with_provenance(tmp_path: Path) -> None:
     db_path = tmp_path / "artifacts.db"
     service = await open_service(db_path, FakeClock())

@@ -40,6 +40,8 @@ export interface DesktopGatewayConnection {
   profileFingerprint: string
   httpUrl: string | null
   wsUrl: string | null
+  /** Owned Gateway's actual Control UI mount; empty means root. Older shells omit it. */
+  controlUiBasePath?: string
   authToken?: string | null
   error: string | null
   sandboxUpgrade?: SandboxUpgradeReport | null
@@ -90,8 +92,12 @@ export interface DesktopUpdateState {
   canNativeInstall: boolean
   /** Explicit shell permission to launch installation; older manual shells omit it. */
   canInstall?: boolean
+  /** The shell can prepare and verify updates without a download click. Older shells omit it. */
+  canAutoDownload?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  /** Validated official release page for latestVersion; never an installer asset URL. */
+  releaseNotesUrl?: string | null
   source: DesktopUpdateSource | null
   fallbackUsed: boolean
 }
@@ -230,6 +236,8 @@ export interface PlatformFilesApi {
   importAttachmentSelection?: (request: NativeAttachmentContext, token: string) => Promise<NativeAttachmentReceipt>
   cancelAttachmentSelections?: () => Promise<void>
   saveArtifact?: (payload: ArtifactOpenRequest) => Promise<{ status: 'saved' | 'cancelled' }>
+  /** Save retained session material without passing its body through the renderer. */
+  saveAttachment?: (payload: { gatewayInstanceId: string; sessionKey: string; sha256: string; name: string }) => Promise<{ status: 'saved' | 'cancelled' }>
   sourceFileAction?: (payload: {
     gatewayInstanceId: string
     sessionKey: string

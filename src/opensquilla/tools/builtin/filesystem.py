@@ -24,6 +24,7 @@ from xml.etree import ElementTree as ET
 
 import structlog
 
+from opensquilla.file_snapshot import build_file_edit_snapshot
 from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
@@ -58,6 +59,7 @@ from opensquilla.sandbox.path_validation import (
     trusted_write_auto_grant_allowed,
 )
 from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
+from opensquilla.source_symbols import _source_symbol_matches_line
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
@@ -83,6 +85,7 @@ from opensquilla.tools.types import (
     SafeToolError,
     ToolError,
     WorkspaceAccessError,
+    current_file_snapshot,
     current_tool_context,
 )
 from opensquilla.tools.write_tracking import (
@@ -97,6 +100,12 @@ from opensquilla.tools.write_tracking import (
 )
 
 log = structlog.get_logger(__name__)
+
+
+def _capture_file_snapshot(snapshot: dict[str, Any]) -> None:
+    target = current_file_snapshot.get()
+    if target is not None:
+        target.update(snapshot)
 
 
 def _settlement_duration_bucket(duration_ms: int) -> str:
@@ -224,118 +233,6 @@ async def _run_executor_mutation[ExecutorResult](
     if worker_error is not None:
         raise worker_error
     return result  # type: ignore[return-value]
-
-
-_SOURCE_C_FAMILY_EXTENSIONS = frozenset(
-    {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
-)
-_SOURCE_C_RETURN_TYPE = re.compile(r"[A-Za-z_][\w:<>,~*&\s]+")
-_SOURCE_C_FUNCTION_TAIL = re.compile(r"\([^;{}]*\)\s*(?:const\s*)?(?:\{|$)")
-_SOURCE_SYMBOL_REGEXES: tuple[tuple[frozenset[str], str, re.Pattern[str]], ...] = (
-    (
-        frozenset({".py", ".pyi"}),
-        "class",
-        re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    ),
-    (
-        frozenset({".py", ".pyi"}),
-        "function",
-        re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    ),
-    (
-        frozenset({".js", ".jsx", ".ts", ".tsx"}),
-        "class",
-        re.compile(r"^\s*(?:export\s+default\s+|export\s+)?class\s+([A-Za-z_$][\w$]*)\b"),
-    ),
-    (
-        frozenset({".js", ".jsx", ".ts", ".tsx"}),
-        "function",
-        re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\("),
-    ),
-    (
-        frozenset({".js", ".jsx", ".ts", ".tsx"}),
-        "function",
-        re.compile(
-            r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*="
-            r"\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"
-        ),
-    ),
-    (
-        frozenset({".java", ".cs", ".kt", ".kts", ".scala"}),
-        "class",
-        re.compile(
-            r"^\s*(?:public|private|protected|internal|abstract|final|sealed|open|"
-            r"static|\s)*(?:class|interface|enum|record|object)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
-        ),
-    ),
-    (
-        frozenset({".java", ".cs", ".kt", ".kts", ".scala"}),
-        "function",
-        re.compile(
-            r"^\s*(?:public|private|protected|internal|static|final|abstract|open|"
-            r"override|async|suspend|\s)+[A-Za-z_<>\[\].?,\s]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("
-        ),
-    ),
-    (
-        frozenset({".go"}),
-        "function",
-        re.compile(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\("),
-    ),
-    (
-        frozenset({".rs"}),
-        "function",
-        re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    ),
-    (
-        frozenset({".rs"}),
-        "class",
-        re.compile(
-            r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|impl)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
-        ),
-    ),
-    (
-        frozenset({".rb"}),
-        "class",
-        re.compile(r"^\s*(?:class|module)\s+([A-Za-z_][A-Za-z0-9_:]*)\b"),
-    ),
-    (
-        frozenset({".rb"}),
-        "function",
-        re.compile(r"^\s*def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_!?=]*)\b"),
-    ),
-    (
-        frozenset({".php"}),
-        "class",
-        re.compile(
-            r"^\s*(?:abstract\s+|final\s+)?(?:class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
-        ),
-    ),
-    (
-        frozenset({".php"}),
-        "function",
-        re.compile(
-            r"^\s*(?:public|private|protected|static|final|abstract|\s)*function\s+"
-            r"([A-Za-z_][A-Za-z0-9_]*)\s*\("
-        ),
-    ),
-    (
-        _SOURCE_C_FAMILY_EXTENSIONS,
-        "class",
-        re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
-    ),
-)
-_SOURCE_SYMBOL_IGNORED_NAMES = frozenset(
-    {
-        "if",
-        "for",
-        "while",
-        "switch",
-        "catch",
-        "return",
-        "sizeof",
-        "function",
-    }
-)
 
 
 def _tool_path_request(args: Mapping[str, Any]) -> FilesystemOperationRequest:
@@ -2339,6 +2236,7 @@ async def write_file(
             _write_full_host,
             settle=_settle_full_host,
         )
+        _capture_file_snapshot({"kind": "write", "path": path, "content": content})
         return f"Written {len(content)} bytes to {p}"
 
     approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
@@ -2389,6 +2287,7 @@ async def write_file(
             record_scratch_file_write(p)
             _notify_memory_source_write(p)
             _notify_bootstrap_source_write(p)
+            _capture_file_snapshot({"kind": "write", "path": path, "content": content})
             return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
                 backup_summaries
             )
@@ -2417,6 +2316,7 @@ async def write_file(
             _notify_bootstrap_source_write(p)
 
     await _run_executor_mutation(_write, settle=_settle_write)
+    _capture_file_snapshot({"kind": "write", "path": path, "content": content})
     return (
         f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
         f"{_backup_receipt_note(backup_summaries)}"
@@ -2924,6 +2824,9 @@ async def edit_file(
             _write_full_host,
             settle=_settle_full_host,
         )
+        _capture_file_snapshot(
+            await asyncio.to_thread(build_file_edit_snapshot, path, original, updated),
+        )
         if len(replacements) == 1:
             replacement = replacements[0]
             return (
@@ -2986,6 +2889,14 @@ async def edit_file(
                 record_scratch_file_write(p)
                 _notify_memory_source_write(p)
                 _notify_bootstrap_source_write(p)
+                metadata = getattr(sandbox_result, "metadata", {})
+                snapshot = metadata.get("file_snapshot") if isinstance(metadata, dict) else None
+                if (
+                    isinstance(snapshot, dict)
+                    and snapshot.get("kind") == "edit"
+                    and isinstance(snapshot.get("content"), str)
+                ):
+                    _capture_file_snapshot({**snapshot, "path": path})
                 return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
                     backup_summaries
                 )
@@ -3027,6 +2938,9 @@ async def edit_file(
             _notify_bootstrap_source_write(p)
 
     await _run_executor_mutation(_write, settle=_settle_edit)
+    _capture_file_snapshot(
+        await asyncio.to_thread(build_file_edit_snapshot, path, original, updated),
+    )
     if len(replacements) == 1:
         replacement = replacements[0]
         return (
@@ -3160,6 +3074,7 @@ async def edit_source(
                 path=p,
                 logical_path=Path(logical_tool_path(path, base=workspace)),
                 paths=(p,),
+                display_path=display_path,
                 expected_revision=expected_revision,
                 edits=tuple(edits),
             ),
@@ -3177,24 +3092,22 @@ async def edit_source(
                 )
             if status == "contract_error":
                 raise RetryableToolInputError(str(getattr(sandbox_result, "message", "")))
-            original_result = metadata.get("original")
-            updated_result = metadata.get("updated")
+            changed_result = metadata.get("changed")
+            diff_summary_result = metadata.get("diffSummary")
             before_revision_result = metadata.get("beforeRevision")
             after_revision_result = metadata.get("afterRevision")
             before_fingerprint = metadata.get("beforeFingerprint")
             after_fingerprint = metadata.get("afterFingerprint")
             if (
                 status != "applied"
-                or not isinstance(original_result, str)
-                or not isinstance(updated_result, str)
+                or not isinstance(changed_result, bool)
+                or not isinstance(diff_summary_result, str)
                 or not isinstance(before_revision_result, str)
                 or not isinstance(after_revision_result, str)
                 or not isinstance(before_fingerprint, dict)
                 or not isinstance(after_fingerprint, dict)
             ):
                 raise ToolError("edit_source worker returned an invalid revision receipt.")
-            original = original_result
-            updated = updated_result
             before_revision = before_revision_result
             after_revision = after_revision_result
             receipt = record_semantic_mutation_receipt(
@@ -3212,7 +3125,7 @@ async def edit_source(
                 },
             )
             workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
-            if updated != original:
+            if changed_result:
                 record_workspace_file_write(p, operation="edit_source", created=False)
                 refresh_workspace_file_read_state(p, operation="edit_source")
                 record_scratch_file_write(p)
@@ -3222,11 +3135,11 @@ async def edit_source(
                 {
                     "status": "applied",
                     "path": display_path,
-                    "changed": updated != original,
+                    "changed": changed_result,
                     "before_revision": before_revision,
                     "after_revision": after_revision,
                     "workspace_epoch": workspace_epoch,
-                    "diff_summary": build_diff_summary(original, updated, path=display_path),
+                    "diff_summary": diff_summary_result,
                     "recoverableBackups": list(backup_summaries),
                 },
                 ensure_ascii=False,
@@ -4079,59 +3992,6 @@ def _source_symbol_files(
         if should_include(candidate):
             files.append(candidate)
     return files
-
-
-def _source_c_function_name(line: str) -> str | None:
-    # Split the return type from the name before validating either. A repeated
-    # regex group containing whitespace can backtrack exponentially on even a
-    # short non-function line. Each scan here is bounded by the line length.
-    prefix, opening, tail = line.lstrip().partition("(")
-    if not opening:
-        return None
-    prefix = prefix.rstrip()
-    name_start = len(prefix)
-    while name_start and (
-        prefix[name_start - 1].isascii()
-        and (prefix[name_start - 1].isalnum() or prefix[name_start - 1] == "_")
-    ):
-        name_start -= 1
-    name = prefix[name_start:]
-    if not name or not (name[0].isalpha() or name[0] == "_"):
-        return None
-    return_type = prefix[:name_start]
-    if not return_type or not return_type[-1].isspace():
-        return None
-    # Reserve the separator, preserving the previous return-type grammar.
-    if _SOURCE_C_RETURN_TYPE.fullmatch(return_type[:-1]) is None:
-        return None
-    if _SOURCE_C_FUNCTION_TAIL.match(opening + tail) is None:
-        return None
-    return name
-
-
-def _source_symbol_matches_line(path: Path, line: str) -> list[tuple[str, str]]:
-    extension = path.suffix.casefold()
-    matches: list[tuple[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for extensions, kind, regex in _SOURCE_SYMBOL_REGEXES:
-        if extension not in extensions:
-            continue
-        match = regex.search(line)
-        if match is None:
-            continue
-        name = match.group(1)
-        if name in _SOURCE_SYMBOL_IGNORED_NAMES:
-            continue
-        key = (kind, name)
-        if key in seen:
-            continue
-        matches.append(key)
-        seen.add(key)
-    if extension in _SOURCE_C_FAMILY_EXTENSIONS:
-        name = _source_c_function_name(line)
-        if name is not None and name not in _SOURCE_SYMBOL_IGNORED_NAMES:
-            matches.append(("function", name))
-    return matches
 
 
 def _source_symbol_query_matches(

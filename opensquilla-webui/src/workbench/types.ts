@@ -18,8 +18,11 @@ export type WorkbenchPanelKind =
   | 'browser'
   | 'frontend-preview'
   | 'file'
+  | 'workspace-files'
+  | 'tool-file-history'
   | 'diff'
   | 'terminal'
+  | 'assistant-chat'
 
 export type WorkbenchRetention = 'dispose-on-suspend' | 'keep-alive'
 
@@ -103,6 +106,15 @@ export interface WorkbenchRuntimeContext {
   nativeWorkbenchApi?: NativeWorkbenchApi
   getRenderState(): Readonly<Record<string, unknown>>
   updateRenderState(patch: Readonly<Record<string, unknown>>): void
+  /** Small, JSON-only reading state. Survives renderer release, not tab close. */
+  getViewState?(): Readonly<Record<string, unknown>>
+  saveViewState?(state: Readonly<Record<string, unknown>>): void
+  /**
+   * Admit asynchronous foreground resource reads without blocking lifecycle
+   * cancellation. Providers still abort running reads on suspend/dispose.
+   * Call from activate/resume, not from an awaited createRuntime factory.
+   */
+  runRestore?(task: () => Promise<void>): Promise<void>
   isItemOpen(): boolean
   isItemActive?(): boolean
   setExpanded(expanded: boolean): void
@@ -137,6 +149,8 @@ export interface WorkbenchPanelRuntime {
 
 export interface WorkbenchPanelRenderState {
   active: boolean
+  /** Selection is retained while collapsed; visible also reflects host presence. */
+  visible?: boolean
   hostAvailable: boolean
   nativeSurface: boolean
   runtimeState: Readonly<Record<string, unknown>>
@@ -146,6 +160,8 @@ export interface WorkbenchPanelDefinition {
   kind: WorkbenchPanelKind
   component?: Component
   supports?(item: WorkbenchItem): boolean
+  /** Check a business owner without recreating a released renderer. */
+  beforeClose?(item: WorkbenchItem, options?: WorkbenchBeforeCloseOptions): boolean | Promise<boolean>
   /**
    * Produces ephemeral component inputs at render time. Credentials, Blob URLs
    * and runtime handles may be read here but must not be written to the item.

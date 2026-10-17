@@ -283,11 +283,13 @@ class TaskRuntimeStreamError(RuntimeError):
         no_prior_provider_dispatch: bool = False,
         replay_safe: bool = False,
         error_id: str | None = None,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.terminal_reason = terminal_reason
         self.failure_kind = failure_kind
+        self.http_status = http_status
         self.retry_after_ms = retry_after_ms
         self.activity_snapshot = activity_snapshot
         self.usage_call_index = usage_call_index
@@ -1390,6 +1392,7 @@ async def dispatch_task_runtime_turn(
             actor_id=run.task_id,
             event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
             preview_service=getattr(adopter, "preview_service", None),
+            office_candidate=run.envelope.metadata.get("office_candidate"),
         )
         await _emit_task_runtime_stream_events(
             raw_stream,
@@ -1617,6 +1620,10 @@ def build_task_runtime_run_kwargs(
         # Internal-only callback: the finalizer supplies the exact assistant
         # row/content to TaskRuntime for durable channel delivery.
         kwargs["assistant_message_sink"] = assistant_message_sink
+    runtime_services = getattr(getattr(run, "envelope", None), "runtime_services", {})
+    on_initial_provider_ready = runtime_services.get("on_initial_provider_ready")
+    if callable(on_initial_provider_ready):
+        kwargs["on_initial_provider_ready"] = on_initial_provider_ready
     return kwargs
 
 
@@ -1871,11 +1878,14 @@ async def _emit_task_runtime_stream_events(
     from dataclasses import is_dataclass
 
     from opensquilla.engine.stream_wrappers import wrap_stream
+    from opensquilla.provider.activity import safe_activity_model
+    from opensquilla.provider.failures import safe_http_status
 
     error_message: str | None = None
     error_code: str | None = None
     error_id: str | None = None
     failure_kind: str | None = None
+    http_status: int | None = None
     terminal_reason: str | None = None
     retry_after_ms: int | None = None
     activity_phases: list[dict[str, Any]] = []
@@ -1930,6 +1940,7 @@ async def _emit_task_runtime_stream_events(
                 if isinstance(raw_terminal_failure_kind, str) and raw_terminal_failure_kind
                 else None
             )
+            http_status = safe_http_status(event_dict.get("terminal_http_status"))
             terminal_reason = "error"
             event_dict.setdefault("terminal_reason", terminal_reason)
         if event_kind == "answer_generation_reset":
@@ -1941,6 +1952,7 @@ async def _emit_task_runtime_stream_events(
             event_dict.pop("terminal_error_message", None)
             event_dict.pop("terminal_error_code", None)
             event_dict.pop("terminal_failure_kind", None)
+            event_dict.pop("terminal_http_status", None)
         if event_kind == "thinking" and not event_dict.get("block_id"):
             # Preserve the exact legacy payload for producers that still
             # construct an unscoped ThinkingEvent.
@@ -1955,7 +1967,21 @@ async def _emit_task_runtime_stream_events(
             )
         if event_kind == "artifact":
             event_dict = enrich_artifact_event_dict(event_dict)
+        if event_kind == "provider_activity":
+            for model_field in ("model", "from_model"):
+                model_value = safe_activity_model(event_dict.pop(model_field, None))
+                if model_value is not None and (
+                    model_field == "model" or event_dict.get("phase") == "fallback"
+                ):
+                    event_dict[model_field] = model_value
+        if event_kind in {"error", "provider_activity"}:
+            observed_http_status = safe_http_status(event_dict.pop("http_status", None))
+            if observed_http_status is not None and (
+                event_kind == "error" or event_dict.get("phase") == "retry_wait"
+            ):
+                event_dict["http_status"] = observed_http_status
         if event_kind == "error":
+            http_status = observed_http_status
             raw_message = event_dict.get("message")
             error_message = (
                 raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
@@ -2035,6 +2061,7 @@ async def _emit_task_runtime_stream_events(
                 message=build_terminal_reply(terminal_payload),
                 error_class=error_code,
                 failure_kind=failure_kind,
+                http_status=http_status,
             ).to_dict()
             if error_id is not None:
                 outcome["error_id"] = error_id
@@ -2123,6 +2150,7 @@ async def _emit_task_runtime_stream_events(
             code=error_code,
             terminal_reason=terminal_reason,
             failure_kind=failure_kind,
+            http_status=http_status,
             error_id=error_id,
             retry_after_ms=retry_after_ms,
             activity_snapshot=activity_snapshot,
@@ -2551,6 +2579,25 @@ class GatewayServer:
             runtime_shutdown_clean = False
         skills_shutdown_clean = True
         try:
+            # PTYs are connection-owned native processes, so they need an
+            # explicit Gateway shutdown fence in addition to WebSocket
+            # transport cleanup. Terminate them before draining the longer
+            # task-runtime phase, while the absolute shutdown deadline still
+            # has bounded room for native process-tree teardown.
+            try:
+                from opensquilla.gateway.terminal_sessions import get_terminal_manager
+
+                terminal_manager = get_terminal_manager()
+
+                await asyncio.wait_for(
+                    terminal_manager.close_all(),
+                    timeout=remaining(2.0),
+                )
+            except TimeoutError:
+                log.warning("gateway.terminal_shutdown_timeout")
+            except Exception:
+                log.exception("gateway.terminal_shutdown_failed")
+
             # Fence optional integration startup before draining/stopping the
             # core.  Otherwise a late channel/MCP completion could race the
             # shutdown stop_all path and re-publish a stale ready state.
@@ -4560,7 +4607,7 @@ async def start_gateway_server(
     # Keep it separate from gateway.pid so legacy CLI/readers retain their
     # exact schema. Electron supplies a separate userData control directory so
     # an external or intentionally missing runtime state_dir remains untouched.
-    # Cleanup is deliberately owned by cli.main.gateway_run:
+    # Cleanup is deliberately owned by the CLI gateway runner:
     # that outer boundary removes the record only *after* the profile writer
     # lock exits, so record disappearance is a safe restart signal.
     _desktop_gateway_ownership = None
@@ -5010,6 +5057,29 @@ async def start_gateway_server(
     from opensquilla.tools.builtin.sessions import set_task_runtime
 
     set_task_runtime(task_runtime)
+    from opensquilla.gateway.auth import Principal
+    from opensquilla.gateway.rpc import RpcContext
+    from opensquilla.gateway.sidechat_leases import restore_sidechat_leases
+
+    sidechat_context = RpcContext(
+        conn_id="sidechat-lease-recovery",
+        principal=Principal(
+            role="operator", scopes=frozenset({"operator.admin"}),
+            is_owner=True, authenticated=True,
+        ),
+        config=config, session_manager=svc.session_manager,
+        turn_runner=turn_runner, task_runtime=task_runtime,
+    )
+
+    async def close_recovered_sidechat(key: str) -> object:
+        response = await get_dispatcher().dispatch(
+            f"sidechat-recovery:{key}", "sessions.sidechat.close", {"key": key}, sidechat_context,
+        )
+        if not response.ok:
+            raise RuntimeError("Side conversation cleanup is still draining")
+        return response.payload
+
+    await restore_sidechat_leases(sidechat_context, close_recovered_sidechat)
     recover_stranded_steers = getattr(task_runtime, "recover_stranded_steers", None)
     if callable(recover_stranded_steers):
         steer_recovery = await recover_stranded_steers()

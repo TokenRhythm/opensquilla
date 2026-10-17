@@ -20,6 +20,12 @@ current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextva
     "current_execution_log", default=None,
 )
 
+# Each dispatch owns this dictionary. File tools populate it after the mutation
+# succeeds; it travels as UI metadata, never as provider-visible result text.
+current_file_snapshot: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "current_file_snapshot", default=None,
+)
+
 
 class ToolResultSnapshotReference(TypedDict):
     handle: str

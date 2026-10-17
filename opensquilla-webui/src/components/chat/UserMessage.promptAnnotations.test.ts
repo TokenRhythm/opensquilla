@@ -93,6 +93,16 @@ async function mountAnnotationMessage(
 }
 
 describe('UserMessage prompt annotation snapshots', () => {
+  it('does not offer native DOM reselection for Office context snapshots', async () => {
+    const message = annotationMessage()
+    message.promptAnnotations![0].selection = { format: 'pptx', kind: 'element', shapeId: 'title', truncated: false }
+    const { app, host, reuse } = await mountAnnotationMessage(message)
+    expect(host.querySelector('.msg-prompt-annotation__reuse')).toBeNull()
+    expect([...host.querySelectorAll('button')].some(button => button.textContent?.includes('Reuse'))).toBe(false)
+    expect(reuse).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
   it('opens an HTML attachment from its card and keeps original download separate', async () => {
     const attachment = {
       kind: 'staged' as const,

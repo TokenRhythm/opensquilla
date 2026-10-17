@@ -649,7 +649,12 @@ async def test_file_delete_preserves_symlink_referent(tmp_path, monkeypatch) -> 
     referent.parent.mkdir(parents=True)
     referent.write_text("important", encoding="utf-8")
     link = referent.parent / "discard-link"
-    link.symlink_to(referent)
+    try:
+        link.symlink_to(referent)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     context = ToolContext(
         run_mode="safe",
         workspace_dir=str(referent.parent),

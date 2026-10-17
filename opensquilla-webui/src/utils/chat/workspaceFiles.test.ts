@@ -4,6 +4,16 @@ import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { clearWorkspaceFileLinks, decorateWorkspaceFileLinks, workspaceFileCandidates, workspaceFilePath } from './workspaceFiles'
 
 describe('workspace file references', () => {
+  it('keeps relative Markdown paths inert until a session resolver approves them', () => {
+    const root = document.createElement('div')
+    root.innerHTML = useChatTextRendering().renderMarkdown('[打开游戏](flappy-bird.html)')
+    expect(root.querySelector('a')?.textContent).toBe('打开游戏')
+    expect(root.querySelector('a')?.hasAttribute('href')).toBe(false)
+    expect(root.querySelector('a')?.hasAttribute('role')).toBe(false)
+    expect(workspaceFileCandidates(root)).toEqual(['flappy-bird.html'])
+    expect(root.querySelector('button')).toBeNull()
+  })
+
   it('finds complete inline and markdown paths, including Chinese and spaces in tables', () => {
     const root = document.createElement('div')
     root.innerHTML = useChatTextRendering().renderMarkdown([
@@ -16,7 +26,8 @@ describe('workspace file references', () => {
   })
 
   it.each(['https://example.com/a.svg', 'file:///tmp/a.svg', 'javascript:alert.svg',
-    '//remote/a.svg', '\\\\remote\\a.svg', 'one.svg\ntwo.svg', 'report.pdf#page=2'])('rejects nonlocal candidate %s', path => {
+    'data:text/html,evil.html', '//remote/a.svg', '\\\\remote\\a.svg', 'one.svg\ntwo.svg',
+    'report.pdf#page=2', 'report.pdf?download=1', 'bad"><img src=x>.html'])('rejects nonlocal candidate %s', path => {
     expect(workspaceFilePath(path)).toBeNull()
   })
 

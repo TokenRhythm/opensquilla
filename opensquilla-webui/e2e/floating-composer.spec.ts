@@ -203,7 +203,7 @@ async function openChat(page: Page, sessionKey = SESSION_A, enabled = true) {
   }, enabled)
   await installMockGateway(page, sessionKey === SESSION_ATTACHMENTS)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(sessionKey))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   const expectedText = sessionKey === SESSION_LONG
     ? 'Long answer line 1000:'
     : sessionKey === SESSION_B
@@ -663,7 +663,19 @@ test('preserves a non-virtualized reader anchor across width reflow', async ({ p
   // TanStack owns measurements even below the DOM-windowing threshold; native
   // anchoring must not apply a second correction to the same width reflow.
   await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
-  const wideAnchor = await visibleRowAnchor(page)
+  // Establish a specific row boundary as the reading position. A bottom-based
+  // offset alone can leave most of the previous row visible after dock-height
+  // changes; that row then correctly owns the anchor as its text reflows.
+  const targetRow = await visibleRowAnchor(page)
+  await thread.evaluate((el, key) => {
+    const row = Array.from(el.querySelectorAll<HTMLElement>('[data-testid="chat-message-row"]'))
+      .find(item => item.dataset.chatMessageKey === key)!
+    el.scrollTop += row.getBoundingClientRect().top - el.getBoundingClientRect().top - 16
+    el.dispatchEvent(new Event('scroll'))
+  }, targetRow.key)
+  await expect.poll(async () => Math.abs((await visibleRowAnchor(page, targetRow.key)).offset - 16))
+    .toBeLessThanOrEqual(1)
+  const wideAnchor = await visibleRowAnchor(page, targetRow.key)
 
   await page.setViewportSize({ width: 900, height: 760 })
   await expect.poll(async () => {
@@ -766,7 +778,7 @@ test.describe('mobile and reduced motion', () => {
     expect(durations).toEqual(['0s', '0s', '0s', '0s'])
 
     // Leave the live edge with a real reader gesture, then focus the input to
-    // restore the expanded disclaimer. The viewport must stop above the
+    // restore the expanded input controls. The viewport must stop above the
     // floating surface in both states on the narrow layout.
     const thread = page.locator('.chat-thread')
     await thread.hover({ position: { x: 120, y: 120 } })
@@ -779,19 +791,13 @@ test.describe('mobile and reduced motion', () => {
 
     const mobileGeometry = await page.evaluate(() => {
       const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!
-      const disclaimer = document.querySelector<HTMLElement>('.chat-ai-disclaimer')!
       const tabbar = document.querySelector<HTMLElement>('.mobile-tabbar')!
-      const disclaimerStyle = getComputedStyle(disclaimer)
       return {
         dockBottom: dock.getBoundingClientRect().bottom,
-        disclaimerBottom: disclaimer.getBoundingClientRect().bottom,
         tabbarTop: tabbar.getBoundingClientRect().top,
-        disclaimerBackground: disclaimerStyle.backgroundColor,
       }
     })
     expect(mobileGeometry.dockBottom).toBeLessThanOrEqual(mobileGeometry.tabbarTop + 1)
-    expect(mobileGeometry.disclaimerBottom).toBeLessThanOrEqual(mobileGeometry.tabbarTop + 1)
-    expect(mobileGeometry.disclaimerBackground).not.toBe('rgba(0, 0, 0, 0)')
-    expect(mobileGeometry.disclaimerBackground).not.toBe('transparent')
+    await expect(page.locator('.chat-ai-disclaimer')).toHaveCount(0)
   })
 })

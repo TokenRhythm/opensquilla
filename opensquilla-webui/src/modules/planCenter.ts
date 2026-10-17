@@ -10,6 +10,12 @@ import type {
 } from '@/types/plans'
 
 export interface PlanRequestOptions { signal?: AbortSignal }
+export class PlanModeConflictError extends Error {
+  constructor(readonly current: CollaborationSnapshot, readonly cause?: unknown) {
+    super('The session collaboration mode changed')
+    this.name = 'PlanModeConflictError'
+  }
+}
 export interface PlanMutationResult {
   readonly accepted?: boolean
   readonly replayed?: boolean

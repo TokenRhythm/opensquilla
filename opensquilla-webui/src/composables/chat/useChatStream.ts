@@ -1,8 +1,11 @@
+import { compactionActivityStatus } from '@/utils/chat/conversationActivity'
+import type { ProviderRecovery } from '@/types/parts'
+import { providerRecoveryIdentity } from '@/utils/chat/providerRecovery'
 import type {
   ConversationCompactionContent,
   ConversationToolContent,
 } from '@/modules/conversationEventContent'
-import { computed, ref, type Ref } from 'vue'
+import { computed, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type {
   ChatMessage,
@@ -42,6 +45,9 @@ import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
 import type { ReasoningBlock } from '@/types/turnlog'
 import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
 import { createClientMessageId } from '@/utils/chat/messageIdentity'
+import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
+import { useToolInputPreviews } from './useToolInputPreviews'
+import type { ToolInputPreview } from '@/types/toolInputPreview'
 
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 630_000
 const THINKING_DELAY_MS = 400
@@ -93,6 +99,8 @@ export interface UseChatStreamOptions {
   lastHeaderRole: Ref<string>
   aborted: Ref<boolean>
   autoScroll: Ref<boolean>
+  /** Renderer visibility only: hiding a panel never stops its business owner. */
+  presentationVisible?: Readonly<Ref<boolean>>
   runStatus?: Ref<ChatRunStatus>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
   renderMarkdown: (
@@ -112,6 +120,8 @@ export interface UseChatStreamOptions {
   interruptState?: Ref<ReadonlyMap<string, InterruptViewState>>
   /** Adapter-projected stream idle timeout. Read lazily across reconnects. */
   streamIdleTimeoutMs?: () => number | null | undefined
+  /** Session and owning turn scope used by the tool disclosure renderer. */
+  toolStateScope?: () => string
 }
 
 export interface StreamTaskClockSnapshot {
@@ -142,7 +152,10 @@ export function resolvedStreamIdleTimeoutMs(value: number | null | undefined): n
 }
 
 export function useChatStream(options: UseChatStreamOptions) {
+  const presentationVisible = () => options.presentationVisible?.value !== false
   const isStreaming = ref(false)
+  const toolInputDrafts = useToolInputPreviews()
+  const stopDraftAbortWatch = watch(options.aborted, aborted => { if (aborted) toolInputDrafts.clear() }, { flush: 'sync' })
   const streamPreviewComplete = ref(true)
   // A replay summary may omit persisted text. Keep that fact until history
   // takes over, without stopping later live deltas from reaching the renderer.
@@ -157,8 +170,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
-  const openToolGroups = ref<Set<string>>(new Set())
-  const openToolItems = ref<Set<string>>(new Set())
+  // Absence follows the display preference; either boolean is an explicit
+  // reader choice. Keep choices across live/history renderer remounts.
+  const openToolGroups = ref<Map<string, boolean>>(new Map())
+  const openToolItems = ref<Map<string, boolean>>(new Map())
   let checkpointedRaw = ''
   let checkpointedAcrossToolBoundary = false
   let activeStreamTurnId = ''
@@ -193,7 +208,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     )
   })
 
-  const streamActivity = ref({ label: 'Sending', key: 'Sending', startedAt: 0 })
+  const streamActivity = ref<{ label: string; key: string; startedAt: number; providerRecovery?: ProviderRecovery }>({ label: 'Sending', key: 'Sending', startedAt: 0 })
   // Turn ownership is intentionally separate from the mutable phase clock.
   // Provider/router transitions may restart the small phase timer, but the
   // disclosure header must measure one uninterrupted user-visible run.
@@ -335,18 +350,14 @@ export function useChatStream(options: UseChatStreamOptions) {
   const MEDIUM_STREAM_CHARS = 8 * 1024
   const LARGE_STREAM_CHARS = 32 * 1024
   const HIDDEN_FLUSH_FALLBACK_MS = 250
-  const COARSE_REASONING_BURST_CHARS = 96
   let renderRaf: number | null = null
   let renderFallbackTimer: ReturnType<typeof setTimeout> | null = null
   let lastFlushAt = 0
   let renderDirty = false
-  let reasoningCharsSinceFlush = 0
-  const reasoningPresentationPending = ref(false)
 
-  function resetStreamState() {
+  function resetStreamState(preservePendingInterrupts = false) {
+    toolInputDrafts.clear()
     acceptedActivityStartedAt = 0
-    reasoningCharsSinceFlush = 0
-    reasoningPresentationPending.value = false
     activeModelCallId = ''
     activeModelCallIteration = 0
     streamCheckpointSeq = 0
@@ -356,7 +367,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     // A steer checkpoint deliberately resets only the current visible segment;
     // checkpointedRaw remains available to de-duplicate an authoritative
     // whole-turn final snapshot.
-    resetLog()
+    resetLog({ preservePendingInterrupts })
   }
 
   function noteStreamSignal() {
@@ -381,19 +392,19 @@ export function useChatStream(options: UseChatStreamOptions) {
     )
   }
 
-  function setStreamActivity(label: string, key = label, recordActivity = true) {
+  function setStreamActivity(label: string, key = label, recordActivity = true, providerRecovery?: ProviderRecovery) {
     noteStreamSignal()
     const current = streamActivity.value
     let isNewPhase = false
-    if (current.key === key) {
+    if (current.key === key && providerRecoveryIdentity(current.providerRecovery) === providerRecoveryIdentity(providerRecovery)) {
       if (!current.startedAt) {
-        streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
+        streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now(), providerRecovery }
         isNewPhase = true
       } else if (current.label !== label) {
-        streamActivity.value = { label, key, startedAt: current.startedAt }
+        streamActivity.value = { label, key, startedAt: current.startedAt, providerRecovery }
       }
     } else {
-      streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now() }
+      streamActivity.value = { label, key, startedAt: acceptedActivityStartedAt || Date.now(), providerRecovery }
       isNewPhase = true
     }
     // Record each accepted phase transition into the append-only log so the
@@ -401,53 +412,35 @@ export function useChatStream(options: UseChatStreamOptions) {
     // Label-only refinements (same key) emit nothing — only a real phase change.
     if (isNewPhase && recordActivity) {
       const committed = streamActivity.value
-      appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt })
+      appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt, providerRecovery: committed.providerRecovery, httpStatus: committed.providerRecovery?.httpStatus })
       // TurnAccumulator is intentionally non-reactive. A provider phase can be
       // the only semantic progress for minutes, so publish the status through
       // the same frame clock even when no text/tool delta follows it.
       scheduleRender()
     }
-    if (!streamActivityTimer) {
+    if (presentationVisible() && !streamActivityTimer) {
       streamActivityTimer = setInterval(() => {
         streamActivityTick.value++
       }, 1000)
     }
   }
 
-  function recordActivityPhase(label: string, key = label) {
-    setStreamActivity(label, key, true)
+  function recordActivityPhase(label: string, key = label, providerRecovery?: ProviderRecovery) {
+    // Reasoning text and provider activity describe the same running phase.
+    // Different pulse metadata must not add rows or restart its phase clock;
+    // an intervening waiting/tool/answer phase still starts a fresh occurrence.
+    if (key === 'provider:reasoning' && streamActivity.value.key === key) {
+      noteStreamSignal()
+      return
+    }
+    setStreamActivity(label, key, true, providerRecovery)
   }
 
   function recordCompactionActivity(payload: ConversationCompactionContent) {
     noteStreamSignal()
-    const rawStatus = String(payload.status || '').toLowerCase()
-    const state = rawStatus === 'skipped'
-      ? 'skipped'
-      : rawStatus === 'stale'
-        ? 'stale'
-        : rawStatus === 'cancelled'
-          ? 'cancelled'
-          : ['completed', 'emergency_ephemeral'].includes(rawStatus)
-            ? 'completed'
-            : ['failed', 'error', 'timed_out'].includes(rawStatus)
-              ? 'failed'
-              : 'running'
     const id = String(payload.compaction_id || 'current')
-    appendFrame({
-      kind: 'status',
-      action: 'context_compaction',
-      label: '',
-      at: Number(payload.emitted_at || payload.started_at || Date.now()),
-      id,
-      category: 'maintenance',
-      state,
-      source: String(payload.source || 'automatic'),
-      durability: rawStatus === 'emergency_ephemeral'
-        ? 'request_scoped'
-        : String(payload.durability || ''),
-      detail: String(payload.detail || payload.phase || ''),
-      reason: String(payload.reason || payload.skip_reason || ''),
-    })
+    const previous = foldedTurn.value.statusHistory.find(entry => entry.category === 'maintenance' && entry.id === id)
+    appendFrame({ kind: 'status', ...compactionActivityStatus(payload, previous) })
     scheduleRender()
   }
 
@@ -475,6 +468,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     activityStartedAt?: number | string | null,
     recordInitialActivity = true,
   ) {
+    const preservePendingInterrupts = !isStreaming.value
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
@@ -490,11 +484,9 @@ export function useChatStream(options: UseChatStreamOptions) {
         ? { ...activeTask, status: 'running' }
         : { status: 'running' },
     })
-    resetStreamState()
+    resetStreamState(preservePendingInterrupts)
     const restoredStartedAt = normalizedTaskStartedAt(activityStartedAt) ?? 0
     setAcceptedActivityStartedAt(restoredStartedAt || undefined)
-    openToolGroups.value = new Set()
-    openToolItems.value = new Set()
     streamRound.value = 1
     streamTaskClockIdentity = ''
     streamTurnStartedAt.value = restoredStartedAt || Date.now()
@@ -502,7 +494,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
     setStreamActivity('Sending', 'Sending', recordInitialActivity)
-    options.autoScroll.value = true
+    // Opening the live reducer also happens for replay and recovery. The send
+    // path owns following a new turn; incoming events preserve reader intent.
     resetStreamIdleTimer()
   }
 
@@ -632,14 +625,13 @@ export function useChatStream(options: UseChatStreamOptions) {
         // useful result.
         statusHistory: terminalFold.statusHistory.slice(),
         reasoningBlocks: terminalReasoningBlocks,
-        reasoningPresentationPending: reasoningPresentationPending.value || undefined,
         interrupted: wasAborted || undefined,
       })
       // Replacing the live block with canonical Markdown/KaTeX can change its
       // measured height after the final stream flush. Pin once after Vue's
       // settled render (and TextPart's post-flush decoration), while preserving
       // the existing autoScroll guard for readers who moved away from the edge.
-      if (options.autoScroll.value) options.scrollToBottom()
+      if (presentationVisible() && options.autoScroll.value) options.scrollToBottom()
     }
 
     streamBubble.value = false
@@ -896,7 +888,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     clearRenderTimer()
   }
 
-  function resetLiveTurnState() {
+  function resetLiveTurnState(resetOptions: { preservePendingInterrupts?: boolean } = {}) {
     // Session switches can happen while a render frame or fallback timer is
     // waiting to flush the previous live turn. Cancel it before clearing the
     // stream state so the old session cannot request a scroll in the next
@@ -907,7 +899,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     clearStreamIdleTimer()
     streamIdlePausedForApproval.value = false
     isStreaming.value = false
-    resetStreamState()
+    resetStreamState(resetOptions.preservePendingInterrupts)
     streamBubble.value = false
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
@@ -930,6 +922,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     textSnapshot?: string
     preserveCompletedTools?: boolean
   } = {}) {
+    toolInputDrafts.clear()
     const preserveCompletedTools = optionsArg.preserveCompletedTools !== false
     const currentToolCalls = foldedTurn.value.toolCalls
     const completedToolIds = new Set(
@@ -950,16 +943,21 @@ export function useChatStream(options: UseChatStreamOptions) {
     const textSnapshot = typeof optionsArg.textSnapshot === 'string'
       ? optionsArg.textSnapshot
       : ''
-    openToolGroups.value = new Set(
-      [...openToolGroups.value].filter(groupId => keptGroupIds.has(groupId)),
+    const scopePrefix = options.toolStateScope?.()
+    const currentPrefix = scopePrefix ? `${scopePrefix}:` : ''
+    const keepChoice = (id: string, retainedIds: Set<string>) => (
+      currentPrefix && !id.startsWith(currentPrefix)
+        ? true
+        : retainedIds.has(currentPrefix ? id.slice(currentPrefix.length) : id)
     )
-    openToolItems.value = new Set(
-      [...openToolItems.value].filter(toolId => keptToolIds.has(toolId)),
+    openToolGroups.value = new Map(
+      [...openToolGroups.value].filter(([id]) => keepChoice(id, keptGroupIds)),
+    )
+    openToolItems.value = new Map(
+      [...openToolItems.value].filter(([id]) => keepChoice(id, keptToolIds)),
     )
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
-    reasoningCharsSinceFlush = 0
-    reasoningPresentationPending.value = false
     streamRound.value = 1
     isStreaming.value = true
     streamBubble.value = true
@@ -1020,9 +1018,10 @@ export function useChatStream(options: UseChatStreamOptions) {
   function scheduleRender() {
     renderDirty = true
     if (renderRaf !== null || renderFallbackTimer !== null) return
-    // rAF is throttled/paused in background tabs — fall back to a timer there so
-    // streamed output still lands while the tab is hidden.
-    if (typeof document !== 'undefined' && document.hidden) {
+    // Use the same bounded background cadence for an obscured workbench panel
+    // and a hidden browser tab. Keep publishing the shared projection so its
+    // business owner stays current, without parsing on every display frame.
+    if (!presentationVisible() || (typeof document !== 'undefined' && document.hidden)) {
       renderFallbackTimer = setTimeout(runFlush, HIDDEN_FLUSH_FALLBACK_MS)
       return
     }
@@ -1031,17 +1030,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     } else {
       renderFallbackTimer = setTimeout(runFlush, MIN_FLUSH_INTERVAL_MS)
     }
-  }
-
-  function noteReasoningPresentationDelta(text: string) {
-    reasoningCharsSinceFlush += text.length
-    if (reasoningCharsSinceFlush > COARSE_REASONING_BURST_CHARS) {
-      reasoningPresentationPending.value = true
-    }
-  }
-
-  function completeReasoningPresentation() {
-    reasoningPresentationPending.value = false
   }
 
   function onRenderFrame() {
@@ -1067,9 +1055,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (!renderDirty) return
 
     publishTurnLog()
-    reasoningCharsSinceFlush = 0
+    // Retain the draft until the real tool is published on the same frame.
+    // Clearing on tool-start receipt would briefly leave neither row visible.
+    for (const call of foldedTurn.value.toolCalls) toolInputDrafts.handoff(call.toolId)
     renderDirty = false
-    if (options.autoScroll.value) options.scrollToBottom()
+    if (presentationVisible() && options.autoScroll.value) options.scrollToBottom()
   }
 
   function visibleFlushIntervalMs(): number {
@@ -1091,7 +1081,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (streamBubble.value) return
       thinkingVisible.value = true
       updateThinkingText()
-      thinkingTimer = setInterval(updateThinkingText, 1000)
+      if (presentationVisible()) thinkingTimer = setInterval(updateThinkingText, 1000)
     }, THINKING_DELAY_MS)
   }
 
@@ -1191,6 +1181,31 @@ export function useChatStream(options: UseChatStreamOptions) {
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', handleVisibilityChange)
   }
+
+  const stopPresentationWatch = options.presentationVisible
+    ? watch(options.presentationVisible, visible => {
+      if (streamActivityTimer) clearInterval(streamActivityTimer)
+      if (thinkingTimer) clearInterval(thinkingTimer)
+      streamActivityTimer = null
+      thinkingTimer = null
+      if (renderDirty) {
+        cancelRenderSchedule()
+        scheduleRender()
+      }
+      if (!visible) return
+      // Clocks use original timestamps, so a hidden interval needs no ticks.
+      // Only refresh presentation; keep stream/queue/approval ownership intact.
+      streamActivityTick.value++
+      if (isStreaming.value) {
+        streamActivityTimer = setInterval(() => { streamActivityTick.value++ }, 1000)
+      }
+      if (thinkingVisible.value) {
+        updateThinkingText()
+        if (thinkingVisible.value) thinkingTimer = setInterval(updateThinkingText, 1000)
+      }
+      if (options.autoScroll.value) options.scrollToBottom()
+    }, { flush: 'sync' })
+    : undefined
 
   // The server-stamped tool start time (epoch ms), or null when absent/invalid.
   // 0 is the backend's "unstamped" sentinel and is treated as absent.
@@ -1346,6 +1361,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         name: tc.name,
         result: content,
         executionLogHandle: payload.execution_log_handle,
+        fileSnapshot: isError ? undefined : normalizeToolFileSnapshot(payload.file_snapshot),
         isError,
         input,
         at: Date.now(),
@@ -1389,8 +1405,10 @@ export function useChatStream(options: UseChatStreamOptions) {
       tool_name: tc.name,
       input: tc.inputRaw || tc.inputPreview,
       groupId: tc.groupId,
+      activityOrder: tc.activityOrder,
       result: tc.result,
       execution_log_handle: tc.executionLogHandle,
+      ...(tc.fileSnapshot && !tc.isError ? { file_snapshot: tc.fileSnapshot } : {}),
       is_error: tc.isError,
       isError: tc.isError,
       execution_status: tc.status ? { status: tc.status } : undefined,
@@ -1420,20 +1438,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     noteStreamSignal()
     appendFrame({ kind: 'interrupt', ...input })
     scheduleRender()
-  }
-
-  // Open a render bubble for an interrupt that arrived with no live turn
-  // streaming (a queued/background turn, or a reload that recovered a pending
-  // approval). This is deliberately lighter than startStreaming(): it does NOT
-  // reset the log or the activity refs, so an interrupt frame appended right
-  // after it survives. The turn stays open because an unresolved approval pauses
-  // the idle timer, so the fold-driven activity surface keeps rendering the part.
-  function ensureInterruptBubble() {
-    if (streamBubble.value) return
-    if (!streamTurnStartedAt.value) streamTurnStartedAt.value = Date.now()
-    streamBubble.value = true
-    streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
-    isStreaming.value = true
   }
 
   function reconcileCheckpointedText(
@@ -1511,24 +1515,41 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (changed) scheduleRender()
   }
 
-  function isToolGroupOpen(groupId: string): boolean {
-    return openToolGroups.value.has(groupId)
+  function isToolGroupOpen(groupId: string): boolean | undefined {
+    return openToolGroups.value.get(groupId)
   }
 
-  function toggleToolGroup(groupId: string) {
-    const next = new Set(openToolGroups.value)
-    next.has(groupId) ? next.delete(groupId) : next.add(groupId)
+  function toggleToolGroup(groupId: string, open: boolean) {
+    const next = new Map(openToolGroups.value)
+    next.set(groupId, open)
     openToolGroups.value = next
   }
 
-  function isToolItemOpen(itemId: string): boolean {
-    return openToolItems.value.has(itemId)
+  function isToolItemOpen(itemId: string): boolean | undefined {
+    return openToolItems.value.get(itemId)
   }
 
-  function toggleToolItem(itemId: string) {
-    const next = new Set(openToolItems.value)
-    next.has(itemId) ? next.delete(itemId) : next.add(itemId)
+  function toggleToolItem(itemId: string, open: boolean) {
+    const next = new Map(openToolItems.value)
+    next.set(itemId, open)
     openToolItems.value = next
+  }
+
+  // A durable turn id may arrive after the optimistic user row. Only the view,
+  // which knows both belong to the same session/turn, requests this migration.
+  function migrateToolDisclosureScope(previousScope: string, nextScope: string) {
+    if (!previousScope || !nextScope || previousScope === nextScope) return
+    const previousPrefix = `${previousScope}:`
+    const nextPrefix = `${nextScope}:`
+    for (const choices of [openToolGroups, openToolItems]) {
+      const next = new Map(choices.value)
+      for (const [id, open] of choices.value) {
+        if (!id.startsWith(previousPrefix)) continue
+        const nextId = `${nextPrefix}${id.slice(previousPrefix.length)}`
+        if (!next.has(nextId)) next.set(nextId, open)
+      }
+      choices.value = next
+    }
   }
 
   function clearRenderTimer() {
@@ -1548,6 +1569,9 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function cleanup() {
+    stopPresentationWatch?.()
+    stopDraftAbortWatch()
+    toolInputDrafts.clear()
     clearRenderTimer()
     clearStreamIdleTimer()
     hideThinkingIndicator()
@@ -1558,6 +1582,8 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   return {
+    toolInputPreviews: toolInputDrafts.previews,
+    applyToolInputPreview: (preview: ToolInputPreview, activityOrder: number, existingOnly = false) => toolInputDrafts.accept(preview, activityOrder, existingOnly),
     isStreaming,
     streamArtifacts,
     streamBubble,
@@ -1594,7 +1620,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     appendInterruptFrame,
     recordActivityPhase,
     setAcceptedActivityStartedAt,
-    ensureInterruptBubble,
     reconcileFinalText,
     resetStreamIdleTimer,
     setStreamConnectionAvailable,
@@ -1608,13 +1633,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     toggleToolGroup,
     isToolItemOpen,
     toggleToolItem,
+    migrateToolDisclosureScope,
     cleanup,
     // Event handlers append accepted frames; foldedTurn is the sole live
     // content projection.
     appendFrame,
     setAcceptedActivityOrder,
-    noteReasoningPresentationDelta,
-    completeReasoningPresentation,
     foldedTurn,
     getThinkingText: () => foldedTurn.value.thinkingText,
   }

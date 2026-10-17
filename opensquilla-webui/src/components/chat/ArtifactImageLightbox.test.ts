@@ -5,6 +5,8 @@ import i18n from '@/i18n'
 import type { DisplayAttachment } from '@/types/chat'
 import {
   provideArtifactImageLightbox,
+  attachmentImagePreviewKey,
+  closeImageLightboxOutsideSession,
   type ArtifactImageLightboxController,
 } from '@/composables/chat/useArtifactImageLightbox'
 import { downloadBlob } from '@/utils/browser'
@@ -76,6 +78,74 @@ afterEach(() => {
 })
 
 describe('shared image preview', () => {
+  it.each(['session', 'attachment', 'released'])('does not reuse another or retired thumbnail: %s', async mismatch => {
+    mount()
+    requestBinary.mockResolvedValue(httpBinaryResponse('authenticated full image', { contentType: 'image/png' }))
+    const image = attachment('staged', { kind: 'staged', data: undefined,
+      download_url: '/api/v1/attachments/current-image' })
+    const readBlob = vi.fn(() => mismatch === 'released' ? null : new Blob(['wrong'], { type: 'image/png' }))
+    controller.openAttachments({
+      attachment: image, navigationAttachments: [image], sessionKey: 'current-session',
+      attachmentPreview: {
+        key: attachmentImagePreviewKey(mismatch === 'attachment'
+          ? { ...image, download_url: '/api/v1/attachments/old-image' } : image,
+        mismatch === 'session' ? 'other-session' : 'current-session'),
+        readBlob,
+      },
+    })
+    await vi.waitFor(() => expect(displayedImage()?.alt).toBe('staged.png'))
+    expect(requestBinary).toHaveBeenCalledExactlyOnceWith('/api/v1/attachments/current-image',
+      expect.objectContaining({ sessionKey: 'current-session' }))
+    expect(readBlob).toHaveBeenCalledTimes(mismatch === 'released' ? 1 : 0)
+    expect(await (objectUrls.mock.calls.at(-1)![0] as Blob).text()).toBe('authenticated full image')
+  })
+
+  it('reuses the current thumbnail only for preview while Download still checks authorization', async () => {
+    mount()
+    const image = attachment('staged', { kind: 'staged', data: undefined,
+      download_url: '/api/v1/attachments/current-image' })
+    const blob = new Blob(['already authenticated image'], { type: 'image/png' })
+    controller.openAttachments({
+      attachment: image, navigationAttachments: [image], sessionKey: 'current-session',
+      attachmentPreview: { key: attachmentImagePreviewKey(image, 'current-session'), readBlob: () => blob },
+    })
+    await vi.waitFor(() => expect(displayedImage()?.alt).toBe('staged.png'))
+    expect(objectUrls).toHaveBeenCalledExactlyOnceWith(blob)
+    expect(requestBinary).not.toHaveBeenCalled()
+    requestBinary.mockResolvedValue(httpBinaryResponse('downloaded separately', { contentType: 'image/png' }))
+    document.querySelector<HTMLButtonElement>('.deliv-preview__actions .btn--primary')!.click()
+    await vi.waitFor(() => expect(downloadBlob).toHaveBeenCalledOnce())
+    expect(requestBinary).toHaveBeenCalledExactlyOnceWith('/api/v1/attachments/current-image',
+      expect.objectContaining({ sessionKey: 'current-session' }))
+    expect(await (vi.mocked(downloadBlob).mock.calls[0][0] as Blob).text()).toBe('downloaded separately')
+  })
+
+  it('keeps side images visible under the parent while fetching with child authorization', async () => {
+    mount()
+    requestBinary.mockResolvedValue(httpBinaryResponse('generated', { contentType: 'image/png' }))
+    const artifact = { id: 'side-image', name: 'side.png', mime: 'image/png' }
+    controller.open({ artifact, navigationArtifacts: [artifact], sessionKey: 'side-child', ownerSessionKey: 'main-parent' })
+    closeImageLightboxOutsideSession(controller, 'main-parent', true)
+    await vi.waitFor(() => expect(displayedImage()?.alt).toBe('side.png'))
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/side-image', expect.objectContaining({ sessionKey: 'side-child' }))
+    closeImageLightboxOutsideSession(controller, 'another-main', true)
+    await nextTick()
+    expect(controller.request.value).toBeNull()
+    expect(displayedImage()).toBeNull()
+  })
+
+  it('applies the same parent owner boundary to side image attachments', async () => {
+    mount()
+    const image = attachment('side-local')
+    controller.openAttachments({ attachment: image, navigationAttachments: [image], sessionKey: 'side-child', ownerSessionKey: 'main-parent' })
+    closeImageLightboxOutsideSession(controller, 'main-parent', true)
+    await vi.waitFor(() => expect(displayedImage()?.alt).toBe('side-local.png'))
+    expect(controller.request.value?.sessionKey).toBe('side-child')
+    closeImageLightboxOutsideSession(controller, 'main-parent', false)
+    await nextTick()
+    expect(displayedImage()).toBeNull()
+  })
+
   it.each(['', 'application/octet-stream'])('previews a local image with inferred MIME when File.type is %j', async type => {
     mount()
     const image = attachment('inferred', {

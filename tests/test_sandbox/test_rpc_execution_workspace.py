@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -126,7 +127,12 @@ async def test_bound_execution_workspace_same_canonical_root_is_idempotent(
         selected = child / ".."
     elif path_form == "symlink":
         selected = tmp_path / "alias"
-        selected.symlink_to(original, target_is_directory=True)
+        try:
+            selected.symlink_to(original, target_is_directory=True)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symbolic-link privilege is unavailable")
+            raise
     overlay = RunContext(run_mode=RunMode.FULL, workspace=str(original))
     remember_resolved_run_context(session.session_key, str(original), overlay)
     storage = ctx.session_manager.storage
@@ -171,7 +177,12 @@ async def test_bound_execution_workspace_set_preserves_binding_validation(
         if invalid_binding == "symlink_root":
             replacement = tmp_path / "replacement"
             replacement.mkdir()
-            original.symlink_to(replacement, target_is_directory=True)
+            try:
+                original.symlink_to(replacement, target_is_directory=True)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    pytest.skip("Windows symbolic-link privilege is unavailable")
+                raise
     changes_before = storage.conn.total_changes
 
     response = await get_dispatcher().dispatch(

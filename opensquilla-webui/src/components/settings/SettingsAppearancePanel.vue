@@ -28,9 +28,8 @@ import {
 const appStore = useAppStore()
 const { t } = useI18n()
 
-// Registry-driven, full list: every selectable value theme (incl. custom ones) +
-// system. The compact topbar menu shows only the basic modes (scope: 'basic')
-// and links here via "More themes…"; this panel is the home for the full set.
+// Registry-driven, full list: this is the shared entry for every selectable
+// theme (including custom ones) and the system preference.
 const themeOptions = themePickerOptions({ scope: 'all' })
 
 const toolDetailOptions = TOOL_DETAIL_DISPLAY_MODES.map(mode => ({
@@ -283,7 +282,7 @@ onBeforeUnmount(stopCustomStepRepeat)
       </div>
     </div>
 
-    <div class="control-row control-row--stack">
+    <div class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('settings.appearance.visualEffectsLabel') }}</span>
         <span class="control-row__desc">{{ t('settings.appearance.visualEffectsDesc') }}</span>
@@ -299,7 +298,7 @@ onBeforeUnmount(stopCustomStepRepeat)
       </div>
     </div>
 
-    <div class="control-row control-row--stack">
+    <div class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('settings.appearance.composerFxLabel') }}</span>
         <span class="control-row__desc">{{ t('settings.appearance.composerFxDesc') }}</span>

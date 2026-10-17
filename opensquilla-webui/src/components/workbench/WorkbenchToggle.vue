@@ -29,7 +29,8 @@ const props = withDefaults(defineProps<{
   allowEmpty?: boolean
   sessionId?: string
   blocked?: boolean
-}>(), { sessionId: '', blocked: false, allowEmpty: false })
+  presentationVisible?: boolean
+}>(), { sessionId: '', blocked: false, allowEmpty: false, presentationVisible: undefined })
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const store = useWorkbenchStore()
@@ -43,7 +44,7 @@ const retained = computed(() => {
 const available = computed(() => props.enabled && (props.allowEmpty || Boolean(retained.value)
   || store.closedBrowserItems.some(item => item.scope.type === 'session'
     && item.scope.id === props.sessionId)))
-const expanded = computed(() => store.expanded && (store.activeItem
+const expanded = computed(() => (props.presentationVisible ?? store.expanded) && (store.activeItem
   ? belongsHere(store.activeItem) : props.allowEmpty))
 const label = computed(() => t(expanded.value ? 'workbench.collapse' : 'workbench.expand'))
 
@@ -56,13 +57,17 @@ function toggle() {
   if (retained.value) {
     store.activateItem(retained.value.id)
     store.setExpanded(true)
+    store.requestReveal()
     return
   }
   const hasClosed = store.closedBrowserItems.some(item => item.scope.type === 'session'
     && item.scope.id === props.sessionId)
   if (!hasClosed && props.allowEmpty) {
     store.openEmpty()
-  } else if (!store.reopenBrowserForSession(props.sessionId)) {
+    store.requestReveal()
+  } else if (store.reopenBrowserForSession(props.sessionId)) {
+    store.requestReveal()
+  } else {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
   }
 }

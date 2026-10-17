@@ -46,6 +46,38 @@ describe('useChatSessionRoute', () => {
     })
   })
 
+  it('isolates an embedded session from the main route, active pointer, and draft navigation', async () => {
+    routeMock.path = '/chat/new'
+    routeMock.query = { session: 'agent:main:webchat:parent', agent: 'other', project: 'project', new: '1' }
+    localStorage.setItem('opensquilla_active_session', 'agent:main:webchat:parent')
+    const child = ref('agent:research:webchat:side')
+    const embedded = useChatSessionRoute(child, () => null, { embedded: true })
+    expect(embedded.resolveInitialSession()).toEqual({
+      sessionKey: child.value, draft: false, hasUrlSession: false, recoveredDraft: false,
+    })
+    expect(embedded.readSessionFromUrl()).toBe(child.value)
+    expect(embedded.readAgentFromUrl()).toBe('research')
+    expect(embedded.readProjectFromUrl()).toBe('')
+    expect(embedded.isDraftRoute()).toBe(false)
+    expect(embedded.hasLegacyNewChatQuery()).toBe(false)
+    embedded.persistSession('agent:research:webchat:side-bound')
+    embedded.goToDraft({ replace: true })
+    expect(await embedded.replaceDraftProject('another-project')).toBe(false)
+    expect(embedded.rebindFreshDraftSession(vi.fn())).toBe(false)
+    expect(child.value).toBe('agent:research:webchat:side-bound')
+    expect(localStorage.getItem('opensquilla_active_session')).toBe('agent:main:webchat:parent')
+    expect(routerMock.push).not.toHaveBeenCalled()
+    expect(routerMock.replace).not.toHaveBeenCalled()
+  })
+
+  it('does not mint a main draft when an embedded child has not materialized', () => {
+    const embedded = useChatSessionRoute(ref(''), () => null, { embedded: true })
+    expect(embedded.resolveInitialSession()).toEqual({
+      sessionKey: '', draft: false, hasUrlSession: false, recoveredDraft: false,
+    })
+    expect(localStorage.length).toBe(0)
+  })
+
   it('defaults an ordinary draft to the main Agent', () => {
     const route = useChatSessionRoute(ref(''))
 

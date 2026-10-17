@@ -1,13 +1,15 @@
 import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import i18n from '@/i18n'
-import { useToasts } from '@/composables/useToasts'
+import { useToasts, type ToastAction } from '@/composables/useToasts'
 import type { CronJob } from '@/types/cron'
 import type { CronScheduler, CronSubscription } from '@/modules/cronScheduler'
 import { CronReadUnavailableError } from '@/modules/cronScheduler'
 import { humanCountdown, humanTime } from '@/utils/cron/time'
-import { wasCronFinishNotified } from '@/utils/cron/notifications'
+import { notifyCronRunFinished } from '@/utils/cron/notifications'
 
-export function useCronJobs(scheduler: CronScheduler) {
+export function useCronJobs(scheduler: CronScheduler, options: {
+  openJob?: (jobId: string) => ReturnType<ToastAction['onClick']>
+} = {}) {
   const { pushToast } = useToasts()
   const t = i18n.global.t
   const searchText = ref('')
@@ -139,7 +141,7 @@ export function useCronJobs(scheduler: CronScheduler) {
     return work
   }
 
-  const loadData = refresh
+  const loadData = () => refresh()
 
   function scheduleReload() {
     if (!active) return
@@ -186,19 +188,42 @@ export function useCronJobs(scheduler: CronScheduler) {
   }
 
   async function runJob(id: string) {
+    if (runningJobIds.value.has(id)) return
     runningJobIds.value = new Set(runningJobIds.value).add(id)
     try {
       const res = await scheduler.runNow(id)
-      if (!res?.runId || !wasCronFinishNotified(res.runId)) {
-        if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
-        else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
-      }
+      const job = jobs.value.find(candidate => candidate.id === id)
+      if (!res?.runId && (res?.success === false || res?.error)) {
+        // A rejected manual request has no completed execution to inspect.
+        // Keep its explanation instead of presenting it as a finished run.
+        pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error || res.reason || res.status || '' }), {
+          tone: 'danger',
+          action: options.openJob ? {
+            label: t('cronSkills.jobs.toastViewTask'), onClick: () => options.openJob!(id),
+          } : undefined,
+        })
+      } else notifyCronRunFinished({
+        jobId: id,
+        jobName: job?.name,
+        runId: res?.runId,
+        success: res?.success === false || !!res?.error ? false : res?.success,
+        // Reminder delivery belongs to its explicit event (which may carry a
+        // session target). A successful RPC must not consume that reminder.
+        summary: res?.reply,
+      }, { t, pushToast, openJob: options.openJob })
+      scheduleReload()
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (isConnectionRecycleError(message)) {
         await recoverAfterConnectionRecycle()
       } else {
-        pushToast(t('cronSkills.jobs.toastRunFailed', { error: message }), { tone: 'danger' })
+        pushToast(t('cronSkills.jobs.toastRunFailed', { error: message }), {
+          tone: 'danger',
+          action: options.openJob ? {
+            label: t('cronSkills.jobs.toastViewTask'),
+            onClick: () => options.openJob!(id),
+          } : undefined,
+        })
       }
     } finally {
       const next = new Set(runningJobIds.value)

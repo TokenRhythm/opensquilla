@@ -1,10 +1,11 @@
-import { getCurrentScope, onScopeDispose, ref, type Ref } from 'vue'
+import { computed, getCurrentScope, onScopeDispose, ref, type Ref } from 'vue'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SkillCandidate } from '@/types/skills'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { replaceSlashQuery, shortSlashDescription, slashQueryAt, slashSearchRank, type SlashQueryRange } from '@/utils/chat/slashPalette'
 import i18n from '@/i18n'
 import type { CommandCatalog } from '@/modules/commandCatalog'
+import { parseSideChatCommand } from '@/modules/sideChatLauncher'
 import type {
   UsageReporting,
   UsageReportingRequestOptions,
@@ -63,13 +64,18 @@ const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
 ])
 
 export interface UseChatSlashCommandsOptions {
-  skillCatalog?: SkillCatalog
+  /** Local UI command; it never enters the main conversation's execution queue. */
+  sideChat?: { run: (command: string) => Promise<boolean> }
+  skillCatalog?: Pick<SkillCatalog, 'supportsCandidates' | 'listCandidates' | 'subscribeInvalidation'>
+  /** Policy filters both menu selection and explicitly typed commands. */
+  commandAllowed?: (command: ChatSlashCommand) => boolean
   selectedSkills?: Ref<SelectedSkillRef[]>
   getCaret?: () => number
   setCaret?: (position: number) => void
+  onSelectSkill?: (skill: SelectedSkillRef, position: number) => void
   manageSkill?: (name: string) => void
   commandCatalog: CommandCatalog
-  usageReporting: UsageReporting
+  usageReporting: Pick<UsageReporting, 'status'>
   sessionMaintenance: SessionMaintenance
   catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
@@ -197,12 +203,24 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   const commandCatalog = options.commandCatalog
   const usageReporting = options.usageReporting
   const maintenance = options.sessionMaintenance
+  const allowed = (command: ChatSlashCommand) => options.commandAllowed?.(command) !== false
   const slashOpen = ref(false)
   const slashIdx = ref(0)
   const slashCmds = ref<ChatSlashCommand[]>([])
+  const availableCommands = computed<ChatSlashCommand[]>(() => options.sideChat ? [
+    ...slashCmds.value,
+    { name: '/side', cmd: '/side', label: '/side', aliases: ['/btw'],
+      desc: i18n.global.t('chat.slashCommands.side.description'), execution: { action: 'workbench.openSideChat' } },
+  ] : slashCmds.value)
   const filteredSlashCmds = ref<ChatSlashCommand[]>([])
   const slashCatalogLoaded = ref(false)
   const skillCandidates = ref<SkillCandidate[]>([])
+  const skillPaletteItems = computed<ChatSlashCommand[]>(() => skillCandidates.value.map(skill => {
+    const copy = paletteCopy(skill.name, String(i18n.global.locale.value).startsWith('zh')
+      ? skill.descriptionZh || skill.description : skill.description)
+    return { ...copy, name: skill.name, cmd: '/' + skill.name,
+      aliases: [...skill.aliases, ...copy.aliases], kind: 'skill', skill }
+  }))
   const skillsLoading = ref(false)
   const skillsError = ref('')
   let queryRange: SlashQueryRange | null = null
@@ -251,17 +269,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   function updatePalette() {
     if (!queryRange) return
     const query = queryRange.query
-    const commands = slashCmds.value.filter(isMenuCommand).map(command => ({
+    const commands = availableCommands.value.filter(isMenuCommand).filter(allowed).map(command => ({
       ...withLiveDescription(command), searchDescriptions: [command.desc], kind: 'command' as const,
     }))
-    const skills: ChatSlashCommand[] = skillCandidates.value.map(skill => {
-      const copy = paletteCopy(skill.name, String(i18n.global.locale.value).startsWith('zh')
-        ? skill.descriptionZh || skill.description : skill.description)
-      return {
-        ...copy, name: skill.name, cmd: '/' + skill.name,
-        aliases: [...skill.aliases, ...copy.aliases], kind: 'skill', skill,
-      }
-    })
+    const skills = skillPaletteItems.value
     filteredSlashCmds.value = [...commands, ...skills]
       .map((command, index) => ({ command, index, rank: slashSearchRank(query,
         [command.label, command.name, command.cmd, ...command.aliases],
@@ -351,8 +362,9 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (firstSpace === -1) {
       // Command-name completion: "/me" -> matching commands.
       const query = val.slice(1).toLowerCase()
-      const matches = slashCmds.value
+      const matches = availableCommands.value
         .filter(isMenuCommand)
+        .filter(allowed)
         .filter(command =>
           slashCommandKeys(command).some(key => key.slice(1).startsWith(query)),
         )
@@ -372,7 +384,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     filteredSlashCmds.value = []
   }
 
-  function addSelectedSkill(skill: SkillCandidate): boolean {
+  function addSelectedSkill(skill: SkillCandidate, position = options.getCaret?.() ?? options.inputText.value.length): boolean {
     const selected = options.selectedSkills
     if (!selected) return false
     if (selected.value.some(item => item.instanceId === skill.instanceId)) return true
@@ -380,11 +392,13 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       options.notify(i18n.global.t('chat.skillPalette.limit'))
       return false
     }
-    selected.value = [...selected.value, {
+    const reference = {
       name: skill.name,
       instanceId: skill.instanceId,
       digest: skill.digest,
-    }]
+    }
+    options.onSelectSkill?.(reference, position)
+    selected.value = [...selected.value, reference]
     return true
   }
 
@@ -403,6 +417,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
     const sessionKey = options.sessionKey.value
     const epoch = candidateEpoch
+    const caret = options.getCaret?.() ?? options.inputText.value.length
     try {
       const result = await options.skillCatalog.listCandidates({ sessionKey })
       if (epoch !== candidateEpoch || sessionKey !== options.sessionKey.value) return false
@@ -415,14 +430,24 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         handleUnavailableSkill(skill)
         return false
       }
-      return addSelectedSkill(skill)
+      return addSelectedSkill(skill, Math.min(caret, options.inputText.value.length))
     } catch {
       options.notify(i18n.global.t('chat.skillPalette.loadFailed'))
       return false
     }
   }
 
+  function selectPaletteSkill(command: ChatSlashCommand): boolean {
+    const picked = command.skill
+    const current = picked && skillCandidates.value.find(skill => skill.instanceId === picked.instanceId
+      && skill.digest === picked.digest && skill.name === picked.name)
+    if (!current) return false
+    if (current.disabled || !current.ready) { handleUnavailableSkill(current); return false }
+    return addSelectedSkill(current)
+  }
+
   function completeSlashCmd(cmd: ChatSlashCommand) {
+    if (cmd.kind !== 'skill' && !allowed(cmd)) return
     if (cmd.kind === 'skill' && cmd.skill && queryRange) {
       const skill = cmd.skill
       if (skill.disabled || !skill.ready) {
@@ -430,7 +455,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         closeSlashMenu()
         return
       }
-      if (!addSelectedSkill(skill)) return
+      if (!addSelectedSkill(skill, queryRange.start)) return
       const caret = queryRange.start
       options.inputText.value = replaceSlashQuery(options.inputText.value, queryRange)
       closeSlashMenu()
@@ -444,6 +469,15 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
     closeSlashMenu()
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
+    if (action === 'workbench.openSideChat') {
+      // The palette may complete only the command token with prose after the
+      // caret. Keep that prose in the handoff and leave the source draft owned
+      // by the launcher until acceptance.
+      const input = options.inputText.value
+      const command = parseSideChatCommand(input) ? input : input.replace(/^\s*\/\S*/, '/side')
+      if (parseSideChatCommand(command)) void options.sideChat?.run(command)
+      return
+    }
     if (action === 'goal.set' && !options.selectedSkills?.value.length) {
       // Selecting /goal arms the goal composer: the Goal chip appears next to
       // the access-mode controls and the user types the goal normally.
@@ -460,6 +494,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function activateSlashCmd(cmd: ChatSlashCommand) {
+    if (cmd.execution?.action === 'workbench.openSideChat') { completeSlashCmd(cmd); return }
     if (cmd.kind === 'skill') {
       completeSlashCmd(cmd)
       return
@@ -474,7 +509,13 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   function selectSlashCmd(cmd: ChatSlashCommand, args = '') {
+    if (!allowed(cmd)) {
+      closeSlashMenu()
+      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmd.cmd }))
+      return
+    }
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
+    if (action === 'workbench.openSideChat') { void options.sideChat?.run(`/side ${args}`); return }
     if (options.selectedSkills?.value.length) {
       options.notify(i18n.global.t('chat.skillPalette.commandWithSkills'))
       return
@@ -680,6 +721,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     text: string,
     knownClassification?: SlashCommandClassification,
   ): Promise<boolean> {
+    if (options.sideChat && parseSideChatCommand(text)) return options.sideChat.run(text)
     const classification = knownClassification ?? await classifySlashCommand(text)
     const trimmed = text.trim()
     const firstWhitespace = trimmed.search(/\s/)
@@ -691,7 +733,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       return true
     }
     const commandKey = slashCommandKey(cmdText)
-    const cmd = slashCmds.value.find(command =>
+    const cmd = availableCommands.value.find(command =>
       slashCommandKeys(command).includes(commandKey),
     )
     if (!cmd) {
@@ -703,17 +745,20 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   async function classifySlashCommand(text: string): Promise<SlashCommandClassification> {
+    const local = availableCommands.value.find(command => command.execution?.action === 'workbench.openSideChat'
+      && slashCommandKeys(command).includes(slashCommandKey(text)))
+    if (local) return allowed(local) ? 'registered' : 'unavailable'
     if (!slashCatalogLoaded.value) await loadSlashCommands()
     if (!slashCatalogLoaded.value) return 'unavailable'
     const commandKey = slashCommandKey(text)
-    return slashCmds.value.some(command => slashCommandKeys(command).includes(commandKey))
-      ? 'registered'
-      : 'unknown'
+    const command = availableCommands.value.find(command => slashCommandKeys(command).includes(commandKey))
+    return command ? allowed(command) ? 'registered' : 'unavailable' : 'unknown'
   }
 
   return {
     slashOpen,
     skillCandidates,
+    skillPaletteItems,
     skillsLoading,
     skillsError,
     loadSkillCandidates,
@@ -725,6 +770,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     closeSlashMenu,
     completeSlashCmd,
     selectSkillByName,
+    selectPaletteSkill,
     activateSlashCmd,
     selectSlashCmd,
     classifySlashCommand,

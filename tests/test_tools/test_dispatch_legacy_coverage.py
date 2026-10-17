@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import trace
 import types
 from pathlib import Path
@@ -30,7 +31,13 @@ from opensquilla.result_budget import ToolRunBudgetExceededError, ToolRunBudgetP
 from opensquilla.tool_boundary import ToolCall, ToolContinuation
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry
-from opensquilla.tools.types import ToolContext, ToolSpec, current_tool_context
+from opensquilla.tools.types import (
+    InteractionMode,
+    ToolContext,
+    ToolSpec,
+    current_file_snapshot,
+    current_tool_context,
+)
 
 _DISPATCH_SOURCE: Path = Path(_dispatch_module.__file__).resolve()
 
@@ -136,6 +143,57 @@ def _collect_executed_lines() -> set[int]:
                     current_tool_context.reset(token)
                     if case.teardown is not None:
                         case.teardown()
+
+        async def _run_snapshot_coverage(outcome: str, hooks: tuple) -> None:
+            snapshot = {"kind": "write", "path": "coverage.txt", "content": "saved"}
+            registry = ToolRegistry()
+
+            async def write_snapshot() -> str:
+                capture = current_file_snapshot.get()
+                assert capture is not None
+                capture.update(snapshot)
+                if outcome == "exception":
+                    raise RuntimeError("snapshot tool failed")
+                if outcome == "cancelled":
+                    raise asyncio.CancelledError()
+                if outcome == "approval_pending":
+                    return json.dumps({"status": "approval_required", "approval_id": "snapshot"})
+                if outcome == "denied":
+                    return json.dumps({"status": "denied", "reason": "sandbox_blocked"})
+                return "written"
+
+            registry.register(
+                ToolSpec(name="coverage_snapshot", description="Snapshot driver", parameters={}),
+                write_snapshot,
+            )
+            handler = build_tool_handler(
+                registry,
+                ToolContext(is_owner=True, interaction_mode=InteractionMode.INTERACTIVE),
+                tool_hooks=hooks or None,
+            )
+            context_token = current_tool_context.set(None)
+            snapshot_token = current_file_snapshot.set(None)
+            try:
+                call = ToolCall(tool_use_id="snapshot", tool_name="coverage_snapshot", arguments={})
+                if outcome == "cancelled":
+                    with pytest.raises(asyncio.CancelledError):
+                        await handler(call)
+                else:
+                    result = await handler(call)
+                    assert result.file_snapshot == (snapshot if outcome == "success" else None)
+                    assert result.is_error is (outcome in {"exception", "denied"})
+                    if outcome == "approval_pending":
+                        assert result.execution_status is not None
+                        assert result.execution_status["reason"] == "approval_pending"
+                assert current_file_snapshot.get() is None
+                assert current_tool_context.get() is None
+            finally:
+                current_file_snapshot.reset(snapshot_token)
+                current_tool_context.reset(context_token)
+
+        for hooks in hook_variants:
+            for outcome in ("success", "approval_pending", "denied", "exception", "cancelled"):
+                await _run_snapshot_coverage(outcome, hooks)
 
         async def _run_coverage_only(
             *,

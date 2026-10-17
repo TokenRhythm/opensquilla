@@ -53,6 +53,7 @@ function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConn
       : '',
     httpUrl: typeof raw.httpUrl === 'string' ? raw.httpUrl : null,
     wsUrl: typeof raw.wsUrl === 'string' ? raw.wsUrl : null,
+    ...(typeof raw.controlUiBasePath === 'string' ? { controlUiBasePath: raw.controlUiBasePath } : {}),
     authToken: typeof raw.authToken === 'string' ? raw.authToken : null,
     error: typeof raw.error === 'string' ? raw.error : null,
     ...(sandboxUpgrade ? { sandboxUpgrade } : {}),
@@ -434,6 +435,7 @@ function idleUpdateState(canNativeInstall: boolean, managed = canNativeInstall):
     canCheck: managed,
     canNativeInstall,
     canInstall: canNativeInstall,
+    canAutoDownload: false,
     installMode: canNativeInstall ? 'native' : managed ? 'manual' : 'unsupported',
     releaseUrl: null,
     source: null,
@@ -479,8 +481,10 @@ function normalizeUpdateState(
     canInstall: normalizedInstallMode !== 'unsupported' && (
       typeof raw.canInstall === 'boolean' ? raw.canInstall : normalizedInstallMode === 'native'
     ),
+    canAutoDownload: raw.canAutoDownload === true,
     installMode: normalizedInstallMode,
     releaseUrl: typeof raw.releaseUrl === 'string' && raw.releaseUrl ? raw.releaseUrl : null,
+    releaseNotesUrl: typeof raw.releaseNotesUrl === 'string' && raw.releaseNotesUrl ? raw.releaseNotesUrl : null,
     source: UPDATE_SOURCES.has(source as DesktopUpdateSource) ? source as DesktopUpdateSource : null,
     fallbackUsed: raw.fallbackUsed === true,
   }
@@ -713,6 +717,8 @@ export function createDesktopPlatform(): Platform {
         ? { cancelAttachmentSelections: () => requireDesktopApi().cancelAttachmentSelections!() } : {}),
       ...(typeof window.opensquillaDesktop?.saveArtifact === 'function'
         ? { saveArtifact: payload => requireDesktopApi().saveArtifact!(payload) } : {}),
+      ...(typeof window.opensquillaDesktop?.saveAttachment === 'function'
+        ? { saveAttachment: payload => requireDesktopApi().saveAttachment!(payload) } : {}),
       ...(typeof window.opensquillaDesktop?.sourceFileAction === 'function'
         ? { sourceFileAction: payload => requireDesktopApi().sourceFileAction!(payload) } : {}),
       ...(typeof window.opensquillaDesktop?.workspaceFileAction === 'function'

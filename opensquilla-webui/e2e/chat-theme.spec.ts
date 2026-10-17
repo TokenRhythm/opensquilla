@@ -22,7 +22,7 @@ async function setTheme(page: import('@playwright/test').Page, theme: 'dark' | '
 test.describe('Chat Theme', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     await page.waitForSelector('.chat', { timeout: 10000 })
   })
 

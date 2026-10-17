@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createApp, h, nextTick, type App } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { Fragment, createApp, createCommentVNode, h, nextTick, shallowRef, type App, type VNode } from 'vue'
 
 import i18n from '@/i18n'
 import type {
@@ -8,9 +8,12 @@ import type {
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { StatusPart } from '@/types/parts'
-import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
+import { projectAssistantActivityTimeline, type AssistantActivityLifecycle } from '@/utils/chat/assistantActivity'
 import AssistantActivityTimeline from './AssistantActivityTimeline.vue'
 import timelineSource from './AssistantActivityTimeline.vue?raw'
+import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
+import { provideActivityDisclosureVisibility } from '@/composables/chat/useActivityDisclosureVisibility'
+import { createPinia } from 'pinia'
 
 const mountedApps: App[] = []
 
@@ -61,7 +64,8 @@ function group(call: ChatToolCallRenderItem): ChatStreamTimelineItem {
 async function mountTimeline(
   timelineItems: ChatStreamTimelineItem[],
   statusHistory: StatusPart[] = [],
-  lifecycle: 'working' | 'answering' | 'settled' = 'working',
+  lifecycle: AssistantActivityLifecycle = 'working',
+  interruptSlot?: (props: { part: Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }> }) => VNode[],
 ) {
   const root = document.createElement('div')
   document.body.appendChild(root)
@@ -75,21 +79,23 @@ async function mountTimeline(
       class: 'external-activity-class',
       projection,
       timelineItems,
-      isToolGroupOpen: () => false,
-      isToolItemOpen: () => false,
+      isToolGroupOpen: () => undefined,
+      isToolItemOpen: () => undefined,
       toolGroupStatusText: () => 'Done',
       toolStatusText: () => 'Done',
       toolSecondaryText: () => 'private detail',
-    }),
+    }, interruptSlot ? { interrupt: interruptSlot } : undefined),
   })
   mountedApps.push(app)
   app.use(i18n)
+  app.use(createPinia())
   app.mount(root)
   await nextTick()
   return root
 }
 
 beforeEach(() => {
+  useToolDetailPreference().setMode('collapsed')
   i18n.global.locale.value = 'en'
   document.body.innerHTML = ''
 })
@@ -100,6 +106,185 @@ afterEach(() => {
 })
 
 describe('AssistantActivityTimeline', () => {
+  it.each([
+    ['provider:requesting', 'Waiting for model'],
+    ['Preparing tool call', 'Preparing tool call'],
+  ])('gives %s quiet text feedback without a dot or second timer', async (action, label) => {
+    const executing = shallowRef(true)
+    const visible = shallowRef(true)
+    const history: StatusPart[] = [{ action, label: action, at: 1_000 }]
+    const projection = shallowRef(projectAssistantActivityTimeline([], {
+      lifecycle: 'working', statusHistory: history, endedAt: 3_000,
+    }))
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({ setup() {
+      provideActivityDisclosureVisibility(visible)
+      return () => h(AssistantActivityTimeline, {
+        projection: projection.value, executing: executing.value,
+        isToolGroupOpen: () => undefined, isToolItemOpen: () => undefined,
+        toolGroupStatusText: () => '', toolStatusText: () => '', toolSecondaryText: () => '',
+      })
+    } })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.use(createPinia())
+    app.mount(root)
+    await nextTick()
+    expect(root.textContent).toContain(label)
+    expect(root.querySelectorAll('.activity-motion--active')).toHaveLength(1)
+    expect(root.querySelector('.assistant-activity-status__dot')).toBeNull()
+    expect(root.querySelector('.assistant-activity-status__duration')).toBeNull()
+
+    visible.value = false
+    await nextTick()
+    expect(root.querySelector('.activity-motion--active')).toBeNull()
+    visible.value = true
+    executing.value = false
+    await nextTick()
+    expect(root.querySelector('.activity-motion--active')).toBeNull()
+
+    // An authoritative tool start takes over the preparing/waiting row.
+    executing.value = true
+    const tool = toolCall('running-write', 'write_file')
+    tool.isRunning = true
+    tool.status = ''
+    projection.value = projectAssistantActivityTimeline([group(tool)], {
+      lifecycle: 'working', statusHistory: history, endedAt: 4_000,
+    })
+    await nextTick()
+    expect(root.querySelector('.assistant-activity-status__row--routine')).toBeNull()
+    expect(root.textContent).not.toContain(label)
+
+    projection.value = projectAssistantActivityTimeline([], {
+      lifecycle: 'interrupted', statusHistory: history, endedAt: 5_000,
+    })
+    await nextTick()
+    expect(root.querySelector('.assistant-activity-status__row')).toBeNull()
+    expect(root.querySelector('.activity-motion--active')).toBeNull()
+  })
+
+  it.each(['absent', 'comment', 'fragment'] as const)(
+    'omits consecutive %s interrupt slots without breaking visible reading boundaries',
+    async kind => {
+      const interrupt = (key: string, activityOrder: number): ChatStreamTimelineItem => ({
+        type: 'interrupt', key, activityOrder, approvalId: key,
+        part: { type: 'interrupt', key, interruptKind: 'approval', resolution: null, busy: false, error: '' },
+      })
+      const slot = kind === 'absent' ? undefined : vi.fn(() => kind === 'comment'
+        ? [createCommentVNode('v-if')]
+        : [h(Fragment, null, [createCommentVNode('v-if')])])
+      const root = await mountTimeline([
+        { type: 'text', key: 'before-tools', html: '<p>Before tools.</p>', activityOrder: 1 },
+        interrupt('empty-1', 2), interrupt('empty-2', 3),
+        { ...group(toolCall('after-empty', 'read_file')), activityOrder: 4 },
+        { type: 'text', key: 'before-prose', html: '<p>Before prose.</p>', activityOrder: 5 },
+        interrupt('empty-3', 6), interrupt('empty-4', 7),
+        { type: 'text', key: 'after-prose', html: '<p>After prose.</p>', activityOrder: 8 },
+      ], [], 'settled', slot)
+
+      expect(root.querySelectorAll('.run-trace__interrupt')).toHaveLength(0)
+      expect(root.querySelectorAll('.activity-narration + .tool-timeline .step-card')).toHaveLength(1)
+      expect(root.querySelectorAll('.activity-narration + .activity-narration')).toHaveLength(1)
+      expect([...root.querySelector('.assistant-activity-timeline')!.children].map(node =>
+        node.classList.contains('activity-narration') ? node.textContent : 'tool',
+      )).toEqual(['Before tools.', 'tool', 'Before prose.', 'After prose.'])
+      if (slot) expect(slot).toHaveBeenCalledTimes(4)
+    },
+  )
+
+  it('evaluates a visible interrupt slot once and preserves its activity identity and order', async () => {
+    const slot = vi.fn(({ part }: { part: Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }> }) =>
+      [h(Fragment, null, [createCommentVNode('leading comment'), h('button', { type: 'button' }, part.key)])])
+    const root = await mountTimeline([
+      { type: 'text', key: 'before', html: '<p>Before approval.</p>', activityOrder: 1 },
+      {
+        type: 'interrupt', key: 'approval-slot', approvalId: 'approval-slot', activityOrder: 2,
+        part: { type: 'interrupt', key: 'approved', interruptKind: 'approval', resolution: 'approved', busy: false, error: '' },
+      },
+      { type: 'text', key: 'after', html: '<p>After approval.</p>', activityOrder: 3 },
+    ], [], 'settled', slot)
+
+    const interrupt = root.querySelector('.run-trace__interrupt')
+    expect(interrupt?.getAttribute('data-activity-id')).toBe('approval-slot')
+    expect(interrupt?.getAttribute('data-activity-order')).toBe('2')
+    expect(interrupt?.querySelector('button')?.textContent).toBe('approved')
+    expect([...root.querySelectorAll('[data-activity-entry]')].map(node => node.getAttribute('data-activity-order')))
+      .toEqual(['1', '2', '3'])
+    expect(slot).toHaveBeenCalledTimes(1)
+  })
+
+  it('retains text-only Fragment slot content', async () => {
+    const root = await mountTimeline([{
+      type: 'interrupt', key: 'text-interrupt', approvalId: 'text-interrupt', activityOrder: 1,
+      part: { type: 'interrupt', key: 'approved', interruptKind: 'approval', resolution: 'approved', busy: false, error: '' },
+    }], [], 'settled', () => [h(Fragment, null, ['Approval recorded'])])
+    expect(root.querySelector('.run-trace__interrupt')?.textContent).toBe('Approval recorded')
+  })
+
+  it('runs compaction feedback only while executing inside a visible activity', async () => {
+    const executing = shallowRef(true)
+    const visible = shallowRef(true)
+    const projection = shallowRef(projectAssistantActivityTimeline([], {
+      lifecycle: 'working',
+      statusHistory: [{
+        action: 'context_compaction', label: '', at: 1_000,
+        id: 'cmp-running', category: 'maintenance', state: 'running',
+        source: 'automatic',
+      }],
+      endedAt: 2_000,
+    }))
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({
+      setup() {
+        provideActivityDisclosureVisibility(visible)
+        return () => h(AssistantActivityTimeline, {
+          projection: projection.value,
+          executing: executing.value,
+          isToolGroupOpen: () => undefined,
+          isToolItemOpen: () => undefined,
+          toolGroupStatusText: () => '',
+          toolStatusText: () => '',
+          toolSecondaryText: () => '',
+        })
+      },
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(root)
+    await nextTick()
+    const isAnimating = () => !!root.querySelector('.assistant-activity-status__row--animating')
+    expect(isAnimating()).toBe(true)
+
+    executing.value = false
+    await nextTick()
+    expect(isAnimating()).toBe(false)
+    expect(root.querySelector('[data-testid="compaction-event"]')).not.toBeNull()
+
+    visible.value = false
+    executing.value = true
+    await nextTick()
+    expect(isAnimating()).toBe(false)
+
+    visible.value = true
+    await nextTick()
+    expect(isAnimating()).toBe(true)
+
+    projection.value = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: [{
+        action: 'context_compaction', label: '', at: 1_000,
+        id: 'cmp-running', category: 'maintenance', state: 'completed',
+        source: 'automatic', durability: 'durable',
+      }],
+      endedAt: 2_000,
+    })
+    await nextTick()
+    expect(isAnimating()).toBe(false)
+    expect(root.textContent).toContain('Context organized')
+  })
+
   it.each(['working', 'settled'] as const)('distinguishes temporary reductions from saved summaries while %s', async lifecycle => {
     const root = await mountTimeline([], [
       {
@@ -135,19 +320,22 @@ describe('AssistantActivityTimeline', () => {
     ).toBe(true)
   })
 
-  it('renders contiguous equivalent calls as one safe semantic group', async () => {
+  it('renders equivalent calls individually with their real targets and no count group', async () => {
     const root = await mountTimeline([
       group(toolCall('write-secret', 'write_file')),
       group(toolCall('edit-secret', 'edit_file')),
     ])
 
-    expect(root.querySelectorAll('.step-card')).toHaveLength(1)
-    expect(root.querySelector('.tool-row__label')?.textContent).toBe('Edited files')
-    expect(root.querySelector('.tool-row__arg')?.textContent).toBe('2 files')
-    // The footprint carries the count; the raw call-count pill would repeat it.
+    expect(root.querySelectorAll('.step-card')).toHaveLength(2)
+    expect([...root.querySelectorAll('.tool-row__label')].map(row => row.textContent))
+      .toEqual(['Written', 'Edited'])
+    expect([...root.querySelectorAll('.tool-row__arg')].map(row => row.textContent))
+      .toEqual(['…/write-secret', '…/edit-secret'])
     expect(root.querySelector('.step-count')).toBeNull()
+    expect(root.querySelector('.tool-row--group')).toBeNull()
     expect(root.textContent).not.toContain('2 calls')
-    expect(root.textContent).not.toContain('/private/')
+    expect(root.textContent).not.toContain('2 files')
+    expect(root.textContent).not.toContain('{"path"')
     expect(root.textContent).not.toContain('Private write-secret')
   })
 
@@ -171,6 +359,27 @@ describe('AssistantActivityTimeline', () => {
     expect(ruleBody('.assistant-activity-status__dot {')).toContain('margin: 0 0.25rem;')
   })
 
+  it('omits empty rendered narration between tools without changing source items', async () => {
+    const items: ChatStreamTimelineItem[] = [
+      group(toolCall('before-blank', 'read_file')),
+      { type: 'text', key: 'blank', html: '', rawText: '\n\n', activityOrder: 2 },
+      group(toolCall('after-blank', 'execute_code')),
+    ]
+    const root = await mountTimeline(items)
+    expect(root.querySelector('.activity-narration')).toBeNull()
+    expect(root.querySelectorAll('.tool-timeline')).toHaveLength(1)
+    expect([...root.querySelectorAll('.tool-row__label')].map(row => row.textContent))
+      .toEqual(['Read', 'Ran'])
+    expect(items[1]).toMatchObject({ rawText: '\n\n', activityOrder: 2 })
+  })
+
+  it('does not leave an empty activity batch for whitespace-only rendered content', async () => {
+    const root = await mountTimeline([
+      { type: 'text', key: 'blank', html: ' \n ', rawText: '\n' },
+    ], [], 'settled')
+    expect(root.querySelector('.assistant-activity-timeline')).toBeNull()
+  })
+
   it('keeps narration as a semantic grouping boundary', async () => {
     const root = await mountTimeline([
       group(toolCall('write-before', 'write_file')),
@@ -188,26 +397,20 @@ describe('AssistantActivityTimeline', () => {
     expect(root.textContent).toContain('Checking the first change.')
   })
 
-  it('folds consecutive tool purposes into a readable batch before call details', async () => {
+  it('renders consecutive mixed tools without an extra disclosure level', async () => {
     const root = await mountTimeline([
       group(toolCall('read-one', 'read_file')),
       group(toolCall('run-one', 'execute_code')),
     ])
 
-    const batch = root.querySelector<HTMLDetailsElement>('.assistant-activity-tool-batch')
-    expect(batch).not.toBeNull()
-    expect(batch?.open).toBe(false)
-    expect(batch?.querySelector('.assistant-activity-tool-batch__summary')?.textContent)
-      .toContain('Inspected files')
-    expect(batch?.querySelector('.assistant-activity-tool-batch__summary')?.textContent)
-      .toContain('Ran commands')
-    expect(batch?.querySelectorAll('.tool-row')).toHaveLength(2)
-
-    batch?.querySelector<HTMLElement>('summary')?.click()
-    expect(batch?.open).toBe(true)
+    expect(root.querySelector('.assistant-activity-tool-batch')).toBeNull()
+    expect(root.querySelector('.tool-row--group')).toBeNull()
+    expect(root.querySelectorAll('.tool-row')).toHaveLength(2)
+    expect([...root.querySelectorAll('.tool-row__label')].map(row => row.textContent))
+      .toEqual(['Read', 'Ran'])
   })
 
-  it('shows only the current routine phase live and restores it with duration when settled', async () => {
+  it('shows only the current routine phase live and removes it from settled history', async () => {
     const statusHistory = [
       {
         action: 'Sending',
@@ -224,32 +427,81 @@ describe('AssistantActivityTimeline', () => {
 
     expect(liveRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
     expect(liveRoot.textContent).toContain('Writing the answer')
-    expect(liveRoot.textContent).toContain('3s')
+    expect(liveRoot.querySelector('.assistant-activity-status__duration')).toBeNull()
     expect(liveRoot.textContent).not.toContain('/private/customer')
     expect(liveRoot.textContent).not.toContain('secret')
 
     const settledRoot = await mountTimeline([], statusHistory, 'settled')
-    expect(settledRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
+    expect(settledRoot.querySelector('.assistant-activity-timeline')).toBeNull()
     expect(settledRoot.textContent).not.toContain('Working')
-    expect(settledRoot.textContent).toContain('Answer composition')
-    expect(settledRoot.textContent).toContain('3s')
+    expect(settledRoot.textContent).not.toContain('Answer composition')
     expect(settledRoot.textContent).not.toContain('/private/customer')
     expect(settledRoot.textContent).not.toContain('secret')
   })
 
-  it('retains the waiting duration and exceptional provider transitions without a duplicate reasoning row', async () => {
+  it('updates the live phase in place and removes it after terminal handoff', async () => {
+    const statusHistory: StatusPart[] = [
+      { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
+    ]
+    const projection = shallowRef(projectAssistantActivityTimeline([], {
+      lifecycle: 'working', statusHistory, endedAt: 2_000,
+    }))
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({
+      render: () => h(AssistantActivityTimeline, {
+        projection: projection.value,
+        isToolGroupOpen: () => undefined,
+        isToolItemOpen: () => undefined,
+        toolGroupStatusText: () => '',
+        toolStatusText: () => '',
+        toolSecondaryText: () => '',
+      }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(root)
+    await nextTick()
+    expect(root.textContent).toContain('Waiting for model')
+
+    statusHistory.push({ action: 'write:1', label: 'Writing', at: 2_000 })
+    projection.value = projectAssistantActivityTimeline([], {
+      lifecycle: 'answering', statusHistory, endedAt: 3_000,
+    })
+    await nextTick()
+    await vi.waitFor(() => {
+      expect(root.querySelectorAll('.assistant-activity-status__row--current')).toHaveLength(1)
+    })
+    expect(root.textContent).toContain('Writing the answer')
+    expect(root.textContent).not.toContain('Waiting for model')
+
+    projection.value = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled', statusHistory, endedAt: 4_000,
+    })
+    await nextTick()
+    expect(root.querySelector('.assistant-activity-timeline')).toBeNull()
+    expect(projection.value.statusSteps.map(step => step.durationSeconds)).toEqual([1, 2])
+    expect(statusHistory).toHaveLength(2)
+  })
+
+  it.each(['settled', 'failed', 'interrupted'] as const)('retains exceptional provider transitions without routine rows when %s', async lifecycle => {
     const root = await mountTimeline([], [
       { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
       { action: 'provider:reasoning', label: 'Reasoning', at: 2_000 },
       { action: 'provider:fallback', label: 'Fallback', at: 3_000 },
-    ], 'settled')
+      { action: 'provider:retrying:2:3', label: 'Retry', at: 4_000 },
+      { action: 'write:1', label: 'Writing', at: 5_000 },
+    ], lifecycle)
 
     const rows = root.querySelectorAll('.assistant-activity-status__row')
     expect(rows).toHaveLength(2)
-    expect(root.textContent).toContain('Model response')
-    expect(root.textContent).toContain('1s')
-    expect(root.textContent).not.toContain('Thinking deeply')
-    expect(root.textContent).toContain('Switching to backup model')
+    expect(root.textContent).not.toContain('Model response')
+    expect(root.textContent).not.toContain('Waiting for model')
+    expect(root.textContent).not.toContain('Answer composition')
+    expect(root.textContent).not.toContain('Writing the answer')
+    expect(root.textContent).not.toContain('Thinking')
+    expect(root.textContent).toContain('Tried a backup model')
+    expect(rows[1]?.textContent).toContain('Retried the model request')
   })
 
   it('shows prior semantic context but leaves the current action to the live header', async () => {

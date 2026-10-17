@@ -14,6 +14,7 @@ from opensquilla.application.artifact_workbench import (
     AttachmentContentQuery,
     AttachmentMimePolicyPort,
     AttachmentStagingPort,
+    ContentExportError,
     ContentIntegrityError,
     ContentMaterial,
     ContentNotFoundError,
@@ -26,9 +27,13 @@ from opensquilla.artifact_session import (
 )
 from opensquilla.artifact_session import ArtifactSessionService
 from opensquilla.artifacts import (
+    DEFAULT_ARTIFACT_MAX_BYTES,
+    ArtifactBundle,
+    ArtifactBundleSourceFile,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactStore,
+    _read_regular_bundle_file,
 )
 from opensquilla.attachment_refs import transcript_material_path
 from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
@@ -41,12 +46,29 @@ from opensquilla.contracts.attachments import (
     normalize_attachment_mime,
 )
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.html_archive import HtmlZipExporter, capture_saved_html
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.paths import media_root_from_config, native_io_path
 
 
 class UploadStagingStore(Protocol):
     async def put_with_expiry(self, name: str, mime: str, payload: bytes) -> tuple[str, float]: ...
+
+
+def _verify_attachment_material(path: Path, expected_sha: str) -> None:
+    """Verify the entire immutable material without buffering it on the event loop."""
+
+    digest = hashlib.sha256()
+    try:
+        if not path.is_file():
+            raise ContentNotFoundError("attachment not found")
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ContentNotFoundError("attachment not found") from exc
+    if digest.hexdigest() != expected_sha:
+        raise ContentIntegrityError("attachment integrity check failed")
 
 
 class GatewayArtifactContentPort(ArtifactContentPort):
@@ -58,8 +80,9 @@ class GatewayArtifactContentPort(ArtifactContentPort):
     ) -> None:
         self._config = config
         self._session_manager = session_manager
+        self._zip_exports = HtmlZipExporter()
 
-    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial:
+    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial | ContentMaterial:
         """Read an already-bound page; never materialize a copy or a version."""
         from opensquilla.agents.scope import resolve_agent_workspace_dir
         from opensquilla.artifact_session.working_files import checked_path, get_working_files
@@ -130,6 +153,44 @@ class GatewayArtifactContentPort(ArtifactContentPort):
                 ):
                     raise ContentNotFoundError("Working file is outside the authorized read scope")
 
+            if query.format == "zip":
+                def capture_working() -> ArtifactBundle:
+                    observed: dict[Path, tuple[int, int, int, int]] = {}
+
+                    def fingerprint(path: Path) -> tuple[int, int, int, int]:
+                        value = native_io_path(path).stat(follow_symlinks=False)
+                        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+                    def guarded_read(candidate: Path) -> None:
+                        read_guard(candidate)
+                        observed.setdefault(candidate, fingerprint(candidate))
+
+                    if binding.bundle_mode == "none":
+                        guarded_read(binding.entry)
+                        bundle = ArtifactBundle(binding.entrypoint, (ArtifactBundleSourceFile(
+                            binding.entrypoint, binding.entry_mime,
+                            _read_regular_bundle_file(
+                                binding.entry, max_bytes=DEFAULT_ARTIFACT_MAX_BYTES,
+                            ),
+                        ),))
+                    else:
+                        bundle = binding.bundle(read_guard=guarded_read)
+                    member = next((item for item in bundle.files if item.path == selected), None)
+                    if member is None or member.mime not in {"text/html", "application/xhtml+xml"}:
+                        raise ContentNotFoundError("Working page unavailable")
+                    if any(fingerprint(path) != value for path, value in observed.items()):
+                        raise ContentExportError(
+                            "ZIP_SOURCE_CHANGED", 409, "Working files changed during export",
+                        )
+                    return bundle
+
+                async def validate_export() -> None:
+                    await validate_workspace()
+                    if await get_working_files(service, query.document_id) != binding:
+                        raise ContentNotFoundError("Working file binding changed")
+
+                return await self._zip_exports.export(capture_working, validate=validate_export)
+
             bundle = await asyncio.to_thread(binding.bundle, read_guard=read_guard)
             member = next((item for item in bundle.files if item.path == selected), None)
             if member is None or member.mime not in {"text/html", "application/xhtml+xml"}:
@@ -166,6 +227,8 @@ class GatewayArtifactContentPort(ArtifactContentPort):
             raise ContentNotFoundError("artifact not found")
         store = ArtifactStore(media_root_from_config(self._config))
         try:
+            if query.format == "zip":
+                return await self._export_artifact(query.session_key, session_id, query.artifact_id)
             ref, path = await asyncio.to_thread(
                 store.resolve_for_download, query.artifact_id, session_id=session_id
             )
@@ -191,13 +254,21 @@ class GatewayArtifactContentPort(ArtifactContentPort):
             raise ContentNotFoundError("artifact document not found")
         try:
             service = await ArtifactSessionService.from_session_storage(storage)
-            document = await service.get_document(query.document_id)
-            if document.session_key != query.session_key or document.session_id != session_id:
-                raise ArtifactSessionNotFoundError("artifact document not found")
-            revision_id = query.revision_id or document.head_revision_id
-            revision = await service.get_revision(revision_id)
-            if revision.document_id != document.document_id:
-                raise ArtifactSessionNotFoundError("artifact revision not found")
+            try:
+                document = await service.get_document(query.document_id)
+                if document.session_key != query.session_key or document.session_id != session_id:
+                    raise ArtifactSessionNotFoundError("artifact document not found")
+                revision_id = query.revision_id or document.head_revision_id
+                revision = await service.get_revision(revision_id)
+                if revision.document_id != document.document_id:
+                    raise ArtifactSessionNotFoundError("artifact revision not found")
+            finally:
+                await service.close()
+            if query.format == "zip":
+                return await self._export_artifact(
+                    query.session_key, session_id, revision.artifact_id,
+                    expected_sha256=revision.artifact_sha256, expected_size=revision.byte_size,
+                )
             ref, path = await asyncio.to_thread(
                 ArtifactStore(media_root_from_config(self._config)).resolve_for_download,
                 revision.artifact_id,
@@ -213,6 +284,23 @@ class GatewayArtifactContentPort(ArtifactContentPort):
             raise ContentNotFoundError("artifact document not found") from exc
         filename = document.name if revision_id == document.head_revision_id else revision.filename
         return ContentMaterial(native_io_path(path), ref.mime, filename)
+
+    async def _export_artifact(
+        self, session_key: str, session_id: str, artifact_id: str, *,
+        expected_sha256: str | None = None, expected_size: int | None = None,
+    ) -> ContentMaterial:
+        store = ArtifactStore(media_root_from_config(self._config))
+
+        async def validate() -> None:
+            if await self._session_id(session_key) != session_id:
+                raise ContentNotFoundError("Artifact session changed")
+
+        return await self._zip_exports.export(
+            lambda: capture_saved_html(
+                store, artifact_id, session_id,
+                expected_sha256=expected_sha256, expected_size=expected_size,
+            ), validate=validate,
+        )
 
     async def attachment_content(self, query: AttachmentContentQuery) -> ContentMaterial:
         session_id = await self._session_id(query.session_key)
@@ -255,14 +343,11 @@ class GatewayArtifactContentPort(ArtifactContentPort):
         except ValueError as exc:
             raise ContentNotFoundError("attachment not found") from exc
         native_path = native_io_path(path)
-        if not native_path.exists() or not native_path.is_file():
-            raise ContentNotFoundError("attachment not found")
-        try:
-            actual_sha = hashlib.sha256(native_path.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise ContentNotFoundError("attachment not found") from exc
-        if actual_sha != query.sha256:
-            raise ContentIntegrityError("attachment integrity check failed")
+        await asyncio.to_thread(_verify_attachment_material, native_path, query.sha256)
+        # The integrity read yields to the event loop just like inline reads;
+        # do not publish old material under a concurrently replaced session.
+        if await self._session_id(query.session_key) != session_id:
+            raise ContentNotFoundError("attachment session changed")
         return ContentMaterial(native_path, "application/octet-stream")
 
     async def _session_id(self, session_key: str) -> str | None:

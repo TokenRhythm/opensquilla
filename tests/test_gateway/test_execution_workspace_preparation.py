@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,47 @@ async def test_channel_rejected_first_turn_removes_uncommitted_workspace(
         assert await stack.storage.get_session(CHANNEL_KEY) is None
         assert stack.received_runs == []
         assert _roots(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_atomic_create_reuse_preserves_winner_and_removes_losing_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with SessionStorage(tmp_path / "create-race.db") as storage:
+        factory = build_execution_workspace_factory(
+            _managed_config(tmp_path), profile_home=tmp_path,
+        )
+        manager = SessionManager(storage, execution_workspace_factory=factory)
+        independent_writer = SessionManager(storage, execution_workspace_factory=factory)
+        prepare = manager._prepare_execution_workspace
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        losing_root: Path | None = None
+
+        async def pause_after_allocation(node: Any) -> Any:
+            nonlocal losing_root
+            preparation = await prepare(node)
+            losing_root = Path(node.execution_workspace["root"])
+            entered.set()
+            await release.wait()
+            return preparation
+
+        monkeypatch.setattr(manager, "_prepare_execution_workspace", pause_after_allocation)
+        operation = asyncio.create_task(manager.create(NEW_KEY, reuse_existing=True))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert losing_root is not None and losing_root.is_dir()
+            winner = await independent_writer.create(NEW_KEY)
+        finally:
+            release.set()
+        returned = await operation
+        persisted = await storage.get_session(NEW_KEY)
+        winner_root = Path(winner.execution_workspace["root"])
+        assert returned.session_id == persisted.session_id == winner.session_id
+        assert returned.execution_workspace == winner.execution_workspace
+        assert winner_root.is_dir()
+        assert not losing_root.exists()
+        assert _roots(tmp_path) == [winner_root]
 
 
 @pytest.mark.asyncio
@@ -376,7 +418,12 @@ def test_allocation_rollback_is_empty_and_identity_scoped(tmp_path: Path, mutati
     elif mutation in {"replacement", "symlink"}:
         root.rename(preserved)
         if mutation == "symlink":
-            root.symlink_to(preserved, target_is_directory=True)
+            try:
+                root.symlink_to(preserved, target_is_directory=True)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    pytest.skip("Windows symbolic-link privilege is unavailable")
+                raise
         else:
             root.mkdir()
     elif mutation == "parent":

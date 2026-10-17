@@ -59,7 +59,6 @@ async def _generate(output_path: Path, **overrides: object):
         "model": _MODEL,
         "prompt": "A quiet city street at dawn",
         "duration": 8,
-        "max_duration_seconds": 8,
         "aspect_ratio": "16:9",
         "resolution": "1080p",
         "output_path": output_path,
@@ -158,13 +157,12 @@ async def test_custom_veo_endpoint_keeps_key_on_the_configured_origin(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("limit", "resolution", "expected"),
-    [(8, "720p", "4"), (6, "720p", "4"), (8, "1080p", "8")],
+    ("resolution", "expected"),
+    [("720p", "4"), ("1080p", "8")],
 )
 async def test_default_duration_chooses_shortest_valid_veo_duration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    limit: int,
     resolution: str,
     expected: str,
 ) -> None:
@@ -181,9 +179,7 @@ async def test_default_duration_chooses_shortest_valid_veo_duration(
         )
 
     _install_transport(monkeypatch, handler)
-    await _generate(
-        tmp_path / "clip.mp4", duration=None, max_duration_seconds=limit, resolution=resolution
-    )
+    await _generate(tmp_path / "clip.mp4", duration=None, resolution=resolution)
     assert len(posted) == 1
     assert posted[0]["parameters"]["durationSeconds"] == expected  # type: ignore[index]
 
@@ -194,7 +190,6 @@ async def test_default_duration_chooses_shortest_valid_veo_duration(
     [
         {"duration": 5},
         {"duration": 4, "resolution": "1080p"},
-        {"duration": None, "resolution": "1080p", "max_duration_seconds": 6},
         {"base_url": "http://evil.example/v1beta"},
         {"model": "gemini-3.1-flash"},
     ],

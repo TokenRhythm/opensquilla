@@ -29,6 +29,7 @@ import { MIGRATION_OPERATIONS_KEY } from './modules/migrationOperations'
 import { WORKSPACE_CATALOG_KEY } from './modules/workspaceCatalog'
 import { WORKSPACE_REFERENCES_KEY } from './modules/workspaceReferences'
 import { WORKSPACE_FILES_KEY } from './modules/workspaceFiles'
+import { TERMINAL_ACCESS_KEY } from './modules/terminal'
 import { SANDBOX_RUNTIME_KEY } from './modules/sandboxRuntime'
 import { USAGE_REPORTING_KEY } from './modules/usageReporting'
 import { COMMAND_CATALOG_KEY } from './modules/commandCatalog'
@@ -47,6 +48,7 @@ import { AUDIO_TRANSCRIPTION_KEY } from './modules/audioTranscription'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { CONVERSATION_EVENTS_KEY } from './modules/conversationEvents'
 import { SESSION_READ_LIFECYCLE_FACTORY_KEY } from './modules/sessionReadLifecycle'
+import { SESSION_MESSAGE_SEARCH_KEY } from './modules/sessionMessageSearch'
 import { SESSION_INSPECTION_KEY } from './modules/sessionInspection'
 import { HISTORY_CONTENT_READER_KEY } from './modules/historyContent'
 import 'katex/dist/katex.min.css'
@@ -55,6 +57,7 @@ import './themes/tokens' // eagerly bundles every value theme's token block
 import './styles/control-visual-system.css'
 import './styles/route-fx.css'
 import './styles/chat-markdown.css'
+import './styles/chat-diagrams.css'
 import './styles/chat-shared.css'
 import './styles/apple-modern.css'
 
@@ -120,6 +123,7 @@ app.provide(
   gatewayAdapters.sessionReadLifecycleFactory,
 )
 app.provide(SESSION_INSPECTION_KEY, gatewayAdapters.sessionInspection)
+app.provide(SESSION_MESSAGE_SEARCH_KEY, gatewayAdapters.sessionMessageSearch)
 app.provide(HISTORY_CONTENT_READER_KEY, gatewayAdapters.historyContentReader)
 app.provide(
   SESSION_DIRECTORY_CHANGES_KEY,
@@ -145,6 +149,7 @@ app.provide(MIGRATION_OPERATIONS_KEY, gatewayAdapters.migrationOperations)
 app.provide(WORKSPACE_CATALOG_KEY, gatewayAdapters.workspaceCatalog)
 app.provide(WORKSPACE_REFERENCES_KEY, gatewayAdapters.workspaceReferences)
 app.provide(WORKSPACE_FILES_KEY, gatewayAdapters.workspaceFiles)
+app.provide(TERMINAL_ACCESS_KEY, gatewayAdapters.terminal)
 app.provide(SANDBOX_RUNTIME_KEY, gatewayAdapters.sandboxRuntime)
 app.provide(USAGE_REPORTING_KEY, gatewayAdapters.usageReporting)
 app.provide(COMMAND_CATALOG_KEY, gatewayAdapters.commandCatalog)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,9 +205,39 @@ def test_selected_working_page_reads_live_source_not_published_snapshot(tmp_path
         assert client.get(payload["launch_url"]).content == b"<h1>Changed editorial</h1>"
         selected.unlink()
         assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
+        assert len(service._leases_by_id) == 1
+    immutable = ArtifactStore(tmp_path).resolve_preview_resource(
+        ref.id, session_id=_SESSION_ID, logical_path="layouts/editorial.html",
+    )
+    assert immutable.path.read_bytes() == b"<h1>Editorial</h1>"
+
+
+def test_selected_working_page_rejects_symlink_source(tmp_path: Path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "site/layouts").mkdir(parents=True)
+    (workspace / "site/index.html").write_text("<h1>Live home</h1>")
+    selected = workspace / "site/layouts/editorial.html"
+    selected.write_text("<h1>Live editorial</h1>")
+    service.register_working_files(
+        session_id=_SESSION_ID, artifact_id=ref.id,
+        binding=WorkingFiles(
+            document_id="doc-site", workspace=str(workspace), relative_root="site",
+            entrypoint="index.html", base_revision_id="revision-initial",
+        ),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 201
+        selected.unlink()
         private = workspace / "private.html"
         private.write_text("<h1>Private page</h1>")
-        selected.symlink_to(private)
+        try:
+            selected.symlink_to(private)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symbolic-link privilege is unavailable")
+            raise
         assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
         assert len(service._leases_by_id) == 1
     immutable = ArtifactStore(tmp_path).resolve_preview_resource(

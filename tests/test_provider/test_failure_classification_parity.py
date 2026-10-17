@@ -110,7 +110,7 @@ _OPENAI_COMPAT_CASES: list[Case] = [
     # Structured quota codes are provider-family independent and must reach
     # terminal consumers as one stable usage-limit classification.
     ("openai", None, "insufficient_quota", "", K.INSUFFICIENT_CREDITS),
-    ("openai_responses", None, "usage_limit_reached", "", K.INSUFFICIENT_CREDITS),
+    ("openai_responses", None, "usage_limit_reached", "", K.USAGE_LIMIT),
     ("anthropic", None, "billing_hard_limit", "", K.INSUFFICIENT_CREDITS),
     ("unregistered-provider", None, "provider_quota_exceeded", "", K.INSUFFICIENT_CREDITS),
     # 402 outranks the rate-limit substring branch.

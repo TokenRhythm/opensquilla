@@ -84,7 +84,9 @@
   --font-display-default: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "Segoe UI", "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", sans-serif;
   --font-sans: var(--font-sans-default);
   --font-display: var(--font-display-default);
-  --font-mono: "SFMono-Regular", ui-monospace, "Cascadia Code", "IBM Plex Mono", Menlo, "PingFang SC", "Hiragino Sans", "Microsoft YaHei", "Yu Gothic", monospace;
+  /* Resolve a named code face first; keep CJK sans fallbacks ahead of generic
+     monospace so Windows comments do not fall back to a serif face. */
+  --font-mono: "SFMono-Regular", "Cascadia Code", Consolas, "IBM Plex Mono", Menlo, "PingFang SC", "Hiragino Sans", "Microsoft YaHei UI", "Microsoft YaHei", "Yu Gothic", ui-monospace, monospace;
   --fs-xs: 0.8125rem;   /* 13px (was 12) */
   --fs-sm: 0.875rem;    /* 14px (was 13) */
   --fs-md: 1rem;        /* 16px (was 15) */
@@ -220,11 +222,11 @@
   --msg-bubble: color-mix(in srgb, var(--text) 7%, var(--bg-surface));
   --msg-obj-border: color-mix(in srgb, var(--text) 12%, transparent);
 
-  /* Code stays close to the user-bubble surface, with only a quiet accent tint
-     to make the recessed work area feel warm rather than like a grey panel. */
-  --code-block-bg: color-mix(in srgb, var(--accent) 2%, var(--msg-bubble));
-  --code-block-header-bg: color-mix(in srgb, var(--accent) 3%, var(--msg-bubble));
-  --code-block-border: color-mix(in srgb, var(--accent) 5%, var(--msg-obj-border));
+  /* Code is a quiet reading well. Share the same recessed ground and hairline
+     across Markdown and tool details without tinting it with the accent. */
+  --code-block-bg: var(--bg);
+  --code-block-header-bg: var(--bg);
+  --code-block-border: var(--hairline);
 
   /* Machined elevation + atmosphere — the dark-ground recipe (the default
      ground); light grounds (light, miami) override with paper shadows. */

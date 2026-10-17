@@ -780,25 +780,10 @@ async def test_unsupported_provider_source_is_consistent_across_the_payload(
     )
 
 
-async def test_legacy_data_block_is_null_without_a_candidate(
+async def test_legacy_data_block_is_null_without_scanning_for_candidates(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Onboarding must not scan even when discovery would find a candidate.
-    monkeypatch.setattr(
-        "opensquilla.migration.legacy_detect.detect_legacy_home",
-        lambda target=None: (_ for _ in ()).throw(AssertionError("unexpected scan")),
-    )
-
-    payload = _status_payload(
-        RpcContext(conn_id="contract", config=_synthetic_config(tmp_path))
-    )
-
-    assert payload["legacyData"] is None
-
-
-async def test_legacy_data_block_stays_null_when_a_candidate_exists(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
     monkeypatch.setattr(
         "opensquilla.migration.legacy_detect.detect_legacy_home",
         lambda target=None: (_ for _ in ()).throw(AssertionError("unexpected scan")),

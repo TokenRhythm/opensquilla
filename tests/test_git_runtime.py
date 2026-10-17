@@ -247,7 +247,12 @@ def test_darwin_symlink_to_apple_shim_is_not_treated_as_host_git(
     shim = _executable(tmp_path / "apple" / "git")
     linked_git = tmp_path / "linked" / "git"
     linked_git.parent.mkdir(parents=True)
-    linked_git.symlink_to(shim)
+    try:
+        linked_git.symlink_to(shim)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     xcode_select = _executable(tmp_path / "usr" / "bin" / "xcode-select")
     monkeypatch.setattr(git_runtime, "_APPLE_GIT_SHIM", shim)
     monkeypatch.setattr(git_runtime, "_XCODE_SELECT", xcode_select)

@@ -413,6 +413,26 @@ describe('shouldCaptureFilePaste', () => {
     expect(shouldCaptureFilePaste(textarea, { ...base, composerTextareaFocused: true })).toBe(true)
   })
 
+  it('captures only the focused, explicitly supplied inline editor and its children', () => {
+    const composerEditor = document.createElement('div')
+    composerEditor.contentEditable = 'true'
+    const reference = document.createElement('span')
+    reference.contentEditable = 'false'
+    composerEditor.append(reference)
+    const options = { ...base, composerEditor, composerTextareaFocused: true }
+    expect(shouldCaptureFilePaste(composerEditor, options)).toBe(true)
+    expect(shouldCaptureFilePaste(reference, options)).toBe(true)
+    expect(shouldCaptureFilePaste(reference, { ...options, composerTextareaFocused: false })).toBe(false)
+    expect(shouldCaptureFilePaste(reference, { ...options, dialogLayerOpen: true })).toBe(false)
+
+    const otherEditor = document.createElement('div')
+    otherEditor.setAttribute('contenteditable', 'true')
+    const otherChild = document.createElement('span')
+    otherEditor.append(otherChild)
+    expect(shouldCaptureFilePaste(otherEditor, options)).toBe(false)
+    expect(shouldCaptureFilePaste(otherChild, options)).toBe(false)
+  })
+
   it('leaves pastes aimed at other editable surfaces alone', () => {
     expect(shouldCaptureFilePaste(document.createElement('textarea'), base)).toBe(false)
     expect(shouldCaptureFilePaste(document.createElement('input'), base)).toBe(false)

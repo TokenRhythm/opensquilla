@@ -254,6 +254,12 @@ async def run_direct_turn(
         )
         await asyncio.to_thread(pin_sandbox_policy, tool_ctx, config)
         from opensquilla.telemetry.contracts.common import ClientSurface, ExecutionMode
+        provider_ready_kwargs: dict[str, Any] = {}
+        on_initial_provider_ready = route_envelope.runtime_services.get(
+            "on_initial_provider_ready"
+        )
+        if callable(on_initial_provider_ready):
+            provider_ready_kwargs["on_initial_provider_ready"] = on_initial_provider_ready
         raw_stream = runner.run(
             provider_message,
             session_key,
@@ -270,6 +276,7 @@ async def run_direct_turn(
             root_turn_id=turn_id,
             telemetry_surface=ClientSurface.TUI if tui_connection else None,
             telemetry_execution_mode=ExecutionMode.GATEWAY if tui_connection else None,
+            **provider_ready_kwargs,
             **owner_kwargs(runner.run),
         )
         raw_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)

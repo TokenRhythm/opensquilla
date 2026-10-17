@@ -24,6 +24,8 @@ SESSION_LIFECYCLE_CONTRACT_METHODS: Final = (
     "sessions.create",
     "sessions.fork",
     "sessions.forkThroughTurn",
+    "sessions.sidechat.create",
+    "sessions.sidechat.close",
     "sessions.rename",
     "sessions.delete",
 )

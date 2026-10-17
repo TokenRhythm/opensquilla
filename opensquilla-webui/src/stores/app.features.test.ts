@@ -60,11 +60,12 @@ describe('app store — V1 feature defaults', () => {
     setFeatureOverrides(undefined)
   })
 
-  it('enables HTML document resources but keeps browser annotations off by default', () => {
+  it('enables Office context on Web while keeping native annotations off', () => {
     const store = useAppStore()
 
     expect(store.features.documentWorkbenchResources).toBe(true)
     expect(store.features.artifactPromptAnnotations).toBe(false)
+    expect(store.features.officePromptAnnotations).toBe(true)
   })
 
   it('enables annotations by default for a complete Desktop v3 bridge', () => {
@@ -77,13 +78,14 @@ describe('app store — V1 feature defaults', () => {
   })
 
   it.each(REQUIRED_V3_METHODS)(
-    'fails closed when Desktop is missing %s',
+    'keeps native annotations closed but Office context available when Desktop is missing %s',
     (missingMethod) => {
       const bridge = completeV3Bridge()
       delete bridge[missingMethod]
       setDesktopApi(bridge)
 
       expect(useAppStore().features.artifactPromptAnnotations).toBe(false)
+      expect(useAppStore().features.officePromptAnnotations).toBe(true)
     },
   )
 
@@ -103,6 +105,16 @@ describe('app store — V1 feature defaults', () => {
   it('retains the explicit development override on Web', () => {
     setFeatureOverrides({ artifactPromptAnnotations: true })
 
+    expect(useAppStore().features.artifactPromptAnnotations).toBe(true)
+  })
+
+  it('can disable Office independently without enabling or disabling native annotations', () => {
+    setFeatureOverrides({ officePromptAnnotations: false })
+    expect(useAppStore().features.officePromptAnnotations).toBe(false)
+    expect(useAppStore().features.artifactPromptAnnotations).toBe(false)
+    setActivePinia(createPinia())
+    setDesktopApi(completeV3Bridge())
+    expect(useAppStore().features.officePromptAnnotations).toBe(false)
     expect(useAppStore().features.artifactPromptAnnotations).toBe(true)
   })
 })

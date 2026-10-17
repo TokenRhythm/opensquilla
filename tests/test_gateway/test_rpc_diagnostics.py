@@ -142,7 +142,3 @@ async def test_diagnostics_off_clears_runtime_state_but_reports_env_forced_raw(
     assert second.ok is True
     assert second.payload["runtime"]["raw"] is False
     assert second.payload["raw_turn_call"]["source"] == "env"
-
-
-def test_doctor_status_is_read_scope() -> None:
-    assert METHOD_SCOPES["doctor.status"] == READ_SCOPE

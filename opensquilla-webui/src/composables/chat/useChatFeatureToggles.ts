@@ -9,7 +9,7 @@ import type {
   ModelRoutingSnapshot,
 } from '@/types/modelRouting'
 import { normalizeModelRoutingMode } from '@/types/modelRouting'
-import { normalizeRouterTier, sortRouterTiers } from '@/utils/chat/routerTiers'
+import { normalizeRouterTierMapping, sortRouterTiers } from '@/utils/chat/routerTiers'
 import { encodeRouterShape, decodeRouterShape } from '@/utils/chat/routerShapeCache'
 import {
   DEFAULT_ROUTER_VISUAL_MODE,
@@ -42,6 +42,7 @@ interface ChatFeatureConfig {
     visual_mode?: string
     tiers?: Record<string, {
       model?: string
+      provider?: string
       supports_image?: boolean
       supportsImage?: boolean
       image_only?: boolean
@@ -69,7 +70,7 @@ function record(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode | null {
+export function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode | null {
   const source = record(value)
   if (!source) return null
 
@@ -104,7 +105,7 @@ const IMAGE_DEGRADATION_REASONS = new Set([
   'router_image_route_unavailable',
 ])
 
-function effectiveImageAdmission(
+export function effectiveImageAdmission(
   admission: ImageInputAdmission,
   reason: string,
 ): ImageInputAdmission {
@@ -135,6 +136,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   let hasCanonicalImageAdmission = false
   let modelRoutingRequestGeneration = 0
   let modelRoutingEventGeneration = 0
+  let modelRoutingConnectionGeneration = 0
   let latestModelRoutingSnapshot: ModelRoutingSnapshot | undefined
   const routerSlots = ref<string[]>([])
   const routerModels = ref<Record<string, string>>({})
@@ -175,10 +177,29 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     return { model: config.model, provider: config.provider }
   }
 
+  function invalidateConnectionState() {
+    invalidateDefaultModel()
+    modelRoutingConnectionGeneration += 1
+    modelRoutingRequestGeneration += 1
+    modelRoutingEventGeneration += 1
+    latestModelRoutingSnapshot = undefined
+    hasCanonicalImageAdmission = false
+    routerEnabled.value = false
+    llmEnsembleEnabled.value = false
+    llmEnsembleSelectionMode.value = ''
+    globalImageInputAdmission.value = 'unknown'
+    globalImageInputAdmissionReason.value = 'capability_unknown'
+    modelRoutingCapabilitiesByMode.value = null
+    routerSlots.value = []
+    routerModels.value = {}
+    routerTierConfigs.value = {}
+    routerVisualMode.value = DEFAULT_ROUTER_VISUAL_MODE
+  }
+
   if (options.connectionEpoch || options.connectionAvailable) {
     watch(
       [() => options.connectionEpoch?.value, () => options.connectionAvailable?.value],
-      invalidateDefaultModel,
+      invalidateConnectionState,
       { flush: 'sync' },
     )
   }
@@ -232,31 +253,34 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const router = cfg?.squilla_router || {}
     const ensembleEnabled = cfg?.llm_ensemble?.enabled === true
 
-    routerEnabled.value = ensembleEnabled || Boolean(router.enabled && router.rollout_phase !== 'observe')
-    llmEnsembleEnabled.value = ensembleEnabled
-    llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
-    if (!hasCanonicalImageAdmission) {
-      globalImageInputAdmission.value = ensembleEnabled ? 'allowed' : 'unknown'
-      globalImageInputAdmissionReason.value = ensembleEnabled
-        ? 'ensemble_mode_unsupported'
-        : 'capability_unknown'
+    // Once received, the atomic routing snapshot owns mode and capabilities.
+    // A config read still refreshes tier models, but must not temporarily
+    // replace a newer routing event while optional usage reads are pending.
+    if (!latestModelRoutingSnapshot) {
+      routerEnabled.value = ensembleEnabled || Boolean(router.enabled && router.rollout_phase !== 'observe')
+      llmEnsembleEnabled.value = ensembleEnabled
+      llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
+      if (!hasCanonicalImageAdmission) {
+        globalImageInputAdmission.value = ensembleEnabled ? 'allowed' : 'unknown'
+        globalImageInputAdmissionReason.value = ensembleEnabled
+          ? 'ensemble_mode_unsupported'
+          : 'capability_unknown'
+      }
     }
     routerVisualMode.value = normalizeRouterVisualMode(router.visual_mode)
-    const tiers = router.tiers
+    const tiers = normalizeRouterTierMapping(router.tiers || {})
     const tierKeys: string[] = []
     const tierModels: Record<string, string> = {}
     const tierConfigs: Record<string, ChatRouterTierConfig> = {}
     if (tiers && typeof tiers === 'object') {
       Object.keys(tiers).forEach((tier) => {
-        if (!tier) return
-        const lower = normalizeRouterTier(tier)
-        if (!lower) return
-        tierKeys.push(lower)
+        tierKeys.push(tier)
         const rawTier = tiers[tier] || {}
         const rawTierRecord = rawTier as Record<string, unknown>
         const model = rawTier.model
+        const provider = typeof rawTier.provider === 'string' ? rawTier.provider.trim().toLowerCase() : ''
         if (typeof model === 'string' && model.trim()) {
-          tierModels[lower] = model.trim()
+          tierModels[tier] = model.trim()
         }
         const explicitEnsembleEnabled = typeof rawTierRecord.ensemble_enabled === 'boolean'
           ? rawTierRecord.ensemble_enabled
@@ -268,8 +292,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
           ?? rawTierRecord.ensembleSelectionMode
           ?? '',
         ).trim()
-        tierConfigs[lower] = {
+        tierConfigs[tier] = {
           model: typeof model === 'string' ? model.trim() : '',
+          ...(provider ? { provider } : {}),
           imageOnly: rawTierRecord.image_only === true || rawTierRecord.imageOnly === true,
           // New Gateways expose the explicit execution switch. Older PR
           // snapshots only expose the legacy selection mode, which still
@@ -297,6 +322,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   }
 
   async function loadFeatureToggles() {
+    if (options.connectionAvailable?.value === false) return
     const defaultModelGeneration = invalidateDefaultModel()
     const requestGeneration = ++modelRoutingRequestGeneration
     const eventGeneration = modelRoutingEventGeneration
@@ -385,7 +411,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   }
 
   async function setModelRoutingMode(mode: ModelRoutingMode) {
-    if (modelRoutingSettingsBusy.value) return
+    if (modelRoutingSettingsBusy.value || options.connectionAvailable?.value === false) return
+    const connectionGeneration = modelRoutingConnectionGeneration
+    const eventGeneration = modelRoutingEventGeneration
     const nextMode = normalizeModelRoutingMode(mode)
     const previousRouter = routerEnabled.value
     const previousEnsemble = llmEnsembleEnabled.value
@@ -403,10 +431,14 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       await options.modelRouting.setRouting(
         nextMode === 'off' ? 'direct' : nextMode === 'squilla_router' ? 'router' : 'ensemble',
       )
+      if (connectionGeneration !== modelRoutingConnectionGeneration) return
       await loadFeatureToggles()
     } catch (err) {
-      routerEnabled.value = previousRouter
-      llmEnsembleEnabled.value = previousEnsemble
+      if (connectionGeneration !== modelRoutingConnectionGeneration) return
+      if (eventGeneration === modelRoutingEventGeneration) {
+        routerEnabled.value = previousRouter
+        llmEnsembleEnabled.value = previousEnsemble
+      }
       console.warn('Failed to update model routing:', err instanceof Error ? err.message : String(err))
       pushToast(i18n.global.t('chat.modelRouting.updateFailed'), { tone: 'danger' })
     } finally {
@@ -418,11 +450,17 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
 
   function bindFeatureRefresh(scheduleHistorySync?: () => void) {
     let timer: ReturnType<typeof setTimeout> | null = null
+    let disposed = false
     const schedule = () => {
+      if (disposed) return
       if (timer) clearTimeout(timer)
+      const connectionGeneration = modelRoutingConnectionGeneration
       timer = setTimeout(() => {
         timer = null
-        loadFeatureToggles().finally(() => scheduleHistorySync?.())
+        if (connectionGeneration !== modelRoutingConnectionGeneration) return
+        loadFeatureToggles().finally(() => {
+          if (!disposed && connectionGeneration === modelRoutingConnectionGeneration) scheduleHistorySync?.()
+        })
       }, 120)
     }
     const onVisibility = () => {
@@ -430,13 +468,20 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     }
     const onFocus = () => schedule()
     const unbindRouting = options.modelRouting.subscribeChanged((payload) => {
+      if (disposed || options.connectionAvailable?.value === false) return
       modelRoutingEventGeneration += 1
+      // Retire pre-save reads immediately, including the debounce interval.
+      // The event carries mode/capabilities; tier candidates require config.get.
+      modelRoutingRequestGeneration += 1
       applyModelRoutingSnapshot(payload)
       scheduleHistorySync?.()
+      schedule()
     })
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onFocus)
     return () => {
+      disposed = true
+      modelRoutingRequestGeneration += 1
       if (timer) clearTimeout(timer)
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onFocus)

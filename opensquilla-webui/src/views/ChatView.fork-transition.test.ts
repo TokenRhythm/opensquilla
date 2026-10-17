@@ -31,9 +31,9 @@ describe('chat fork hand-off contract', () => {
   })
 
   it('keeps a read-only parent projection visible until child history is ready', () => {
-    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || visibleRenderedMessages"')
+    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || findDisplayMessages"')
     expect(chatViewSource).toContain(':session-key="forkTransition?.parentKey || sessionKey"')
-    expect(chatViewSource).toContain(':inert="forkTransition ? true : undefined"')
+    expect(chatViewSource).toContain(':inert="forkTransition || sessionViewCache.showingPreview.value ? true : undefined"')
     expect(chatViewSource).toContain('Render-only snapshot; never becomes the child session\'s canonical messages.')
     expect(chatViewSource).toContain('loadedKey !== transition.targetKey')
     expect(chatViewSource).toContain("if (status === 'ready')")

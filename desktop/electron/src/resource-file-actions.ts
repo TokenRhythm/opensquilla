@@ -1,9 +1,15 @@
-import { createHmac, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import type { BigIntStats } from 'node:fs'
 import { open, rename, unlink, lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, sep, extname } from 'node:path'
 
 export interface SaveArtifactRequest { data: ArrayBuffer; name: string; mime: string }
+export interface SaveAttachmentRequest {
+  gatewayInstanceId: string
+  sessionKey: string
+  sha256: string
+  name: string
+}
 export interface SourceFileActionRequest {
   gatewayInstanceId: string
   sessionKey: string
@@ -67,6 +73,102 @@ export async function saveArtifactFile(
     await file.close().catch(() => {})
     await io.unlink(temporary).catch(() => {})
     throw error
+  }
+  return { status: 'saved' }
+}
+
+/** Stream immutable historical material to an explicitly chosen local file. */
+export async function saveAttachmentFile(
+  payload: SaveAttachmentRequest,
+  deps: {
+    connection: () => SourceGatewayConnection | null
+    choosePath: (name: string) => Promise<string | null>
+    fetch?: typeof fetch
+    signal?: AbortSignal
+  },
+  io = { open, rename, unlink },
+): Promise<{ status: 'saved' | 'cancelled' }> {
+  if (!payload || Object.keys(payload).some(key => ![
+    'gatewayInstanceId', 'sessionKey', 'sha256', 'name',
+  ].includes(key)) || !boundedString(payload.gatewayInstanceId)
+    || !boundedString(payload.sessionKey) || !boundedString(payload.name, 4096)
+    || typeof payload.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(payload.sha256)) {
+    throw new Error('Invalid attachment save request')
+  }
+  const connection = deps.connection()
+  if (!connection || connection.instanceId !== payload.gatewayInstanceId) {
+    throw new Error('Local attachment save is unavailable')
+  }
+  const base = new URL(connection.url)
+  if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)
+    || base.username || base.password || base.pathname !== '/' || base.search || base.hash) {
+    throw new Error('Invalid owned Gateway')
+  }
+  let signal = deps.signal
+  const assertCurrent = () => {
+    signal?.throwIfAborted()
+    const current = deps.connection()
+    if (!current || current.instanceId !== connection.instanceId
+      || current.profile !== connection.profile || current.url !== connection.url
+      || current.authToken !== connection.authToken) {
+      throw new Error('Gateway changed; retry saving the file')
+    }
+  }
+  const name = basename(payload.name.replace(/\\/g, '/'))
+    .replace(/[\u0000-\u001f\u007f<>:"|?*]/g, '_').replace(/^\.+/, '') || 'attachment'
+  assertCurrent()
+  const destination = await deps.choosePath(name)
+  if (!destination) return { status: 'cancelled' }
+  assertCurrent()
+  // User time in the native chooser does not consume the transfer deadline.
+  signal = deps.signal
+    ? AbortSignal.any([deps.signal, AbortSignal.timeout(5 * 60_000)])
+    : AbortSignal.timeout(5 * 60_000)
+  const url = new URL(`/api/v1/attachments/${payload.sha256}`, base)
+  const response = await (deps.fetch ?? fetch)(url, {
+    headers: { Authorization: `Bearer ${connection.authToken}`, 'x-opensquilla-session-key': payload.sessionKey },
+    redirect: 'error', signal,
+  })
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {})
+    throw new Error(`Attachment unavailable (${response.status})`)
+  }
+  const reader = response.body?.getReader()
+  if (!reader) throw new Error('Missing attachment content')
+  const temporary = join(dirname(destination), `.opensquilla-save-${randomUUID()}.part`)
+  let file: Awaited<ReturnType<typeof open>> | undefined
+  let created = false
+  try {
+    assertCurrent()
+    file = await io.open(temporary, 'wx', 0o600)
+    created = true
+    const digest = createHash('sha256')
+    for (;;) {
+      assertCurrent()
+      const next = await reader.read()
+      assertCurrent()
+      if (next.done) break
+      // Network chunks may be larger than a normal read. Keep every write and
+      // its memory view bounded; the renderer never receives the file body.
+      for (let offset = 0; offset < next.value.byteLength; offset += 64 * 1024) {
+        assertCurrent()
+        const chunk = next.value.subarray(offset, offset + 64 * 1024)
+        digest.update(chunk)
+        await file.writeFile(chunk)
+      }
+    }
+    if (digest.digest('hex') !== payload.sha256) throw new Error('Attachment integrity check failed')
+    await file.sync()
+    await file.close()
+    file = undefined
+    assertCurrent()
+    await io.rename(temporary, destination)
+  } catch (error) {
+    await file?.close().catch(() => {})
+    if (created) await io.unlink(temporary).catch(() => {})
+    throw error
+  } finally {
+    await reader.cancel().catch(() => {})
   }
   return { status: 'saved' }
 }

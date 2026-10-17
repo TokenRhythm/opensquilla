@@ -78,6 +78,50 @@ afterEach(() => {
 })
 
 describe('useSkillDetailController', () => {
+  it.each(['first', 'second'])('does not close a reopened %s detail after an older uninstall completes', async nextName => {
+    const pending = deferred<boolean>()
+    const uninstallSkill = vi.fn(() => pending.promise)
+    const { controller, unmount } = mountController({
+      catalog: { detail: async (skill: Skill) => skill } as Parameters<typeof useSkillDetailController>[0]['catalog'],
+      installDeps: vi.fn(async () => completeOutcome()),
+      uninstallSkill,
+    })
+    await controller.openSkill({ name: 'first', install_id: 'install:first' })
+    const uninstall = controller.uninstallCurrentSkill('first', 'install:first')
+    controller.closeSkill()
+    await controller.openSkill({ name: nextName, install_id: `install:${nextName}` })
+    pending.resolve(true)
+    expect(await uninstall).toBe(true)
+    expect(uninstallSkill).toHaveBeenCalledExactlyOnceWith('first', 'install:first')
+    expect(controller.selectedSkill.value?.name).toBe(nextName)
+    unmount()
+  })
+
+  it.each([true, false])('only closes the original detail on successful uninstall (%s)', async removed => {
+    const { controller, unmount } = mountController({
+      catalog: { detail: async (skill: Skill) => skill } as Parameters<typeof useSkillDetailController>[0]['catalog'],
+      installDeps: vi.fn(async () => completeOutcome()),
+      uninstallSkill: vi.fn(async () => removed),
+    })
+    await controller.openSkill({ name: 'first', install_id: 'install:first' })
+    expect(await controller.uninstallCurrentSkill('first', 'install:first')).toBe(removed)
+    expect(controller.selectedSkill.value?.name).toBe(removed ? undefined : 'first')
+    unmount()
+  })
+
+  it('rejects a stale uninstall event targeting a different lifecycle identity', async () => {
+    const uninstallSkill = vi.fn(async () => true)
+    const { controller, unmount } = mountController({
+      catalog: { detail: async (skill: Skill) => skill } as Parameters<typeof useSkillDetailController>[0]['catalog'],
+      installDeps: vi.fn(async () => completeOutcome()),
+      uninstallSkill,
+    })
+    await controller.openSkill({ name: 'shared', install_id: 'new-install' })
+    expect(await controller.uninstallCurrentSkill('shared', 'old-install')).toBe(false)
+    expect(uninstallSkill).not.toHaveBeenCalled()
+    unmount()
+  })
+
   it('passes the selected lifecycle identity and fences same-name candidate responses', async () => {
     const managed = deferred<Skill>()
     const workspace = deferred<Skill>()

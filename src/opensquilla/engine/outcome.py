@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
+from opensquilla.provider.failures import safe_http_status
+
 TurnOutcomeKind = Literal[
     "completed",
     "partial",
@@ -88,6 +90,7 @@ class TurnOutcome:
     error_message: str | None = None
     failure_kind: str | None = None
     retryable: bool = False
+    http_status: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -103,6 +106,7 @@ def outcome_from_error(
     message: str | None = None,
     error_class: str | None = None,
     failure_kind: str | None = None,
+    http_status: int | None = None,
 ) -> TurnOutcome:
     normalized = _normalize_code(code)
     normalized_failure_kind = _normalize_code(failure_kind)
@@ -114,6 +118,7 @@ def outcome_from_error(
             error_class=error_class or normalized,
             error_message=text,
             failure_kind=failure_kind or None,
+            http_status=safe_http_status(http_status),
             retryable=True,
         )
     if normalized in _PARTIAL_CODES:
@@ -123,6 +128,7 @@ def outcome_from_error(
             error_class=error_class or normalized,
             error_message=text,
             failure_kind=failure_kind or None,
+            http_status=safe_http_status(http_status),
             retryable=normalized == "provider_output_truncated",
         )
     if normalized in _INTERRUPTED_CODES:
@@ -132,6 +138,7 @@ def outcome_from_error(
             error_class=error_class or normalized,
             error_message=text,
             failure_kind=failure_kind or None,
+            http_status=safe_http_status(http_status),
             retryable=True,
         )
     if normalized in _BLOCKED_CODES:
@@ -141,6 +148,7 @@ def outcome_from_error(
             error_class=error_class or normalized,
             error_message=text,
             failure_kind=failure_kind or None,
+            http_status=safe_http_status(http_status),
             retryable=True,
         )
     return TurnOutcome(
@@ -149,6 +157,7 @@ def outcome_from_error(
         error_class=error_class or normalized or "error",
         error_message=text,
         failure_kind=failure_kind or None,
+        http_status=safe_http_status(http_status),
         retryable=(
             normalized in _RETRYABLE_PROVIDER_CODES
             or normalized_failure_kind in _RETRYABLE_PROVIDER_FAILURE_KINDS

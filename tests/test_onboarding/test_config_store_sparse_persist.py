@@ -18,6 +18,8 @@ import threading
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config, persist_config
 from opensquilla.onboarding.mutations import upsert_llm_provider
@@ -216,7 +218,12 @@ def test_persist_updates_symlink_target_in_place(tmp_path):
     real = tmp_path / "real-config.toml"
     real.write_text("port = 18791\n")
     link = tmp_path / "config.toml"
-    link.symlink_to(real)
+    try:
+        link.symlink_to(real)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
     cfg = load_config(link)
     cfg.port = 18795

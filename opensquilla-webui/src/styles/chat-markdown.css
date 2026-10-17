@@ -2,11 +2,11 @@
  *
  * Assistant text is injected with v-html, so its children carry no scoped-style
  * attribute; these plain global selectors reach the rendered markdown wherever
- * it lands — `.msg-ai-text` (live chat bubble + tool-call timeline) and
+ * it lands — `.msg-ai-text`, `.activity-narration` (answer + process prose) and
  * `.inspect-msg__text` (session inspect drawer). Element rules that already
  * exist as scoped `:deep()` in a component keep winning by specificity, so this
- * file only fills the gaps those components never styled (tables, headings,
- * horizontal rules, task lists) and mirrors the quote/link treatment for the
+ * file fills the gaps those components never styled (paragraphs, lists, tables,
+ * headings, horizontal rules, task lists) and mirrors the quote/link treatment for the
  * surfaces that lack a scoped copy. All colors come from base.css tokens. */
 
 .chat-markdown-plain {
@@ -14,11 +14,26 @@
   overflow-wrap: anywhere;
 }
 
+/* Narration is assistant prose too. Shared defaults keep it consistent with
+ * the answer while existing component-specific markdown rules take precedence. */
+:is(.msg-ai-text, .activity-narration) p { margin: 0.75rem 0; }
+:is(.msg-ai-text, .activity-narration) ul,
+:is(.msg-ai-text, .activity-narration) ol { margin: 0.75rem 0; padding-left: 1.25rem; }
+:is(.msg-ai-text, .activity-narration) li { margin: 0.375rem 0; }
+:is(.msg-ai-text, .activity-narration, .streaming-rich-block, .inspect-msg__text) strong { font-weight: 600; }
+:is(.msg-ai-text, .activity-narration) :not(pre) > code {
+  background: var(--bg-hover);
+  padding: 0.0625rem 0.25rem;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  color: var(--text-muted);
+}
+
 /* Tables — bare GFM output has no wrapper, so the table itself scrolls.
  * `display:block` lets the row groups re-establish their own table layout
  * (the proven pattern for a horizontally scrollable markdown table). */
-.msg-ai-text table,
-.inspect-msg__text table {
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) table {
   display: block;
   width: max-content;
   max-width: 100%;
@@ -29,30 +44,35 @@
   font-size: 0.9375em;
 }
 
-.msg-ai-text th,
-.msg-ai-text td,
-.inspect-msg__text th,
-.inspect-msg__text td {
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) :is(th, td) {
   padding: var(--sp-1) var(--sp-3);
   border: 1px solid var(--border);
-  text-align: left; /* GFM `align` attribute, when present, overrides this */
+  text-align: left;
   vertical-align: top;
 }
 
-.msg-ai-text th,
-.inspect-msg__text th {
+/* Author CSS wins over HTML's presentational align attribute. Map the GFM
+ * enum explicitly so number columns retain the alignment in the source. */
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) :is(th, td)[align='center'] {
+  text-align: center;
+}
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) :is(th, td)[align='right'] {
+  text-align: right;
+}
+
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) th {
   background: var(--bg-elevated);
   font-weight: 600;
 }
 
 /* Headings — UA defaults are oversized for a chat bubble; use a compact scale
  * relative to the surrounding text so long answers stay readable. */
-.msg-ai-text h1,
-.msg-ai-text h2,
-.msg-ai-text h3,
-.msg-ai-text h4,
-.msg-ai-text h5,
-.msg-ai-text h6,
+:is(.msg-ai-text, .activity-narration) h1,
+:is(.msg-ai-text, .activity-narration) h2,
+:is(.msg-ai-text, .activity-narration) h3,
+:is(.msg-ai-text, .activity-narration) h4,
+:is(.msg-ai-text, .activity-narration) h5,
+:is(.msg-ai-text, .activity-narration) h6,
 .inspect-msg__text h1,
 .inspect-msg__text h2,
 .inspect-msg__text h3,
@@ -66,41 +86,46 @@
   color: var(--text);
 }
 
-.msg-ai-text h1,
+:is(.msg-ai-text, .activity-narration) h1,
 .inspect-msg__text h1 { font-size: 1.4em; }
-.msg-ai-text h2,
+:is(.msg-ai-text, .activity-narration) h2,
 .inspect-msg__text h2 { font-size: 1.25em; }
-.msg-ai-text h3,
+:is(.msg-ai-text, .activity-narration) h3,
 .inspect-msg__text h3 { font-size: 1.1em; }
-.msg-ai-text h4,
+:is(.msg-ai-text, .activity-narration) h4,
 .inspect-msg__text h4 { font-size: 1em; }
-.msg-ai-text h5,
+:is(.msg-ai-text, .activity-narration) h5,
 .inspect-msg__text h5,
-.msg-ai-text h6,
+:is(.msg-ai-text, .activity-narration) h6,
 .inspect-msg__text h6 { font-size: 0.9em; color: var(--text-muted); }
 
-/* No leading gap above the first rendered block. */
-.msg-ai-text > :first-child,
+/* The surrounding activity/answer owns separation between semantic blocks.
+   Visualize wraps settled prose segments; keep the outer prose boundary
+   identical to streaming text without removing spacing around inner canvases. */
+.msg-ai-text > .visualize-body__text:first-child > :first-child,
+:is(.msg-ai-text, .activity-narration) > :first-child,
 .inspect-msg__text > :first-child { margin-top: 0; }
+.msg-ai-text > .visualize-body__text:last-child > :last-child,
+:is(.msg-ai-text, .activity-narration) > :last-child { margin-bottom: 0; }
 
 /* KaTeX rendered math — match message text color and keep wide formulas usable. */
-.msg-ai-text .katex,
+:is(.msg-ai-text, .activity-narration) .katex,
 .inspect-msg__text .katex {
   color: var(--text);
   font-size: 1.1em;
 }
-.msg-ai-text .katex-display,
+:is(.msg-ai-text, .activity-narration) .katex-display,
 .inspect-msg__text .katex-display {
   margin: 0.6em 0;
   overflow-x: auto;
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
 }
-.msg-ai-text .katex .katex-html,
+:is(.msg-ai-text, .activity-narration) .katex .katex-html,
 .inspect-msg__text .katex .katex-html { max-width: 100%; }
 
 /* Blockquote — mirrors the inspect-drawer treatment for the chat surfaces. */
-.msg-ai-text blockquote,
+:is(.msg-ai-text, .activity-narration) blockquote,
 .inspect-msg__text blockquote {
   border-left: 2px solid var(--border-strong);
   color: var(--text-muted);
@@ -109,16 +134,24 @@
 }
 
 /* Links — accent color, underline on hover. */
-.msg-ai-text a,
+:is(.msg-ai-text, .activity-narration) a,
 .inspect-msg__text a {
   color: var(--accent);
   text-decoration: none;
 }
-.msg-ai-text a:hover,
+:is(.msg-ai-text, .activity-narration) a:hover,
 .inspect-msg__text a:hover { text-decoration: underline; }
 
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text) :is([data-markdown-footnote-ref], [data-markdown-footnote-back]) {
+  cursor: pointer;
+}
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text) :is([data-markdown-footnote-ref], [data-markdown-footnote-back]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* Horizontal rule. */
-.msg-ai-text hr,
+:is(.msg-ai-text, .activity-narration) hr,
 .inspect-msg__text hr {
   border: 0;
   border-top: 1px solid var(--border);
@@ -126,12 +159,12 @@
 }
 
 /* Task lists — drop the bullet beside the (disabled) checkbox and align it. */
-.msg-ai-text li:has(> input[type='checkbox']),
+:is(.msg-ai-text, .activity-narration) li:has(> input[type='checkbox']),
 .inspect-msg__text li:has(> input[type='checkbox']) {
   list-style: none;
   margin-left: -1.1em;
 }
-.msg-ai-text li > input[type='checkbox'],
+:is(.msg-ai-text, .activity-narration) li > input[type='checkbox'],
 .inspect-msg__text li > input[type='checkbox'] {
   margin: 0 0.4em 0 0;
   vertical-align: middle;
@@ -139,7 +172,7 @@
 }
 
 /* ─── Markdown images (rendered again; the sanitizer value-gates sources) ── */
-.msg-ai-text img,
+:is(.msg-ai-text, .activity-narration) img,
 .inspect-msg__text img,
 .artifact-preview__markdown img {
   max-width: 100%;
@@ -148,7 +181,7 @@
 }
 
 /* Click-to-zoom affordance; the lightbox itself is theme-agnostic chrome. */
-.msg-ai-text .md-img,
+:is(.msg-ai-text, .activity-narration) .md-img,
 .inspect-msg__text .md-img,
 .artifact-preview__markdown .md-img {
   cursor: zoom-in;
@@ -203,45 +236,47 @@
   box-shadow: var(--focus-ring);
 }
 
-/* ─── Fenced code chrome (shared by chat, streaming, and artifact preview) ──
- * decorateCodeBlocks() adds .code-block + the copy button on sanitized output;
- * the streaming renderer and the workbench preview run the same pass, so the
- * chrome is defined once here instead of per component. */
-.msg-ai-text pre.code-block,
-.inspect-msg__text pre.code-block,
-.artifact-preview__markdown pre.code-block {
+/* Reuse the existing code-copy chrome on answers, narration, and file previews. */
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) pre.code-block.markdown-code-block {
   position: relative;
-  padding-top: 2.375rem;
+  padding-top: 2.625rem;
   background: linear-gradient(
     to bottom,
     var(--code-block-header-bg) 0,
-    var(--code-block-header-bg) 1.75rem,
-    var(--code-block-bg) 1.75rem,
+    var(--code-block-header-bg) 2rem,
+    var(--code-block-bg) 2rem,
     var(--code-block-bg) 100%
   );
 }
 
-.msg-ai-text pre.code-block > .code-lang,
-.inspect-msg__text pre.code-block > .code-lang,
-.artifact-preview__markdown pre.code-block > .code-lang {
-  top: 0.375rem;
-  right: 2.5rem;
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) pre.code-block > .code-lang {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.875rem;
+  right: 2.75rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   line-height: 1rem;
   background: transparent;
-  color: var(--text-dim);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  user-select: none;
+  pointer-events: none;
 }
 
-.msg-ai-text .code-copy-btn,
-.inspect-msg__text .code-copy-btn,
-.artifact-preview__markdown .code-copy-btn {
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) .code-copy-btn {
   position: absolute;
   top: 0;
   right: 0.25rem;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.75rem;
-  height: 1.75rem;
+  width: 2rem;
+  height: 2rem;
   padding: 0;
   border: 0;
   border-radius: var(--radius-sm);
@@ -251,43 +286,42 @@
   cursor: pointer;
   transition: color var(--transition), background var(--transition), opacity var(--transition);
 }
-.msg-ai-text .code-copy-btn svg,
-.inspect-msg__text .code-copy-btn svg,
-.artifact-preview__markdown .code-copy-btn svg {
+
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) .code-copy-btn svg {
   display: block;
   width: 0.9375rem;
   height: 0.9375rem;
 }
-.msg-ai-text .code-copy-btn:hover,
-.inspect-msg__text .code-copy-btn:hover,
-.artifact-preview__markdown .code-copy-btn:hover {
+
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) .code-copy-btn:hover {
   color: var(--text);
   opacity: 1;
   background: var(--bg-hover);
 }
-.msg-ai-text .code-copy-btn:focus-visible,
-.inspect-msg__text .code-copy-btn:focus-visible,
-.artifact-preview__markdown .code-copy-btn:focus-visible {
+
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) .code-copy-btn:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
 }
-.msg-ai-text .code-copy-btn.is-copied,
-.inspect-msg__text .code-copy-btn.is-copied,
-.artifact-preview__markdown .code-copy-btn.is-copied {
+
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) .code-copy-btn.is-copied {
   color: var(--ok);
   opacity: 1;
 }
-.msg-ai-text .code-copy-btn.is-error,
-.inspect-msg__text .code-copy-btn.is-error,
-.artifact-preview__markdown .code-copy-btn.is-error {
+
+:is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) .code-copy-btn.is-error {
   color: var(--danger);
   opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :is(.msg-ai-text, .activity-narration, .inspect-msg__text, .artifact-preview__markdown) .code-copy-btn { transition: none; }
 }
 
 /* ─── Mermaid diagrams ──────────────────────────────────────────────────────
  * renderMermaidBlocks() swaps a ```mermaid fence for this wrapper; a failed
  * render becomes .mermaid-error, which always keeps the source copyable. */
-.msg-ai-text .mermaid-diagram,
+:is(.msg-ai-text, .activity-narration) .mermaid-diagram,
 .inspect-msg__text .mermaid-diagram,
 .artifact-preview__markdown .mermaid-diagram {
   position: relative;
@@ -299,7 +333,7 @@
   overflow: hidden;
 }
 
-.msg-ai-text .mermaid-svg-wrap,
+:is(.msg-ai-text, .activity-narration) .mermaid-svg-wrap,
 .inspect-msg__text .mermaid-svg-wrap,
 .artifact-preview__markdown .mermaid-svg-wrap {
   display: flex;
@@ -307,14 +341,14 @@
   overflow: hidden;
 }
 
-.msg-ai-text .mermaid-svg-wrap svg,
+:is(.msg-ai-text, .activity-narration) .mermaid-svg-wrap svg,
 .inspect-msg__text .mermaid-svg-wrap svg,
 .artifact-preview__markdown .mermaid-svg-wrap svg {
   max-width: 100%;
   height: auto;
 }
 
-.msg-ai-text .mermaid-toolbar,
+:is(.msg-ai-text, .activity-narration) .mermaid-toolbar,
 .inspect-msg__text .mermaid-toolbar,
 .artifact-preview__markdown .mermaid-toolbar {
   position: absolute;
@@ -326,8 +360,8 @@
   transition: opacity var(--transition);
 }
 
-.msg-ai-text .mermaid-diagram:hover .mermaid-toolbar,
-.msg-ai-text .mermaid-diagram:focus-within .mermaid-toolbar,
+:is(.msg-ai-text, .activity-narration) .mermaid-diagram:hover .mermaid-toolbar,
+:is(.msg-ai-text, .activity-narration) .mermaid-diagram:focus-within .mermaid-toolbar,
 .inspect-msg__text .mermaid-diagram:hover .mermaid-toolbar,
 .inspect-msg__text .mermaid-diagram:focus-within .mermaid-toolbar,
 .artifact-preview__markdown .mermaid-diagram:hover .mermaid-toolbar,
@@ -335,7 +369,7 @@
   opacity: 1;
 }
 
-.msg-ai-text .mermaid-btn,
+:is(.msg-ai-text, .activity-narration) .mermaid-btn,
 .inspect-msg__text .mermaid-btn,
 .artifact-preview__markdown .mermaid-btn {
   display: inline-flex;
@@ -353,19 +387,19 @@
   cursor: pointer;
   transition: background var(--transition), color var(--transition);
 }
-.msg-ai-text .mermaid-btn:hover,
+:is(.msg-ai-text, .activity-narration) .mermaid-btn:hover,
 .inspect-msg__text .mermaid-btn:hover,
 .artifact-preview__markdown .mermaid-btn:hover {
   color: var(--accent);
 }
-.msg-ai-text .mermaid-btn:focus-visible,
+:is(.msg-ai-text, .activity-narration) .mermaid-btn:focus-visible,
 .inspect-msg__text .mermaid-btn:focus-visible,
 .artifact-preview__markdown .mermaid-btn:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
 }
 
-.msg-ai-text .mermaid-error,
+:is(.msg-ai-text, .activity-narration) .mermaid-error,
 .inspect-msg__text .mermaid-error,
 .artifact-preview__markdown .mermaid-error {
   display: flex;
@@ -382,7 +416,7 @@
   overflow-wrap: anywhere;
 }
 
-.msg-ai-text .mermaid-error .mermaid-err-copy,
+:is(.msg-ai-text, .activity-narration) .mermaid-error .mermaid-err-copy,
 .inspect-msg__text .mermaid-error .mermaid-err-copy,
 .artifact-preview__markdown .mermaid-error .mermaid-err-copy {
   flex-shrink: 0;
@@ -395,25 +429,25 @@
   cursor: pointer;
   transition: background var(--transition), color var(--transition);
 }
-.msg-ai-text .mermaid-error .mermaid-err-copy:hover,
+:is(.msg-ai-text, .activity-narration) .mermaid-error .mermaid-err-copy:hover,
 .inspect-msg__text .mermaid-error .mermaid-err-copy:hover,
 .artifact-preview__markdown .mermaid-error .mermaid-err-copy:hover {
   color: var(--accent);
 }
-.msg-ai-text .mermaid-error .mermaid-err-copy:focus-visible,
+:is(.msg-ai-text, .activity-narration) .mermaid-error .mermaid-err-copy:focus-visible,
 .inspect-msg__text .mermaid-error .mermaid-err-copy:focus-visible,
 .artifact-preview__markdown .mermaid-error .mermaid-err-copy:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
 }
 
-.msg-ai-text .mermaid-error details,
+:is(.msg-ai-text, .activity-narration) .mermaid-error details,
 .inspect-msg__text .mermaid-error details,
 .artifact-preview__markdown .mermaid-error details {
   flex-basis: 100%;
 }
 
-.msg-ai-text .mermaid-error summary,
+:is(.msg-ai-text, .activity-narration) .mermaid-error summary,
 .inspect-msg__text .mermaid-error summary,
 .artifact-preview__markdown .mermaid-error summary {
   color: var(--text-muted);
@@ -421,7 +455,7 @@
   cursor: pointer;
 }
 
-.msg-ai-text .mermaid-err-src,
+:is(.msg-ai-text, .activity-narration) .mermaid-err-src,
 .inspect-msg__text .mermaid-err-src,
 .artifact-preview__markdown .mermaid-err-src {
   max-height: 16rem;
@@ -438,10 +472,10 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .msg-ai-text .mermaid-toolbar,
+  :is(.msg-ai-text, .activity-narration) .mermaid-toolbar,
   .inspect-msg__text .mermaid-toolbar,
   .artifact-preview__markdown .mermaid-toolbar,
-  .msg-ai-text .code-copy-btn,
+  :is(.msg-ai-text, .activity-narration) .code-copy-btn,
   .inspect-msg__text .code-copy-btn,
   .artifact-preview__markdown .code-copy-btn,
   .md-img-lightbox__close {
@@ -452,8 +486,8 @@
 /* ─── Highlight token palette (global; was a ChatView-scoped subset) ────────
  * Values come from the --syntax-* family so every theme ships its own colors.
  * Applied to every surface that renders the shared pipeline. */
-.msg-ai-text .hljs-comment,
-.msg-ai-text .hljs-quote,
+:is(.msg-ai-text, .activity-narration) .hljs-comment,
+:is(.msg-ai-text, .activity-narration) .hljs-quote,
 .inspect-msg__text .hljs-comment,
 .inspect-msg__text .hljs-quote,
 .artifact-preview__markdown .hljs-comment,
@@ -462,8 +496,8 @@
   font-style: italic;
 }
 
-.msg-ai-text .hljs-meta,
-.msg-ai-text .hljs-doctag,
+:is(.msg-ai-text, .activity-narration) .hljs-meta,
+:is(.msg-ai-text, .activity-narration) .hljs-doctag,
 .inspect-msg__text .hljs-meta,
 .inspect-msg__text .hljs-doctag,
 .artifact-preview__markdown .hljs-meta,
@@ -471,30 +505,24 @@
   color: var(--syntax-comment);
 }
 
-.msg-ai-text .hljs-keyword,
-.msg-ai-text .hljs-selector-tag,
-.msg-ai-text .hljs-selector-id,
-.msg-ai-text .hljs-selector-class,
-.msg-ai-text .hljs-built_in,
-.msg-ai-text .hljs-template-tag,
+:is(.msg-ai-text, .activity-narration) .hljs-keyword,
+:is(.msg-ai-text, .activity-narration) .hljs-selector-tag,
+:is(.msg-ai-text, .activity-narration) .hljs-built_in,
+:is(.msg-ai-text, .activity-narration) .hljs-template-tag,
 .inspect-msg__text .hljs-keyword,
 .inspect-msg__text .hljs-selector-tag,
-.inspect-msg__text .hljs-selector-id,
-.inspect-msg__text .hljs-selector-class,
 .inspect-msg__text .hljs-built_in,
 .inspect-msg__text .hljs-template-tag,
 .artifact-preview__markdown .hljs-keyword,
 .artifact-preview__markdown .hljs-selector-tag,
-.artifact-preview__markdown .hljs-selector-id,
-.artifact-preview__markdown .hljs-selector-class,
 .artifact-preview__markdown .hljs-built_in,
 .artifact-preview__markdown .hljs-template-tag {
   color: var(--syntax-keyword);
 }
 
-.msg-ai-text .hljs-string,
-.msg-ai-text .hljs-regexp,
-.msg-ai-text .hljs-addition,
+:is(.msg-ai-text, .activity-narration) .hljs-string,
+:is(.msg-ai-text, .activity-narration) .hljs-regexp,
+:is(.msg-ai-text, .activity-narration) .hljs-addition,
 .inspect-msg__text .hljs-string,
 .inspect-msg__text .hljs-regexp,
 .inspect-msg__text .hljs-addition,
@@ -504,10 +532,10 @@
   color: var(--syntax-string);
 }
 
-.msg-ai-text .hljs-number,
-.msg-ai-text .hljs-literal,
-.msg-ai-text .hljs-symbol,
-.msg-ai-text .hljs-bullet,
+:is(.msg-ai-text, .activity-narration) .hljs-number,
+:is(.msg-ai-text, .activity-narration) .hljs-literal,
+:is(.msg-ai-text, .activity-narration) .hljs-symbol,
+:is(.msg-ai-text, .activity-narration) .hljs-bullet,
 .inspect-msg__text .hljs-number,
 .inspect-msg__text .hljs-literal,
 .inspect-msg__text .hljs-symbol,
@@ -519,9 +547,9 @@
   color: var(--syntax-literal);
 }
 
-.msg-ai-text .hljs-title,
-.msg-ai-text .hljs-section,
-.msg-ai-text .hljs-name,
+:is(.msg-ai-text, .activity-narration) .hljs-title,
+:is(.msg-ai-text, .activity-narration) .hljs-section,
+:is(.msg-ai-text, .activity-narration) .hljs-name,
 .inspect-msg__text .hljs-title,
 .inspect-msg__text .hljs-section,
 .inspect-msg__text .hljs-name,
@@ -531,15 +559,19 @@
   color: var(--syntax-title);
 }
 
-.msg-ai-text .hljs-attr,
-.msg-ai-text .hljs-attribute,
-.msg-ai-text .hljs-variable,
-.msg-ai-text .hljs-template-variable,
-.msg-ai-text .hljs-type,
-.msg-ai-text .hljs-property,
-.msg-ai-text .hljs-selector-attr,
-.msg-ai-text .hljs-selector-pseudo,
+:is(.msg-ai-text, .activity-narration) .hljs-attr,
+:is(.msg-ai-text, .activity-narration) .hljs-selector-id,
+:is(.msg-ai-text, .activity-narration) .hljs-selector-class,
+:is(.msg-ai-text, .activity-narration) .hljs-attribute,
+:is(.msg-ai-text, .activity-narration) .hljs-variable,
+:is(.msg-ai-text, .activity-narration) .hljs-template-variable,
+:is(.msg-ai-text, .activity-narration) .hljs-type,
+:is(.msg-ai-text, .activity-narration) .hljs-property,
+:is(.msg-ai-text, .activity-narration) .hljs-selector-attr,
+:is(.msg-ai-text, .activity-narration) .hljs-selector-pseudo,
 .inspect-msg__text .hljs-attr,
+.inspect-msg__text .hljs-selector-id,
+.inspect-msg__text .hljs-selector-class,
 .inspect-msg__text .hljs-attribute,
 .inspect-msg__text .hljs-variable,
 .inspect-msg__text .hljs-template-variable,
@@ -548,6 +580,8 @@
 .inspect-msg__text .hljs-selector-attr,
 .inspect-msg__text .hljs-selector-pseudo,
 .artifact-preview__markdown .hljs-attr,
+.artifact-preview__markdown .hljs-selector-id,
+.artifact-preview__markdown .hljs-selector-class,
 .artifact-preview__markdown .hljs-attribute,
 .artifact-preview__markdown .hljs-variable,
 .artifact-preview__markdown .hljs-template-variable,
@@ -558,9 +592,9 @@
   color: var(--syntax-attr);
 }
 
-.msg-ai-text .hljs-operator,
-.msg-ai-text .hljs-punctuation,
-.msg-ai-text .hljs-tag,
+:is(.msg-ai-text, .activity-narration) .hljs-operator,
+:is(.msg-ai-text, .activity-narration) .hljs-punctuation,
+:is(.msg-ai-text, .activity-narration) .hljs-tag,
 .inspect-msg__text .hljs-operator,
 .inspect-msg__text .hljs-punctuation,
 .inspect-msg__text .hljs-tag,
@@ -570,8 +604,8 @@
   color: var(--text-muted);
 }
 
-.msg-ai-text .hljs-subst,
-.msg-ai-text .hljs-params,
+:is(.msg-ai-text, .activity-narration) .hljs-subst,
+:is(.msg-ai-text, .activity-narration) .hljs-params,
 .inspect-msg__text .hljs-subst,
 .inspect-msg__text .hljs-params,
 .artifact-preview__markdown .hljs-subst,
@@ -579,7 +613,7 @@
   color: var(--text);
 }
 
-.msg-ai-text .hljs-link,
+:is(.msg-ai-text, .activity-narration) .hljs-link,
 .inspect-msg__text .hljs-link,
 .artifact-preview__markdown .hljs-link {
   color: var(--accent);
@@ -587,19 +621,19 @@
   text-underline-offset: 0.18em;
 }
 
-.msg-ai-text .hljs-deletion,
+:is(.msg-ai-text, .activity-narration) .hljs-deletion,
 .inspect-msg__text .hljs-deletion,
 .artifact-preview__markdown .hljs-deletion {
   color: var(--danger);
 }
 
-.msg-ai-text .hljs-emphasis,
+:is(.msg-ai-text, .activity-narration) .hljs-emphasis,
 .inspect-msg__text .hljs-emphasis,
 .artifact-preview__markdown .hljs-emphasis {
   font-style: italic;
 }
 
-.msg-ai-text .hljs-strong,
+:is(.msg-ai-text, .activity-narration) .hljs-strong,
 .inspect-msg__text .hljs-strong,
 .artifact-preview__markdown .hljs-strong {
   font-weight: 600;

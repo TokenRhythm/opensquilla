@@ -17,6 +17,7 @@
     @dragleave="onChatDragLeave"
     @drop="onChatDrop"
   >
+    <ConversationSurface :policy="conversationPolicy" :workbench-owner-session-key="workbenchOwnerKey">
     <div v-if="threadDragOver" class="chat-drop-overlay" role="status" aria-live="polite" aria-atomic="true">
       <div class="chat-drop-overlay__frame" aria-hidden="true"></div>
       <div class="chat-drop-overlay__beacon">
@@ -107,6 +108,7 @@
           class="chat-thread"
           :data-session-key="sessionKey"
           :class="{
+            'chat-thread--temporary-empty': showTemporaryConversationEmpty,
             'chat-thread--reading-history': !autoScroll,
             'chat-thread--nonvirtualized': messageListRef && !messageListRef.isVirtualized(),
           }"
@@ -149,20 +151,20 @@
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
-        <ChatDeliveryRecoveryStatus
-          v-if="!forkTransition"
-          :entries="chatSend.deliveryRecoveryEntries.value"
-          :checking-ids="chatSend.checkingDeliveryIds.value"
-          @check="chatSend.checkDelivery"
-        />
+        <div v-if="showTemporaryConversationEmpty" class="chat-temporary-empty" data-testid="temporary-conversation-empty">
+          <Icon name="chat" :size="32" aria-hidden="true" />
+          <h2>{{ t('workbench.newPanel.assistantChat') }}</h2>
+          <p>{{ t('workbench.assistantChat.temporaryHint') }}</p>
+          <p class="chat-temporary-empty__keep">{{ t('workbench.assistantChat.temporaryKeepHint') }}</p>
+        </div>
         <div
-          v-if="!forkTransition && showConfirmedEmptySession"
+          v-else-if="!forkTransition && showConfirmedEmptySession"
           class="chat-empty"
         >
           {{ t('chat.noMessagesYet') }}
         </div>
         <HistoryLoadSentinel
-          v-if="!isNewChatLanding && !forkTransition && !historyState.sessionMissing"
+          v-if="!isNewChatLanding && !forkTransition && !findContextMessages && !historyState.sessionMissing"
           :scroll-container="threadRef"
           :has-more="historyState.hasMore"
           :loading="historyState.loadingEarlier"
@@ -181,16 +183,28 @@
           v-if="!historyState.sessionMissing"
           class="chat-message-surface"
           :class="{ 'chat-message-surface--preview': forkTransition }"
-          :inert="forkTransition ? true : undefined"
+          :inert="forkTransition || sessionViewCache.showingPreview.value ? true : undefined"
           :aria-hidden="forkTransition ? 'true' : undefined"
           :data-preview-session="forkTransition?.parentKey"
         >
+        <div v-if="findContextMessages" class="chat-find-context" role="status">
+          <span>{{ t('chat.find.historyContext') }}</span>
+          <button type="button" @click="chatFind.close()">{{ t('chat.find.returnToConversation') }}</button>
+        </div>
+        <div v-if="findPresentation.sourceSnippet.value" class="chat-find-context" role="status">
+          <span>{{ findPresentation.sourceSnippet.value }}</span>
+        </div>
         <ChatMessageList
           ref="messageListRef"
           :bottom-padding="24"
           :layout-header="threadHeaderRef"
-          :messages="forkTransition?.previewMessages || visibleRenderedMessages"
+          :messages="forkTransition?.previewMessages || findDisplayMessages"
+          :live-visualize-publications="forkTransition ? undefined : presentedLive.liveVisualizePublications"
+          :find-fallback-index="findPresentation.fallbackIndex.value"
           :session-key="forkTransition?.parentKey || sessionKey"
+          :content-cache-scope="deliveryIdentity"
+          :content-cache-generation="sessionViewCache.generation.value"
+          :preview-read-only="sessionViewCache.showingPreview.value"
           :scroll-container="threadRef"
           :virtualization-disabled="Boolean(forkTransition)"
           :artifact-navigation-items="sessionArtifacts"
@@ -221,9 +235,10 @@
           :plan-presentations="planPresentations"
           :plan-presentation-available="planPresentationAvailable"
           :plan-presentation-pending="planPresentationPending"
-          :is-streaming="isStreaming"
-          :follow-live-edge="autoScroll"
+          :is-streaming="!findContextMessages && isStreaming"
+          :follow-live-edge="!chatFind.open.value && autoScroll"
           :scroll-epoch="scrollEpoch"
+          :restored-viewport="sessionViewCache.restoredViewport.value"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
           :goal-removable="!shareMode && !forkTransition"
@@ -246,7 +261,7 @@
           @content-hydrated="chatHistory.reconcileHydratedContent"
           :load-history-details="message => historyDetails.setExpanded(message.contentRef, true)"
           @show-tool-result="showToolResultModal"
-          @open-session="switchToSession"
+          @open-session="openReferencedSession"
           @resolve-interrupt="resolveInterrupt"
           @extend-interrupt="extendInterrupt"
           @clarify-submit="submitClarify"
@@ -261,7 +276,7 @@
           <template #router-strip="{ message: msg }">
             <RouterFxStrip v-if="shouldRenderRouterStrip(msg)" :message="msg" />
           </template>
-          <template #trailing>
+          <template v-if="!findContextMessages" #trailing>
 
         <!-- Manual or turn-boundary compaction has no assistant turn to own
              it. Keep one quiet transcript maintenance row instead of a
@@ -315,143 +330,52 @@
           @presentation-change="chatPlans.setPresentation"
         />
 
-        <SkillLoadStatus v-if="isStreaming" standalone :receipts="liveSkillLoads[activeStreamTaskId] || []" />
+        <SkillLoadStatus v-if="presentedLive.visible" standalone :receipts="presentedLive.skillLoads" />
 
-        <!-- Streaming AI message: activity stays open while the turn is live.
-             Gateway-marked intermediate text remains in the transcript, while
-             gateway-marked answer text streams below the activity boundary. -->
-        <!-- No blanket aria-live here: the phase label inside ActivityDisclosure
-             is the single live announcement point, so streaming DOM churn (tool
-             rows, answer tokens) is not read out mutation-by-mutation. -->
-        <div v-if="isStreaming && streamBubble && answerRevealOpen" class="msg-ai" data-history-role="assistant">
-          <div class="msg-ai-main">
-            <ActivityDisclosure
-              default-open
-              lifecycle="working"
-              :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
-              :failure-count="liveActivityFailureCount"
-              :phase-label="liveActivityPhaseLabel"
-              :elapsed-label="streamTurnElapsed"
-              :phase-elapsed-label="liveActivityElapsedLabel"
-              :stale="streamActivityStale"
-            >
-              <UnifiedAssistantActivityTimeline
-                v-if="liveHasUnifiedActivityOrder"
-                variant="checklist"
-                :projection="liveActivityProjection"
-                :timeline-items="liveActivityTimelineItems"
-                :reasoning-blocks="liveReasoningBlocks"
-                :reasoning-collapse-active="liveReasoningCollapseActive"
-                :reasoning-timeline-phase="false"
-                reasoning-pace-bursts
-                :state-scope="liveToolStateScope"
-                :is-tool-group-open="isToolGroupOpen"
-                :is-tool-item-open="isToolItemOpen"
-                :tool-group-status-text="toolGroupStatusText"
-                :tool-status-text="toolStatusText"
-                :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="liveToolElapsedText"
-                @reveal-complete="completeReasoningPresentation"
-                @toggle-group="toggleToolGroup"
-                @toggle-item="toggleToolItem"
-                @show-result="showToolResultModal"
-              >
-                <template #interrupt="{ part }">
-                  <InterruptPart
-                    v-if="part.resolution"
-                    :part="part"
-                    timeline
-                    @resolve="resolveInterrupt"
-                    @extend="extendInterrupt"
-                    @clarify-submit="(fields, request) => submitClarify(fields, request)"
-                    @clarify-dismiss="dismissClarify"
-                  />
-                </template>
-              </UnifiedAssistantActivityTimeline>
-              <template v-else>
-              <ReasoningTimeline
-                v-if="liveReasoningBlocks.length"
-                :blocks="liveReasoningBlocks"
-                :collapse-active="liveReasoningCollapseActive"
-                pace-bursts
-                nested
-                @reveal-complete="completeReasoningPresentation"
-              />
-
-              <AssistantActivityTimeline
-                v-if="
-                  liveActivityTimelineItems.length
-                  || liveActivityProjection.statusSteps.length
-                "
-                variant="checklist"
-                :projection="liveActivityProjection"
-                :timeline-items="liveActivityTimelineItems"
-                :state-scope="liveToolStateScope"
-                :is-tool-group-open="isToolGroupOpen"
-                :is-tool-item-open="isToolItemOpen"
-                :tool-group-status-text="toolGroupStatusText"
-                :tool-status-text="toolStatusText"
-                :tool-secondary-text="toolSecondaryText"
-                :tool-elapsed-text="liveToolElapsedText"
-                @toggle-group="toggleToolGroup"
-                @toggle-item="toggleToolItem"
-                @show-result="showToolResultModal"
-              >
-                <template #interrupt="{ part }">
-                  <InterruptPart
-                    v-if="part.resolution"
-                    :part="part"
-                    timeline
-                    @resolve="resolveInterrupt"
-                    @extend="extendInterrupt"
-                    @clarify-submit="(fields, request) => submitClarify(fields, request)"
-                    @clarify-dismiss="dismissClarify"
-                  />
-                </template>
-              </AssistantActivityTimeline>
-              </template>
-            </ActivityDisclosure>
-
-            <!-- The gateway marks text as intermediate or answer. Only the
-                 semantic answer span streams below the activity boundary; no
-                 timeout or draft heuristic is involved. -->
-            <div v-if="liveAnswerPart" class="live-answer">
-              <StreamingTextPart
-                :raw-text="liveAnswerPart.rawText"
-                :render-markdown="renderMarkdown"
-              />
-            </div>
-            <span
-              v-if="liveAnswerPart && !streamActivityStale && liveCurrentPhaseCode === 'chat.activity.lifecycle.answering'"
-              class="stream-caret"
-              aria-hidden="true"
-            />
-
-            <ChatArtifactList
-              :artifacts="liveArtifacts"
-              :navigation-artifacts="sessionArtifacts"
-              :session-key="sessionKey"
-              :prefer-workbench="workbenchEnabled"
-              @download="downloadArtifact"
-              @open="openArtifact"
-            />
-
-          </div>
-        </div>
-
-        <!-- Pending controls stay outside the collapsible activity timeline at
-             the live edge. A resolution removes this card and leaves its compact
-             outcome in chronological history. -->
-        <InterruptPart
-          v-for="part in livePendingInterruptParts"
-          :key="part.key"
-          :part="part"
+        <ConversationLiveEdge
+          :visible="presentedLive.visible"
+          :session-key="sessionKey"
+          :continuity-key="presentedLive.liveActivityContinuityKey"
+          :executing="presentedLive.liveActivityExecuting"
+          :step-count="presentedLive.liveActivityStepCount"
+          :failure-count="presentedLive.liveActivityFailureCount"
+          :phase-label="presentedLive.liveActivityPhaseLabel"
+          :phase-announcement="presentedLive.liveActivityPhaseAnnouncement"
+          :phase-waiting="presentedLive.liveActivityWaiting"
+          :elapsed-label="presentedLive.streamTurnElapsed"
+          :stale="presentedLive.streamActivityStale"
+          :queued="presentedLive.queued"
+          :has-unified-activity-order="presentedLive.liveHasUnifiedActivityOrder"
+          :display-projection="presentedLive.liveActivityDisplayProjection"
+          :timeline-items="presentedLive.liveActivityTimelineItems"
+          :reasoning-blocks="presentedLive.liveReasoningBlocks"
+          :reasoning-collapse-active="presentedLive.liveReasoningCollapseActive"
+          :tool-input-previews="presentedLive.toolInputPreviews"
+          :tool-state-scope="presentedLive.liveToolStateScope"
+          :answer-part="presentedLive.liveAnswerPart"
+          :visualize-receipts="presentedLive.liveVisualizeReceipts"
+          :current-phase-code="presentedLive.liveCurrentPhaseCode"
+          :artifacts="presentedLive.liveArtifacts"
+          :navigation-artifacts="sessionArtifacts"
+          :prefer-workbench="workbenchEnabled"
+          :render-markdown="renderMarkdown"
+          :is-tool-group-open="isToolGroupOpen"
+          :is-tool-item-open="isToolItemOpen"
+          :tool-group-status-text="toolGroupStatusText"
+          :tool-status-text="toolStatusText"
+          :tool-secondary-text="toolSecondaryText"
+          :tool-elapsed-text="presentedToolElapsedText"
+          :pending-interrupt-parts="presentedLive.livePendingInterruptParts"
+          @toggle-group="toggleToolGroup"
+          @toggle-item="toggleToolItem"
+          @show-result="showToolResultModal"
           @resolve="resolveInterrupt"
           @extend="extendInterrupt"
           @clarify-submit="(fields, request) => submitClarify(fields, request)"
           @clarify-dismiss="dismissClarify"
+          @download="downloadArtifact"
+          @open="openArtifact"
         />
-
         <!-- Soft long-running banner: content events crossed the high watchdog
              threshold while no backend-deadline-owned phase (tool, approval,
              ensemble) explains it. "Keep waiting" suppresses this silence
@@ -475,7 +399,7 @@
         </div>
 
         <!-- Thinking indicator -->
-        <div v-else-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+        <div v-else-if="thinkingVisible && answerRevealOpen && sessionViewCache.ready.value && !sessionViewCache.showingPreview.value" class="msg-ai thinking" role="status" aria-live="polite">
           <div class="msg-ai-main">
             <div class="thinking-status">
               <span class="stream-activity-dot" aria-hidden="true" />
@@ -490,7 +414,7 @@
         </div>
         </div>
         <ConversationMinimap
-          v-if="!isNewChatLanding && !shareMode && !forkTransition"
+          v-if="!isNewChatLanding && !shareMode && !forkTransition && !findContextMessages"
           ref="conversationMinimapRef"
           :messages="visibleRenderedMessages"
           :scroll-container="threadRef"
@@ -574,10 +498,6 @@
         <span>{{ t('chat.latest') }}</span>
       </button>
     </Transition>
-    <div v-if="slashOpen" ref="slashMenuRef">
-      <ChatSlashPalette :items="filteredSlashCmds" :active-index="slashIdx"
-        :loading="skillsLoading" :error="skillsError" @choose="completeSlashCmd" />
-    </div>
 
     <PendingQueue
       :items="pendingQueue"
@@ -624,6 +544,12 @@
       />
     </div>
 
+    <ChatDeliveryRecoveryStatus
+      v-if="!forkTransition && !shareMode"
+      :entries="chatSend.deliveryRecoveryEntries.value"
+      :checking-ids="chatSend.checkingDeliveryIds.value"
+      @check="chatSend.checkDelivery"
+    />
     <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"
@@ -636,12 +562,14 @@
       :send-disabled="chatSend.sendHydrationBlocked.value"
       :is-streaming="isStreaming"
       :can-stop="canStop"
+      :show-stop="showStableStop || showCachedStop"
       :stop-targets-plan-run="composerStopsPlanRun"
       :stop-pending="planActionPending === 'cancel-run'"
       :is-new-landing="isNewChatLanding"
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :show-send-blocked-tooltip="composerSendBlockedTooltip"
       :show-image-input-warning="!forkTransition && !modelRoutingMutationBusy
         && imageInputAdmission === 'blocked' && Boolean(modelImageSendBlockedMessage)"
       :input-disabled="Boolean(dockedPlanQuestionnaire)
@@ -652,20 +580,20 @@
       :safe-setup-available="composerSafeSetupAvailable"
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
-      :session-routing-mode="modelRoutingMode"
+      :session-routing-mode="sessionViewCache.presentation.value?.modelRoutingMode ?? modelRoutingMode"
       :session-routing-busy="modelRoutingMutationBusy"
-      :session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy"
+      :session-routing-control-blocked="preparingHostSession || goalBusy || modelRoutingSettingsBusy || sessionViewCache.showingPreview.value"
       :session-routing-available="sessionRoutingAvailable"
-      :session-model-name="sessionModelName"
+      :session-model-name="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.sessionModelName : sessionModelName"
       :is-new-task="isProvisionalDraftSession()"
-      :model-selection-available="composerModelSelectionAvailable"
+      :model-selection-available="sessionViewCache.presentation.value?.modelSelectionAvailable ?? composerModelSelectionAvailable"
       :available-models="newTaskModels"
-      :model-selection="composerModelSelection"
+      :model-selection="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.modelSelection : composerModelSelection"
       :default-model="composerDefaultModel"
       :models-loading="newTaskModelsLoading"
       :models-error="newTaskModelsError"
       :model-provider-errors="newTaskModelsProviderErrors"
-      :model-selection-disabled-reason="composerModelDisabledReason"
+      :model-selection-disabled-reason="sessionViewCache.showingPreview.value ? 'busy' : composerModelDisabledReason"
       :goal-draft-armed="goalDraftArmed"
       :goal-mode-available="goalUiAvailable"
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
@@ -677,15 +605,24 @@
       :voice-ready="voiceReady"
       :project-workspace="activeWorkspace"
       :project-workspace-status="activeWorkspaceStatus"
-      :project-binding-busy="projectBindingBusy || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
+      :project-binding-busy="projectBindingBusy || workbenchSessionPreparing || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
       :selected-skills="selectedSkills"
+      :skill-positions="skillPositions"
+      :draft-key="draftSessionKey"
+      :palette-id="slashPaletteId"
+      :skill-palette-items="composerSkillItems"
+      :skills-loading="skillsLoading"
+      :skills-error="skillsError"
+      :palette-open="slashOpen"
+      :palette-active-index="slashIdx"
+      :has-context="Boolean(visualizeDraft.snapshot.value)"
       :can-close-project="isDraftRoute() && pendingWorkspaceId !== null"
       :can-choose-project="gatewayAccess.canChooseProject"
       :plan-mode-available="planUiAvailable"
       :collaboration-mode="collaboration.mode"
-      :plan-mode-busy="planModeBusy"
+      :plan-mode-busy="planModeBusy || workbenchSessionPreparing"
       :plan-mode-disabled="planActionPending !== null"
       :plan-mode-applies-next-turn="planModeAppliesNextTurn"
       :replan-active="replanActive"
@@ -707,6 +644,8 @@
       @remove-attachment="removeAttachment"
       @remove-local-path="removeLocalPath"
       @remove-skill="selectedSkills = selectedSkills.filter(skill => skill.instanceId !== $event)"
+      @positions-change="skillPositions = $event"
+      @select-skill="selectComposerSkill"
       @retry-attachment="retryAttachment"
       @preview-image="previewPendingImage"
       @set-busy-send-mode="busySendMode = $event"
@@ -734,7 +673,19 @@
       @jump-prompt-annotation="jumpPromptAnnotation"
       @open-prompt-cache-keepalive="promptCacheKeepaliveOpen = true"
       @refresh-prompt-cache-keepalive="void refreshPromptCacheKeepaliveStatus()"
-    />
+    >
+      <template #palette>
+        <div v-if="slashOpen" ref="slashMenuRef">
+          <ChatSlashPalette :palette-id="slashPaletteId" :items="filteredSlashCmds" :active-index="slashIdx"
+            :loading="skillsLoading" :error="skillsError" :selected-skills="selectedSkills"
+            :composer-element="composerRef?.editorElement()?.closest<HTMLElement>('.chat-input-panel')"
+            @close="closeSlashMenu(); composerRef?.focusTextarea()" @choose="completeSlashCmd" />
+        </div>
+      </template>
+      <template #context>
+        <VisualizeContextChip v-if="visualizeDraft.snapshot.value" :snapshot="visualizeDraft.snapshot.value" @remove="visualizeDraft.clear" />
+      </template>
+    </ChatComposer>
     <SandboxSetupDialog
       :open="composerSandboxSetupOpen"
       :pending="sandboxSetupPending"
@@ -799,11 +750,12 @@
          across the streaming boundary; it fills when a live turn settles and
          clears when the next turn starts so repeat turns announce again. -->
     <span class="chat-turn-settled-announcer" role="status" aria-live="polite">{{ turnSettledAnnouncement }}</span>
+    </ConversationSurface>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, onScopeDispose, nextTick, watch } from 'vue'
+import { ref, computed, provide, inject, onMounted, onUnmounted, onScopeDispose, nextTick, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -835,13 +787,14 @@ import {
   notifyPageAnnotationsSent,
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
-import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
-import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
-import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
-import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
+import ConversationLiveEdge from '@/components/chat/ConversationLiveEdge.vue'
+import ConversationSurface from '@/components/chat/ConversationSurface.vue'
+import { MAIN_CONVERSATION_POLICY, conversationSlashActionAllowed, type ConversationPolicy } from '@/modules/conversationPolicy'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
+import VisualizeContextChip from '@/components/chat/VisualizeContextChip.vue'
+import { acceptsVisualizeContext, useVisualizeDraft } from '@/visualize/useVisualizeDraft'
 import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
@@ -851,9 +804,8 @@ import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
-import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
-import StreamingTextPart from '@/components/chat/parts/StreamingTextPart.vue'
-import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
+import { VISUALIZE_CONVERSATION_KEY } from '@/visualize/types'
+import { visualizeReceipts } from '@/visualize/receipts'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
 import TaskProgressRibbon from '@/components/chat/TaskProgressRibbon.vue'
 import { useChatTaskProgress } from '@/composables/chat/useChatTaskProgress'
@@ -874,7 +826,12 @@ import { useLocalPathPicker } from '@/composables/chat/useLocalPathPicker'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
 import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverableUpdateIndicator'
-import { useChatRouteHeaderBridge } from '@/composables/chat/useChatRouteHeaderBridge'
+import { useChatRouteHeaderBridge, type ChatRouteHeaderAction } from '@/composables/chat/useChatRouteHeaderBridge'
+import { configureWorkbenchSessionCollaboration, configureWorkbenchSessionRouting, useWorkbenchSessionPreparation } from '@/composables/chat/useWorkbenchSessionPreparation'
+import { useChatFind } from '@/composables/chat/useChatFind'
+import { useChatFindPresentation } from '@/composables/chat/useChatFindPresentation'
+import { isChatFindShortcut } from '@/utils/chat/chatFindShortcut'
+import { SESSION_MESSAGE_SEARCH_KEY } from '@/modules/sessionMessageSearch'
 import {
   goalHasRenderedTerminalAnchor,
   goalStatusIsTerminal,
@@ -882,11 +839,12 @@ import {
   type GoalSnapshot,
   useChatGoals,
 } from '@/composables/chat/useChatGoals'
-import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
+import { useChatDraftPersistence, createMemoryChatDraftStorage } from '@/composables/chat/useChatDraftPersistence'
 import { useLocalPathDraft } from '@/composables/chat/useLocalPathDraft'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
+import { useStableStopControl } from '@/composables/chat/useStableStopControl'
 import { useNewTaskModelSelection, type NewTaskModelSelection } from '@/composables/chat/useNewTaskModelSelection'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
@@ -947,7 +905,8 @@ import {
 import { useSandboxReadinessRefresh } from '@/composables/chat/useSandboxReadinessRefresh'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
-import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
+import { useChatTurnAnnouncement } from '@/composables/chat/useChatTurnAnnouncement'
+import { useArtifactImageLightbox, type AttachmentImagePreviewSource } from '@/composables/chat/useArtifactImageLightbox'
 import { useChatPlans } from '@/composables/chat/useChatPlans'
 import { PLAN_CENTER_KEY, type PlanCenter } from '@/modules/planCenter'
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
@@ -975,6 +934,7 @@ import {
   optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
+import { useChatSessionViewCache } from '@/composables/chat/useChatSessionViewCache'
 import {
   useChatSessionSubscription,
 } from '@/composables/chat/useChatSessionSubscription'
@@ -997,6 +957,7 @@ import {
   useChatSlashCommands,
 } from '@/composables/chat/useChatSlashCommands'
 import { useChatStream } from '@/composables/chat/useChatStream'
+import { useChatToolDisclosureScope } from '@/composables/chat/useChatToolDisclosureScope'
 import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
@@ -1014,6 +975,7 @@ import {
 } from '@/composables/useProjectWorkspaces'
 import {
   createDraftProjectHydrationGuard,
+  applySessionProjectWorkspaceMetadata,
   useActiveProjectWorkspace,
   type ActiveProjectWorkspaceSnapshot,
 } from '@/composables/useActiveProjectWorkspace'
@@ -1056,7 +1018,7 @@ import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
 } from '@/types/promptCacheKeepalive'
-import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import { promptAnnotationAllowed, type PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import {
   createWorkbenchResourceRef,
@@ -1076,8 +1038,6 @@ import {
 import {
   artifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
-  initialSectionFromWorkbenchItem,
-  initialSectionRequestIdFromWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
 } from '@/workbench/artifactItems'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
@@ -1094,6 +1054,7 @@ import {
 import {
   artifactUsesWorkbenchPreview,
   artifactWorkbenchPreviewKind,
+  isOfficePreviewFormat,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import {
@@ -1125,8 +1086,7 @@ import {
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
-import { sessionApplicationLink, sessionDesktopLink } from '@/types/references'
-import { currentSessionGatewayLink } from '@/utils/chat/sessionLinks'
+import { currentSessionLink } from '@/utils/chat/sessionLinks'
 import {
   toolCallGroups,
   toolGroupStatusText,
@@ -1143,11 +1103,13 @@ import {
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
-import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
+import { chatMessageKey, isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import {
   projectSessionCreationRouterPresentation,
 } from '@/utils/chat/sessionCreationRouterPresentation'
-import { createPendingInputWal } from '@/utils/chat/pendingInputWal'
+import { createPendingInputWal, type PendingInputWal } from '@/utils/chat/pendingInputWal'
+import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
+import type { AttachmentDraftStore } from '@/utils/chat/attachmentDrafts'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import {
@@ -1165,7 +1127,10 @@ import {
   getChatWheelDirection,
   resolveChatWheelOwnership,
 } from '@/utils/chat/chatScrollOwnership'
-import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { activateAssistantActivitySession, releaseAssistantActivitySession, assistantActivityContinuityKey, clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { LOCAL_SESSIONS_DELETED_EVENT, localSessionsDeletedDetail } from '@/utils/sessionSync'
+import { parseSideChatCommand, useSideChatLauncher, type SideChatLaunchRequest } from '@/modules/sideChatLauncher'
+import { useSideChatCommand } from '@/composables/chat/useSideChatCommand'
 import { stripBackgroundProcessNoticeTimeline } from '@/utils/chat/backgroundProcessNotice'
 import {
   resolveChatHistoryRecoveryState,
@@ -1173,10 +1138,10 @@ import {
   visibleChatHistoryRecoveryState,
 } from '@/utils/chat/sessionLoadState'
 import {
+  canMergeAssistantActivityOrder,
   isSemanticActivityStatusStep,
-  isVisibleActivityStatusStep,
   projectAssistantActivityTimeline,
-  providerActivityRemainingSeconds,
+  providerActivityLabel,
   splitLiveAssistantTimeline,
 } from '@/utils/chat/assistantActivity'
 
@@ -1188,9 +1153,38 @@ interface ChatComposerHandle {
   focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
+  showSendBlockedHint: () => void
+  editorElement: () => HTMLElement | null
+  getSelection: () => { start: number; end: number; length: number }
+  setSelectionRange: (start: number, end: number) => void
 }
 
 type Message = ChatMessage
+
+// Both route chat and a workbench child mount this exact implementation. Host
+// differences concern identity/lifetime only, never event folding or rendering.
+const props = defineProps<{
+  embedded?: boolean
+  surfaceVisible?: boolean
+  sessionKeyOverride?: string
+  policy?: Readonly<ConversationPolicy>
+  workbenchOwnerSessionKey?: string
+  prepareSession?: () => Promise<string>
+  ownerBlocked?: boolean
+  pendingInputWal?: PendingInputWal
+  pendingQueuePolicy?: ReturnType<typeof createPendingQueuePolicy>
+  draftStorage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
+  attachmentDraftStore?: AttachmentDraftStore
+  draftIdentity?: string
+  inheritedRunMode?: string | null
+  expectedWorkspaceId?: string | null
+}>()
+const conversationPolicy = computed(() => props.policy ?? MAIN_CONVERSATION_POLICY)
+const surfaceVisible = computed(() => props.surfaceVisible !== false)
+const workbenchOwnerKey = computed(() => props.workbenchOwnerSessionKey || sessionKey.value)
+const preparingHostSession = ref(false)
+const workspaceBindingMismatch = ref(false)
+const activityOwner = Symbol('conversation-view')
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 
@@ -1319,10 +1313,19 @@ let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
 
+function openWorkbenchItemExplicit(item: Parameters<typeof workbenchStore.openItem>[0]): boolean {
+  const opened = workbenchStore.openItem(item)
+  // Late resource reads can register on a background owner's shelf. They must
+  // not reveal an unrelated foreground tab on a constrained screen.
+  if (opened && workbenchStore.activeItemId === item.id) workbenchStore.requestReveal()
+  return opened
+}
+
 function artifactPreviewItemForExplicitOpen(
   options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
 ) {
   const item = createArtifactPreviewWorkbenchItem(options)
+  if (props.workbenchOwnerSessionKey) item.scope = { type: 'session', id: props.workbenchOwnerSessionKey }
   return requestInitialSectionForWorkbenchItem(
     item,
     workbenchStore.items.find(candidate => candidate.id === item.id) || null,
@@ -1449,6 +1452,15 @@ watch(sessionKey, resetComposerRetraction, { flush: 'sync' })
 const promptAnnotationsEnabled = computed(() => (
   appStore.features.artifactPromptAnnotations === true
 ))
+const officePromptAnnotationsEnabled = computed(() => (
+  appStore.features.officePromptAnnotations === true
+))
+function annotationAllowed(annotation: Pick<PromptAnnotationSnapshot, 'selection'> | undefined) {
+  return promptAnnotationAllowed(annotation, {
+    native: promptAnnotationsEnabled.value,
+    office: officePromptAnnotationsEnabled.value,
+  })
+}
 const workbenchResourcesEnabled = computed(() => (
   appStore.features.documentWorkbenchResources === true
   || promptAnnotationsEnabled.value
@@ -1463,24 +1475,21 @@ const attachmentWorkbenchEditEnabled = computed(() => (
   && artifactWorkbench.resources.canImportDocuments()
 ))
 const activePromptAnnotations = computed(() =>
-  promptAnnotationsEnabled.value
-    ? artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value)
-    : [])
+  artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value, annotationAllowed))
 const sendableAnnotationDraftIds = computed(() =>
-  promptAnnotationsEnabled.value
-    ? artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value)
-      .map(annotation => annotation.annotationId)
-    : [])
+  artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value, annotationAllowed)
+    .map(annotation => annotation.annotationId))
 
 function promptAnnotationBlockedMessage(): string {
-  if (!promptAnnotationsEnabled.value) return ''
-  const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value)
+  if (!promptAnnotationsEnabled.value && !officePromptAnnotationsEnabled.value) return ''
+  const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value, annotationAllowed)
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
 }
 
 async function updatePromptAnnotation(annotationId: string, body: string) {
+  if (!annotationAllowed(artifactPromptAnnotationsStore.annotations[annotationId])) return
   try {
     await artifactPromptAnnotationsStore.update(annotationId, body)
   } catch {
@@ -1498,7 +1507,7 @@ async function discardPromptAnnotation(annotationId: string) {
 
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
-  if (!annotation) return
+  if (!promptAnnotationsEnabled.value || !annotation || annotation.selection !== undefined) return
   const activated = await focusArtifactPromptAnnotation({
     annotationId,
     documentId: annotation.documentId,
@@ -1514,6 +1523,7 @@ async function jumpPromptAnnotation(annotationId: string) {
 async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
   if (
     !promptAnnotationsEnabled.value
+    || annotation.selection !== undefined
     || !annotation.body.trim()
     || !sessionKey.value
     || !workbenchEnabled.value
@@ -1550,9 +1560,12 @@ const promptAnnotationDesktopAvailable = computed(() => (
 ))
 const { inputText, composerText, localPaths, appendLocalPaths, removeLocalPath, restoreInput } = useLocalPathDraft()
 const selectedSkills = ref<SelectedSkillRef[]>([])
+const skillPositions = ref<Record<string, number>>({})
+const slashPaletteId = `chat-slash-options-${useId()}`
 const composerRevision = ref(0)
 const aborted = ref(false)
 const autoScroll = ref(true)
+const findOwnsViewport = ref(false)
 // Every session gets a monotonically increasing scroll epoch. Any queued
 // layout/render callback from an older epoch must become a no-op; the DOM node
 // for the thread is intentionally reused so focus and native scrolling remain
@@ -1666,7 +1679,12 @@ const chatElevatedMode = useChatElevatedMode({
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
-const draftPersistence = useChatDraftPersistence({ sessionKey, inputText: composerText, localPaths, selectedSkills })
+// An embedded owner exists before its first wire session. Keep that owner's
+// draft stable across lazy session creation and tab reader remounts.
+const draftSessionKey = props.draftIdentity ? ref(props.draftIdentity) : sessionKey
+const draftPersistence = useChatDraftPersistence({ sessionKey: draftSessionKey, inputText: composerText, localPaths, selectedSkills, skillPositions,
+  ...(props.embedded ? { storage: props.draftStorage ?? createMemoryChatDraftStorage() } : {}),
+})
 const {
   elevatedMode,
   loadElevatedMode,
@@ -1695,8 +1713,17 @@ async function refreshRunModePreference() {
   }
 }
 const activeRunModeLock = ref<SandboxRunMode | null>(null)
+// A temporary host inherits its parent's execution preference without changing
+// the global default used by unrelated chats. Explicit composer choices remain
+// local to this instance as well.
+const savedRunMode = props.draftStorage?.getItem('conversation.run-mode')
+const localRunMode = ref<SandboxRunMode | null>(isRecognizedSandboxRunMode(savedRunMode)
+  ? normalizeSandboxRunMode(savedRunMode) : null)
+const preferredRunMode = computed<SandboxRunMode>(() => localRunMode.value
+  ?? (isRecognizedSandboxRunMode(props.inheritedRunMode)
+    ? normalizeSandboxRunMode(props.inheritedRunMode) : globalRunMode.value))
 const requestedRunMode = computed<SandboxRunMode>(
-  () => activeRunModeLock.value ?? globalRunMode.value,
+  () => activeRunModeLock.value ?? preferredRunMode.value,
 )
 
 const sandboxSetupRecovery = useSandboxSetupRecovery({
@@ -1714,7 +1741,7 @@ const {
   status: sandboxSetupStatus,
 } = sandboxSetupRecovery
 const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
-  globalRunMode.value,
+  preferredRunMode.value,
   sandboxSetupStatus.value,
   activeRunModeLock.value,
   sandboxSetupRecovery.resolved.value,
@@ -1813,12 +1840,15 @@ function projectWorkspaceFromSessionRead(
 
 // Pending session intent
 const pendingSessionIntent = ref<string | null>(null)
+const workbenchSessionPreparing = ref(false)
+let workbenchMaterializedSessionKey = ''
+let workbenchPreparationNavigationEpoch = 0
 const pendingForkBeforeMessageId = ref<string | null>(null)
 const freshTaskDraft = useFreshTaskDraft()
 const promptCacheKeepaliveSessionReady = computed(() => pendingSessionIntent.value === null)
 
 function isProvisionalDraftSession(): boolean {
-  return pendingSessionIntent.value === 'new_chat'
+  return pendingSessionIntent.value === 'new_chat' || Boolean(props.embedded && !sessionKey.value)
 }
 
 function isDraftSurface(): boolean {
@@ -1881,6 +1911,7 @@ const {
 const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
 
 const chatStream = useChatStream({
+  presentationVisible: surfaceVisible,
   messages,
   lastHeaderRole,
   aborted,
@@ -1893,6 +1924,7 @@ const chatStream = useChatStream({
   scrollToBottom,
   interruptState,
   streamIdleTimeoutMs: () => gatewayAccess.streamIdleTimeoutMs,
+  toolStateScope: () => liveToolStateScope.value,
 })
 const {
   isStreaming,
@@ -1917,12 +1949,28 @@ const {
   toggleToolGroup,
   isToolItemOpen,
   toggleToolItem,
+  migrateToolDisclosureScope,
   cleanup: cleanupStream,
   foldedTurn,
+  toolInputPreviews,
   appendInterruptFrame,
-  ensureInterruptBubble,
-  completeReasoningPresentation,
 } = chatStream
+// Register departure capture before session-scoped routing/live reset watchers.
+// Only display data is retained; subscription, ownership and approvals recover
+// through their existing authoritative readers.
+const sessionViewCache = useChatSessionViewCache({
+  currentReadAuthority: () => sessionReadLifecycle.current(),
+  sessionKey, deliveryIdentity, messages, waitForLive: true,
+  capturePresentation: captureSessionPresentation,
+  captureViewport: captureSessionViewport,
+})
+const visualizeDraft = useVisualizeDraft({
+  sessionKey, deliveryIdentity, generation: sessionViewCache.generation,
+  available: key => visualizeConversationEnabled(key),
+})
+// Task events can confirm an owner before deferred session metadata arrives.
+// Keep that control fact separate from completion of the display snapshot.
+const presentationMetadataReady = ref(false)
 useBrowserAutomationState({
   native: platform.workbench.native,
   sessionKey,
@@ -1960,10 +2008,11 @@ watch(() => gatewayAccess.deliveryIdentity, async (identity, _previous, onCleanu
   finally { if (current) attachmentDraftIdentityPending.value = false }
 }, { immediate: true })
 const chatAttachments = useChatAttachments(artifactWorkbench.content, {
+  draftStore: props.attachmentDraftStore,
   draftOwnerState: () => [inputText.value, selectedSkills.value],
   draftScopePending: () => attachmentDraftIdentityPending.value,
-  draftScope: () => attachmentDraftIdentity.value && sessionKey.value
-    ? { identity: attachmentDraftIdentity.value, sessionKey: sessionKey.value } : null,
+  draftScope: () => attachmentDraftIdentity.value && (props.draftIdentity || sessionKey.value)
+    ? { identity: attachmentDraftIdentity.value, sessionKey: props.draftIdentity || sessionKey.value } : null,
   native: platform.files,
   nativeIsCurrent: context => context.sessionKey === sessionKey.value
     && nativeAttachmentSession.value?.epoch === context.sessionEpoch,
@@ -1998,7 +2047,7 @@ const {
   prepareAttachmentsForSend,
 } = chatAttachments
 watch(
-  [inputText, composerText, localPaths, pendingAttachments, selectedSkills],
+  [inputText, composerText, localPaths, pendingAttachments, selectedSkills, visualizeDraft.snapshot],
   () => {
     composerRevision.value += 1
   },
@@ -2022,7 +2071,7 @@ let dispatchQueuedItem: (
   preDispatchGuard?: () => boolean,
 ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
-const pendingInputWal = createPendingInputWal()
+const pendingInputWal = props.pendingInputWal ?? createPendingInputWal()
 const chatPendingQueue = useChatPendingQueue({
   selectedSkills,
   localPathReferences: localPaths,
@@ -2051,6 +2100,7 @@ const chatPendingQueue = useChatPendingQueue({
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
   pendingInputWal,
+  pendingQueuePolicy: props.pendingQueuePolicy,
   pendingInputQueue,
   connectionState: gatewayConnectionState,
   deliveryIdentity,
@@ -2149,6 +2199,7 @@ watch(compactStatus, (status) => {
     compactionId,
     source: status.source || 'manual',
     state: transcriptCompactionState(status.status),
+    providerRecovery: status.providerRecovery, httpStatus: status.httpStatus, failureKind: status.failureKind,
     durability: status.durability || '',
     ...(status.detail ? { detail: status.detail } : {}),
     ...(status.reason ? { reason: status.reason } : {}),
@@ -2176,6 +2227,7 @@ const chatUsageWidget = useChatUsageWidget({
   usageReporting,
   readOptions: optionalSessionReadOptions,
   sessionKey,
+  connectionIdentity: () => JSON.stringify([deliveryIdentity.value, gatewayAccess.subscriptionEpoch, currentEpoch.value]),
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
 const {
@@ -2187,7 +2239,7 @@ const {
   loadCurrentSessionUsage,
 } = chatUsageWidget
 
-const chatSessionRoute = useChatSessionRoute(sessionKey, () => gatewayAccess.guestSessionOwnerId)
+const chatSessionRoute = useChatSessionRoute(sessionKey, () => gatewayAccess.guestSessionOwnerId, { embedded: props.embedded })
 const {
   route,
   createSessionKey,
@@ -2274,6 +2326,7 @@ const {
   imageInputAdmissionReason,
 } = chatSessionRouting
 const newTaskModel = useNewTaskModelSelection({
+  ...(props.embedded ? { storage: props.draftStorage ?? null } : {}),
   catalog: injectedProviderConfiguration,
   catalogAvailable: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated
     && (gatewayAccess.chatSendInitialModel || chatSessionRouting.modelSelectionSupported.value)),
@@ -2287,7 +2340,7 @@ const newTaskModel = useNewTaskModelSelection({
   // cannot delay the first chat/sidebar control requests.
   autoRefresh: false,
   routingMode: modelRoutingMode,
-  busy: computed(() => isStreaming.value || modelRoutingSettingsBusy.value
+  busy: computed(() => preparingHostSession.value || isStreaming.value || workbenchSessionPreparing.value || modelRoutingSettingsBusy.value
     || acceptanceStopPending.value || acceptanceRecoveryPending.value),
 })
 const {
@@ -2309,7 +2362,7 @@ const sessionModelName = computed(() => chatSessionRouting.modelSelectionSupport
 const composerModelDisabledReason = computed(() => {
   if (isProvisionalDraftSession()) return newTaskModelDisabledReason.value
   if (!composerModelSelectionAvailable.value) return 'unavailable' as const
-  return isStreaming.value || modelRoutingMutationBusy.value
+  return preparingHostSession.value || isStreaming.value || workbenchSessionPreparing.value || modelRoutingMutationBusy.value
     || acceptanceStopPending.value || acceptanceRecoveryPending.value ? 'busy' as const : null
 })
 watch(
@@ -2459,7 +2512,13 @@ const {
   replanActive,
 } = chatPlans
 
-const renderSourceMessages = computed(() => messages.value)
+watch(sessionViewCache.generation, () => clearAssistantActivityExpansionState(sessionKey.value), { flush: 'sync' })
+function invalidateDeletedSessionViews(event: Event) {
+  for (const key of localSessionsDeletedDetail(event)?.keys ?? []) sessionViewCache.invalidate(key)
+}
+window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, invalidateDeletedSessionViews)
+onScopeDispose(() => window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, invalidateDeletedSessionViews))
+const renderSourceMessages = sessionViewCache.messages
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
   interruptState,
@@ -2490,6 +2549,16 @@ const sessionCreationRouterPresentation = computed(() => (
   projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
 ))
 const visibleRenderedMessages = computed(() => sessionCreationRouterPresentation.value.messages)
+const findContextMessages = ref<ChatMessage[] | null>(null)
+const findContextRendered = useChatRenderedMessages({
+  messages: computed(() => findContextMessages.value ?? []),
+  sessionKey, routerSlots, routerModels, routerTierConfigs,
+  routerVisualEffectsEnabled, routerVisualMode,
+  renderMarkdown, stripGeneratedArtifactMarkers, stripTimePrefix,
+  isSubagentCompletionMessage, timeTranslator: t,
+})
+const findDisplayMessages = computed(() => findContextMessages.value
+  ? findContextRendered.renderedMessages.value : visibleRenderedMessages.value)
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
@@ -2512,6 +2581,7 @@ const preserveHistoryLiveTail = computed(() =>
 const chatHistory = useChatHistory({
   sessionReadLeaseReader: sessionReadLifecycle,
   sessionKey,
+  deliveryIdentity,
   messages,
   threadRef,
   lastHeaderRole,
@@ -2522,12 +2592,20 @@ const chatHistory = useChatHistory({
   canApplyViewportCorrection: () => !historyNavigationScrollLock.locked,
   stripTimePrefix,
   scrollToBottom,
+  onHistoryInstalled: sessionViewCache.historyInstalled,
+  initialWindowSize: () => sessionViewCache.showingPreview.value ? sessionViewCache.messages.value.length : 0,
   onTerminalTask: outcome => {
     const taskId = outcome.taskId || ''
     if (!taskId) return
-    taskOwnership.noteTerminal(taskId)
     const ownsLiveStream = activeStreamTaskId.value === taskId
     const ownsRunStatus = chatTaskId(runStatus.value.task) === taskId
+    if (sessionViewCache.presentation.value?.stoppableTaskId === taskId) {
+      // Durable completion supersedes the cached in-progress picture, even if
+      // transport recovery has not installed a new live snapshot yet.
+      sessionViewCache.retirePreview(sessionKey.value)
+    }
+    // An older finished turn does not resolve the current owner's hydration.
+    taskOwnership.noteTerminal(taskId, ownsLiveStream || ownsRunStatus)
     if (ownsLiveStream) {
       resetStreamLiveTurnState()
       activeStreamTaskId.value = outcome.status === 'cancelled'
@@ -2557,6 +2635,47 @@ const {
   markSessionMissing,
   cleanup: cleanupHistory,
 } = chatHistory
+const sessionMessageSearch = inject(SESSION_MESSAGE_SEARCH_KEY, null)
+const findPresentation = useChatFindPresentation({
+  sessionKey,
+  source: sessionMessageSearch,
+  messages: visibleRenderedMessages,
+  displayMessages: findDisplayMessages,
+  contextMessages: findContextMessages,
+  project: chatHistory.projectHistoryPage,
+  list: messageListRef,
+  thread: threadRef,
+  autoScroll,
+  focusComposer: () => composerRef.value?.focusTextarea(),
+})
+const chatFind = useChatFind({
+  sessionKey,
+  foregroundBusy: preserveHistoryLiveTail,
+  identity: computed(() => JSON.stringify([deliveryIdentity.value, currentEpoch.value])),
+  search: sessionMessageSearch,
+  onOpen: findPresentation.capture,
+  onReset: restore => { void findPresentation.reset(restore) },
+  onClear: findPresentation.clear,
+  onSelect: findPresentation.select,
+})
+watch(chatFind.open, value => { findOwnsViewport.value = value }, { flush: 'sync' })
+watch(() => historyState.value.sessionMissing, missing => {
+  if (missing) sessionViewCache.invalidate(sessionKey.value)
+}, { flush: 'sync' })
+watch([
+  () => historyState.value.initialLoadStatus,
+  () => historyState.value.loading,
+  () => historyState.value.canonicalAvailable,
+  () => historyState.value.recoveryError,
+], ([status, loading, canonicalAvailable, recoveryError]) => {
+  if (historySessionKey.value === sessionKey.value && !loading && (status === 'error' || recoveryError
+    || (status === 'ready' && canonicalAvailable === false))) {
+    // Legacy or retained history remains readable after a failed refresh. It
+    // cannot populate a verified cache, but must not hide the ongoing live
+    // turn. An epoch refresh can finish without changing the ready status.
+    sessionViewCache.historyInstalled(sessionKey.value, false)
+  }
+}, { flush: 'sync' })
 
 function cancelInitialSessionPin() {
   if (initialSessionPinFrame !== null) {
@@ -2590,10 +2709,9 @@ function beginSessionScrollEpoch() {
   resetReaderScrollTracking()
   clearPendingComposerScrollIntent()
   if (threadRef.value) clearProgrammaticScroll(threadRef.value)
-  // The selected product policy is that every newly opened session starts at
-  // its live edge. A pre-pin reader gesture is recorded below and takes
-  // precedence over this one initial pin.
-  autoScroll.value = true
+  // A warm return restores the reader's position; first visits start at the
+  // live edge. Any new reader gesture still wins over pending restoration.
+  autoScroll.value = sessionViewCache.restoredViewport.value?.followLiveEdge ?? true
 }
 
 function scheduleInitialSessionPin(epoch: number) {
@@ -2612,14 +2730,16 @@ function scheduleInitialSessionPin(epoch: number) {
       if (
         epoch !== scrollEpoch.value
         || sessionScrollInputEpoch === epoch
-        || (!isNewChatLanding.value && sessionKey.value !== historySessionKey.value)
+        || (!isNewChatLanding.value && !sessionViewCache.showingPreview.value && sessionKey.value !== historySessionKey.value)
       ) {
         if (epoch === scrollEpoch.value) sessionScrollSwitching = false
         return
       }
       const thread = threadRef.value
       if (thread && bottomSentinelRef.value) {
-        messageListRef.value?.scrollToEnd({ behavior: 'auto' })
+        const saved = sessionViewCache.restoredViewport.value
+        if (saved) messageListRef.value?.restoreViewport?.(saved)
+        else messageListRef.value?.scrollToEnd({ behavior: 'auto' })
       }
       sessionScrollSwitching = false
     })
@@ -2628,13 +2748,12 @@ function scheduleInitialSessionPin(epoch: number) {
 
 watch(sessionKey, beginSessionScrollEpoch, { flush: 'sync' })
 watch(
-  () => [sessionKey.value, historySessionKey.value, historyState.value.initialLoadStatus] as const,
-  ([activeKey, loadedKey, status]) => {
+  () => [sessionKey.value, historySessionKey.value, sessionViewCache.ready.value, sessionViewCache.showingPreview.value] as const,
+  ([activeKey, loadedKey, ready, preview]) => {
     if (
       !sessionScrollSwitching
       || !activeKey
-      || activeKey !== loadedKey
-      || (status !== 'ready' && status !== 'error')
+      || (!preview && (activeKey !== loadedKey || !ready))
     ) return
     scheduleInitialSessionPin(scrollEpoch.value)
   },
@@ -2763,9 +2882,14 @@ const chatSessionSubscription = useChatSessionSubscription({
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
-  onStreamGenerationReset: chatCompaction.handleGatewayRestart,
+  onStreamGenerationReset: () => {
+    sessionViewCache.invalidate()
+    chatCompaction.handleGatewayRestart()
+  },
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
   onReadStarted: () => {
+    sessionViewCache.beginLiveRead(sessionKey.value)
+    presentationMetadataReady.value = false
     conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
     rpcEventHandlers.beginRecovery()
   },
@@ -2796,18 +2920,34 @@ const chatSessionSubscription = useChatSessionSubscription({
     if (isRecognizedSandboxRunMode(lock.runMode)) {
       activeRunModeLock.value = normalizeSandboxRunMode(lock.runMode)
     } else if (activeRunModeLock.value === null) {
-      activeRunModeLock.value = globalRunMode.value
+      activeRunModeLock.value = preferredRunMode.value
     }
   },
-  beginSessionMetadataResolution: key =>
-    pendingSessionIntent.value === 'new_chat'
-      ? -1
-      : activeProjectWorkspace.beginSessionResolution(key),
+  beginSessionMetadataResolution: key => {
+    if (pendingSessionIntent.value === 'new_chat') return -1
+    const preserveCurrent = workbenchMaterializedSessionKey === key
+    workbenchMaterializedSessionKey = ''
+    return activeProjectWorkspace.beginSessionResolution(key, preserveCurrent)
+  },
   onSessionMetadata: (key, generation, metadata) => {
     if (generation < 0) return
-    activeProjectWorkspace.applySessionSnapshot(key, generation, {
-      workspaceId: metadata.workspaceId ?? undefined,
-      projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
+    if (key === sessionKey.value && props.expectedWorkspaceId !== undefined) {
+      workspaceBindingMismatch.value = (metadata.workspaceId ?? null) !== props.expectedWorkspaceId
+    }
+    const connectionEpoch = gatewayAccess.subscriptionEpoch
+    const cached = projectWorkspaces.workspaces.value.find(item => item.id === metadata.workspaceId)
+    void applySessionProjectWorkspaceMetadata({
+      state: activeProjectWorkspace, sessionKey: key, generation,
+      metadata: {
+        workspaceId: metadata.workspaceId ?? undefined,
+        projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
+        projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
+      },
+      cachedWorkspace: cached ? activeSnapshot(cached) : null,
+      loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
+        .map(workspace => activeSnapshot(workspace)),
+      isCurrent: () => !chatViewDisposed && key === sessionKey.value
+        && gatewayAccess.subscriptionEpoch === connectionEpoch,
     })
   },
   onSessionMetadataError: (key, generation) => {
@@ -2816,6 +2956,13 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
+    const viewGeneration = sessionViewCache.generation.value
+    sessionViewCache.observeEpoch(snapshot.sessionKey, snapshot.epoch)
+    if (viewGeneration !== sessionViewCache.generation.value) {
+      // History can beat metadata on a warm return. A changed incarnation
+      // needs a new fenced history read before the presentation barrier opens.
+      scheduleHistorySync()
+    }
     if (snapshot.sessionKey === sessionKey.value) {
       nativeAttachmentSession.value = typeof snapshot.epoch === 'number' && Number.isSafeInteger(snapshot.epoch)
         && snapshot.epoch >= 0 ? { key: snapshot.sessionKey, epoch: snapshot.epoch } : null
@@ -2825,6 +2972,7 @@ const chatSessionSubscription = useChatSessionSubscription({
     taskProgress.applySnapshot(snapshot)
     applyGoalSnapshot(snapshot)
     applyPendingUserInputSnapshot(snapshot)
+    presentationMetadataReady.value = true
   },
 })
 const {
@@ -2868,6 +3016,12 @@ const {
   setSessionHandoffTarget,
   isSessionBootstrapCurrent,
 } = chatSessionBootstrap
+watch([livePhase, presentationMetadataReady, chatSessionSubscription.metadataRecoveryError], ([phase, metadataReady, error]) => {
+  // Degraded transport must not hide readable history indefinitely. It still
+  // grants no task authority; canStop/send retain their own admission checks.
+  if (phase === 'ready' && metadataReady) sessionViewCache.liveInstalled(sessionKey.value)
+  else if (phase === 'degraded' || (phase === 'ready' && error)) sessionViewCache.liveInstalled(sessionKey.value, false)
+}, { flush: 'sync' })
 
 function holdOptionalRpcAdmission() {
   if (!releaseOptionalRpcAdmission) {
@@ -3055,7 +3209,9 @@ const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
 const effectiveSendBlockedReason = computed<string | null>(() => (
-  (projectBindingBusy.value ? t('workspaces.activeProjectResolving') : null)
+  (props.ownerBlocked || preparingHostSession.value ? t('chat.liveSendBlockedConnecting') : null)
+  || (workspaceBindingMismatch.value ? t('workbench.newPanel.workspaceNotReady') : null)
+  || (projectBindingBusy.value || workbenchSessionPreparing.value ? t('workspaces.activeProjectResolving') : null)
   || deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
   || newTaskModelSendBlockedReason.value
 ))
@@ -3090,7 +3246,7 @@ const offlineQueueIdentity = computed<string | null>(() => {
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
 watch(
   livePhase,
-  phase => appStore.setChatLivePhase(phase),
+  phase => { if (!props.embedded) appStore.setChatLivePhase(phase) },
   { immediate: true },
 )
 watch(livePhase, (phase, previousPhase) => {
@@ -3148,15 +3304,36 @@ const canStop = computed(() => (
     )
   ))
 ))
+const { showStop: showStableStop } = useStableStopControl({
+  identity: () => deliveryIdentity.value ? JSON.stringify([
+    deliveryIdentity.value, sessionKey.value, nativeAttachmentSession.value?.epoch ?? null,
+  ]) : '',
+  taskId: () => {
+    const id = taskOwnership.stopTargetTaskId.value || activeStreamTaskId.value
+    return [PENDING_STREAM_TASK_ID, FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(id) ? '' : id
+  },
+  canStop: () => canStop.value,
+  hydrating: () => isSessionHydrating.value || !taskOwnership.hydrationResolved.value || !presentationMetadataReady.value,
+  terminal: () => [FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(activeStreamTaskId.value),
+})
+const showCachedStop = computed(() => {
+  const id = sessionViewCache.presentation.value?.stoppableTaskId
+  const current = taskOwnership.stopTargetTaskId.value || activeStreamTaskId.value
+  return Boolean(id && sessionViewCache.showingPreview.value
+    && (isSessionHydrating.value || !taskOwnership.hydrationResolved.value || !presentationMetadataReady.value)
+    && !taskOwnership.isSettled(id)
+    && ![FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(current)
+    && (!current || current === PENDING_STREAM_TASK_ID || current === id))
+})
 const runModeLocked = computed(
-  () => isSessionHydrating.value
+  () => preparingHostSession.value || isSessionHydrating.value
     || sessionHasActiveWork.value
     || activeRunModeLock.value !== null,
 )
 
 watch(sessionHasActiveWork, active => {
   if (active && activeRunModeLock.value === null) {
-    activeRunModeLock.value = globalRunMode.value
+    activeRunModeLock.value = preferredRunMode.value
   } else if (!active && !isSessionHydrating.value) {
     activeRunModeLock.value = null
   }
@@ -3229,6 +3406,17 @@ async function switchToSession(nextSessionKey: string) {
     await handleAuthoritativeSessionSubscription(nextSessionKey)
   }
   return outcome
+}
+
+async function openReferencedSession(nextSessionKey: string) {
+  if (chatViewDisposed || !nextSessionKey.trim()) return
+  // A side host remains bound to its leased child. References navigate the
+  // route-owned conversation instead of adopting a different execution owner.
+  if (props.embedded) {
+    await router.push({ path: '/chat', query: { session: nextSessionKey } })
+    return
+  }
+  await switchToSession(nextSessionKey)
 }
 
 function projectAcceptedGoalMessage({
@@ -3354,7 +3542,7 @@ const chatGoals = useChatGoals({
     return outcome.authoritative
   },
   onSetAccepted: projectAcceptedGoalMessage,
-  notify: message => pushToast(message, { duration: 6000 }),
+  notify: message => pushToast(message, { tone: 'danger', duration: 6000 }),
 })
 applyGoalSnapshot = snapshot => { chatGoals.applyHydration(snapshot) }
 const {
@@ -3440,13 +3628,26 @@ const goalOutcomeHasMessageAnchor = computed(() => (
   goalHasRenderedTerminalAnchor(goalOutcomeGoal.value, renderedMessages.value)
 ))
 
+const sideChatCommand = useSideChatCommand({
+  launcher: useSideChatLauncher(), inputText: composerText, sessionKey, revision: composerRevision,
+  identity: () => gatewayAccess.deliveryIdentity,
+  allowed: () => conversationSlashActionAllowed(conversationPolicy.value, 'workbench.openSideChat'),
+  active: () => !chatViewDisposed && chatViewActive && !props.ownerBlocked,
+  hasAttachments: () => pendingAttachments.value.length > 0 || selectedSkills.value.length > 0
+    || localPaths.value.length > 0 || sendableAnnotationDraftIds.value.length > 0
+    || Boolean(visualizeDraft.snapshot.value) || goalDraftArmed.value || Boolean(replanTarget.value),
+  notify: message => pushToast(message, { duration: 6000 }), translate: key => t(key), resized: autoResizeTextarea,
+})
 const chatSlashCommands = useChatSlashCommands({
+  sideChat: sideChatCommand,
+  commandAllowed: command => conversationSlashActionAllowed(conversationPolicy.value, command.execution?.action || command.cmd),
   skillCatalog,
   selectedSkills,
-  getCaret: () => composerRef.value?.composerElement()?.querySelector('textarea')?.selectionStart ?? composerText.value.length,
+  getCaret: () => composerRef.value?.getSelection().start ?? composerText.value.length,
+  onSelectSkill: (skill, position) => { skillPositions.value = { ...skillPositions.value, [skill.instanceId]: position } },
   setCaret: (position) => { void nextTick(() => {
     composerRef.value?.focusTextarea()
-    composerRef.value?.composerElement()?.querySelector('textarea')?.setSelectionRange(position, position)
+    composerRef.value?.setSelectionRange(position, position)
   }) },
   manageSkill: (name) => { void router.push({ path: '/skills', query: { skill: name } }) },
   commandCatalog,
@@ -3462,10 +3663,16 @@ const chatSlashCommands = useChatSlashCommands({
     goToDraft({ agentId: 'main' })
   },
   resetCurrentSession: () => {
+    sessionViewCache.invalidate(sessionKey.value)
     resetCurrentSessionAfterSlash()
     resetSessionArtifacts()
     chatPlans.reset()
     chatGoals.reset()
+    // Reset retires both presentation barriers under the same route key.
+    // Confirm the new incarnation instead of leaving live output gated by the
+    // completed bootstrap of the discarded conversation.
+    scheduleHistorySync()
+    void retryLive()
   },
   setCompactInFlight,
   showCompactStatus,
@@ -3488,6 +3695,7 @@ const {
   slashOpen,
   slashIdx,
   skillCandidates,
+  skillPaletteItems,
   skillsLoading,
   skillsError,
   invalidateSkillCandidates,
@@ -3506,9 +3714,24 @@ const browserUseAvailable = computed(() => browserUseSupported.value
   && skillCandidates.value.some(candidate => candidate.name === 'browser-use' && candidate.ready))
 
 function prepareAddMenu() {
-  if (!browserUseSupported.value) return
+  closeSlashMenu()
   invalidateSkillCandidates()
   void loadSkillCandidates()
+}
+
+const composerSkillItems = computed(() => skillPaletteItems.value.map(item => (
+  item.skill?.name === 'browser-use' && !browserUseSupported.value
+    ? { ...item, skill: { ...item.skill, ready: false, reasonCode: 'tools_unavailable' as const } }
+    : item
+)))
+
+async function selectComposerSkill(command: (typeof skillPaletteItems.value)[number]) {
+  if (!command.skill || (command.skill.name === 'browser-use' && !browserUseSupported.value)) return
+  const origin = sessionKey.value
+  if (chatSlashCommands.selectPaletteSkill(command) && origin === sessionKey.value) {
+    await nextTick()
+    composerRef.value?.focusTextarea()
+  }
 }
 
 async function selectBrowserUse() {
@@ -3552,6 +3775,7 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   localPathReferences: localPaths,
   restoreInput,
   textareaText: composerText,
+  getEditorSelection: () => composerRef.value?.getSelection() ?? null,
   composing,
   messages,
   pendingQueue,
@@ -3567,9 +3791,19 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   activateSlashCmd,
   popPendingTail,
   enqueuePendingInput: async text => {
+    const context = visualizeDraft.capture()
+    if (visualizeDraft.snapshot.value && !context) return false
+    const revision = composerRevision.value
+    if (context && !await acceptsVisualizeContext(text, classifySlashCommand)) return false
+    if (context && (!context.isCurrent() || composerRevision.value !== revision)) return false
     const resume = !isStopPending.value ? capturePendingAutoSendResume() : undefined
-    const queued = await enqueuePendingInput(text)
-    if (queued) resume?.()
+    const queued = await enqueuePendingInput(
+      context ? context.message(text, t('visualize.contextAttached')) : text,
+      undefined,
+      context && text.trim().startsWith('/') && !text.trim().startsWith('//')
+        ? { confirmedPlainText: true } : undefined,
+    )
+    if (queued) { context?.accepted(); resume?.() }
     return queued
   },
   sendCurrentInput: () => sendCurrentInput(),
@@ -3597,6 +3831,11 @@ const chatSend = useChatSend({
       forgetFreshDraftSession(
         request.kind === 'new-turn' ? request.params.sessionKey : request.params.key,
       )
+      if (conversationPolicy.value.kind === 'side' && request.kind === 'new-turn') {
+        request = { ...request, params: { ...request.params,
+          source: { ...request.params.source, noMemoryCapture: true },
+        } }
+      }
       return turnCommands.send(request, options)
     },
     cancel: (request, options) => turnCommands.cancel(request, options),
@@ -3638,10 +3877,13 @@ const chatSend = useChatSend({
   draftIds: sendableAnnotationDraftIds,
   idempotentReplayBlockedReason: liveSendBlockedReason,
   preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
+    if (!ids.every(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id]))) return false
     const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
-  promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
+  promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(
+    ids.filter(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id])),
+  ).filter(annotationAllowed),
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -3754,7 +3996,46 @@ watch(
 async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {
+  if (!sendOptions?.bypassSlashCommand && parseSideChatCommand(composerText.value)) {
+    await sideChatCommand.run(composerText.value)
+    return
+  }
   if (browserUseSelectionPending.value) return
+  if (props.ownerBlocked) return
+  if (props.embedded && !sessionKey.value) {
+    if (preparingHostSession.value || !props.prepareSession || !composerHasSendContent.value) return
+    preparingHostSession.value = true
+    try {
+      // Capture user-selected draft routing before bootstrap applies the
+      // child's inherited settings. Creating the owner alone never sends.
+      const mode = initialRoutingMode.value
+      const model = newTaskModelSelection.value
+      const key = await props.prepareSession()
+      if (chatViewDisposed || !key) return
+      // Keep the draft key (and its model/routing choice) until configuration
+      // succeeds. The owner retains this child, so a failed CAS retries the
+      // same session without adopting its inherited settings or sending.
+      const isCurrentDraft = () => !chatViewDisposed && !props.ownerBlocked && !sessionKey.value
+      if (sessionRouting && (mode || model)) {
+        await configureWorkbenchSessionRouting(sessionRouting, key, mode ?? 'direct', model, isCurrentDraft)
+      }
+      if (!isCurrentDraft()) return
+      sessionKey.value = key
+      pendingSessionIntent.value = null
+      activeProjectWorkspace.beginSessionResolution(key)
+      const bootstrap = startSessionBootstrap({ includeHistory: true, force: true })
+      const result = await bootstrap.live
+      if (chatViewDisposed || sessionKey.value !== key || !result.authoritative || workspaceBindingMismatch.value) return
+      if (sessionRouting && (mode || model)) {
+        await chatSessionRouting.load()
+      }
+      await nextTick()
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : String(error), { tone: 'danger' })
+      return
+    } finally { preparingHostSession.value = false }
+  }
+  if (props.ownerBlocked || workspaceBindingMismatch.value) return
   if (pendingSessionIntent.value === 'new_chat') {
     draftHandoffSourceKey.value = sessionKey.value
   }
@@ -3764,6 +4045,52 @@ async function onSend(
   }
   await dispatchCurrentInput(sendOptions)
 }
+
+// Both ordinary side typing and a slash-command hand-off use this view's one
+// sender/receipt ledger. A retry keeps the same child and its recovered attempt.
+const sideLaunchAccepted = new Set<string>()
+const sideLaunchPending = new Map<string, Promise<boolean>>()
+async function launchSideChat(request: SideChatLaunchRequest): Promise<boolean> {
+  if (!props.embedded || props.workbenchOwnerSessionKey !== request.parentKey || !request.isCurrent()
+    || chatViewDisposed || props.ownerBlocked) return false
+  if (sideLaunchAccepted.has(request.requestId)) return true
+  if (!request.text) {
+    await nextTick()
+    if (!request.isCurrent()) return false
+    composerRef.value?.focusTextarea()
+    return true
+  }
+  const pending = sideLaunchPending.get(request.requestId)
+  if (pending) return pending
+  const hasExtraDraftContent = () => pendingAttachments.value.length > 0 || selectedSkills.value.length > 0
+    || localPaths.value.length > 0 || sendableAnnotationDraftIds.value.length > 0
+    || Boolean(visualizeDraft.snapshot.value) || goalDraftArmed.value || Boolean(replanTarget.value)
+  if (hasExtraDraftContent()) return false
+  if (composerText.value && composerText.value !== request.text) return false
+  composerText.value = request.text
+  autoResizeTextarea()
+  composerRef.value?.focusTextarea()
+  // Restoring equivalent empty draft collections is not a user edit.
+  // Track semantic draft changes here, permanently fencing even an
+  // edit-then-undo, before the shared sender takes its own immutable snapshot.
+  let childDraftChanged = false
+  const stopDraftWatch = watch([composerText, hasExtraDraftContent], () => {
+    if (composerText.value !== request.text || hasExtraDraftContent()) childDraftChanged = true
+  }, { flush: 'sync' })
+  const draftIsCurrent = () => request.isCurrent() && !childDraftChanged
+    && composerText.value === request.text && !hasExtraDraftContent()
+  const sending = (async () => {
+    await nextTick()
+    if (!draftIsCurrent()) return false
+    await onSend({ bypassSlashCommand: true, cancelIfComposerChanged: true,
+      preflightGuard: draftIsCurrent, preDispatchGuard: request.isCurrent,
+      onDeliveryAccepted: () => { sideLaunchAccepted.add(request.requestId) } })
+    return sideLaunchAccepted.has(request.requestId)
+  })().finally(() => { stopDraftWatch(); sideLaunchPending.delete(request.requestId) })
+  sideLaunchPending.set(request.requestId, sending)
+  return sending
+}
+defineExpose({ launchSideChat })
 sendCurrentInput = onSend
 
 function flushPendingAutoSend(targetSessionKey: string): boolean {
@@ -3844,12 +4171,17 @@ watch(composerSameTurnSteerAvailable, (available) => {
 })
 
 async function onComposerSend() {
+  if (parseSideChatCommand(composerText.value)) { await sideChatCommand.run(composerText.value); return }
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
-  if (composerSendBlockedMessage.value) return
+  if (composerSendBlockedMessage.value) {
+    composerRef.value?.showSendBlockedHint()
+    return
+  }
   // Serialize session-routing and plan mutations before accepting another
   // composer turn, so the send cannot race either CAS update.
   if (modelRoutingMutationBusy.value || planModeBusy.value) return
+  const returnToLiveOnAccepted = chatFind.captureAcceptedSend(jumpToLatest)
   // Goal draft mode: the composer text is the durable objective and the set
   // mutation atomically accepts its first ordinary user turn.
   if (goalDraftArmed.value) {
@@ -3858,6 +4190,7 @@ async function onComposerSend() {
     const submittedRevision = composerRevision.value
     const started = await startGoal(goalText)
     if (!started) return
+    returnToLiveOnAccepted()
     disarmGoalMode()
     if (composerRevision.value === submittedRevision) inputText.value = ''
     autoResizeTextarea()
@@ -3865,7 +4198,26 @@ async function onComposerSend() {
   }
   const target = replanTarget.value
   if (!target) {
-    onSend({ resumeQueueOnSuccess: !isStopPending.value })
+    const context = visualizeDraft.capture()
+    // A visible attachment must not silently disappear from the submitted request
+    // during cached/read-only recovery. The normal Send gate owns the next retry.
+    if (visualizeDraft.snapshot.value && !context) return
+    const composer = inputText.value
+    const submittedRevision = composerRevision.value
+    // Only actual controls keep the attachment for a later question. Unknown
+    // slash text and the // escape are ordinary messages in the existing sender.
+    const withContext = context && await acceptsVisualizeContext(composer, classifySlashCommand)
+    if (context && (!context.isCurrent() || composerRevision.value !== submittedRevision)) return
+    void onSend({
+      resumeQueueOnSuccess: !isStopPending.value,
+      ...(withContext ? {
+        composerText: composer, textOverride: context.message(composer, t('visualize.contextAttached')),
+        consumeComposerOnQueue: true, cancelIfComposerChanged: true,
+        preflightGuard: context.isCurrent,
+        preDispatchGuard: context.isCurrent,
+      } : {}),
+      onAccepted: () => { if (withContext) context.accepted(); returnToLiveOnAccepted() },
+    })
     return
   }
   const prompt = inputText.value.trim()
@@ -3873,6 +4225,7 @@ async function onComposerSend() {
   const submittedRevision = composerRevision.value
   const accepted = await chatPlans.revise({ ...target, prompt })
   if (!accepted) return
+  returnToLiveOnAccepted()
   if (composerRevision.value === submittedRevision) {
     inputText.value = ''
     autoResizeTextarea()
@@ -3903,9 +4256,11 @@ async function sendPendingMessage(pendingUiId: string) {
   if (!candidate || candidate.steerAttempt) return
   const item = beginPendingDelivery(pendingUiId)
   if (!item) return
+  const returnToLiveOnAccepted = chatFind.captureAcceptedSend(jumpToLatest)
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
     outcome = await sendQueuedFollowup(item, ownerSessionKey, preDispatchGuard)
+    if (outcome === 'accepted') returnToLiveOnAccepted()
   } finally {
     settlePendingDelivery(item, outcome)
   }
@@ -3927,9 +4282,11 @@ async function steerPendingMessage(pendingUiId: string) {
   if (!item) return
   if (candidate?.steerAttempt) pendingSteerClicks.add(candidate)
 
+  const returnToLiveOnAccepted = chatFind.captureAcceptedSend(jumpToLatest)
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
     outcome = await sendQueuedSteer(item)
+    if (outcome === 'accepted') returnToLiveOnAccepted()
   } finally {
     settlePendingDelivery(item, outcome)
     pendingSteerClicks.delete(item)
@@ -3943,9 +4300,9 @@ const chatApprovals = useChatApprovals({
   gatewayAvailability: computed(() => gatewayAccess.availability),
   sessionKey,
   runStatus,
-  stream: { isStreaming, appendInterruptFrame, ensureInterruptBubble },
+  stream: { appendInterruptFrame },
   interruptState,
-  onSnapshotCount: count => appStore.setApprovalCount(count),
+  onSnapshotCount: count => { if (!props.embedded) appStore.setApprovalCount(count) },
 })
 const {
   pendingClarify,
@@ -4113,8 +4470,8 @@ bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
 const { attachTurnReasoning } = rpcEventHandlers
 
-// The append-only turn log is the single live content projection. The activity
-// head (phase/elapsed) remains presentation state outside the transcript fold.
+// The append-only turn log is the single live content projection. Only the
+// total clock and accessible phase announcement live outside the transcript.
 const liveTimelineItems = computed(() => stripBackgroundProcessNoticeTimeline(
   foldedTurn.value.timelineItems,
   foldedTurn.value.toolCalls,
@@ -4122,6 +4479,8 @@ const liveTimelineItems = computed(() => stripBackgroundProcessNoticeTimeline(
 ))
 const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
   keepToolTurnTextInActivity: true,
+  toolInputPreviewOrder: Math.max(0, ...toolInputPreviews.value.map(preview => preview.activityOrder)),
+  renderActivityMarkdown: renderMarkdown,
 }))
 const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() => {
   const candidate = liveTimelineSplit.value.answerItem
@@ -4152,23 +4511,24 @@ const liveActivityProjection = computed(() =>
 const liveCurrentActivityTool = computed(() => liveActivityProjection.value.activityClusters.find(
   cluster => cluster.key === liveActivityProjection.value.currentClusterKey,
 ))
-const liveActivityPhaseLabel = computed(() => {
+const liveActivityDisplayProjection = computed(() => toolInputPreviews.value.length ? {
+  ...liveActivityProjection.value,
+  statusSteps: liveActivityProjection.value.statusSteps.filter(step =>
+    !(step.isCurrent && step.label.code === 'chat.activity.lifecycle.preparingToolCall')),
+} : liveActivityProjection.value)
+const liveCurrentActivityPhase = computed(() => [...liveActivityProjection.value.statusSteps].reverse().find(step => step.isCurrent))
+const liveActivityWaiting = computed(() => !['queued', 'approval_pending'].includes(runStatus.value.status) && !liveCurrentActivityTool.value && liveCurrentActivityPhase.value?.providerRecovery?.phase === 'retry_wait')
+function currentActivityLabel(announce = false): string {
   if (runStatus.value.status === 'queued') return String(t('chat.status.queued'))
   if (runStatus.value.status === 'approval_pending') return String(t('chat.status.approvalPending'))
-  const currentPhase = [...liveActivityProjection.value.statusSteps].reverse()
-    .find(step => step.isCurrent)
-  const label = liveCurrentActivityTool.value?.purpose || currentPhase?.label
-  if (!liveCurrentActivityTool.value && currentPhase) {
-    const seconds = providerActivityRemainingSeconds(currentPhase)
-    if (seconds !== null) return String(t(currentPhase.label.code, { ...currentPhase.label.params, seconds }))
-  }
-  return label ? String(t(label.code, label.params)) : String(t('chat.activity.lifecycle.working'))
-})
-const liveActivityElapsedLabel = computed(() => {
-  if (streamActivityStale.value || ['queued', 'approval_pending'].includes(runStatus.value.status)) return ''
-  const runningCall = liveCurrentActivityTool.value?.calls.find(call => call.isRunning)
-  return runningCall ? liveToolElapsedText(runningCall) : streamPhaseElapsed.value
-})
+  const phase = liveCurrentActivityPhase.value
+  const label = liveCurrentActivityTool.value?.purpose || (phase && providerActivityLabel(phase, Date.now(), announce))
+  const text = label ? String(t(label.code, label.params)) : String(t('chat.activity.lifecycle.working'))
+  return !liveCurrentActivityTool.value && phase?.category === 'maintenance' && phase.providerRecovery
+    ? `${t(phase.label.code, phase.label.params)} · ${text}` : text
+}
+const liveActivityPhaseLabel = computed(() => { void streamPhaseElapsed.value; return currentActivityLabel() })
+const liveActivityPhaseAnnouncement = computed(() => liveActivityWaiting.value ? currentActivityLabel(true) : '')
 const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.statusSteps]
   .reverse()
   .find(step => step.isCurrent && step.category !== 'maintenance')
@@ -4176,7 +4536,16 @@ const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.sta
 const liveReasoningCollapseActive = computed(() =>
   liveCurrentPhaseCode.value === 'chat.activity.lifecycle.answering',
 )
-const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
+const {
+  stateScope: liveToolStateScope,
+} = useChatToolDisclosureScope({
+  sessionKey,
+  activeTaskId: activeStreamTaskId,
+  isStreaming,
+  messages,
+  renderedMessages,
+  migrateScope: migrateToolDisclosureScope,
+})
 // Elapsed readouts in the live turn round to whole seconds ("4s"), matching
 // streamPhaseElapsed. The shared tool formatter
 // (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
@@ -4190,26 +4559,12 @@ const liveArtifacts = computed(() => foldedTurn.value.artifacts)
 const liveReasoningBlocks = computed<ReasoningBlock[]>(() =>
   foldedTurn.value.reasoningBlocks.filter(block => block.text),
 )
-function validLiveActivityOrder(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
-}
-const liveHasUnifiedActivityOrder = computed(() => {
-  const orders = [
-    ...liveActivityProjection.value.statusSteps
-      .filter(isVisibleActivityStatusStep)
-      .map(step => step.activityOrder),
-    ...liveReasoningBlocks.value.map(block => block.activityOrder),
-    ...liveActivityTimelineItems.value.map(item => (
-      item.activityOrder
-      ?? (item.type === 'tool-group' ? item.group.activityOrder : undefined)
-    )),
-  ]
-  return orders.length > 0 && orders.every(validLiveActivityOrder)
-})
-// No clamp and no raw status count: the header chip must agree with the
-// visible body, which renders clusters plus only the semantic status steps.
-// A text-only turn therefore counts 0 and the disclosure's stepCount > 0
-// gate hides the chip instead of claiming "step 1" over an empty body.
+const liveHasUnifiedActivityOrder = computed(() => canMergeAssistantActivityOrder(
+  liveActivityProjection.value.statusSteps,
+  liveReasoningBlocks.value,
+  liveActivityTimelineItems.value,
+))
+// Keep the fallback count semantic for records without an elapsed duration.
 const liveActivityStepCount = computed(() =>
   liveActivityProjection.value.activityClusters.length
     + liveActivityProjection.value.statusSteps.filter(isSemanticActivityStatusStep).length
@@ -4224,6 +4579,91 @@ const liveInterruptParts = computed(() => foldedTurn.value.parts.filter(
 const livePendingInterruptParts = computed(() =>
   liveInterruptParts.value.filter(part => !part.resolution),
 )
+
+// Tool-start can survive an approval interrupt. Motion needs the live owner,
+// not just that persisted per-call flag, to confirm execution is still active.
+const liveActivityExecuting = computed(() =>
+  isStreaming.value
+  && runStatus.value.status === 'running'
+  && !streamActivityStale.value
+  && !isStopPending.value
+  && livePendingInterruptParts.value.length === 0,
+)
+
+function captureLivePresentation(key = sessionKey.value) {
+  // Departure capture runs before scoped owners reset, but the route key has
+  // already changed. Retain the outgoing task's disclosure identity explicitly.
+  const turnKey = String(JSON.parse(liveToolStateScope.value)[1])
+  const liveVisualizeReceipts = visualizeReceipts(foldedTurn.value.toolCalls)
+  return {
+    visible: isStreaming.value && streamBubble.value && answerRevealOpen.value,
+    liveActivityContinuityKey: assistantActivityContinuityKey(key, turnKey),
+    liveToolStateScope: JSON.stringify([key, turnKey]),
+    liveActivityExecuting: liveActivityExecuting.value,
+    liveActivityStepCount: executionDockRun.value?.status === 'running' ? 0 : liveActivityStepCount.value,
+    liveActivityFailureCount: liveActivityFailureCount.value,
+    liveActivityPhaseLabel: liveActivityPhaseLabel.value,
+    liveActivityPhaseAnnouncement: liveActivityPhaseAnnouncement.value,
+    liveActivityWaiting: liveActivityWaiting.value,
+    queued: runStatus.value.status === 'queued',
+    streamTurnElapsed: streamTurnElapsed.value,
+    streamActivityStale: streamActivityStale.value,
+    liveHasUnifiedActivityOrder: liveHasUnifiedActivityOrder.value,
+    liveActivityDisplayProjection: liveActivityDisplayProjection.value,
+    liveActivityTimelineItems: liveActivityTimelineItems.value,
+    liveReasoningBlocks: liveReasoningBlocks.value,
+    liveReasoningCollapseActive: liveReasoningCollapseActive.value,
+    toolInputPreviews: toolInputPreviews.value,
+    liveAnswerPart: liveAnswerPart.value,
+    liveVisualizeReceipts,
+    liveVisualizePublications: { sessionKey: key, deliveryIdentity: deliveryIdentity.value, receipts: liveVisualizeReceipts },
+    liveCurrentPhaseCode: liveCurrentPhaseCode.value,
+    liveArtifacts: liveArtifacts.value,
+    livePendingInterruptParts: livePendingInterruptParts.value,
+    skillLoads: liveSkillLoads.value[activeStreamTaskId.value] || [],
+    toolElapsed: Object.fromEntries(foldedTurn.value.toolCalls.map(call => [call.toolId, liveToolElapsedText(call)])),
+  }
+}
+
+function captureSessionPresentation(key: string) {
+  const taskId = taskOwnership.stopTargetTaskId.value || activeStreamTaskId.value
+  const stoppableTaskId = (canStop.value || showStableStop.value)
+    && ![PENDING_STREAM_TASK_ID, FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID].includes(taskId)
+    ? taskId : ''
+  return {
+    live: captureLivePresentation(key),
+    modelRoutingMode: modelRoutingMode.value,
+    modelSelection: composerModelSelection.value,
+    modelSelectionAvailable: composerModelSelectionAvailable.value,
+    sessionModelName: sessionModelName.value,
+    stoppableTaskId,
+  }
+}
+
+function captureSessionViewport(retainedMessages: readonly ChatMessage[]) {
+  const viewport = findOwnsViewport.value
+    ? findPresentation.capturedViewport() : messageListRef.value?.captureViewport?.()
+  if (!viewport?.anchor || viewport.followLiveEdge) return viewport
+  const anchor = visibleRenderedMessages.value.find((message, index) => chatMessageKey(message, index) === viewport.anchor?.key)
+  if (anchor?.sourceIndex !== undefined && anchor.sourceIndex < messages.value.length - retainedMessages.length) {
+    // The bounded cache does not contain this older page. Treat it as a cold
+    // return rather than applying its pixel offset to unrelated newer text.
+    return undefined
+  }
+  return viewport
+}
+
+const presentedLive = computed(() => {
+  const cached = sessionViewCache.presentation.value?.live
+  if (cached) return { ...cached, liveActivityExecuting: false, liveActivityPhaseAnnouncement: '' }
+  const current = captureLivePresentation()
+  // Replayed content must not precede its historical user/context rows. Drafts
+  // and already-installed sessions retain normal immediate streaming.
+  return { ...current, visible: current.visible && (sessionViewCache.ready.value || isDraftSurface()) }
+})
+function presentedToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
+  return presentedLive.value.toolElapsed[call.toolId] ?? ''
+}
 
 const visiblePendingInterruptKeys = computed(() => {
   const keys = new Set(livePendingInterruptParts.value.map(part => part.key))
@@ -4269,11 +4709,8 @@ watch(
   { flush: 'post', immediate: true },
 )
 
-// Feeds the persistent visually-hidden status region in the template. It only
-// fills on the true→false streaming transition (a live turn actually settled),
-// and empties as soon as the next turn starts so that setting the same
-// "Completed" text again is a fresh mutation screen readers re-announce.
-const turnSettledAnnouncement = ref('')
+// Reuse the hidden live region; outcome text follows the confirmed run state.
+const turnSettledAnnouncement = useChatTurnAnnouncement({ sessionKey, isStreaming, runStatus, t })
 
 function preserveTerminalAnswerAnchor() {
   const container = threadRef.value
@@ -4332,11 +4769,9 @@ function preserveTerminalAnswerAnchor() {
   void nextTick(() => window.requestAnimationFrame(restore))
 }
 
-watch(isStreaming, (streaming, wasStreaming) => {
-  if (streaming) turnSettledAnnouncement.value = ''
-  else if (wasStreaming) {
+watch([sessionKey, isStreaming], ([key, streaming], [previousKey, wasStreaming]) => {
+  if (key === previousKey && wasStreaming && !streaming) {
     preserveTerminalAnswerAnchor()
-    turnSettledAnnouncement.value = String(t('chat.activity.lifecycle.settled'))
   }
 }, { flush: 'pre' })
 
@@ -4359,7 +4794,18 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
         message.payload,
       )
     }
-    return rpcEventHandlers.consumeConversationEvent(message)
+    const previousEpoch = currentEpoch.value
+    const result = rpcEventHandlers.consumeConversationEvent(message)
+    if (currentEpoch.value !== previousEpoch) {
+      const viewGeneration = sessionViewCache.generation.value
+      sessionViewCache.observeEpoch(sessionKey.value, currentEpoch.value)
+      if (viewGeneration !== sessionViewCache.generation.value) {
+        presentationMetadataReady.value = false
+        scheduleHistorySync()
+        void retryLive()
+      }
+    }
+    return result
   },
   onRecoveryRequired: recoverCurrentSession,
   onConnectionState: rpcEventHandlers.handlers.onConnectionState,
@@ -4392,8 +4838,10 @@ function recoverCurrentSession(scope?: { readonly keys: readonly string[], reado
 // Session switches drop the previous session's stall tracking entirely.
 watch(sessionKey, () => {
   stallWatchdog.reset()
-  clearAssistantActivityExpansionState()
 })
+watch([sessionKey, deliveryIdentity], ([key, scope]) => {
+  activateAssistantActivitySession(key, scope, activityOwner)
+}, { flush: 'sync', immediate: true })
 
 // Keep event delivery fenced to the visible logical session. The hub swaps
 // only its handle; the shared WebSocket and diagnostic listeners stay alive.
@@ -4496,6 +4944,7 @@ const recoveryNoticeState = computed(() => historyState.value.sessionMissing
 const recoveryNoticeVisible = useChatRecoveryNotice(
   recoveryNoticeState,
   computed(() => gatewayAccess.isRuntimeStarting),
+  computed(() => gatewayAccess.connectionBlocked === true),
 )
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
@@ -4504,6 +4953,11 @@ const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession
   messageCount: messages.value.length,
   initialHistoryStatus: historyState.value.initialLoadStatus,
 }))
+
+const showTemporaryConversationEmpty = computed(() => conversationPolicy.value.kind === 'side'
+  && !props.ownerBlocked && !forkTransition.value && !preparingHostSession.value
+  && messages.value.length === 0 && !isStreaming.value && pendingQueue.value.length === 0
+  && (!sessionKey.value || showConfirmedEmptySession.value))
 
 const composerPlaceholder = computed(() => {
   if (dockedPlanQuestionnaire.value) return t('chat.clarify.answerPlanQuestionnaire')
@@ -4526,12 +4980,12 @@ const composerHasSendContent = computed(() =>
 // A mixed-version gateway may know plans.setMode but not the atomic first-send
 // contract. Hide Plan rather than claim a read-only turn that would run Default.
 const planUiAvailable = computed(() =>
-  planCenter.available('mode'),
+  conversationPolicy.value.plan && planCenter.available('mode'),
 )
 const planPresentationAvailable = computed(() =>
   !shareMode.value && !forkTransition.value && planCenter.available('presentation'),
 )
-const goalUiAvailable = computed(() => goalCenter.available('goal-mode'))
+const goalUiAvailable = computed(() => conversationPolicy.value.goal && goalCenter.available('goal-mode'))
 const goalComposerExisting = computed(() => (
   currentGoalRun.value !== null
   && !goalStatusIsTerminal(currentGoalRun.value.status)
@@ -4674,6 +5128,17 @@ const composerSendBlockedMessage = computed(() =>
   || (offlineQueueIdentity.value ? '' : activeProjectComposerBlockMessage.value),
 )
 
+const composerSendBlockedTooltip = computed(() => {
+  // Preserve the blocking priority above. Project, annotation and fork UI
+  // already explain their own state; only otherwise silent gates need a hint.
+  if (browserUseSelectionPending.value || forkTransition.value) return false
+  if (modelImageSendBlockedMessage.value) return true
+  if (offlineQueueIdentity.value || projectBindingBusy.value) return false
+  if (deliveryBlockedReason.value) return true
+  if (promptAnnotationSendBlockedReason.value) return false
+  return Boolean(newTaskModelSendBlockedReason.value)
+})
+
 const sendButtonTitle = computed(() => {
   if (replanActive.value) return t('chat.plan.reviseSend')
   if (composerSendBlockedMessage.value) return composerSendBlockedMessage.value
@@ -4808,7 +5273,11 @@ function reportRunModePersistenceError(cause: unknown): void {
 }
 
 async function persistComposerRunMode(mode: SandboxRunMode): Promise<void> {
-  await setGlobalRunMode(mode)
+  if (props.embedded) {
+    props.draftStorage?.setItem('conversation.run-mode', mode)
+    localRunMode.value = mode
+  }
+  else await setGlobalRunMode(mode)
   void sandboxSetupRecovery.refresh()
 }
 
@@ -4855,7 +5324,7 @@ function runComposerSandboxSetupInBackground(): void {
 }
 
 async function setComposerSessionRoutingMode(mode: ModelRoutingMode) {
-  if (goalBusy.value) return
+  if (preparingHostSession.value || goalBusy.value) return
   await newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode)
 }
 
@@ -4886,6 +5355,40 @@ function applyLandingSuggestion(text: string) {
   if (landingSuggestionsDisabled.value) return
   sendComposerText(text)
 }
+
+function visualizeConversationEnabled(key: string) {
+  return Boolean(key && key === sessionKey.value && gatewayAccess.isAvailable && !shareMode.value
+    && !sessionViewCache.showingPreview.value && sessionViewCache.ready.value
+    && !isSessionHydrating.value && taskOwnership.hydrationResolved.value
+    && !forkTransition.value && !goalDraftArmed.value && !replanActive.value && !dockedPlanQuestionnaire.value)
+}
+watch([goalDraftArmed, replanActive, dockedPlanQuestionnaire], ([goal, replan, questionnaire]) => {
+  if (goal || replan || questionnaire) visualizeDraft.clear()
+})
+provide(VISUALIZE_CONVERSATION_KEY, {
+  enabled: visualizeConversationEnabled,
+  attach(key, receipt, context) {
+    const attached = visualizeDraft.attach(key, receipt, context)
+    if (!attached) return false
+    if (!composerText.value.trim() && attached.suggestedPrompt) appendComposerText(attached.suggestedPrompt)
+    expandComposer()
+    nextTick(() => composerRef.value?.focusTextarea())
+    return true
+  },
+  draft(key, receipt, text) {
+    if (!visualizeConversationEnabled(key)) return false
+    const draft = `${receipt.name}\n${text.slice(0, 4000)}`
+    // Idempotent while the exact block is still in this session's composer.
+    // Clearing/sending it permits another explicit request, even after remount.
+    const presented = localPathPresentation(draft).text.trim()
+    if (!composerText.value.includes(presented)) appendComposerText(draft)
+    expandComposer()
+    nextTick(() => {
+      if (visualizeConversationEnabled(key)) composerRef.value?.focusTextarea()
+    })
+    return true
+  },
+})
 
 function appendComposerText(text: string, paths?: readonly string[]) {
   const presentation = localPathPresentation(String(text || '').trim(), paths)
@@ -5006,11 +5509,13 @@ function subagentBody(text: string): string {
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
-function previewImageAttachment(attachment: DisplayAttachment, attachments: readonly DisplayAttachment[]) {
+function previewImageAttachment(attachment: DisplayAttachment, attachments: readonly DisplayAttachment[], preview?: AttachmentImagePreviewSource) {
   artifactImageLightbox.openAttachments({
     attachment,
     navigationAttachments: attachments,
+    attachmentPreview: preview,
     sessionKey: sessionKey.value,
+    ownerSessionKey: workbenchOwnerKey.value,
   })
 }
 
@@ -5021,6 +5526,7 @@ function previewPendingImage(attachment: Attachment) {
     // Drafts have a provisional runtime key before a session exists in the URL.
     // Keep local previews owned by the visible route used by App's dialog guard.
     sessionKey: readSessionFromUrl(),
+    ownerSessionKey: props.workbenchOwnerSessionKey || readSessionFromUrl(),
   })
 }
 
@@ -5040,23 +5546,44 @@ async function downloadAttachment(attachment: DisplayAttachment): Promise<boolea
   return true
 }
 
+let workbenchPreviewRequest = 0
+watch([sessionKey, currentEpoch, deliveryIdentity, () => gatewayAccess.subscriptionEpoch], () => {
+  // Returning to the same values does not revive a request from the old owner.
+  workbenchPreviewRequest += 1
+}, { flush: 'sync' })
+
+function beginWorkbenchPreviewRequest(): () => boolean {
+  const key = sessionKey.value
+  const epoch = currentEpoch.value
+  const identity = deliveryIdentity.value
+  const subscriptionEpoch = gatewayAccess.subscriptionEpoch
+  const request = ++workbenchPreviewRequest
+  return () => !chatViewDisposed && chatViewActive && sessionKey.value === key
+    && currentEpoch.value === epoch && deliveryIdentity.value === identity
+    && gatewayAccess.subscriptionEpoch === subscriptionEpoch && request === workbenchPreviewRequest
+}
+
 async function attachmentWorkbenchResource(
   attachment: DisplayAttachment,
+  key: string,
+  isCurrent: () => boolean,
 ): Promise<WorkbenchResource | null> {
   if (!workbenchResourcesEnabled.value || !workbenchEnabled.value) return null
-  if (!attachment.attachmentId || !sessionKey.value) return null
+  if (!attachment.attachmentId || !key || !isCurrent()) return null
   const ref = {
     type: 'attachment' as const,
     attachmentId: attachment.attachmentId,
     id: attachment.attachmentId,
   }
-  let resource = workbenchResourcesStore.find(sessionKey.value, ref)
+  let resource = workbenchResourcesStore.find(key, ref)
   if (!resource) {
-    await workbenchResourcesStore.load(sessionKey.value, true)
-    resource = workbenchResourcesStore.find(sessionKey.value, ref)
+    await workbenchResourcesStore.load(key, true)
+    if (!isCurrent()) return null
+    resource = workbenchResourcesStore.find(key, ref)
   }
   if (resource) {
-    resource = await workbenchResourcesStore.resolve(sessionKey.value, ref) || resource
+    resource = await workbenchResourcesStore.resolve(key, ref) || resource
+    if (!isCurrent()) return null
   }
   if (!resource) {
     pushToast(t('workbench.resources.actionFailed'), { tone: 'danger' })
@@ -5065,15 +5592,19 @@ async function attachmentWorkbenchResource(
 }
 
 async function previewAttachmentResource(attachment: DisplayAttachment) {
+  const key = sessionKey.value
+  const isCurrent = beginWorkbenchPreviewRequest()
+  if (!isCurrent()) return
   try {
-    const resource = await attachmentWorkbenchResource(attachment)
-    if (!resource || !sessionKey.value) return
-    const current = await workbenchResourcesStore.openCurrent(sessionKey.value, resource)
+    const resource = await attachmentWorkbenchResource(attachment, key, isCurrent)
+    if (!resource || !isCurrent()) return
+    const current = await workbenchResourcesStore.openCurrent(key, resource)
+    if (!isCurrent()) return
     if (current?.disposition === 'document') {
       const artifact = artifactPayloadFromRevision(current.revision)
       artifact.documentId = current.document.documentId
       artifact.revisionId = current.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5082,12 +5613,12 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         ),
         previewLeaseEligible: true,
         resourceIdentity: workbenchResourceKey(current.resource.resource),
-        sessionKey: sessionKey.value,
+        sessionKey: key,
       }))
       return
     }
     if (!current && resource.resource.type === 'document') {
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact: artifactPayloadFromWorkbenchResource(resource),
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5096,7 +5627,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         ),
         previewLeaseEligible: true,
         resourceIdentity: workbenchResourceKey(resource.resource),
-        sessionKey: sessionKey.value,
+        sessionKey: key,
       }))
       return
     }
@@ -5107,13 +5638,14 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
-        sessionKey.value,
+        key,
         resource,
       )
+      if (!isCurrent()) return
       const artifact = artifactPayloadFromRevision(imported.revision)
       artifact.documentId = imported.document.documentId
       artifact.revisionId = imported.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -5122,7 +5654,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         ),
         previewLeaseEligible: true,
         resourceIdentity: `document:${imported.document.documentId}`,
-        sessionKey: sessionKey.value,
+        sessionKey: key,
       }))
       return
     }
@@ -5137,21 +5669,22 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       return
     }
     const preview = await workbenchResourcesStore.preview(
-      sessionKey.value,
+      key,
       readonlyResource.resource,
     )
-    if (!preview) return
+    if (!preview || !isCurrent()) return
     const preparedResource = resourceFromPreparedPreview(preview)
-    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       initialSection: 'preview',
       nativeHtml: false,
       preparedPreview: preview.preview,
       previewLeaseEligible: false,
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
-      sessionKey: sessionKey.value,
+      sessionKey: key,
     }))
   } catch (error) {
+    if (!isCurrent()) return
     const classified = classifyArtifactProductError(error)
     const translated = t(classified.messageKey)
     pushToast(
@@ -5216,13 +5749,15 @@ const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResou
 const deliverablesOpen = ref(false)
 
 function focusHeaderAction(
-  action: 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link',
+  action: 'deliverables' | 'share' | 'copy-session-link',
 ) {
   void nextTick(() => chatRouteHeaderRegistration.focusAction(action))
 }
 
 async function openDeliverables() {
   if (headerDeliverableCount.value === 0) return
+  const resourceSessionKey = sessionKey.value
+  const visibleOwnerKey = workbenchOwnerKey.value
   acknowledgeDeliverableUpdate()
   if (
     workbenchEnabled.value
@@ -5230,20 +5765,24 @@ async function openDeliverables() {
     && sessionKey.value
   ) {
     try {
-      const snapshot = await workbenchResourcesStore.load(sessionKey.value)
-      const resources = workbenchResourcesStore.navigationResources(sessionKey.value)
+      const snapshot = await workbenchResourcesStore.load(resourceSessionKey)
+      if (chatViewDisposed || sessionKey.value !== resourceSessionKey || workbenchOwnerKey.value !== visibleOwnerKey) return
+      const resources = workbenchResourcesStore.navigationResources(resourceSessionKey)
       if (snapshot.available && resources.length > 0) {
-        workbenchStore.openItem(createResourceCollectionWorkbenchItem({
+        const item = createResourceCollectionWorkbenchItem({
           resources,
-          sessionKey: sessionKey.value,
+          sessionKey: resourceSessionKey,
           title: t('workbench.resources.title'),
-        }))
+        })
+        item.scope = { type: 'session', id: visibleOwnerKey }
+        openWorkbenchItemExplicit(item)
         return
       }
     } catch {
       // Mixed-version or reconnect fallback keeps the existing deliverables flow available.
     }
   }
+  if (chatViewDisposed || sessionKey.value !== resourceSessionKey || workbenchOwnerKey.value !== visibleOwnerKey) return
   const allArtifactsUseWorkbench = sessionWorkbenchArtifacts.value.length
     === sessionArtifacts.value.length
   if (workbenchEnabled.value && allArtifactsUseWorkbench) {
@@ -5251,7 +5790,8 @@ async function openDeliverables() {
       if (
         item.kind !== 'artifact-preview'
         || item.scope.type !== 'session'
-        || item.scope.id !== sessionKey.value
+        || item.scope.id !== workbenchOwnerKey.value
+        || item.payload.sessionKey !== sessionKey.value
       ) return false
       const artifact = artifactFromWorkbenchItem(item)
       if (!artifact) return false
@@ -5260,6 +5800,7 @@ async function openDeliverables() {
     if (recentPreview) {
       workbenchStore.activateItem(recentPreview.id)
       workbenchStore.setExpanded(true)
+      workbenchStore.requestReveal()
       return
     }
 
@@ -5310,21 +5851,17 @@ watch(sessionArtifacts, artifacts => {
     if (
       item.kind !== 'artifact-preview'
       || item.scope.type !== 'session'
-      || item.scope.id !== sessionKey.value
+      || item.scope.id !== workbenchOwnerKey.value
+      || item.payload.sessionKey !== sessionKey.value
     ) continue
     const artifact = artifactFromWorkbenchItem(item)
     if (!artifact) continue
-    workbenchStore.updateItem(createArtifactPreviewWorkbenchItem({
-      artifact,
-      initialSection: initialSectionFromWorkbenchItem(item),
-      initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item),
-      navigationArtifacts: artifacts,
-      nativeHtml: item.hostKind === 'native-webcontents',
-      resourceIdentity: typeof item.payload.resourceIdentity === 'string'
-        ? item.payload.resourceIdentity
-        : undefined,
-      sessionKey: sessionKey.value,
-    }))
+    // Inventory refresh changes navigation only. Preserve the child's resource
+    // authority, parent visibility, prepared preview and explicit section request.
+    workbenchStore.updateItem({
+      ...item,
+      payload: { ...item.payload, navigationArtifacts: [...artifacts] },
+    })
   }
 })
 
@@ -5332,7 +5869,7 @@ function openLegacyArtifactWorkbench(
   artifact: ArtifactPayload,
   initialSection: 'preview' | 'source' = 'preview',
 ): boolean {
-  return workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+  return openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     navigationArtifacts: sessionArtifacts.value,
@@ -5345,29 +5882,43 @@ function openLegacyArtifactWorkbench(
 }
 
 async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
+  const key = sessionKey.value
+  const isCurrent = beginWorkbenchPreviewRequest()
+  if (!isCurrent()) return
   const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
   const documentId = typeof artifact.documentId === 'string'
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
-  if ((!artifactId && !documentId) || !sessionKey.value) {
+  if ((!artifactId && !documentId) || !key) {
     openLegacyArtifactWorkbench(artifact)
     return
   }
   try {
+    // Persisted workspace cards can reference an internal historical revision.
+    // Resolve its owning document instead of treating it as a public delivery.
+    if (artifact.source === 'workspace-preview') {
+      await openWorkspacePreviewExplicit(
+        documentId || { artifactId }, key,
+        typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
+      )
+      return
+    }
     const ref = documentId
       ? createWorkbenchResourceRef('document', documentId)
       : createWorkbenchResourceRef('deliverable', artifactId)
-    const resource = await workbenchResourcesStore.resolve(sessionKey.value, ref)
+    const resource = await workbenchResourcesStore.resolve(key, ref)
+    if (!isCurrent()) return
     if (!resource) {
       openLegacyArtifactWorkbench(artifact)
       return
     }
-    const current = await workbenchResourcesStore.openCurrent(sessionKey.value, resource)
+    const current = await workbenchResourcesStore.openCurrent(key, resource)
+    if (!isCurrent()) return
     if (current?.disposition === 'document') {
       const currentArtifact = artifactPayloadFromRevision(current.revision)
       currentArtifact.documentId = current.document.documentId
       currentArtifact.revisionId = current.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact: currentArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5377,7 +5928,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         ),
         previewLeaseEligible: true,
         resourceIdentity: workbenchResourceKey(current.resource.resource),
-        sessionKey: sessionKey.value,
+        sessionKey: key,
       }))
       return
     }
@@ -5395,13 +5946,14 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
-        sessionKey.value,
+        key,
         resource,
       )
+      if (!isCurrent()) return
       const importedArtifact = artifactPayloadFromRevision(imported.revision)
       importedArtifact.documentId = imported.document.documentId
       importedArtifact.revisionId = imported.revision.revisionId
-      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact: importedArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5411,7 +5963,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         ),
         previewLeaseEligible: true,
         resourceIdentity: `document:${imported.document.documentId}`,
-        sessionKey: sessionKey.value,
+        sessionKey: key,
       }))
       return
     }
@@ -5426,24 +5978,26 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const preview = await workbenchResourcesStore.preview(
-      sessionKey.value,
+      key,
       readonlyResource.resource,
     )
+    if (!isCurrent()) return
     if (!preview) {
       openLegacyArtifactWorkbench(artifact)
       return
     }
     const preparedResource = resourceFromPreparedPreview(preview)
-    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: false,
       preparedPreview: preview.preview,
       previewLeaseEligible: false,
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
-      sessionKey: sessionKey.value,
+      sessionKey: key,
     }))
   } catch (error) {
+    if (!isCurrent()) return
     // METHOD_NOT_FOUND is normalized to a null open result by the provider and
     // follows the compatibility path above. Any other failure must remain
     // visible: silently opening the immutable chat artifact would disguise a
@@ -5466,7 +6020,9 @@ async function resolveWorkspacePreviewResource(key: string, documentId: string) 
 const workspacePreviewOpening = useWorkspacePreviewOpening({
   sessionKey,
   currentEpoch,
+  beginRequest: beginWorkbenchPreviewRequest,
   enabled: attachmentWorkbenchPreviewEnabled,
+  getArtifact: (key, artifactId) => artifactWorkbench.artifacts.get(key, artifactId),
   resolve: (key, resource) => workbenchResourcesStore.resolve(key, resource),
   openCurrent: (key, resource) => workbenchResourcesStore.openCurrent(key, resource),
   show: (current, key, previewPagePath) => {
@@ -5474,7 +6030,7 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
     if (previewPagePath) artifact.previewPagePath = previewPagePath
-    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    const item = artifactPreviewItemForExplicitOpen({
       artifact,
       initialSection: 'preview',
       navigationArtifacts: sessionArtifacts.value,
@@ -5482,7 +6038,12 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
       previewLeaseEligible: true,
       resourceIdentity: workbenchResourceKey(current.resource.resource),
       sessionKey: key,
-    }))
+    })
+    // A live result still registers its resource while its conversation is
+    // hidden, but must not take over another conversation or the new-chat page.
+    return workbenchStore.openItem(item, {
+      activate: item.scope.type !== 'session' || item.scope.id === workbenchStore.activeSessionId,
+    })
   },
   onError: error => {
     const classified = classifyArtifactProductError(error)
@@ -5492,9 +6053,23 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
   },
 })
 
+async function openWorkspacePreviewExplicit(...args: Parameters<typeof workspacePreviewOpening.open>) {
+  const owner = workbenchOwnerKey.value
+  const opened = await workspacePreviewOpening.open(...args)
+  if (opened && owner === workbenchOwnerKey.value && owner === workbenchStore.activeSessionId) {
+    workbenchStore.requestReveal()
+  }
+}
+
 function openArtifact(artifact: ArtifactPayload): boolean {
-  if (artifact.source === 'workspace-preview') {
-    void workspacePreviewOpening.open(
+  // All file entry points share ordering, including synchronous legacy/media
+  // opens that must retire an older document request still awaiting transport.
+  const isCurrent = beginWorkbenchPreviewRequest()
+  if (!isCurrent()) return false
+  // Persisted artifacts also carry this provenance. Only id-less workspace
+  // actions already carry the document/session identity needed by this helper.
+  if (artifact.source === 'workspace-preview' && !artifact.id) {
+    void openWorkspacePreviewExplicit(
       typeof artifact.documentId === 'string' ? artifact.documentId : '',
       artifact.session_key || '',
       typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
@@ -5509,6 +6084,7 @@ function openArtifact(artifact: ArtifactPayload): boolean {
       artifact,
       navigationArtifacts: sessionArtifacts.value,
       sessionKey: sessionKey.value,
+      ownerSessionKey: workbenchOwnerKey.value,
     })
     return true
   }
@@ -5524,7 +6100,10 @@ function openArtifact(artifact: ArtifactPayload): boolean {
   if (!workbenchEnabled.value || !sessionKey.value) return false
   if (
     attachmentWorkbenchPreviewEnabled.value
-    && artifactWorkbenchPreviewKind(artifact) === 'html'
+    && (
+      artifactWorkbenchPreviewKind(artifact) === 'html'
+      || isOfficePreviewFormat(artifactWorkbenchPreviewKind(artifact))
+    )
     && (
       (typeof artifact.id === 'string' && artifact.id.trim())
       || (typeof artifact.documentId === 'string' && artifact.documentId.trim())
@@ -5785,49 +6364,106 @@ const {
   copyState: sessionCopyState,
   copyIconName: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
-  onCopyClick: onSessionCopyClick,
+  onCopyClick: copySessionLink,
 } = useCopyFeedback(async () => {
-  if (!sessionKey.value) return false
+  const key = sessionKey.value
+  const epoch = gatewayAccess.subscriptionEpoch
+  const isCurrent = () => !chatViewDisposed
+    && sessionKey.value === key
+    && gatewayAccess.subscriptionEpoch === epoch
+  if (!key || !isCurrent()) return false
   try {
-    await copyTextWithFallback(sessionKey.value)
-    return true
+    const link = await currentSessionLink(key, platform)
+    if (!isCurrent()) return false
+    await copyTextWithFallback(link)
+    return isCurrent()
   } catch {
-    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+    if (isCurrent()) pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
     return false
   }
 })
 
-async function copySessionReference(value: string) {
-  if (!sessionKey.value) return
-  try {
-    await copyTextWithFallback(value)
-    pushToast(t('chat.copied'), { tone: 'ok' })
-  } catch {
-    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
-  }
-}
-const copySessionLink = () => copySessionReference(
-  platform.capabilities.isDesktop
-    ? sessionDesktopLink(sessionKey.value)
-    : sessionApplicationLink(sessionKey.value),
-)
-async function copyGatewayLink() {
-  const key = sessionKey.value
-  if (!key) return
-  try {
-    const link = await currentSessionGatewayLink(key, platform)
-    if (sessionKey.value === key) await copySessionReference(link)
-  } catch {
-    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
-  }
-}
-
 // App owns the header component. This view registers one stable set of refs and
 // commands; draft materialization only changes those refs and never rebuilds
 // the header subtree. The owner token makes delayed teardown harmless.
+const workbenchSessionPreparation = useWorkbenchSessionPreparation({
+  lifecycle: sessionLifecycle,
+  state: () => {
+    const model = newTaskModelSelection.value
+    const workspaceId = pendingWorkspaceId.value
+    return {
+      key: sessionKey.value,
+      durable: !isDraftSurface(),
+      canCreate: !chatViewDisposed && gatewayAccess.isAvailable && gatewayAccess.isAuthenticated
+        && gatewayAccess.isLocalOwner && pendingSessionIntent.value === 'new_chat'
+        && !sessionHasActiveWork.value && !acceptanceStopAvailable.value
+        && !acceptanceRecoveryPending.value && !acceptanceStopPending.value
+        && !projectBindingBusy.value && !goalBusy.value && !planModeBusy.value
+        && !modelRoutingMutationBusy.value && !newTaskModelsLoading.value && pendingQueue.value.length === 0
+        && ['none', 'ready'].includes(activeWorkspaceStatus.value),
+      scope: JSON.stringify([
+        sessionKey.value, pendingSessionIntent.value, route.fullPath, workbenchPreparationNavigationEpoch,
+        gatewayAccess.subscriptionEpoch, deliveryIdentity.value, workspaceId, boundWorkspaceId.value,
+        model?.model, model?.provider, initialRoutingMode.value, initialCollaborationMode.value,
+      ]),
+      request: {
+        agentId: agentIdFromSessionKey(sessionKey.value), kind: 'webchat',
+        ...(workspaceId ? { workspaceId } : {}),
+        ...(model ? { model: model.model, provider: model.provider } : {}),
+      },
+    }
+  },
+  configure: async (state, isCurrent) => {
+    const mode = initialRoutingMode.value ?? (state.request.model ? 'direct' : null)
+    // A failed earlier attempt may have created this same key with another
+    // model. Reconcile the current draft pin (including clearing one) under CAS.
+    await configureWorkbenchSessionRouting(sessionRouting, state.key, mode,
+      state.request.model && state.request.provider
+        ? { model: state.request.model, provider: state.request.provider } : null,
+      isCurrent)
+    if (!isCurrent()) return
+    if (planCenter.available('mode')) {
+      await configureWorkbenchSessionCollaboration(planCenter, state.key,
+        initialCollaborationMode.value, collaboration.value.revision, isCurrent)
+    }
+  },
+  commit: async key => {
+    const connectionEpoch = gatewayAccess.subscriptionEpoch
+    const workspaceId = pendingWorkspaceId.value
+    if (workspaceId) freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
+    // Persist the existing key: changing keys here would retire attachment and
+    // annotation ownership and restore a different composer's stored draft.
+    persistSession(key, { updateRoute: false, source: 'chatView.workbenchMaterialized' })
+    pendingSessionIntent.value = null
+    activeProjectWorkspace.acceptPendingBinding(workspaceId)
+    workbenchMaterializedSessionKey = key
+    await router.replace({ path: '/chat', query: { session: key } })
+    if (chatViewDisposed || sessionKey.value !== key || isDraftSurface()
+      || gatewayAccess.subscriptionEpoch !== connectionEpoch) return false
+    // Let the route's draft-to-durable watchers retire their provisional
+    // metadata before starting the replacement authoritative subscription.
+    startSessionBootstrap({ includeHistory: false, force: true })
+    return true
+  },
+})
+watch(workbenchSessionPreparation.busy, value => {
+  workbenchSessionPreparing.value = value
+}, { flush: 'sync' })
+
 const chatRouteHeader = useChatRouteHeaderBridge()
-const chatRouteHeaderRegistration = chatRouteHeader.register({
+const chatRouteHeaderRegistration = props.embedded
+  ? { focusAction: (_action: ChatRouteHeaderAction) => false, release: () => false }
+  : chatRouteHeader.register({
   sessionKey,
+  sessionDurable: computed(() => !isDraftSurface()),
+  // Bootstrap owns whether a history read is needed (materialized drafts skip
+  // it). A failed workspace lookup is settled, not an endless loading state.
+  sessionLoading: computed(() => activeWorkspaceStatus.value === 'resolving'
+    || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value)),
+  sessionPreparable: workbenchSessionPreparation.canPrepare,
+  workspaceId: boundWorkspaceId,
+  workspaceReady: computed(() => activeWorkspaceStatus.value === 'ready'),
+  workspaceResolved: computed(() => ['none', 'ready', 'unavailable', 'removed'].includes(activeWorkspaceStatus.value)),
   visible: computed(() => !isNewChatLanding.value),
   title: currentChatTitle,
   optimisticTitle: computed(() => (
@@ -5842,19 +6478,25 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   hasNewDeliverable,
   shareMode,
   shareableMessageCount,
+  findState: chatFind.state,
 }, {
+  prepareWorkbenchSession: workbenchSessionPreparation.prepare,
   openDeliverables,
   startShare: startShareMode,
-  copySessionKey: onSessionCopyClick,
   copySessionLink,
-  copyGatewayLink,
   restoreComposerFocus: () => composerRef.value?.focusTextarea(),
+  openFind: openChatFind,
+  updateFindQuery: chatFind.updateQuery,
+  searchFind: query => { void chatFind.search(query) },
+  navigateFind: chatFind.navigate,
+  closeFind: () => chatFind.close(),
 })
 
 /* ── Share export ──────────────────────────────────────────────────── */
 
 function startShareMode() {
   if (shareableMessageCount.value === 0) return
+  if (chatFind.open.value) chatFind.close()
   shareMode.value = true
   selectedShareMessageIds.value = new Set()
   nextTick(() => shareBannerRef.value?.focus())
@@ -5992,6 +6634,7 @@ function shareTitle(): string {
 /* ── Streaming ─────────────────────────────────────────────────────── */
 
 function scrollToBottom() {
+  if (!surfaceVisible.value) return
   const epoch = scrollEpoch.value
   const key = sessionKey.value
   nextTick(() => {
@@ -6000,10 +6643,12 @@ function scrollToBottom() {
     // Re-check here so that queued automatic scrolls never override that choice.
     if (
       epoch !== scrollEpoch.value
+      || !surfaceVisible.value
       || key !== sessionKey.value
       || !threadRef.value
       || !bottomSentinelRef.value
       || !autoScroll.value
+      || findOwnsViewport.value
     ) return
     messageListRef.value?.scrollToEnd({ behavior: 'auto' })
   })
@@ -6447,6 +7092,7 @@ watch(showJumpToLatest, showing => {
 }, { flush: 'sync' })
 
 function jumpToLatest() {
+  if (chatFind.open.value) chatFind.close(false)
   conversationMinimapRef.value?.cancelNavigation()
   cancelActiveThreadNavigation()
   historyNavigationScrollLock.finish()
@@ -6535,10 +7181,10 @@ function handleLongPastedInput(text: string, event?: InputEvent): boolean {
     : text
   if (!isLongPlainTextPaste(pastedText)) return false
 
-  if (event?.target instanceof HTMLTextAreaElement
-    && typeof event.data === 'string'
+  if (typeof event?.data === 'string'
     && event.data.length > 0) {
-    const caret = event.target.selectionStart
+    const caret = event.target instanceof HTMLTextAreaElement
+      ? event.target.selectionStart : composerRef.value?.getSelection().start ?? text.length
     const start = Math.max(0, caret - event.data.length)
     composerText.value = `${text.slice(0, start)}${text.slice(caret)}`
   } else {
@@ -6558,12 +7204,24 @@ function autoResizeTextarea() {
 
 /* ── Clipboard paste ───────────────────────────────────────────────── */
 
+function ownsConversationInput(target: EventTarget | null): boolean {
+  const element = target instanceof Element ? target : document.activeElement
+  const surface = element?.closest('.chat')
+  if (surface) return surface === chatRootRef.value
+  // Workbench editors and previews own their keyboard/clipboard input. The
+  // route surface is the default only when no other interactive surface owns it.
+  if (element?.closest('#workbench-panel,[data-workbench-surface]')) return false
+  return !props.embedded
+}
+
 function onDocumentPaste(e: ClipboardEvent) {
+  if (!ownsConversationInput(e.target)) return
   // Pastes aimed at another editable surface (clarify/approval inputs, the
   // command palette) or at an open dialog keep their default behavior — only
   // composer-bound pastes claim clipboard files, mirroring onDocumentKeydown.
   if (!shouldCaptureFilePaste(e.target, {
     composerTextareaFocused: composerRef.value?.isTextareaFocused() ?? false,
+    composerEditor: composerRef.value?.editorElement(),
     dialogLayerOpen: hasOpenDialogLayer(),
   })) return
   const files = collectClipboardFiles(e.clipboardData)
@@ -6597,9 +7255,25 @@ function onDocumentPaste(e: ClipboardEvent) {
 /* ── Document keydown (ESC) ────────────────────────────────────────── */
 
 function onDocumentKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Escape') return
+  if (!ownsConversationInput(e.target)) return
   if (e.defaultPrevented) return
+  if (e.isComposing || e.keyCode === 229) return
   if (hasOpenDialogLayer()) return
+  if (isChatFindShortcut(e)) {
+    const target = e.target instanceof Element ? e.target : null
+    // Editors and artifact/embedded document surfaces retain their own find.
+    if (isNewChatLanding.value || forkTransition.value || shareMode.value
+      || target?.closest('.monaco-editor,.cm-editor,iframe')) return
+    e.preventDefault()
+    if (!e.repeat) openChatFind()
+    return
+  }
+  if (e.key !== 'Escape') return
+  if (chatFind.open.value) {
+    e.preventDefault()
+    chatFind.close()
+    return
+  }
 
   // The share preview modal owns Escape while it is open: it closes only the
   // preview (share mode stays active) via its own handler, so bail here and let
@@ -6616,7 +7290,7 @@ function onDocumentKeydown(e: KeyboardEvent) {
   const editableTarget = target instanceof HTMLInputElement
     || target instanceof HTMLSelectElement
     || (target instanceof HTMLTextAreaElement && !composerRef.value?.isTextareaFocused())
-    || (target instanceof HTMLElement && target.isContentEditable)
+    || (target instanceof HTMLElement && target.isContentEditable && !composerRef.value?.isTextareaFocused())
   if (editableTarget) return
 
   if (canStop.value) {
@@ -6629,6 +7303,11 @@ function onDocumentKeydown(e: KeyboardEvent) {
     e.preventDefault()
     popAllPendingIntoComposer()
   }
+}
+
+function openChatFind() {
+  if (isNewChatLanding.value || forkTransition.value || shareMode.value) return
+  chatFind.show()
 }
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -6675,6 +7354,7 @@ function scopedDraftFromHistoryState(
 }
 
 function persistDraftHistoryState() {
+  if (props.embedded) return
   if (!isDraftRoute() || !sessionKey.value) return
   try {
     const state = window.history.state as Record<string, unknown> | null
@@ -6699,6 +7379,7 @@ function persistDraftHistoryState() {
 
 function canChangeDraftProject(): boolean {
   return isDraftRoute()
+    && !workbenchSessionPreparing.value
     && pendingSessionIntent.value === 'new_chat'
     && gatewayAccess.canChooseProject
     && !sessionHasActiveWork.value
@@ -6937,7 +7618,8 @@ function enterDraft() {
 
 let chatViewActive = false
 let initialDraftRouteMayCanonicalize = true
-onBeforeRouteLeave(() => {
+if (!props.embedded) onBeforeRouteLeave(() => {
+  workbenchPreparationNavigationEpoch += 1
   // A lazy destination has not updated route.fullPath yet. Once the operator
   // leaves, late draft bootstrap must not replace that pending navigation.
   initialDraftRouteMayCanonicalize = false
@@ -6992,7 +7674,10 @@ onMounted(async () => {
     && initialHistoryState.prefill.length > 0) || readSkillTaskPrefill(initialHistoryState).length > 0
   const scopedDraft = scopedDraftFromHistoryState(initialHistoryState)
   const canRecoverDraft = !hasLegacyNewChatQuery() && !hasExplicitDraftPrefill
-  const initialSession = resolveInitialSession({
+  const initialSession = props.embedded ? {
+    sessionKey: props.sessionKeyOverride || '', draft: !props.sessionKeyOverride,
+    hasUrlSession: false, recoveredDraft: false,
+  } : resolveInitialSession({
     recoverDraft: canRecoverDraft,
     scopedDraft,
   })
@@ -7016,7 +7701,7 @@ onMounted(async () => {
     revision: number
     attachments: Attachment[]
   } | null = null
-  if (initialSession.draft) {
+  if (initialSession.draft && !props.embedded) {
     pendingSessionIntent.value = 'new_chat'
     initialDraftProjectGeneration = draftProjectHydration.begin()
     // Apply the hand-off before any asynchronous project/live work. A later
@@ -7029,7 +7714,7 @@ onMounted(async () => {
         attachments: [...pendingAttachments.value],
       }
     }
-  } else {
+  } else if (initialSession.sessionKey) {
     activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
     persistSession(sessionKey.value, {
       updateRoute: initialSession.recoveredDraft,
@@ -7055,6 +7740,13 @@ onMounted(async () => {
   const sessionBootstrap = startSessionBootstrap({
     includeHistory: !initialSession.draft,
   })
+  if (props.embedded && !initialSession.sessionKey) {
+    // An unopened child has no read lease. Release optional metadata admission
+    // now; a real bootstrap starts only after the first explicit send.
+    releaseOptionalRpcAdmission?.()
+    releaseOptionalRpcAdmission = null
+    startPostBootstrapMetadata()
+  }
   const initialDraftProjectSync = initialDraftProjectGeneration === null
     ? Promise.resolve(true)
     : sessionBootstrap.live.then(() =>
@@ -7096,7 +7788,7 @@ onMounted(async () => {
   }
 
   // Automatic entry preserves focus in overlays and their invoking controls.
-  if (isDesktopViewport.value) {
+  if (isDesktopViewport.value && !props.embedded) {
     composerRef.value?.focusTextarea({ preserveFocus: !explicitFreshTask })
   }
 
@@ -7161,8 +7853,9 @@ onUnmounted(() => {
   window.removeEventListener('pointerup', onThreadPointerEnd)
   window.removeEventListener('pointercancel', onThreadPointerEnd)
   chatRouteHeaderRegistration.release()
+  releaseAssistantActivitySession(activityOwner)
   chatViewActive = false
-  appStore.setChatLivePhase('idle')
+  if (!props.embedded) appStore.setChatLivePhase('idle')
   chatViewDisposed = true
   forkTransitionLifetime.dispose()
   forkTransition.value = null
@@ -7204,11 +7897,12 @@ onUnmounted(() => {
   }
 })
 
-useDocumentEvent('paste', onDocumentPaste)
+useDocumentEvent('paste', onDocumentPaste, true)
 useDocumentEvent('keydown', onDocumentKeydown)
 
 // Watch for route changes
 watch(() => route.query.session, async (newSession) => {
+  if (props.embedded) return
   const transition = forkTransition.value
   if (transition) {
     const handoffAction = forkRouteHandoffAction(newSession, transition)
@@ -7231,6 +7925,11 @@ watch(() => route.query.session, async (newSession) => {
     })
     await switchToSession(newSession)
   }
+})
+
+watch(() => props.sessionKeyOverride, async key => {
+  if (!props.embedded || preparingHostSession.value || !key || key === sessionKey.value) return
+  await switchToSession(key)
 })
 
 // A route switch briefly retains the parent's terminal history status. Require
@@ -7283,6 +7982,7 @@ watch(
 
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
+  if (props.embedded) return
   if (
     draftProjectChoice
     && draftProjectChoice.target !== undefined
@@ -7315,6 +8015,7 @@ watch(() => pendingAttachments.value.length, () => {
 // Explicit new-task actions must reset even when navigation targets the exact
 // draft URL already on screen (for example, clicking the same project pencil).
 watch(freshTaskDraft.request, request => {
+  if (props.embedded) return
   if (!request) return
   cancelDraftProjectChoice()
   draftProjectHydration.invalidate()
@@ -7386,6 +8087,7 @@ watch(
 
 // Legacy ?newChat=1 / ?new=1 links land on the draft route, then the params disappear.
 watch(() => [route.query.newChat, route.query.new], () => {
+  if (props.embedded) return
   if (hasLegacyNewChatQuery()) goToDraft({ replace: true })
 })
 
@@ -7421,7 +8123,7 @@ function flushSessionOptionalReads() {
       ? loadSessionArtifactsAfterReconnect()
       : loadSessionArtifacts())
   }
-  if (pending.key && promptAnnotationsEnabled.value) {
+  if (pending.key && (promptAnnotationsEnabled.value || officePromptAnnotationsEnabled.value)) {
     void artifactPromptAnnotationsStore.load(
       pending.key,
       pending.forceAnnotations ? { force: true } : undefined,
@@ -7510,9 +8212,28 @@ watch(
 )
 </script>
 
+<style scoped src="../styles/chat-assistant-row.css"></style>
 <style scoped src="../styles/chat-view.css"></style>
 
 <style scoped>
+.chat-find-context {
+  display: flex;
+  width: var(--chat-col);
+  margin-inline: auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+.chat-find-context button {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
 
 /* No shared sr-only utility exists in this repo (each component scopes its
    own), so the completion announcer's clip-out lives here: zero visual

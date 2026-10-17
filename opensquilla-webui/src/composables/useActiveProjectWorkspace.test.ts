@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   createDraftProjectHydrationGuard,
+  applySessionProjectWorkspaceMetadata,
   useActiveProjectWorkspace,
   type ActiveProjectWorkspaceSnapshot,
 } from './useActiveProjectWorkspace'
@@ -19,6 +20,83 @@ function project(
 }
 
 describe('useActiveProjectWorkspace', () => {
+  it('hydrates deferred project metadata from cache and validates it without dropping the project chip', async () => {
+    const state = useActiveProjectWorkspace()
+    const generation = state.beginSessionResolution('session-a')
+    let finish!: (value: ActiveProjectWorkspaceSnapshot[]) => void
+    const pending = applySessionProjectWorkspaceMetadata({
+      state, sessionKey: 'session-a', generation,
+      metadata: { workspaceId: 'p1', projectWorkspace: null, projectWorkspaceDeferred: true },
+      cachedWorkspace: project('p1', true),
+      loadWorkspaces: () => new Promise(resolve => { finish = resolve }), isCurrent: () => true,
+    })
+    expect(state.status.value).toBe('ready')
+    expect(state.activeWorkspace.value?.id).toBe('p1')
+    finish([project('p1', false)])
+    await pending
+    expect(state.status.value).toBe('unavailable')
+  })
+
+  it('resolves deferred workspace metadata after a cold durable-session reload', async () => {
+    const state = useActiveProjectWorkspace()
+    const generation = state.beginSessionResolution('session-a')
+    await applySessionProjectWorkspaceMetadata({
+      state, sessionKey: 'session-a', generation,
+      metadata: { workspaceId: 'p1', projectWorkspaceDeferred: true },
+      loadWorkspaces: async () => [project('p1', true)], isCurrent: () => true,
+    })
+    expect(state.status.value).toBe('ready')
+    expect(state.activeWorkspace.value?.id).toBe('p1')
+  })
+
+  it('rejects deferred workspace validation after a newer session metadata generation', async () => {
+    const state = useActiveProjectWorkspace()
+    const generation = state.beginSessionResolution('session-a')
+    let finish!: (value: ActiveProjectWorkspaceSnapshot[]) => void
+    const pending = applySessionProjectWorkspaceMetadata({
+      state, sessionKey: 'session-a', generation,
+      metadata: { workspaceId: 'p1', projectWorkspaceDeferred: true },
+      loadWorkspaces: () => new Promise(resolve => { finish = resolve }), isCurrent: () => true,
+    })
+    const next = state.beginSessionResolution('session-b')
+    state.applySessionSnapshot('session-b', next, { workspaceId: 'p2', projectWorkspace: project('p2', true) })
+    finish([project('p1', true)])
+    await pending
+    expect(state.boundWorkspaceId.value).toBe('p2')
+    expect(state.activeWorkspace.value?.id).toBe('p2')
+  })
+
+  it('ignores a deferred workspace validation failure from a previous connection', async () => {
+    const state = useActiveProjectWorkspace()
+    const generation = state.beginSessionResolution('session-a')
+    let current = true
+    let fail!: (cause: Error) => void
+    const pending = applySessionProjectWorkspaceMetadata({
+      state, sessionKey: 'session-a', generation,
+      metadata: { workspaceId: 'p1', projectWorkspaceDeferred: true }, cachedWorkspace: project('p1', true),
+      loadWorkspaces: () => new Promise((_resolve, reject) => { fail = reject }), isCurrent: () => current,
+    })
+    current = false
+    fail(new Error('old connection closed'))
+    await pending
+    expect(state.status.value).toBe('ready')
+  })
+
+  it('keeps same-key draft workspace identity while durable metadata refreshes', () => {
+    const state = useActiveProjectWorkspace()
+    state.beginProjectDraft(project('p1', true))
+    const generation = state.beginSessionResolution('draft-key', true)
+    expect(state.boundWorkspaceId.value).toBe('p1')
+    expect(state.status.value).toBe('ready')
+    expect(state.pendingWorkspaceId.value).toBeNull()
+    expect(state.applySessionSnapshot('draft-key', generation, {
+      workspaceId: 'p1', projectWorkspace: project('p1', true),
+    })).toBe(true)
+    state.beginSessionResolution('different-session')
+    expect(state.boundWorkspaceId.value).toBeNull()
+    expect(state.status.value).toBe('resolving')
+  })
+
   it('invalidates an older draft-project hydration when navigation advances', () => {
     const guard = createDraftProjectHydrationGuard()
     const projectA = guard.begin()

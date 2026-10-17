@@ -30,10 +30,8 @@
     radial-gradient(40% 44% at 14% 82%, color-mix(in srgb, var(--warn) 18%, transparent) 0%, transparent 60%);
 }
 
-/* Uppercase-tracked display headings in a flamingo->aqua gradient ink, with a
-   whisper of candy glow. Body text is untouched and stays crisp dark plum. */
-[data-theme="miami"] h1,
-[data-theme="miami"] h2,
+/* Application titles use flamingo->aqua gradient ink and a whisper of candy
+   glow. Content headings and body text stay crisp dark plum. */
 [data-theme="miami"] .control-stage__title,
 [data-theme="miami"] .view-title {
   text-transform: uppercase;
@@ -54,13 +52,13 @@
 /* Soft pastel candy glow on elevated accent surfaces. Sidebar navigation stays
    flat so it remains visually behind modal scrims and matches adjacent rows.
    Semantic topbar controls opt in below only for actionable states. */
-[data-theme="miami"] .btn--primary,
-[data-theme="miami"] .conn-pill:not(.topbar-state) {
+[data-theme="miami"] .btn--primary {
   position: relative;
   overflow: hidden;
-  box-shadow: var(--elev-1),
-              0 6px 20px -6px color-mix(in srgb, var(--accent) 45%, transparent),
-              0 2px 8px -2px color-mix(in srgb, var(--accent-secondary) 30%, transparent);
+}
+
+[data-theme="miami"] .btn--primary:not(:focus-visible) {
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 [data-theme="miami"] .topbar .topbar-state:is(
@@ -78,8 +76,7 @@
    only), pointer-events:none, tucked under the label. It rests fully invisible
    (opacity:0) so with reduced motion no frozen streak sits on the surface; the
    sweep animation is the only thing that makes it briefly glint. */
-[data-theme="miami"] .btn--primary::after,
-[data-theme="miami"] .conn-pill:not(.topbar-state)::after {
+[data-theme="miami"] .btn--primary::after {
   content: "";
   position: absolute;
   top: 0;
@@ -113,15 +110,12 @@
     animation: miami-aurora-drift 32s ease-in-out infinite; /* motion-allow */
   }
 
-  [data-theme="miami"] h1,
-  [data-theme="miami"] h2,
   [data-theme="miami"] .control-stage__title,
   [data-theme="miami"] .view-title {
     animation: miami-hue-breathe var(--dur-pulse) ease-in-out infinite alternate; /* motion-allow */
   }
 
-  [data-theme="miami"] .btn--primary::after,
-  [data-theme="miami"] .conn-pill:not(.topbar-state)::after {
+  [data-theme="miami"] .btn--primary::after {
     animation: miami-sheen 9s linear infinite; /* motion-allow */
   }
 }
@@ -177,8 +171,6 @@
    the titles invisible. Restore solid, system-coloured text.
    --------------------------------------------------------------------------- */
 @media (forced-colors: active) {
-  [data-theme="miami"] h1,
-  [data-theme="miami"] h2,
   [data-theme="miami"] .control-stage__title,
   [data-theme="miami"] .view-title {
     background: none;

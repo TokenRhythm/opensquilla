@@ -14,6 +14,7 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import { withDeadline } from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -61,6 +62,10 @@ function launchEnvironment(isolatedHome) {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
+    APPDATA: join(isolatedHome, 'AppData', 'Roaming'),
+    LOCALAPPDATA: join(isolatedHome, 'AppData', 'Local'),
+    TEMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
+    TMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
     OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
@@ -97,8 +102,85 @@ const consolidationBackupMarker = join(
   'archived-recovery-data.txt',
 )
 const cleanupJournal = join(userData, '.opensquilla.profile-cleanup.json')
+// Keep diagnostic output outside userData: delete-all removes every approved
+// userData entry, and its detached helper outlives Electron's event listeners.
+const helperDiagnostics = join(root, 'cleanup-helper-diagnostics')
 const deleteAllHelperTimeoutMs = process.platform === 'win32' ? 90_000 : 30_000
 let desktopApp
+
+async function observeDeleteAllHelper(app) {
+  await mkdir(helperDiagnostics, { recursive: true })
+  await app.evaluate((_electron, directory) => {
+    // Playwright's evaluate VM has no dynamic-import callback. Update the
+    // built-in named spawn binding used by main.ts without a product test hook.
+    const fs = process.getBuiltinModule('fs')
+    const childProcess = process.getBuiltinModule('child_process')
+    const { syncBuiltinESMExports } = process.getBuiltinModule('module')
+    const { join } = process.getBuiltinModule('path')
+    const originalSpawn = childProcess.spawn
+    const record = (event, detail = {}) => fs.appendFileSync(
+      join(directory, 'events.jsonl'),
+      `${JSON.stringify({ at: new Date().toISOString(), event, ...detail })}\n`,
+    )
+    childProcess.spawn = function (command, args, options) {
+      if (!Array.isArray(args) || !args.includes('cleanup-apply') || !args.includes('--after-parent-exit')) {
+        return originalSpawn.apply(this, arguments)
+      }
+      childProcess.spawn = originalSpawn
+      syncBuiltinESMExports()
+      record('spawn_requested', { command, args, cwd: options.cwd, stdio: options.stdio })
+      // Regular inherited file descriptors preserve output after app.exit
+      // without adding pipes, readers, or references that keep Electron alive.
+      const descriptors = []
+      let child
+      try {
+        descriptors.push(fs.openSync(join(directory, 'stdout.log'), 'w'))
+        descriptors.push(fs.openSync(join(directory, 'stderr.log'), 'w'))
+        child = originalSpawn.call(this, command, args, {
+          ...options,
+          stdio: [options.stdio[0], ...descriptors],
+        })
+      } finally {
+        for (const descriptor of descriptors) fs.closeSync(descriptor)
+      }
+      record('spawn_returned', { pid: child.pid, electronPid: process.pid })
+      child.once('error', (error) => record('spawn_error', { message: error.message, code: error.code }))
+      child.once('exit', (code, signal) => record('exit_before_electron', { code, signal }))
+      child.stdin.once('error', (error) => record('stdin_error', { message: error.message, code: error.code }))
+      const originalWrite = child.stdin.write
+      child.stdin.write = function (...values) {
+        record('approval_write', { bytes: Buffer.byteLength(values[0], 'utf8') })
+        const last = values.length - 1
+        if (typeof values[last] === 'function') {
+          const callback = values[last]
+          values[last] = function (error) {
+            record('approval_write_callback', { error: error?.message ?? null })
+            return callback.apply(this, arguments)
+          }
+        }
+        return originalWrite.apply(this, values)
+      }
+      return child
+    }
+    syncBuiltinESMExports()
+    record('observer_installed')
+  }, helperDiagnostics)
+}
+
+async function reportDeleteAllHelperFailure() {
+  const files = [
+    ['events', join(helperDiagnostics, 'events.jsonl')],
+    ['electronExit', join(helperDiagnostics, 'electron-exit.json')],
+    ['stdout', join(helperDiagnostics, 'stdout.log')],
+    ['stderr', join(helperDiagnostics, 'stderr.log')],
+    ['cleanupJournal', cleanupJournal],
+  ]
+  const diagnostics = Object.fromEntries(await Promise.all(files.map(async ([name, path]) => [
+    name,
+    (await readFile(path, 'utf8').catch(() => '')).slice(0, 65_536),
+  ])))
+  console.error(JSON.stringify({ event: 'delete_all_helper_failure', ...diagnostics }))
+}
 
 async function pendingDeleteAllTargets() {
   const targets = [
@@ -140,7 +222,10 @@ try {
   await mkdir(workspace, { recursive: true })
   await mkdir(state, { recursive: true })
   await mkdir(dirname(consolidationBackupMarker), { recursive: true })
-  await mkdir(isolatedHome, { recursive: true })
+  await Promise.all([
+    mkdir(join(isolatedHome, 'AppData', 'Roaming'), { recursive: true }),
+    mkdir(join(isolatedHome, 'AppData', 'Local', 'Temp'), { recursive: true }),
+  ])
   await writeFile(join(workspace, 'IDENTITY.md'), 'synthetic cleanup identity\n', 'utf8')
   await writeFile(join(state, 'sessions.db.keep'), 'synthetic chat state\n', 'utf8')
   await writeFile(consolidationBackupMarker, 'recorded backup must remain\n', 'utf8')
@@ -212,12 +297,7 @@ try {
       confirmation: '',
     })
   ), preview.previewId).catch(() => {})
-  await Promise.race([
-    exited,
-    delay(30_000).then(() => {
-      throw new Error('Desktop did not exit after deleting the current profile.')
-    }),
-  ])
+  await withDeadline(() => exited, 'Desktop exit after deleting the current profile', 30_000)
 
   assert.equal(await exists(primaryHome), false)
   assert.equal(await exists(join(userData, 'desktop-credential.json')), false)
@@ -261,7 +341,13 @@ try {
     true,
     'inspection must not touch recorded consolidation backups',
   )
+  await observeDeleteAllHelper(desktopApp)
   const deleteAllProcess = desktopApp.process()
+  deleteAllProcess.once('exit', (code, signal) => {
+    void writeFile(join(helperDiagnostics, 'electron-exit.json'), JSON.stringify({
+      at: new Date().toISOString(), code, signal,
+    })).catch(() => {})
+  })
   const deleteAllExited = new Promise((resolveExit) => deleteAllProcess.once('exit', resolveExit))
   void deleteAllPage.evaluate((previewId) => (
     window.opensquillaDesktop.applyDesktopCleanup({
@@ -270,12 +356,7 @@ try {
       confirmation: 'DELETE ALL OPENSQUILLA DATA',
     })
   ), deleteAllPreview.previewId).catch(() => {})
-  await Promise.race([
-    deleteAllExited,
-    delay(30_000).then(() => {
-      throw new Error('Desktop did not exit before the delete-all helper handoff.')
-    }),
-  ])
+  await withDeadline(() => deleteAllExited, 'Desktop exit before the delete-all helper handoff', 30_000)
   try {
     await waitFor(async () => (
       !await exists(primaryHome)
@@ -301,6 +382,7 @@ try {
     allPrimaryDataAndBackupsDeletedByOfflineHelper: true,
   }))
 } catch (error) {
+  await reportDeleteAllHelperFailure()
   const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
   if (desktopLog) console.error(desktopLog)
   throw error

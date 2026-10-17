@@ -173,6 +173,44 @@ describe('useChatSlashCommands compaction lifecycle', () => {
   })
 })
 
+describe('local side chat command palette', () => {
+  it('has one primary entry searchable by its alias before the remote catalog loads', async () => {
+    const run = vi.fn(async () => true)
+    const { api, inputText, rpc } = harness(false, [], Promise.resolve(), undefined, { sideChat: { run } })
+    for (const query of ['/si', '/btw']) {
+      inputText.value = query
+      api.handleSlashInput()
+      expect(api.filteredSlashCmds.value.filter(command => command.execution?.action === 'workbench.openSideChat')).toHaveLength(1)
+      expect(api.filteredSlashCmds.value[0]?.cmd).toBe('/side')
+    }
+    await expect(api.classifySlashCommand('/btw question')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/btw question')).resolves.toBe(true)
+    expect(run).toHaveBeenCalledWith('/btw question')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('completes only the leading token and preserves all prose after the caret', () => {
+    const run = vi.fn(async () => true)
+    const { api, inputText } = harness(false, [], Promise.resolve(), undefined, { sideChat: { run }, getCaret: () => 3 })
+    inputText.value = '/si keep this question\nincluding this line'
+    api.handleSlashInput()
+    api.completeSlashCmd(api.filteredSlashCmds.value[0]!)
+    expect(run).toHaveBeenCalledWith('/side keep this question\nincluding this line')
+    expect(inputText.value).toBe('/si keep this question\nincluding this line')
+  })
+
+  it('filters recursive side creation while retaining explicit command classification', async () => {
+    const run = vi.fn(async () => true)
+    const { api, inputText } = harness(false, [], Promise.resolve(), undefined, {
+      sideChat: { run }, commandAllowed: command => command.execution?.action !== 'workbench.openSideChat',
+    })
+    inputText.value = '/btw'
+    api.handleSlashInput()
+    expect(api.filteredSlashCmds.value).toEqual([])
+    await expect(api.classifySlashCommand('/btw question')).resolves.toBe('unavailable')
+  })
+})
+
 describe('useChatSlashCommands plan compatibility', () => {
   it('allows command completion with skill tags but blocks direct menu execution', async () => {
     const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
@@ -622,6 +660,105 @@ describe('unified skill palette', () => {
     const skillCatalog = { supportsCandidates: () => true, listCandidates } as unknown as SkillCatalog
     return { ...harness(false, [], Promise.resolve(), undefined, { skillCatalog, selectedSkills, ...extra }), selectedSkills, listCandidates }
   }
+
+  it('selects a current palette skill synchronously at the caret without another request or rewriting text', async () => {
+    const onSelectSkill = vi.fn()
+    const { api, inputText, selectedSkills, listCandidates } = skills({ getCaret: () => 3, onSelectSkill })
+    inputText.value = '前半句，后半句'
+    await api.loadSkillCandidates()
+    const picked = api.skillPaletteItems.value[0]!
+    expect(listCandidates).toHaveBeenCalledOnce()
+
+    expect(api.selectPaletteSkill(picked)).toBe(true)
+
+    const reference = { name: candidate.name, instanceId: candidate.instanceId, digest: candidate.digest }
+    expect(selectedSkills.value).toEqual([reference])
+    expect(onSelectSkill).toHaveBeenCalledExactlyOnceWith(reference, 3)
+    expect(inputText.value).toBe('前半句，后半句')
+    expect(listCandidates).toHaveBeenCalledOnce()
+    // Selecting an already present capability is idempotent, including position.
+    expect(api.selectPaletteSkill(picked)).toBe(true)
+    expect(selectedSkills.value).toHaveLength(1)
+    expect(onSelectSkill).toHaveBeenCalledOnce()
+    expect(listCandidates).toHaveBeenCalledOnce()
+  })
+
+  it.each(['name', 'instanceId', 'digest'] as const)(
+    'rejects a palette reference with a changed %s without fetching or selecting it', async (field) => {
+      const onSelectSkill = vi.fn()
+      const { api, inputText, selectedSkills, listCandidates } = skills({ onSelectSkill })
+      inputText.value = '保留草稿'
+      await api.loadSkillCandidates()
+      const picked = api.skillPaletteItems.value[0]!
+      const changed = { ...picked, skill: { ...picked.skill!, [field]: `changed-${picked.skill![field]}` } }
+
+      expect(api.selectPaletteSkill(changed)).toBe(false)
+      expect(selectedSkills.value).toEqual([])
+      expect(onSelectSkill).not.toHaveBeenCalled()
+      expect(inputText.value).toBe('保留草稿')
+      expect(listCandidates).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('rejects a formerly valid palette row after its catalog is invalidated', async () => {
+    const onSelectSkill = vi.fn()
+    const { api, inputText, selectedSkills, listCandidates } = skills({ onSelectSkill })
+    inputText.value = '目录刷新中也保留草稿'
+    await api.loadSkillCandidates()
+    const picked = api.skillPaletteItems.value[0]!
+    api.invalidateSkillCandidates()
+
+    expect(api.selectPaletteSkill(picked)).toBe(false)
+    expect(selectedSkills.value).toEqual([])
+    expect(onSelectSkill).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('目录刷新中也保留草稿')
+    expect(listCandidates).toHaveBeenCalledOnce()
+  })
+
+  it.each([{ disabled: true, ready: true }, { disabled: false, ready: false }])(
+    'uses current catalog readiness instead of a caller-supplied ready flag: %j', async status => {
+      const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [{ ...candidate, ...status }] }))
+      const onSelectSkill = vi.fn()
+      const { api, inputText, selectedSkills } = skills({ onSelectSkill, skillCatalog: {
+        supportsCandidates: () => true, listCandidates,
+      } as unknown as SkillCatalog })
+      inputText.value = '保留正文'
+      await api.loadSkillCandidates()
+      const picked = api.skillPaletteItems.value[0]!
+
+      expect(api.selectPaletteSkill({ ...picked, skill: { ...picked.skill!, ready: true, disabled: false } })).toBe(false)
+      expect(selectedSkills.value).toEqual([])
+      expect(onSelectSkill).not.toHaveBeenCalled()
+      expect(inputText.value).toBe('保留正文')
+      expect(listCandidates).toHaveBeenCalledOnce()
+    },
+  )
+
+  it('inserts a slash-selected reference at the query start and preserves both surrounding text fragments', async () => {
+    const prefix = '前面的说明 '
+    const query = '/SPREADSHEET'
+    const suffix = ' 后面的补充 /原样保留'
+    const onSelectSkill = vi.fn()
+    const setCaret = vi.fn()
+    const { api, inputText, selectedSkills, listCandidates } = skills({
+      getCaret: () => prefix.length + query.length, onSelectSkill, setCaret,
+    })
+    inputText.value = prefix + query + suffix
+    api.handleSlashInput()
+    await Promise.resolve()
+    const picked = api.filteredSlashCmds.value.find(command => command.skill?.instanceId === candidate.instanceId)!
+    expect(picked).toBeDefined()
+
+    api.completeSlashCmd(picked)
+
+    const reference = { name: candidate.name, instanceId: candidate.instanceId, digest: candidate.digest }
+    expect(onSelectSkill).toHaveBeenCalledExactlyOnceWith(reference, prefix.length)
+    expect(selectedSkills.value).toEqual([reference])
+    expect(inputText.value).toBe(prefix + suffix)
+    expect(setCaret).toHaveBeenCalledExactlyOnceWith(prefix.length)
+    expect(api.slashOpen.value).toBe(false)
+    expect(listCandidates).toHaveBeenCalledOnce()
+  })
 
   it('omits reset and usage from the menu while keeping all ordinary skills browseable', async () => {
     const candidates = ['pdf-toolkit', 'github', 'docx', 'html-coder', 'pptx', 'xlsx', 'custom-skill']

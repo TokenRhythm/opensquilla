@@ -1329,3 +1329,33 @@ async def test_task_runtime_preserves_accepted_inputs_on_provider_budget_error(
     assert "automatic context compaction" in payload["terminal_message"]
     assert "send less text" not in payload["terminal_message"]
     assert "failed before" not in payload["terminal_message"]
+
+
+@pytest.mark.parametrize("http_status", [429, 503, None, "429", True, 200, 700])
+async def test_http_status_survives_stream_and_durable_task_without_inference(http_status):
+    emitted = []
+
+    async def emitter(_session, name, payload):
+        emitted.append((name, payload))
+
+    async def stream():
+        yield ErrorEvent(message="PRIVATE_PROVIDER_BODY", code="429",
+                         failure_kind="rate_limited", http_status=http_status)
+
+    async def handler(run):
+        await _emit_task_runtime_stream_events(
+            stream(), run.envelope.session_key, emitter, task_id=run.task_id,
+            idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+    expected = http_status if type(http_status) is int and 400 <= http_status <= 599 else None
+    assert record.details["turn_outcome"].get("http_status") == expected
+    for name in ("session.event.error", "task.failed"):
+        payload = next(payload for event, payload in emitted if event == name)
+        assert payload.get("http_status") == expected
+        assert payload["turn_outcome"].get("http_status") == expected
+        assert "PRIVATE_PROVIDER_BODY" not in repr(payload)
+    assert "PRIVATE_PROVIDER_BODY" not in repr(record.details)

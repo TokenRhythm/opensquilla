@@ -1,3 +1,4 @@
+import { providerFailureKind } from '@/utils/chat/providerFailure'
 export type CompactionSkippedLabelCode =
   | 'chat.compact.withinBudget'
   | 'chat.compact.noSafeHistory'
@@ -69,4 +70,12 @@ export function compactionFailurePresentation(reason: unknown) {
     return { title: 'chat.compact.cancelled', detail: 'chat.compact.failureRetryDetail', warning: true }
   }
   return { title: 'chat.compact.failed', detail: 'chat.compact.failureRetryDetail', warning: false }
+}
+
+/** A refused provider summary is a failed maintenance attempt, not a benign no-op. */
+export function compactionSkippedProviderFailure(status: unknown, reason: unknown, failureKind: unknown): boolean {
+  const normalizedReason = String(reason || '').trim().toLowerCase()
+  const refusedSummary = ['summary_failed', 'suffix_summary_failed'].includes(normalizedReason)
+  return status === 'skipped' && !compactionSkipIsInformational(reason)
+    && (refusedSummary || providerFailureKind(failureKind) !== undefined)
 }

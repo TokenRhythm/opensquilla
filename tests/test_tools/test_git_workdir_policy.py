@@ -34,16 +34,7 @@ def test_git_effective_workdir_rejects_foreign_posix_absolute_path_on_windows(
         current_tool_context.reset(token)
 
 
-def test_git_rejects_foreign_diff_path_on_windows(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(git, "os", SimpleNamespace(name="nt"), raising=False)
-
-    with pytest.raises(ToolError, match="foreign_host_path"):
-        git._reject_foreign_git_path("/Users/a1/Desktop/repo/file.py")
-
-
-def test_git_rejects_foreign_commit_file_on_windows(
+def test_git_rejects_foreign_file_path_on_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(git, "os", SimpleNamespace(name="nt"), raising=False)

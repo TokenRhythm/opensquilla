@@ -1,6 +1,7 @@
 import { test, expect, type Locator, type Page } from '@playwright/test'
 import { readFile } from 'node:fs/promises'
 import { chatHistoryPayload } from './support/session-read-fixtures'
+import { installSidebarFixture } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2edeliverables'
@@ -11,86 +12,39 @@ interface SeedHistoryOptions {
   indexedArtifacts?: Array<Record<string, unknown>>
 }
 
-// Seed a finished turn through the real WS pipeline: the page talks to the
-// real gateway, but chat.history responses are rewritten in flight so a
-// deliverable-bearing assistant turn renders without a live agent run.
-async function seedHistory(
-  page: Page,
-  withArtifacts: boolean,
-  options: SeedHistoryOptions = {},
-) {
-  await page.routeWebSocket(/\/ws$/, ws => {
-    const server = ws.connectToServer()
-    const historyIds = new Set<string>()
-    ws.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
-          historyIds.add(String(frame.id))
-        }
-        if (
-          frame?.type === 'req'
-          && frame.method === 'artifacts.list'
-          && options.indexedArtifacts
-        ) {
-          ws.send(JSON.stringify({
-            type: 'res',
-            id: frame.id,
-            ok: true,
-            payload: {
-              artifacts: options.indexedArtifacts,
-              has_more: false,
-              oldest_cursor: options.indexedArtifacts[0]?.id || null,
-              newest_cursor: options.indexedArtifacts.at(-1)?.id || null,
-              total_count: options.indexedArtifacts.length,
-              page_size: Number(frame.params?.limit) || 200,
-            },
-          }))
-          return
-        }
-      } catch {}
-      server.send(message)
-    })
-    server.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.protocol !== undefined && options.indexedArtifacts) {
-          const methods = Array.isArray(frame.features?.methods) ? frame.features.methods : []
-          frame.features = {
-            ...frame.features,
-            methods: [...new Set([...methods, 'artifacts.list'])],
-          }
-        }
-        if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
-          historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
-          frame.payload = chatHistoryPayload([
-            {
-              role: 'user',
-              text: 'Save a couple of files for me.',
-              id: 'msg-deliv-user',
-              timestamp: Math.floor(Date.now() / 1000) - 120,
-            },
-            {
-              role: 'assistant',
-              text: withArtifacts ? 'Saved the files.' : 'Nothing to save on this turn.',
-              id: 'msg-deliv-assistant',
-              timestamp: Math.floor(Date.now() / 1000) - 60,
-              artifacts: withArtifacts
-                ? [
-                  { id: 'art-deliv-1', name: 'report.csv', mime: 'text/csv', size: 2048 },
-                  { id: 'art-deliv-2', name: 'notes.txt', mime: 'text/plain', size: 512 },
-                ]
-                : [],
-            },
-          ])
-          ws.send(JSON.stringify(frame))
-          return
-        }
-      } catch {}
-      ws.send(message)
-    })
+// Complete offline session read protocol, including optional indexed artifacts.
+async function seedHistory(page: Page, withArtifacts: boolean, options: SeedHistoryOptions = {}) {
+  await installSidebarFixture(page, {
+    'chat.history': chatHistoryPayload([
+      {
+        role: 'user',
+        text: 'Save a couple of files for me.',
+        id: 'msg-deliv-user',
+        timestamp: Math.floor(Date.now() / 1000) - 120,
+      },
+      {
+        role: 'assistant',
+        text: withArtifacts ? 'Saved the files.' : 'Nothing to save on this turn.',
+        id: 'msg-deliv-assistant',
+        timestamp: Math.floor(Date.now() / 1000) - 60,
+        artifacts: withArtifacts
+          ? [
+            { id: 'art-deliv-1', name: 'report.csv', mime: 'text/csv', size: 2048 },
+            { id: 'art-deliv-2', name: 'notes.txt', mime: 'text/plain', size: 512 },
+          ]
+          : [],
+      },
+    ]),
+    ...(options.indexedArtifacts ? {
+      'artifacts.list': (params: Record<string, unknown>) => ({
+        artifacts: options.indexedArtifacts,
+        has_more: false,
+        oldest_cursor: options.indexedArtifacts?.[0]?.id || null,
+        newest_cursor: options.indexedArtifacts?.at(-1)?.id || null,
+        total_count: options.indexedArtifacts?.length || 0,
+        page_size: Number(params.limit) || 200,
+      }),
+    } : {}),
   })
 }
 
@@ -105,7 +59,7 @@ async function openSeededSession(
   })
   await seedHistory(page, withArtifacts, options)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(key))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
 }
 
@@ -238,13 +192,13 @@ test.describe('Indexed deliverables with the default Workbench', () => {
     await page.route('**/api/v1/artifacts/art-deliv-indexed', route => {
       downloadRequests += 1
       expect(route.request().headers()['x-opensquilla-session-key']).toBe(INDEXED_SESSION_KEY)
-      return route.fulfill({ contentType: 'application/json', body: fileContent })
+      return route.fulfill({ contentType: 'application/octet-stream', body: fileContent })
     })
     await openSeededSession(page, INDEXED_SESSION_KEY, false, {
       indexedArtifacts: [{
         id: 'art-deliv-indexed',
-        name: 'archived-report.json',
-        mime: 'application/json',
+        name: 'archived-report.bin',
+        mime: 'application/octet-stream',
         size: Buffer.byteLength(fileContent),
         created_at: '2026-08-01T00:00:00Z',
         download_url: '/api/v1/artifacts/art-deliv-indexed',
@@ -261,7 +215,7 @@ test.describe('Indexed deliverables with the default Workbench', () => {
     const drawer = page.locator('.deliv-drawer')
     await expect(drawer).toBeVisible()
     await expect(drawer.locator('.deliv-tile')).toHaveCount(1)
-    await expect(drawer.locator('.deliv-tile__name')).toHaveText('archived-report.json')
+    await expect(drawer.locator('.deliv-tile__name')).toHaveText('archived-report.bin')
     await drawer.locator('.deliv-tile').click()
 
     const preview = page.locator('.deliv-preview')
@@ -272,7 +226,7 @@ test.describe('Indexed deliverables with the default Workbench', () => {
     const downloadPromise = page.waitForEvent('download')
     await preview.getByRole('button', { name: 'Download', exact: true }).click()
     const download = await downloadPromise
-    expect(download.suggestedFilename()).toBe('archived-report.json')
+    expect(download.suggestedFilename()).toBe('archived-report.bin')
     const path = await download.path()
     expect(path).not.toBeNull()
     expect(await readFile(path!, 'utf8')).toBe(fileContent)

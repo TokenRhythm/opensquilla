@@ -16,6 +16,26 @@ import type {
 } from './types'
 
 const CLOSED_BROWSER_HISTORY_LIMIT = 8
+// Matches the existing Gateway PTY admission limit. Keeping terminals across
+// navigation must not turn a bounded connection into unbounded mounted views.
+const TERMINAL_ITEM_LIMIT = 4
+// Native interactive artifact pages cannot be safely reconstructed yet. Bound
+// new protected preview owners instead of evicting existing user work. This is
+// an admission count, not a heap limit or a cap on adopted browser targets.
+const NATIVE_ARTIFACT_ITEM_LIMIT = 4
+const BROWSER_ITEM_LIMIT = 8
+
+interface WorkbenchAdmissionRejection {
+  reason: 'native-preview-capacity' | 'browser-capacity'
+  item: WorkbenchItem
+  limit: number
+}
+
+interface SessionPresentation {
+  activeItemId: string | null
+  expanded: boolean
+  widthPreference: WorkbenchWidthPreference
+}
 
 function hydrateWidthPreference(): WorkbenchWidthPreference {
   if (typeof localStorage === 'undefined') return defaultWorkbenchWidthPreference()
@@ -38,6 +58,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const activeItemId = ref<string | null>(null)
   const expanded = ref(false)
   const maximized = ref(false)
+  // Transient presentation intent from an explicit user action. It never
+  // changes panel ownership, retention, width preference, or execution state.
+  const revealRequestId = ref(0)
   const hostAvailable = ref(true)
   const widthPreference = ref<WorkbenchWidthPreference>(hydrateWidthPreference())
   const activeSessionId = ref<string | null>(null)
@@ -46,10 +69,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   // caller; the page gets a fresh safe surface instead of a stale targetRef.
   const closedBrowserItems = ref<WorkbenchItem[]>([])
 
-  // Both collections are runtime-only. They are intentionally not reactive or
+  // These collections are runtime-only. They are intentionally not reactive or
   // persisted, and therefore cannot leak controller state into Pinia snapshots.
   const activationOrder: string[] = []
+  // Runtime-only presentation state: no child bindings, credentials, document
+  // contents or native handles are serialized when the user navigates.
+  const sessionPresentations = new Map<string | null, SessionPresentation>()
   const lifecycleListeners = new Set<WorkbenchLifecycleListener>()
+  const admissionListeners = new Set<(rejection: WorkbenchAdmissionRejection) => void>()
 
   const activeItem = computed<WorkbenchItem | null>(() =>
     items.value.find(item => item.id === activeItemId.value) ?? null)
@@ -74,6 +101,20 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   function onLifecycle(listener: WorkbenchLifecycleListener): () => void {
     lifecycleListeners.add(listener)
     return () => lifecycleListeners.delete(listener)
+  }
+
+  function onAdmissionRejected(listener: (rejection: WorkbenchAdmissionRejection) => void): () => void {
+    admissionListeners.add(listener)
+    return () => admissionListeners.delete(listener)
+  }
+
+  function rejectAdmission(rejection: WorkbenchAdmissionRejection): false {
+    for (const listener of admissionListeners) {
+      try { listener(rejection) } catch (error) {
+        console.error('[workbench] admission listener failed', error)
+      }
+    }
+    return false
   }
 
   function rememberActivation(id: string) {
@@ -125,7 +166,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function activateItem(id: string): boolean {
     const item = items.value.find(candidate => candidate.id === id)
-    if (!item) return false
+    if (!item || item.scope.type === 'session' && item.scope.id !== activeSessionId.value) return false
     const previous = activeItem.value
     if (previous?.id === item.id) {
       rememberActivation(item.id)
@@ -141,6 +182,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   function openItem(item: WorkbenchItem, options: { activate?: boolean } = {}): boolean {
+    const existing = items.value.some(candidate => candidate.id === item.id)
+    // Adoption describes a target already admitted by the native host. Refusing
+    // it here would strand the page without a tab or an explicit close action.
+    if (!existing && item.kind === 'browser' && item.payload.adoptedNativeSurface !== true
+      && items.value.filter(candidate => candidate.kind === 'browser').length >= BROWSER_ITEM_LIMIT) {
+      return rejectAdmission({ reason: 'browser-capacity', item, limit: BROWSER_ITEM_LIMIT })
+    }
+    if (!existing && item.kind === 'artifact-preview' && item.hostKind === 'native-webcontents'
+      && items.value.filter(candidate => candidate.kind === 'artifact-preview'
+        && candidate.hostKind === 'native-webcontents').length >= NATIVE_ARTIFACT_ITEM_LIMIT) {
+      return rejectAdmission({ reason: 'native-preview-capacity', item, limit: NATIVE_ARTIFACT_ITEM_LIMIT })
+    }
+    if (item.kind === 'terminal' && !existing
+      && items.value.filter(candidate => candidate.kind === 'terminal').length >= TERMINAL_ITEM_LIMIT) return false
+    if (options.activate !== false && activeSessionId.value === null && item.scope.type === 'session') {
+      setSessionScope(item.scope.id)
+    }
     if (item.kind === 'browser') {
       closedBrowserItems.value = closedBrowserItems.value.filter(
         candidate => candidate.id !== item.id,
@@ -150,10 +208,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       items.value.push(item)
       notify({ type: 'open', item })
     }
-    if (options.activate !== false) {
-      if (activeSessionId.value === null && item.scope.type === 'session') {
-        activeSessionId.value = item.scope.id
-      }
+    // Background conversations may finish a resource after navigation. Keep
+    // that resource on its owner's shelf without replacing the visible panel.
+    const matchesActiveSession = item.scope.type !== 'session'
+      || item.scope.id === activeSessionId.value
+    if (options.activate !== false && matchesActiveSession) {
       expanded.value = true
       activateItem(item.id)
     } else {
@@ -231,12 +290,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     reason: WorkbenchDisposeReason = 'scope-changed',
   ) {
     closeMatchingItems(item => sameScope(item.scope, scope), reason)
+    if (scope.type === 'session') sessionPresentations.delete(scope.id)
   }
 
   function closeAllItems(
     reason: WorkbenchDisposeReason = 'closed',
   ) {
     closeMatchingItems(() => true, reason)
+    sessionPresentations.clear()
   }
 
   function closeMatchingItems(
@@ -268,33 +329,35 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function setSessionScope(sessionId: string | null) {
     if (activeSessionId.value === sessionId) return
-    // Browser tabs represent live native pages. Keep them in the in-memory
-    // workbench shelf while the user moves between chat sessions so returning
-    // to the originating task can reveal the same page again. Other
-    // session-scoped panels still follow the existing disposal contract.
-    closeMatchingItems(
-      item => item.scope.type === 'session'
-        && item.scope.id !== sessionId
-        && item.kind !== 'browser',
-      'scope-changed',
-    )
-    const active = activeItem.value
-    if (!active || active.scope.type === 'session' && active.scope.id !== sessionId) {
-      // Scope changes keep the native page alive, but it must stop consuming
-      // the current sidebar rectangle before another session can take focus.
-      suspendItem(active)
-      const replacement = findMostRecentItem(item =>
-        item.scope.type !== 'session'
-        || item.scope.id === sessionId,
-      )
-      activeItemId.value = replacement?.id ?? null
-      if (replacement) {
-        rememberActivation(replacement.id)
-        notify({ type: 'activate', item: replacement })
-        if (expanded.value && hostAvailable.value) resumeItem(replacement)
-      }
-    }
+    sessionPresentations.set(activeSessionId.value, {
+      activeItemId: activeItemId.value,
+      expanded: expanded.value,
+      widthPreference: { ...widthPreference.value },
+    })
+    // Navigation relinquishes the visible rectangle, never the business owner.
+    // In particular it must not run close hooks or remove retained descriptors.
+    if (expanded.value && hostAvailable.value) suspendItem(activeItem.value)
     activeSessionId.value = sessionId
+    const saved = sessionPresentations.get(sessionId)
+    const matchesScope = (item: WorkbenchItem) => item.scope.type !== 'session'
+      || item.scope.id === sessionId
+    const savedItem = saved?.activeItemId
+      ? items.value.find(item => item.id === saved.activeItemId && matchesScope(item))
+      : null
+    // A deliberately selected empty start page is also part of the layout.
+    const replacement = saved && saved.activeItemId === null
+      ? null : savedItem ?? findMostRecentItem(matchesScope)
+    activeItemId.value = replacement?.id ?? null
+    // Expansion belongs to this conversation, including its empty launcher.
+    // A new owner starts collapsed; draft materialization keeps the same key.
+    expanded.value = saved?.expanded ?? false
+    maximized.value = false
+    widthPreference.value = saved ? { ...saved.widthPreference } : hydrateWidthPreference()
+    if (replacement) {
+      rememberActivation(replacement.id)
+      notify({ type: 'activate', item: replacement })
+      if (expanded.value && hostAvailable.value) resumeItem(replacement)
+    }
   }
 
   function setExpanded(next: boolean) {
@@ -322,6 +385,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function toggleMaximized() {
     setMaximized(!maximized.value)
+  }
+
+  function requestReveal() {
+    revealRequestId.value += 1
   }
 
   function setHostAvailable(next: boolean) {
@@ -362,6 +429,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     maximized.value = false
     activeSessionId.value = null
     activationOrder.splice(0)
+    sessionPresentations.clear()
     closedBrowserItems.value = []
     for (const item of openItems) {
       notify({ type: 'dispose', item, reason: 'store-reset' })
@@ -377,11 +445,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     activeSessionId,
     expanded,
     maximized,
+    revealRequestId,
     hostAvailable,
     widthPreference,
     isVisible,
     hasMultipleItems,
     onLifecycle,
+    onAdmissionRejected,
     findMostRecentItem,
     hasAvailableItemForSession,
     openItem,
@@ -397,6 +467,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     toggleExpanded,
     setMaximized,
     toggleMaximized,
+    requestReveal,
     setHostAvailable,
     setWidth,
     resetWidth,

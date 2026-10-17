@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import cache
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Any, Final
 
 # Skill manifests fingerprint complete bundled trees.  Keep imports performed
 # by this runner and both pytest phases from creating derived files in those
@@ -36,12 +36,30 @@ SHARD_NAMES: Final[tuple[str, ...]] = (
     "recovery-migration",
     "desktop-installer-contracts",
 )
+SHARED_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
+    f"{family}-{partition}"
+    for family in SHARD_NAMES
+    for partition in range(1, 9 if family == "gateway-sqlite" else 5)
+)
+WINDOWS_EXTRA_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
+    f"gateway-sqlite-{partition}" for partition in range(9, 12)
+)
 WINDOWS_SHARD_NAMES: Final[tuple[str, ...]] = tuple(
     f"{family}-{partition}"
     for family in SHARD_NAMES
-    for partition in range(1, 5 if family == "gateway-sqlite" else 3)
+    for partition in range(1, 12 if family == "gateway-sqlite" else 5)
 )
+WINDOWS_OVERRIDE_SOURCE: Final[str] = "gateway-sqlite-5"
 DEFAULT_PARALLEL_WORKERS: Final[int] = 4
+# Audited function-scoped synthetic homes/configs allow independent cases in
+# this file to share the existing worker pool. Every other file retains xdist's
+# loadfile grouping, and ci_serial tests still run in their separate phase.
+ITEM_PARALLEL_FILES: Final[frozenset[str]] = frozenset(
+    {"tests/test_observability/test_bundle.py"}
+)
+BUNDLE_TEST_FILE: Final[str] = "tests/test_observability/test_bundle.py"
+BUNDLE_OWNER: Final[str] = "desktop-installer-contracts-1"
+BUNDLE_SHARDS: Final[tuple[str, ...]] = tuple(f"bundle-{part}" for part in range(1, 5))
 _CORE_WHEEL_FIXTURE: Final[str] = "isolated_core_wheel"
 _CORE_WHEEL_ENV: Final[str] = "OPENSQUILLA_TEST_CORE_WHEEL"
 _CORE_WHEEL_SHA_ENV: Final[str] = "OPENSQUILLA_TEST_CORE_WHEEL_SHA256"
@@ -113,6 +131,32 @@ _HARD_PINNED_SHARDS: Final[dict[str, str]] = {
 _DURATION_FILE: Final[Path] = Path(__file__).with_name("windows_test_durations.json")
 _ASSIGNMENT_FILE: Final[Path] = Path(__file__).with_name("windows_test_assignments.json")
 _PARTITION_FILE: Final[Path] = Path(__file__).with_name("windows_test_partitions.json")
+
+
+def pytest_xdist_make_scheduler(config: Any, log: Any) -> Any:
+    """Split only audited files into cases while preserving file isolation."""
+
+    if config.getoption("dist", default=None) != "loadfile":
+        return None
+
+    # Keep report/list/metadata operations independent of pytest and xdist.
+    from xdist.scheduler.loadfile import LoadFileScheduling
+
+    class AuditedItemScheduling(LoadFileScheduling):
+        def _split_scope(self, nodeid: str) -> str:
+            if nodeid.split("::", 1)[0] in ITEM_PARALLEL_FILES:
+                return nodeid
+            return super()._split_scope(nodeid)
+
+    return AuditedItemScheduling(config, log)
+
+
+# Equivalent to pytest.hookimpl, without importing pytest for the runner's
+# read-only inventory commands. xdist's default scheduler hook is trylast.
+pytest_xdist_make_scheduler.pytest_impl = {  # type: ignore[attr-defined]
+    "tryfirst": True,
+    "optionalhook": True,
+}
 
 
 # These files are excluded from offline CI by its marker expression.
@@ -441,10 +485,10 @@ def validate_partition_payload(payload: object) -> dict[str, str]:
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise ValueError("unsupported Windows test partition schema")
     partitions = payload.get("partitions")
-    if not isinstance(partitions, dict) or set(partitions) != set(WINDOWS_SHARD_NAMES):
+    if not isinstance(partitions, dict) or set(partitions) != set(SHARED_SHARD_NAMES):
         raise ValueError("partitions must contain every Windows execution shard exactly once")
     assignments: dict[str, str] = {}
-    for shard in WINDOWS_SHARD_NAMES:
+    for shard in SHARED_SHARD_NAMES:
         paths = partitions[shard]
         if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
             raise ValueError(f"invalid Windows partition paths in {shard!r}")
@@ -465,7 +509,34 @@ def validate_partition_payload(payload: object) -> dict[str, str]:
             if shard_for_test(path) != shard_family(shard):
                 raise ValueError(f"Windows partition crosses responsibility families: {path}")
             assignments[path] = shard
+    validate_windows_overrides(payload, assignments)
     return assignments
+
+
+def validate_windows_overrides(
+    payload: dict[str, Any], assignments: dict[str, str],
+) -> dict[str, str]:
+    """Validate whole-file Windows moves without changing shared ownership."""
+
+    raw = payload.get("windows_overrides")
+    if raw is None:
+        return {}  # Existing shared snapshots and historical fixtures remain valid.
+    if not isinstance(raw, dict) or set(raw) != set(WINDOWS_EXTRA_SHARD_NAMES):
+        raise ValueError("windows_overrides must contain exactly gateway-sqlite-9..11")
+    overrides: dict[str, str] = {}
+    for shard in WINDOWS_EXTRA_SHARD_NAMES:
+        paths = raw[shard]
+        if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            raise ValueError(f"invalid windows_overrides paths in {shard!r}")
+        if paths != sorted(paths):
+            raise ValueError(f"windows_overrides {shard!r} is not sorted")
+        for path in paths:
+            if path in overrides:
+                raise ValueError(f"duplicate windows_overrides path: {path}")
+            if assignments.get(path) != WINDOWS_OVERRIDE_SOURCE:
+                raise ValueError(f"windows_overrides source must be gateway-sqlite-5: {path}")
+            overrides[path] = shard
+    return overrides
 
 
 @cache
@@ -479,39 +550,124 @@ def partition_assignments() -> dict[str, str]:
     return validate_partition_payload(payload)
 
 
-def partition_snapshot_fingerprint() -> str:
+@cache
+def windows_partition_overrides() -> dict[str, str]:
+    """Load the reviewed Windows-only overlay; new files keep shared fallback."""
+
+    try:
+        payload = json.loads(_PARTITION_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read Windows test partitions from {_PARTITION_FILE}") from exc
+    assignments = validate_partition_payload(payload)
+    return validate_windows_overrides(payload, assignments)
+
+
+def _execution_platform(target: str | None) -> str:
+    if target is None:
+        return "windows" if platform.system() == "Windows" else "ubuntu"
+    if target not in {"windows", "ubuntu"}:
+        raise ValueError(f"unknown execution platform: {target}")
+    return target
+
+
+def partition_snapshot_fingerprint(*, platform: str = "windows") -> str:
     """Bind physical Windows reports to their reviewed execution assignment map."""
 
-    canonical = json.dumps(partition_assignments(), sort_keys=True, separators=(",", ":"))
+    assignments = dict(partition_assignments())
+    if _execution_platform(platform) == "windows":
+        assignments.update(windows_partition_overrides())
+    canonical = json.dumps(assignments, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def windows_shard_for_test(path: str) -> str:
     """Select one physical Windows shard, with stable fallback for new files."""
 
+    return execution_shard_for_test(path, platform="windows")
+
+
+def execution_shard_for_test(path: str, *, platform: str | None = None) -> str:
+    """Resolve shared ownership and, only on Windows, its reviewed overlay."""
+
     normalized = PurePosixPath(path).as_posix()
+    if _execution_platform(platform) == "windows":
+        override = windows_partition_overrides().get(normalized)
+        if override is not None:
+            return override
     assignment = partition_assignments().get(normalized)
     if assignment is not None:
         return assignment
     family = shard_for_test(normalized)
-    partitions = tuple(shard for shard in WINDOWS_SHARD_NAMES if shard_family(shard) == family)
+    partitions = tuple(shard for shard in SHARED_SHARD_NAMES if shard_family(shard) == family)
     index = int(hashlib.sha256(normalized.encode("utf-8")).hexdigest(), 16) % len(partitions)
     return partitions[index]
 
 
-def files_for_shard(root: Path, shard: str) -> tuple[str, ...]:
+def files_for_shard(
+    root: Path, shard: str, *, platform: str | None = None,
+) -> tuple[str, ...]:
     shard_family(shard)
-    selector = windows_shard_for_test if shard in WINDOWS_SHARD_NAMES else shard_for_test
+    target = _execution_platform(platform)
+    if target != "windows" and shard in WINDOWS_EXTRA_SHARD_NAMES:
+        raise ValueError(f"Windows-only shard cannot run on {target}: {shard}")
+
+    def selector(path: str) -> str:
+        return (execution_shard_for_test(path, platform=target)
+                if shard in WINDOWS_SHARD_NAMES else shard_for_test(path))
+
     return tuple(path for path in discover_test_files(root) if selector(path) == shard)
 
 
-def validated_files_for_shard(root: Path, shard: str) -> tuple[str, ...]:
+def files_for_planned_windows_shards(
+    root: Path, current_shard: str, planned_json: str, *, platform: str = "windows",
+) -> tuple[str, ...]:
+    """List only files whose physical owner must run in this Windows matrix."""
+
+    planned = json.loads(planned_json)
+    target = _execution_platform(platform)
+    names = WINDOWS_SHARD_NAMES if target == "windows" else SHARED_SHARD_NAMES
+    if (
+        not isinstance(planned, list)
+        or not planned
+        or any(not isinstance(shard, str) or shard not in names for shard in planned)
+        or len(set(planned)) != len(planned)
+        or current_shard not in planned
+    ):
+        raise ValueError(
+            "planned Windows shards must be unique physical shards including this cell"
+        )
+    selected = set(planned)
+    return tuple(
+        path for path in discover_test_files(root)
+        if execution_shard_for_test(path, platform=target) in selected
+    )
+
+
+def validated_files_for_shard(
+    root: Path, shard: str, *, platform: str | None = None,
+) -> tuple[str, ...]:
     """Return one shard after validating the complete offline file inventory."""
 
     discovered = set(discover_test_files(root))
-    names = WINDOWS_SHARD_NAMES if shard in WINDOWS_SHARD_NAMES else SHARD_NAMES
+    target = _execution_platform(platform)
+    physical_names = WINDOWS_SHARD_NAMES if target == "windows" else SHARED_SHARD_NAMES
+    if target != "windows" and shard in WINDOWS_EXTRA_SHARD_NAMES:
+        raise ValueError(f"Windows-only shard cannot run on {target}: {shard}")
+    names = physical_names if shard in WINDOWS_SHARD_NAMES else SHARD_NAMES
     shard_family(shard)
-    by_shard = {name: set(files_for_shard(root, name)) for name in names}
+
+    def selector(path: str) -> str:
+        return (execution_shard_for_test(path, platform=target)
+                if shard in WINDOWS_SHARD_NAMES else shard_for_test(path))
+
+    by_shard: dict[str, set[str]] = {name: set() for name in names}
+    # Validate the full inventory in one pass. More physical partitions must
+    # not multiply repository scans in every matrix cell.
+    for path in discovered:
+        owner = selector(path)
+        if owner not in by_shard:
+            raise ValueError(f"Windows test file has an unknown shard owner: {path}: {owner}")
+        by_shard[owner].add(path)
     assigned = set().union(*by_shard.values())
     assignment_count = sum(len(paths) for paths in by_shard.values())
     if assigned != discovered or assignment_count != len(discovered):
@@ -587,12 +743,51 @@ def _inventory_fingerprint(files: tuple[str, ...]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _delegate_bundle_files(
+    files: tuple[str, ...], shard: str, planned_platform_matrix: str | None,
+) -> tuple[str, ...]:
+    """Exclude bundle only after verifying its four native Windows owners."""
+
+    if platform.system() != "Windows":
+        raise ValueError("--delegate-bundle requires native Windows")
+    if shard != BUNDLE_OWNER or BUNDLE_TEST_FILE not in files:
+        raise ValueError(f"--delegate-bundle requires the bundle owner {BUNDLE_OWNER}")
+    try:
+        planned = json.loads(planned_platform_matrix or "null")
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid --planned-platform-matrix JSON") from exc
+    if not isinstance(planned, list) or not planned:
+        raise ValueError("--delegate-bundle requires a planned platform matrix list")
+    cells: list[tuple[str, str, str]] = []
+    for cell in planned:
+        if not isinstance(cell, dict) or any(
+            not isinstance(cell.get(key), str) or not cell[key].strip()
+            for key in ("suite", "os", "shard")
+        ):
+            raise ValueError("malformed planned platform matrix cell")
+        cells.append((cell["suite"], cell["os"], cell["shard"]))
+    if len(cells) != len(set(cells)):
+        raise ValueError("duplicate planned platform matrix cell")
+    expected = {("windows-high-risk", "windows-latest", part) for part in BUNDLE_SHARDS}
+    actual = {cell for cell in cells if cell[2].startswith("bundle-")}
+    owner = ("windows-high-risk", "windows-latest", BUNDLE_OWNER)
+    if actual != expected or owner not in cells:
+        raise ValueError(
+            "bundle delegation requires the Windows owner and exactly bundle-1..4 "
+            "in windows-high-risk on windows-latest"
+        )
+    return tuple(path for path in files if path != BUNDLE_TEST_FILE)
+
+
 def _write_run_metadata(
     path: Path,
     shard: str,
     files: tuple[str, ...],
     *,
     parallel_workers: int,
+    marker_expression: str | None = None,
+    delegate_bundle: bool = False,
+    execution_platform: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -616,17 +811,26 @@ def _write_run_metadata(
             "parallel": {
                 "workers": parallel_workers,
                 "dist": "loadfile",
-                "marker": "not ci_serial",
+                "item_parallel_files": sorted(ITEM_PARALLEL_FILES.intersection(files)),
+                "marker": _phase_marker(marker_expression, "not ci_serial"),
             },
             "serial": {
                 "workers": 1,
-                "marker": "ci_serial",
+                "marker": _phase_marker(marker_expression, "ci_serial"),
             },
         },
     }
     if shard in WINDOWS_SHARD_NAMES:
+        target = _execution_platform(execution_platform)
         payload["family"] = shard_family(shard)
-        payload["partition_sha256"] = partition_snapshot_fingerprint()
+        payload["partition_sha256"] = partition_snapshot_fingerprint(platform=target)
+        payload["execution_shards"] = list(
+            WINDOWS_SHARD_NAMES if target == "windows" else SHARED_SHARD_NAMES
+        )
+    if delegate_bundle:
+        payload["delegated_case_files"] = [
+            {"path": BUNDLE_TEST_FILE, "shards": list(BUNDLE_SHARDS)}
+        ]
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -808,9 +1012,10 @@ def _run_pytest_subprocess(root: Path, pytest_args: list[str], *, phase: str) ->
 
     environment = os.environ.copy()
     root_text = str(root)
+    script_directory = str(Path(__file__).resolve().parent)
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = os.pathsep.join(
-        value for value in (root_text, existing_pythonpath) if value
+        value for value in (script_directory, root_text, existing_pythonpath) if value
     )
     started_at = time.monotonic()
     result = subprocess.run(
@@ -875,6 +1080,10 @@ def _pytest_phase_inputs(
 
 
 def _phase_marker(base_expression: str | None, selection: str) -> str:
+    # Our explicit -m replaces pytest's addopts. Match the ordinary repository
+    # default unless the caller deliberately supplies a marker, including "".
+    if base_expression is None:
+        base_expression = "not stress"
     if not base_expression:
         return selection
     return f"({base_expression}) and ({selection})"
@@ -1002,16 +1211,27 @@ def _run(args: argparse.Namespace) -> int:
     import pytest
 
     root = args.root.resolve()
-    files = validated_files_for_shard(root, args.shard)
+    target = _execution_platform(getattr(args, "platform", None))
+    files = validated_files_for_shard(root, args.shard, platform=target)
+    delegate_bundle = getattr(args, "delegate_bundle", False)
+    planned_platform_matrix = getattr(args, "planned_platform_matrix", None)
+    if delegate_bundle:
+        files = _delegate_bundle_files(files, args.shard, planned_platform_matrix)
+    elif planned_platform_matrix is not None:
+        raise ValueError("--planned-platform-matrix requires --delegate-bundle")
     args.junit.parent.mkdir(parents=True, exist_ok=True)
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text("pytest_status=started\n", encoding="utf-8")
+    pytest_args, marker_expression = _pytest_phase_inputs(args.pytest_args)
     if args.metadata is not None:
         _write_run_metadata(
             args.metadata,
             args.shard,
             files,
             parallel_workers=args.workers,
+            marker_expression=marker_expression,
+            delegate_bundle=delegate_bundle,
+            execution_platform=target,
         )
     if not files:
         error = ValueError(f"Windows shard {args.shard!r} has no tests")
@@ -1020,7 +1240,6 @@ def _run(args: argparse.Namespace) -> int:
         _write_failure_summary(args.junit, args.summary, 2)
         return 2
 
-    pytest_args, marker_expression = _pytest_phase_inputs(args.pytest_args)
     parallel_junit = _phase_junit_path(args.junit, "parallel")
     serial_junit = _phase_junit_path(args.junit, "serial")
     runner_error_junit = _phase_junit_path(args.junit, "runner-error")
@@ -1051,6 +1270,8 @@ def _run(args: argparse.Namespace) -> int:
                 str(args.workers),
                 "--dist",
                 "loadfile",
+                "-p",
+                "windows_test_shards",
                 file_selection_arg,
                 f"--junitxml={parallel_junit}",
             ]
@@ -1058,6 +1279,12 @@ def _run(args: argparse.Namespace) -> int:
                 f"Running parallel bulk phase with {args.workers} workers "
                 "(--dist loadfile; excludes ci_serial)"
             )
+            item_parallel_files = sorted(ITEM_PARALLEL_FILES.intersection(files))
+            if item_parallel_files:
+                print(
+                    "Audited files distributed by individual test case: "
+                    + ", ".join(item_parallel_files)
+                )
             parallel_exit_code = _run_pytest_subprocess(
                 root,
                 parallel_args,
@@ -1131,7 +1358,16 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _list(args: argparse.Namespace) -> int:
-    for path in files_for_shard(args.root.resolve(), args.shard):
+    root = args.root.resolve()
+    files = (
+        files_for_planned_windows_shards(
+            root, args.shard, args.planned_windows_shards,
+            platform=_execution_platform(args.platform),
+        )
+        if args.planned_windows_shards is not None
+        else files_for_shard(root, args.shard, platform=args.platform)
+    )
+    for path in files:
         print(path)
     return 0
 
@@ -1178,6 +1414,11 @@ def _parser() -> argparse.ArgumentParser:
     list_parser = subparsers.add_parser("list", help="list files assigned to one shard")
     list_parser.add_argument("shard", choices=(*SHARD_NAMES, *WINDOWS_SHARD_NAMES))
     list_parser.add_argument("--root", type=Path, default=Path.cwd())
+    list_parser.add_argument("--platform", choices=("windows", "ubuntu"))
+    list_parser.add_argument(
+        "--planned-windows-shards",
+        help="JSON physical Windows matrix whose mandatory owners replace preflight repeats",
+    )
     list_parser.set_defaults(handler=_list)
 
     report_parser = subparsers.add_parser(
@@ -1190,9 +1431,18 @@ def _parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="run one shard through pytest")
     run_parser.add_argument("shard", choices=(*SHARD_NAMES, *WINDOWS_SHARD_NAMES))
     run_parser.add_argument("--root", type=Path, default=Path.cwd())
+    run_parser.add_argument("--platform", choices=("windows", "ubuntu"))
     run_parser.add_argument("--junit", type=Path, required=True)
     run_parser.add_argument("--summary", type=Path, required=True)
     run_parser.add_argument("--metadata", type=Path)
+    run_parser.add_argument(
+        "--delegate-bundle", action="store_true",
+        help="delegate bundle cases to four explicitly planned native Windows jobs",
+    )
+    run_parser.add_argument(
+        "--planned-platform-matrix",
+        help="JSON platform matrix proving all four delegated bundle jobs are required",
+    )
     run_parser.add_argument(
         "--workers",
         type=_positive_int,

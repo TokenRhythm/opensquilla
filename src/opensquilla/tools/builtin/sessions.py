@@ -873,7 +873,13 @@ async def sessions_list(
 
 @tool(
     name="sessions_history",
-    description="Retrieve conversation history from a session's transcript.",
+    description=(
+        "Retrieve conversation history from a session's transcript. Use recent=true for "
+        "the latest persisted visible messages, oldest-first, including archived history. "
+        "Recent reads are bounded text previews, omit tool/reasoning details and live output, "
+        "and report truncation/coverage; complete describes history, not task completion. "
+        "The default retains the legacy earliest active transcript read."
+    ),
     params={
         "session_key": {
             "type": "string",
@@ -884,17 +890,31 @@ async def sessions_list(
             "description": "Max messages to return (1-100)",
             "default": 20,
         },
+        "recent": {
+            "type": "boolean",
+            "description": (
+                "Return latest persisted visible text previews "
+                "instead of the legacy transcript prefix"
+            ),
+            "default": False,
+        },
     },
     required=["session_key"],
     plan_access=PlanAccess.READ_ONLY,
 )
-async def sessions_history(session_key: str, limit: int = 20) -> str:
+async def sessions_history(session_key: str, limit: int = 20, recent: bool = False) -> str:
     _reject_guest_session_tool("sessions_history")
     if not (1 <= limit <= 100):
         raise ToolError("Limit must be between 1 and 100")
+    if type(recent) is not bool:
+        raise ToolError("recent must be a boolean")
 
     try:
         mgr = _get_session_manager()
+        if recent:
+            from opensquilla.tools.builtin.session_history_preview import recent_session_history
+
+            return await recent_session_history(mgr, session_key, limit, current_tool_context.get())
         session = await mgr.get_session(session_key)
         if session is None:
             raise ToolError(f"Session not found: {session_key}")

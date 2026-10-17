@@ -48,6 +48,7 @@ class CreateSession:
     workspace_id: str | None
     provider: OptionalSessionBinding
     auth_profile: OptionalSessionBinding
+    session_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,7 @@ class NewSession:
     workspace: SessionWorkspaceBinding | None
     provider: OptionalSessionBinding
     auth_profile: OptionalSessionBinding
+    reuse_existing: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +177,7 @@ class SessionAvailabilityRequirement(StrEnum):
     CREATE_WITH_MESSAGE = "create_with_message"
     CREATE_WITH_DEPLOYMENT = "create_with_deployment"
     CREATE_WITH_WORKSPACE = "create_with_workspace"
+    CREATE_WITH_KEY = "create_with_key"
     FORK = "fork"
     RENAME = "rename"
     DELETE = "delete"
@@ -285,7 +288,9 @@ class SessionLifecycle:
         self._events = events
 
     async def create(self, command: CreateSession) -> CreatedSession:
-        session_key = self._creation_policy.new_session_key(command.agent_id, command.kind)
+        session_key = command.session_key or self._creation_policy.new_session_key(
+            command.agent_id, command.kind
+        )
         requested_model = command.model.value
         model = requested_model or await self._creation_policy.default_model(command.agent_id)
         deployment_requested = bool(command.provider.value or command.auth_profile.value)
@@ -307,6 +312,10 @@ class SessionLifecycle:
             raise SessionAgentNotFoundError(command.agent_id)
 
         if not self._store.available:
+            if command.session_key is not None:
+                raise SessionLifecycleUnavailableError(
+                    SessionAvailabilityRequirement.CREATE_WITH_KEY
+                )
             if command.initial_message:
                 raise SessionLifecycleUnavailableError(
                     SessionAvailabilityRequirement.CREATE_WITH_MESSAGE
@@ -339,6 +348,7 @@ class SessionLifecycle:
                 workspace=workspace,
                 provider=command.provider,
                 auth_profile=command.auth_profile,
+                reuse_existing=command.session_key is not None,
             )
         )
         seeded = False

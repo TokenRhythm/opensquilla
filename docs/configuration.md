@@ -257,7 +257,6 @@ enabled = true
 provider = "tokenrhythm"
 primary = "wan3.0-video"
 duration_seconds = 8
-max_duration_seconds = 8
 aspect_ratio = "16:9"
 allowed_aspect_ratios = ["16:9", "9:16"]
 resolution = "720p"
@@ -265,6 +264,12 @@ allowed_resolutions = ["720p", "1080p"]
 timeout_seconds = 600
 max_output_bytes = 104857600 # 100 MiB
 ```
+
+An explicit generation request overrides `duration_seconds`. If the request
+omits it, this configured default is used; leaving the default unset delegates
+duration selection to the provider/model adapter. Provider/model duration
+constraints still apply. The retired `max_duration_seconds` setting is ignored
+when loading older configurations and removed when they are saved or migrated.
 
 OpenRouter uses a raw model ID such as `google/veo-3.1-fast`; TokenRhythm uses
 its native model ID. The `wan3.0-video` example is documented by TokenRhythm;

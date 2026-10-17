@@ -2,22 +2,22 @@ import { reactive } from 'vue'
 
 /**
  * Self-contained open-state for the non-chat run-trace surfaces. Chat owns its
- * own toggle store (useChatToolToggles via ChatView); SessionInspect and Logs
- * have none, so this supplies two reactive sets plus the exact
- * isToolGroupOpen / isToolItemOpen predicate + toggle contract `<RunTrace>`
+ * own choice store (useChatStream via ChatView); SessionInspect and Logs
+ * have none, so this supplies two reactive maps plus the exact
+ * isToolGroupOpen / isToolItemOpen choice + setter contract `<RunTrace>`
  * binds, so the same component props work on every surface.
  */
 export function useRunTrace() {
-  const openGroups = reactive(new Set<string>())
-  const openItems = reactive(new Set<string>())
+  const openGroups = reactive(new Map<string, boolean>())
+  const openItems = reactive(new Map<string, boolean>())
   return {
-    isToolGroupOpen: (id: string) => openGroups.has(id),
-    isToolItemOpen: (key: string) => openItems.has(key),
-    toggleGroup: (id: string) => {
-      openGroups.has(id) ? openGroups.delete(id) : openGroups.add(id)
+    isToolGroupOpen: (id: string) => openGroups.get(id),
+    isToolItemOpen: (key: string) => openItems.get(key),
+    toggleGroup: (id: string, open: boolean) => {
+      openGroups.set(id, open)
     },
-    toggleItem: (key: string) => {
-      openItems.has(key) ? openItems.delete(key) : openItems.add(key)
+    toggleItem: (key: string, open: boolean) => {
+      openItems.set(key, open)
     },
   }
 }

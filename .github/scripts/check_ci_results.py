@@ -20,18 +20,28 @@ JOB_RESULT_LABELS: Final[dict[str, str]] = {
     "RESULT_WORKFLOW_LINT": "Workflow lint",
     "RESULT_README_LOCALE": "README locale parity",
     "RESULT_FRONTEND_ARTIFACT": "Frontend artifact",
-    "RESULT_FRONTEND": "Frontend validation and wheel WebUI roundtrip",
+    "RESULT_FRONTEND": "Frontend type checks",
+    "RESULT_FRONTEND_UNIT": "Frontend unit test matrix",
+    "RESULT_WHEEL_WEBUI": "Wheel WebUI roundtrip",
+    "RESULT_CONTRACT_LINUX": "Gateway Contract production on Linux",
     "RESULT_CONTRACT_WINDOWS": "Gateway Contract determinism on Windows",
+    "RESULT_CONTRACT_VERIFICATION_WINDOWS": "Complete Gateway Contract verification on Windows",
     "RESULT_CONTRACT_VERIFICATION_LINUX": "Complete Gateway Contract verification on Linux",
     "RESULT_CONTRACT_COMPARE": "Gateway Contract cross-platform hashes",
     "RESULT_TUI": "OpenTUI package tests",
     "RESULT_DESKTOP": "Desktop Electron unit tests",
     "RESULT_UBUNTU": "Ubuntu quality gate",
     "RESULT_UBUNTU_FULL": "Ubuntu full test matrix",
+    "RESULT_PYTHON_STRESS": "Python capacity and soak tests",
     "RESULT_WINDOWS_FULL": "Windows high-risk matrix",
+    "RESULT_WINDOWS_BUNDLE": "Windows bundle test matrix",
+    "RESULT_WINDOWS_BUNDLE_COVERAGE": "Windows bundle exact-once coverage",
     "RESULT_MACOS_RECOVERY": "macOS profile recovery and native no-replace tests",
     "RESULT_DESKTOP_RECOVERY_E2E": "Desktop recovery E2E matrix",
+    "RESULT_DESKTOP_NATIVE": "Desktop native platform probes",
+    "RESULT_WINDOWS_PROFILES_COVERAGE": "Windows profiles exact-once coverage",
     "RESULT_WEBUI_CHAT_RECOVERY": "WebUI chat recovery browser contracts",
+    "RESULT_WEBUI_CAPACITY": "WebUI capacity browser contracts",
     "RESULT_RELEASE": "Release packaging contracts",
     "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS": "Managed Toolchain Artifact E2E",
     "RESULT_SKILL_HUB": "Skill Hub contract matrix",
@@ -48,11 +58,13 @@ KNOWN_SUITES: Final[frozenset[str]] = frozenset(
         "macos-recovery",
         "managed-toolchain",
         "python-full",
+        "python-stress",
         "python-targeted",
         "readme-locale",
         "release-packaging",
         "skill-hub",
         "tui",
+        "webui-capacity",
         "webui-chat-recovery",
         "wheel-webui-roundtrip",
         "windows-high-risk",
@@ -66,27 +78,115 @@ KNOWN_SUITES: Final[frozenset[str]] = frozenset(
 # accepting a planner suite that the aggregate gate does not understand.
 SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
     "dependency-audit": ("RESULT_DEPENDENCY_AUDIT",),
-    "desktop-recovery-e2e": ("RESULT_DESKTOP_RECOVERY_E2E",),
+    "desktop-recovery-e2e": (
+        "RESULT_DESKTOP_RECOVERY_E2E", "RESULT_DESKTOP_NATIVE", "RESULT_WINDOWS_PROFILES_COVERAGE",
+    ),
     "desktop-static": ("RESULT_DESKTOP",),
     "frontend-artifact": ("RESULT_FRONTEND_ARTIFACT",),
     "frontend-validation": (
-        "RESULT_FRONTEND", "RESULT_CONTRACT_WINDOWS", "RESULT_CONTRACT_VERIFICATION_LINUX",
+        "RESULT_FRONTEND",
+        "RESULT_FRONTEND_UNIT",
+        "RESULT_CONTRACT_LINUX",
+        "RESULT_CONTRACT_WINDOWS",
+        "RESULT_CONTRACT_VERIFICATION_LINUX",
+        "RESULT_CONTRACT_VERIFICATION_WINDOWS",
         "RESULT_CONTRACT_COMPARE",
     ),
     "macos-recovery": ("RESULT_MACOS_RECOVERY",),
     "managed-toolchain": ("RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",),
     "python-full": ("RESULT_UBUNTU", "RESULT_UBUNTU_FULL"),
+    "python-stress": ("RESULT_PYTHON_STRESS",),
     "python-targeted": ("RESULT_UBUNTU",),
     "readme-locale": ("RESULT_README_LOCALE",),
     "release-packaging": ("RESULT_RELEASE",),
     "skill-hub": ("RESULT_SKILL_HUB",),
     "tui": ("RESULT_TUI",),
+    "webui-capacity": ("RESULT_WEBUI_CAPACITY",),
     "webui-chat-recovery": ("RESULT_WEBUI_CHAT_RECOVERY",),
-    "wheel-webui-roundtrip": ("RESULT_FRONTEND",),
-    "windows-high-risk": ("RESULT_WINDOWS_FULL",),
+    "wheel-webui-roundtrip": ("RESULT_WHEEL_WEBUI",),
+    "windows-high-risk": (
+        "RESULT_WINDOWS_FULL", "RESULT_WINDOWS_BUNDLE", "RESULT_WINDOWS_BUNDLE_COVERAGE",
+    ),
     "windows-nsis-regression": ("RESULT_WINDOWS_NSIS",),
     "workflow-lint": ("RESULT_WORKFLOW_LINT",),
 }
+
+WINDOWS_BUNDLE_RESULTS: Final[frozenset[str]] = frozenset(
+    {"RESULT_WINDOWS_BUNDLE", "RESULT_WINDOWS_BUNDLE_COVERAGE"}
+)
+WINDOWS_PHYSICAL_SHARDS: Final[frozenset[str]] = frozenset(
+    f"{family}-{partition}"
+    for family in ("core", "gateway-sqlite", "recovery-migration", "desktop-installer-contracts")
+    for partition in range(1, 12 if family == "gateway-sqlite" else 5)
+)
+WINDOWS_PROFILES_SHARDS: Final[frozenset[str]] = frozenset({
+    "profiles-onboarding-flow",
+    "profiles-onboarding-first-chat",
+    "profiles-profile-consolidation-flow",
+    "profiles-primary-repair-accessibility",
+    "profiles-profile-import-flow",
+    "profiles-desktop-cleanup-flow",
+})
+DESKTOP_MATRIX_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
+    (os_name, shard)
+    for os_name in ("ubuntu-latest", "macos-latest", "windows-latest")
+    for shard in ("profiles", "ownership", "workbench")
+) | frozenset(("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS)
+
+
+def _windows_profiles_required(env: Mapping[str, str], errors: list[str]) -> bool:
+    """Require the complete delegated Windows flow set and its original owner."""
+
+    try:
+        matrix = json.loads(env.get("PLANNED_DESKTOP_MATRIX", ""))
+        if not isinstance(matrix, list) or not matrix:
+            raise ValueError("missing Desktop matrix")
+        cells: set[tuple[str, str]] = set()
+        for cell in matrix:
+            if (
+                not isinstance(cell, dict)
+                or set(cell) != {"os", "shard"}
+                or not all(isinstance(value, str) for value in cell.values())
+            ):
+                raise ValueError("invalid Desktop cell")
+            key = (cell["os"], cell["shard"])
+            if key not in DESKTOP_MATRIX_CELLS or key in cells:
+                raise ValueError("unknown or duplicate Desktop cell")
+            cells.add(key)
+        expected = {("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS}
+        has_owner = ("windows-latest", "profiles") in cells
+        if has_owner and not expected <= cells:
+            raise ValueError("incomplete Windows profiles delegation")
+        if not has_owner and expected & cells:
+            raise ValueError("Windows profiles delegation has no browser/router owner")
+    except (ValueError, TypeError):
+        errors.append("Planned Desktop matrix is missing, malformed, or incomplete.")
+        return True
+    return has_owner
+
+
+def _windows_bundle_required(env: Mapping[str, str], errors: list[str]) -> bool:
+    """Validate the physical owner plan before accepting delegated coverage."""
+
+    try:
+        matrix = json.loads(env.get("PLANNED_PYTHON_MATRIX", ""))
+        if not isinstance(matrix, dict) or set(matrix) != {"ubuntu", "windows"}:
+            raise ValueError("missing Python matrix keys")
+        windows = matrix["windows"]
+        if (
+            not isinstance(windows, list)
+            or not windows
+            or any(not isinstance(shard, str) for shard in windows)
+            or len(windows) != len(set(windows))
+            or not set(windows) <= WINDOWS_PHYSICAL_SHARDS
+        ):
+            raise ValueError("invalid Windows physical shards")
+    except (ValueError, TypeError):
+        errors.append("Planned Python Windows matrix is missing, malformed, or incomplete.")
+        # Preserve mandatory results on invalid input; no missing plan may
+        # authorize skipping either the test matrix or its exact-once proof.
+        return True
+    return "desktop-installer-contracts-1" in windows
 
 
 def _require_exact_result(
@@ -124,9 +224,7 @@ def _read_required_suites(env: Mapping[str, str], errors: list[str]) -> set[str]
     required_suites = set(value)
     missing_baseline = sorted(BASELINE_SUITES - required_suites)
     if missing_baseline:
-        errors.append(
-            "Suite planner omitted baseline suites: " + ", ".join(missing_baseline)
-        )
+        errors.append("Suite planner omitted baseline suites: " + ", ".join(missing_baseline))
     return required_suites
 
 
@@ -181,6 +279,10 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         for suite in required_suites & KNOWN_SUITES
         for variable in SUITE_RESULT_REQUIREMENTS.get(suite, ())
     }
+    if "windows-high-risk" in required_suites and not _windows_bundle_required(env, errors):
+        required_results.difference_update(WINDOWS_BUNDLE_RESULTS)
+    if "desktop-recovery-e2e" in required_suites and not _windows_profiles_required(env, errors):
+        required_results.discard("RESULT_WINDOWS_PROFILES_COVERAGE")
     for variable, label in JOB_RESULT_LABELS.items():
         _require_exact_result(
             env,
@@ -198,9 +300,7 @@ def _full_queue_suites() -> set[str]:
     return set(json.loads(manifest.read_text(encoding="utf-8"))["full_suites"])
 
 
-def _check_partial_coverage(
-    env: Mapping[str, str], executed: set[str], errors: list[str]
-) -> None:
+def _check_partial_coverage(env: Mapping[str, str], executed: set[str], errors: list[str]) -> None:
     """A partial run still owes EVERY full-matrix suite, by proof or execution."""
     if env.get("GITHUB_EVENT_NAME") != "merge_group":
         errors.append("Partial evidence is valid only for merge_group.")
@@ -208,14 +308,16 @@ def _check_partial_coverage(
         errors.append("Partial evidence verifier must succeed.")
     if env.get("QUEUE_CANARY_RESULT") != "success":
         errors.append("Partial queue combined-tree canary must succeed.")
-    if not env.get("QUEUE_SOURCE_RUN_ID", "").isdigit() or int(
-        env.get("QUEUE_SOURCE_RUN_ID", "0")
-    ) <= 0:
+    if (
+        not env.get("QUEUE_SOURCE_RUN_ID", "").isdigit()
+        or int(env.get("QUEUE_SOURCE_RUN_ID", "0")) <= 0
+    ):
         errors.append("Partial evidence source run is missing.")
     try:
         reused = json.loads(env.get("QUEUE_REUSED_SUITES", ""))
         if (
-            not isinstance(reused, list) or not reused
+            not isinstance(reused, list)
+            or not reused
             or any(not isinstance(suite, str) for suite in reused)
             or reused != sorted(set(reused))
             or not set(reused) <= {"frontend-validation", "tui"}
