@@ -15,6 +15,8 @@ import { useChatMessageActions } from './useChatMessageActions'
 import { useChatAttachments } from './useChatAttachments'
 import { useChatDraftPersistence } from './useChatDraftPersistence'
 import { useLocalPathDraft } from './useLocalPathDraft'
+import { useChatSlashCommands } from './useChatSlashCommands'
+import { usageReportingDouble } from '@/testing/usage.test-helper'
 import { attachmentDraftKey, type AttachmentDraftStore } from '@/utils/chat/attachmentDrafts'
 import type {
   Attachment,
@@ -222,6 +224,42 @@ function sameTurnSteerOptions(
     }),
     activeStreamTaskId: ref(expectedTurnId),
   }
+}
+
+function connectPlanCommands(
+  harness: ReturnType<typeof makeOptions>,
+  activate?: () => boolean | Promise<boolean>,
+) {
+  const { options } = harness
+  const mode = ref(options.initialCollaborationMode.value)
+  options.initialCollaborationMode = mode
+  const activatePlanMode = vi.fn(async () => {
+    const accepted = await (activate?.() ?? true)
+    if (accepted) mode.value = 'plan'
+    return accepted
+  })
+  const slash = useChatSlashCommands({
+    commandCatalog: { list: vi.fn(async () => ({ commands: [
+      { name: '/compact', aliases: [] }, { name: '/reset', aliases: [] },
+    ] })) },
+    usageReporting: usageReportingDouble(),
+    sessionMaintenance: {
+      reset: vi.fn(async () => { throw new Error('Unexpected reset') }),
+      compact: vi.fn(async () => { throw new Error('Unexpected compact') }),
+    },
+    inputText: options.inputText,
+    selectedSkills: options.selectedSkills,
+    sessionKey: options.sessionKey,
+    autoResizeTextarea: options.autoResizeTextarea,
+    newSession: vi.fn(), resetCurrentSession: vi.fn(), setCompactInFlight: vi.fn(),
+    showCompactStatus: vi.fn(), showCompactionToast: vi.fn(), notify: vi.fn(),
+    planModeAvailable: () => true,
+    activatePlanMode,
+  })
+  options.classifySlashCommand = slash.classifySlashCommand
+  options.isPlanModeCommand = slash.isPlanModeCommand
+  options.executeSlashCommand = slash.executeSlashCommand
+  return { slash, activatePlanMode }
 }
 
 function usageReplayMessages(): ChatMessage[] {
@@ -3270,22 +3308,20 @@ describe('useChatSend attachment payloads', () => {
     }
     const inputText = ref('/plan analyze this architecture')
     const pendingAttachments = ref<Attachment[]>([ready])
-    const executeSlashCommand = vi.fn(async () => false)
-    const { api, options, rpc } = makeOptions({
-      executeSlashCommand,
+    const harness = makeOptions({
       inputText,
       pendingAttachments,
+      pendingSessionIntent: ref('new_chat'),
     })
+    const { api, options, rpc } = harness
+    connectPlanCommands(harness)
 
-    await api.dispatchComposerPrompt(
-      'analyze this architecture',
-      '/plan analyze this architecture',
-    )
+    await api.onSend()
 
-    expect(executeSlashCommand).not.toHaveBeenCalled()
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       message: 'analyze this architecture',
       displayText: 'analyze this architecture',
+      collaborationMode: 'plan',
       attachments: [
         {
           type: 'image/png',
@@ -3334,25 +3370,230 @@ describe('useChatSend attachment payloads', () => {
           task_id: 'task-plan-retry',
         }),
     }
-    const { api, options } = makeOptions({
+    const harness = makeOptions({
       inputText,
       pendingAttachments,
       rpc,
     })
+    const { api, options } = harness
+    connectPlanCommands(harness)
 
-    await api.dispatchComposerPrompt('analyze this diagram', originalInput)
+    await api.onSend()
 
     const firstParams = rpc.call.mock.calls[0]?.[1]
     expect(inputText.value).toBe(originalInput)
     expect(pendingAttachments.value).toEqual([ready])
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
 
-    await api.dispatchComposerPrompt('analyze this diagram', originalInput)
+    await api.onSend()
 
     expect(rpc.call.mock.calls[1]?.[1]).toEqual(firstParams)
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
     expect(inputText.value).toBe('')
     expect(pendingAttachments.value).toEqual([])
+  })
+
+  it.each(['default', 'plan'] as const)('submits /plan prose once from an existing %s session', async initialMode => {
+    const harness = makeOptions({
+      inputText: ref('/plan inspect the runtime'),
+      initialCollaborationMode: ref(initialMode),
+    })
+    const { activatePlanMode } = connectPlanCommands(harness)
+
+    await harness.api.onSend()
+
+    expect(activatePlanMode).toHaveBeenCalledOnce()
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(harness.rpc.call.mock.calls[0]?.[1]).toMatchObject({ message: 'inspect the runtime' })
+    expect(harness.options.inputText.value).toBe('')
+  })
+
+  it('keeps duplicate sends blocked and preserves acceptance hooks while Plan mode is activating', async () => {
+    let finishMode!: (accepted: boolean) => void
+    const harness = makeOptions({ inputText: ref('/plan inspect the runtime') })
+    const { activatePlanMode } = connectPlanCommands(harness, () => new Promise<boolean>(resolve => { finishMode = resolve }))
+    const onAccepted = vi.fn()
+    const onDeliveryAccepted = vi.fn()
+    const resumeQueue = vi.fn()
+    harness.options.capturePendingAutoSendResume = vi.fn(() => resumeQueue)
+    const sending = harness.api.onSend({ onAccepted, onDeliveryAccepted, resumeQueueOnSuccess: true })
+    await vi.waitFor(() => expect(activatePlanMode).toHaveBeenCalledOnce())
+
+    await harness.api.onSend()
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(activatePlanMode).toHaveBeenCalledOnce()
+    finishMode(true)
+    await sending
+
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(onAccepted).toHaveBeenCalledOnce()
+    expect(onDeliveryAccepted).toHaveBeenCalledOnce()
+    expect(resumeQueue).toHaveBeenCalledOnce()
+  })
+
+  it('preserves the Plan draft and files when mode activation is rejected', async () => {
+    const attachment: Attachment = { kind: 'staged', local_id: 100,
+      name: 'runtime.pdf', mime: 'application/pdf', file_uuid: 'runtime-file' }
+    const harness = makeOptions({ inputText: ref('/plan inspect the runtime'), pendingAttachments: ref([attachment]) })
+    connectPlanCommands(harness, async () => false)
+    await harness.api.onSend()
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.inputText.value).toBe('/plan inspect the runtime')
+    expect(harness.options.pendingAttachments.value).toEqual([attachment])
+    expect(harness.options.messages.value).toEqual([])
+  })
+
+  it.each(['steer', 'queue'] as const)('queues Plan prose for the next turn when work starts during mode activation (%s preference)', async busySendMode => {
+    const harness = makeOptions({
+      ...sameTurnSteerOptions('remote-default-turn'),
+      inputText: ref('/plan inspect the runtime'),
+      busySendMode: ref<BusySendMode>(busySendMode),
+    })
+    const { options, api, stream, rpc } = harness
+    options.pendingQueueOwnerContext.value = { sessionKey: options.sessionKey.value, ownerRequestId: 'plan-queue-owner' }
+    const pending = useChatPendingQueue({
+      sessionKey: options.sessionKey, inputText: options.inputText,
+      ownerContext: options.pendingQueueOwnerContext,
+      pendingAttachments: options.pendingAttachments, pendingSessionIntent: options.pendingSessionIntent,
+      isStreaming: stream.isStreaming, isBlocked: () => true,
+      autoResizeTextarea: vi.fn(), sendCurrentInput: vi.fn(), resetInputHistory: vi.fn(),
+      hasComposer: () => true, pendingInputWal: options.pendingInputWal,
+    })
+    options.enqueuePendingInput = vi.fn(pending.enqueuePendingInput)
+    let finishMode!: (accepted: boolean) => void
+    const { activatePlanMode } = connectPlanCommands(harness, () => new Promise<boolean>(resolve => { finishMode = resolve }))
+    const onAccepted = vi.fn()
+    const onDeliveryAccepted = vi.fn()
+    const resumeQueue = vi.fn()
+    options.capturePendingAutoSendResume = vi.fn(() => resumeQueue)
+    try {
+      const sending = api.onSend({ onAccepted, onDeliveryAccepted, resumeQueueOnSuccess: true })
+      await vi.waitFor(() => expect(activatePlanMode).toHaveBeenCalledOnce())
+      stream.isStreaming.value = true
+      finishMode(true)
+      await sending
+
+      expect(rpc.call).not.toHaveBeenCalled()
+      expect(options.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('inspect the runtime', { ownerRequestId: 'plan-queue-owner' })
+      expect(pending.pendingQueue.value).toMatchObject([{
+        text: 'inspect the runtime', ownerRequestId: 'plan-queue-owner', ownerSessionKey: options.sessionKey.value,
+      }])
+      expect(options.inputText.value).toBe('')
+      expect(onAccepted).toHaveBeenCalledOnce()
+      expect(resumeQueue).toHaveBeenCalledOnce()
+      expect(onDeliveryAccepted).not.toHaveBeenCalled()
+    } finally {
+      pending.cleanup()
+    }
+  })
+
+  it('retains Plan prose when the next-turn queue rejects it after work starts during activation', async () => {
+    const harness = makeOptions({
+      ...sameTurnSteerOptions('remote-default-turn'),
+      inputText: ref('/plan inspect the runtime'), busySendMode: ref<BusySendMode>('steer'),
+      enqueuePendingInput: vi.fn(() => false),
+    })
+    let finishMode!: (accepted: boolean) => void
+    const { activatePlanMode } = connectPlanCommands(harness, () => new Promise<boolean>(resolve => { finishMode = resolve }))
+    const onAccepted = vi.fn()
+    const sending = harness.api.onSend({ onAccepted })
+    await vi.waitFor(() => expect(activatePlanMode).toHaveBeenCalledOnce())
+    harness.stream.isStreaming.value = true
+    finishMode(true)
+    await sending
+
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('inspect the runtime', undefined)
+    expect(harness.options.inputText.value).toBe('/plan inspect the runtime')
+    expect(onAccepted).not.toHaveBeenCalled()
+  })
+
+  it.each(['edited-back', 'attachment', 'skill', 'workspace', 'session', 'identity', 'queue-owner'] as const)(
+    'cancels the original Plan send when its %s changes during mode activation', async scenario => {
+      const composerRevision = ref(0)
+      const deliveryIdentity = ref('plan-owner')
+      const harness = makeOptions({
+        inputText: ref('/plan inspect the runtime'),
+        composerRevision,
+        deliveryIdentity,
+        selectedSkills: ref([]),
+        pendingSessionIntent: ref('new_chat'),
+        pendingWorkspaceId: ref('workspace-a'),
+      })
+      let finishMode!: (accepted: boolean) => void
+      const { activatePlanMode } = connectPlanCommands(harness, () => new Promise<boolean>(resolve => { finishMode = resolve }))
+      const sending = harness.api.onSend()
+      await vi.waitFor(() => expect(activatePlanMode).toHaveBeenCalledOnce())
+      const { options } = harness
+      if (scenario === 'edited-back') {
+        options.inputText.value = 'replacement'
+        composerRevision.value += 1
+        options.inputText.value = '/plan inspect the runtime'
+        composerRevision.value += 1
+      } else if (scenario === 'attachment') {
+        options.pendingAttachments.value = [{ kind: 'staged', local_id: 101,
+          name: 'later.pdf', mime: 'application/pdf', file_uuid: 'later-file' }]
+      } else if (scenario === 'skill') {
+        options.selectedSkills!.value = [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }]
+      } else if (scenario === 'workspace') options.pendingWorkspaceId!.value = 'workspace-b'
+      else if (scenario === 'session') options.sessionKey.value = 'agent:main:webchat:elsewhere'
+      else if (scenario === 'identity') deliveryIdentity.value = 'replacement-owner'
+      else options.pendingQueueOwnerContext.value = { sessionKey: options.sessionKey.value, ownerRequestId: 'replacement-queue' }
+      finishMode(true)
+      await sending
+
+      expect(harness.rpc.call).not.toHaveBeenCalled()
+      expect(options.inputText.value).toBe('/plan inspect the runtime')
+      expect(options.messages.value).toEqual([])
+      if (scenario === 'attachment') expect(options.pendingAttachments.value).toHaveLength(1)
+      if (scenario === 'skill') expect(options.selectedSkills!.value).toHaveLength(1)
+    },
+  )
+
+  it.each([
+    { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) },
+    { name: 'browser-use', instanceId: 'bundled:browser-use', digest: 'b'.repeat(64) },
+    { name: 'visualize', instanceId: 'bundled:visualize', digest: 'c'.repeat(64) },
+  ])('sends Plan prose with the selected $name identity and local references intact', async skill => {
+    const path = 'C:\\项目\\report.csv'
+    const harness = makeOptions({
+      inputText: ref(`/plan compare the data\n${path}`),
+      selectedSkills: ref([skill]), localPathReferences: ref([path]),
+      pendingSessionIntent: ref('new_chat'),
+      methodAvailability: () => true,
+    })
+    connectPlanCommands(harness)
+    await harness.api.onSend()
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(harness.rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      message: `compare the data\n${path}`, collaborationMode: 'plan',
+      selectedSkills: [skill], localPathReferences: [path],
+    })
+    expect(harness.rpc.call.mock.calls[0]?.[1]?.requiredServices).toEqual(
+      skill.name === 'browser-use' ? ['desktop_browser'] : undefined,
+    )
+  })
+
+  it('enters Plan mode without sending an empty task or discarding a selected skill', async () => {
+    const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+    const harness = makeOptions({ inputText: ref('/plan'), selectedSkills: ref([skill]) })
+    const { activatePlanMode } = connectPlanCommands(harness)
+    await harness.api.onSend()
+    expect(activatePlanMode).toHaveBeenCalledOnce()
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.inputText.value).toBe('')
+    expect(harness.options.selectedSkills!.value).toEqual([skill])
+  })
+
+  it.each(['/compact', '/reset', '!echo inspect'])('keeps other controls blocked with selected skills: %s', async text => {
+    const harness = makeOptions({ inputText: ref(text), selectedSkills: ref([
+      { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) },
+    ]) })
+    const { activatePlanMode } = connectPlanCommands(harness)
+    await harness.api.onSend()
+    expect(activatePlanMode).not.toHaveBeenCalled()
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.inputText.value).toBe(text)
   })
 
   it('refreshes staged uploads before serializing chat.send attachments', async () => {

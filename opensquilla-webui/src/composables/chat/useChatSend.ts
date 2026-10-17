@@ -44,7 +44,7 @@ import type {
   PendingSteerPayload,
 } from '@/composables/chat/useChatPendingQueue'
 import type { ChatSteerDeliveryApi } from '@/composables/chat/useChatSteerDelivery'
-import type { SlashCommandClassification } from '@/composables/chat/useChatSlashCommands'
+import type { SlashCommandClassification, SlashCommandExecution } from '@/composables/chat/useChatSlashCommands'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 import {
@@ -625,10 +625,11 @@ export interface UseChatSendOptions {
   popAllPendingIntoComposer: () => boolean
   reconcileTaskOwnership?: () => void | Promise<unknown>
   classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
+  isPlanModeCommand?: (text: string) => boolean
   executeSlashCommand: (
     text: string,
     knownClassification?: SlashCommandClassification,
-  ) => Promise<boolean>
+  ) => Promise<SlashCommandExecution>
   closeSlashMenu: () => void
   autoResizeTextarea: () => void
   scrollToBottom: () => void
@@ -2265,6 +2266,8 @@ export function useChatSend(options: UseChatSendOptions) {
     textOverride?: string
     /** An explicit composer attachment enriches text but still consumes the draft after queue persistence. */
     consumeComposerOnQueue?: boolean
+    /** A mode command's prompt belongs to a new turn, even if work starts during activation. */
+    requireNewTurn?: boolean
     cancelIfComposerChanged?: boolean
     resumeQueueOnSuccess?: boolean
     /** Invocation-owned UI response; automatic sends leave it unset. */
@@ -2308,7 +2311,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  async function sendComposerInput(invocation: SendInvocation, onAccepted?: () => void) {
+  async function sendComposerInput(invocation: SendInvocation, onAccepted?: () => void): Promise<ChatSendOutcome | undefined> {
     const requestSessionKey = options.sessionKey.value
     const requestDeliveryIdentity = options.deliveryIdentity?.value
     const deliveryStillMatches = () => (
@@ -2484,7 +2487,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (composerSnapshot.selectedSkills.length && (
-      slashClassification === 'registered'
+      (slashClassification === 'registered' && !options.isPlanModeCommand?.(text))
       || (!bypassSlashCommand && !isLiteralSlash && text.startsWith('!'))
     )) {
       pushToast(i18n.global.t('chat.skillPalette.commandWithSkills'), { tone: 'info' })
@@ -2526,6 +2529,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (
           options.busySendMode.value === 'steer'
+          && !invocation.requireNewTurn
           && !composerSnapshot.pageContext
           && composerSnapshot.selectedSkills.length === 0
           && !options.taskOwnership?.stopRequestedTaskId.value
@@ -2603,6 +2607,22 @@ export function useChatSend(options: UseChatSendOptions) {
 
     if (slashClassification !== null && slashClassification !== 'unknown') {
       const handled = await options.executeSlashCommand(text, slashClassification)
+      if (typeof handled === 'object' && handled.kind === 'composer-prompt') {
+        if (!deliveryStillMatches() || !composerMatchesSnapshot(composerSnapshot)
+          || !queueOwnerMatchesSnapshot(composerSnapshot)) return
+        // Continue under the original onSend token rather than re-entering its
+        // duplicate-submission guard. Capture the newly selected Plan mode only
+        // after verifying that the original draft still belongs to this send.
+        return await sendComposerInput({
+          ...invocation,
+          bypassSlashCommand: true,
+          composerText: handled.composerText,
+          textOverride: handled.prompt,
+          consumeComposerOnQueue: true,
+          cancelIfComposerChanged: true,
+          requireNewTurn: true,
+        }, onAccepted)
+      }
       if (handled) return
     }
 
@@ -2617,14 +2637,6 @@ export function useChatSend(options: UseChatSendOptions) {
       preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
       onAccepted,
       onDeliveryAccepted: invocation.onDeliveryAccepted,
-    })
-  }
-
-  async function dispatchComposerPrompt(prompt: string, composerText: string) {
-    await onSend({
-      bypassSlashCommand: true,
-      composerText,
-      textOverride: prompt,
     })
   }
 
@@ -4139,7 +4151,6 @@ export function useChatSend(options: UseChatSendOptions) {
     sendQueuedSteer,
     sendQueuedFollowup,
     supportsSameTurnSteer,
-    dispatchComposerPrompt,
     recoverResponseHandoffs,
     sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,

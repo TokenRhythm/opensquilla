@@ -427,6 +427,7 @@ onBeforeUnmount(() => {
 
 .plan-card__header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--sp-3);
@@ -436,31 +437,42 @@ onBeforeUnmount(() => {
 .plan-card__identity {
   display: flex;
   align-items: center;
+  flex: 1 1 auto;
   min-width: 0;
   gap: var(--sp-2);
 }
 
 .plan-card__header-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  max-width: 100%;
+  margin-inline-start: auto;
   gap: var(--sp-1);
 }
 
 .plan-card__icon {
   display: inline-flex;
+  flex: 0 0 auto;
   color: var(--text-muted);
 }
 
 .plan-card__eyebrow {
+  flex: 0 0 auto;
   color: var(--text-muted);
   font-size: var(--fs-xs);
   font-weight: 650;
   letter-spacing: 0;
   text-transform: none;
+  white-space: nowrap;
 }
 
 .plan-card__revision {
+  /* A long revision uses remaining space instead of pushing the label out. */
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
   overflow: hidden;
   color: var(--text-muted);
   font-family: var(--font-mono);

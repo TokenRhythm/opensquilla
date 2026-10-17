@@ -43,7 +43,6 @@ function harness(
     call,
   }
   const activatePlanMode = vi.fn(async () => true)
-  const dispatchPlanPrompt = vi.fn()
   const notify = vi.fn()
   const armGoal = vi.fn(async () => true)
   const startGoal = vi.fn(async () => true)
@@ -85,7 +84,6 @@ function harness(
     showCompactStatus: vi.fn(),
     showCompactionToast: vi.fn(),
     notify,
-    dispatchPlanPrompt,
     activatePlanMode,
     planModeAvailable: () => planModeAvailable,
     armGoal,
@@ -102,7 +100,6 @@ function harness(
     api,
     armGoal,
     startGoal,
-    dispatchPlanPrompt,
     inputText,
     goalStatus,
     goalEdit,
@@ -212,7 +209,7 @@ describe('local side chat command palette', () => {
 })
 
 describe('useChatSlashCommands plan compatibility', () => {
-  it('allows command completion with skill tags but blocks direct menu execution', async () => {
+  it('keeps skill tags when completing and activating Plan mode', async () => {
     const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
     const selectedSkills = ref([skill])
     const { api, inputText, activatePlanMode, notify } = harness(true, [], Promise.resolve(), undefined, { selectedSkills })
@@ -227,9 +224,9 @@ describe('useChatSlashCommands plan compatibility', () => {
     api.activateSlashCmd(api.filteredSlashCmds.value[0]!)
     await Promise.resolve()
 
-    expect(activatePlanMode).not.toHaveBeenCalled()
-    expect(notify).toHaveBeenCalledOnce()
-    expect(inputText.value).toBe('/plan')
+    expect(activatePlanMode).toHaveBeenCalledOnce()
+    expect(notify).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('')
     expect(selectedSkills.value).toEqual([skill])
   })
 
@@ -318,31 +315,51 @@ describe('useChatSlashCommands plan compatibility', () => {
     expect(api.filteredSlashCmds.value.map(command => command.name)).toEqual(['/plan'])
   })
 
-  it('activates Plan mode before dispatching an optional Plan prompt', async () => {
+  it('returns the optional Plan prompt to the active sender after activating the mode', async () => {
     const {
       activatePlanMode,
       api,
-      dispatchPlanPrompt,
       inputText,
     } = harness(true)
     inputText.value = '/plan inspect the logging flow'
 
-    await api.executeSlashCommand(inputText.value)
-    await Promise.resolve()
+    await expect(api.executeSlashCommand(inputText.value)).resolves.toEqual({
+      kind: 'composer-prompt',
+      prompt: 'inspect the logging flow',
+      composerText: '/plan inspect the logging flow',
+    })
 
     expect(activatePlanMode).toHaveBeenCalledOnce()
-    expect(dispatchPlanPrompt).toHaveBeenCalledWith(
-      'inspect the logging flow',
-      '/plan inspect the logging flow',
-    )
     expect(inputText.value).toBe('/plan inspect the logging flow')
+  })
+
+  it('recognizes Plan aliases by their supported catalog action, not a command prefix', async () => {
+    const { api } = harness(true, [{
+      name: '/planning', aliases: ['/outline'], execution: { action: 'plans.setMode' },
+    }, { name: '/compact', aliases: [] }])
+    await api.loadSlashCommands()
+    expect(api.isPlanModeCommand('/outline inspect')).toBe(true)
+    expect(api.isPlanModeCommand('/planning inspect')).toBe(true)
+    expect(api.isPlanModeCommand('/plan-other inspect')).toBe(false)
+    expect(api.isPlanModeCommand('/compact')).toBe(false)
+  })
+
+  it('does not continue a Plan command that is unavailable in the current workbench', async () => {
+    const { api, activatePlanMode, inputText } = harness(true, [], Promise.resolve(), undefined, {
+      commandAllowed: () => false,
+    })
+    inputText.value = '/plan inspect the runtime'
+    await api.loadSlashCommands()
+    expect(api.isPlanModeCommand(inputText.value)).toBe(false)
+    await expect(api.executeSlashCommand(inputText.value)).resolves.toBe(true)
+    expect(activatePlanMode).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/plan inspect the runtime')
   })
 
   it('preserves the command when Plan mode cannot be activated', async () => {
     const {
       activatePlanMode,
       api,
-      dispatchPlanPrompt,
       inputText,
     } = harness(true)
     activatePlanMode.mockResolvedValueOnce(false)
@@ -354,7 +371,6 @@ describe('useChatSlashCommands plan compatibility', () => {
     await Promise.resolve()
 
     expect(inputText.value).toBe('/plan')
-    expect(dispatchPlanPrompt).not.toHaveBeenCalled()
   })
 })
 
@@ -598,15 +614,14 @@ describe('slash commands with explicit local paths', () => {
   it('dispatches a Plan prompt with paths exactly once and the canonical submission snapshot', async () => {
     const draft = localDraft('/plan Compare this report')
     const original = draft.inputText.value
-    const { api, dispatchPlanPrompt } = harness(true, [], Promise.resolve(), undefined, {
+    const { api } = harness(true, [], Promise.resolve(), undefined, {
       inputText: draft.composerText,
       submissionText: draft.inputText,
     })
 
-    await expect(api.executeSlashCommand(original)).resolves.toBe(true)
-    await Promise.resolve()
-
-    expect(dispatchPlanPrompt).toHaveBeenCalledExactlyOnceWith('Compare this report\nC:\\项目\\report.pdf', original)
+    await expect(api.executeSlashCommand(original)).resolves.toEqual({
+      kind: 'composer-prompt', prompt: 'Compare this report\nC:\\项目\\report.pdf', composerText: original,
+    })
     // The normal send path, not the slash parser, owns accepted-draft cleanup.
     expect(draft.composerText.value).toBe('/plan Compare this report')
     expect(draft.localPaths.value).toEqual(['C:\\项目\\report.pdf'])

@@ -2061,7 +2061,6 @@ let sendUsageBarrierReplay: (payload: {
   localPathReferences?: string[]
   forkBeforeMessageId: string
 }) => Promise<boolean> = async () => false
-let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void = () => {}
 let isCompactInFlightForCurrentSession: () => boolean = () => false
 let isQueuedDeliveryBlocked: () => boolean = () => false
 let isLiveDeliveryBlocked: () => boolean = () => true
@@ -3678,9 +3677,6 @@ const chatSlashCommands = useChatSlashCommands({
   showCompactStatus,
   showCompactionToast,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
-  dispatchPlanPrompt: (prompt: string, composerText: string) => {
-    dispatchPlanComposerPrompt(prompt, composerText)
-  },
   activatePlanMode: activatePlanComposerMode,
   planModeAvailable: () => planUiAvailable.value,
   armGoal: activateGoalComposerMode,
@@ -3708,6 +3704,7 @@ const {
   activateSlashCmd,
   classifySlashCommand,
   executeSlashCommand,
+  isPlanModeCommand,
 } = chatSlashCommands
 
 const browserUseAvailable = computed(() => browserUseSupported.value
@@ -3972,6 +3969,7 @@ const chatSend = useChatSend({
   reconcileTaskOwnership: () => retrySessionMetadata(),
   classifySlashCommand,
   executeSlashCommand,
+  isPlanModeCommand,
   closeSlashMenu,
   autoResizeTextarea,
   scrollToBottom,
@@ -3982,7 +3980,6 @@ const {
   sendQueuedSteer,
   sendQueuedFollowup,
   sendUsageBarrierReplay: dispatchUsageBarrierReplay,
-  dispatchComposerPrompt,
   recoverResponseHandoffs,
 } = chatSend
 sendUsageBarrierReplay = dispatchUsageBarrierReplay
@@ -4235,9 +4232,6 @@ async function onComposerSend() {
 sendCurrentInput = onComposerSend
 sendAutomaticInput = () => {
   void onSend({ cancelIfComposerChanged: true })
-}
-dispatchPlanComposerPrompt = (prompt, composerText) => {
-  void dispatchComposerPrompt(prompt, composerText)
 }
 dispatchQueuedItem = sendQueuedFollowup
 
