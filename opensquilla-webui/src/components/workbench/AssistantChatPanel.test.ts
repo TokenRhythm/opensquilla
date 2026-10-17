@@ -9,8 +9,7 @@ import { assistantChatPendingOwner } from '@/modules/assistantChatPendingOwner'
 import { SIDE_CONVERSATION_POLICY } from '@/modules/conversationPolicy'
 
 // This adapter owns no chat runtime. Real routed host execution is covered by
-// e2e/conversation-host-parity.spec.ts; shared behavior coverage is mapped in
-// docs/side-chat-conversation-contract.md rather than duplicated with partial mocks.
+// e2e/conversation-host-parity.spec.ts rather than duplicated with partial mocks.
 const { views } = vi.hoisted(() => ({ views: [] as {
   props: Record<string, unknown> & { prepareSession: () => Promise<string> }
   unmounted: boolean
