@@ -64,7 +64,7 @@ from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
 )
-from opensquilla.tools.path_policy import reject_foreign_host_path
+from opensquilla.tools.path_policy import reject_foreign_host_path, resolve_bound_workspace
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import (
     current_run_mode,
@@ -317,7 +317,11 @@ def _resolve_unmapped_path(path: str) -> Path:
     from opensquilla.tools.path_aliases import resolve_workspace_alias
 
     raw = Path(path).expanduser()
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        resolve_bound_workspace(ctx.workspace_dir)
+        if ctx is not None and ctx.workspace_dir else _workspace_root()
+    )
     reject_foreign_host_path(str(path), platform=os.name, workspace=root)
     alias = resolve_workspace_alias(raw, root)
     candidate = alias if alias is not None else (
@@ -445,7 +449,11 @@ async def _prepare_attachment_edit_path(
 def _resolve_base(path: str | None) -> Path:
     if path:
         return _resolve_path(path)
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        resolve_bound_workspace(ctx.workspace_dir)
+        if ctx is not None and ctx.workspace_dir else _workspace_root()
+    )
     return root if root is not None else Path.cwd()
 
 

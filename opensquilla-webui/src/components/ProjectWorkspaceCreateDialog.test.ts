@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
 import { createI18n } from 'vue-i18n'
 import ProjectWorkspaceCreateDialog from './ProjectWorkspaceCreateDialog.vue'
+import en from '@/locales/en.json'
+import type { ProjectWorkspaceMode } from '@/utils/projectWorkspaceCreation'
 
 const mountedApps: App<Element>[] = []
 
@@ -10,19 +12,7 @@ function i18n() {
   return createI18n({
     legacy: false,
     locale: 'en',
-    messages: {
-      en: {
-        common: { close: 'Close', cancel: 'Cancel' },
-        workspaces: {
-          createProject: 'Create project',
-          projectName: 'Project name',
-          projectNamePlaceholder: 'Project name',
-          sourceFolders: 'Source folders',
-          addSourceFolder: 'Add a folder OpenSquilla can read and edit',
-          creatingProject: 'Creating…',
-        },
-      },
-    },
+    messages: { en },
   })
 }
 
@@ -31,20 +21,31 @@ async function mountDialog(options: {
   sourcePath?: string
   busy?: boolean
   sourcePicking?: boolean
+  mode?: ProjectWorkspaceMode
+  creationAvailable?: boolean
+  hostPlatform?: 'windows' | 'posix'
+  error?: string
 } = {}) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const name = ref(options.name || '')
+  const mode = ref<ProjectWorkspaceMode>(options.mode || 'create')
   const chooseSource = vi.fn()
   const create = vi.fn()
   const close = vi.fn()
   const Root = defineComponent(() => () => h(ProjectWorkspaceCreateDialog, {
     open: true,
+    mode: mode.value,
     name: name.value,
     sourcePath: options.sourcePath || '',
     busy: options.busy || false,
     sourcePicking: options.sourcePicking || false,
+    creationAvailable: options.creationAvailable ?? true,
+    hostName: 'project-host',
+    hostPlatform: options.hostPlatform || 'posix',
+    error: options.error,
     'onUpdate:name': (value: string) => { name.value = value },
+    'onUpdate:mode': (value: ProjectWorkspaceMode) => { mode.value = value },
     onChooseSource: chooseSource,
     onCreate: create,
     onClose: close,
@@ -54,7 +55,7 @@ async function mountDialog(options: {
   app.mount(host)
   mountedApps.push(app)
   await nextTick()
-  return { name, chooseSource, create, close }
+  return { name, mode, chooseSource, create, close }
 }
 
 afterEach(() => {
@@ -63,18 +64,18 @@ afterEach(() => {
 })
 
 describe('ProjectWorkspaceCreateDialog', () => {
-  it('collects a project name and source folder before creating', async () => {
+  it('shows the final new directory and execution host before creating', async () => {
     const events = await mountDialog({
       name: 'Demo',
-      sourcePath: '/repos/demo',
+      sourcePath: '/repos',
     })
     const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
     const source = dialog?.querySelector<HTMLButtonElement>('.project-create__source-picker')
-    const create = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
-      .find(button => button.textContent?.trim() === 'Create project')
+    const create = dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')
 
-    expect(dialog?.textContent).toContain('Source folders')
-    expect(dialog?.textContent).toContain('/repos/demo')
+    expect(dialog?.textContent).toContain('Save in')
+    expect(dialog?.textContent).toContain('/repos/Demo')
+    expect(dialog?.textContent).toContain('Computer: project-host')
     expect(create?.disabled).toBe(false)
 
     source?.click()
@@ -82,14 +83,13 @@ describe('ProjectWorkspaceCreateDialog', () => {
     await nextTick()
 
     expect(events.chooseSource).toHaveBeenCalledOnce()
-    expect(events.create).toHaveBeenCalledWith({ name: 'Demo', path: '/repos/demo' })
+    expect(events.create).toHaveBeenCalledWith({ mode: 'create', name: 'Demo', path: '/repos' })
   })
 
   it('keeps creation disabled until both fields are present', async () => {
     await mountDialog()
     const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
-    const create = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
-      .find(button => button.textContent?.trim() === 'Create project')
+    const create = dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')
 
     expect(create?.disabled).toBe(true)
   })
@@ -102,8 +102,7 @@ describe('ProjectWorkspaceCreateDialog', () => {
     })
     const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
     const source = dialog?.querySelector<HTMLButtonElement>('.project-create__source-picker')
-    const create = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
-      .find(button => button.textContent?.trim() === 'Create project')
+    const create = dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')
 
     expect(source?.disabled).toBe(true)
     expect(create?.disabled).toBe(true)
@@ -114,5 +113,37 @@ describe('ProjectWorkspaceCreateDialog', () => {
 
     expect(events.chooseSource).not.toHaveBeenCalled()
     expect(events.create).not.toHaveBeenCalled()
+  })
+
+  it('opens an existing directory without a project name on an older Gateway', async () => {
+    const events = await mountDialog({
+      mode: 'open', sourcePath: '/repos/existing', creationAvailable: false,
+    })
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')!
+    const modes = dialog.querySelectorAll<HTMLButtonElement>('.project-create__modes button')
+    const submit = dialog.querySelector<HTMLButtonElement>('button[type="submit"]')!
+
+    expect(modes[0].disabled).toBe(true)
+    expect(modes[1].disabled).toBe(false)
+    expect(dialog.querySelector('input')).toBeNull()
+    expect(dialog.textContent).toContain(en.workspaces.createUnavailable)
+    expect(submit.disabled).toBe(false)
+    submit.click()
+    await nextTick()
+    expect(events.create).toHaveBeenCalledWith({ mode: 'open', name: '', path: '/repos/existing' })
+  })
+
+  it('uses the host platform for the final path and prevents multi-segment names', async () => {
+    const events = await mountDialog({ name: 'Demo', sourcePath: 'C:\\Projects\\', hostPlatform: 'windows' })
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')!
+    expect(dialog.querySelector('.project-create__target')?.textContent).toBe('C:\\Projects\\Demo')
+    events.name.value = '../other'
+    await nextTick()
+    expect(dialog.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true)
+  })
+
+  it('keeps an unconfirmed result visible for review', async () => {
+    await mountDialog({ name: 'Demo', sourcePath: '/repos', error: 'Check the project list before trying again.' })
+    expect(document.body.querySelector('[role="alert"]')?.textContent).toContain('Check the project list')
   })
 })

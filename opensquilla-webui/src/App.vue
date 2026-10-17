@@ -391,10 +391,16 @@
     v-if="gatewayAccess.canChooseProject"
     :open="projectCreateOpen && !projectCreateConfirming && !projectSourcePickerOpen"
     :name="projectCreateName"
+    :mode="projectCreateMode"
     :source-path="projectCreateSourcePath"
     :busy="projectCreateBusy"
     :source-picking="projectCreateSourcePicking"
+    :creation-available="gatewayAccess.canCreateProjectWorkspace === true"
+    :host-name="projectWorkspaces.creationDefaults.value?.hostName || gatewayAccess.connectedGatewayHost || undefined"
+    :host-platform="projectWorkspaces.creationDefaults.value?.platform"
+    :error="projectCreateError"
     @update:name="projectCreateName = $event"
+    @update:mode="changeProjectCreateMode"
     @choose-source="chooseProjectSourceDirectory"
     @close="closeProjectCreator"
     @create="createProjectWorkspace"
@@ -496,6 +502,7 @@ import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useProjectWorkspaceEditor } from './composables/useProjectWorkspaceEditor'
+import { projectWorkspaceTarget, validProjectDirectoryName, type ProjectWorkspaceMode } from './utils/projectWorkspaceCreation'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
@@ -801,6 +808,9 @@ const projectWorkspaces = useProjectWorkspaces()
 const freshTaskDraft = useFreshTaskDraft()
 const projectCreateOpen = ref(false)
 const projectCreateName = ref('')
+const projectCreateMode = ref<ProjectWorkspaceMode>('create')
+const projectCreateError = ref('')
+let projectCreateInstance = 0
 const projectCreateSourcePath = ref('')
 const projectCreateBusy = ref(false)
 const projectCreateSourcePicking = ref(false)
@@ -830,13 +840,7 @@ watch(
       scheduleSessionRefresh()
       return
     }
-    projectCreateOpen.value = false
-    projectCreateName.value = ''
-    projectCreateSourcePath.value = ''
-    projectCreateBusy.value = false
-    projectCreateSourcePicking.value = false
-    projectCreateConfirming.value = false
-    projectSourcePickerOpen.value = false
+    resetProjectCreator()
     closeProjectEditor()
   },
 )
@@ -1430,14 +1434,11 @@ function startProjectTask(workspaceId: string) {
   })
 }
 
-function projectNameFromPath(path: string): string {
-  const normalized = path.trim().replace(/[\\/]+$/, '')
-  return normalized.split(/[\\/]/).pop() || normalized
-}
-
 function resetProjectCreator() {
+  projectCreateInstance += 1
   projectCreateOpen.value = false
   projectCreateName.value = ''
+  projectCreateError.value = ''
   projectCreateSourcePath.value = ''
   projectCreateBusy.value = false
   projectCreateSourcePicking.value = false
@@ -1447,14 +1448,38 @@ function resetProjectCreator() {
 
 function openProjectCreator() {
   if (!gatewayAccess.canChooseProject) return
+  projectCreateInstance += 1
+  projectCreateMode.value = gatewayAccess.canCreateProjectWorkspace ? 'create' : 'open'
   projectCreateName.value = ''
-  projectCreateSourcePath.value = ''
+  projectCreateError.value = ''
+  projectCreateSourcePath.value = projectCreateMode.value === 'create'
+    ? projectWorkspaces.creationDefaults.value?.parentPath || '' : ''
   projectCreateBusy.value = false
   projectCreateSourcePicking.value = false
   projectCreateConfirming.value = false
   projectSourcePickerOpen.value = false
   projectCreateOpen.value = true
 }
+
+function changeProjectCreateMode(mode: ProjectWorkspaceMode) {
+  if (projectCreateBusy.value || projectCreateSourcePicking.value
+    || (mode === 'create' && !gatewayAccess.canCreateProjectWorkspace)) return
+  projectCreateInstance += 1
+  projectCreateMode.value = mode
+  projectCreateSourcePath.value = mode === 'create'
+    ? projectWorkspaces.creationDefaults.value?.parentPath || '' : ''
+  projectCreateError.value = ''
+}
+
+watch(projectWorkspaces.creationDefaults, defaults => {
+  if (projectCreateOpen.value && projectCreateMode.value === 'create'
+    && !projectCreateSourcePath.value && !projectCreateBusy.value) {
+    projectCreateSourcePath.value = defaults?.parentPath || ''
+  }
+})
+
+watch(() => [gatewayAccess.deliveryIdentity, gatewayAccess.loadConnectionEndpoint(), gatewayAccess.subscriptionEpoch],
+  resetProjectCreator)
 
 function closeProjectCreator() {
   if (projectCreateBusy.value) return
@@ -1464,9 +1489,7 @@ function closeProjectCreator() {
 function onProjectPathChosen(path: string) {
   if (!projectCreateOpen.value || !gatewayAccess.canChooseProject) return
   projectCreateSourcePath.value = path
-  if (!projectCreateName.value.trim()) {
-    projectCreateName.value = projectNameFromPath(path)
-  }
+  projectCreateError.value = ''
 }
 
 function onProjectSourcePathChosen(path: string) {
@@ -1490,38 +1513,46 @@ async function chooseProjectSourceDirectory() {
   }
 
   projectCreateSourcePicking.value = true
+  const instance = projectCreateInstance
   try {
-    const choice = await nativePicker()
+    const choice = await nativePicker({ initialPath: projectCreateSourcePath.value || undefined })
     const selected = String(choice?.path || '').trim()
-    if (selected) onProjectPathChosen(selected)
+    if (selected && instance === projectCreateInstance) onProjectPathChosen(selected)
   } catch (err) {
-    pushToast(t('workspaces.directoryPickerFailed', { error: errorMessage(err) }), {
+    if (instance === projectCreateInstance) pushToast(t('workspaces.directoryPickerFailed', { error: errorMessage(err) }), {
       tone: 'danger',
     })
   } finally {
-    projectCreateSourcePicking.value = false
+    if (instance === projectCreateInstance) projectCreateSourcePicking.value = false
   }
 }
 
-async function createProjectWorkspace(payload: { name: string; path: string }) {
+async function createProjectWorkspace(payload: { mode: ProjectWorkspaceMode; name: string; path: string }) {
   if (
     !projectCreateOpen.value
     || !gatewayAccess.canChooseProject
     || projectCreateBusy.value
     || projectCreateSourcePicking.value
     || projectSourcePickerOpen.value
+    || payload.mode !== projectCreateMode.value
   ) return
   const name = payload.name.trim()
   const path = payload.path.trim()
-  if (!name || !path) return
+  const creating = payload.mode === 'create'
+  if (!path || (creating && (!gatewayAccess.canCreateProjectWorkspace || !validProjectDirectoryName(name)))) return
+  const instance = projectCreateInstance
+  const target = creating
+    ? projectWorkspaceTarget(path, name, projectWorkspaces.creationDefaults.value?.platform) : path
+  projectCreateError.value = ''
   projectCreateConfirming.value = true
   await nextTick()
   const trusted = await confirm({
     title: t('workspaces.trustTitle'),
-    body: t('workspaces.trustBody', { path }),
+    body: t('workspaces.trustBody', { path: target }),
     primaryLabel: t('workspaces.trustConfirm'),
     primaryClass: 'btn--primary',
   })
+  if (instance !== projectCreateInstance || !projectCreateOpen.value || !gatewayAccess.canChooseProject) return
   if (!trusted) {
     projectCreateConfirming.value = false
     return
@@ -1531,28 +1562,22 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
     projectWorkspaces.workspaces.value.map(workspace => workspace.id),
   )
   try {
-    const workspace = await projectWorkspaces.openWorkspace(path)
+    const workspace = creating
+      ? await projectWorkspaces.createWorkspace(path, name)
+      : await projectWorkspaces.openWorkspace(path)
+    if (instance !== projectCreateInstance) return
     if (!workspace) throw new Error('Gateway returned an empty project.')
     const alreadyExists = existingWorkspaceIds.has(workspace.id)
-    const renamedExisting = alreadyExists && workspace.name !== name
-    if (workspace.name !== name) {
-      await projectWorkspaces.renameWorkspace(workspace.id, name)
-    }
     resetProjectCreator()
-    if (alreadyExists) {
-      pushToast(t(
-        renamedExisting
-          ? 'workspaces.projectExistingRenamed'
-          : 'workspaces.projectAlreadyExists',
-        { name },
-      ), { tone: 'info' })
-    } else {
-      pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
-    }
+    pushToast(t(creating ? 'workspaces.projectCreated'
+      : alreadyExists ? 'workspaces.projectAlreadyExists' : 'workspaces.projectOpened',
+    { name: workspace.name }), { tone: alreadyExists ? 'info' : 'ok' })
   } catch (err) {
+    if (instance !== projectCreateInstance) return
     projectCreateBusy.value = false
     projectCreateConfirming.value = false
-    pushToast(t('workspaces.createProjectFailed', { error: errorMessage(err) }), { tone: 'danger' })
+    projectCreateError.value = t(creating ? 'workspaces.createProjectUnconfirmed' : 'workspaces.openProjectFailed',
+      { path: target, error: errorMessage(err) })
   }
 }
 

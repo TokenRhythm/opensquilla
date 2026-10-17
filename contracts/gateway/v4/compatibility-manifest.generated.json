@@ -1402,6 +1402,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "workspaces.create",
+      "schema": "workspaces/workspaces-create.schema.json",
+      "schemaSha256": "c830b2e7b547091cbbcfa6487efe1bbf74a1592970afd2cef46d97ea28dab4cd"
+    },
+    {
+      "lifecycle": "stable",
       "name": "workspaces.history.delete",
       "schema": "workspaces/workspaces-history-delete.schema.json",
       "schemaSha256": "40d9883d69051043212569d4c85ff9de42e84082ceaf4cf3c98c5875e645e091"
@@ -1410,7 +1416,7 @@
       "lifecycle": "stable",
       "name": "workspaces.list",
       "schema": "workspaces/workspaces-list.schema.json",
-      "schemaSha256": "63d8f75e1962ad870288036cc6ae9bdf83424de8ffa9b015854d9a5bf15e03eb"
+      "schemaSha256": "f0efec721d7273d1aec62d3bf74744f81467664a9b312041439c79b9a008cd48"
     },
     {
       "lifecycle": "stable",
@@ -1446,10 +1452,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "5663d69c0f0b761bd637bd6615ae8e262006b703d729d25fd3393ba6322f8012",
-    "methodCount": 212,
-    "schemaCount": 222,
-    "schemaTreeSha256": "31684b504437706d1c3ca3e587229b28b3a975aff4b4f453fed3410a98409ba8",
+    "generatorSha256": "829c5afc1ad4481e06e232cd30f7746db621efafcc9c29f6dcb01e7eb3b79cad",
+    "methodCount": 213,
+    "schemaCount": 223,
+    "schemaTreeSha256": "45c60c57da8639123f8aee5b3d6f4b4f4489c8fc15fed0e2bd7953b39cbc3f53",
     "toolchains": {
       "legacyTypes": {
         "python": {

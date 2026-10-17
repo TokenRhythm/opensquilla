@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
+import { nextTick, ref } from 'vue'
 import { useRpcStore } from '@/stores/rpc'
 import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import type { GatewayAccess } from '@/modules/gatewayAccess'
@@ -7,6 +8,7 @@ import { useProjectWorkspaces } from './useProjectWorkspaces'
 
 const PROJECT_METHODS = [
   'workspaces.list',
+  'workspaces.create',
   'workspaces.open',
   'workspaces.update',
   'workspaces.pin',
@@ -25,6 +27,10 @@ function catalogFromRpc(rpc: ReturnType<typeof useRpcStore>): WorkspaceCatalog {
     rpc.client!.call(method, params)
   return {
     list: async () => ((await call('workspaces.list', undefined) as { workspaces?: unknown }).workspaces ?? []) as never,
+    create: async (parentPath, name) => {
+      const result = await call('workspaces.create', { parentPath, name, trusted: true }) as { workspace?: unknown }
+      return result.workspace as never
+    },
     open: async path => {
       const result = await call('workspaces.open', { path, trusted: true }) as { workspace?: unknown }
       return result.workspace as never
@@ -61,6 +67,7 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
     deliveryIdentity: null,
     get canManageProjectWorkspaces() { return rpc.canManageProjectWorkspaces },
     get canChooseProject() { return rpc.canChooseProject },
+    get canCreateProjectWorkspace() { return rpc.canCreateProjectWorkspace },
     runModePolicy: null,
     streamIdleTimeoutMs: null,
     concurrentHistoryReads: false,
@@ -80,10 +87,96 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
 describe('useProjectWorkspaces', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
+    const rpc = useRpcStore()
+    useProjectWorkspaces(catalogFromRpc(rpc), accessFromRpc(rpc)).resetWorkspaces()
   })
 
   it('creates the RPC store without browser globals', () => {
     expect(useRpcStore().state).toBe('disconnected')
+  })
+
+  it('retains an authoritative creation result when the following refresh fails', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'created', name: 'Demo', path: '/repo/Demo', taskCount: 0, pinned: false, available: true }
+    const call = vi.fn().mockResolvedValueOnce({ workspace }).mockRejectedValueOnce(new Error('refresh unavailable'))
+    rpc.client = { call } as never
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc), accessFromRpc(rpc))
+    projects.resetWorkspaces()
+
+    await expect(projects.createWorkspace('/repo', 'Demo')).resolves.toEqual(workspace)
+
+    expect(projects.byId.value.get('created')).toEqual(workspace)
+    expect(projects.error.value).toBe('refresh unavailable')
+    expect(call).toHaveBeenNthCalledWith(1, 'workspaces.create', { parentPath: '/repo', name: 'Demo', trusted: true })
+  })
+
+  it('refreshes registrations after a lost create reply without adopting or replaying the directory', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const registered = { id: 'registered', name: 'Demo', path: '/repo/Demo', taskCount: 0, pinned: false, available: true }
+    const call = vi.fn().mockRejectedValueOnce(new Error('reply lost'))
+      .mockResolvedValueOnce({ workspaces: [registered] })
+    rpc.client = { call } as never
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc), accessFromRpc(rpc))
+    projects.resetWorkspaces()
+
+    await expect(projects.createWorkspace('/repo', 'Demo')).rejects.toThrow('reply lost')
+
+    expect(projects.workspaces.value).toEqual([registered])
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['workspaces.create', 'workspaces.list'])
+  })
+
+  it('does not publish a creation result into another Gateway scope', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    let finish!: (value: unknown) => void
+    const call = vi.fn().mockReturnValue(new Promise(resolve => { finish = resolve }))
+    rpc.client = { call } as never
+    const endpoint = ref('ws://first.example/ws')
+    const access = { ...accessFromRpc(rpc), loadConnectionEndpoint: () => endpoint.value }
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc), access)
+    projects.resetWorkspaces()
+    const pending = projects.createWorkspace('/repo', 'Demo')
+    endpoint.value = 'ws://second.example/ws'
+    await nextTick()
+    finish({ workspace: { id: 'first', name: 'Demo', path: '/repo/Demo' } })
+    await pending
+    expect(projects.workspaces.value).toEqual([])
+    expect(projects.creationDefaults.value).toBeNull()
+    expect(call).toHaveBeenCalledOnce()
+  })
+
+  it('clears Gateway creation defaults when the active profile changes', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    rpc.client = { call: vi.fn().mockResolvedValue({ workspaces: [] }) } as never
+    const epoch = ref(1)
+    const access = { ...accessFromRpc(rpc), get subscriptionEpoch() { return epoch.value } }
+    const defaults = { parentPath: '/home/profile-a', hostName: 'host-a', platform: 'posix' as const }
+    const catalog = { ...catalogFromRpc(rpc), creationDefaults: defaults }
+    const projects = useProjectWorkspaces(catalog, access)
+    await projects.loadWorkspaces()
+    expect(projects.creationDefaults.value).toEqual(defaults)
+
+    epoch.value += 1
+    await nextTick()
+
+    expect(projects.creationDefaults.value).toBeNull()
+    expect(projects.hasLoaded.value).toBe(false)
+  })
+
+  it('keeps opening existing projects available when creation is unsupported', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    rpc.methods = PROJECT_METHODS.filter(method => method !== 'workspaces.create')
+    const workspace = { id: 'existing', name: 'Existing', path: '/repo/existing' }
+    const call = vi.fn().mockResolvedValueOnce({ workspace }).mockResolvedValueOnce({ workspaces: [workspace] })
+    rpc.client = { call } as never
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc), accessFromRpc(rpc))
+    await expect(projects.createWorkspace('/repo', 'Demo')).rejects.toThrow('does not support')
+    await expect(projects.openWorkspace('/repo/existing')).resolves.toEqual(workspace)
+    expect(call.mock.calls.map(([method]) => method)).toEqual(['workspaces.open', 'workspaces.list'])
   })
 
   it('distinguishes an unavailable project list from a successfully empty list', async () => {

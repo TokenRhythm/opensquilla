@@ -11,7 +11,7 @@
         @submit.prevent="create"
       >
         <header class="project-create__header">
-          <h3 id="project-workspace-create-title">{{ t('workspaces.createProject') }}</h3>
+          <h3 id="project-workspace-create-title">{{ t('workspaces.addProject') }}</h3>
           <button
             type="button"
             class="btn btn--icon btn--ghost"
@@ -23,7 +23,19 @@
           </button>
         </header>
 
-        <label class="project-create__name">
+        <div class="project-create__modes" role="group" :aria-label="t('workspaces.projectAction')">
+          <button type="button" class="btn" :class="mode === 'create' ? 'btn--primary' : 'btn--ghost'"
+            :disabled="busy || sourcePicking || !creationAvailable" :aria-pressed="mode === 'create'" @click="emit('update:mode', 'create')">
+            {{ t('workspaces.createProject') }}
+          </button>
+          <button type="button" class="btn" :class="mode === 'open' ? 'btn--primary' : 'btn--ghost'"
+            :disabled="busy || sourcePicking" :aria-pressed="mode === 'open'" @click="emit('update:mode', 'open')">
+            {{ t('workspaces.openExistingProject') }}
+          </button>
+        </div>
+        <p v-if="!creationAvailable" class="project-create__hint">{{ t('workspaces.createUnavailable') }}</p>
+
+        <label v-if="mode === 'create'" class="project-create__name">
           <span class="sr-only">{{ t('workspaces.projectName') }}</span>
           <span class="project-create__input-wrap">
             <Icon name="folder" :size="16" />
@@ -41,7 +53,7 @@
         </label>
 
         <div class="project-create__source">
-          <span class="project-create__source-label">{{ t('workspaces.sourceFolders') }}</span>
+          <span class="project-create__source-label">{{ t(mode === 'create' ? 'workspaces.saveParentDirectory' : 'workspaces.projectLocation') }}</span>
           <button
             type="button"
             class="project-create__source-picker"
@@ -53,16 +65,23 @@
               <strong>{{ sourceName }}</strong>
               <small>{{ sourcePath }}</small>
             </span>
-            <span v-else>{{ t('workspaces.addSourceFolder') }}</span>
+            <span v-else>{{ t(mode === 'create' ? 'workspaces.chooseParentDirectory' : 'workspaces.chooseExistingDirectory') }}</span>
           </button>
         </div>
+
+        <div class="project-create__summary">
+          <span>{{ t('workspaces.executionHost', { host: hostName || t('workspaces.gatewayHost') }) }}</span>
+          <strong v-if="targetPath" class="project-create__target">{{ targetPath }}</strong>
+          <p>{{ t(mode === 'create' ? 'workspaces.createLocationHint' : 'workspaces.openLocationHint') }}</p>
+        </div>
+        <p v-if="error" class="project-create__error" role="alert">{{ error }}</p>
 
         <footer class="project-create__footer">
           <button type="button" class="btn btn--ghost" :disabled="busy" @click="close">
             {{ t('common.cancel') }}
           </button>
           <button type="submit" class="btn btn--primary" :disabled="!canCreate">
-            {{ busy ? t('workspaces.creatingProject') : t('workspaces.createProject') }}
+            {{ busy ? t('workspaces.preparingProject') : t(mode === 'create' ? 'workspaces.createProject' : 'workspaces.openExistingProject') }}
           </button>
         </footer>
       </form>
@@ -75,19 +94,26 @@ import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
+import { projectWorkspaceTarget, validProjectDirectoryName, type ProjectWorkspaceMode } from '@/utils/projectWorkspaceCreation'
 
 const props = defineProps<{
   open: boolean
+  mode: ProjectWorkspaceMode
   name: string
   sourcePath: string
   busy: boolean
   sourcePicking?: boolean
+  creationAvailable: boolean
+  hostName?: string
+  hostPlatform?: 'windows' | 'posix'
+  error?: string
 }>()
 const emit = defineEmits<{
   close: []
   'update:name': [name: string]
+  'update:mode': [mode: ProjectWorkspaceMode]
   'choose-source': []
-  create: [payload: { name: string; path: string }]
+  create: [payload: { mode: ProjectWorkspaceMode; name: string; path: string }]
 }>()
 const { t } = useI18n()
 const dialogRef = ref<HTMLElement | null>(null)
@@ -97,10 +123,13 @@ const sourceName = computed(() => {
   const normalized = props.sourcePath.replace(/[\\/]+$/, '')
   return normalized.split(/[\\/]/).pop() || normalized
 })
+const targetPath = computed(() => props.mode === 'create'
+  ? projectWorkspaceTarget(props.sourcePath, props.name, props.hostPlatform)
+  : props.sourcePath.trim())
 const canCreate = computed(() =>
   !props.busy
   && !props.sourcePicking
-  && Boolean(props.name.trim())
+  && (props.mode === 'open' || (props.creationAvailable && validProjectDirectoryName(props.name)))
   && Boolean(props.sourcePath.trim()),
 )
 
@@ -115,6 +144,7 @@ function close() {
 function create() {
   if (!canCreate.value) return
   emit('create', {
+    mode: props.mode,
     name: props.name.trim(),
     path: props.sourcePath.trim(),
   })
@@ -169,6 +199,14 @@ useDialogA11y(dialogRef, computed(() => props.open), close, {
   margin: 0;
   font-size: var(--fs-xl);
 }
+
+.project-create__modes { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.project-create__hint,
+.project-create__summary { margin: 0; color: var(--text-muted); font-size: var(--fs-sm); }
+.project-create__summary { display: grid; gap: var(--sp-2); }
+.project-create__summary p { margin: 0; }
+.project-create__target { color: var(--text); overflow-wrap: anywhere; font-weight: 500; }
+.project-create__error { margin: 0; color: var(--danger); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 
 .project-create__name {
   display: block;

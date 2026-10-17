@@ -1336,8 +1336,8 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
         type="button"
         class="sidebar-project-create-btn"
         data-testid="sidebar-create-project"
-        :aria-label="t('workspaces.createProject')"
-        :title="t('workspaces.createProject')"
+        :aria-label="t('workspaces.addProject')"
+        :title="t('workspaces.addProject')"
         @click="emit('new-project')"
       >
         <Icon name="plus" :size="13" />
@@ -1473,8 +1473,8 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
             type="button"
             class="sidebar-project-create-btn"
             data-testid="sidebar-create-project"
-            :aria-label="t('workspaces.createProject')"
-            :title="t('workspaces.createProject')"
+            :aria-label="t('workspaces.addProject')"
+            :title="t('workspaces.addProject')"
             @click="emit('new-project')"
           >
             <Icon name="plus" :size="13" />

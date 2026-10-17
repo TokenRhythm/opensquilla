@@ -211,6 +211,9 @@ export const useRpcStore = defineStore('rpc', () => {
   const canChooseProject = computed(() =>
     canManageProjectWorkspaces.value
     && hasRpcMethod('workspaces.open'))
+  const canCreateProjectWorkspace = computed(() =>
+    canManageProjectWorkspaces.value
+    && hasRpcMethod('workspaces.create'))
 
   function clearConnectionIdentity(): void {
     policy.value = null
@@ -605,6 +608,7 @@ export const useRpcStore = defineStore('rpc', () => {
     isLocalOwner,
     canManageProjectWorkspaces,
     canChooseProject,
+    canCreateProjectWorkspace,
     getConnectionEndpoint: () => connectionEndpoint.value,
     init,
     connect,
