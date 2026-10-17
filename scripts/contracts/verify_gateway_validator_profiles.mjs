@@ -71,6 +71,7 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
     'turns.receipt.get', 'sessions.read.open.v2', 'sessions.read.state.v2',
     'sessions.read.install.v2', 'sessions.read.close.v2',
     'sessions.history.page.v2', 'sessions.messages.search', 'transport.sessionFlow.update.v2',
+    'sessions.sidechat.create', 'sessions.sidechat.close',
   ]) {
     const contract = inventory.find(entry => entry.kind === 'method' && entry.wireName === wireName)
     assert.ok(contract, `${wireName}: complete Contract is required`)
@@ -124,7 +125,7 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       result.roles++
     }
   }
-  assert.equal(result.roles, 850)
+  assert.equal(result.roles, 858)
   // A complete baseline omits only the frozen sessions.list params validator.
   assert.equal(result.comparedRoles, baselineRoot ? result.roles - 1 : selected.size)
   assert.deepEqual(result.rolesWithoutPositiveSeed, [], 'each role requires a positive seed')

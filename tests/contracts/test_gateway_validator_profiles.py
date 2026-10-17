@@ -22,17 +22,19 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 186
+    assert len(targets) == 188
     assert targets[("method", "sessions.messages.search")] == ("params", "result")
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 176,
-        "params": 33,
+        "result": 178,
+        "params": 35,
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 850
+    assert sum(len(spec.targets) for spec in specs) == 858
+    assert targets[("method", "sessions.sidechat.create")] == ("params", "result")
+    assert targets[("method", "sessions.sidechat.close")] == ("params", "result")
     assert targets[("method", "onboarding.videoGeneration.models.discover")] == ("result",)
     assert targets[("method", "agents.list")] == ("result",)
     assert targets[("method", "turns.receipt.get")] == ("params", "result")
@@ -74,6 +76,10 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
         "artifacts.source.patch",
     }
     method_specs = {spec.wire_name: spec for spec in specs if spec.contract_type == "method"}
+    for name in ("sessions.sidechat.create", "sessions.sidechat.close"):
+        assert {role for role, _ in method_specs[name].targets} == {
+            "request", "params", "response", "result",
+        }
     retired_workflows = {
         "meta.drafts.discard",
         "meta.drafts.list",
