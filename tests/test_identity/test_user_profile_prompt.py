@@ -332,12 +332,13 @@ def test_system_prompt_guides_generated_file_delivery() -> None:
 
     assert "## Generated File Delivery" in prompt
     assert "Do not paste full file source" in prompt
-    assert "call `publish_artifact` for the final file" in prompt
+    assert "prepare the final workspace file and its required local materials" in prompt
     assert "complete workspace-relative paths, including subdirectories" in prompt
     assert "Exact local paths in inline code also work" in prompt
     assert "Follow the tool's delivery instructions for the current surface" in prompt
     assert "Do not invent artifact download URLs" in prompt
-    assert "do not call `publish_artifact` again" in prompt
+    assert "do not register it again" in prompt
+    assert "do not claim native channel delivery without a confirmed delivery receipt" in prompt
     assert "If `publish_artifact` reports" in prompt
     assert "registered, published, or delivered" not in prompt
     assert "Publication does not end the turn" in prompt

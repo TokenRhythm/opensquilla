@@ -1,10 +1,10 @@
 # 项目、规则与文件交付实施计划
 
-状态：P1 已有代码与独立 review，首轮受影响集合 195 passed、3 skipped；完整 CI 另外发现旧数据库、CLI 默认目录及发布文档检查遗漏，正在补齐回归。P2 正在实施；P3–P6 尚未实施。P1/P2 没有 prompt 修改。本文第 5 节仍为后续阶段草案，实际 prompt 变更在对应阶段单列。
+状态：六阶段代码均已实施并经过交叉 review，已完成影响范围内的本地组合验证、真实浏览器及真实模型 init 验收。P1 CI、P5 列表/异步焦点和最新 main 的 Plan/init 排队组合问题均已修复。后端 1,535 passed/30 skipped，交付 1,219 passed/12 skipped；前端最终组合、主线集成、实际运行及平台限制详见 [验收记录](project-workspace-resources-validation.md)，不同分组不合计为唯一测试数。P1/P2/P5 没有模型 prompt 修改；实际 prompt 内容分别记录在同目录的 P3、P4、P6 implementation 文档。
 
-提交要求（2026-10-18）：继续按六阶段隔离实现与 review，但必须完成全部六阶段和最终联调验收后再创建 PR。已提前创建的 P1 PR #1930 已关闭；各 PR 标题、正文和评论使用英文。P2 正在本地实施。
+提交要求（2026-10-18）：继续按六阶段隔离实现与 review，但必须完成全部六阶段和最终联调验收后再创建 PR。已提前创建的 P1 PR #1930 已关闭；各 PR 标题、正文和评论使用英文。当前改动保留在本地，未重新创建 PR。
 
-基线：2026-10-17 核对的 `origin/main d3f926c17e361b27f0410e6ea52526c9a2bcbb3d`。reference 为本地固定快照，不等于最新版本或交互验收。原报告为分析工作树中的 `docs/design/project-workspace-resources.md`，未修改；其中的实施指令不作为额外授权。
+基线：初始 `origin/main d3f926c17e361b27f0410e6ea52526c9a2bcbb3d`，最终已集成随后更新的 `7cdca98faa48fbfb6b5b0826b4f8f9d811122d78` 并验证 Plan/init 组合链路。reference 为本地固定快照，不等于最新版本或交互验收。原报告为分析工作树中的 `docs/design/project-workspace-resources.md`，未修改；其中的实施指令不作为额外授权。
 
 ## 1. 收敛结论与范围
 
@@ -162,11 +162,12 @@ init 接入：
 保留后端 `workbench.resources.open(edit-current)`，修 ChatView/provider 的默认历史查看路径。[S11]
 
 - 优先使用已有 WorkbenchResourceRef 的 deliverable/document、规范 type:id 及 workbenchResourceType/workbenchResourceId，不预定新 historical enum。legacy resourceIdentity 可能只是普通 artifact identity，不能将所有非 document 字符串当作已解析、授权的 deliverable。
-- 历史固定原 artifact ID；HTML 用已有 lease/bundle，Office 用 previews.create。覆盖 load Document、head 替换/事件、下载、外部打开和编辑按钮。
+- 历史固定原 artifact ID；HTML 用已有 lease/bundle，Office 沿用现有 createResource 的授权 binary/SHA 校验与本地 OOXML renderer，不为原草案中的 previews.create 名称新增 RPC。覆盖 load Document、head 替换/事件、下载、外部打开和编辑按钮。
 - 不把所有历史 HTML 套 preparedPreview，它会强制 offline；保留现有端能力和安全限制。
 - 继续编辑明确走 edit-current；无映射时只有用户选择才创建工作副本，不按文件名猜、不因查看隐式导入。
 - 历史材料已缺失/过期明确失败，不拿当前文件或当前源码冒充。旧 Gateway 使用既有安全 fallback，无预览能力保留可用的原 artifact 下载。
 - 文件树仍直接预览工作文件；child 授权、parent 展示、epoch/Gateway/关闭 guards 保持。
+- Files 列表保留既有 canonical lineage 聚合：Document 行表示当前工作文件，未聚合的 Deliverable 行表示固定交付；两类行明确标识。历史消息卡始终保留原 Deliverable，不因关联 Document 而跳转当前版本。
 
 验收：发布 A→修改 B，历史预览/下载保持 A，外部单文件副本保持 A 的字节，head 更新不改变它；继续编辑才 B；缺材料不冒充 B。多文件 HTML 的完整外部使用走现有 ZIP 导出，单文件副本不承诺带齐 CSS/图片，不为此新增解包目录、外部浏览器服务或缓存。HTML/Office、main/side、远程/无能力端实际点击，保留 edit-current 恢复测试。
 
@@ -196,7 +197,7 @@ init 接入：
 
 ## 5. Prompt 改动：逐字草案与注入位置
 
-尚未写入代码；工具与 prompt 同批上线。原“规则变化导致整批未执行”Q3 已取消。以下四组取代旧五组，超出这些文本的改动需在实施 PR 明示。
+以下为获批草案；工具与 prompt 已同批实施。实际逐字内容与注入位置见 [P3](project-workspace-resources-p3-implementation.md)、[P4](project-workspace-resources-p4-implementation.md)、[P6](project-workspace-resources-p6-implementation.md)。Q1 的可写/只读分支和空文件说明在 P4 单列。原“规则变化导致整批未执行”Q3 已取消。保留 memory_save 原有 default-deny 和显式授权语义，不在本轮扩大默认写权限。
 
 ### Q1：init 单次任务模板
 

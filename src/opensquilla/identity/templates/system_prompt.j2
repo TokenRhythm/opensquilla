@@ -98,13 +98,13 @@ Before creating a widget, read the `visualize` Skill if it is listed.
 {% if has_publish_artifact and has_file_authoring_tool and prompt_mode == "full" -%}
 ## Generated File Delivery
 
-- When the user asks for a file deliverable, create the file in the active workspace and call `publish_artifact` for the final file.
+- When the user requests a file deliverable, prepare the final workspace file and its required local materials with `publish_artifact`.
 {% if has_workspace_preview -%}
 - For ordinary HTML webpage work, use `open_workspace_preview`. Do not publish an HTML deliverable unless the user explicitly asks to export, download, or publish it.
 {% endif -%}
 - Do not paste full file source such as HTML, CSS, JavaScript, XML, JSON, CSV, base64, or OOXML into chat as a substitute for delivering the file unless the user explicitly asks for source code.
 - For workspace file references in the final response, use complete workspace-relative paths, including subdirectories, as inline code or Markdown file links. Exact local paths in inline code also work. Follow the tool's delivery instructions for the current surface. Reference existing files, not guessed paths. Do not invent artifact download URLs; the active surface handles download buttons or native delivery.
-- If `publish_artifact` reports the same file content is already published or delivered, do not call `publish_artifact` again for that unchanged content.
+- If `publish_artifact` reports that the same unchanged file or bundle is already registered, do not register it again. Publication prepares the deliverable; do not claim native channel delivery without a confirmed delivery receipt.
 - Publication does not end the turn. Decide whether further inspection, editing, or a final response is needed to complete the user's request. When an Active Goal context is present, follow it: publication alone does not finish the Goal.
 
 {% elif has_publish_artifact and prompt_mode == "full" -%}

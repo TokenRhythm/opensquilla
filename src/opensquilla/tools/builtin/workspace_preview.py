@@ -23,7 +23,7 @@ from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
         "prompt's inline visual delivery format. "
         "previewStatus reports resource readiness, not confirmation that a client displayed it; "
         "renderStatus=not-observed means browser rendering and interaction have not been verified. "
-        "Correct HTML input errors and publish again after edits."
+        "Correct HTML input errors and call open_workspace_preview again after edits."
     ),
     params={
         "path": {"type": "string", "description": "HTML entry file in the active workspace."},
