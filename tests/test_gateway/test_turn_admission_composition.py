@@ -150,13 +150,23 @@ registry = get_dispatcher()
 # Includes durable receipts and execution logs after workflow and agent admin retirement.
 # The v2 recovery contracts and video discovery add seven production methods.
 # Bounded in-conversation search adds sessions.messages.search.
-# Interactive terminals add create, write, resize, and close methods.
+# Interactive terminals add create, write, resize, close, and consume methods.
+# Temporary side conversations add their create and close Contracts.
 # Keep the exact count so an unrelated RPC cannot slip into the registry.
-assert len(registry.list_methods()) == 281
-for method in ("terminal.create", "terminal.write", "terminal.resize", "terminal.close"):
+assert len(registry.list_methods()) == 284
+for method in (
+    "terminal.create", "terminal.write", "terminal.resize", "terminal.close",
+    "terminal.consume",
+):
     terminal_entry = registry.get_entry(method)
     assert terminal_entry is not None
     assert terminal_entry.required_scope == "operator.write"
+for method in ("sessions.sidechat.create", "sessions.sidechat.close"):
+    sidechat_entry = registry.get_entry(method)
+    assert sidechat_entry is not None
+    assert sidechat_entry.required_scope == "operator.write"
+    assert sidechat_entry.generated_contract_name == method
+    assert sidechat_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
 search_entry = registry.get_entry("sessions.messages.search")
 assert search_entry is not None
 assert search_entry.required_scope == "operator.read"

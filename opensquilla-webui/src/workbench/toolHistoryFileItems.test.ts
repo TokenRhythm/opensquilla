@@ -30,12 +30,21 @@ describe('recorded tool file Workbench entries', () => {
     expect(store.items.map(toolHistoryFileSessionKey)).toEqual(['parent', 'child'])
     expect(store.activeItem?.scope).toEqual({ type: 'session', id: 'parent' })
     expect(toolHistoryFileSessionKey(store.activeItem!)).toBe('child')
+    const retainedItems = [...store.items]
     store.setSessionScope('unrelated')
     expect(openToolHistoryFile(view, side)).toBe(false)
     expect(store.revealRequestId).toBe(2)
+    expect(store.visibleItems).toEqual([])
+    expect(store.items).toEqual(retainedItems)
     store.setSessionScope(null)
     expect(openToolHistoryFile(view, side)).toBe(false)
-    expect(store.items).toEqual([])
+    expect(store.visibleItems).toEqual([])
+    expect(store.items).toEqual(retainedItems)
+    store.setSessionScope('parent')
+    expect(store.visibleItems).toEqual(retainedItems)
+    expect(store.visibleItems.map(toolHistoryFileSessionKey)).toEqual(['parent', 'child'])
+    expect(toolHistoryFileSessionKey(store.activeItem!)).toBe('child')
+    expect(store.revealRequestId).toBe(2)
   })
 
   it('bounds the displayed record while retaining the immutable download source', () => {
@@ -76,17 +85,24 @@ describe('recorded tool file Workbench entries', () => {
     expect(preference).not.toContain('recorded content')
   })
 
-  it('disposes history on session change and refuses an action from a stale session or disabled host', () => {
+  it('retains history descriptors across session changes and refuses an action from a stale session or disabled host', () => {
     openToolHistoryFile(view, options)
     const store = useWorkbenchStore()
     const item = store.activeItem!
     expect(item).toMatchObject({ scope: { type: 'session', id: 'session-a' }, retention: 'dispose-on-suspend', hostKind: 'dom' })
     store.setSessionScope('session-b')
-    expect(store.items).toHaveLength(0)
+    expect(store.items).toEqual([item])
+    expect(store.visibleItems).toEqual([])
     expect(openToolHistoryFile(view, options)).toBe(false)
     settings.features.artifactWorkbench = false
     expect(openToolHistoryFile(view, { ...options, sessionKey: 'session-b' })).toBe(false)
-    expect(store.items).toHaveLength(0)
+    expect(store.items).toEqual([item])
+    expect(store.visibleItems).toEqual([])
+    settings.features.artifactWorkbench = true
+    store.setSessionScope('session-a')
+    expect(store.visibleItems).toEqual([item])
+    expect(store.activeItem).toEqual(item)
+    expect(toolHistoryFileSessionKey(store.activeItem!)).toBe('session-a')
   })
 
   it('accepts recorded empty source files but rejects missing content, commands, failures and empty diffs', () => {
