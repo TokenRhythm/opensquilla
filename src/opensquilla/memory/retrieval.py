@@ -14,6 +14,7 @@ from .source_paths import (
     is_legacy_memory_capture_candidate,
     is_legacy_memory_capture_file,
     is_searchable_source_path,
+    resolve_memory_source_path,
 )
 from .store import LongTermMemoryStore
 from .types import (
@@ -176,6 +177,7 @@ class MemoryRetriever:
         sync_manager: Any | None = None,
         effective_metadata: dict[str, str] | None = None,
         workspace_dir: str | Path | None = None,
+        memory_dir: str | Path | None = None,
     ) -> None:
         self._store = store
         self._temporal_decay_enabled = temporal_decay_enabled
@@ -189,6 +191,9 @@ class MemoryRetriever:
         self._effective_metadata = dict(effective_metadata or {})
         self._workspace_dir = (
             Path(workspace_dir).expanduser().resolve() if workspace_dir is not None else None
+        )
+        self._memory_dir = (
+            Path(memory_dir).expanduser().resolve() if memory_dir is not None else None
         )
 
     def _excluded_legacy_paths(self, paths: set[str]) -> set[str]:
@@ -205,11 +210,11 @@ class MemoryRetriever:
         for relative_path in paths:
             if not is_legacy_memory_capture_candidate(relative_path):
                 continue
-            path = root / relative_path
             try:
-                if not path.resolve().is_relative_to(root):
-                    excluded.add(relative_path)
-                elif is_legacy_memory_capture_file(path, relative_path=relative_path):
+                path = resolve_memory_source_path(
+                    root, self._memory_dir or root / "memory", relative_path,
+                )
+                if is_legacy_memory_capture_file(path, relative_path=relative_path):
                     excluded.add(relative_path)
             except (OSError, ValueError):
                 excluded.add(relative_path)

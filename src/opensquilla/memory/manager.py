@@ -201,7 +201,7 @@ def _migrate_legacy_turn_archives(
             target = _unique_destination(target_root / rel_to_archive)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(path), str(target))
-            moved_rel_paths.append(path.relative_to(root.parent).as_posix())
+            moved_rel_paths.append((Path("memory") / path.relative_to(root)).as_posix())
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "memory_manager.turn_archive_migration_move_failed",
@@ -446,10 +446,8 @@ async def build_memory_managers(
     # patches honoured on every fresh call.
     from opensquilla.agents.scope import (
         maybe_migrate_legacy_memory,
-        resolve_agent_data_dir,
         resolve_agent_memory_db,
-        resolve_agent_memory_dir,
-        resolve_agent_workspace_dir,
+        resolve_agent_source_paths,
     )
 
     from .embedding import (
@@ -514,17 +512,9 @@ async def build_memory_managers(
             await in_flight_store.initialize()
 
             # Resolve workspace + memory dirs
-            memory_source = getattr(config.memory, "source", "state")
-            if memory_source == "workspace":
-                agent_workspace = resolve_agent_workspace_dir(agent_id, config)
-                mem_dir = str(agent_workspace / "memory")
-            elif agent_id == "main" and os.environ.get("OPENSQUILLA_MEMORY_DIR"):
-                mem_dir = os.environ["OPENSQUILLA_MEMORY_DIR"]
-                agent_workspace = resolve_agent_data_dir(agent_id)
-            else:
-                mem_dir = str(resolve_agent_memory_dir(agent_id, config.state_dir))
-                agent_workspace = resolve_agent_data_dir(agent_id, config.state_dir)
-            logical_memory_dir = Path(mem_dir)
+            source_paths = resolve_agent_source_paths(agent_id, config)
+            agent_workspace = source_paths.memory_root
+            logical_memory_dir = source_paths.notes_dir
             native_memory_dir = _native_io_path(logical_memory_dir)
             native_agent_workspace = _native_io_path(agent_workspace)
             native_turns_dir = _native_io_path(db_path.parent / "turns")
@@ -608,6 +598,7 @@ async def build_memory_managers(
                 sync_manager=in_flight_sync,
                 effective_metadata=retrieval_metadata,
                 workspace_dir=native_agent_workspace,
+                memory_dir=native_memory_dir,
             )
 
             turn_capture = TurnCaptureService(

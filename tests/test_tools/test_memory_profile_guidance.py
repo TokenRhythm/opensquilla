@@ -22,5 +22,5 @@ def test_memory_tool_descriptions_keep_profile_out_of_memory_save() -> None:
     assert "Do not use memory_search for current user identity/profile questions" in (
         memory_search.spec.description
     )
-    assert "USER.md" in memory_save.spec.description
-    assert "filesystem tools, not memory_save" in memory_save.spec.description
+    assert "configured Agent sources" in memory_save.spec.description
+    assert "agent_file when available, not memory_save" in memory_save.spec.description

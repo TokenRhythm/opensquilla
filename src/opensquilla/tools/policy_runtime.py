@@ -8,7 +8,7 @@ from opensquilla.tools.browser_policy import BROWSER_MCP_TOOL_NAMES, browser_con
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 _PRIVATE_MEMORY_READ_TOOL_NAMES: frozenset[str] = frozenset(
-    {"memory_get", "memory_search", "session_search"}
+    {"memory_get", "memory_search", "session_search", "agent_file"}
 )
 _IMAGE_GENERATION_TOOL_NAMES: frozenset[str] = frozenset({"image_generate"})
 _SESSION_READ_TOOL_NAMES: frozenset[str] = frozenset(
@@ -68,6 +68,20 @@ def private_memory_read_tool_denied(ctx: ToolContext | None, tool_name: str) -> 
     return (
         tool_name in _PRIVATE_MEMORY_READ_TOOL_NAMES
         and private_memory_read_tools_blocked(ctx)
+    )
+
+
+def agent_file_context_allowed(ctx: ToolContext | None) -> bool:
+    """Use existing trusted route facts; neither session text nor a path grants access."""
+
+    if ctx is None or not ctx.is_owner or ctx.guest_safe or private_memory_read_tools_blocked(ctx):
+        return False
+    if ctx.caller_kind in {CallerKind.AGENT, CallerKind.WEB, CallerKind.CLI}:
+        return True
+    return bool(
+        ctx.caller_kind is CallerKind.CHANNEL
+        and ctx.channel_admin_verified
+        and ctx.channel_kind != "group"
     )
 
 
@@ -181,6 +195,7 @@ def resolve_runtime_tool_surface(
     caps = capabilities or ToolSurfaceCapabilities()
     denied_tools = set(ctx.denied_tools)
     allowed_tools = set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
+    surfaced_tools = set(ctx.surfaced_tools or ())
 
     if not browser_context_available(ctx):
         denied_tools |= BROWSER_MCP_TOOL_NAMES
@@ -219,9 +234,16 @@ def resolve_runtime_tool_surface(
             denied_tools |= set(_ADMIN_RUNTIME_TOOL_NAMES)
     if private_memory_read_tools_blocked(ctx):
         denied_tools |= set(_PRIVATE_MEMORY_READ_TOOL_NAMES)
+    if not agent_file_context_allowed(ctx):
+        denied_tools.add("agent_file")
+    else:
+        surfaced_tools.add("agent_file")
 
     allowed_tools = _remove_denied_from_allowed(allowed_tools, denied_tools)
-    return replace(ctx, allowed_tools=allowed_tools, denied_tools=denied_tools)
+    return replace(
+        ctx, allowed_tools=allowed_tools, denied_tools=denied_tools,
+        surfaced_tools=surfaced_tools or ctx.surfaced_tools,
+    )
 
 
 def detect_runtime_tool_surface_capabilities(

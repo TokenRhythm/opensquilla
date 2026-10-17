@@ -7,6 +7,7 @@ from pathlib import Path
 
 from opensquilla.memory.dream.models import PromotionCandidate, RehydrateResult
 from opensquilla.memory.dream.quarantine import is_quarantined_path
+from opensquilla.memory.source_paths import resolve_memory_source_path
 
 
 def _sha256(text: str) -> str:
@@ -17,14 +18,16 @@ def _normalize_text(text: str) -> str:
     return " ".join(text.strip().split())
 
 
-def rehydrate_candidate(workspace: Path, candidate: PromotionCandidate) -> RehydrateResult:
+def rehydrate_candidate(
+    workspace: Path, candidate: PromotionCandidate, *, notes_dir: Path | None = None,
+) -> RehydrateResult:
     source_rel = candidate.source_path.replace("\\", "/").lstrip("./")
     if is_quarantined_path(source_rel):
         return RehydrateResult(ok=False, reason="source_quarantined")
-    source_path = (workspace / source_rel).resolve()
-    workspace_root = workspace.resolve()
     try:
-        source_path.relative_to(workspace_root)
+        source_path = resolve_memory_source_path(
+            workspace, notes_dir if notes_dir is not None else workspace / "memory", source_rel,
+        )
     except ValueError:
         return RehydrateResult(ok=False, reason="source_outside_workspace")
     try:

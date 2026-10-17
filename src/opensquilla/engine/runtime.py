@@ -4712,6 +4712,7 @@ class TurnRunner:
             Callable[[object, object | None, dict[str, Any]], Any | None] | None
         ) = None,
         usage_telemetry: UsageTelemetryPort | None = None,
+        memory_managers: dict[str, Any] | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._session_deployment_resolver = session_deployment_resolver
@@ -4722,6 +4723,7 @@ class TurnRunner:
         self._config = config
         self._last_agent_max_iterations_source = "AgentConfig default"
         self._memory_sync_managers = memory_sync_managers
+        self._memory_managers = memory_managers
         self._model_catalog = model_catalog
         self._memory_retrievers = memory_retrievers
         self._turn_capture_services = turn_capture_services
@@ -4954,7 +4956,9 @@ class TurnRunner:
         ws = self._resolve_memory_source_dir(agent_id)
         new_snap = MemorySnapshot(
             memory_md=self._load_memory_md(ws),
-            daily_notes=self._load_daily_notes(ws),
+            daily_notes=self._load_daily_notes(
+                ws, notes_dir=self._resolve_memory_notes_dir(agent_id),
+            ),
         )
         for key in list(self._memory_snapshots):
             if key[0] == agent_id:
@@ -4998,6 +5002,16 @@ class TurnRunner:
                 )
             except Exception:  # noqa: BLE001 - memory path should not block tool setup
                 pass
+
+        if not tool_context.memory_notes_dir:
+            tool_context = replace(
+                tool_context, memory_notes_dir=str(self._resolve_memory_notes_dir(agent_id)),
+            )
+        if not tool_context.bootstrap_source_dir:
+            tool_context = replace(
+                tool_context,
+                bootstrap_source_dir=str(self._resolve_bootstrap_workspace_dir(agent_id)),
+            )
 
         previous_memory_write = tool_context.on_memory_source_write
         if previous_memory_write is None:
@@ -9516,6 +9530,7 @@ class TurnRunner:
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -9613,7 +9628,9 @@ class TurnRunner:
             memory_text = snap.memory_md
             daily = snap.daily_notes
         else:
-            daily = self._load_daily_notes(memory_source_dir)
+            daily = self._load_daily_notes(
+                memory_source_dir, notes_dir=self._resolve_memory_notes_dir(agent_id),
+            )
             memory_text = self._load_memory_md(memory_source_dir)
         daily_notes_count_before_omit = len(daily)
         daily_notes_omitted = daily_notes_count_before_omit > 0
@@ -9683,7 +9700,9 @@ class TurnRunner:
         }
         base_prompt = assemble_system_prompt(
             agent_profile,
-            tools=[td.name for td in tool_defs] if tool_defs else None,
+            tools=sorted(
+                {td.name for td in tool_defs} | set(persistence_tools or ()),
+            ) or None,
             memory=memory_text,
             runtime_info=runtime_info,
             docs_path=(self._resolve_docs_path()),
@@ -9727,10 +9746,22 @@ class TurnRunner:
         return None
 
     def _resolve_memory_source_dir(self, agent_id: str):
-        from opensquilla.agents.scope import resolve_agent_memory_source_dir
+        from opensquilla.agents.scope import resolve_agent_source_paths
 
-        source = getattr(getattr(self._config, "memory", None), "source", "state")
-        return resolve_agent_memory_source_dir(agent_id, self._config, source=source)
+        manager = (self._memory_managers or {}).get(agent_id)
+        source = getattr(manager, "workspace_dir", None)
+        if source is not None:
+            return source
+        return resolve_agent_source_paths(agent_id, self._config).memory_root
+
+    def _resolve_memory_notes_dir(self, agent_id: str):
+        from opensquilla.agents.scope import resolve_agent_source_paths
+
+        manager = (self._memory_managers or {}).get(agent_id)
+        notes = getattr(manager, "memory_dir", None)
+        if notes is not None:
+            return notes
+        return resolve_agent_source_paths(agent_id, self._config).notes_dir
 
     def _effective_memory_retrieval_metadata(self, agent_id: str) -> dict[str, str]:
         retrievers = self._memory_retrievers or {}
@@ -9798,12 +9829,13 @@ class TurnRunner:
         return content
 
 
-    def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
+    def _load_daily_notes(self, workspace_dir: Any, *, notes_dir: Any = None) -> dict[str, str]:
         from opensquilla.identity.workspace import load_daily_notes
 
         memory_cfg = getattr(self._config, "memory", None)
         return load_daily_notes(
             str(workspace_dir),
+            notes_dir=notes_dir,
             per_note_max_chars=getattr(memory_cfg, "daily_note_max_chars", 4000),
             total_max_chars=getattr(memory_cfg, "daily_notes_total_max_chars", 8000),
         )

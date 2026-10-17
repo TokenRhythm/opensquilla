@@ -278,7 +278,11 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]:
+        prompt_options: dict[str, Any] = {}
+        if persistence_tools is not None:
+            prompt_options["persistence_tools"] = persistence_tools
         return self._runner._assemble_prompt(
             agent_id,
             tool_defs,
@@ -290,6 +294,7 @@ class _TurnRunnerPromptAssemblerAdapter(PromptAssemblerPort):
             fresh_user_session=fresh_user_session,
             workspace_dir=workspace_dir,
             webui_rendering=webui_rendering,
+            **prompt_options,
         )
 
 class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
@@ -969,7 +974,9 @@ class _TurnRunnerMemorySnapshotAdapter(MemorySnapshotPort):
             workspace = runner._resolve_memory_source_dir(agent_id)
             runner._memory_snapshots[snap_key] = MemorySnapshot(
                 memory_md=runner._load_memory_md(workspace),
-                daily_notes=runner._load_daily_notes(workspace),
+                daily_notes=runner._load_daily_notes(
+                    workspace, notes_dir=runner._resolve_memory_notes_dir(agent_id),
+                ),
             )
         return _MemorySnapshotResult(
             sync_manager=sync_manager,
@@ -1464,7 +1471,9 @@ class _TurnRunnerMemorySnapshotRefreshAdapter(MemorySnapshotRefreshPort):
         if private_memory_allowed:
             runner._memory_snapshots[(agent_id, session_key)] = MemorySnapshot(
                 memory_md=runner._load_memory_md(workspace),
-                daily_notes=runner._load_daily_notes(workspace),
+                daily_notes=runner._load_daily_notes(
+                    workspace, notes_dir=runner._resolve_memory_notes_dir(agent_id),
+                ),
             )
 
 class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
@@ -1492,6 +1501,14 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
         from opensquilla.tools.types import CallerKind
 
         tool_context = getattr(agent, "_tool_context", None)
+        authorized_tools = getattr(tool_context, "authorized_tool_names", None)
+        persistence_tools = (
+            frozenset(authorized_tools) & {"agent_file", "memory_save", "memory_get"}
+            if authorized_tools is not None else None
+        )
+        prompt_options: dict[str, Any] = {}
+        if persistence_tools is not None:
+            prompt_options["persistence_tools"] = persistence_tools
         assembled = self._runner._assemble_prompt(
             agent_id,
             tool_defs,
@@ -1499,6 +1516,7 @@ class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
             bootstrap_context_mode=(bootstrap_context_mode),
             workspace_dir=(getattr(agent.config, "workspace_dir", None)),
             webui_rendering=(getattr(tool_context, "caller_kind", None) is CallerKind.WEB),
+            **prompt_options,
         )
         refreshed_prompt = (
             assembled[0] if isinstance(assembled, tuple) else assembled

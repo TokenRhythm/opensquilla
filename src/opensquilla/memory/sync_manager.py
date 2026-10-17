@@ -15,6 +15,7 @@ from .source_paths import (
     is_legacy_memory_capture,
     is_legacy_memory_capture_file,
     is_memory_source_path,
+    resolve_memory_source_path,
 )
 from .store import LongTermMemoryStore
 from .types import MemorySource
@@ -311,7 +312,7 @@ class MemorySyncManager:
                     rel_to_memory = path.relative_to(self._memory_dir)
                     if any(part.startswith(".") for part in rel_to_memory.parts[:-1]):
                         continue
-                    rel = path.relative_to(self._workspace_dir).as_posix()
+                    rel = (Path("memory") / rel_to_memory).as_posix()
                     if not is_memory_source_path(rel):
                         continue
                     try:
@@ -408,7 +409,9 @@ class MemorySyncManager:
                     return failed_deletes
                 try:
                     content = await run_memory_io(
-                        self._read_file, self._workspace_dir / rel_path,
+                        self._read_file, resolve_memory_source_path(
+                            self._workspace_dir, self._memory_dir, rel_path,
+                        ),
                     )
                     if not self._accepts_generation(generation):
                         return failed_deletes

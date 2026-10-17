@@ -31,7 +31,11 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 import structlog
 
 from opensquilla.memory.redaction import redact_memory_text
-from opensquilla.memory.source_paths import is_memory_source_path, is_searchable_source_path
+from opensquilla.memory.source_paths import (
+    is_memory_source_path,
+    is_searchable_source_path,
+    resolve_memory_source_path,
+)
 from opensquilla.memory.types import (
     DEFAULT_MEMORY_SEARCH_MIN_SCORE,
     DEFAULT_MEMORY_SEARCH_RESULTS,
@@ -333,6 +337,7 @@ def create_memory_tools(
     memory_source: str = "state",
     workspace_base: str | None = None,
     maintenance_allowed: Callable[[str, Path, Path | None], bool] | None = None,
+    memory_managers: dict[str, Any] | None = None,
 ) -> None:
     """Register memory tools. Accepts either a single store or a dict keyed by agent_id.
 
@@ -368,14 +373,24 @@ def create_memory_tools(
         if memory_source not in {"state", "workspace"}:
             raise ToolError("memory_source must be 'state' or 'workspace'.")
 
-        if memory_source == "workspace":
+        manager = memory_managers.get(agent_id) if memory_managers is not None else None
+        if (
+            manager is not None
+            and manager.workspace_dir is not None
+            and manager.memory_dir is not None
+        ):
+            wd: str | None = str(manager.workspace_dir)
+            md: str | None = str(manager.memory_dir)
+        elif ctx and ctx.memory_source_dir:
+            wd = str(Path(ctx.memory_source_dir).expanduser().resolve())
+            md = (
+                str(Path(ctx.memory_notes_dir))
+                if ctx.memory_notes_dir else str(Path(wd) / "memory")
+            )
+        elif memory_source == "workspace":
             from opensquilla.agents.scope import resolve_agent_workspace_dir
 
-            if ctx and ctx.memory_source_dir:
-                # Runtime resolves this from the Agent's memory configuration.
-                # A task execution directory is not a new long-term memory root.
-                wd: str | None = str(Path(ctx.memory_source_dir).expanduser().resolve())
-            elif workspace_base:
+            if workspace_base:
                 wd = str(
                     resolve_agent_workspace_dir(
                         agent_id,
@@ -386,15 +401,15 @@ def create_memory_tools(
                 wd = str(resolve_agent_workspace_dir(agent_id))
             else:
                 wd = memory_dir
-            md: str | None = str(Path(wd) / "memory") if wd else memory_dir
+            md = str(Path(wd) / "memory") if wd else memory_dir
         elif memory_base:
             from opensquilla.agents.scope import resolve_agent_data_dir, resolve_agent_memory_dir
 
             md = str(resolve_agent_memory_dir(agent_id, memory_base))
             wd = str(resolve_agent_data_dir(agent_id, memory_base))
         else:
-            md = memory_dir
             wd = memory_dir  # fallback: use memory_dir as workspace in test/legacy mode
+            md = str(Path(wd) / "memory") if wd else None
         source_root, notes_root = wd, md
 
         def allow_maintenance() -> bool:
@@ -442,13 +457,13 @@ def create_memory_tools(
             raise ToolError("workspace directory not configured.")
         return Path(r.workspace_dir)
 
-    def _resolve_memory_path(workspace_dir: Path, path: str) -> Path:
-        mem_path = workspace_dir / path
+    def _resolve_memory_path(r: ResolvedAgent, path: str) -> Path:
         try:
-            mem_path.resolve().relative_to(workspace_dir.resolve())
+            return resolve_memory_source_path(
+                _workspace_path(r), r.memory_dir or _workspace_path(r) / "memory", path,
+            )
         except ValueError as exc:
             raise ToolError("path traversal not allowed.") from exc
-        return mem_path
 
     def _validate_memory_save_target(path: str, mode: str) -> None:
         if not _is_memory_save_path(path):
@@ -532,14 +547,14 @@ def create_memory_tools(
                     f"({total_kb:.0f} + {content_size_kb:.0f} KB > {max_total} KB)."
                 )
 
-    def _snapshot_paths(workspace_dir: Path, plans: list[PlannedWrite]) -> list[FileSnapshot]:
+    def _snapshot_paths(r: ResolvedAgent, plans: list[PlannedWrite]) -> list[FileSnapshot]:
         seen: set[str] = set()
         snapshots: list[FileSnapshot] = []
         for plan in plans:
             if plan.path in seen:
                 continue
             seen.add(plan.path)
-            abs_path = _resolve_memory_path(workspace_dir, plan.path)
+            abs_path = _resolve_memory_path(r, plan.path)
             existed = abs_path.exists()
             content = abs_path.read_text(encoding="utf-8") if existed else None
             snapshots.append(
@@ -624,7 +639,7 @@ def create_memory_tools(
         workspace_dir = _workspace_path(r)
         await _maybe_prune(r)
 
-        snapshots = _snapshot_paths(workspace_dir, plans)
+        snapshots = _snapshot_paths(r, plans)
         snapshot_map = {snapshot.path: snapshot for snapshot in snapshots}
         touched_paths: set[str] = set()
         chunks_by_path: dict[str, int] = {}
@@ -730,11 +745,10 @@ def create_memory_tools(
     @tool(
         name="memory_save",
         description=(
-            "Save content to memory source files for future recall. This is not "
-            "for ordinary task deliverables such as reports, JSON outputs, or "
-            "result files. Use MEMORY.md for long-term facts (mode=replace) and "
-            "memory/YYYY-MM-DD.md for daily notes (mode=append). Profile/bootstrap "
-            "files such as USER.md are edited with filesystem tools, not memory_save. "
+            "Write durable non-profile memory to the configured Agent sources, which may "
+            "differ from the task workspace. Profile and persona files use agent_file "
+            "when available, not memory_save. Use MEMORY.md for long-term facts "
+            "(mode=replace) and memory/YYYY-MM-DD.md for daily notes (mode=append). "
             "Before replacing an existing file, read its complete contents and preserve "
             "unrelated facts."
         ),
@@ -789,7 +803,8 @@ def create_memory_tools(
         params={
             "path": {
                 "type": "string",
-                "description": "Workspace-relative memory source path: MEMORY.md or memory/**/*.md",
+                "description": "Logical path in the configured Agent memory sources: "
+                "MEMORY.md or memory/**/*.md.",
             },
             "from": {
                 "type": "integer",
@@ -821,15 +836,12 @@ def create_memory_tools(
         if not r.workspace_dir:
             return "Error: workspace directory not configured."
 
-        workspace_dir = Path(r.workspace_dir)
-        file_path = workspace_dir / path
-        try:
-            file_path.resolve().relative_to(workspace_dir.resolve())
-        except ValueError:
-            return "Error: path traversal not allowed."
-
         if not _is_memory_source_path(path):
             return f"Error: path is not a memory source file. {_MEMORY_SOURCE_PATH_HINT}"
+        try:
+            file_path = _resolve_memory_path(r, path)
+        except ToolError:
+            return "Error: path traversal not allowed."
 
         if not file_path.exists():
             return f"Error: {path} not found."
@@ -855,7 +867,8 @@ def create_memory_tools(
         params={
             "path": {
                 "type": "string",
-                "description": "File path relative to memory directory to delete",
+                "description": "Supported logical file path in the configured Agent "
+                "memory sources to delete.",
             },
         },
         required=["path"],
@@ -867,15 +880,12 @@ def create_memory_tools(
         if not r.workspace_dir:
             return "Error: workspace directory not configured."
 
-        workspace_dir = Path(r.workspace_dir)
-        file_path = workspace_dir / path
-        try:
-            file_path.resolve().relative_to(workspace_dir.resolve())
-        except ValueError:
-            return "Error: path traversal not allowed."
-
         if not _is_memory_source_path(path):
             return f"Error: path is not a memory source file. {_MEMORY_SOURCE_PATH_HINT}"
+        try:
+            file_path = _resolve_memory_path(r, path)
+        except ToolError:
+            return "Error: path traversal not allowed."
 
         if not file_path.exists():
             return f"Error: {path} not found."
@@ -884,7 +894,7 @@ def create_memory_tools(
         file_path.unlink()
 
         # Remove from index (workspace-relative path)
-        index_path = file_path.resolve().relative_to(workspace_dir.resolve()).as_posix()
+        index_path = Path(path).as_posix()
         await r.store.remove_file(index_path)
 
         logger.info("memory_delete.ok", path=path)

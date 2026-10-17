@@ -293,7 +293,8 @@ def _memory_source_root() -> Path | None:
 
 def _memory_roots() -> tuple[Path, ...]:
     roots: list[Path] = []
-    for root in (_workspace_root(), _memory_source_root()):
+    source = _memory_source_root()
+    for root in (source,) if source is not None else (_workspace_root(),):
         if root is None or root in roots:
             continue
         roots.append(root)
@@ -473,6 +474,15 @@ def _workspace_display_path(path: Path, original_path: str) -> str:
 
 def _memory_source_rel_path(path: Path) -> str | None:
     resolved = path.resolve(strict=False)
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.memory_notes_dir:
+        try:
+            note = resolved.relative_to(Path(ctx.memory_notes_dir).expanduser().resolve())
+        except ValueError:
+            pass
+        else:
+            if note.suffix == ".md" and not any(part.startswith(".") for part in note.parts):
+                return (Path("memory") / note).as_posix()
     for root in _memory_roots():
         try:
             rel = resolved.relative_to(root)
@@ -481,13 +491,20 @@ def _memory_source_rel_path(path: Path) -> str | None:
 
         if rel.parts in {("MEMORY.md",), ("memory.md",)}:
             return rel.as_posix()
-        if len(rel.parts) >= 2 and rel.parts[0] == "memory" and rel.suffix == ".md":
+        if (
+            len(rel.parts) >= 2 and rel.parts[0] == "memory" and rel.suffix == ".md"
+            and not (ctx is not None and ctx.memory_notes_dir)
+        ):
             return rel.as_posix()
     return None
 
 
 def _bootstrap_source_rel_path(path: Path) -> str | None:
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        Path(ctx.bootstrap_source_dir).expanduser().resolve()
+        if ctx is not None and ctx.bootstrap_source_dir else _workspace_root()
+    )
     if root is None:
         return None
     resolved = path.resolve(strict=False)

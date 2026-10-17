@@ -205,26 +205,36 @@ Before creating a widget, read the `visualize` Skill if it is listed.
 
 {% endif -%}
 
-{% set has_memory_recall = tools and ("memory_search" in tools or "memory_get" in tools) -%}
-{% set has_memory_file_write = tools and ("write_file" in tools or "edit_file" in tools or "apply_patch" in tools) -%}
-{% if has_memory_recall and has_memory_file_write and prompt_mode == "full" -%}
-## Memory Write Guidance
+{% set has_memory_save = tools and "memory_save" in tools -%}
+{% set has_agent_file = tools and "agent_file" in tools -%}
+{% if prompt_mode == "full" -%}
+## Profile and Memory Updates
 
-- Memory source files are plain Markdown files in the active workspace.
-- User profile: `USER.md` for stable identity fields such as name, preferred address, pronouns, timezone, and durable profile notes.
-- Agent identity: `IDENTITY.md` for assistant name, emoji, theme, avatar, and how the assistant introduces itself.
-- Agent persona: `SOUL.md` for durable voice, tone, and interaction style.
-- Long-term memory: `MEMORY.md` for durable non-profile facts, preferences, decisions, and constraints.
-- Daily/named notes: `memory/YYYY-MM-DD.md` and `memory/**/*.md` for running context and session observations.
-- If the user specifies a memory file path, use that exact path.
-- For remember/save requests, use ordinary file tools to create or edit the relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file.
-- For assistant rename/persona requests, edit `IDENTITY.md` or `SOUL.md` with ordinary file tools. Do not put assistant rename/persona requests into `MEMORY.md`.
-- Use `memory_search` and `memory_get` for recall; default memory search is derived from curated files, with optional virtual session snippets only when explicitly requested and indexed.
-- Do not treat the memory database or search index as the source of truth.
-- Do not use `memory_save` for `USER.md`; profile files are bootstrap workspace files, not memory source files.
-- Only say memory was updated after the file write succeeds.
-- For ordinary task deliverables such as reports, JSON outputs, or result files, use file/code tools outside memory source files.
-- Do not save fleeting emotions, in-progress conversation state, or information that only matters within the current session.
+- Profile and memory files belong to configured Agent sources, which may differ
+  from the task workspace and from one another.
+{% if has_agent_file -%}
+- Use agent_file for USER.md (stable user profile), IDENTITY.md (assistant
+  identity), and SOUL.md (persona). Read first, preserve unrelated content,
+  and supply the returned revision when replacing. The runtime selects the source.
+{% endif -%}
+{% if has_memory_save -%}
+- Use memory_save for durable non-profile facts in MEMORY.md and daily/named
+  notes under memory/. These are logical paths in the configured Agent sources.
+{% if "memory_get" in tools -%}
+- Read existing content with memory_get before replacing it.
+{% else -%}
+- Do not replace existing memory content unless you have read it completely.
+{% endif -%}
+- Do not use memory_save for USER.md, IDENTITY.md, or SOUL.md.
+{% endif -%}
+- If the relevant persistence tool is unavailable, explain the limitation;
+  do not create a task-local profile or memory file as a substitute.
+- An ordinary file requested at an explicit path remains a file task. Keep
+  task deliverables separate from configured profile and memory sources.
+- Source files are authoritative; the index is derived. Report a saved update
+  only when its final state is confirmed. Respect rollback results and distinguish
+  an unresolved outcome from a successful save.
+- Do not persist fleeting emotions, in-progress state, or session-only facts.
 
 {% endif -%}
 

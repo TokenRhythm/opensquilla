@@ -11,13 +11,6 @@ from opensquilla.memory.dream.quarantine import is_quarantined_path, is_quaranti
 _SNIPPET_MAX_CHARS = 4000
 
 
-def _workspace_relative(workspace: Path, path: Path) -> str:
-    try:
-        return path.relative_to(workspace).as_posix()
-    except ValueError:
-        return path.as_posix()
-
-
 def _normalize_snippet(text: str) -> str:
     return " ".join(text.strip().split())
 
@@ -61,8 +54,9 @@ def scan_dream_candidates(
     max_batch_size: int,
     agent_id: str,
     quarantine_enabled: bool = True,
+    notes_dir: Path | None = None,
 ) -> list[RawDreamCandidate]:
-    memory_dir = workspace / "memory"
+    memory_dir = notes_dir if notes_dir is not None else workspace / "memory"
     if not memory_dir.exists():
         return []
     candidates: list[tuple[float, RawDreamCandidate]] = []
@@ -77,7 +71,7 @@ def scan_dream_candidates(
             continue
         if stat.st_mtime <= cursor:
             continue
-        rel_path = _workspace_relative(workspace, path)
+        rel_path = (Path("memory") / path.relative_to(memory_dir)).as_posix()
         if quarantine_enabled and is_quarantined_path(rel_path):
             continue
         try:

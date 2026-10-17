@@ -181,9 +181,10 @@ class Dream:
         session_lock: asyncio.Lock | None,
         config: Any,  # DreamConfig — avoid circular import
         agent_id: str = "main",
+        notes_dir: Path | None = None,
     ) -> None:
         self.workspace = workspace
-        self.memory_dir = workspace / "memory"
+        self.memory_dir = notes_dir if notes_dir is not None else workspace / "memory"
         self.memory_md = workspace / "MEMORY.md"
         self.cursor = DreamCursor(self.memory_dir)
         self.provider = provider
@@ -228,6 +229,10 @@ class Dream:
 
     def _workspace_relative(self, path: Path) -> str:
         try:
+            return (Path("memory") / path.relative_to(self.memory_dir)).as_posix()
+        except ValueError:
+            pass
+        try:
             return path.relative_to(self.workspace).as_posix()
         except ValueError:
             return str(path)
@@ -249,6 +254,7 @@ class Dream:
                 max_batch_size=getattr(self.config, "max_batch_size", 20),
                 agent_id=getattr(self, "agent_id", "main"),
                 quarantine_enabled=getattr(self.config, "evidence_quarantine_enabled", True),
+                notes_dir=self.memory_dir,
             )
         )
 
@@ -276,6 +282,7 @@ class Dream:
             max_batch_size=getattr(self.config, "max_batch_size", 20),
             agent_id=getattr(self, "agent_id", "main"),
             quarantine_enabled=getattr(self.config, "evidence_quarantine_enabled", True),
+            notes_dir=self.memory_dir,
         )
         result.files_considered = len(raw_candidates)
         if len(raw_candidates) < getattr(self.config, "min_batch_size", 1):
@@ -294,6 +301,7 @@ class Dream:
                 raw_candidates,
                 now_iso=now_iso,
                 persist=not result.dry_run,
+                notes_dir=self.memory_dir,
             )
             ranked = rank_promotion_candidates(
                 store,
@@ -319,7 +327,7 @@ class Dream:
                 default=result.cursor_before,
             )
             if not result.dry_run:
-                write_evidence_store(self.workspace, store)
+                write_evidence_store(self.workspace, store, notes_dir=self.memory_dir)
                 result.files_processed = len(raw_candidates)
                 self.cursor.save(max_mtime)
                 result.cursor_after = max_mtime
@@ -328,6 +336,7 @@ class Dream:
             result.apply_status = "skipped"
             result.edit_receipt_path = write_dream_receipt(
                 workspace=self.workspace,
+                notes_dir=self.memory_dir,
                 artifact_id=self._artifact_id(),
                 agent_id=getattr(self, "agent_id", "main"),
                 dry_run=result.dry_run,
@@ -363,7 +372,9 @@ class Dream:
 
             live_candidate_ids: set[str] = set()
             for candidate in ranked:
-                rehydrated = rehydrate_candidate(self.workspace, candidate)
+                rehydrated = rehydrate_candidate(
+                    self.workspace, candidate, notes_dir=self.memory_dir,
+                )
                 if rehydrated.ok:
                     live_candidate_ids.add(candidate.candidate_id)
                 else:
@@ -424,7 +435,7 @@ class Dream:
                 ]
                 mark_evidence_promoted(store, promoted_ids, now_iso)
                 mark_evidence_represented(store, represented_ids, "no_curated_change")
-                write_evidence_store(self.workspace, store)
+                write_evidence_store(self.workspace, store, notes_dir=self.memory_dir)
                 max_mtime = max(
                     (candidate.source_mtime_ns / 1_000_000_000 for candidate in raw_candidates),
                     default=result.cursor_before,
@@ -444,6 +455,7 @@ class Dream:
             result.apply_ms = int((time.monotonic() - apply_start) * 1000)
             result.edit_receipt_path = write_dream_receipt(
                 workspace=self.workspace,
+                notes_dir=self.memory_dir,
                 artifact_id=artifact_id,
                 agent_id=getattr(self, "agent_id", "main"),
                 dry_run=result.dry_run,

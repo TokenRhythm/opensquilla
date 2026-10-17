@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 
 from opensquilla.agents.registry import AgentRegistry
@@ -14,6 +17,61 @@ class _FailingModelSelector:
 
 def _ctx(config: GatewayConfig, registry: AgentRegistry | None) -> RpcContext:
     return RpcContext(conn_id="test", config=config, agent_registry=registry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+async def test_agent_file_rpc_revision_conflict_and_targeted_invalidation(
+    tmp_path, registry_enabled,
+):
+    config = GatewayConfig(workspace_dir=str(tmp_path / "source"))
+    registry = AgentRegistry(config, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(config, registry)
+    invalidated = Mock()
+    ctx.turn_runner = SimpleNamespace(invalidate_profile_snapshot=invalidated)
+    dispatcher = get_dispatcher()
+    listed = await dispatcher.dispatch("list", "agents.files.list", {"agentId": "ops"}, ctx)
+    absent = next(item for item in listed.payload["files"] if item["name"] == "USER.md")
+    assert absent["revision"] == "absent"
+    created = await dispatcher.dispatch("create", "agents.files.set", {
+        "agentId": "ops", "name": "USER.md", "content": "first",
+        "expectedRevision": absent["revision"],
+    }, ctx)
+    assert created.error is None
+    invalidated.assert_called_once_with("ops")
+    read = await dispatcher.dispatch("read", "agents.files.get", {
+        "agentId": "ops", "name": "USER.md",
+    }, ctx)
+    assert read.payload["revision"] == created.payload["revision"]
+    changed = await dispatcher.dispatch("legacy", "agents.files.set", {
+        "agentId": "ops", "name": "USER.md", "content": "legacy caller still works",
+    }, ctx)
+    assert changed.error is None
+    invalidated.reset_mock()
+    stale = await dispatcher.dispatch("stale", "agents.files.set", {
+        "agentId": "ops", "name": "USER.md", "content": "must not overwrite",
+        "expectedRevision": read.payload["revision"],
+    }, ctx)
+    assert stale.error.code == "AGENT_FILE_CONFLICT"
+    invalidated.assert_not_called()
+    assert (tmp_path / "source" / "agents" / "ops" / "USER.md").read_text() == (
+        "legacy caller still works"
+    )
+
+
+@pytest.mark.asyncio
+async def test_absent_revision_does_not_match_an_existing_empty_file(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "USER.md").write_bytes(b"")
+    config = GatewayConfig(workspace_dir=str(source))
+    ctx = _ctx(config, AgentRegistry(config, persist_changes=False))
+    result = await get_dispatcher().dispatch("replace", "agents.files.set", {
+        "agentId": "main", "name": "USER.md", "content": "must not create over empty",
+        "expectedRevision": "absent",
+    }, ctx)
+    assert result.error.code == "AGENT_FILE_CONFLICT"
+    assert (source / "USER.md").read_bytes() == b""
 
 
 @pytest.mark.asyncio
@@ -85,7 +143,10 @@ async def test_agent_file_rpc_set_creates_only_requested_file(tmp_path, registry
     )
 
     assert response.error is None
-    assert response.payload == {"name": "USER.md", "path": "USER.md", "size": 11}
+    assert {key: response.payload[key] for key in ("name", "path", "size")} == {
+        "name": "USER.md", "path": "USER.md", "size": 11,
+    }
+    assert response.payload["revision"].startswith("sha256:")
     assert {path.name for path in workspace.iterdir()} == {*originals, "USER.md"}
     for name, content in originals.items():
         assert (workspace / name).read_bytes() == content

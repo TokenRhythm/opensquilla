@@ -7,6 +7,21 @@ from pathlib import Path
 
 from .types import MemorySource
 
+
+def resolve_memory_source_path(
+    memory_root: str | Path, notes_dir: str | Path, path: str,
+) -> Path:
+    """Map a supported logical memory path to its configured source tree."""
+
+    if not is_memory_source_path(path):
+        raise ValueError("not a memory source path")
+    relative = Path(path)
+    is_long_term = relative.parts == ("MEMORY.md",)
+    root = Path(memory_root) if is_long_term else Path(notes_dir)
+    candidate = root / (relative if is_long_term else Path(*relative.parts[1:]))
+    candidate.resolve().relative_to(root.resolve())
+    return candidate
+
 _LEGACY_RAW_FALLBACK_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-(reset|compact)-\d+\.md$")
 _LEGACY_TURN_CAPTURE_REQUIRED_MARKERS = (
     "# Turn Capture",

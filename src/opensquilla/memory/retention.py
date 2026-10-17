@@ -84,12 +84,9 @@ async def prune_expired_memory_files(
         store: ``LongTermMemoryStore`` (anything with ``async remove_file``).
         ttl_days: 0 disables the sweep. Files with mtime older than
             ``now - ttl_days * 86400 - debounce_seconds`` are pruned.
-        workspace_dir: Per-agent workspace root. Store keys are computed
-            as ``path.relative_to(workspace_dir)`` to match the
-            ``MemorySyncManager._scan_files`` convention. Defaults to
-            ``memory_dir.parent`` since manager.py keeps the parent /
-            child relationship in both ``source="workspace"`` and
-            ``source="state"`` modes.
+        workspace_dir: Retained compatibility parameter. Notes use logical
+            ``memory/<relative note>`` keys even when their configured tree
+            is separate from the MEMORY.md source root.
         exempt_files: Names that survive regardless of mtime. Default
             covers ``MEMORY.md`` + bootstrap files; pass a smaller set
             only if you know what you are doing.
@@ -123,7 +120,6 @@ async def prune_expired_memory_files(
     if not mem_root.is_dir():
         return PruneResult(0, 0, 0, int((time.monotonic() - started) * 1000))
 
-    workspace_root = Path(workspace_dir) if workspace_dir is not None else mem_root.parent
     cutoff = time.time() - (ttl_days * 86400) - max(0.0, debounce_seconds)
 
     examined = 0
@@ -176,13 +172,8 @@ async def prune_expired_memory_files(
         if mtime >= cutoff:
             continue
 
-        # Store keys are workspace-relative, NOT memory-relative — must
-        # match MemorySyncManager._scan_files.
-        try:
-            store_key = path.relative_to(workspace_root).as_posix()
-        except ValueError:
-            # Symlink or odd path that escapes workspace — skip.
-            continue
+        # Keep the same logical index namespace for independent notes roots.
+        store_key = (Path("memory") / rel_to_memory).as_posix()
         if maintenance_allowed is not None and not maintenance_allowed():
             break
         try:

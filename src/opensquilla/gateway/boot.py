@@ -3102,6 +3102,9 @@ async def build_services(
     from opensquilla.agents.registry import AgentRegistry
 
     agent_registry = AgentRegistry(config)
+    from opensquilla.tools.builtin.agent_files import create_agent_file_tool
+
+    create_agent_file_tool(agent_registry, registry=tool_registry)
 
     # ── Session manager ─────────────────────────────────────────────
     if session_manager is None:
@@ -3518,6 +3521,7 @@ async def build_services(
                     memory_source=getattr(config.memory, "source", "state"),
                     on_memory_write=_on_memory_write,
                     memory_config=config.memory,
+                    memory_managers=memory_managers,
                     maintenance_allowed=source_maintenance_policy.allows,
                     workspace_base=config.workspace_dir
                     if getattr(config.memory, "source", "state") == "workspace"
@@ -4206,6 +4210,7 @@ def build_turn_runner_from_services(
         memory_sync_managers=getattr(svc, "memory_sync_managers", None) or None,
         model_catalog=getattr(svc, "model_catalog", None),
         memory_retrievers=getattr(svc, "memory_retrievers", None) or None,
+        memory_managers=getattr(svc, "memory_managers", None),
         turn_capture_services=getattr(svc, "turn_capture_services", None) or None,
         session_lock_provider=_standalone_lock_provider,
         diagnostics_state=diagnostics_state,
@@ -5120,6 +5125,7 @@ async def start_gateway_server(
             build_dream=build_dream_factory(
                 config=config,
                 turn_runner=turn_runner,
+                memory_managers=svc.memory_managers,
             ),
             should_skip=lambda: (
                 "disabled" if not getattr(config.memory.dream, "enabled", False) else None

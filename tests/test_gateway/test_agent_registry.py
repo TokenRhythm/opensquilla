@@ -182,6 +182,9 @@ async def test_registry_file_set_creates_only_requested_file(tmp_path) -> None:
 
     result = await registry.set_agent_file("main", "USER.md", "Name: Mira\n")
 
-    assert result == {"name": "USER.md", "path": "USER.md", "size": 11}
+    assert {key: result[key] for key in ("name", "path", "size")} == {
+        "name": "USER.md", "path": "USER.md", "size": 11,
+    }
+    assert result["revision"].startswith("sha256:")
     assert {path.name for path in workspace.iterdir()} == {"USER.md"}
     assert (workspace / "USER.md").read_text(encoding="utf-8") == "Name: Mira\n"

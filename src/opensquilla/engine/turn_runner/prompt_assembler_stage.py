@@ -165,6 +165,7 @@ class PromptAssemblerPort(Protocol):
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -450,6 +451,14 @@ class PromptAssemblerStage:
                 if key in reference_keys:
                     plan_reference_parts.append(f"## {key}\n\n{extra_context.pop(key)}")
         prompt_metadata: dict[str, Any] = {}
+        authorized_tools = getattr(inp.effective_tool_context, "authorized_tool_names", None)
+        persistence_tools = (
+            frozenset(authorized_tools) & {"agent_file", "memory_save", "memory_get"}
+            if authorized_tools is not None else None
+        )
+        prompt_options: dict[str, Any] = {}
+        if persistence_tools is not None:
+            prompt_options["persistence_tools"] = persistence_tools
         base_prompt = self._prompt_assembler.assemble_prompt(
             inp.agent_id,
             inp.tool_defs,
@@ -463,6 +472,7 @@ class PromptAssemblerStage:
             webui_rendering=(
                 getattr(inp.effective_tool_context, "caller_kind", None) is CallerKind.WEB
             ),
+            **prompt_options,
         )
         from opensquilla.engine.collaboration_prompt import with_collaboration_instructions
         from opensquilla.token_estimation import estimate_tokens

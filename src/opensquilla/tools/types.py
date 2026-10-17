@@ -340,6 +340,9 @@ class ToolContext:
     process_event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = field(
         default=None, repr=False
     )
+    # Actual Agent sources are independent from task execution and from each other.
+    memory_notes_dir: str | None = None
+    bootstrap_source_dir: str | None = None
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
@@ -412,6 +415,7 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "agents_list",
         "subagents",
         "memory_get",
+        "agent_file",
         "memory_search",
         "session_search",
         "message",
@@ -443,6 +447,7 @@ CRON_AGENT_ALLOW: frozenset[str] = frozenset(
 CRON_AGENT_DENY: frozenset[str] = frozenset(
     {
         "cron",
+        "agent_file",
         "agents_list",
         "subagents",
         "message",

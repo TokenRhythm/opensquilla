@@ -52,10 +52,10 @@ def test_system_prompt_routes_profile_to_user_md() -> None:
 
     assert "USER.md" in prompt
     assert "name, preferred address, pronouns, timezone" in prompt
-    assert "Do not use `memory_save` for `USER.md`" in prompt
-    assert "MEMORY.md` for durable non-profile facts" in prompt
+    assert "do not create a task-local profile or memory file as a substitute" in prompt
+    assert "Profile and memory files belong to configured Agent sources" in prompt
     assert "`MEMORY.md` + `memory/**/*.md`" in prompt
-    assert "relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file" in prompt
+    assert "use ordinary file tools to create or edit" not in prompt
     assert "decisions, dates, people, preferences, or todos" not in prompt
     assert "prior work, decisions, dated history, todos" in prompt
 
@@ -120,12 +120,13 @@ def test_system_prompt_routes_exact_transcript_search_to_session_search() -> Non
 def test_system_prompt_routes_agent_identity_away_from_memory_md() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),
-        tools=["memory_search", "memory_get", "write_file", "edit_file", "apply_patch"],
+        tools=["memory_search", "memory_get", "agent_file", "memory_save"],
     )
 
-    assert "Agent identity: `IDENTITY.md`" in prompt
-    assert "Agent persona: `SOUL.md`" in prompt
-    assert "Do not put assistant rename/persona requests into `MEMORY.md`" in prompt
+    assert "Use agent_file for USER.md" in prompt
+    assert "IDENTITY.md (assistant" in prompt
+    assert "SOUL.md (persona)" in prompt
+    assert "Do not use memory_save for USER.md, IDENTITY.md, or SOUL.md" in prompt
 
 
 def test_system_prompt_only_documents_canonical_tool_names() -> None:

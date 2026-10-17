@@ -23,8 +23,9 @@ def write_dream_receipt(
     memory_md_backup_path: str,
     cursor_before: float,
     cursor_after: float,
+    notes_dir: Path | None = None,
 ) -> str:
-    receipt_dir = workspace / "memory" / ".dream_receipts"
+    receipt_dir = (notes_dir if notes_dir is not None else workspace / "memory") / ".dream_receipts"
     receipt_dir.mkdir(parents=True, exist_ok=True)
     receipt_path = receipt_dir / f"{artifact_id}.json"
     payload = {
@@ -56,4 +57,4 @@ def write_dream_receipt(
         json.dumps(payload, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )
-    return receipt_path.relative_to(workspace).as_posix()
+    return (Path("memory") / ".dream_receipts" / receipt_path.name).as_posix()

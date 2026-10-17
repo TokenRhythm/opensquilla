@@ -11,6 +11,7 @@ import structlog
 from opensquilla.provider.types import ToolDefinition
 from opensquilla.tools.policy_runtime import (
     ToolSurfaceCapabilities,
+    agent_file_context_allowed,
     resolve_runtime_tool_surface,
 )
 from opensquilla.tools.types import (
@@ -296,6 +297,8 @@ def effective_tool_context(
 
 
 def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
+    if rt.spec.name == "agent_file" and not agent_file_context_allowed(ctx):
+        return False
     if ctx is not None and ctx.caller_kind is CallerKind.CHANNEL:
         from opensquilla.safety.permission_matrix import Principal, is_tool_allowed
 

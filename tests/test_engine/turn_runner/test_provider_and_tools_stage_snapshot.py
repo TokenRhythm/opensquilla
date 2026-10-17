@@ -50,6 +50,7 @@ def _make_assemble_prompt_probe():
         self, agent_id, tool_defs, *, session_key, semantic_message,
         extra_context, prompt_metadata, bootstrap_context_mode,
         fresh_user_session=False, workspace_dir=None, webui_rendering=False,
+        persistence_tools=None,
     ):  # noqa: ARG001
         # Walk up the stack to find the ``_run_turn`` frame. Under the
         # In the staged runtime, ``_assemble_prompt`` is called from inside

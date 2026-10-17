@@ -58,6 +58,7 @@ HARDCODED_ADMIN_ONLY: Final[frozenset[str]] = frozenset(
         "git_commit",
         "git_push",
         "channel_send_as_admin",
+        "agent_file",
     }
 )
 
