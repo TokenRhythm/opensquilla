@@ -654,6 +654,8 @@ try {
   assert.deepEqual(actionState,{below:1,covered:0,obstruction:0})
   const crashTarget = await app.evaluate(async ({}, origin) => {
     const { manager } = globalThis.browserFixture
+    // This completed fixture no longer needs a native preview slot.
+    await manager.destroySurface('same-url', true)
     const created = await manager.createSurface({ version: 4, surfaceId: 'crash-target', kind: 'artifact-preview',
       payload: { launchUrl: origin+'/', expectedOrigin: origin, scopeId: 'session-a', mode: 'full' } })
     if (!created.ok) throw new Error(created.message || 'Crash target did not load.')
@@ -726,3 +728,5 @@ try {
   await new Promise(resolve=>server.close(resolve))
   await rm(root,{recursive:true,force:true})
 }
+
+await import('./test-workbench-retention-electron.mjs')

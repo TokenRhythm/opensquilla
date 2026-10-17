@@ -61,6 +61,12 @@ import { showBrowserContextMenu } from './browser-context-menu.js'
 import { NativeWorkbenchPdfResourcePolicy } from './native-workbench-pdf-policy.js'
 import { BROWSER_PROMPT_PRELOAD, BrowserPromptController } from './browser-prompt.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import { WorkbenchResourceBudget, WORKBENCH_RESOURCE_LIMITS, type WorkbenchResourceReservation } from './workbench-resource-budget.js'
+
+function releaseReservationAfterDestruction(reservation: WorkbenchResourceReservation, contents?: WebContents): void {
+  if (!contents || contents.isDestroyed()) reservation.release()
+  else contents.once('destroyed', () => reservation.release())
+}
 
 function artifactHtmlCsp(allowRemoteResources: boolean): string {
   const remote = allowRemoteResources ? ' https:' : ''
@@ -84,6 +90,7 @@ function artifactHtmlCsp(allowRemoteResources: boolean): string {
 
 interface NativeWorkbenchSurfaceRecord {
   id: string
+  resourceReservation: WorkbenchResourceReservation
   surfaceInstanceId: string
   version: NativeWorkbenchCreateRequest['version']
   kind: NativeWorkbenchCreateRequest['kind']
@@ -807,6 +814,7 @@ const BASIC_AUTH_PROMPT_HTML = `<!doctype html>
  * permission and lifecycle policy is still enforced here in the main process.
  */
 export class NativeWorkbenchSurfaceManager {
+  private readonly resourceBudget = new WorkbenchResourceBudget()
   private browserTabsClosePromise?: Promise<boolean>
   private browserTabsCloseApproved?: { record: NativeWorkbenchSurfaceRecord; generation: number; url: string; invalid: boolean }
   private readonly surfaces = new Map<string, NativeWorkbenchSurfaceRecord>()
@@ -832,7 +840,8 @@ export class NativeWorkbenchSurfaceManager {
     if (!validId(sessionKey) || !validId(taskId) || typeof active !== 'boolean') return { ok: false, message: 'Invalid browser activity.' }
     const current = this.browserAutomationStates.get(sessionKey)
     if (!active && current?.taskId !== taskId) return { ok: true }
-    this.browserAutomationStates.set(sessionKey, { taskId, active })
+    if (active) this.browserAutomationStates.set(sessionKey, { taskId, active })
+    else this.browserAutomationStates.delete(sessionKey)
     await Promise.all([...this.surfaces.values()].filter(record => record.scopeId === sessionKey)
       .map(record => record.pointer?.setTask(active ? taskId : null)))
     return { ok: true }
@@ -867,16 +876,34 @@ export class NativeWorkbenchSurfaceManager {
       pending.annotationPickerEpoch += 1
       this.cancelPendingAuthentication(pending)
     }
-    return await this.queueSurfaceOperation(
-      request.surfaceId,
-      () => this.createSurfaceNow(request, prepareBrowser, signal, context, manualDownload),
-    )
+    try {
+      return await this.queueSurfaceOperation(
+        request.surfaceId,
+        () => this.createSurfaceNow(request, prepareBrowser, signal, context, manualDownload),
+      )
+    } catch (error) {
+      if (error instanceof DesktopBrowserError && error.code === 'RESOURCE_LIMIT') {
+        return { ok: false, code: error.code, message: error.message }
+      }
+      throw error
+    }
   }
 
   private allocateSurface(
     request: NativeWorkbenchCreateRequest, owner: BrowserWindow,
     inheritedSession?: Session, inheritedView?: WebContentsView,
+    reserved?: WorkbenchResourceReservation,
   ): NativeWorkbenchSurfaceRecord {
+    const resourceKind = request.kind === 'url-preview' ? 'browser' : 'preview'
+    const resourceReservation = reserved ?? this.resourceBudget.acquire(resourceKind)
+    if (!resourceReservation) {
+      if (inheritedView && !inheritedView.webContents.isDestroyed()) inheritedView.webContents.close({ waitForBeforeUnload: false })
+      throw new DesktopBrowserError('RESOURCE_LIMIT',
+        `Up to ${WORKBENCH_RESOURCE_LIMITS[resourceKind]} ${resourceKind === 'browser' ? 'browser tabs' : 'interactive previews'} can remain open. Close an existing tab before opening another. Existing pages are preserved.`)
+    }
+    resourceReservation.setPhase('creating')
+    let allocatedView = inheritedView
+    try {
     const isLegacyArtifact = request.kind === 'artifact-html'
     const handle = isLegacyArtifact ? randomUUID() : null
     const documentUrl = isLegacyArtifact
@@ -911,8 +938,10 @@ export class NativeWorkbenchSurfaceManager {
         ...(request.kind === 'url-preview' ? { preload: BROWSER_PROMPT_PRELOAD } : {}),
       },
     })
+    allocatedView = view
     const record: NativeWorkbenchSurfaceRecord = {
       id: request.surfaceId,
+      resourceReservation,
       surfaceInstanceId: randomUUID(),
       version: request.version,
       kind: request.kind,
@@ -993,6 +1022,13 @@ export class NativeWorkbenchSurfaceManager {
     this.surfaces.set(record.id, record)
 
     return record
+    } catch (error) {
+      try {
+        if (allocatedView && !allocatedView.webContents.isDestroyed()) allocatedView.webContents.close({ waitForBeforeUnload: false })
+      } catch { /* Keep its slot until Chromium reports actual destruction. */ }
+      releaseReservationAfterDestruction(resourceReservation, allocatedView?.webContents)
+      throw error
+    }
   }
 
   private async createSurfaceNow(
@@ -1003,10 +1039,40 @@ export class NativeWorkbenchSurfaceManager {
     manualDownload = false,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const previous = this.surfaces.get(request.surfaceId)
+    const resourceKind = request.kind === 'url-preview' ? 'browser' : 'preview'
+    const previousKind = previous?.kind === 'url-preview' ? 'browser' : previous ? 'preview' : null
+    const reservation = previous && previousKind === resourceKind
+      ? previous.resourceReservation.retain() : this.resourceBudget.acquire(resourceKind)
+    if (!reservation) {
+      return { ok: false, code: 'RESOURCE_LIMIT',
+        message: `Close an existing ${resourceKind === 'browser' ? 'browser tab' : 'interactive preview'} before opening another. Existing pages are preserved.` }
+    }
+    try {
+      return await this.createReservedSurfaceNow(request, reservation, previous,
+        prepareBrowser, signal, context, manualDownload)
+    } finally {
+      reservation.release()
+    }
+  }
+
+  private async createReservedSurfaceNow(
+    request: NativeWorkbenchCreateRequest,
+    reservation: WorkbenchResourceReservation,
+    previous: NativeWorkbenchSurfaceRecord | undefined,
+    prepareBrowser: boolean,
+    signal: AbortSignal | undefined,
+    context: { sessionKey: string; targetRef: string } | undefined,
+    manualDownload: boolean,
+  ): Promise<NativeWorkbenchSurfaceResult> {
     if (previous?.kind === 'url-preview' && !await this.requestBrowserClose(previous)) {
       return { ok: false, code: 'CLOSE_CANCELLED', message: 'The page remains open because replacement was cancelled.' }
     }
-    if (previous) await this.destroyRecord(previous)
+    if (previous) {
+      await this.destroyRecord(previous)
+      if (!previous.contents.isDestroyed()) {
+        return { ok: false, code: 'RESOURCE_RELEASING', message: 'The previous preview is still closing. Retry after it closes.' }
+      }
+    }
     const owner = this.options.getWindow()
     if (!owner || owner.isDestroyed()) {
       return { ok: false, message: 'The OpenSquilla window is unavailable.' }
@@ -1021,7 +1087,7 @@ export class NativeWorkbenchSurfaceManager {
       throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser context is not owned by this session.', 404)
     }
     this.hookWindow(owner)
-    const record = this.allocateSurface(request, owner, source?.previewSession)
+    const record = this.allocateSurface(request, owner, source?.previewSession, undefined, reservation.retain())
     if (source) record.contextTargetRef = source.targetRef
     let interruptedNavigation: DesktopBrowserError | undefined
 
@@ -1090,6 +1156,7 @@ export class NativeWorkbenchSurfaceManager {
       }
       if (record.kind === 'artifact-preview') await this.watchWorkingPreview(record)
       if (this.surfaces.get(record.id) !== record) return { ok: false, message: 'The browser page was closed.' }
+      record.resourceReservation.setPhase('resident')
       return { ok: true, surfaceInstanceId: record.surfaceInstanceId,
         ...(interruptedNavigation ? { code: interruptedNavigation.code, message: interruptedNavigation.message } : {}),
         ...(record.browserNavigationError ? { navigationError: record.browserNavigationError } : {}) }
@@ -2326,7 +2393,7 @@ export class NativeWorkbenchSurfaceManager {
       const result = await this.createSurface({ version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
         surfaceId, kind: 'url-preview', payload: { url, scopeId: request.sessionKey } }, true, signal,
         request.contextTargetRef ? { sessionKey: request.sessionKey, targetRef: request.contextTargetRef } : undefined)
-      if (!result.ok) throw new DesktopBrowserError('OPEN_FAILED', result.message || 'The browser page could not open.')
+      if (!result.ok) throw new DesktopBrowserError(result.code === 'RESOURCE_LIMIT' ? result.code : 'OPEN_FAILED', result.message || 'The browser page could not open.')
       const record = this.surfaces.get(surfaceId)
       if (!record) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
       const assertOpeningRecord = () => {
@@ -3875,6 +3942,7 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
   ): Promise<void> {
     if (record.cleanupPromise) return record.cleanupPromise
+    record.resourceReservation.setPhase('disposing')
     const isCurrent = this.surfaces.get(record.id) === record
     if (isCurrent) this.surfaces.delete(record.id)
     if (isCurrent && this.activeSurfaceId === record.id) this.activeSurfaceId = null
@@ -3917,7 +3985,11 @@ export class NativeWorkbenchSurfaceManager {
       }
     } catch {}
 
-    const cleanupPromise = this.cleanupDisposedRecord(record)
+    const cleanupPromise = this.cleanupDisposedRecord(record).finally(() => {
+      // Cache cleanup alone does not prove that Chromium released its renderer.
+      // A failed/async native close keeps its slot until actual destruction.
+      releaseReservationAfterDestruction(record.resourceReservation, record.contents)
+    })
     record.cleanupPromise = cleanupPromise
     this.recordCleanups.add(cleanupPromise)
     void cleanupPromise.then(
@@ -4898,6 +4970,10 @@ export class NativeWorkbenchSurfaceManager {
         && !record.disposed && !record.owner.isDestroyed()
         && (details.url === 'about:blank' || (target && this.v2TopLevelNavigationAllowed(record, target.href)))
       if (managedPopup) {
+        if (!this.resourceBudget.hasCapacity('browser')) {
+          this.emit(record, 'blocked-action', { action: 'popup', reason: 'resource-limit' })
+          return { action: 'deny' }
+        }
         return { action: 'allow', outlivesOpener: true,
           overrideBrowserWindowOptions: { webPreferences: {
             session: record.previewSession, contextIsolation: true, nodeIntegration: false,
@@ -4905,6 +4981,13 @@ export class NativeWorkbenchSurfaceManager {
             sandbox: true, webSecurity: true, webviewTag: false, devTools: false,
             navigateOnDragDrop: false, disableHtmlFullscreenWindowResize: true,
           } }, createWindow: options => {
+          // Recheck at actual allocation: another surface may have been created
+          // since Chromium asked whether the popup was allowed.
+          if (!this.resourceBudget.hasCapacity('browser')) {
+            const guest = (options as Electron.WebContentsViewConstructorOptions).webContents
+            if (guest && !guest.isDestroyed()) guest.close({ waitForBeforeUnload: false })
+            throw new DesktopBrowserError('RESOURCE_LIMIT', 'Close an existing browser tab before opening another.')
+          }
           // Retain Chromium's opener, POST body and shared session semantics.
           // Only the child renderer is registered as a new authorized target.
           const viewOptions: Electron.WebContentsViewConstructorOptions = { ...options, webPreferences: { ...options.webPreferences,
@@ -4926,6 +5009,7 @@ export class NativeWorkbenchSurfaceManager {
             surfaceId: `browser-${randomUUID()}`, kind: 'url-preview',
             payload: { scopeId: record.scopeId, url: details.url } }, record.owner, record.previewSession, view)
           child.openerTargetRef = record.targetRef
+          child.resourceReservation.setPhase('resident')
           if (record.browserDownloadAttempt && this.managedDownloadOwner(record)) {
             child.browserDownloadParent = { targetRef: record.targetRef, attempt: record.browserDownloadAttempt }
           }

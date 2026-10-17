@@ -3,6 +3,37 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { DesktopBrowserError } from '../dist/desktop-browser.js'
 import { BROWSER_BLANK_URL } from '../dist/browser-action-contract.js'
+import { WorkbenchResourceBudget } from '../dist/workbench-resource-budget.js'
+
+// Creation and async cleanup both occupy admission slots. Ordinary visibility
+// changes have no release operation and cannot silently discard an existing page.
+const retentionBudget = new WorkbenchResourceBudget({ browser: 2, preview: 1 })
+const browserA = retentionBudget.acquire('browser')
+const browserB = retentionBudget.acquire('browser')
+assert.ok(browserA && browserB)
+browserA.setPhase('resident')
+const replacementHold = browserA.retain()
+browserA.release()
+assert.equal(retentionBudget.acquire('browser'), null, 'replacement keeps its slot while old cleanup releases')
+replacementHold.release()
+const restoredA = retentionBudget.acquire('browser')
+assert.ok(restoredA)
+restoredA.setPhase('resident')
+browserB.setPhase('disposing')
+assert.equal(retentionBudget.acquire('browser'), null)
+const independentPreview = retentionBudget.acquire('preview')
+assert.ok(independentPreview)
+browserB.release()
+browserB.release()
+const replacementBrowser = retentionBudget.acquire('browser')
+assert.ok(replacementBrowser)
+assert.equal(retentionBudget.acquire('browser'), null)
+assert.deepEqual(retentionBudget.snapshot().map(entry => entry.phase), ['resident', 'creating', 'creating'])
+browserA.release()
+restoredA.release()
+independentPreview.release()
+replacementBrowser.release()
+assert.deepEqual(retentionBudget.snapshot(), [])
 import {
   parseNativeWorkbenchAnnotationGeometry,
   parseNativeWorkbenchAnnotationModeRequest,
