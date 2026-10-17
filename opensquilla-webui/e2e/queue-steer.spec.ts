@@ -288,6 +288,64 @@ function acceptedSteer(
 }
 
 test.describe('Queue/Steer composer semantics', () => {
+  for (const theme of ['dark', 'light', 'miami']) {
+    for (const floating of [true, false]) {
+      test(`composer menu covers queued cards in ${theme} with floating=${floating}`, async ({ page }, testInfo) => {
+        await page.setViewportSize({ width: 1100, height: 850 })
+        await page.addInitScript(({ theme, floating }) => {
+          localStorage.setItem('opensquilla-locale', 'en')
+          localStorage.setItem('opensquilla-theme', theme)
+          localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: floating }))
+        }, { theme, floating })
+        const state = await installMockGateway(page)
+        await openRunningSession(page)
+        const composer = page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })
+        for (const text of ['Queued first', 'Queued second', 'Queued third']) {
+          await composer.fill(text)
+          await composer.press('Enter')
+          await expect(page.locator('.chat-pending-card').filter({ hasText: text })).toBeVisible()
+        }
+        await page.locator('.chat-plus-btn').click()
+        const menu = page.locator('.composer-add-menu')
+        await expect(menu).toBeVisible()
+        // Inspect actual painting/hit-testing, not the numerical z-index of a
+        // child trapped inside its parent's backdrop-filter stacking context.
+        const overlap = () => menu.evaluate(menu => {
+          const bounds = menu.getBoundingClientRect()
+          return [...document.querySelectorAll('.chat-pending-card')].flatMap(card => {
+            const rect = card.getBoundingClientRect()
+            const left = Math.max(bounds.left, rect.left) + 4
+            const right = Math.min(bounds.right, rect.right) - 4
+            const top = Math.max(bounds.top, rect.top) + 4
+            const bottom = Math.min(bounds.bottom, rect.bottom) - 4
+            if (left >= right || top >= bottom) return []
+            return [0.1, 0.5, 0.9].map(fraction => {
+              const hit = document.elementFromPoint(left + (right - left) * fraction, (top + bottom) / 2)
+              return { covered: Boolean(hit && menu.contains(hit)), hit: hit?.className }
+            })
+          })
+        })
+        await expect.poll(async () => (await overlap()).length).toBeGreaterThan(0)
+        const hits = await overlap()
+        await page.screenshot({ path: testInfo.outputPath('queue-add-menu.png') })
+        expect(hits.every(hit => hit.covered), JSON.stringify(hits)).toBe(true)
+        await page.keyboard.press('Escape')
+        await expect(menu).toHaveCount(0)
+        // The queue's own upward menu must remain usable after its layer moves.
+        await page.locator('.chat-pending-more-wrap').last().getByRole('button').click()
+        await expect(page.locator('.chat-pending-menu')).toBeVisible()
+        expect(await page.locator('.chat-pending-menu').evaluate(menu => {
+          const rect = menu.getBoundingClientRect()
+          const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+          return Boolean(hit && menu.contains(hit))
+        })).toBe(true)
+        expect(state.chatSendCalls).toBe(0)
+        expect(state.steerRequests).toHaveLength(0)
+        await expect(page.locator('.chat-pending-card')).toHaveCount(3)
+      })
+    }
+  }
+
   for (const legacyHistory of [false, true]) {
     const title = legacyHistory
       ? 'preserves the router and first segment when legacy history refreshes after a steer'

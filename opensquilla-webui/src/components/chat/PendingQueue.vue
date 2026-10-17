@@ -651,7 +651,10 @@ onBeforeUnmount(() => {
 <style scoped>
 .chat-pending {
   position: relative;
-  z-index: 1;
+  /* Keep queue menus/drag layers local, below the later composer surface.
+     Its backdrop-filter creates a level-zero stacking context: raising this
+     sibling above zero would paint cards over every inline composer popover. */
+  z-index: 0;
   display: grid;
   gap: 8px;
   width: min(calc(100% - 3rem), calc(var(--composer-col, 820px) - 1rem));
