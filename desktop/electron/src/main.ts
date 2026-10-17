@@ -16178,6 +16178,7 @@ async function showDesktopQuitConfirmation(options: {
   })
   try {
     const html = buildDesktopQuitDialogHtml({
+      lang: desktopLocale,
       title: options.title,
       message: options.message,
       detail: options.detail,

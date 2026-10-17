@@ -177,6 +177,7 @@ try {
       await controller.locator('#theme').selectOption(theme)
       await controller.locator(supportsBackgroundClose ? '#closeMain' : '#quit').click()
       const prompt = await dialog()
+      assert.equal(await prompt.locator('html').getAttribute('lang'), locale === 'zh' ? 'zh-Hans' : locale)
       assert.equal(await prompt.locator('#background').count(), supportsBackgroundClose ? 1 : 0)
       assert.equal(await prompt.locator('button').count(), supportsBackgroundClose ? 3 : 2)
       const actualNativeTheme = await nativeApp.evaluate(({ nativeTheme }) => ({

@@ -6,6 +6,7 @@ export interface DesktopQuitDialogDecision {
 }
 
 export interface DesktopQuitDialogCopy {
+  lang?: string
   title: string
   message: string
   detail: string
@@ -41,7 +42,7 @@ export function buildDesktopQuitDialogHtml(copy: DesktopQuitDialogCopy): string 
     Object.entries(copy).map(([key, value]) => [key, escapeQuitDialogHtml(value ?? '')]),
   ) as unknown as DesktopQuitDialogCopy
   return `<!doctype html>
-<html lang="zh-CN">
+<html lang="${text.lang || 'en'}">
 <head>
   <meta charset="utf-8">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">

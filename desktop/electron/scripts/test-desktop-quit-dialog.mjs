@@ -25,6 +25,7 @@ assert.equal(parseDesktopQuitDialogResponse('confirm '), null)
 assert.equal(parseDesktopQuitDialogResponse(null), null)
 
 const html = buildDesktopQuitDialogHtml({
+  lang: 'zh-Hans',
   title: '退出 OpenSquilla？',
   message: '当前还有未完成的任务。',
   detail: '退出将停止任务，并保存已收到的内容。',
@@ -32,6 +33,7 @@ const html = buildDesktopQuitDialogHtml({
   confirm: '停止任务并退出',
 })
 assert.match(html, /role="dialog"/)
+assert.match(html, /<html lang="zh-Hans">/)
 assert.match(html, /aria-modal="true"/)
 assert.match(html, /停止任务并退出/)
 assert.match(html, /send\('confirm'\)/)
@@ -39,6 +41,7 @@ assert.match(html, /send\('cancel'\)/)
 assert.match(html, /document\.getElementById\('keep'\)\.focus\(\)/)
 
 const escaped = buildDesktopQuitDialogHtml({
+  lang: 'en" onload="unsafe',
   title: '<unsafe>',
   message: 'a & b',
   detail: '"quoted"',
@@ -48,6 +51,7 @@ const escaped = buildDesktopQuitDialogHtml({
 assert.match(escaped, /&lt;unsafe&gt;/)
 assert.match(escaped, /a &amp; b/)
 assert.doesNotMatch(escaped, /<unsafe>/)
+assert.match(escaped, /lang="en&quot; onload=&quot;unsafe"/)
 
 const ask = buildDesktopQuitDialogHtml({
   title: '关闭 OpenSquilla？', message: '当前还有未完成的任务。',
@@ -156,7 +160,7 @@ async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height:
   }
   const show = new Function('env', `with (env) { ${showSource}; return showDesktopQuitConfirmation }`)({
     BrowserWindow: Window, ipcMain, join, __dirname: '/fixture',
-    process: { platform },
+    process: { platform }, desktopLocale: 'en',
     buildDesktopQuitDialogHtml, parseDesktopQuitDialogResponse, desktopLog() {},
     screen: { getDisplayMatching: bounds => { displays.push(bounds); return { workArea: area } } },
   })
