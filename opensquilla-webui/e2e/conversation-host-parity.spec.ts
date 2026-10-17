@@ -689,20 +689,61 @@ test.describe('real routed main and workbench side conversation hosts', () => {
     expect(gateway.errors).toEqual([])
   })
 
-  test('keeps the side draft and does not dispatch when its first routing update conflicts', async ({ page }) => {
-    const gateway = await installGateway(page, false, true)
-    const { main, side } = await openHosts(page)
-    await side.getByRole('button', { name: 'Models & routing', exact: true }).click()
-    await page.getByRole('menuitemradio', { name: /Intelligent model routing/ }).click()
-    await send(side, 'Keep this draft after a routing conflict')
-    await expect.poll(() => gateway.requests.filter(request => request.method === 'sessions.routing.set').length).toBe(1)
-    await expect(composer(side)).toHaveText('Keep this draft after a routing conflict')
-    await expect(page.getByText('Routing changed in another window.', { exact: true })).toBeVisible()
-    expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(0)
-    expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
-    await expect(main.getByRole('button', { name: 'Models & routing', exact: true })).toContainText('Fixed model')
-    expect(gateway.errors).toEqual([])
-  })
+  for (const choice of ['routing', 'model'] as const) {
+    test(`retries the side ${choice} choice on the same child before sending its preserved draft`, async ({ page }) => {
+      const selectedModel = 'Retry model A'
+      const gateway = await installGateway(page, false, true, false, false,
+        choice === 'model' ? { draftModelName: selectedModel } : {})
+      const { main, side } = await openHosts(page)
+      const routingButton = side.getByRole('button', { name: 'Models & routing', exact: true })
+      await routingButton.click()
+      if (choice === 'model') {
+        await page.getByRole('menuitem', { name: /^Fixed model/ }).click()
+        await page.getByRole('option', { name: new RegExp(selectedModel) }).click()
+      } else {
+        await page.getByRole('menuitemradio', { name: /Intelligent model routing/ }).click()
+      }
+      const selectionLabel = choice === 'model' ? selectedModel : 'Intelligent model routing'
+      await expect(routingButton).toContainText(selectionLabel)
+      const text = 'Keep this draft after a routing conflict'
+      const attachmentText = 'Keep the exact attachment across side routing retries'
+      await side.locator('input[type="file"]').setInputFiles({
+        name: 'routing-retry.txt', mimeType: 'text/plain', buffer: Buffer.from(attachmentText),
+      })
+      await expect(side.locator('.attachment-chip--busy')).toHaveCount(0)
+      await composer(side).fill(text)
+      for (const attempt of [1, 2]) {
+        await side.getByRole('button', { name: 'Send', exact: true }).click()
+        await expect.poll(() => gateway.requests.filter(request => request.method === 'sessions.routing.set').length).toBe(attempt)
+        await expect(routingButton).toBeEnabled()
+        await expect(routingButton).toContainText(selectionLabel)
+        await expect(composer(side)).toHaveText(text)
+        await expect(side.locator('.attachment-chip')).toContainText('routing-retry.txt')
+        await expect(page.getByText('Routing changed in another window.', { exact: true }).last()).toBeVisible()
+        expect(gateway.requests.filter(request => request.method === 'chat.send')).toHaveLength(0)
+        expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
+      }
+      gateway.setRoutingConflict(false)
+      await side.getByRole('button', { name: 'Send', exact: true }).click()
+      await expect.poll(() => gateway.requests.filter(request => request.method === 'chat.send').length).toBe(1)
+      const routingRequests = gateway.requests.filter(request => request.method === 'sessions.routing.set')
+      expect(routingRequests).toHaveLength(3)
+      for (const request of routingRequests) expect(request.params).toMatchObject({
+        sessionKey: SIDE, mode: choice === 'model' ? 'direct' : 'router', expectedRevision: 1,
+        modelSelection: choice === 'model' ? { model: selectedModel, provider: 'synthetic' } : null,
+      })
+      const submitted = gateway.requests.find(request => request.method === 'chat.send')!
+      expect(gateway.requests.indexOf(routingRequests[2]!)).toBeLessThan(gateway.requests.indexOf(submitted))
+      expect(submitted.params).toMatchObject({ sessionKey: SIDE, message: text, attachments: [{
+        name: 'routing-retry.txt', mime: 'text/plain', data: Buffer.from(attachmentText).toString('base64'),
+      }] })
+      expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.create')).toHaveLength(1)
+      expect(gateway.requests.filter(request => request.method === 'sessions.sidechat.close')).toHaveLength(0)
+      await expect(main.getByRole('button', { name: 'Models & routing', exact: true })).toContainText('Fixed model')
+      expect(new URL(page.url()).searchParams.get('session')).toBe(MAIN)
+      expect(gateway.errors).toEqual([])
+    })
+  }
 
   test('freezes only the preparing side settings until its child is ready', async ({ page }) => {
     const gateway = await installGateway(page, false, false, true)

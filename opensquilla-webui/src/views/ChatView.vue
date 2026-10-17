@@ -4012,6 +4012,14 @@ async function onSend(
       const model = newTaskModelSelection.value
       const key = await props.prepareSession()
       if (chatViewDisposed || !key) return
+      // Keep the draft key (and its model/routing choice) until configuration
+      // succeeds. The owner retains this child, so a failed CAS retries the
+      // same session without adopting its inherited settings or sending.
+      const isCurrentDraft = () => !chatViewDisposed && !props.ownerBlocked && !sessionKey.value
+      if (sessionRouting && (mode || model)) {
+        await configureWorkbenchSessionRouting(sessionRouting, key, mode ?? 'direct', model, isCurrentDraft)
+      }
+      if (!isCurrentDraft()) return
       sessionKey.value = key
       pendingSessionIntent.value = null
       activeProjectWorkspace.beginSessionResolution(key)
@@ -4019,8 +4027,6 @@ async function onSend(
       const result = await bootstrap.live
       if (chatViewDisposed || sessionKey.value !== key || !result.authoritative || workspaceBindingMismatch.value) return
       if (sessionRouting && (mode || model)) {
-        await configureWorkbenchSessionRouting(sessionRouting, key, mode ?? 'direct', model,
-          () => !chatViewDisposed && sessionKey.value === key)
         await chatSessionRouting.load()
       }
       await nextTick()

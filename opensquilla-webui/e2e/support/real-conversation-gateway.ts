@@ -13,7 +13,7 @@ type Stream = { sequence: number; task: string | null; lastTask: Wire | null; hi
 export const logs = new WeakMap<Page, { requests: Request[]; errors: string[]; consoleWarnings: string[] }>()
 
 export async function installGateway(page: Page, eventBeforeAck = false, routingConflict = false, delayCreate = false, modernSnapshots = false,
-  options: { workspace?: boolean; terminal?: boolean; locale?: string; modelName?: string; audioConfigured?: boolean } = {}) {
+  options: { workspace?: boolean; terminal?: boolean; locale?: string; modelName?: string; draftModelName?: string; audioConfigured?: boolean } = {}) {
   const requests: Request[] = []
   const errors: string[] = []
   const consoleWarnings: string[] = []
@@ -41,6 +41,11 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
   const approvalResolutions: Wire[] = []
   const failedApprovals = new Set<string>()
   const pendingInputs = new Map<string, Wire[]>()
+  const sessionRouting = new Map<string, Wire>()
+  const routingSnapshot = (key: string) => sessionRouting.get(key) ?? {
+    key, mode: 'direct', revision: 1, source: 'session', initialized: true, appliesTo: 'next_accepted_turn',
+    ...(options.modelName ? { modelSelection: { model: options.modelName, provider: 'synthetic' } } : {}),
+  }
   const heldClarifications = new Map<string, { key: string; reply: (accepted: boolean) => void }>()
   const deniedFiles = new Set<string>()
   const documents = new Map<string, { resource: Wire; document: Wire; revision: Wire; artifact: Wire }>()
@@ -178,9 +183,13 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
           ...(modernSnapshots ? { server: { conn_id: `host-parity-${connectionId}` }, policy: {
             transport_probe_nonce: true,
             transport_flow: { delivery_epoch: deliveryEpoch, window_frames: 128, window_bytes: 4 * 1024 * 1024 },
-            ...(options.modelName ? { sessions_routing_model_selection: true } : {}),
+            ...(options.modelName || options.draftModelName ? { sessions_routing_model_selection: true } : {}),
+            ...(options.draftModelName ? { chat_send_initial_model: true } : {}),
           } } : {}),
-          ...(!modernSnapshots && options.modelName ? { policy: { sessions_routing_model_selection: true } } : {}),
+          ...(!modernSnapshots && (options.modelName || options.draftModelName) ? { policy: {
+            sessions_routing_model_selection: true,
+            ...(options.draftModelName ? { chat_send_initial_model: true } : {}),
+          } } : {}),
           features: { methods: [
           'sessions.messages.subscribe', 'sessions.messages.hydrate', 'sessions.messages.snapshot',
           'sessions.messages.unsubscribe', 'sessions.sidechat.create', 'sessions.sidechat.close',
@@ -189,6 +198,7 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
           'artifacts.documents.get', 'artifacts.revisions.list', 'artifacts.changes.list',
           'workspaces.references.read',
           'sandbox.setup.status', 'sandbox.capability.status',
+          ...(options.draftModelName ? ['models.list'] : []),
           ...(options.workspace ? ['workspaces.list'] : []),
           ...(options.terminal ? ['terminal.create', 'terminal.write', 'terminal.resize', 'terminal.close'] : []),
           ...(modernSnapshots ? ['sessions.messages.snapshot.read', 'sessions.messages.resume',
@@ -269,6 +279,15 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
           error: { code: 'SESSION_ROUTING_CHANGED', message: 'Routing changed in another window.' } }))
         return
       }
+      if (frame.method === 'sessions.routing.set') {
+        const previous = routingSnapshot(key)
+        const snapshot = { ...previous, mode: frame.params?.mode ?? previous.mode,
+          revision: Number(previous.revision) + 1,
+          ...('modelSelection' in (frame.params ?? {}) ? { modelSelection: frame.params?.modelSelection } : {}) }
+        sessionRouting.set(key, snapshot)
+        respond(snapshot)
+        return
+      }
       if (frame.method === 'chat.send') {
         if (rejectedNextSends.delete(key)) {
           ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: false,
@@ -338,10 +357,10 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
         'commands.list_for_surface': { commands: ['/new', '/plan', '/goal', '/usage', '/compact'].map(name => ({ name })) },
         'config.get': configuration,
         'models.routing.get': { mode: 'direct' },
-        'models.list': { models: [] },
-        'sessions.routing.get': { key, mode: 'direct', revision: 1, source: 'session', initialized: true, appliesTo: 'next_accepted_turn',
-          ...(options.modelName ? { modelSelection: { model: options.modelName, provider: 'synthetic' } } : {}) },
-        'sessions.routing.set': { key, mode: frame.params?.mode ?? 'direct', revision: 2, source: 'session', initialized: true, appliesTo: 'next_accepted_turn' },
+        'models.list': { models: options.draftModelName ? [{ id: options.draftModelName, name: options.draftModelName,
+          provider: 'synthetic', contextWindow: 128000, maxOutputTokens: 4096, capabilities: ['text'],
+          pricing: { inputPer1k: 0, outputPer1k: 0 }, source: 'configured', reasoningFormat: 'none', metadata: null }] : [], errors: [] },
+        'sessions.routing.get': routingSnapshot(key),
         'onboarding.status': { audioConfigured: options.audioConfigured ?? false, configured: true },
         'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
         'sandbox.setup.status': { state: 'ready', platform: 'linux', message: 'Synthetic sandbox ready', requiresAdmin: false },
@@ -426,6 +445,7 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
       } }))
     },
     releaseCreate: () => { heldCreate?.(); heldCreate = null },
+    setRoutingConflict: (conflict: boolean) => { routingConflict = conflict },
     failNextSideCreate: () => { failNextCreate = true },
     rejectNextSend: (key: string) => { rejectedNextSends.add(key) },
     releaseAcks: () => heldAcks.splice(0).forEach(release => release()),
