@@ -400,7 +400,7 @@ def create_memory_tools(
         def allow_maintenance() -> bool:
             allowed = memory_source == "state"
             if maintenance_allowed is not None:
-                allowed = bool(source_root) and maintenance_allowed(
+                allowed = source_root is not None and maintenance_allowed(
                     agent_id, Path(source_root), Path(notes_root) if notes_root else None,
                 )
             if allowed and ctx and ctx.workspace_dir:

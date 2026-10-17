@@ -31,7 +31,6 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from functools import wraps
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 from uuid import uuid4
 
@@ -2163,61 +2162,13 @@ class SessionStorage:
     ) -> None:
         """Remember user roots before maintenance, without adopting or authorizing them."""
 
-        from opensquilla.agents.scope import resolve_agent_workspace_dir
-        from opensquilla.execution_workspaces import normalize_execution_workspace
-        from opensquilla.project_workspaces import (
-            ProjectWorkspaceStateError,
-            _legacy_project_path,
-            project_path_key,
-        )
-        from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
+        from opensquilla.project_workspaces import protected_session_workspace_path
 
-        if isinstance(execution_workspace, str):
-            try:
-                execution_workspace = json.loads(execution_workspace)
-            except (TypeError, ValueError):
-                return
-        if execution_workspace is not None:
-            try:
-                binding = normalize_execution_workspace(execution_workspace)
-            except ProjectWorkspaceStateError:
-                # A damaged configured binding still does not authorize source
-                # maintenance. Recover only an explicit absolute configured root.
-                if not isinstance(execution_workspace, dict):
-                    return
-                binding = execution_workspace
-            if binding.get("kind") == "configured":
-                root = binding.get("root")
-                if isinstance(root, str) and Path(root).is_absolute():
-                    try:
-                        path = _legacy_project_path(root)
-                    except ValueError:
-                        return
-                    if path is not None:
-                        self.protected_project_paths.add(path.path)
-            return
-        if isinstance(origin, str):
-            try:
-                origin = json.loads(origin)
-            except (TypeError, ValueError):
-                return
-        if not isinstance(origin, dict):
-            return
-        run_context = origin.get(RUN_CONTEXT_ORIGIN_KEY)
-        if not isinstance(run_context, dict):
-            return
-        root = run_context.get("workspace")
-        if not isinstance(root, str) or not root.strip():
-            return
-        try:
-            path = _legacy_project_path(root)
-        except ValueError:
-            return
-        if path is not None and path.path_key != project_path_key(
-            resolve_agent_workspace_dir(agent_id),
-        ):
-            # Old default origins were implicit Agent-workspace fallbacks.
-            self.protected_project_paths.add(path.path)
+        path = protected_session_workspace_path(
+            agent_id=agent_id, execution_workspace=execution_workspace, origin=origin,
+        )
+        if path is not None:
+            self.protected_project_paths.add(path)
 
     async def connect(
         self,
@@ -2255,9 +2206,17 @@ class SessionStorage:
             await self._initialize_schema(goal_pause_reason=goal_pause_reason)
             async with self._conn.execute("SELECT path FROM project_workspaces") as cursor:
                 self.protected_project_paths.update(row[0] for row in await cursor.fetchall())
+            # Recovery can open legacy tables with only a subset of today's
+            # columns. Missing metadata means no binding to classify, not an
+            # invalid database that should prevent startup or recovery.
+            async with self._conn.execute("PRAGMA table_info(sessions)") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            projection = ", ".join(
+                name if name in columns else f"NULL AS {name}"
+                for name in ("agent_id", "execution_workspace", "origin")
+            )
             async with self._conn.execute(
-                "SELECT agent_id, execution_workspace, origin FROM sessions "
-                "WHERE execution_workspace IS NOT NULL OR origin IS NOT NULL"
+                f"SELECT {projection} FROM sessions"  # noqa: S608 - fixed column allowlist
             ) as cursor:
                 for row in await cursor.fetchall():
                     self._protect_session_workspace(**dict(row))

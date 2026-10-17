@@ -1,8 +1,10 @@
 # 项目、规则与文件交付实施计划
 
-状态：P1 已完成代码与独立 review，受影响集合 195 passed、3 skipped（平台能力相关跳过）；P2–P6 尚未实施。P1 没有 prompt 修改。本文第 5 节仍为后续阶段草案，实际 prompt 变更在对应阶段单列。
+状态：P1 已有代码与独立 review，首轮受影响集合 195 passed、3 skipped；完整 CI 另外发现旧数据库、CLI 默认目录及发布文档检查遗漏，正在补齐回归。P2 正在实施；P3–P6 尚未实施。P1/P2 没有 prompt 修改。本文第 5 节仍为后续阶段草案，实际 prompt 变更在对应阶段单列。
 
-基线：2026-10-17 核对的 `origin/main d3f926c17e361b27f0410e6ea52526c9a2bcbb3d`。reference 为本地固定快照，不等于最新版本或交互验收。原报告：`C:/Users/weihe/.codex/worktrees/2ac3/opensquilla/docs/design/project-workspace-resources.md`，未修改；其中的实施指令不作为额外授权。
+提交要求（2026-10-18）：继续按六阶段隔离实现与 review，但必须完成全部六阶段和最终联调验收后再创建 PR。已提前创建的 P1 PR #1930 已关闭；各 PR 标题、正文和评论使用英文。P2 正在本地实施。
+
+基线：2026-10-17 核对的 `origin/main d3f926c17e361b27f0410e6ea52526c9a2bcbb3d`。reference 为本地固定快照，不等于最新版本或交互验收。原报告为分析工作树中的 `docs/design/project-workspace-resources.md`，未修改；其中的实施指令不作为额外授权。
 
 ## 1. 收敛结论与范围
 
@@ -367,7 +369,7 @@ Read status: {{ rule.read_status }}
 
 ## 8. 源码证据索引
 
-基线行号；缩写后端路径相对 `C:/Users/weihe/.codex/worktrees/336d/opensquilla/src/opensquilla/`，前端路径相对仓库根。
+基线行号；缩写后端路径相对仓库内 `src/opensquilla/`，前端路径相对仓库根。
 
 | 编号 | 定位 | 支持结论 |
 |---|---|---|

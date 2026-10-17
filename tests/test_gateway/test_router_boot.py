@@ -2089,6 +2089,8 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         mcp={"enabled": False},
     )
 
+    # Explicit shared roots must already exist; startup no longer creates projects.
+    Path(config.workspace_dir).mkdir(parents=True)
     services = await build_services(
         config=config,
         tool_registry=registry,

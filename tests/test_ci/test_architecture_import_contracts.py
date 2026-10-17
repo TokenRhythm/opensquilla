@@ -58,6 +58,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "eval"),
     ("cli", "gateway"),
     ("cli", "health"),
+    # Standalone CLI initializes only its application-managed default workspace;
+    # identity bootstrap is a lower-level service and never imports CLI back.
+    ("cli", "identity"),
     ("cli", "memory"),
     ("cli", "mcp_server"),
     ("cli", "migration"),
