@@ -464,7 +464,6 @@ const dependencyInventory = spawnSync('uv', [
   ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'release_dependency_inventory.py'),
   '--repo', repoRoot, '--kind', 'pyinstaller',
   '--analysis', join(pyinstallerWorkDir, 'opensquilla-gateway', 'Analysis-00.toc'),
-  '--workers', process.platform === 'win32' ? '4' : '1',
   '--output', join(runtimeGatewayDir, 'dependency-inventory.json'),
 ], { cwd: repoRoot, stdio: 'inherit', windowsHide: true })
 if (dependencyInventory.error) throw dependencyInventory.error

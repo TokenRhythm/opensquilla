@@ -610,11 +610,16 @@ data, source provenance and all frozen-package checks. Fresh hosted runners
 do not supply a reusable PyInstaller analysis cache, so removing `--clean`
 alone is not a supported performance improvement. Stage logs distinguish
 preparation, PyInstaller, UI externalization, dependency inventory and build
-provenance. The inventory uses four read workers on Windows: resolve installed
-file paths and TOC paths in ordered read batches, attribute ownership and
-deduplicate on the main thread, then hash bytes in a separate ordered batch. Lock validation,
-multi-owner attribution, duplicate handling and output order are retained.
-The CLI defaults to one worker; wheelhouse inventory remains serial.
+provenance. Dependency inventory keeps the original serial implementation,
+including lock validation, multi-owner attribution, duplicate handling and
+output order. A four-worker implementation was tested in two remote pilot
+runs at `47742f27627879c5d6b3865e6e73fe8a88f10c69`, then withdrawn before
+the final three-sample comparison. Although its local representative fixture
+was faster with byte-identical JSON, the remote post-freeze stage took
+29.028 and 28.088 seconds versus the baseline median of 19.007 seconds.
+The evidence did not support retaining the added concurrency and complexity.
+Both pilot runs and their failures remain recorded separately from the final
+three runs; do not combine revisions into a candidate median.
 
 The normal unsigned NSIS target is still built once. The CI wrapper starts
 the unchanged `npm run verify:package` once at the existing `afterSign`
@@ -644,12 +649,14 @@ small timing record. All existing 148 planned jobs and 28 NSIS jobs retain
 their ownership; the wrapper's positive/negative contracts run inside the
 existing Windows package-contract job.
 
-The local inventory comparison checks complete byte-identical JSON against
-the original serial implementation. Its representative installed-package
-fixture is not a release-lock validation or a remote performance sample.
-Remote build logs, exact executed-job inventories and all six run identities
-are required for the final comparison; do not infer an overall speedup from
-the inventory microbenchmark or package-verification overlap alone.
+The two pilot runs also exposed an omitted merge-critical declaration for
+`test-build-ci-nsis.mjs`. The existing trust-policy closure test correctly
+failed in both Ubuntu and Windows core-4 cells; all jobs remained selected.
+The final revision declares both the wrapper and its contract script. These
+pilot failures are not attributed to runner noise or counted as successful
+CI. Remote build logs, exact executed-job inventories and all six baseline/
+final run identities are required for the final comparison; do not infer an
+overall speedup from package-verification overlap alone.
 
 ## Test cost and ownership
 

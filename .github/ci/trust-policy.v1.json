@@ -13,6 +13,7 @@
     ".github/scripts/nsis_packaged_proof.py",
     ".github/scripts/plan_ci.py",
     ".github/scripts/prepare-electron.mjs",
+    ".github/scripts/test-build-ci-nsis.mjs",
     ".github/scripts/test-prepare-electron.mjs",
     ".github/scripts/verify-nsis-upgrade-regression.py",
     ".github/scripts/verify-packaged-ownership-long-paths.py",
