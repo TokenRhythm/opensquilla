@@ -37,7 +37,7 @@ async def enforce_sidechat_command(method: str, params: Any, ctx: Any) -> Any:
     storage = get_session_storage(ctx.session_manager)
     node = await storage.get_session(key) if storage is not None else None
     metadata = sidechat_metadata(node)
-    if metadata is None:
+    if storage is None or metadata is None:
         raise _rejected("NOT_FOUND", "Side conversation not found.")
     prohibited = (
         method.startswith("goals.")

@@ -2749,6 +2749,9 @@ try {
         && (event.type === 'error' || event.type === 'crashed' || event.type === 'unresponsive')
       ).length
       const failedCapacityDetached = !owner.contentView.children.includes(failedCapacityView)
+      // Admission retains the slot until both renderer destruction and its
+      // asynchronous session cleanup complete, not just removal from the map.
+      await failedCapacityRecord.cleanupPromise
       const capacityReuse = await manager.createSurface({
         version: 2,
         surfaceId: 'browser:capacity-reused',

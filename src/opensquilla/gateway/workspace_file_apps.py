@@ -193,8 +193,9 @@ async def _access_reason(request: Request, config: GatewayConfig) -> str | None:
 
 def _windows_reveal_file(target: Path) -> None:
     """Select one Unicode file with the Shell API, without Explorer CLI parsing."""
-    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    win_dll = getattr(ctypes, "WinDLL")
+    shell32 = win_dll("shell32", use_last_error=True)
+    ole32 = win_dll("ole32", use_last_error=True)
     ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     ole32.CoInitializeEx.restype = ctypes.c_long
     ole32.CoUninitialize.argtypes = []

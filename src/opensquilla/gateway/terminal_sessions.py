@@ -399,7 +399,7 @@ class TerminalManager:
         session.cols, session.rows = cols, rows
         return {"terminalId": terminal_id, "cols": cols, "rows": rows}
 
-    async def consume(self, *, terminal_id: str, conn_id: str, seq: int) -> dict[str, Any]:
+    async def consume(self, *, terminal_id: str, conn_id: str, seq: object) -> dict[str, Any]:
         """Release output credits only after the owning emulator consumed them."""
         if isinstance(seq, bool) or not isinstance(seq, int) or not 1 <= seq <= 2**53 - 1:
             raise TerminalSessionError("INVALID_REQUEST", "seq must be a positive safe integer")

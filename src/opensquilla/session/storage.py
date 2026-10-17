@@ -6276,7 +6276,7 @@ class SessionStorage:
         async with self._write_transaction("insert_session") as conn:
             values = [_serialize(data[column]) for column in columns]
             async with conn.execute(sql, values) as cursor:
-                inserted = cursor.rowcount == 1
+                inserted = bool(cursor.rowcount == 1)
             if inserted:
                 await self._ensure_usage_baseline_for_session_on_conn(
                     conn, session_key=node.session_key,

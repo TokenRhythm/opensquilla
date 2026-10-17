@@ -508,8 +508,8 @@ def transcript_entries_to_chat_messages(
     entries = [
         entry for entry in entries
         if not (
-            isinstance(getattr(entry, "turn_context", None), dict)
-            and entry.turn_context.get("visibility") == "model-only"
+            isinstance(turn_context := getattr(entry, "turn_context", None), dict)
+            and turn_context.get("visibility") == "model-only"
         )
     ]
     selected = entries[-limit:] if limit is not None else entries

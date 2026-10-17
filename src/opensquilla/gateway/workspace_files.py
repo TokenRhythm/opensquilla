@@ -869,10 +869,10 @@ def _scan_text_file(
         cache_key = (workspace.binding, target.relative_to(workspace.root).as_posix(), revision)
         index = index_cache.get(cache_key) if index_cache is not None else None
         use_index = index is not None and start_line > 0 and not query
-        if use_index and start_line > index.total_lines:
+        if use_index and index is not None and start_line > index.total_lines:
             raise WorkspaceFileUnavailableError()
         checkpoint = (start_line - 1) // _TEXT_INDEX_STRIDE if use_index else 0
-        offset = index.offsets[checkpoint] if use_index else 0
+        offset = index.offsets[checkpoint] if use_index and index is not None else 0
         if offset:
             stream.seek(offset)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
@@ -935,7 +935,7 @@ def _scan_text_file(
         or opened.st_ctime_ns != after_read.st_ctime_ns
     ):
         raise WorkspaceFileUnavailableError()
-    total_lines = index.total_lines if use_index else max(1, total)
+    total_lines = index.total_lines if use_index and index is not None else max(1, total)
     if not use_index and index_cache is not None:
         index_cache.put(
             cache_key,

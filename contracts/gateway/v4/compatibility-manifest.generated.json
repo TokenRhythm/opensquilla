@@ -1446,7 +1446,7 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "18bb70b7c66f57d67b05f28204a1b2df237a428936f9ee6c53dfa0c1d3e376dd",
+    "generatorSha256": "5663d69c0f0b761bd637bd6615ae8e262006b703d729d25fd3393ba6322f8012",
     "methodCount": 212,
     "schemaCount": 222,
     "schemaTreeSha256": "31684b504437706d1c3ca3e587229b28b3a975aff4b4f453fed3410a98409ba8",

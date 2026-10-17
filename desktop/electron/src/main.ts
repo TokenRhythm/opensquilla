@@ -637,7 +637,7 @@ let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
-const DESKTOP_LIGHT_BACKGROUND_COLOR = '#FAFAFA'
+const DESKTOP_LIGHT_BACKGROUND_COLOR = '#FFFFFF'
 const DESKTOP_DARK_BACKGROUND_COLOR = '#18181A'
 
 function desktopWindowBackgroundColor(): string {
