@@ -268,7 +268,7 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, false)"
-        v-on="{ 'workbench-event': panelEventHandler(item) }"
+        v-on="{ workbenchEvent: panelEventHandler(item) }"
       />
       <div v-else class="app-workbench__unsupported">
         {{ t('workbench.empty') }}
@@ -281,7 +281,7 @@
         v-if="panelComponent(item)"
         :ref="panelRefSetter(item)"
         v-bind="panelProps(item, active, true)"
-        v-on="{ 'workbench-event': panelEventHandler(item) }"
+        v-on="{ workbenchEvent: panelEventHandler(item) }"
       />
     </template>
   </WorkbenchHost>

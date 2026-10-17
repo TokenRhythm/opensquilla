@@ -10,17 +10,30 @@ import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { artifactDocumentWorkspaceKey, useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import { artifactFromWorkbenchItem, artifactWorkbenchItemId, createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
+import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchResource, WorkbenchResourceOpenResponse } from '@/types/workbenchResources'
 import AppWorkbench from './AppWorkbench.vue'
 
-const { pushToast, previewHarness } = vi.hoisted(() => ({ pushToast: vi.fn(), previewHarness: { enabled: false } }))
+const { pushToast, previewHarness } = vi.hoisted(() => ({ pushToast: vi.fn(), previewHarness: { enabled: false, runtime: false } }))
 vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
-vi.mock('@/workbench/runtime', async importOriginal => ({
-  ...await importOriginal<typeof import('@/workbench/runtime')>(),
-  attachWorkbenchRuntime: () => async () => {},
-}))
+vi.mock('@/workbench/runtime', async importOriginal => {
+  const original = await importOriginal<typeof import('@/workbench/runtime')>()
+  return {
+    ...original,
+    attachWorkbenchRuntime: (...args: Parameters<typeof original.attachWorkbenchRuntime>) =>
+      previewHarness.runtime ? original.attachWorkbenchRuntime(...args) : async () => {},
+  }
+})
+// Keep the real collection runtime and event routing; preview-engine I/O is
+// outside this host integration test (the document panel is stubbed below).
+vi.mock('./artifactWorkbenchProvider', async importOriginal => {
+  const original = await importOriginal<typeof import('./artifactWorkbenchProvider')>()
+  return { ...original, createArtifactWorkbenchDefinitions: (options: Parameters<typeof original.createArtifactWorkbenchDefinitions>[0]) =>
+    original.createArtifactWorkbenchDefinitions({ ...options, previewLeasesEnabled: false }),
+  }
+})
 // Exercise AppWorkbench's real actions slot without mounting preview engines.
 vi.mock('./WorkbenchHost.vue', async () => {
   const { defineComponent, h } = await import('vue')
@@ -86,11 +99,12 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
   const resolve = vi.spyOn(resources, 'resolve').mockResolvedValue(resource(nextArtifact))
   const openCurrent = vi.spyOn(resources, 'openCurrent').mockResolvedValue(opened(nextArtifact))
   const host = document.createElement('div'); document.body.append(host)
+  const fetchArtifact = vi.fn().mockResolvedValue({ ok: true, blob: new Blob(['download']) })
   const app = createApp(AppWorkbench, { sessionId: 'session-a', routeActive: true, workbenchResourcesEnabled: options.resourcesEnabled ?? true })
   app.use(pinia)
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
   app.provide(ARTIFACT_WORKBENCH_KEY, {
-    documents: null, resources: null, content: {}, previews: {},
+    documents: null, resources: null, content: { fetchArtifact }, previews: {},
     subscribeDocumentChanges: () => ({ close() {} }),
   } as unknown as ArtifactWorkbench)
   app.mount(host); apps.push(app)
@@ -102,16 +116,57 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
     picker.dispatchEvent(new Event('change', { bubbles: true }))
     await flush()
   }
-  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose }
+  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose, fetchArtifact }
 }
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
   vi.restoreAllMocks(); pushToast.mockClear()
   previewHarness.enabled = false
+  previewHarness.runtime = false
 })
 
 describe('AppWorkbench artifact navigation', () => {
+  it.each([target, { id: 'listed-html', name: 'listed.html', mime: 'text/html' }])(
+    'opens listed $name through the mounted panel and workbench runtime', async artifact => {
+      previewHarness.enabled = true
+      previewHarness.runtime = true
+      const h = await mount({ target: artifact })
+      const listed = resource(artifact)
+      h.resources.snapshots['session-a'] = {
+        sessionKey: 'session-a', available: true, loading: false, loaded: true,
+        error: null, resources: [listed], totalCount: 1,
+      }
+      const collection = createResourceCollectionWorkbenchItem({
+        sessionKey: 'session-a', title: 'Files', resources: [listed],
+      })
+      h.store.openItem(collection)
+      await flush()
+      const entry = h.host.querySelector<HTMLButtonElement>('.resource-collection__open')
+      expect(entry?.textContent).toContain(artifact.name)
+      vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:download')
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+      h.host.querySelector<HTMLButtonElement>(`[aria-label="Download ${artifact.name}"]`)!.click()
+      await flush()
+      await vi.waitFor(() => expect(h.fetchArtifact).toHaveBeenCalledWith(expect.objectContaining({ id: artifact.id }), { sessionKey: 'session-a' }))
+      expect(h.store.activeItemId).toBe(collection.id)
+
+      h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+      entry!.click()
+      await flush()
+      expect(h.openCurrent).toHaveBeenCalledWith('session-a', listed)
+      expect(h.host.querySelector('[role="alert"]')?.textContent).toContain(en.workbench.artifactErrors.permissionDenied)
+      expect(h.store.activeItemId).toBe(collection.id)
+      h.host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.resources.retry}"]`)!.click()
+      await flush()
+      expect(h.openCurrent).toHaveBeenCalledTimes(2)
+      expect(h.store.activeItem?.kind).toBe('artifact-preview')
+      expect(artifactFromWorkbenchItem(h.store.activeItem!)).toMatchObject({
+        id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head',
+      })
+    },
+  )
+
   it.each([target, { id: 'side-html', name: 'side.html', mime: 'text/html' }])(
     'navigates side $name using child authorization while retaining parent visibility', async artifact => {
       const child = 'agent:main:sidechat:child'
