@@ -380,6 +380,7 @@
     },
     "resources": {
       "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
+      "currentWorkingFile": "Archivo de trabajo actual", "publishedVersion": "Versión publicada",
       "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
       "open": "Abrir {name}", "preparing": "Preparando el editor…", "retry": "Reintentar", "preview": "Vista previa de {name}", "download": "Descargar {name}", "edit": "Editar una copia de {name}", "publish": "Publicar {name}",
       "imported": "Ya puedes editar {name}.", "published": "Ya puedes compartir {name}.",
@@ -564,6 +565,8 @@
       "documentEditingRetired": "Actualiza el cliente y vuelve a abrir la página para enviar anotaciones como mensajes."
     },
     "artifactDocument": {
+      "fixedSnapshot": "Versión fija",
+      "continueEditing": "Seguir editando",
       "sections": "Secciones del documento del artefacto",
       "preview": "Vista previa",
       "source": "Código fuente",

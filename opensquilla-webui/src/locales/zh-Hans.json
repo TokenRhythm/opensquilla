@@ -388,6 +388,7 @@
     },
     "resources": {
       "title": "文件", "count": "文件（{count}）", "empty": "暂无文件或链接。",
+      "currentWorkingFile": "当前工作文件", "publishedVersion": "已发布版本",
       "groups": { "files": "文件", "links": "链接", "attachments": "文件", "documents": "文件", "deliverables": "文件", "urls": "链接" },
       "open": "打开 {name}", "preparing": "正在准备编辑器…", "retry": "重试", "preview": "预览 {name}", "download": "下载 {name}", "edit": "创建 {name} 的可编辑副本", "publish": "发布 {name}",
       "imported": "{name} 已可编辑。", "published": "{name} 已可分享。",
@@ -582,6 +583,8 @@
       "documentEditingRetired": "请更新客户端并重新打开页面，将批注作为聊天输入发送。"
     },
     "artifactDocument": {
+      "fixedSnapshot": "固定版本",
+      "continueEditing": "继续编辑",
       "sections": "交付件文档区域",
       "preview": "预览",
       "source": "源码",

@@ -380,6 +380,7 @@
     },
     "resources": {
       "title": "Fichiers", "count": "Fichiers ({count})", "empty": "Aucun fichier ni lien pour le moment.",
+      "currentWorkingFile": "Fichier de travail actuel", "publishedVersion": "Version publiée",
       "groups": { "files": "Fichiers", "links": "Liens", "attachments": "Fichiers", "documents": "Fichiers", "deliverables": "Fichiers", "urls": "Liens" },
       "open": "Ouvrir {name}", "preparing": "Préparation de l’éditeur…", "retry": "Réessayer", "preview": "Aperçu de {name}", "download": "Télécharger {name}", "edit": "Modifier une copie de {name}", "publish": "Publier {name}",
       "imported": "{name} peut maintenant être modifié.", "published": "{name} peut maintenant être partagé.",
@@ -564,6 +565,8 @@
       "documentEditingRetired": "Mettez à jour le client et rouvrez la page pour envoyer vos annotations dans la conversation."
     },
     "artifactDocument": {
+      "fixedSnapshot": "Version figée",
+      "continueEditing": "Continuer à modifier",
       "sections": "Sections du document de l’artefact",
       "preview": "Aperçu",
       "source": "Source",

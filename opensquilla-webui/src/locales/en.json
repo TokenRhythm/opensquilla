@@ -389,6 +389,7 @@
     },
     "resources": {
       "title": "Files", "count": "Files ({count})", "empty": "No files or links yet.",
+      "currentWorkingFile": "Current working file", "publishedVersion": "Published version",
       "groups": { "files": "Files", "links": "Links", "attachments": "Files", "documents": "Files", "deliverables": "Files", "urls": "Links" },
       "open": "Open {name}", "preparing": "Preparing editor…", "retry": "Retry", "preview": "Preview {name}", "download": "Download {name}", "edit": "Edit a copy of {name}", "publish": "Publish {name}",
       "imported": "{name} is ready to edit.", "published": "{name} is ready to share.",
@@ -583,6 +584,8 @@
       "documentEditingRetired": "Update the client and reopen the page to send annotations as chat input."
     },
     "artifactDocument": {
+      "fixedSnapshot": "Fixed snapshot",
+      "continueEditing": "Continue editing",
       "sections": "Artifact document sections",
       "preview": "Preview",
       "source": "Source",

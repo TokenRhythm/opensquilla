@@ -25,16 +25,17 @@ function revision(version: number): ArtifactPayload {
   }
 }
 
-async function harness(options: { http?: ReturnType<typeof httpTransportTestDouble>; initialHead?: ArtifactPayload } = {}) {
+async function harness(options: { http?: ReturnType<typeof httpTransportTestDouble>; initialHead?: ArtifactPayload; fixed?: boolean } = {}) {
   let current = revision(2)
   if (options.initialHead) current = options.initialHead
   const initial = revision(1)
   const http = options.http || httpTransportTestDouble()
-  const blob = new Blob(['revision two'], { type: String(current.mime) })
+  const blob = new Blob([options.fixed ? 'revision one' : 'revision two'], { type: String(current.mime) })
   const fetchArtifact = vi.fn<ArtifactContentAccess['fetchArtifact']>().mockResolvedValue({ ok: true, status: 200, url: '', blob })
   const openArtifact = vi.fn<NonNullable<Platform['files']['openArtifact']>>().mockResolvedValue({ ok: true })
   const headArtifact = vi.fn(() => current)
-  const item = createArtifactPreviewWorkbenchItem({ artifact: initial, nativeHtml: false, sessionKey: 'session-a' })
+  const item = createArtifactPreviewWorkbenchItem({ artifact: initial, nativeHtml: false, sessionKey: 'session-a',
+    resourceIdentity: options.fixed ? 'deliverable:artifact-1' : 'document:document-1' })
   const definition = createArtifactWorkbenchDefinitions({
     artifactContent: { ...createV4ArtifactContentAccess(http), ...(options.http ? {} : { fetchArtifact }),
       fetchAttachment: vi.fn(), uploadAttachment: vi.fn() },
@@ -60,6 +61,31 @@ async function harness(options: { http?: ReturnType<typeof httpTransportTestDoub
 afterEach(() => vi.clearAllMocks())
 
 describe('Workbench revision file actions', () => {
+  it.each(['download', 'open-external'])('keeps published A bytes for %s after the current Document becomes B', async action => {
+    const f = await harness({ fixed: true })
+    f.advance()
+    await f.runtime.handleComponentEvent?.({ type: 'artifact-head-changed', payload: { revisionId: 'revision-3' } }, f.item)
+    await f.runtime.performAction?.(action, f.item)
+    expect(f.headArtifact).not.toHaveBeenCalled()
+    expect(f.fetchArtifact).toHaveBeenCalledWith({ ...revision(1), source: 'artifact', download_url: '/api/v1/artifacts/artifact-1' },
+      { sessionKey: 'session-a', requireSameOrigin: true })
+    if (action === 'download') expect(downloadBlob).toHaveBeenCalledWith(f.blob, 'deck-v1.pptx')
+    else {
+      expect(f.openArtifact).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck-v1.pptx' }))
+      expect(new TextDecoder().decode(f.openArtifact.mock.calls[0]?.[0].data)).toBe('revision one')
+    }
+  })
+
+  it('reports missing historical bytes without substituting the current head', async () => {
+    const http = httpTransportTestDouble()
+    const requestBinary = vi.spyOn(http, 'requestBinary').mockRejectedValue(new Error('snapshot A is missing'))
+    const f = await harness({ fixed: true, http })
+    await f.runtime.performAction?.('open-external', f.item)
+    expect(requestBinary).toHaveBeenCalledOnce()
+    expect(f.headArtifact).not.toHaveBeenCalled()
+    expect(f.openArtifact).not.toHaveBeenCalled()
+    expect(downloadBlob).not.toHaveBeenCalled()
+  })
   it.each(['download', 'open-external'])('uses the whole current preview revision for %s after a v1 to v2 edit', async action => {
     const f = await harness()
     await f.runtime.performAction?.(action, f.item)

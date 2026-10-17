@@ -380,6 +380,7 @@
     },
     "resources": {
       "title": "Dateien", "count": "Dateien ({count})", "empty": "Noch keine Dateien oder Links.",
+      "currentWorkingFile": "Aktuelle Arbeitsdatei", "publishedVersion": "Veröffentlichte Version",
       "groups": { "files": "Dateien", "links": "Links", "attachments": "Dateien", "documents": "Dateien", "deliverables": "Dateien", "urls": "Links" },
       "open": "{name} öffnen", "preparing": "Editor wird vorbereitet…", "retry": "Erneut versuchen", "preview": "{name} ansehen", "download": "{name} herunterladen", "edit": "Kopie von {name} bearbeiten", "publish": "{name} veröffentlichen",
       "imported": "{name} kann jetzt bearbeitet werden.", "published": "{name} kann jetzt geteilt werden.",
@@ -564,6 +565,8 @@
       "documentEditingRetired": "Aktualisieren Sie die App und öffnen Sie die Seite erneut, um Anmerkungen als Chatnachricht zu senden."
     },
     "artifactDocument": {
+      "fixedSnapshot": "Fester Stand",
+      "continueEditing": "Weiter bearbeiten",
       "sections": "Bereiche des Artefaktdokuments",
       "preview": "Vorschau",
       "source": "Quelltext",

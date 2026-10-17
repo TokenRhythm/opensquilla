@@ -380,6 +380,7 @@
     },
     "resources": {
       "title": "ファイル", "count": "ファイル（{count}）", "empty": "ファイルまたはリンクはまだありません。",
+      "currentWorkingFile": "現在の作業ファイル", "publishedVersion": "公開済みバージョン",
       "groups": { "files": "ファイル", "links": "リンク", "attachments": "ファイル", "documents": "ファイル", "deliverables": "ファイル", "urls": "リンク" },
       "open": "{name} を開く", "preparing": "エディターを準備しています…", "retry": "再試行", "preview": "{name} をプレビュー", "download": "{name} をダウンロード", "edit": "{name} のコピーを編集", "publish": "{name} を公開",
       "imported": "{name} を編集できます。", "published": "{name} を共有できます。",
@@ -564,6 +565,8 @@
       "documentEditingRetired": "クライアントを更新してページを開き直し、注釈をチャット入力として送信してください。"
     },
     "artifactDocument": {
+      "fixedSnapshot": "固定されたバージョン",
+      "continueEditing": "編集を続ける",
       "sections": "成果物ドキュメントのセクション",
       "preview": "プレビュー",
       "source": "ソース",

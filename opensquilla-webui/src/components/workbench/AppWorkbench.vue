@@ -328,10 +328,10 @@ import { workbenchPanelRegistry } from '@/workbench/registry'
 import {
   artifactWorkbenchItemId,
   artifactFromWorkbenchItem,
+  isFixedArtifactPreview,
   fileActionArtifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
-  preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
   sessionKeyFromWorkbenchItem,
@@ -634,7 +634,7 @@ watch(() => [store.items, store.activeSessionId] as const, () => {
   const wanted = new Set<string>()
   for (const item of store.items) {
     const artifact = artifactFromWorkbenchItem(item)
-    if (!artifact) continue
+    if (!artifact || isFixedArtifactPreview(item)) continue
     const sessionKey = sessionKeyFromWorkbenchItem(item)
     const key = `document:${artifactDocumentWorkspaceKey(artifact, sessionKey)}`
     wanted.add(key)
@@ -695,10 +695,9 @@ const nativeSnapshotUrl = computed(() => {
 })
 function thumbnailFingerprint(item: WorkbenchItem) {
   const artifact = artifactFromWorkbenchItem(item)
-  const prepared = preparedPreviewFromWorkbenchItem(item)
   // Mutable documents render the store's head without replacing their tab item.
   // Prepared attachment/deliverable previews remain pinned to their own bytes.
-  const workspace = artifact && !(prepared && prepared.resource.type !== 'document')
+  const workspace = artifact && !isFixedArtifactPreview(item)
     ? artifactDocuments.snapshot(artifact, sessionKeyFromWorkbenchItem(item)).workspace
     : null
   const head = workspace?.source === 'document-api' ? workspace.headArtifact : artifact
@@ -793,6 +792,7 @@ let stopArtifactEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
 let scopeChangeGeneration = 0
 let artifactNavigationGeneration = 0
+watch(() => store.activeItemId, () => { artifactNavigationGeneration += 1 }, { flush: 'sync' })
 function artifactPreviewItemForExplicitOpen(
   options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
 ): WorkbenchItem {
@@ -1143,6 +1143,23 @@ for (const definition of createArtifactWorkbenchDefinitions({
     primaryClass: 'btn--primary',
   }),
   currentSessionId: () => store.activeSessionId || props.sessionId,
+  editCurrentResource: async (ref, item, requestIsCurrent) => {
+    const generation = scopeChangeGeneration
+    const navigationGeneration = artifactNavigationGeneration
+    const identity = gateway?.deliveryIdentity
+    const epoch = gateway?.subscriptionEpoch
+    const isCurrent = () => requestIsCurrent() && generation === scopeChangeGeneration
+      && navigationGeneration === artifactNavigationGeneration && store.activeItemId === item.id
+      && props.routeActive && props.enabled && !props.modalBlocked
+      && gateway?.deliveryIdentity === identity && gateway?.subscriptionEpoch === epoch
+      && store.items.some(candidate => candidate.id === item.id)
+    const sessionKey = resourceSessionKey(item)
+    if (!sessionKey || !isCurrent()) return
+    const resource = await workbenchResources.resolve(sessionKey, ref)
+    if (!isCurrent()) return
+    if (!resource) throw artifactProductClientError('RESOURCE_UNSUPPORTED')
+    await openWorkbenchResource(resource, item, isCurrent)
+  },
   getPreviewPreferences: () => readPreviewPreferences(platform),
   publishDocument: async request => {
     await workbenchResources.publishDocument(
@@ -1172,7 +1189,7 @@ workbenchPanelRegistry.register(createWorkbenchResourceCollectionDefinition({
   },
   retain: item => workbenchResources.retain(resourceSessionKey(item)),
   download: downloadWorkbenchResource,
-  open: openWorkbenchResource,
+  open: openCollectionResource,
   publish: publishWorkbenchResource,
   pushError: message => pushToast(message, { tone: 'danger', duration: 9000 }),
   t: (key, params) => String(t(key, params || {})),
@@ -1257,6 +1274,25 @@ function openResourceArtifact(
   // their preview stays visible in the owning parent's Workbench.
   const opened = store.openItem(ownerItem ? { ...previewItem, scope: ownerItem.scope } : previewItem)
   if (opened && store.activeItemId === previewItem.id) store.requestReveal()
+}
+
+async function openCollectionResource(resource: WorkbenchResource, item: WorkbenchItem) {
+  if (resource.resource.type !== 'deliverable') return openWorkbenchResource(resource, item)
+  const sessionKey = resourceSessionKey(item)
+  if (!sessionKey) return
+  const artifact = artifactPayloadFromWorkbenchResource(resource)
+  if (!resource.capabilities.preview) {
+    if (artifactWorkbenchPreviewKind(artifact) !== 'html' && resource.capabilities.download) {
+      await downloadWorkbenchResource(resource, item)
+      return
+    }
+    throw artifactProductClientError('RESOURCE_UNSUPPORTED', {
+      reasonCode: workbenchResourceActionReasonCode(resource.capabilities, 'preview') || undefined,
+    })
+  }
+  // A collection's Deliverable Open has the same immutable semantics as a
+  // historical chat card. Continue editing is the explicit current-head path.
+  openResourceArtifact(resource, artifact, sessionKey, undefined, 'preview', item)
 }
 
 async function openWorkbenchResource(
@@ -1453,6 +1489,7 @@ function refreshResourceCollectionItem(sessionKey: string) {
 async function refreshArtifactDocumentItem(
   item: WorkbenchItem,
 ) {
+  if (isFixedArtifactPreview(item)) return
   const artifact = artifactFromWorkbenchItem(item)
   if (!artifact) return
   const sessionKey = sessionKeyFromWorkbenchItem(item)
@@ -1491,7 +1528,7 @@ async function refreshArtifactDocumentItem(
 function refreshOpenArtifactDocuments(sessionKey: string) {
   for (const item of store.items) {
     const artifact = artifactFromWorkbenchItem(item)
-    if (!artifact || sessionKeyFromWorkbenchItem(item) !== sessionKey) continue
+    if (!artifact || isFixedArtifactPreview(item) || sessionKeyFromWorkbenchItem(item) !== sessionKey) continue
     const workspace = artifactDocuments.snapshot(artifact, sessionKey).workspace
     if (workspace?.source !== 'document-api') continue
     void refreshArtifactDocumentItem(item).catch(() => undefined)
@@ -1537,7 +1574,11 @@ function artifactNavigationId(
   item: WorkbenchItem | null,
   artifact: ArtifactPayload,
 ): string {
-  return artifactWorkbenchItemId(sessionKeyFromWorkbenchItem(item), artifact)
+  const documentId = artifact.source === 'workspace-preview'
+    ? String(artifact.documentId || artifact.document_id || '') : ''
+  const resourceIdentity = documentId ? `document:${documentId}`
+    : artifact.id ? `deliverable:${artifact.id}` : undefined
+  return artifactWorkbenchItemId(sessionKeyFromWorkbenchItem(item), artifact, resourceIdentity)
 }
 
 function showArtifactNavigation(item: WorkbenchItem | null): boolean {
@@ -1564,8 +1605,11 @@ async function selectNavigationArtifact(
   const visibleSessionKey = item.scope.type === 'session' ? item.scope.id : ''
   const navigationGeneration = ++artifactNavigationGeneration
   const scopeGeneration = scopeChangeGeneration
+  const identity = gateway?.deliveryIdentity
+  const epoch = gateway?.subscriptionEpoch
   const isCurrent = () => navigationGeneration === artifactNavigationGeneration
     && scopeGeneration === scopeChangeGeneration
+    && gateway?.deliveryIdentity === identity && gateway?.subscriptionEpoch === epoch
     && props.routeActive && props.sessionId === visibleSessionKey
     && store.activeSessionId === visibleSessionKey && store.activeItemId === item.id
     && store.items.some(candidate => candidate.id === item.id)
@@ -1575,15 +1619,18 @@ async function selectNavigationArtifact(
   const documentId = typeof artifact.documentId === 'string'
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
-  if (props.workbenchResourcesEnabled && sessionKey && (artifactId || documentId)
+  if (props.workbenchResourcesEnabled && sessionKey && (artifactId || (artifact.source === 'workspace-preview' && documentId))
     && (kind === 'html' || isOfficePreviewFormat(kind))) {
     try {
+      const workingFile = artifact.source === 'workspace-preview' && documentId
       const resource = await workbenchResources.resolve(sessionKey, createWorkbenchResourceRef(
-        documentId ? 'document' : 'deliverable', documentId || artifactId,
+        workingFile ? 'document' : 'deliverable', workingFile || artifactId,
       ))
       if (!isCurrent()) return
       if (resource) {
-        await openWorkbenchResource(resource, item, isCurrent)
+        if (workingFile) await openWorkbenchResource(resource, item, isCurrent)
+        else openResourceArtifact(resource, artifactPayloadFromWorkbenchResource(resource), sessionKey,
+          undefined, 'preview', item)
         return
       }
       // A Gateway without the resource API retains the established legacy path.
@@ -1605,6 +1652,7 @@ async function selectNavigationArtifact(
       && platform.workbench.native,
     ),
     sessionKey,
+    ...(artifactId ? { resourceIdentity: `deliverable:${artifactId}` } : {}),
   })
   if (store.openItem({ ...previewItem, scope: item.scope }) && store.activeItemId === previewItem.id) {
     store.requestReveal()
@@ -1808,7 +1856,7 @@ function onArtifactState(event: ArtifactDocumentChange) {
   }
   for (const item of store.items) {
     const artifact = artifactFromWorkbenchItem(item)
-    if (!artifact) continue
+    if (!artifact || isFixedArtifactPreview(item)) continue
     const itemSessionKey = sessionKeyFromWorkbenchItem(item)
     const snapshot = artifactDocuments.snapshot(artifact, itemSessionKey)
     if (snapshot.workspace?.document.documentId !== documentId) continue
@@ -1822,7 +1870,7 @@ function promptAnnotationItem(
   if (!detail.documentId || !detail.sessionKey) return null
   const item = store.items.find((candidate) => {
     const artifact = artifactFromWorkbenchItem(candidate)
-    if (!artifact || sessionKeyFromWorkbenchItem(candidate) !== detail.sessionKey) return false
+    if (!artifact || isFixedArtifactPreview(candidate) || sessionKeyFromWorkbenchItem(candidate) !== detail.sessionKey) return false
     return artifactDocuments.snapshot(artifact, detail.sessionKey)
       .workspace?.document.documentId === detail.documentId
   })

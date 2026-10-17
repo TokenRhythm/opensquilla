@@ -87,6 +87,49 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+it('keeps a fixed HTML lease on A with normal preview capabilities until explicit Continue editing', async () => {
+  const published = { ...artifact, id: 'published-A', documentId: 'doc-current', sha256: 'a'.repeat(64) }
+  const item = createArtifactPreviewWorkbenchItem({ artifact: published, nativeHtml: false,
+    sessionKey: 'side-child', resourceIdentity: 'deliverable:published-A' })
+  const headArtifact = vi.fn(() => ({ ...published, id: 'current-B', sha256: 'b'.repeat(64) }))
+  const load = vi.fn(async () => undefined)
+  const snapshot = vi.fn(() => ({ workspace: null }))
+  const editCurrentResource = vi.fn(async () => undefined)
+  const createLease = vi.fn<ArtifactPreviewAccess['createLease']>().mockResolvedValue({
+    version: 1, lease_id: 'fixed-A', effective_mode: 'full', entrypoint: 'index.html',
+    launch_url: 'http://preview.localhost/index.html', preview_origin: 'http://preview.localhost',
+    expires_at: '2099-01-01T00:00:00Z', idle_timeout_seconds: 3600,
+    source: { kind: 'bundle', collection_status: 'complete', file_count: 2, total_bytes: 128, warning_codes: [] },
+  })
+  const definition = createArtifactWorkbenchDefinitions({
+    artifactDocuments: { load, snapshot: snapshot as never, headArtifact }, editCurrentResource,
+    artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
+    baseOrigin: 'http://localhost', currentSessionId: () => 'parent', previewLeasesEnabled: true,
+    confirmRemoteResources: async () => true, pushToast: vi.fn(), t: key => key,
+    platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+  })[0]!
+  const renderState: Record<string, unknown> = {}
+  const runtime = await definition.createRuntime!(item, { getRenderState: () => renderState,
+    updateRenderState: patch => Object.assign(renderState, patch), isItemOpen: () => true,
+    setExpanded: vi.fn(), reportError: vi.fn() })
+  try {
+    expect(createLease).toHaveBeenCalledWith(expect.objectContaining({ id: 'published-A', sha256: 'a'.repeat(64) }),
+      'full', 'web', expect.objectContaining({ sessionKey: 'side-child' }))
+    await runtime.handleComponentEvent?.({ type: 'artifact-head-changed', payload: { revisionId: 'B' } }, item)
+    expect(createLease).toHaveBeenCalledOnce()
+    expect(load).not.toHaveBeenCalled()
+    expect(snapshot).not.toHaveBeenCalled()
+    expect(headArtifact).not.toHaveBeenCalled()
+    const state = { active: true, hostAvailable: true, nativeSurface: false, runtimeState: renderState }
+    expect(definition.getProps!(item, state)).toMatchObject({ documentFeatures: false, artifact: { id: 'published-A' } })
+    expect(definition.getToolbarItems!(item, state).map(action => action.id)).toContain('edit-current')
+    expect(editCurrentResource).not.toHaveBeenCalled()
+    await runtime.performAction?.('edit-current', item)
+    expect(editCurrentResource).toHaveBeenCalledWith(expect.objectContaining({ type: 'deliverable', artifactId: 'published-A' }),
+      item, expect.any(Function))
+  } finally { await runtime.dispose?.('closed') }
+})
+
 function nativeResource() {
   return {
     artifact,
@@ -117,6 +160,7 @@ async function createNativeRuntimeHarness(
     artifact,
     nativeHtml: true,
     sessionKey: 'session-a',
+    resourceIdentity: 'document:document-1',
   })
   const definition = createArtifactWorkbenchDefinitions({
     baseOrigin: 'http://localhost',
@@ -258,6 +302,7 @@ async function createAnnotationDraftHarness(
     artifact,
     nativeHtml: true,
     sessionKey: 'session-a',
+    resourceIdentity: 'document:document-1',
   })
   const definition = createArtifactWorkbenchDefinitions({
     artifactContent: { ...testArtifactContent, uploadAttachment },
@@ -423,7 +468,8 @@ describe('artifact Workbench provider', () => {
         source: { kind: 'bundle', collection_status: 'complete', file_count: 3, total_bytes: 128, warning_codes: [] },
       }))
       const item = createArtifactPreviewWorkbenchItem({
-        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1, ...options,
+        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1,
+        resourceIdentity: 'document:document-1', ...options,
       })
       const definition = createArtifactWorkbenchDefinitions({
         artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
@@ -539,6 +585,7 @@ describe('artifact Workbench provider', () => {
       await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
         artifact: { ...artifact, previewPagePath: 'editorial.html' },
         nativeHtml: true, sessionKey: 'session-a',
+        resourceIdentity: 'document:document-1',
       }))
       const expected = kind === 'known-lease'
         ? 'This client or Gateway does not support opening this subpage directly. Update and try again.'
@@ -578,6 +625,7 @@ describe('artifact Workbench provider', () => {
     await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
       artifact: { ...artifact, previewPagePath: 'editorial.html' },
       nativeHtml: true, sessionKey: 'session-a',
+      resourceIdentity: 'document:document-1',
     }))
     await vi.waitFor(() => expect(harness.renderState.previewLeaseError)
       .toBe('This client or Gateway does not support opening this subpage directly. Update and try again.'))
@@ -603,6 +651,7 @@ describe('artifact Workbench provider', () => {
       const next = createArtifactPreviewWorkbenchItem({
         artifact: { ...artifact, ...(previewPagePath ? { previewPagePath } : {}) },
         nativeHtml: true, sessionKey: 'session-a',
+        resourceIdentity: 'document:document-1',
       })
       expect(next.id).toBe(harness.item.id)
       await harness.runtime.update?.(next)
@@ -1367,6 +1416,7 @@ describe('artifact Workbench provider', () => {
       nativeHtml: false,
       previewLeaseEligible: false,
       sessionKey: 'session-a',
+      resourceIdentity: 'document:document-1',
     })
     const renderState: Record<string, unknown> = {}
     const pushToast = vi.fn()
@@ -1451,7 +1501,7 @@ describe('artifact Workbench provider', () => {
     })
 
     expect(createLease).not.toHaveBeenCalled()
-    expect(load).toHaveBeenCalledOnce()
+    expect(load).not.toHaveBeenCalled()
   })
 
   it('keeps a bound attachment preview on its immutable wire identity', async () => {
@@ -1751,6 +1801,7 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const pushToast = vi.fn()
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -3122,6 +3173,7 @@ describe('artifact Workbench provider', () => {
     const reportError = vi.fn()
     const pushToast = vi.fn()
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -3291,6 +3343,7 @@ describe('artifact Workbench provider', () => {
     }
     const renderState: Record<string, unknown> = {}
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -3677,6 +3730,7 @@ describe('artifact Workbench provider', () => {
     }
     const renderState: Record<string, unknown> = {}
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',

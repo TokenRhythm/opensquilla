@@ -1,5 +1,6 @@
 import type { ArtifactPayload } from '@/types/artifacts'
-import type { WorkbenchPreviewDescriptor } from '@/types/workbenchResources'
+import type { WorkbenchPreviewDescriptor, WorkbenchResourceRef, WorkbenchResourceType } from '@/types/workbenchResources'
+import { createWorkbenchResourceRef, workbenchResourceRefId } from '@/types/workbenchResources'
 import {
   artifactFileTitle,
   isOfficeArtifact,
@@ -218,12 +219,44 @@ export function artifactFromWorkbenchItem(
     : null
 }
 
+/** Only typed resource identities carry Document authority. Legacy artifact IDs do not. */
+export function artifactResourceRefFromWorkbenchItem(item: WorkbenchItem): WorkbenchResourceRef | null {
+  if (item.kind !== 'artifact-preview') return null
+  const accepted = new Set<WorkbenchResourceType>(['attachment', 'document', 'deliverable', 'url'])
+  const prepared = preparedPreviewFromWorkbenchItem(item)
+  if (prepared && accepted.has(prepared.resource.type)) {
+    const id = workbenchResourceRefId(prepared.resource).trim()
+    if (id) return createWorkbenchResourceRef(prepared.resource.type, id)
+  }
+  const identity = typeof item.payload.resourceIdentity === 'string' ? item.payload.resourceIdentity : ''
+  const match = /^(attachment|document|deliverable|url):(.+)$/.exec(identity)
+  if (match?.[2]?.trim()) return createWorkbenchResourceRef(match[1] as WorkbenchResourceType, match[2].trim())
+  const artifact = artifactFromWorkbenchItem(item)
+  const type = artifact?.workbenchResourceType
+  const id = artifact?.workbenchResourceId
+  return typeof type === 'string' && accepted.has(type as WorkbenchResourceType)
+    && typeof id === 'string' && id.trim()
+    ? createWorkbenchResourceRef(type as WorkbenchResourceType, id.trim()) : null
+}
+
+/** Unscoped legacy previews stay read-only; this does not authorize a Deliverable operation. */
+export function isFixedArtifactPreview(item: WorkbenchItem): boolean {
+  return item.kind === 'artifact-preview' && artifactResourceRefFromWorkbenchItem(item)?.type !== 'document'
+}
+
+/** Use the immutable revision URL or the original ArtifactStore ID. */
+export function fixedArtifactTarget(artifact: ArtifactPayload): ArtifactPayload {
+  if (!artifact.id) return artifact
+  return { ...artifact, source: 'artifact', download_url: artifact.revision_download_url || undefined }
+}
+
 /** File operations follow the displayed Document, never a related delivery. */
 export function fileActionArtifactFromWorkbenchItem(
   item: WorkbenchItem, state: Readonly<Record<string, unknown>>,
 ): ArtifactPayload | undefined {
   const artifact = artifactFromWorkbenchItem(item)
   if (!artifact) return
+  if (isFixedArtifactPreview(item)) return fixedArtifactTarget(artifact)
   const prepared = preparedPreviewFromWorkbenchItem(item)
   if (prepared && prepared.resource.type !== 'document') return artifact
   const documentId = typeof state.workingFileDocumentId === 'string' && state.workingFileDocumentId
