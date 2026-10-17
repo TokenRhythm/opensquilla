@@ -156,6 +156,37 @@ describe('workbench store', () => {
     expect(store.visibleItems).toHaveLength(2)
   })
 
+  it.each([null, 'session-a'])('does not inherit an empty launcher from owner %s into a new draft', owner => {
+    const store = useWorkbenchStore()
+    store.setSessionScope(owner)
+    store.openEmpty()
+    store.setMaximized(true)
+    store.setSessionScope('new-draft')
+    expect(store.expanded).toBe(false)
+    expect(store.maximized).toBe(false)
+    expect(store.activeItemId).toBeNull()
+    store.setSessionScope(owner)
+    expect(store.expanded).toBe(true)
+    expect(store.activeItemId).toBeNull()
+  })
+
+  it('retains a manually opened draft launcher on materialization without sharing its expansion', () => {
+    const store = useWorkbenchStore()
+    store.setSessionScope('draft-a')
+    store.openEmpty()
+    store.setSessionScope('draft-a')
+    expect(store.expanded).toBe(true)
+    store.setSessionScope('draft-b')
+    expect(store.expanded).toBe(false)
+    store.openEmpty()
+    store.setSessionScope('draft-a')
+    store.setExpanded(false)
+    store.setSessionScope('draft-b')
+    expect(store.expanded).toBe(true)
+    store.setSessionScope('draft-a')
+    expect(store.expanded).toBe(false)
+  })
+
   it('falls back safely when an inactive session selected tab was explicitly closed', () => {
     const store = useWorkbenchStore()
     store.openItem(item('a-first'))

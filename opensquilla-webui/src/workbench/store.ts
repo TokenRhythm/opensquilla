@@ -329,7 +329,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function setSessionScope(sessionId: string | null) {
     if (activeSessionId.value === sessionId) return
-    const emptyLauncherExpanded = expanded.value && activeItemId.value === null
     sessionPresentations.set(activeSessionId.value, {
       activeItemId: activeItemId.value,
       expanded: expanded.value,
@@ -349,9 +348,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const replacement = saved && saved.activeItemId === null
       ? null : savedItem ?? findMostRecentItem(matchesScope)
     activeItemId.value = replacement?.id ?? null
-    // An explicitly open launcher remains a stable shell while a new owner
-    // resolves. A retained conversation's own preference always takes priority.
-    expanded.value = saved?.expanded ?? emptyLauncherExpanded
+    // Expansion belongs to this conversation, including its empty launcher.
+    // A new owner starts collapsed; draft materialization keeps the same key.
+    expanded.value = saved?.expanded ?? false
     maximized.value = false
     widthPreference.value = saved ? { ...saved.widthPreference } : hydrateWidthPreference()
     if (replacement) {

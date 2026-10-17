@@ -228,7 +228,7 @@ describe('AppWorkbench new panel menu interaction', () => {
   })
 
   it.each(['history-first', 'workspace-first'] as const)(
-    'keeps launcher entries stable and disabled until the next session resolves (%s)', async order => {
+    'keeps explicitly reopened launcher entries stable while the next session resolves (%s)', async order => {
       const harness = await mount({ native: false })
       harness.store.closeAllItems()
       harness.store.openEmpty()
@@ -243,6 +243,10 @@ describe('AppWorkbench new panel menu interaction', () => {
       harness.props.workspaceId = null
       harness.props.conversationStarted = false
       await settle()
+      expect(harness.store.expanded).toBe(false)
+      harness.store.openEmpty()
+      await settle()
+      expect(harness.store.expanded).toBe(true)
       expect(cards()).toEqual(initial)
       expect(start.getAttribute('aria-busy')).toBe('true')
       for (const card of cards()) { expect(card.disabled).toBe(true); card.click() }
@@ -284,6 +288,9 @@ describe('AppWorkbench new panel menu interaction', () => {
     harness.props.workspaceResolved = false
     harness.props.workspaceId = null
     harness.props.conversationStarted = false
+    await settle()
+    expect(harness.store.expanded).toBe(false)
+    harness.store.openEmpty()
     await settle()
     const start = harness.host.querySelector('[data-testid="workbench-start-panel"]')!
     expect(start.querySelectorAll('[data-panel-kind]')).toHaveLength(4)

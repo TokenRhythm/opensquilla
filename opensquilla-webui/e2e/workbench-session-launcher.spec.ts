@@ -257,9 +257,20 @@ async function openLauncher(page: Page, count: number) {
 }
 
 for (const withProject of [false, true]) {
-  test(`launcher keeps ${withProject ? 4 : 3} vertical cards while sidebar session history and workspace resolve`, async ({ page }, info) => {
+  test(`explicitly opened launcher keeps ${withProject ? 4 : 3} vertical cards while sidebar session history and workspace resolve`, async ({ page }, info) => {
     const gateway = await installLauncherGateway(page, withProject)
     const { host, cards } = await openLauncher(page, withProject ? 4 : 3)
+    await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
+    await expect.poll(() => gateway.requests.some(request => request.key === B && request.method === 'chat.history')).toBe(true)
+    await expect.poll(() => gateway.requests.some(request => request.key === B && request.method === 'sessions.messages.subscribe')).toBe(true)
+    // A's open launcher belongs to A. B starts closed, even before its
+    // metadata/history arrive, and opens only through the user's own action.
+    await expect(host).toBeHidden()
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(host).toBeVisible()
+    await expect(cards).toHaveCount(withProject ? 4 : 3)
+    await expect.poll(() => host.evaluate(element => element.getAnimations().every(animation =>
+      animation.playState === 'finished' || animation.playState === 'idle'))).toBe(true)
     // Observe the real App across every rendered frame; no store injection,
     // readiness delay, or synthetic event supplies the navigation state.
     const probe = await host.evaluateHandle(element => {
@@ -281,10 +292,6 @@ for (const withProject of [false, true]) {
       sample(); requestAnimationFrame(frame)
       return { stop: () => { sample(); running = false; return snapshots } }
     })
-    await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
-    await expect.poll(() => gateway.requests.some(request => request.key === B && request.method === 'chat.history')).toBe(true)
-    await expect.poll(() => gateway.requests.some(request => request.key === B && request.method === 'sessions.messages.subscribe')).toBe(true)
-    await expect(cards).toHaveCount(withProject ? 4 : 3)
     for (const card of await cards.all()) await expect(card).toBeDisabled()
     gateway.releaseMetadata()
     await expect(page.locator('#app-main .chat-thread')).toHaveAttribute('data-session-key', B)
@@ -322,6 +329,9 @@ test('resolved no-project session removes only its workspace entry and side keep
   const background = await host.evaluate(element => getComputedStyle(element).backgroundColor)
   await page.getByRole('button', { name: 'Launcher task B', exact: true }).click()
   await expect.poll(() => gateway.requests.some(request => request.key === B && request.method === 'chat.history')).toBe(true)
+  await expect(host).toBeHidden()
+  await page.getByTestId('topbar-workbench-toggle').click()
+  await expect(host).toBeVisible()
   await expect(cards).toHaveCount(4)
   gateway.releaseMetadata()
   gateway.releaseHistory()
@@ -333,6 +343,36 @@ test('resolved no-project session removes only its workspace entry and side keep
   expect(await host.evaluate(element => getComputedStyle(element).backgroundColor)).toBe(background)
   expect(gateway.requests.filter(request => /sessions.sidechat.(create|close)/.test(request.method))).toHaveLength(0)
 })
+
+for (const withProject of [false, true]) {
+  test(`${withProject ? 'project' : 'global'} new task starts with its panel closed and returns to A's open launcher`, async ({ page }, info) => {
+    const gateway = await installLauncherGateway(page, withProject)
+    gateway.releaseMetadata(); gateway.releaseHistory()
+    const { host, cards } = await openLauncher(page, withProject ? 4 : 3)
+    if (withProject) {
+      const project = page.locator('.sidebar-history-row--workspace').first()
+      await project.hover()
+      await project.getByTestId('project-workspace-new-task').click()
+    } else {
+      await page.getByRole('button', { name: 'New task', exact: true }).click()
+    }
+    await expect(page).toHaveURL(withProject
+      ? /\/chat\/new\?agent=main&project=launcher-project$/
+      : /\/chat\/new(?:\?|$)/)
+    await expect(page.locator('.chat--new-landing')).toBeVisible()
+    await expect(host).toBeHidden()
+    await expect(page.getByTestId('topbar-workbench-toggle')).toHaveAttribute('aria-expanded', 'false')
+    await page.screenshot({ path: info.outputPath(`${withProject ? 'project' : 'global'}-new-task-panel-closed.png`) })
+
+    await page.getByRole('button', { name: 'Launcher task A', exact: true }).click()
+    await expect(page.locator('#app-main .chat')).toContainText('Answer A is ready.')
+    await expect(host).toBeVisible()
+    await expect(cards).toHaveCount(withProject ? 4 : 3)
+    await expect(page.getByTestId('topbar-workbench-toggle')).toHaveAttribute('aria-expanded', 'true')
+    expect(gateway.requests.filter(request => ['sessions.create', 'sessions.sidechat.create',
+      'sessions.sidechat.close', 'chat.send', 'chat.abort', 'chat.cancel'].includes(request.method))).toHaveLength(0)
+  })
+}
 
 test('project draft materialization through Files does not leave the reopened panel menu preparing', async ({ page }) => {
   const gateway = await installLauncherGateway(page, true)
