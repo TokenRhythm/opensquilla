@@ -2917,6 +2917,8 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
             ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/*.json
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/*.png
           if-no-files-found: error
           retention-days: 14
 

@@ -2184,6 +2184,29 @@ def test_desktop_case_arguments_work_with_nounset(
     assert command == expected
 
 
+def test_desktop_quit_success_evidence_excludes_browser_profiles(tmp_path: Path) -> None:
+    summary = next(
+        step for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Upload Desktop recovery summary"
+    )
+    prefix = "${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/"
+    patterns = [line.removeprefix(prefix) for line in summary["with"]["path"].splitlines()
+                if line.startswith(prefix)]
+    assert patterns == ["*.json", "*.png"]
+    # Only top-level results and layout evidence are retained on success.
+    # Profiles contain Chromium storage and fixture receipts and remain local.
+    expected = {"results.json", "ask-en-dark.json", "ask-en-dark.png"}
+    for name in [*expected, "attempt.log", "profile-test/events.json",
+                 "profile-test/preferences.json", "profile-test/chromium/Preferences",
+                 "profile-test/chromium/storage.json", "profile-test/capture.png"]:
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("synthetic fixture data", encoding="utf-8")
+    selected = {path.relative_to(tmp_path).as_posix()
+                for pattern in patterns for path in tmp_path.glob(pattern)}
+    assert selected == expected
+
+
 def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> None:
     job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
     steps = job["steps"]
@@ -2417,8 +2440,9 @@ def test_windows_profile_split_keeps_shared_setup_and_original_browser_router_ch
     ("Linux", "all", "", (
         "profile-consolidation-flow", "primary-repair-accessibility", "profile-import-flow",
         "desktop-cleanup-flow", "gateway-ownership", "gateway-orphan-recovery-flow",
-        "window-background-flow", "theme-flow", "native-workbench-surface",
-        "desktop-zoom-shortcuts", "native-workbench-v2", "desktop-browser",
+        "window-background-flow", "desktop-quit-interaction", "theme-flow",
+        "native-workbench-surface", "desktop-zoom-shortcuts", "native-workbench-v2",
+        "desktop-browser",
         "desktop-browser-electron", "live-html-business", "unsafe-legacy-recovery-no-write",
     )),
 ])
@@ -2453,6 +2477,7 @@ def test_profile_dispatcher_selects_independent_cases_without_duplicate_legacy_r
         "gateway-ownership": "desktop-gateway-ownership",
         "gateway-orphan-recovery-flow": "desktop-gateway-orphan-recovery-flow",
         "window-background-flow": "desktop-window-background-flow",
+        "desktop-quit-interaction": "desktop-quit-native-acceptance",
         "theme-flow": "desktop-theme-flow",
         "native-workbench-surface": "native-workbench-surface-electron",
         "native-workbench-v2": "native-workbench-v2-electron",

@@ -284,6 +284,15 @@ try {
     followsSystem: true,
   })
 
+  // The native renderer can finish these local theme checks while its owned
+  // Gateway is still starting. Wait for the verified connection before the
+  // ordinary idle app.close(); otherwise Quit correctly asks about unknown
+  // activity after Playwright has already disposed its main-process channel.
+  await waitFor(async () => {
+    const connection = await page.evaluate(() => window.opensquillaDesktop?.getGatewayConnection?.())
+    return connection?.status === 'ready' && /^[0-9a-f]{64}$/.test(connection.authToken ?? '')
+  }, 'the isolated theme Gateway to be ready and owned before idle shutdown')
+
   console.log(JSON.stringify({
     ok: true,
     platform: runtimeIsolation.platform,
@@ -326,6 +335,28 @@ try {
       app: desktopApp,
       phase: 'theme-final-shutdown',
       timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+      diagnostics: async () => {
+        const log = await readFile(desktopLogPath, 'utf8').catch(() => null)
+        if (log === null) return { logReadFailed: true }
+        const events = new Set([
+          'gateway_spawned', 'gateway_exited', 'quit_gateway_activity_checked',
+          'quit_confirmation_required', 'quit_confirmation_failed', 'quit_cancelled_by_user',
+          'quit_confirmed', 'quit_deferred_for_profile_writer', 'quit_deferred_for_update_drain',
+          'before_quit', 'desktop_exit_phase', 'quit_gateway_shutdown_requested',
+          'quit_gateway_exit', 'quit_gateway_drain_failed', 'quit_gateway_still_running',
+        ])
+        const fields = new Set(['event', 'at', 'pid', 'kind', 'activity', 'activeCount',
+          'ownershipMatched', 'retainedScope', 'exited', 'gatewayStatus', 'from', 'to',
+          'activeWriters', 'gatewayDrainInFlight', 'accepted', 'alreadyStopping', 'hardTerminated'])
+        const records = []
+        for (const line of log.split(/\r?\n/)) {
+          let record
+          try { record = JSON.parse(line) } catch { continue }
+          if (!events.has(record?.event)) continue
+          records.push(Object.fromEntries(Object.entries(record).filter(([key]) => fields.has(key))))
+        }
+        return { logBytes: Buffer.byteLength(log, 'utf8'), records: records.slice(-32) }
+      },
     })
     shutdownError = shutdown.error
     if (shutdown.error) {
@@ -343,6 +374,11 @@ try {
       }
     }
   }
-  await rm(isolationRoot, { recursive: true, force: true }).catch(() => {})
+  if (!flowSucceeded || shutdownError) {
+    // This is the test's keyless synthetic profile. Do not erase the evidence
+    // needed to distinguish a pending decision, a writer, or a Gateway drain.
+    console.error(JSON.stringify({ event: 'desktop_e2e_evidence_preserved',
+      phase: 'theme-final-shutdown', isolationRoot, flowSucceeded, shutdownFailed: shutdownError !== null }))
+  } else await rm(isolationRoot, { recursive: true, force: true }).catch(() => {})
   if (flowSucceeded && shutdownError) throw shutdownError
 }

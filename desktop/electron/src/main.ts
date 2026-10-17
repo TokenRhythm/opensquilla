@@ -16079,9 +16079,11 @@ async function showDesktopQuitConfirmation(options: {
   remember?: string
 }): Promise<DesktopQuitDialogDecision> {
   const parent = options.parent && !options.parent.isDestroyed() ? options.parent : undefined
+  const contentWidth = options.background ? 560 : 500
+  const contentHeight = options.background ? 420 : options.detail.includes('\n\n') ? 340 : 300
   const confirmationWindow = new BrowserWindow({
-    width: options.background ? 560 : 500,
-    height: options.background ? 420 : options.detail.includes('\n\n') ? 340 : 300,
+    width: contentWidth,
+    height: contentHeight,
     useContentSize: true,
     resizable: false,
     minimizable: false,
@@ -16125,22 +16127,35 @@ async function showDesktopQuitConfirmation(options: {
     settle({ response: 'cancel', remember: false })
   })
   confirmationWindow.webContents.on('will-navigate', event => event.preventDefault())
+  const positionWindow = (): void => {
+    if (parent && !parent.isDestroyed()) {
+      const owner = parent.getBounds()
+      const bounds = confirmationWindow.getBounds()
+      const area = screen.getDisplayMatching(owner).workArea
+      // Keep the decision visibly attached to its parent, including when the
+      // parent straddles displays or has been moved partly off screen.
+      const x = Math.round(owner.x + (owner.width - bounds.width) / 2)
+      const y = Math.round(owner.y + (owner.height - bounds.height) / 2)
+      confirmationWindow.setPosition(
+        Math.max(area.x, Math.min(x, area.x + Math.max(0, area.width - bounds.width))),
+        Math.max(area.y, Math.min(y, area.y + Math.max(0, area.height - bounds.height))),
+      )
+    } else confirmationWindow.center()
+  }
   confirmationWindow.once('ready-to-show', () => {
     if (!confirmationWindow.isDestroyed()) {
-      if (parent && !parent.isDestroyed()) {
-        const owner = parent.getBounds()
-        const bounds = confirmationWindow.getBounds()
-        const area = screen.getDisplayMatching(owner).workArea
-        // Keep the decision visibly attached to its parent, including when the
-        // parent straddles displays or has been moved partly off screen.
-        const x = Math.round(owner.x + (owner.width - bounds.width) / 2)
-        const y = Math.round(owner.y + (owner.height - bounds.height) / 2)
-        confirmationWindow.setPosition(
-          Math.max(area.x, Math.min(x, area.x + Math.max(0, area.width - bounds.width))),
-          Math.max(area.y, Math.min(y, area.y + Math.max(0, area.height - bounds.height))),
-        )
-      } else confirmationWindow.center()
+      positionWindow()
       confirmationWindow.show()
+      if (process.platform === 'darwin') {
+        // Attaching a frameless macOS sheet can change its content dimensions
+        // after construction. Restore the intended viewport after attachment
+        // so wrapped labels and the action row remain inside the visible card.
+        const [width, height] = confirmationWindow.getContentSize()
+        if (width !== contentWidth || height !== contentHeight) {
+          confirmationWindow.setContentSize(contentWidth, contentHeight)
+          positionWindow()
+        }
+      }
       confirmationWindow.focus()
     }
   })

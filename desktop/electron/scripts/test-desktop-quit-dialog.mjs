@@ -122,7 +122,7 @@ collect(main)
 assert.ok(showSource)
 
 async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height: 1080 },
-  destroyed = false, destroyBeforeReady = false, expected }) {
+  destroyed = false, destroyBeforeReady = false, expected, platform = 'win32', sheetHeightLoss = 0 }) {
   const ipcMain = new EventEmitter()
   const displays = []
   let child
@@ -137,12 +137,16 @@ async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height:
       this.destroyed = false
       this.centered = 0
       this.shown = 0
+      this.contentSize = [options.width, options.height]
+      this.resizes = []
     }
     isDestroyed() { return this.destroyed }
-    getBounds() { return { x: 0, y: 0, width: this.options.width, height: this.options.height } }
+    getBounds() { return { x: 0, y: 0, width: this.contentSize[0], height: this.contentSize[1] } }
+    getContentSize() { return [...this.contentSize] }
+    setContentSize(width, height) { this.contentSize = [width, height]; this.resizes.push([width, height]) }
     setPosition(x, y) { this.position = [x, y] }
     center() { this.centered++ }
-    show() { this.shown++ }
+    show() { this.shown++; this.contentSize[1] -= sheetHeightLoss }
     focus() {}
     close() { this.destroyed = true; this.emit('closed') }
     async loadURL() {
@@ -152,6 +156,7 @@ async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height:
   }
   const show = new Function('env', `with (env) { ${showSource}; return showDesktopQuitConfirmation }`)({
     BrowserWindow: Window, ipcMain, join, __dirname: '/fixture',
+    process: { platform },
     buildDesktopQuitDialogHtml, parseDesktopQuitDialogResponse, desktopLog() {},
     screen: { getDisplayMatching: bounds => { displays.push(bounds); return { workArea: area } } },
   })
@@ -160,16 +165,21 @@ async function checkPlacement({ owner, area = { x: 0, y: 0, width: 1920, height:
   if (expected) {
     assert.deepEqual(child.position, expected)
     assert.equal(child.centered, 0, 'A live parent supplies the modal position')
-    assert.deepEqual(displays, [owner], 'Choose the display matching the parent, including negative coordinates')
+    assert.deepEqual(displays, Array(child.resizes.length + 1).fill(owner),
+      'Choose the parent display again after any native sheet resize')
     assert.ok(child.position[0] >= area.x && child.position[1] >= area.y)
     assert.ok(child.position[0] + child.options.width <= area.x + area.width)
     assert.ok(child.position[1] + child.options.height <= area.y + area.height)
   } else {
-    assert.equal(child.centered, 1, 'An absent or destroyed parent uses the original standalone centering')
+    assert.equal(child.centered, child.resizes.length + 1,
+      'An absent or destroyed parent uses standalone centering, including after a native resize')
     assert.equal(child.position, undefined)
     assert.deepEqual(displays, [])
   }
   assert.equal(child.shown, 1)
+  assert.deepEqual(child.getContentSize(), [560, 420], 'The visible viewport retains the requested content size')
+  assert.deepEqual(child.resizes, sheetHeightLoss ? [[560, 420]] : [],
+    'Only an actual native size change needs correction; do not hardcode titlebar pixels')
   ipcMain.emit('desktop:quit-dialog-response', { sender: child.webContents }, 'cancel')
   assert.deepEqual(await result, { response: 'cancel', remember: false })
 }
@@ -182,5 +192,9 @@ await checkPlacement({ owner: { x: -1900, y: 80, width: 980, height: 720 },
 await checkPlacement({ owner: { x: 460, y: 80, width: 980, height: 720 }, destroyed: true })
 await checkPlacement({ owner: { x: 460, y: 80, width: 980, height: 720 }, destroyBeforeReady: true })
 await checkPlacement({})
+for (const sheetHeightLoss of [0, 32, 48]) {
+  await checkPlacement({ platform: 'darwin', sheetHeightLoss,
+    owner: { x: 460, y: 80, width: 980, height: 720 }, expected: [670, 230] })
+}
 
 console.log('desktop quit dialog tests passed, including parent-relative and offscreen placement')

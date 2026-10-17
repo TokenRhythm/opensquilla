@@ -107,9 +107,9 @@ try {
         focus: document.activeElement?.id, controls: targets.map(node => ({ text: node.textContent, rect: node.getBoundingClientRect().toJSON() })) }
     })
     geometry.nativeWindow = await nativeDialogState(page)
+    await writeFile(join(output, `${name}.json`), JSON.stringify(geometry, null, 2))
     assert.ok(geometry.scroll.width <= geometry.viewport.width, `${name}: no horizontal overflow`)
     assert.ok(geometry.scroll.height <= geometry.viewport.height + 1, `${name}: no vertical overflow`)
-    await writeFile(join(output, `${name}.json`), JSON.stringify(geometry, null, 2))
   }
   async function reset(behavior = 'ask') {
     const previousGeneration = (await state()).resetGeneration

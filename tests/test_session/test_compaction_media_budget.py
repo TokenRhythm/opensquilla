@@ -733,12 +733,26 @@ def test_image_shape_nested_in_tool_arguments_keeps_its_full_text_cost(
     assert estimate_entries_model_replay_chars([entry]) > len(data)
 
 
-def test_image_reference_uses_fallback_until_request_bytes_are_available() -> None:
-    entry = {"role": "user", "content": json.dumps({
-        "text": "Inspect.", "attachments": [{"type": "image/png", "sha256_ref": "a" * 64}],
+@pytest.mark.parametrize("tokenizer_unavailable", [False, True], ids=["default", "forced-fallback"])
+def test_image_reference_uses_fallback_until_request_bytes_are_available(
+    monkeypatch: pytest.MonkeyPatch, tokenizer_unavailable: bool,
+) -> None:
+    if tokenizer_unavailable:
+        from opensquilla import token_estimation
+
+        monkeypatch.setattr(token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE)
+    # This case measures an unread media reference. Unknown session/legacy-ID
+    # reserves have their own coverage and must not change this fixture's scope.
+    entry = {"role": "user", "session_id": "history-scope", "content": json.dumps({
+        "text": "Inspect.", "attachments": [{
+            "type": "image/png", "sha256_ref": "a" * 64,
+            "attachment_id": "att_synthetic_0001",
+        }],
     })}
+    before = deepcopy(entry)
     assert 1024 <= estimate_entry_model_replay_tokens(entry) < 1500
     assert 4096 <= estimate_entries_model_replay_chars([entry]) < 6000
+    assert entry == before
 
 
 @pytest.mark.parametrize("empty_inline_data", [False, True])
@@ -777,20 +791,28 @@ def test_retained_image_reference_uses_verified_request_media(
     assert estimate_entries_model_replay_chars([entry], preserve_images=False) < 1000
 
 
+@pytest.mark.parametrize("tokenizer_unavailable", [False, True], ids=["default", "forced-fallback"])
 def test_inline_image_replay_uses_data_despite_stale_metadata(
-    png_encodings: list[str],
+    png_encodings: list[str], monkeypatch: pytest.MonkeyPatch, tokenizer_unavailable: bool,
 ) -> None:
+    if tokenizer_unavailable:
+        from opensquilla import token_estimation
+
+        monkeypatch.setattr(token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE)
     content = json.dumps({"text": "Inspect.", "attachments": [{
         "type": "image/png", "data": png_encodings[1],
         "sha256_ref": "0" * 64, "size": 1,
+        "attachment_id": "att_synthetic_0001",
     }]})
-    entry = {"role": "user", "content": content}
+    entry = {"role": "user", "session_id": "history-scope", "content": content}
+    before = deepcopy(entry)
     projected, complete = project_entry_content_for_provider(
         content, preserve_images=True,
     )
     assert complete is True
     assert isinstance(projected, list)
     assert 4096 <= estimate_entry_model_replay_tokens(entry) < 4600
+    assert entry == before
 
 
 @pytest.mark.parametrize("damage", ["missing", "wrong-size", "wrong-hash", "bad-image"])
