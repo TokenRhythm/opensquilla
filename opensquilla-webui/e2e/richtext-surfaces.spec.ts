@@ -75,6 +75,73 @@ test('streaming commits rich blocks once and keeps an open tail plain until sett
   await expect(body.locator('pre').first().locator('code')).toHaveText('$x^2$ 和 \\(f(x)\\) 保持源码')
 })
 
+test('rich blocks keep the same prose boundary while streaming and after settling', async ({ page }, testInfo) => {
+  const multipleRichBlocks = '## earlier-prefix\n\n~~~text\nstable code\n~~~\n\n'
+    + '| boundary-prefix | value |\n|---|---|\n| one | two |\n\n'
+  const prefixes = [
+    ['table', '| boundary-prefix | value |\n|---|---|\n| one | two |\n\n'],
+    ['heading', '## boundary-prefix\n\n'],
+    ['code', '~~~text\nboundary-prefix\n~~~\n\n'],
+    ['paragraph', 'boundary-prefix\n\n'],
+    ['list', '- boundary-prefix\n\n'],
+    ['quote', '> boundary-prefix\n\n'],
+    ['multiple-rich-blocks', multipleRichBlocks],
+  ] as const
+  const measurements: Array<{ boundary: string; frozen: boolean; streaming: number; settled: number }> = []
+  const body = page.locator('[data-surface="chat"]')
+  const offsets = (prefix = 'boundary-prefix', tail = 'boundary-tail') => body.evaluate((root, tokens) => {
+    const tokenTop = (token: string) => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const start = (node.textContent || '').indexOf(token)
+        if (start < 0) continue
+        const range = document.createRange()
+        range.setStart(node, start)
+        range.setEnd(node, start + token.length)
+        return range.getBoundingClientRect().top
+      }
+      throw new Error(`Missing boundary token: ${token}`)
+    }
+    return tokenTop(tokens.tail) - tokenTop(tokens.prefix)
+  }, { prefix, tail })
+  for (const [name, prefix] of prefixes) {
+    for (const frozen of [false, true]) {
+      const content = prefix + 'boundary-tail ' + 'plain prose '.repeat(frozen ? 2_000 : 2)
+      await page.evaluate(async value => {
+        await window.richtextPreview.setContent(value)
+        await window.richtextPreview.setStreaming(true)
+        await document.fonts.ready
+      }, content)
+      await expect(body.locator('.streaming-plain-block')).toHaveCount(frozen ? 1 : 0)
+      const streamingOffset = await offsets()
+      if (name === 'table' && !frozen) {
+        await page.screenshot({ path: testInfo.outputPath('table-prose-streaming.png') })
+      }
+      await page.evaluate(() => window.richtextPreview.setStreaming(false))
+      await expect(body.locator('.streaming-text-part')).toHaveCount(0)
+      const settledOffset = await offsets()
+      measurements.push({ boundary: name, frozen, streaming: streamingOffset, settled: settledOffset })
+      expect(Math.abs(settledOffset - streamingOffset), `${name}, frozen=${frozen}`).toBeLessThanOrEqual(2)
+      if (name === 'table' && !frozen) {
+        await page.screenshot({ path: testInfo.outputPath('table-prose-settled.png') })
+      }
+    }
+  }
+  // Adding an open tail must only change its own boundary. Earlier committed
+  // rich blocks keep their existing geometry and copy controls.
+  await page.evaluate(async value => {
+    await window.richtextPreview.setContent(value)
+    await window.richtextPreview.setStreaming(true)
+  }, multipleRichBlocks)
+  const richOnlyOffset = await offsets('earlier-prefix', 'boundary-prefix')
+  await page.evaluate(value => window.richtextPreview.setContent(value + 'boundary-tail prose'), multipleRichBlocks)
+  expect(Math.abs((await offsets('earlier-prefix', 'boundary-prefix')) - richOnlyOffset)).toBeLessThanOrEqual(2)
+  await expect(body.locator('.code-copy-btn')).toHaveCount(1)
+  const reportPath = testInfo.outputPath('prose-boundaries.json')
+  await writeFile(reportPath, JSON.stringify(measurements, null, 2), 'utf8')
+  await testInfo.attach('prose-boundaries.json', { path: reportPath, contentType: 'application/json' })
+})
+
 test('all themes retain legible math and process diagram with one copy control', async ({ page }) => {
   test.setTimeout(90_000)
   await page.evaluate(() => window.richtextPreview.setSurface('process'))

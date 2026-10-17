@@ -231,6 +231,12 @@ watch(() => props.rawText, update, { immediate: true })
 /* A committed block ends with the shared 12px Markdown margin, including at
    the boundary with the next block. Do not add a second container gap. */
 .streaming-rich-block :deep(> :first-child) { margin-top: 0; }
+/* Settled prose starts a paragraph with a 12px margin. Keep that same
+   boundary before the open/plain tail; shorter table/heading margins would
+   otherwise move the text when the live answer becomes canonical. */
+.streaming-rich-block:has(+ .streaming-plain-block, + .streaming-tail) {
+  margin-bottom: 0.75rem;
+}
 .streaming-rich-block :deep(pre) {
   margin: 0.75rem 0;
   padding: 0.75rem 0.875rem 0.875rem;
