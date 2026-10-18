@@ -30,6 +30,7 @@ from opensquilla.provider.image_generation_credentials import (
     resolve_image_generation_credential,
 )
 from opensquilla.provider.image_generation_policy import (
+    OPENAI_IMAGE_GENERATION_DEFAULT_MODEL,
     conflicting_image_generation_endpoint_provider,
     is_valid_image_generation_base_url,
     parse_image_generation_model_ref,
@@ -161,7 +162,7 @@ def _detach_exception(exc: Exception) -> Exception:
 
 class OpenAIImageGenerationProvider:
     provider_id = "openai"
-    default_model = "gpt-image-1"
+    default_model = OPENAI_IMAGE_GENERATION_DEFAULT_MODEL
     auth_env_vars: tuple[str, ...] = ("OPENAI_API_KEY",)
 
     def __init__(

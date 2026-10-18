@@ -1972,6 +1972,42 @@ def test_image_generation_persisted_default_primary_still_adds_llm_provider(
     )
 
 
+def test_image_generation_openai_defaults_avoid_retired_gpt_image_1() -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.provider.image_generation import OpenAIImageGenerationProvider
+    from opensquilla.provider.image_generation_catalog import (
+        get_image_generation_provider_catalog_entry,
+    )
+
+    entry = get_image_generation_provider_catalog_entry("openai")
+    assert entry is not None
+    assert ImageGenerationConfig().primary == "openai/gpt-image-2.5-flare"
+    assert OpenAIImageGenerationProvider.default_model == "gpt-image-2.5-flare"
+    assert entry.default_model == "openai/gpt-image-2.5-flare"
+    assert entry.suggested_models == ("openai/gpt-image-2.5-flare",)
+
+
+def test_image_generation_legacy_default_primary_still_adds_llm_provider(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    from opensquilla.gateway.config import ImageGenerationConfig, LlmProviderConfig
+    from opensquilla.tools.builtin.media import (
+        _resolve_image_generation_candidates,
+        configure_image_generation,
+    )
+
+    image_config = ImageGenerationConfig(primary="openai/gpt-image-1")
+    configure_image_generation(
+        image_config,
+        llm_config=LlmProviderConfig(provider="openrouter", api_key="sk-or-configured"),
+    )
+
+    assert "openrouter/google/gemini-3.1-flash-image-preview" in (
+        _resolve_image_generation_candidates(None, image_config)
+    )
+
+
 def test_image_generation_capability_exposes_agent_tool_when_configured(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

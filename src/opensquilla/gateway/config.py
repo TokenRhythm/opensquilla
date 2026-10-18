@@ -57,6 +57,7 @@ from opensquilla.provider.credentials import (
     credential_provider_hint,
     endpoint_provider_hint,
 )
+from opensquilla.provider.image_generation_policy import DEFAULT_IMAGE_GENERATION_PRIMARY
 from opensquilla.provider.preset_registry import (
     PREVIOUS_RECOMMENDED_TEXT_MODELS,
     get_preset,
@@ -1674,7 +1675,7 @@ class ImageGenerationConfig(BaseSettings):
     # intent. Existing image sections load as ``custom`` so upgrades never
     # silently replace an operator-owned route or re-enable a disabled tool.
     binding: Literal["custom", "follow_llm"] = "custom"
-    primary: str = "openai/gpt-image-1"
+    primary: str = DEFAULT_IMAGE_GENERATION_PRIMARY
     fallbacks: list[str] = Field(default_factory=list)
     size: str = "1024x1024"
     timeout_seconds: float = 180.0

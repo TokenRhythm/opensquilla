@@ -14,6 +14,12 @@ IMAGE_GENERATION_OFFICIAL_BASE_URLS: dict[str, str] = {
     "tokenrhythm": "https://tokenrhythm.studio/v1",
     "qwen_token_plan": QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
 }
+# OpenAI shuts gpt-image-1 down on 2026-10-23 and lists gpt-image-2.5-flare as a
+# replacement: https://developers.openai.com/api/docs/deprecations
+OPENAI_IMAGE_GENERATION_DEFAULT_MODEL = "gpt-image-2.5-flare"
+DEFAULT_IMAGE_GENERATION_PRIMARY = f"openai/{OPENAI_IMAGE_GENERATION_DEFAULT_MODEL}"
+# Earlier releases wrote this default into saved configs; it still means "not chosen".
+LEGACY_DEFAULT_IMAGE_GENERATION_PRIMARY = "openai/gpt-image-1"
 _PROVIDER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
