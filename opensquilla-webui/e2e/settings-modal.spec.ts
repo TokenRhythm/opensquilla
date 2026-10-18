@@ -87,6 +87,14 @@ test.describe('Settings modal', () => {
   })
 
   test('no YAML editor, raw key search, or guided-setup wording anywhere', async ({ page }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: async (value: string) => {
+          ;(window as unknown as { settingsCopiedPath: string }).settingsCopiedPath = value
+        } },
+      })
+    })
     await openFromSidebar(page)
 
     await expect(dialog(page).getByRole('button', { name: 'YAML', exact: true })).toHaveCount(0)
@@ -103,7 +111,10 @@ test.describe('Settings modal', () => {
     await expect(file).toContainText('Configuration file')
     await expect(file.locator('code')).toContainText(/config.*\.toml/)
     await file.getByRole('button', { name: 'Copy config path' }).click()
-    await expect(page.locator('.toast', { hasText: /Copied/ }).first()).toBeVisible()
+    await expect.poll(() => page.evaluate(() =>
+      (window as unknown as { settingsCopiedPath?: string }).settingsCopiedPath,
+    )).toBe(await file.locator('code').textContent())
+    await expect(page.locator('.toast', { hasText: /Copied/ })).toHaveCount(0)
   })
 
   test('renders a failure toast above Settings from the body portal', async ({ page }) => {

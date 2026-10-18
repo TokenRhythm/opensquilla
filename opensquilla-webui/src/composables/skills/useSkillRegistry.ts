@@ -695,7 +695,6 @@ export function useSkillRegistry(
         ...(instanceId ? { instanceId } : {}),
       })
       if (res.success) {
-        pushToast(res.message || t('cronSkills.registry.installed'), { tone: 'ok' })
         const still = res.missing_still || {}
         const missingStill = {
           bins: [...(still.bins || [])],
@@ -705,6 +704,9 @@ export function useSkillRegistry(
         const stillMissing = missingStill.bins.length
           + missingStill.env.length
           + missingStill.env_any.length
+        if (stillMissing > 0) {
+          pushToast(res.message || t('cronSkills.skillDetail.installIncomplete', { count: stillMissing }), { tone: 'warn' })
+        }
         if (!(await loadData())) {
           pushToast(t('cronSkills.skillsView.reloadListFailed'), { tone: 'warn' })
         }

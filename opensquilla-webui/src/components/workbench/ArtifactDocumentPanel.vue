@@ -116,7 +116,7 @@
           @click="downloadHead"
         >
           <Icon name="download" :size="15" />
-          <span>{{ t('workbench.artifactDocument.downloadLatest') }}</span>
+          <span>{{ documentFeatures ? t('workbench.artifactDocument.downloadLatest') : t('chat.download') }}</span>
         </button>
         <small>{{ t('workbench.artifactDocument.noEditingClaim') }}</small>
       </div>

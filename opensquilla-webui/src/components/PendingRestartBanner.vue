@@ -15,7 +15,6 @@ const { pushToast } = useToasts()
 async function copyCommand(command: string): Promise<void> {
   try {
     await copyTextWithFallback(command)
-    pushToast(t('channelStatus.banner.copied'), { tone: 'ok' })
   } catch {
     pushToast(t('channelStatus.banner.copyFailed'), { tone: 'danger' })
   }

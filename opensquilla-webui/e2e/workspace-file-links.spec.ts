@@ -280,9 +280,13 @@ test('loads bounded pages, jumps and searches beyond the first page, and copies 
     [1, 200], [201, 400], [401, 600], [1, 200], [401, 600],
   ])
   expect(state.reads).toEqual([])
-  await source.getByRole('button', { name: 'Copy file contents', exact: true }).click()
-  await expect(source.getByRole('button', { name: 'Copy file contents', exact: true })).toHaveAttribute('title', 'Copied')
-  expect(await page.evaluate(() => (window as unknown as { workspaceCopied?: string }).workspaceCopied)).toBe(LARGE)
+  const copy = source.getByRole('button', { name: 'Copy file contents', exact: true })
+  const copyIcon = await copy.innerHTML()
+  await copy.click()
+  await expect(copy).toHaveAttribute('title', 'Copy file contents')
+  await expect.poll(() => page.evaluate(() => (window as unknown as { workspaceCopied?: string }).workspaceCopied)).toBe(LARGE)
+  await expect.poll(() => copy.innerHTML()).not.toBe(copyIcon)
+  await expect(copy).toHaveAttribute('aria-label', 'Copy file contents')
   expect(state.reads).toEqual([{ sessionKey: SESSION, path: 'outputs/large.py', binding: 'binding-A' }])
 })
 

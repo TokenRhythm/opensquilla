@@ -1,15 +1,18 @@
 // @vitest-environment happy-dom
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSvgDiagram, diagramExportSize, readDiagramViewBox, sanitizeDiagramSvg } from './svgDiagram'
 import { isSafeMarkdownImageSource, isSafeMarkdownLinkSource } from './markdownUris'
+import { copyTextWithFallback } from '@/utils/browser'
 
 // happy-dom strips a bare SVG root in DOMPurify's native namespace path.
 // Chrome e2e covers that integration; these tests isolate our resource gates
 // and interaction/dimension code from the emulated purifier implementation.
 vi.mock('dompurify', () => ({ default: () => ({ sanitize: (source: string) => source }) }))
+vi.mock('@/utils/browser', () => ({ copyTextWithFallback: vi.fn() }))
 
-const labels = { zoomIn: '+', zoomOut: '-', reset: 'Reset', copyCode: 'Copy', copied: 'Copied', copyFailed: 'Failed', exportPng: 'PNG', exportFailed: 'Export failed' }
-afterEach(() => document.body.replaceChildren())
+const labels = { zoomIn: '+', zoomOut: '-', reset: 'Reset', copyCode: 'Copy', copyFailed: 'Failed', exportPng: 'PNG', exportFailed: 'Export failed' }
+beforeEach(() => vi.mocked(copyTextWithFallback).mockReset().mockResolvedValue(undefined))
+afterEach(() => { document.body.replaceChildren(); vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('generated SVG resource contract', () => {
   it('preserves HTML labels and internal references while removing active/custom resources', () => {
@@ -50,6 +53,48 @@ describe('generated SVG resource contract', () => {
 })
 
 describe('diagram dimensions and retained source viewport', () => {
+  it('copies the retained source with a temporary check while keeping its action name', async () => {
+    vi.useFakeTimers()
+    const diagram = createSvgDiagram('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"/>', 'raw source', labels)
+    document.body.append(diagram.element)
+    const button = diagram.element.querySelector<HTMLButtonElement>('button[title="Copy"]')!
+    button.click()
+    await Promise.resolve()
+    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith('raw source')
+    expect(button.querySelector('polyline')).not.toBeNull()
+    expect(button.title).toBe('Copy')
+    expect(button.getAttribute('aria-label')).toBe('Copy')
+    expect(button.textContent).toBe('')
+    vi.advanceTimersByTime(1500)
+    expect(button.querySelector('polyline')).toBeNull()
+    expect(button.title).toBe('Copy')
+    diagram.dispose()
+  })
+  it('ignores an older failure and completions for a replaced toolbar', async () => {
+    const diagram = createSvgDiagram('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 80"/>', 'raw source', labels)
+    document.body.append(diagram.element)
+    const button = diagram.element.querySelector<HTMLButtonElement>('button[title="Copy"]')!
+    let rejectFirst!: (error: Error) => void
+    vi.mocked(copyTextWithFallback).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectFirst = reject }))
+    button.click()
+    button.click()
+    await Promise.resolve()
+    rejectFirst(new Error('late failure'))
+    await Promise.resolve(); await Promise.resolve()
+    expect(button.querySelector('polyline')).not.toBeNull()
+    expect(button.getAttribute('aria-label')).toBe('Copy')
+    let resolveCopy!: () => void
+    vi.mocked(copyTextWithFallback).mockImplementationOnce(() => new Promise<void>(resolve => { resolveCopy = resolve }))
+    button.click()
+    diagram.updateLabels({ ...labels, copyCode: '复制源码' })
+    resolveCopy()
+    await Promise.resolve()
+    const replacement = diagram.element.querySelector<HTMLButtonElement>('button[title="复制源码"]')!
+    expect(replacement).not.toBe(button)
+    expect(replacement.querySelector('polyline')).toBeNull()
+    expect(replacement.getAttribute('aria-label')).toBe('复制源码')
+    diagram.dispose()
+  })
   it('bounds both axes and total output pixels for very tall diagrams', () => {
     for (const [w, h] of [[800, 200], [20, 90_000], [90_000, 20], [50_000, 50_000]]) {
       const result = diagramExportSize(w, h)

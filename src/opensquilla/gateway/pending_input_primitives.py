@@ -23,7 +23,8 @@ from opensquilla.attachment_refs import (
     PendingChatInputManifestCorruptError,
     read_pending_chat_input_manifest,
 )
-from opensquilla.engine.commands import DEFAULT_REGISTRY, Surface
+from opensquilla.contracts.turn_commands import normalize_turn_command
+from opensquilla.engine.commands import DEFAULT_REGISTRY, CommandCategory, Surface
 from opensquilla.gateway import attachment_ingest
 from opensquilla.gateway.admission_input import decode_admit_turn, source_hint_from_turn
 from opensquilla.gateway.turn_ingress import request_fingerprint
@@ -58,6 +59,9 @@ def pending_input_payload(turn: AdmitTurn, confirmed_plain_text: bool) -> dict[s
         "clientMessageId": turn.client_message_id,
         "_source": source,
     }
+    command = normalize_turn_command((turn.capture.input_provenance or {}).get("turn_command"))
+    if command is not None:
+        payload["turnCommand"] = command
     if turn.required_services:
         # Preserve the producer dependency fence through the durable pending
         # queue.  Re-dispatch decodes this payload before acceptance; dropping
@@ -140,6 +144,8 @@ def pending_input_projection(
         result["pageContext"] = payload["pageContext"]
     if payload.get("selectedSkills"):
         result["selectedSkills"] = payload["selectedSkills"]
+    if payload.get("turnCommand") is not None:
+        result["turnCommand"] = normalize_turn_command(payload["turnCommand"])
     if payload.get("localPathReferences"):
         result["localPathReferences"] = payload["localPathReferences"]
     routing = payload.get("initialRoutingMode")
@@ -183,6 +189,7 @@ def stored_pending_input(row: PendingChatInput) -> StoredPendingInput:
             row.payload.get(name) is not None
             for name in (
                 "pageContext",
+                "turnCommand",
                 "workspaceFiles",
                 "intent",
                 "model",
@@ -214,6 +221,8 @@ class GatewayPendingInputPrimitives:
     def control_commands() -> frozenset[str]:
         names = {"/plan"}
         for command in DEFAULT_REGISTRY.for_surface(Surface.WEB_CHAT):
+            if command.category == CommandCategory.TURN:
+                continue
             names.add(command.name.casefold())
             names.update(alias.casefold() for alias in command.aliases)
         return frozenset(names)

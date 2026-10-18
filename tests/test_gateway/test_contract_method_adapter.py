@@ -27,6 +27,7 @@ from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
     "method",
     (
         "sandbox.path.list",
+        "workspaces.create",
         "workspaces.open",
         "workspaces.update",
         "workspaces.pin",

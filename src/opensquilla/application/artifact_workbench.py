@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NotRequired, Protocol, TypedDict
+
+from opensquilla.contracts.content_material import (
+    ContentExportError as ContentExportError,
+)
+from opensquilla.contracts.content_material import (
+    ContentMaterial as ContentMaterial,
+)
 
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
@@ -362,15 +369,6 @@ class ContentIntegrityError(RuntimeError):
     """Stored Workbench content failed its integrity check."""
 
 
-class ContentExportError(RuntimeError):
-    """A bounded HTML archive cannot be exported safely."""
-
-    def __init__(self, code: str, status_code: int, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.status_code = status_code
-
-
 class AttachmentClaimError(ValueError):
     """A strict attachment admission policy rejected the claimed MIME."""
 
@@ -480,15 +478,6 @@ class WorkingFileMaterial:
     path: Path
     media_type: str
     data: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class ContentMaterial:
-    path: Path | None
-    media_type: str
-    filename: str | None = None
-    data: bytes | None = None
-    cleanup: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass(frozen=True, slots=True)

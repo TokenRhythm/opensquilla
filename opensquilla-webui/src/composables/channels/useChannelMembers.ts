@@ -218,7 +218,6 @@ export function useChannelMembers(
             ? t('console.channels.pairings.approveAdminSuccess', { sender })
             : t('console.channels.pairings.approveSuccess', { sender })
           if (activeName.value === name) announcement.value = message
-          pushToast(message, { tone: 'ok' })
         }
         if (activeName.value === name) await load(name)
       } catch (err) {
@@ -252,7 +251,6 @@ export function useChannelMembers(
         announcement.value = admin
           ? t('console.channels.pairings.adminGrantedSuccess', { sender })
           : t('console.channels.pairings.adminRemovedSuccess', { sender })
-        pushToast(announcement.value, { tone: 'ok' })
         await load(name)
       } catch (err) {
         error.value = t('console.channels.pairings.adminUpdateFailed', { sender, error: errorMessage(err) })
@@ -281,7 +279,6 @@ export function useChannelMembers(
       try {
         await channelAdministration.setAdmin(name, senderId, false)
         announcement.value = t('console.channels.pairings.adminRemovedSuccess', { sender: senderId })
-        pushToast(announcement.value, { tone: 'ok' })
         await load(name)
       } catch (err) {
         error.value = t('console.channels.pairings.adminUpdateFailed', { sender: senderId, error: errorMessage(err) })
@@ -303,7 +300,6 @@ export function useChannelMembers(
       try {
         await channelAdministration.revokePairing(name, pairing.pairingId)
         announcement.value = t('console.channels.pairings.revokeSuccess', { sender })
-        pushToast(announcement.value, { tone: 'ok' })
         await load(name)
       } catch (err) {
         error.value = t('console.channels.pairings.revokeFailed', { sender, error: errorMessage(err) })

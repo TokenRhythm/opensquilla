@@ -18,7 +18,7 @@
         <span v-else class="workspace-file__language">{{ snapshot.relativePath.split('.').pop()?.toUpperCase() }}</span>
         <span class="workspace-file__spacer" />
         <button type="button" class="workspace-file__tool" :aria-label="t('workspaceReference.search')" :title="t('workspaceReference.search')" :aria-expanded="toolsOpen" @click="toolsOpen = !toolsOpen; mode = 'source'"><span v-html="getIconSvg('search', 15)" /></button>
-        <button type="button" class="workspace-file__tool" :disabled="copying" :aria-label="t('workspaceReference.copyContents')" :title="copied ? t('workspaceReference.copied') : t('workspaceReference.copyContents')" @click="copyContents"><span v-html="getIconSvg(copied ? 'check' : 'copy', 15)" /></button>
+        <button type="button" class="workspace-file__tool" :disabled="copying" :aria-label="t('workspaceReference.copyContents')" :title="t('workspaceReference.copyContents')" @click="copyContents"><span v-html="getIconSvg(copied ? 'check' : 'copy', 15)" /></button>
       </div>
       <div v-show="toolsOpen" class="workspace-file__find">
         <label>

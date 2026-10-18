@@ -5,9 +5,11 @@ import sqlite3
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
+from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.persistence.migrator import apply_pending
 from opensquilla.persistence.router_decision_writer import (
     open_router_decision_writer,
@@ -85,6 +87,167 @@ async def test_legacy_project_adoption_cas_does_not_create_or_bind_stale_candida
         assert await storage.list_project_workspaces() == []
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_project_paths_remain_protected_after_removal_and_restart(tmp_path) -> None:
+    db_path = str(tmp_path / "sessions.db")
+    active_path = str(tmp_path / "active-project")
+    removed_path = str(tmp_path / "removed-project")
+    async with SessionStorage(db_path) as storage:
+        assert storage.protected_project_paths == set()
+        for path in (active_path, removed_path):
+            workspace = await storage.create_or_restore_project_workspace(
+                path=path,
+                path_key=project_path_key(path),
+                display_name=Path(path).name,
+                trusted_at=100,
+            )
+        await storage.remove_project_workspace(workspace.workspace_id)
+
+        assert storage.protected_project_paths == {active_path, removed_path}
+        assert [item.path for item in await storage.list_project_workspaces()] == [active_path]
+
+    async with SessionStorage(db_path) as reopened:
+        assert reopened.protected_project_paths == {active_path, removed_path}
+
+
+@pytest.mark.asyncio
+async def test_project_path_is_protected_even_if_registration_rolls_back(tmp_path) -> None:
+    path = str(tmp_path / "project")
+    async with SessionStorage(str(tmp_path / "sessions.db")) as storage:
+        await storage.conn.execute(
+            """CREATE TRIGGER reject_project_insert BEFORE INSERT ON project_workspaces
+            BEGIN SELECT RAISE(ABORT, 'test registration failure'); END"""
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="test registration failure"):
+            await storage.create_or_restore_project_workspace(
+                path=path, path_key=project_path_key(path), display_name="project", trusted_at=100,
+            )
+
+        assert path in storage.protected_project_paths
+        assert await storage.list_project_workspaces() == []
+
+
+def _execution_binding(path: Path, *, kind: str = "configured") -> dict:
+    return {"version": 1, "id": str(uuid4()), "kind": kind, "root": str(path)}
+
+
+def _workspace_origin(path: Path) -> dict:
+    return {"sandbox_run_context": {"run_mode": "standard", "workspace": str(path)}}
+
+
+@pytest.mark.asyncio
+async def test_session_source_paths_protected_before_catalog_adoption_and_after_restart(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "sessions.db")
+    configured = tmp_path / "configured"
+    legacy = tmp_path / "legacy"
+    damaged = tmp_path / "damaged-configured"
+    default = resolve_agent_workspace_dir("main").resolve()
+    expected = {str(configured), str(legacy), str(damaged), str(default)}
+    sessions = [
+        {"execution_workspace": _execution_binding(configured)},
+        {"origin": _workspace_origin(legacy)},
+        {"execution_workspace": {**_execution_binding(damaged), "id": "damaged"}},
+        # Explicit configured ownership differs from an implicit default origin.
+        {"execution_workspace": _execution_binding(default)},
+        {
+            "execution_workspace": _execution_binding(tmp_path / "managed", kind="managed"),
+            "origin": _workspace_origin(tmp_path / "managed"),
+        },
+        {"origin": _workspace_origin(default)},
+        {"agent_id": "ops", "origin": _workspace_origin(
+            resolve_agent_workspace_dir("ops").resolve(),
+        )},
+    ]
+    async with SessionStorage(db_path) as storage:
+        for index, fields in enumerate(sessions):
+            await storage.upsert_session(SessionNode(
+                session_key=f"agent:main:webchat:source-{index}", **fields,
+            ))
+        assert storage.protected_project_paths == expected
+        assert await storage.list_project_workspaces() == []
+
+    async with SessionStorage(db_path) as reopened:
+        assert reopened.protected_project_paths == expected
+        assert await reopened.list_project_workspaces() == []
+
+
+@pytest.mark.asyncio
+async def test_implicit_default_and_managed_session_roots_remain_maintainable(
+    tmp_path: Path,
+) -> None:
+    db_path = str(tmp_path / "sessions.db")
+    async with SessionStorage(db_path) as storage:
+        for agent_id in ("main", "ops"):
+            await storage.insert_session(SessionNode(
+                session_key=f"agent:{agent_id}:webchat:default-origin", agent_id=agent_id,
+                origin=_workspace_origin(resolve_agent_workspace_dir(agent_id).resolve()),
+            ))
+        await storage.insert_session(SessionNode(
+            session_key="agent:main:webchat:managed",
+            execution_workspace=_execution_binding(tmp_path / "managed", kind="managed"),
+            origin=_workspace_origin(tmp_path / "old-managed-origin"),
+        ))
+        assert storage.protected_project_paths == set()
+    async with SessionStorage(db_path) as reopened:
+        assert reopened.protected_project_paths == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", [
+    "insert", "upsert", "patch", "patch_binding", "origin_cas", "accept", "accept_update",
+])
+async def test_session_binding_write_protects_source_immediately(
+    tmp_path: Path, operation: str,
+) -> None:
+    path = tmp_path / "project"
+    session = SessionNode(session_key="agent:main:webchat:source-write")
+    async with SessionStorage(str(tmp_path / "sessions.db")) as storage:
+        if operation in {"patch", "patch_binding", "origin_cas", "accept_update"}:
+            await storage.insert_session(session)
+        if operation == "insert":
+            session.execution_workspace = _execution_binding(path)
+            await storage.insert_session(session)
+        elif operation == "upsert":
+            session.execution_workspace = _execution_binding(path)
+            await storage.upsert_session(session)
+        elif operation == "patch":
+            await storage.update_session_fields(
+                session.session_key, {"origin": _workspace_origin(path)},
+            )
+        elif operation == "patch_binding":
+            await storage.update_session_fields(
+                session.session_key, {"execution_workspace": _execution_binding(path)},
+            )
+        elif operation == "origin_cas":
+            assert await storage.compare_and_set_session_origin(
+                expected_session=session, expected_origin=None,
+                origin=_workspace_origin(path), workspace_guard=None,
+            ) is not None
+        else:
+            if operation == "accept":
+                session.execution_workspace = _execution_binding(path)
+            await storage.accept_turn(
+                TranscriptEntry(
+                    session_id=session.session_id, session_key=session.session_key,
+                    message_id="source-message", role="user", content="source", created_at=200,
+                ),
+                expected_epoch=0, updated_at=200,
+                session_node=session if operation == "accept" else None,
+                session_updates={"origin": _workspace_origin(path)}
+                if operation == "accept_update" else None,
+                task_record=AgentTaskRecord(
+                    task_id="source-task", session_key=session.session_key,
+                    agent_id="main", created_at=200, updated_at=200,
+                ),
+                source_scope="source-test", request_session_key=session.session_key,
+                client_request_id="source-request", request_fingerprint="sha256:source",
+            )
+        assert storage.protected_project_paths == {str(path)}
 
 
 async def _seed_session_history(

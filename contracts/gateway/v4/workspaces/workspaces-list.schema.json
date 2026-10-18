@@ -11,7 +11,8 @@
   "$defs": {
     "Params": {"type": "object", "additionalProperties": false},
     "Workspace": {"type": "object", "additionalProperties": true, "required": ["id", "name", "path", "taskCount", "pinned", "available"], "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "path": {"type": "string"}, "taskCount": {"type": "integer", "minimum": 0}, "pinned": {"type": "boolean"}, "available": {"type": "boolean"}, "availabilityReason": {"type": ["string", "null"]}}},
-    "Result": {"type": "object", "additionalProperties": false, "required": ["workspaces"], "properties": {"workspaces": {"type": "array", "items": {"$ref": "#/$defs/Workspace"}}}},
+    "CreationDefaults": {"type": "object", "additionalProperties": false, "required": ["parentPath", "hostName", "platform"], "properties": {"parentPath": {"type": ["string", "null"]}, "hostName": {"type": "string"}, "platform": {"enum": ["windows", "posix"]}}},
+    "Result": {"type": "object", "additionalProperties": false, "required": ["workspaces"], "properties": {"workspaces": {"type": "array", "items": {"$ref": "#/$defs/Workspace"}}, "creationDefaults": {"$ref": "#/$defs/CreationDefaults"}}},
     "RpcError": {"type": "object", "additionalProperties": true},
     "RequestFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "method"], "properties": {"type": {"const": "req"}, "id": {"type": "string"}, "method": {"const": "workspaces.list"}, "params": {"$ref": "#/$defs/Params"}}},
     "ResponseFrame": {"type": "object", "additionalProperties": true, "required": ["type", "id", "ok"], "properties": {"type": {"const": "res"}, "id": {"type": "string"}, "ok": {"type": "boolean"}, "payload": {"$ref": "#/$defs/Result"}, "error": {"$ref": "#/$defs/RpcError"}}}

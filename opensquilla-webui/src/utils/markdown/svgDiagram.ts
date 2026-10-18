@@ -8,7 +8,6 @@ export interface SvgDiagramLabels {
   zoomOut: string
   reset: string
   copyCode: string
-  copied: string
   copyFailed: string
   exportPng: string
   exportFailed: string
@@ -201,6 +200,8 @@ function namespaceDiagramIds(root: HTMLElement): void {
 function buildToolbar(svgWrap: HTMLElement, source: string, labels: SvgDiagramLabels): HTMLElement {
   const bar = document.createElement('div')
   bar.className = 'mermaid-toolbar'
+  let copyRequest = 0
+  let copyTimer: number | undefined
   const specs: Array<{ title: string, content: string | Node, action: (button: HTMLButtonElement) => void }> = [
     { title: labels.zoomIn, content: '+', action: () => applyZoom(svgWrap, ZOOM_STEP) },
     { title: labels.zoomOut, content: '−', action: () => applyZoom(svgWrap, -ZOOM_STEP) },
@@ -209,18 +210,20 @@ function buildToolbar(svgWrap: HTMLElement, source: string, labels: SvgDiagramLa
       title: labels.copyCode,
       content: copyIconSvg('idle'),
       action: (button) => {
+        const request = ++copyRequest
+        window.clearTimeout(copyTimer)
         void copyTextWithFallback(source).then(() => {
+          if (!button.isConnected || request !== copyRequest) return
           button.replaceChildren(copyIconSvg('copied'))
-          button.title = labels.copied
-          button.setAttribute('aria-label', labels.copied)
-          window.setTimeout(() => {
-            if (!button.isConnected) return
+          button.title = labels.copyCode
+          button.setAttribute('aria-label', labels.copyCode)
+          copyTimer = window.setTimeout(() => {
+            if (!button.isConnected || request !== copyRequest) return
             button.replaceChildren(copyIconSvg('idle'))
-            button.title = labels.copyCode
-            button.setAttribute('aria-label', labels.copyCode)
+            copyTimer = undefined
           }, 1500)
         }).catch(() => {
-          if (!button.isConnected) return
+          if (!button.isConnected || request !== copyRequest) return
           button.replaceChildren(copyIconSvg('error'))
           button.title = labels.copyFailed
           button.setAttribute('aria-label', labels.copyFailed)

@@ -257,7 +257,7 @@ describe('PromptCacheKeepaliveDialog', () => {
     app.unmount()
   })
 
-  it('confirms when keepalive is turned off', async () => {
+  it('reports the saved state without a success toast when keepalive is turned off', async () => {
     const enabledStatus = {
       enabled: true,
       ttlSeconds: 300,
@@ -282,9 +282,13 @@ describe('PromptCacheKeepaliveDialog', () => {
 
     const host = document.createElement('div')
     document.body.appendChild(host)
+    const saved = vi.fn()
+    const closed = vi.fn()
     const app = createApp(PromptCacheKeepaliveDialog, {
       open: true,
       sessionKey: 'agent:main:webchat:test',
+      onSaved: saved,
+      onClose: closed,
     })
     app.use(i18n)
     app.provide(PROMPT_CACHE_LEASE_KEY, promptCacheLease)
@@ -300,11 +304,9 @@ describe('PromptCacheKeepaliveDialog', () => {
     document.body.querySelector<HTMLButtonElement>('.btn--primary')?.click()
     await settle()
 
-    const disabledToasts = useToasts().toasts.value
-    expect(disabledToasts[disabledToasts.length - 1]).toMatchObject({
-      message: 'Prompt cache keepalive turned off.',
-      tone: 'ok',
-    })
+    expect(saved).toHaveBeenCalledWith({ sessionKey: 'agent:main:webchat:test', status: offStatus })
+    expect(closed).toHaveBeenCalledOnce()
+    expect(useToasts().toasts.value).toHaveLength(0)
     app.unmount()
   })
 

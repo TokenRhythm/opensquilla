@@ -4,7 +4,6 @@
 // unblock. Content (URLs, JSON) is machine material from the catalog; labels
 // are localized here by aid id. Links substitute the draft's App id and swap
 // to the Lark console domain when the entry targets lark.
-import { ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChannelSetupAid } from '@/composables/channels/useChannelEditor'
 
@@ -22,14 +21,9 @@ function aidHref(aid: ChannelSetupAid): string {
   return url
 }
 
-const copiedAidId = ref('')
 async function copyAid(aid: ChannelSetupAid) {
   try {
     await navigator.clipboard.writeText(aid.content || '')
-    copiedAidId.value = aid.id
-    window.setTimeout(() => {
-      if (copiedAidId.value === aid.id) copiedAidId.value = ''
-    }, 2000)
   } catch {
     /* clipboard unavailable — the manifest is also in the docs */
   }
@@ -43,7 +37,7 @@ async function copyAid(aid: ChannelSetupAid) {
       <div v-if="aid.kind === 'copy'" class="fsa__aid">
         <span>{{ t(`setup.channels.aids.${aid.id}`) }}</span>
         <button type="button" class="btn btn--ghost fsa__btn" @click="copyAid(aid)">
-          {{ copiedAidId === aid.id ? t('setup.channels.aids.copied') : t('setup.channels.aids.copy') }}
+          {{ t('setup.channels.aids.copy') }}
         </button>
       </div>
       <div v-else-if="aid.kind === 'link'" class="fsa__aid">

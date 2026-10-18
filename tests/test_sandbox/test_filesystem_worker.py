@@ -673,6 +673,25 @@ def test_create_source_does_not_leave_empty_file_when_utf8_encoding_fails(
     assert not target.exists()
 
 
+def test_edit_source_worker_inserts_into_empty_file_with_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.tools.source_edit_contract import source_revision_for_path
+
+    target = tmp_path / "AGENTS.md"
+    target.write_bytes(b"")
+    revision = source_revision_for_path(target)
+    monkeypatch.setattr(filesystem_worker, "_authorized_source_target", lambda _payload: target)
+    payload = {
+        "expectedRevision": revision,
+        "edits": [{"start_line": 0, "end_line": 0, "replacement": "项目规则\n"}],
+    }
+    result = filesystem_worker._edit_source(payload)
+    assert result["status"] == "applied"
+    assert target.read_bytes() == "项目规则\n".encode()
+    assert filesystem_worker._edit_source(payload)["status"] == "revision_conflict"
+
+
 def test_apply_patch_accepts_explicit_target_outside_patch_root(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

@@ -259,9 +259,6 @@ async def run_agent_once(
     tool_workspace_dir: str | None
     if active_workspace and agent_id != "main":
         resolved_path = resolve_agent_workspace_dir(agent_id, service_cfg)
-        # Mirror gateway boot.py:594 — pre-create the per-agent dir so
-        # shell/cwd-based tools do not hit FileNotFoundError on first use.
-        resolved_path.mkdir(parents=True, exist_ok=True)
         tool_workspace_dir = str(resolved_path)
     else:
         tool_workspace_dir = active_workspace
@@ -301,6 +298,21 @@ async def run_agent_once(
     done: DoneEvent | None = None
 
     try:
+        if workspace is None and getattr(cfg, "workspace_dir_source", None) == "default":
+            from opensquilla.gateway.session_services import get_session_storage
+            from opensquilla.identity.bootstrap import ensure_agent_workspace
+            from opensquilla.memory.source_protection import policy_for_storage
+
+            # CLI pins its effective startup directory as a configured binding
+            # for compatibility. That runtime override is not a user-selected
+            # project: initialize the original application default only when no
+            # persisted project/session source overlaps it.
+            maintenance = policy_for_storage(cfg, get_session_storage(svc.session_manager))
+            if maintenance.bootstrap_allowed(agent_id):
+                ensure_agent_workspace(
+                    resolve_agent_workspace_dir(agent_id, cfg),
+                    seed_templates=seed_agent_workspaces,
+                )
         session_result = await svc.session_manager.get_or_create(
             session_key,
             agent_id=agent_id,

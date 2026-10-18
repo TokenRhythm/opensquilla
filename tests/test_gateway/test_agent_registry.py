@@ -126,3 +126,64 @@ async def test_registry_get_identity_rejects_hardlinked_identity_file(tmp_path) 
 
     with pytest.raises(ValueError, match="hardlinked"):
         await registry.get_identity("main")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_id", ["main", "ops"])
+async def test_registry_file_reads_do_not_create_missing_workspace(tmp_path, agent_id) -> None:
+    workspace = tmp_path / "missing" / agent_id
+    cfg = GatewayConfig(
+        workspace_dir=str(workspace),
+        agents=[AgentEntryConfig(id="ops", workspace=str(workspace))],
+    )
+    registry = AgentRegistry(cfg, persist_changes=False)
+
+    listed = await registry.list_agent_files(agent_id)
+    with pytest.raises(FileNotFoundError):
+        await registry.get_agent_file(agent_id, "AGENTS.md")
+
+    assert listed
+    assert all(item["status"] == "missing" for item in listed)
+    assert not workspace.parent.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agents_content", [b"", b"# User rules\r\nKeep this text.\r\n"])
+async def test_registry_file_reads_preserve_existing_workspace(tmp_path, agents_content) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    originals = {
+        "AGENTS.md": agents_content,
+        "SOUL.md": b"User-maintained persona\r\n",
+        "notes.txt": b"Ordinary project file\x00",
+    }
+    for name, content in originals.items():
+        (workspace / name).write_bytes(content)
+    registry = AgentRegistry(
+        GatewayConfig(workspace_dir=str(workspace)), persist_changes=False,
+    )
+
+    listed = {item["name"]: item for item in await registry.list_agent_files("main")}
+    read = await registry.get_agent_file("main", "AGENTS.md")
+
+    assert listed["AGENTS.md"]["status"] == "present"
+    assert listed["AGENTS.md"]["size"] == len(agents_content)
+    assert listed["IDENTITY.md"]["status"] == "missing"
+    assert read["content"] == agents_content.decode().replace("\r\n", "\n")
+    assert {path.name: path.read_bytes() for path in workspace.iterdir()} == originals
+
+
+@pytest.mark.asyncio
+async def test_registry_file_set_creates_only_requested_file(tmp_path) -> None:
+    workspace = tmp_path / "missing" / "workspace"
+    registry = AgentRegistry(
+        GatewayConfig(workspace_dir=str(workspace)), persist_changes=False,
+    )
+
+    result = await registry.set_agent_file("main", "USER.md", "Name: Mira\n")
+
+    assert result == {
+        "name": "USER.md", "path": "USER.md", "size": 11,
+    }
+    assert {path.name for path in workspace.iterdir()} == {"USER.md"}
+    assert (workspace / "USER.md").read_text(encoding="utf-8") == "Name: Mira\n"

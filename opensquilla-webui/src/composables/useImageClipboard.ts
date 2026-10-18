@@ -104,7 +104,6 @@ export function useImageClipboard(options: {
         }
       }), controller.signal)
       assertCurrent()
-      pushToast(t(mode === 'image' ? 'imageClipboard.copiedImage' : 'imageClipboard.copiedSource'), { tone: 'ok' })
       return true
     } catch (error) {
       const failure = preparationError ?? error

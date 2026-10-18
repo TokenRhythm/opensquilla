@@ -201,6 +201,12 @@ from opensquilla.execution_status import (
     normalize_execution_status,
 )
 from opensquilla.git_runtime import git_run_mode_scope
+from opensquilla.identity.project_instructions import (
+    SOURCE_TOOLS,
+    ProjectInitRequest,
+    ProjectRulesSnapshot,
+    load_project_rules,
+)
 from opensquilla.observability.decision_log import (
     DecisionEntry,
     PipelineStepRecord,
@@ -4712,6 +4718,7 @@ class TurnRunner:
             Callable[[object, object | None, dict[str, Any]], Any | None] | None
         ) = None,
         usage_telemetry: UsageTelemetryPort | None = None,
+        memory_managers: dict[str, Any] | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._session_deployment_resolver = session_deployment_resolver
@@ -4722,6 +4729,7 @@ class TurnRunner:
         self._config = config
         self._last_agent_max_iterations_source = "AgentConfig default"
         self._memory_sync_managers = memory_sync_managers
+        self._memory_managers = memory_managers
         self._model_catalog = model_catalog
         self._memory_retrievers = memory_retrievers
         self._turn_capture_services = turn_capture_services
@@ -4954,7 +4962,9 @@ class TurnRunner:
         ws = self._resolve_memory_source_dir(agent_id)
         new_snap = MemorySnapshot(
             memory_md=self._load_memory_md(ws),
-            daily_notes=self._load_daily_notes(ws),
+            daily_notes=self._load_daily_notes(
+                ws, notes_dir=self._resolve_memory_notes_dir(agent_id),
+            ),
         )
         for key in list(self._memory_snapshots):
             if key[0] == agent_id:
@@ -4974,13 +4984,20 @@ class TurnRunner:
         """Drop frozen bootstrap snapshots after a bootstrap workspace file write."""
         self.invalidate_profile_snapshot(agent_id)
 
+    def invalidate_memory_snapshot(self, agent_id: str) -> None:
+        """Drop one Agent's cached memory without reading unrelated source files."""
+        for key in list(self._memory_snapshots):
+            if key[0] == agent_id:
+                del self._memory_snapshots[key]
+
     def invalidate_profile_snapshot(self, agent_id: str) -> None:
         """Drop cached bootstrap/profile files for every session of one agent.
 
         Profile writers outside the tool loop (for example, an operator-confirmed
         profile import) call this after committing ``USER.md`` so the next turn
-        reloads the file from disk.  Memory snapshots are intentionally separate
-        and continue to be refreshed through :meth:`refresh_memory_snapshot`.
+        reloads the file from disk. Memory snapshots are separate: management
+        file writes evict them through :meth:`invalidate_memory_snapshot`, while
+        memory tools continue to use :meth:`refresh_memory_snapshot`.
         """
         for key in list(self._bootstrap_snapshots):
             if key[0] == agent_id:
@@ -4998,6 +5015,16 @@ class TurnRunner:
                 )
             except Exception:  # noqa: BLE001 - memory path should not block tool setup
                 pass
+
+        if not tool_context.memory_notes_dir:
+            tool_context = replace(
+                tool_context, memory_notes_dir=str(self._resolve_memory_notes_dir(agent_id)),
+            )
+        if not tool_context.bootstrap_source_dir:
+            tool_context = replace(
+                tool_context,
+                bootstrap_source_dir=str(self._resolve_bootstrap_workspace_dir(agent_id)),
+            )
 
         previous_memory_write = tool_context.on_memory_source_write
         if previous_memory_write is None:
@@ -6014,6 +6041,8 @@ class TurnRunner:
         expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
         on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
+        project_init: ProjectInitRequest | None = None,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
     ) -> AsyncIterator[AgentEvent]:
         mark_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
         # Observability: bracket turn setup + stream loop with monotonic clock
@@ -6159,12 +6188,19 @@ class TurnRunner:
                     session_key=session_key,
                     tool_context=tool_context,
                     session_append=session_append,
+                    project_init=project_init,
                 )
             )
             runtime_message = input_out.runtime_message
             semantic_input = input_out.semantic_input
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
+            project_init = input_out.project_init
+            if project_init is not None and tool_context is not None:
+                tool_context = replace(
+                    tool_context,
+                    surfaced_tools=set(tool_context.surfaced_tools or ()) | SOURCE_TOOLS,
+                )
 
             async def _load_turn_transcript() -> Sequence[Any]:
                 if self._session_manager is None:
@@ -6288,6 +6324,11 @@ class TurnRunner:
             tool_handler = pt_out.tool_handler
             tool_context = pt_out.effective_tool_context
             tool_metadata = pt_out.tool_metadata
+            if project_init is not None:
+                authorized = getattr(tool_context, "authorized_tool_names", None)
+                if authorized is None:
+                    authorized = frozenset(tool.name for tool in tool_defs)
+                runtime_message += "\n\n" + project_init.render(authorized)
             skill_catalog = pt_out.skill_catalog
 
             # Uploaded attachments have already crossed the controlled ingress
@@ -6393,6 +6434,21 @@ class TurnRunner:
 
             with bind_usage_accounting_scope(turn_usage_scope):
                 mark_current_turn_failure_stage(TurnFailureStage.PROMPT_ASSEMBLY)
+                workspace_dir = getattr(tool_context, "workspace_dir", None)
+                if (
+                    project_rules_snapshot is None and workspace_dir
+                    and bootstrap_context_mode not in {"stateless", "heartbeat_light"}
+                ):
+                    project_rules_snapshot = load_project_rules(
+                        workspace_dir,
+                        per_file_max_chars=min(
+                            self._resolve_bootstrap_max_chars(),
+                            self._resolve_bootstrap_total_max_chars(),
+                        ),
+                        injection_scan_mode=getattr(
+                            getattr(self._config, "safety", None), "injection_scan_mode", "report",
+                        ),
+                    )
                 prompt_assembly = self._prompt_assembler_stage.run(
                     PromptAssemblerStageInput(
                         runtime_message=runtime_message,
@@ -6431,6 +6487,7 @@ class TurnRunner:
                         expected_session_epoch=expected_session_epoch,
                         provider_request_correlation=provider_request_correlation,
                         on_initial_provider_ready=on_initial_provider_ready,
+                        project_rules_snapshot=project_rules_snapshot,
                     )
                 )
                 if tool_context is not None and tool_context.selected_skills:
@@ -7551,6 +7608,8 @@ class TurnRunner:
                         expected_session_id=expected_session_id,
                         expected_session_epoch=expected_session_epoch,
                         execution_context=execution_context,
+                        project_init=project_init,
+                        project_rules_snapshot=project_rules_snapshot,
                     ),
                 )
                 async with contextlib.aclosing(replay_stream):
@@ -9516,6 +9575,9 @@ class TurnRunner:
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
         webui_rendering: bool = False,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
+        include_project_rules: bool = True,
+        persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -9595,6 +9657,28 @@ class TurnRunner:
                     report=list(visible_bootstrap_report),
                 )
         memory_source_dir = self._resolve_memory_source_dir(agent_id)
+        if (
+            project_rules_snapshot is None and workspace_dir and include_project_rules
+            and bootstrap_context_mode not in {"stateless", "heartbeat_light"}
+        ):
+            project_rules_snapshot = load_project_rules(
+                workspace_dir,
+                per_file_max_chars=min(
+                    self._resolve_bootstrap_max_chars(),
+                    self._resolve_bootstrap_total_max_chars(),
+                ),
+                injection_scan_mode=getattr(
+                    getattr(self._config, "safety", None), "injection_scan_mode", "report",
+                ),
+            )
+        if (
+            project_rules_snapshot is not None
+            and project_rules_snapshot.includes_file(bootstrap_workspace_dir / "AGENTS.md")
+        ):
+            workspace_files.pop("AGENTS.md", None)
+            visible_bootstrap_report = [
+                report for report in visible_bootstrap_report if report.filename != "AGENTS.md"
+            ]
         stateless_prompt = bootstrap_context_mode in {
             "stateless",
             "stateless_keep_project_rules",
@@ -9613,7 +9697,9 @@ class TurnRunner:
             memory_text = snap.memory_md
             daily = snap.daily_notes
         else:
-            daily = self._load_daily_notes(memory_source_dir)
+            daily = self._load_daily_notes(
+                memory_source_dir, notes_dir=self._resolve_memory_notes_dir(agent_id),
+            )
             memory_text = self._load_memory_md(memory_source_dir)
         daily_notes_count_before_omit = len(daily)
         daily_notes_omitted = daily_notes_count_before_omit > 0
@@ -9683,7 +9769,9 @@ class TurnRunner:
         }
         base_prompt = assemble_system_prompt(
             agent_profile,
-            tools=[td.name for td in tool_defs] if tool_defs else None,
+            tools=sorted(
+                {td.name for td in tool_defs} | set(persistence_tools or ()),
+            ) or None,
             memory=memory_text,
             runtime_info=runtime_info,
             docs_path=(self._resolve_docs_path()),
@@ -9698,6 +9786,10 @@ class TurnRunner:
         # Render them into the dynamic suffix instead so the base hash
         # stays stable across those rotations.
         dynamic_blocks: list[str] = []
+        if include_project_rules and project_rules_snapshot is not None:
+            project_rules_block = project_rules_snapshot.render()
+            if project_rules_block:
+                dynamic_blocks.append(project_rules_block)
         volatile_block = self._render_volatile_block(
             daily_notes=daily,
             workspace_files=workspace_files,
@@ -9727,10 +9819,22 @@ class TurnRunner:
         return None
 
     def _resolve_memory_source_dir(self, agent_id: str):
-        from opensquilla.agents.scope import resolve_agent_memory_source_dir
+        from opensquilla.agents.scope import resolve_agent_source_paths
 
-        source = getattr(getattr(self._config, "memory", None), "source", "state")
-        return resolve_agent_memory_source_dir(agent_id, self._config, source=source)
+        manager = (self._memory_managers or {}).get(agent_id)
+        source = getattr(manager, "workspace_dir", None)
+        if source is not None:
+            return source
+        return resolve_agent_source_paths(agent_id, self._config).memory_root
+
+    def _resolve_memory_notes_dir(self, agent_id: str):
+        from opensquilla.agents.scope import resolve_agent_source_paths
+
+        manager = (self._memory_managers or {}).get(agent_id)
+        notes = getattr(manager, "memory_dir", None)
+        if notes is not None:
+            return notes
+        return resolve_agent_source_paths(agent_id, self._config).notes_dir
 
     def _effective_memory_retrieval_metadata(self, agent_id: str) -> dict[str, str]:
         retrievers = self._memory_retrievers or {}
@@ -9798,12 +9902,13 @@ class TurnRunner:
         return content
 
 
-    def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
+    def _load_daily_notes(self, workspace_dir: Any, *, notes_dir: Any = None) -> dict[str, str]:
         from opensquilla.identity.workspace import load_daily_notes
 
         memory_cfg = getattr(self._config, "memory", None)
         return load_daily_notes(
             str(workspace_dir),
+            notes_dir=notes_dir,
             per_note_max_chars=getattr(memory_cfg, "daily_note_max_chars", 4000),
             total_max_chars=getattr(memory_cfg, "daily_notes_total_max_chars", 8000),
         )

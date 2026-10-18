@@ -8,20 +8,27 @@ import json
 import re
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
 import structlog
 
+from opensquilla.artifact_archives import HtmlZipExporter, capture_saved_html
 from opensquilla.artifacts import ArtifactStore, strip_artifact_markers_from_text
 from opensquilla.channels.contract import (
     ChannelCapabilities,
+    ChannelSendResult,
+    ChannelSendStatus,
     channel_capability_profile,
     normalize_channel_send_result,
 )
-from opensquilla.channels.delivery_store import deliver_operation_with_outbox
+from opensquilla.channels.delivery_store import (
+    _artifact_delivery_binding,
+    deliver_operation_with_outbox,
+)
 from opensquilla.channels.types import ChannelArtifactDeliveryRequest, IncomingMessage
+from opensquilla.contracts.content_material import ContentExportError
 from opensquilla.paths import media_root_from_config
 
 log = structlog.get_logger(__name__)
@@ -70,12 +77,41 @@ def artifact_fallback_lines(artifacts: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
     for artifact in dedupe_artifacts_for_channel_delivery(artifacts):
         name = artifact.get("name") if isinstance(artifact.get("name"), str) else "artifact"
+        issue = artifact.get("channel_delivery_issue")
+        if isinstance(issue, str) and issue:
+            lines.append(f"{name}: {issue}")
+        if artifact.get("channel_delivery_denied"):
+            continue
         target = channel_safe_artifact_url(artifact)
         if target:
             lines.append(f"Generated file: {name} -> {target}")
         else:
             lines.append(f"Generated file: {name} -> available in the OpenSquilla task")
     return lines
+
+
+def _delivery_issue(result: ChannelSendResult) -> str:
+    # Adapter reasons can contain a request repr, local paths or provider data.
+    # Only known internal outcomes and fixed adapter limits become user text.
+    if result.reason == "artifact delivery identity does not match its original session and route":
+        return "Channel delivery materials do not match the stored receipt; no confirmed receipt."
+    if re.fullmatch(
+        r"artifact delivery [0-9a-f]+ has durable outcome "
+        r"(?:pending|unknown|sent_unconfirmed); manual reconciliation is required before retry",
+        result.reason,
+    ):
+        return "Channel delivery has no confirmed receipt; awaiting confirmation."
+    if result.reason in {
+        "DingTalk artifacts must not exceed 20 MB",
+        "DingTalk artifact ZIP must not exceed 20 MB",
+        "DingTalk cannot upload an empty artifact",
+    }:
+        return result.reason + "."
+    if result.status is ChannelSendStatus.UNSUPPORTED:
+        return "This channel does not support the prepared file delivery."
+    if result.status is ChannelSendStatus.FAILED:
+        return "Channel file delivery failed; no confirmed receipt."
+    return "Channel delivery has no confirmed receipt; awaiting confirmation."
 
 
 def strip_artifact_markers_from_channel_text(text: str) -> str:
@@ -149,6 +185,44 @@ def _named_artifact_delivery_path(source: Path, filename: str) -> Iterator[Path]
         yield target
 
 
+@contextlib.asynccontextmanager
+async def _prepared_delivery_path(
+    channel: Any, store: ArtifactStore, ref: Any, path: Path,
+) -> AsyncIterator[tuple[Path, str, str, int]]:
+    """Hold immutable, complete materials until the awaited adapter has consumed them."""
+    is_html = ref.mime in {"text/html", "application/xhtml+xml"} or (
+        Path(ref.name).suffix.lower() in {".html", ".htm", ".xhtml"}
+    )
+    if is_html:
+        exporter = getattr(channel, "_artifact_zip_exporter", None)
+        if not isinstance(exporter, HtmlZipExporter):
+            exporter = HtmlZipExporter()
+            # Normal adapters retain the bounded exporter for their lifetime.
+            # Slot-only third-party adapters still work with a call-owned one.
+            with contextlib.suppress(AttributeError, TypeError):
+                setattr(channel, "_artifact_zip_exporter", exporter)
+
+        async def validate() -> None:
+            store.get_ref(artifact_id=ref.id, session_id=ref.session_id)
+
+        material = await exporter.export(
+            lambda: capture_saved_html(store, ref.id, ref.session_id),
+            validate=validate, single_file_name=ref.name,
+        )
+        assert material.path is not None and material.cleanup is not None
+        assert material.filename is not None
+        try:
+            yield (
+                material.path, material.filename, material.media_type,
+                material.path.stat().st_size,
+            )
+        finally:
+            await material.cleanup()
+        return
+    with _named_artifact_delivery_path(path, ref.name) as delivery_path:
+        yield delivery_path, ref.name, ref.mime, ref.size
+
+
 async def deliver_artifacts_as_channel_files(
     channel: Any,
     msg: IncomingMessage,
@@ -218,19 +292,35 @@ async def deliver_artifacts_as_channel_files(
         if not native_delivery or (not callable(deliver_artifact) and not callable(send_file)):
             undelivered.append(artifact)
             continue
+        sending = False
+        delivery_confirmed = False
         try:
-            with _named_artifact_delivery_path(path, ref.name) as delivery_path:
+            async with _prepared_delivery_path(channel, store, ref, path) as (
+                delivery_path, delivery_name, delivery_mime, delivery_size,
+            ):
+                original_request = ChannelArtifactDeliveryRequest(
+                    inbound=msg, artifact_id=ref.id, file_path=str(path),
+                    name=ref.name, mime_type=ref.mime, size=ref.size, session_id=session_id,
+                )
+                # Keep the identity the previous HTML sender could calculate.
+                # The outbox compares the actual ZIP metadata under this same
+                # key and refuses incompatible replay instead of uploading twice.
+                delivery_id = _artifact_delivery_binding(
+                    str(getattr(channel, "_delivery_channel_name", "") or ""), original_request,
+                )
                 request = ChannelArtifactDeliveryRequest(
                     inbound=msg,
                     artifact_id=ref.id,
                     file_path=str(delivery_path),
-                    name=ref.name,
-                    mime_type=ref.mime,
-                    size=ref.size,
+                    name=delivery_name,
+                    mime_type=delivery_mime,
+                    size=delivery_size,
                     session_id=session_id,
+                    delivery_id=delivery_id,
                 )
                 if attempted_keys is not None:
                     attempted_keys.add(key)
+                sending = True
                 result = await deliver_operation_with_outbox(
                     channel, "deliver_artifact", deliver_request, (request,), {}
                 )
@@ -240,12 +330,12 @@ async def deliver_artifacts_as_channel_files(
                     capability=capability,
                     target_id=msg.channel_id,
                 )
-                if not normalized.is_delivered():
+                if result is None or not normalized.is_delivered():
                     log.warning(
                         "channel_artifact_delivery.file_delivery_not_sent",
                         artifact_id=artifact_id,
                         channel_type=type(channel).__name__,
-                        status=normalized.status.value,
+                        status="unconfirmed" if result is None else normalized.status.value,
                         reason=(
                             ""
                             if capability == ChannelCapabilities.ARTIFACT_DELIVERY
@@ -253,9 +343,17 @@ async def deliver_artifacts_as_channel_files(
                         ),
                         retryable=normalized.retryable,
                     )
-                    undelivered.append(artifact)
-                elif delivered_keys is not None:
-                    delivered_keys.add(key)
+                    undelivered.append({
+                        **artifact,
+                        "channel_delivery_issue": (
+                            "Channel delivery has no confirmed receipt; awaiting confirmation."
+                            if result is None else _delivery_issue(normalized)
+                        ),
+                    })
+                else:
+                    delivery_confirmed = True
+                    if delivered_keys is not None:
+                        delivered_keys.add(key)
         except Exception as exc:  # noqa: BLE001 - preserve text fallback on delivery failure.
             log.warning(
                 "channel_artifact_delivery.file_delivery_failed",
@@ -263,5 +361,21 @@ async def deliver_artifacts_as_channel_files(
                 channel_type=type(channel).__name__,
                 error_type=type(exc).__name__,
             )
-            undelivered.append(artifact)
+            if delivery_confirmed:
+                # A local cleanup failure does not revoke an already confirmed
+                # remote receipt or justify another upload.
+                continue
+            issue = (
+                f"Could not prepare the complete HTML bundle: {exc}"
+                if isinstance(exc, ContentExportError)
+                else "Channel file delivery was denied."
+                if isinstance(exc, PermissionError)
+                else "Channel delivery has no confirmed receipt; awaiting confirmation."
+                if sending
+                else "Could not prepare verified delivery materials."
+            )
+            undelivered.append({
+                **artifact, "channel_delivery_issue": issue,
+                **({"channel_delivery_denied": True} if isinstance(exc, PermissionError) else {}),
+            })
     return undelivered

@@ -558,7 +558,7 @@ async def test_open_lists_empty_workspace_and_normalizes_duplicates(
     listed = await rpc_workspaces._handle_workspaces_list(None, ctx)
 
     assert duplicate["workspace"]["id"] == opened["workspace"]["id"]
-    assert listed == {
+    assert {"workspaces": listed["workspaces"]} == {
         "workspaces": [
             {
                 "id": opened["workspace"]["id"],
@@ -681,9 +681,7 @@ async def test_remove_restores_identity_and_history_delete_keeps_project(
     await rpc_workspaces._handle_workspaces_remove(
         {"workspaceId": opened["id"]}, ctx
     )
-    assert await rpc_workspaces._handle_workspaces_list(None, ctx) == {
-        "workspaces": []
-    }
+    assert (await rpc_workspaces._handle_workspaces_list(None, ctx))["workspaces"] == []
     restored = await rpc_workspaces._handle_workspaces_open(
         {"path": str(project), "trusted": True}, ctx
     )
@@ -1827,6 +1825,10 @@ async def test_all_workspace_handlers_require_local_owner(
     ctx = _remote_ctx(owner_ctx)
     calls = (
         (rpc_workspaces._handle_workspaces_list, None),
+        (
+            rpc_workspaces._handle_workspaces_create,
+            {"parentPath": str(tmp_path), "name": "new-project", "trusted": True},
+        ),
         (
             rpc_workspaces._handle_workspaces_open,
             {"path": str(tmp_path), "trusted": True},

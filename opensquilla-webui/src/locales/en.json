@@ -136,6 +136,22 @@
     "openDirectoryFailed": "Could not open the project directory. Try again.",
     "copyDirectoryFailed": "Could not copy the project directory path.",
     "projects": "Projects",
+    "addProject": "Add project",
+    "projectAction": "Project action",
+    "openExistingProject": "Open existing",
+    "saveParentDirectory": "Save in",
+    "projectLocation": "Project directory",
+    "chooseParentDirectory": "Choose parent directory",
+    "chooseExistingDirectory": "Choose existing directory",
+    "executionHost": "Computer: {host}",
+    "gatewayHost": "Gateway host",
+    "createLocationHint": "A new project directory will be created at this location.",
+    "openLocationHint": "The selected directory will be added to your projects.",
+    "createUnavailable": "This Gateway does not support creating and registering a project directly. You can still open an existing project or use the directory picker's new-folder action.",
+    "preparingProject": "Preparing…",
+    "projectOpened": "Opened project “{name}”",
+    "createProjectUnconfirmed": "There was a problem creating the project at {path}. Check the project list before trying again. {error}",
+    "openProjectFailed": "Could not open the project: {error}",
     "createProject": "Create project",
     "projectNamePlaceholder": "Project name",
     "sourceFolders": "Source folders",
@@ -373,6 +389,7 @@
     },
     "resources": {
       "title": "Files", "count": "Files ({count})", "empty": "No files or links yet.",
+      "currentWorkingFile": "Current working file", "publishedVersion": "Published version",
       "groups": { "files": "Files", "links": "Links", "attachments": "Files", "documents": "Files", "deliverables": "Files", "urls": "Links" },
       "open": "Open {name}", "preparing": "Preparing editor…", "retry": "Retry", "preview": "Preview {name}", "download": "Download {name}", "edit": "Edit a copy of {name}", "publish": "Publish {name}",
       "imported": "{name} is ready to edit.", "published": "{name} is ready to share.",
@@ -567,6 +584,8 @@
       "documentEditingRetired": "Update the client and reopen the page to send annotations as chat input."
     },
     "artifactDocument": {
+      "fixedSnapshot": "Fixed snapshot",
+      "continueEditing": "Continue editing",
       "sections": "Artifact document sections",
       "preview": "Preview",
       "source": "Source",
@@ -3835,6 +3854,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Create or improve project instructions from the current project",
         "new": "Start a new chat",
         "compact": "Shorten the current context",
         "goal": "Set a long-running goal",
@@ -4496,6 +4516,7 @@
       "sendingContinuing": "Sending reply · continuing run…"
     },
     "slashCommands": {
+      "initUnavailable": "This Gateway does not support project initialization. Update it and try again. Your draft was kept.",
       "side": {
         "closed": "The original side chat was closed. Your draft was kept. Edit the command before sending again to start a new side chat.",
         "description": "Open temporary side chat · /btw is an alias",

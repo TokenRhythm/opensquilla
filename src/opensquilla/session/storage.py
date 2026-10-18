@@ -2111,6 +2111,8 @@ class SessionStorage:
         self._monotonic = time.monotonic
         self._random = random.random
         self._restart_abandoned_session_keys: tuple[str, ...] = ()
+        # Removing a catalog entry does not authorize maintenance of its files.
+        self.protected_project_paths: set[str] = set()
 
     @property
     def restart_abandoned_session_keys(self) -> tuple[str, ...]:
@@ -2151,6 +2153,23 @@ class SessionStorage:
 
         self._legacy_project_adoption_generation += 1
 
+    def _protect_session_workspace(
+        self,
+        *,
+        agent_id: str | None,
+        execution_workspace: Any,
+        origin: Any,
+    ) -> None:
+        """Remember user roots before maintenance, without adopting or authorizing them."""
+
+        from opensquilla.project_workspaces import protected_session_workspace_path
+
+        path = protected_session_workspace_path(
+            agent_id=agent_id, execution_workspace=execution_workspace, origin=origin,
+        )
+        if path is not None:
+            self.protected_project_paths.add(path)
+
     async def connect(
         self,
         *,
@@ -2185,6 +2204,22 @@ class SessionStorage:
             # loop. Keep SQLite's startup busy budget while another opener may
             # be upgrading, then restore short waits before serving requests.
             await self._initialize_schema(goal_pause_reason=goal_pause_reason)
+            async with self._conn.execute("SELECT path FROM project_workspaces") as cursor:
+                self.protected_project_paths.update(row[0] for row in await cursor.fetchall())
+            # Recovery can open legacy tables with only a subset of today's
+            # columns. Missing metadata means no binding to classify, not an
+            # invalid database that should prevent startup or recovery.
+            async with self._conn.execute("PRAGMA table_info(sessions)") as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            projection = ", ".join(
+                name if name in columns else f"NULL AS {name}"
+                for name in ("agent_id", "execution_workspace", "origin")
+            )
+            async with self._conn.execute(
+                f"SELECT {projection} FROM sessions"  # noqa: S608 - fixed column allowlist
+            ) as cursor:
+                for row in await cursor.fetchall():
+                    self._protect_session_workspace(**dict(row))
             await self._conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
             await self._open_transcript_reader(journal_mode)
         except BaseException:
@@ -5650,6 +5685,9 @@ class SessionStorage:
         trusted_at: int | None,
         now_ms: int,
     ) -> ProjectWorkspace:
+        # Protect before yielding to SQLite; a failed registration may only
+        # conservatively suppress maintenance, never grant it permission.
+        self.protected_project_paths.add(path)
         async with conn.execute(
             "SELECT * FROM project_workspaces WHERE path_key = ?",
             (path_key,),
@@ -5938,6 +5976,18 @@ class SessionStorage:
             where_values.append(expected_session_epoch)
 
         async with self._write_transaction("update_session_fields") as conn:
+            if {"agent_id", "execution_workspace", "origin"} & updates.keys():
+                async with conn.execute(
+                    "SELECT agent_id, execution_workspace, origin FROM sessions "
+                    "WHERE session_key = ?", (session_key,),
+                ) as cur:
+                    previous_workspace = await cur.fetchone()
+                if previous_workspace is not None:
+                    workspace_fields = dict(previous_workspace)
+                    workspace_fields.update({
+                        key: value for key, value in updates.items() if key in workspace_fields
+                    })
+                    self._protect_session_workspace(**workspace_fields)
             previous_epoch: int | None = None
             if "epoch" in updates:
                 async with conn.execute(
@@ -6267,6 +6317,10 @@ class SessionStorage:
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
         data = node.model_dump()
+        self._protect_session_workspace(
+            agent_id=node.agent_id, execution_workspace=node.execution_workspace,
+            origin=node.origin,
+        )
         columns = list(data)
         sql = (
             f"INSERT INTO sessions ({', '.join(columns)}) "
@@ -6306,6 +6360,10 @@ class SessionStorage:
             session_epoch=expected_session_epoch,
         )
         data = node.model_dump()
+        self._protect_session_workspace(
+            agent_id=node.agent_id, execution_workspace=node.execution_workspace,
+            origin=node.origin,
+        )
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         update_columns = []
@@ -6412,6 +6470,10 @@ class SessionStorage:
         """Replace one origin only while identity, binding, and origin still match."""
 
         session_key = canonicalize_session_key(expected_session.session_key)
+        self._protect_session_workspace(
+            agent_id=expected_session.agent_id,
+            execution_workspace=expected_session.execution_workspace, origin=origin,
+        )
         async with self._write_transaction("compare_and_set_session_origin") as conn:
             await _verify_project_workspace_guard(
                 conn,
@@ -13197,6 +13259,11 @@ class SessionStorage:
     ) -> None:
         """Archive and rotate one session identity in a single transaction."""
 
+        self._protect_session_workspace(
+            agent_id=node.agent_id, execution_workspace=node.execution_workspace,
+            origin=node.origin,
+        )
+
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
         if not expected_session_id:
@@ -13579,12 +13646,25 @@ class SessionStorage:
             )
 
         pending_dispatch_client_message_id: str | None = None
+        if session_node is not None:
+            self._protect_session_workspace(
+                agent_id=session_node.agent_id,
+                execution_workspace=session_node.execution_workspace,
+                origin=session_updates.get("origin", session_node.origin),
+            )
         async with self._write_transaction("accept_turn") as conn:
             async with conn.execute(
-                "SELECT origin FROM sessions WHERE session_key = ?", (entry.session_key,),
+                "SELECT agent_id, execution_workspace, origin FROM sessions "
+                "WHERE session_key = ?", (entry.session_key,),
             ) as sidechat_cursor:
                 sidechat_row = await sidechat_cursor.fetchone()
             if sidechat_row is not None:
+                if "origin" in session_updates:
+                    self._protect_session_workspace(
+                        agent_id=sidechat_row["agent_id"],
+                        execution_workspace=sidechat_row["execution_workspace"],
+                        origin=session_updates["origin"],
+                    )
                 origin = json.loads(sidechat_row["origin"] or "{}")
                 sidechat = origin.get("sidechat")
                 if isinstance(sidechat, dict):

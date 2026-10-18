@@ -63,6 +63,13 @@ def _serialize(cmd: CommandDef, surface: Surface) -> dict[str, Any]:
             visible_by_default=cmd.visible_by_default,
             deprecated=cmd.deprecated,
         )
+    elif execution.action == "project.init":
+        # Web ordinary-turn commands need scheduling metadata to preserve
+        # explicit intent through the existing send/pending-input flow.
+        out.update(
+            category=cmd.category.value, busy_policy=cmd.busy_policy.value,
+            presentation=cmd.presentation.value,
+        )
     if execution.rpc_method is not None:
         out["execution"]["rpc_method"] = execution.rpc_method
         out["rpc_method"] = execution.rpc_method

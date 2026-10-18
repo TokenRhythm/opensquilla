@@ -191,6 +191,15 @@ def _capture(params: dict[str, Any]) -> MemoryCapturePolicy:
         provenance = {"kind": str(kind)}
     elif provenance is not None and "kind" not in provenance and kind:
         provenance["kind"] = str(kind)
+    from opensquilla.contracts.turn_commands import normalize_turn_command
+
+    # The public provenance bag is descriptive. Only the explicit wire field
+    # establishes command intent; quoted/history/literal input never does.
+    if provenance is not None:
+        provenance.pop("turn_command", None)
+    command = normalize_turn_command(params.get("turnCommand"))
+    if command is not None:
+        provenance = {**(provenance or {}), "turn_command": command}
     # Public run-kind labels never grant an internal execution role.
     return MemoryCapturePolicy(bool(no_capture), provenance)
 
@@ -341,6 +350,7 @@ def decode_admit_turn(
         fingerprint_params=fingerprint,
     )
     display = params.get("displayText")
+    capture = _capture(params)
     routing = _optional_string(params, "initialRoutingMode", "initial_routing_mode")
     if routing is not None and routing not in {"direct", "router", "ensemble"}:
         raise ValueError("initialRoutingMode must be direct, router, or ensemble")
@@ -349,7 +359,7 @@ def decode_admit_turn(
         message=message,
         surface="webchat" if surface == "webchat" else "session",
         source=_source(source),
-        capture=_capture(params),
+        capture=capture,
         client_request_id=identity.client_request_id,
         request_fingerprint=identity.request_fingerprint,
         source_scope=identity.source_scope,
@@ -375,7 +385,10 @@ def decode_admit_turn(
         page_context=page_context,
         receipt_replay_only=retired_input,
         display_text=display if isinstance(display, str) else None,
-        queue_mode=params.get("queueMode") or params.get("queue_mode"),
+        queue_mode=(
+            "followup" if (capture.input_provenance or {}).get("turn_command") is not None
+            else params.get("queueMode") or params.get("queue_mode")
+        ),
         initial_collaboration_mode=params.get(
             "collaborationMode", params.get("collaboration_mode")
         ),

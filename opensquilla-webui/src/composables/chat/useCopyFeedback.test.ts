@@ -30,17 +30,26 @@ describe('copy feedback ownership', () => {
   it.each([true, false])('keeps the newest %s result when an older copy finishes later', async latest => {
     vi.useFakeTimers()
     const { feedback, results } = fixture()
+    const actionTitle = feedback.copyTitle.value
+    // Vue's first happy-dom mount can schedule its 3s devtools-hook replay.
+    // Count only timers added by copying, keeping that environment timer intact.
+    const mountedTimers = vi.getTimerCount()
     const first = feedback.onCopyClick()
     const second = feedback.onCopyClick()
     results[1]!(latest)
     await second
     expect(feedback.copyState.value).toBe(latest ? 'ok' : 'err')
+    expect(feedback.copyIconName.value).toBe(latest ? 'check' : 'x')
+    if (latest) expect(feedback.copyTitle.value).toBe(actionTitle)
+    expect(Boolean(feedback.copyLiveText.value)).toBe(!latest)
+    expect(vi.getTimerCount()).toBe(mountedTimers + 1)
     await vi.advanceTimersByTimeAsync(500)
     results[0]!(!latest)
     await first
     expect(feedback.copyState.value).toBe(latest ? 'ok' : 'err')
     await vi.advanceTimersByTimeAsync(700)
     expect(feedback.copyState.value).toBeNull()
+    expect(feedback.copyIconName.value).toBe('copy')
   })
 
   it('does not install feedback or a timer after unmount', async () => {
@@ -53,5 +62,47 @@ describe('copy feedback ownership', () => {
     await pending
     expect(feedback.copyState.value).toBeNull()
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('clears the previous check and timer while a repeated copy is pending', async () => {
+    vi.useFakeTimers()
+    const { feedback, results } = fixture()
+    const mountedTimers = vi.getTimerCount()
+    const first = feedback.onCopyClick()
+    results[0]!(true)
+    await first
+    expect(feedback.copyIconName.value).toBe('check')
+    await vi.advanceTimersByTimeAsync(600)
+
+    const second = feedback.onCopyClick()
+    expect(feedback.copyState.value).toBeNull()
+    expect(feedback.copyIconName.value).toBe('copy')
+    expect(vi.getTimerCount()).toBe(mountedTimers)
+    await vi.advanceTimersByTimeAsync(700)
+    expect(feedback.copyState.value).toBeNull()
+
+    results[1]!(true)
+    await second
+    expect(feedback.copyIconName.value).toBe('check')
+    await vi.advanceTimersByTimeAsync(1199)
+    expect(feedback.copyIconName.value).toBe('check')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(feedback.copyIconName.value).toBe('copy')
+  })
+
+  it('invalidates a pending copy and clears feedback when its owner changes', async () => {
+    vi.useFakeTimers()
+    const { feedback, results } = fixture()
+    const first = feedback.onCopyClick()
+    results[0]!(true)
+    await first
+    expect(feedback.copyIconName.value).toBe('check')
+    const second = feedback.onCopyClick()
+    feedback.resetCopyFeedback()
+    results[1]!(true)
+    await second
+    expect(feedback.copyState.value).toBeNull()
+    expect(feedback.copyIconName.value).toBe('copy')
+    expect(feedback.copyLiveText.value).toBe('')
   })
 })

@@ -55,6 +55,20 @@ Search previous sessions as well as memory:
 opensquilla memory search "deployment decision" --source all
 ```
 
+## Configured Sources and Projects
+
+Profile, memory, and note files come from the configured Agent sources. These
+sources can differ from the task workspace and from each other. Opening a
+project does not create project-specific memory or relocate existing sources.
+Profile settings, memory tools, and runtime loading resolve those configured
+sources consistently; search indexes remain derived data.
+
+When authorized, `memory_save` writes durable facts to logical `MEMORY.md` or
+`memory/` paths in those sources. It does not edit `USER.md`, `IDENTITY.md`, or
+`SOUL.md`. Updating these profile files requires an existing file tool with
+access to the known configured path. If access is unavailable, the Agent should
+explain the limitation rather than create an ineffective project-local copy.
+
 ## Natural Chat Usage
 
 Ask naturally when something should be remembered:

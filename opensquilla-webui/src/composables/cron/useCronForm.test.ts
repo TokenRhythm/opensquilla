@@ -80,7 +80,8 @@ describe('cron form default schedule', () => {
 
     await form.saveJob()
 
-    expect(toasts.filter(entry => entry.tone === 'danger')).toEqual([])
+    expect(toasts).toEqual([])
+    expect(form.panelOpen.value).toBe(false)
     expect(rpcCall).toHaveBeenCalledTimes(1)
     const [method, payload] = rpcCall.mock.calls[0] as [string, Record<string, unknown>]
     expect(method).toBe('cron.create')

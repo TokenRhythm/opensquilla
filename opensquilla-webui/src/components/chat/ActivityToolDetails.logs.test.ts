@@ -29,10 +29,10 @@ afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.in
 
 describe('inline persisted execution output', () => {
   it.each([
-    ['complete', { result: 'Python 3.12.10\n', resultTruncated: false }],
-    ['unknown old record', { result: 'Python 3.12.10\n', resultTruncated: undefined }],
-    ['preview-only old record', { result: '', resultPreview: 'Python 3.12.10\n', resultTruncated: undefined }],
-  ])('keeps %s output and copying independent of an expired optional log', async (_label, overrides) => {
+    ['complete', { result: 'Python 3.12.10\n', resultTruncated: false }, en.chat.copy],
+    ['unknown old record', { result: 'Python 3.12.10\n', resultTruncated: undefined }, en.chat.copy],
+    ['preview-only old record', { result: '', resultPreview: 'Python 3.12.10\n', resultTruncated: undefined }, en.shared.runTrace.copyPreview],
+  ])('keeps %s output and copying independent of an expired optional log', async (_label, overrides, copyLabel) => {
     const read = vi.fn().mockRejectedValue(new Error('NOT_FOUND'))
     const host = mount(read, 'command.run', 'expired-log', overrides)
     await nextTick()
@@ -41,7 +41,9 @@ describe('inline persisted execution output', () => {
     expect(host.querySelector('.activity-code-details__output')?.textContent).toBe('Python 3.12.10\n')
     host.querySelector<HTMLButtonElement>('[data-testid="activity-tool-detail-copy"]')?.click()
     await vi.waitFor(() => expect(mocks.copy).toHaveBeenCalledWith('$ npm test\n\nPython 3.12.10\n'))
-    await vi.waitFor(() => expect(host.querySelector('[data-testid="activity-tool-detail-copy"]')?.getAttribute('aria-label')).toBe(en.chat.copied))
+    await vi.waitFor(() => expect(host.querySelector('[data-testid="activity-tool-detail-copy"]')?.getAttribute('aria-label')).toBe(copyLabel))
+    expect(host.querySelector('[data-testid="activity-tool-detail-copy"] polyline')?.getAttribute('points')).toBe('20 6 9 17 4 12')
+    expect(host.querySelector('.activity-code-details__sr')?.textContent).toBe('')
     expect(read).not.toHaveBeenCalled()
   })
 

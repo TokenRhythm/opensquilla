@@ -2100,6 +2100,7 @@ async def test_sessions_yield_is_a_dispatch_boundary_before_goal_terminal(
 async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publish(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2161,6 +2162,7 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
 async def test_turn_runner_html_backstop_respects_preview_capability(
     tmp_path, caller_kind: CallerKind, preview_available: bool, expected_artifacts: int,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2241,6 +2243,7 @@ async def test_custom_named_publication_is_not_duplicated_in_events_or_transcrip
     tmp_path, name: str, mention_source: bool,
 ) -> None:
     # #1164: the real write/publish/Done chain must deliver only the explicit artifact.
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2301,6 +2304,7 @@ async def test_repeated_cancel_persists_completed_artifact_and_interrupted_trans
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2735,6 +2739,7 @@ def test_auto_publish_oversized_pptx_preflights_before_read_or_validation(
 async def test_turn_runner_rejects_invalid_omitted_pptx_and_marks_delivery_failure(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2835,6 +2840,7 @@ async def test_turn_runner_does_not_auto_publish_edited_config_json(tmp_path) ->
 async def test_turn_runner_auto_publishes_deliverable_file_created_by_apply_patch(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2884,6 +2890,7 @@ async def test_turn_runner_auto_publishes_deliverable_file_created_by_apply_patc
 async def test_turn_runner_marks_partial_omitted_artifact_delivery_failure(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2946,6 +2953,7 @@ async def test_turn_runner_marks_partial_omitted_artifact_delivery_failure(
 async def test_turn_runner_auto_publishes_same_content_deliverables_by_name(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2999,6 +3007,7 @@ async def test_turn_runner_auto_publishes_same_content_deliverables_by_name(
 async def test_turn_runner_auto_publishes_omitted_deliverable_after_existing_artifact(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -3051,6 +3060,7 @@ async def test_turn_runner_auto_publishes_omitted_deliverable_after_existing_art
 
 @pytest.mark.asyncio
 async def test_turn_runner_does_not_auto_publish_memory_json_write(tmp_path) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -3099,6 +3109,7 @@ async def test_turn_runner_does_not_auto_publish_memory_json_write(tmp_path) -> 
 async def test_turn_runner_marks_failed_omitted_artifact_delivery_in_final_text(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)

@@ -97,6 +97,31 @@ async def test_read_source_records_workspace_read(
 
 
 @pytest.mark.asyncio
+async def test_empty_source_read_then_insert_keeps_revision_and_read_freshness(
+    workspace_context: tuple[Path, ToolContext],
+) -> None:
+    workspace, ctx = workspace_context
+    target = workspace / "AGENTS.md"
+    target.write_bytes(b"")
+    receipt = json.loads(await filesystem.read_source("AGENTS.md"))
+    assert receipt["range"] == [0, 0]
+    assert ctx.workspace_file_reads[-1]["complete"] is True
+    assert ctx.workspace_file_reads[-1]["limit"] == 0
+    result = json.loads(await filesystem.edit_source(
+        "AGENTS.md", expected_revision=receipt["revision"],
+        edits=[{"start_line": 0, "end_line": 0, "replacement": "# Project\n"}],
+    ))
+    assert result["status"] == "applied"
+    assert target.read_text() == "# Project\n"
+    with pytest.raises(RetryableToolInputError, match="revision_conflict"):
+        await filesystem.edit_source(
+            "AGENTS.md", expected_revision=receipt["revision"],
+            edits=[{"start_line": 0, "end_line": 0, "replacement": "overwrite"}],
+        )
+    assert target.read_text() == "# Project\n"
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="Windows cannot represent these POSIX filenames")
 @pytest.mark.parametrize("literal_path, other_path", [
     (" source.py", "source.py"),

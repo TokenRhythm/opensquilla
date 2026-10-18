@@ -33,6 +33,8 @@ root release README with task-oriented guides.
 - [`features/tool-compression.md`](features/tool-compression.md) - compact tool
   results and handles.
 - [`features/memory.md`](features/memory.md) - durable memory and recall.
+- [`features/project-workspaces.md`](features/project-workspaces.md) - open or
+  create projects, initialize instructions, and apply project rules.
 - [`features/skills.md`](features/skills.md) - skill discovery, install, and
   authoring.
 - [`features/compaction-and-cache.md`](features/compaction-and-cache.md) -

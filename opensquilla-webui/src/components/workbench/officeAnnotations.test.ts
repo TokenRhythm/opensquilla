@@ -48,7 +48,8 @@ async function harness(officeEnabled = true, nativeEnabled = false) {
     artifactDocuments: { load: async () => undefined,
       headArtifact: () => artifact, snapshot: () => ({ workspace }) },
   } as unknown as ArtifactWorkbenchProviderOptions
-  const item = createArtifactPreviewWorkbenchItem({ artifact, sessionKey: 'session-1', nativeHtml: false })
+  const item = createArtifactPreviewWorkbenchItem({ artifact, sessionKey: 'session-1', nativeHtml: false,
+    resourceIdentity: 'document:document-1' })
   const renderState: Record<string, unknown> = {}
   const definition = createArtifactWorkbenchDefinitions(options)[0]
   const runtime = await definition.createRuntime!(item, { getRenderState: () => renderState,

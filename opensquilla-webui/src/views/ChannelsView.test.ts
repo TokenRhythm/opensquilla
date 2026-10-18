@@ -536,16 +536,18 @@ describe('ChannelsView dashboard home', () => {
   })
 
   it('runs Test and Restart from the card without drilling in', async () => {
-    const { app, el, flush, rpcCall, push } = await mountChannelsView()
+    const { app, el, flush, rpcCall, push, pushToast } = await mountChannelsView()
     try {
       await flush()
       const ops = channelCard(el, 'ops-slack')
       buttonWithText(ops, 'Test').click()
       await flush()
       expect(rpcCall).toHaveBeenCalledWith('channels.probe', { name: 'ops-slack' })
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('ops-slack verified in 17 ms', { tone: 'ok' })
       buttonWithText(ops, 'Restart').click()
       await flush()
       expect(rpcCall).toHaveBeenCalledWith('channels.restart', { name: 'ops-slack' })
+      expect(pushToast).toHaveBeenCalledTimes(1)
       // The quick actions never navigate: still on the dashboard.
       expect(el.querySelector('.chd')).toBeNull()
       expect(push).not.toHaveBeenCalled()
@@ -650,7 +652,8 @@ describe('ChannelsView dashboard home', () => {
         channelName: 'ops-slack',
         pairingId: 'pair-pending',
       })
-      expect(pushToast).toHaveBeenCalledWith('Rejected the pairing request from Pending User', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
+      expect(el.querySelector('[aria-label="Reject the pairing request from Pending User"]')).toBeNull()
     } finally {
       app.unmount()
     }
@@ -1058,7 +1061,7 @@ describe('ChannelsView drill-in page', () => {
       await flush()
       // The clipboard always receives the FULL id, not the display form.
       expect(writeText).toHaveBeenCalledWith('U-BOT-FEED-0123456789')
-      expect(pushToast).toHaveBeenCalledWith('Bot ID copied', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalledWith('Bot ID copied', { tone: 'ok' })
     } finally {
       app.unmount()
     }
@@ -1243,7 +1246,7 @@ describe('ChannelsView members section', () => {
         channelName: 'ops-slack',
         pairingId: 'pair-pending',
       })
-      expect(pushToast).toHaveBeenCalledWith('Approved pairing access for Pending User', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
       expect(panel.querySelector('[aria-label="Approve access for Pending User"]')).toBeNull()
 
       panel.querySelector<HTMLButtonElement>('[aria-label="Revoke access for Approved User"]')!.click()
@@ -1255,7 +1258,7 @@ describe('ChannelsView members section', () => {
         channelName: 'ops-slack',
         pairingId: 'pair-approved',
       })
-      expect(pushToast).toHaveBeenCalledWith('Revoked pairing access for Approved User', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
       expect(panel.querySelector('[aria-label="Revoke access for Approved User"]')).toBeNull()
 
       // A revoked request can be re-approved via the same approve RPC.
@@ -1462,7 +1465,7 @@ describe('ChannelsView members section', () => {
         pairingId: 'pair-pending',
         asAdmin: true,
       })
-      expect(pushToast).toHaveBeenCalledWith('Approved Pending User as a channel admin', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
     } finally {
       app.unmount()
     }
@@ -1783,8 +1786,8 @@ describe('ChannelsView in-place configuration editor', () => {
     }
   })
 
-  it('saves via probe → upsert, resets the baseline, and drops edit mode', async () => {
-    const ctx = await mountChannelsView()
+  it.each([true, false])('saves via probe → upsert, with restart required %s, resets the baseline, and drops edit mode', async restartRequired => {
+    const ctx = await mountChannelsView({ channelUpsert: () => ({ changed: true, restartRequired }) })
     const { el, flush, rpcCall, pushToast } = ctx
     try {
       const page = await openConfiguration(ctx)
@@ -1803,10 +1806,12 @@ describe('ChannelsView in-place configuration editor', () => {
       const entry = (upsertCall[1] as { entry: Record<string, unknown> }).entry
       expect(entry).toMatchObject({ name: 'ops-slack', slack_channel_id: 'C123' })
       expect(JSON.stringify(entry)).not.toContain('***')
-      expect(pushToast).toHaveBeenCalledWith(
-        'Channel saved — configuration validated locally; use Test connection to verify credentials',
-        { tone: 'ok' },
-      )
+      if (restartRequired) {
+        expect(pushToast).toHaveBeenCalledWith(
+          'Channel saved — configuration validated locally; use Test connection to verify credentials',
+          { tone: 'ok' },
+        )
+      } else expect(pushToast).not.toHaveBeenCalled()
       // Baseline reset from the reseed: read mode, no dirty dot, no bar.
       expect(page.querySelector('[data-field="slack_channel_id"] input')).toBeNull()
       expect(page.querySelector('.ch-tab-dirty')).toBeNull()

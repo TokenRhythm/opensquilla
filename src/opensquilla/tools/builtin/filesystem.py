@@ -64,7 +64,7 @@ from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
 )
-from opensquilla.tools.path_policy import reject_foreign_host_path
+from opensquilla.tools.path_policy import reject_foreign_host_path, resolve_bound_workspace
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import (
     current_run_mode,
@@ -293,7 +293,8 @@ def _memory_source_root() -> Path | None:
 
 def _memory_roots() -> tuple[Path, ...]:
     roots: list[Path] = []
-    for root in (_workspace_root(), _memory_source_root()):
+    source = _memory_source_root()
+    for root in (source,) if source is not None else (_workspace_root(),):
         if root is None or root in roots:
             continue
         roots.append(root)
@@ -317,7 +318,11 @@ def _resolve_unmapped_path(path: str) -> Path:
     from opensquilla.tools.path_aliases import resolve_workspace_alias
 
     raw = Path(path).expanduser()
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        resolve_bound_workspace(ctx.workspace_dir)
+        if ctx is not None and ctx.workspace_dir else _workspace_root()
+    )
     reject_foreign_host_path(str(path), platform=os.name, workspace=root)
     alias = resolve_workspace_alias(raw, root)
     candidate = alias if alias is not None else (
@@ -445,7 +450,11 @@ async def _prepare_attachment_edit_path(
 def _resolve_base(path: str | None) -> Path:
     if path:
         return _resolve_path(path)
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        resolve_bound_workspace(ctx.workspace_dir)
+        if ctx is not None and ctx.workspace_dir else _workspace_root()
+    )
     return root if root is not None else Path.cwd()
 
 
@@ -465,6 +474,15 @@ def _workspace_display_path(path: Path, original_path: str) -> str:
 
 def _memory_source_rel_path(path: Path) -> str | None:
     resolved = path.resolve(strict=False)
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.memory_notes_dir:
+        try:
+            note = resolved.relative_to(Path(ctx.memory_notes_dir).expanduser().resolve())
+        except ValueError:
+            pass
+        else:
+            if note.suffix == ".md" and not any(part.startswith(".") for part in note.parts):
+                return (Path("memory") / note).as_posix()
     for root in _memory_roots():
         try:
             rel = resolved.relative_to(root)
@@ -473,13 +491,20 @@ def _memory_source_rel_path(path: Path) -> str | None:
 
         if rel.parts in {("MEMORY.md",), ("memory.md",)}:
             return rel.as_posix()
-        if len(rel.parts) >= 2 and rel.parts[0] == "memory" and rel.suffix == ".md":
+        if (
+            len(rel.parts) >= 2 and rel.parts[0] == "memory" and rel.suffix == ".md"
+            and not (ctx is not None and ctx.memory_notes_dir)
+        ):
             return rel.as_posix()
     return None
 
 
 def _bootstrap_source_rel_path(path: Path) -> str | None:
-    root = _workspace_root()
+    ctx = current_tool_context.get()
+    root = (
+        Path(ctx.bootstrap_source_dir).expanduser().resolve()
+        if ctx is not None and ctx.bootstrap_source_dir else _workspace_root()
+    )
     if root is None:
         return None
     resolved = path.resolve(strict=False)
@@ -1853,7 +1878,8 @@ async def read_file(
     description=(
         "Read a UTF-8 workspace source line range and return a JSON revision receipt. "
         "Use the returned revision as edit_source.expected_revision before editing "
-        "that file. Returned lines are plain text without read_file line-number prefixes."
+        "that file. Returned lines are plain text without read_file line-number prefixes. "
+        "An empty file returns range [0, 0], total_lines 0, and a valid revision."
     ),
     params={
         "path": {
@@ -1919,8 +1945,11 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         p,
         operation="read_source",
         offset=receipt["range"][0],
-        limit=receipt["range"][1] - receipt["range"][0] + 1,
-        complete=(receipt["range"][0] == 1 and receipt["range"][1] == receipt["total_lines"]),
+        limit=(receipt["range"][1] - receipt["range"][0] + 1 if receipt["total_lines"] else 0),
+        complete=(
+            receipt["total_lines"] == 0
+            or receipt["range"][0] == 1 and receipt["range"][1] == receipt["total_lines"]
+        ),
     )
     return json.dumps(receipt, ensure_ascii=False)
 
@@ -2975,6 +3004,7 @@ async def edit_file(
             "type": "array",
             "description": (
                 "Non-overlapping inclusive line-range edits against the revision. "
+                "For an empty file, use one edit with start_line=0 and end_line=0. "
                 "Each replacement is complete source text for that range."
             ),
             "items": {

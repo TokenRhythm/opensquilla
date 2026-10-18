@@ -64,6 +64,101 @@ function memoryStorage(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
   }
 }
 
+describe('ordinary project initialization turns', () => {
+  const command = { name: 'project.init' as const, args: 'keep existing guidance' }
+  const initOptions = () => ({
+    inputText: ref('/init keep existing guidance'),
+    resolveTurnCommand: vi.fn(() => command), supportsTurnCommand: vi.fn(async () => true),
+  })
+
+  it('uses ordinary chat.send with an immutable command and its attachments', async () => {
+    const h = makeOptions({ ...initOptions(), pendingAttachments: ref<Attachment[]>([{
+      kind: 'staged', local_id: 1, name: 'notes.txt', mime: 'text/plain', file_uuid: 'init-notes',
+    }]) })
+    await h.api.onSend()
+    expect(h.options.executeSlashCommand).not.toHaveBeenCalled()
+    expect(h.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      turnCommand: command, message: '/init keep existing guidance', queueMode: 'followup',
+      attachments: [expect.objectContaining({ file_uuid: 'init-notes' })],
+    }), expect.anything())
+  })
+
+  it('queues init behind a running turn and never uses same-turn steer', async () => {
+    const h = makeOptions({ ...initOptions(), busySendMode: ref<BusySendMode>('steer') })
+    h.stream.isStreaming.value = true
+    await h.api.onSend()
+    expect(h.options.enqueuePendingInput).toHaveBeenCalledWith('/init keep existing guidance', undefined,
+      expect.objectContaining({ turnCommand: command }))
+    expect(h.rpc.call).not.toHaveBeenCalled()
+    expect(h.options.executeSlashCommand).not.toHaveBeenCalled()
+  })
+
+  it('does not infer initialization from a literal slash escape or a reference chip', async () => {
+    const literal = makeOptions({ ...initOptions(), inputText: ref('//init') })
+    await literal.api.onSend()
+    const literalSend = literal.rpc.call.mock.calls.find(([method]: unknown[]) => method === 'chat.send')
+    expect(literalSend?.[1]).toMatchObject({ message: '/init' })
+    expect(literalSend?.[1]).not.toHaveProperty('turnCommand')
+    expect(literal.options.resolveTurnCommand).not.toHaveBeenCalled()
+
+    const referenced = makeOptions({ ...initOptions(), inputText: ref('/init'), commandText: ref(''), localPathReferences: ref(['/init']) })
+    await referenced.api.onSend()
+    const referenceSend = referenced.rpc.call.mock.calls.find(([method]: unknown[]) => method === 'chat.send')
+    expect(referenceSend?.[1]).not.toHaveProperty('turnCommand')
+    expect(referenced.options.classifySlashCommand).not.toHaveBeenCalled()
+  })
+
+  it('preserves explicit queued intent without reclassifying the stored text', async () => {
+    const h = makeOptions(initOptions())
+    const item: ChatPendingItem = { pendingUiId: 'queued-init', text: '/init keep existing guidance',
+      turnCommand: command, attachments: [], intent: null }
+    await expect(h.api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(h.options.classifySlashCommand).not.toHaveBeenCalled()
+    expect(h.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({ turnCommand: command }), expect.anything())
+  })
+
+  it('keeps a queued command editable when the connected Gateway cannot execute it', async () => {
+    const h = makeOptions({ ...initOptions(), supportsTurnCommand: vi.fn(async () => false) })
+    const item: ChatPendingItem = { pendingUiId: 'queued-old-gateway-init', text: '/init',
+      turnCommand: command, attachments: [], intent: null }
+    await expect(h.api.sendQueuedFollowup(item)).resolves.toBe('not_sent')
+    expect(h.rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('recovers a lost acceptance reply with the original intent after catalog availability changes', async () => {
+    let supported = true
+    const call = vi.fn().mockRejectedValueOnce(new RpcTransportError('lost reply', null))
+      .mockResolvedValue({ sessionKey: 'agent:main:webchat:test' })
+    const h = makeOptions({ ...initOptions(), rpc: { call },
+      resolveTurnCommand: () => supported ? command : null })
+    await h.api.onSend()
+    supported = false
+    await h.api.onSend()
+    expect(call.mock.calls.filter(([method]) => method === 'chat.send')).toHaveLength(1)
+    expect(call).toHaveBeenCalledWith('turns.receipt.get', expect.objectContaining({ turnCommand: command }))
+  })
+
+  it('revokes fresh command admission if support disappears while the WAL is committing', async () => {
+    const wal = memoryDeliveryWal()
+    const original = wal.prepareDelivery!
+    let finish!: () => void
+    const ready = new Promise<void>(resolve => { finish = resolve })
+    wal.prepareDelivery = vi.fn(async (...args: Parameters<NonNullable<PendingInputWal['prepareDelivery']>>) => {
+      await ready
+      return original(...args)
+    })
+    let supported = true
+    const h = makeOptions({ ...initOptions(), pendingInputWal: wal,
+      resolveTurnCommand: () => supported ? command : null })
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(wal.prepareDelivery).toHaveBeenCalledOnce())
+    supported = false
+    finish()
+    await sending
+    expect(h.rpc.call).not.toHaveBeenCalled()
+  })
+})
+
 interface UseChatSendOptions extends Omit<DomainUseChatSendOptions, 'durableDelivery'> {
   durableDelivery?: DomainUseChatSendOptions['durableDelivery']
   // Raw transport exists only inside this Adapter harness; production options
@@ -241,6 +336,8 @@ function connectPlanCommands(
   const slash = useChatSlashCommands({
     commandCatalog: { list: vi.fn(async () => ({ commands: [
       { name: '/compact', aliases: [] }, { name: '/reset', aliases: [] },
+      { name: '/init', aliases: [], category: 'turn', busy_policy: 'next_turn', presentation: 'turn',
+        execution: { action: 'project.init' } },
     ] })) },
     usageReporting: usageReportingDouble(),
     sessionMaintenance: {
@@ -258,9 +355,111 @@ function connectPlanCommands(
   })
   options.classifySlashCommand = slash.classifySlashCommand
   options.isPlanModeCommand = slash.isPlanModeCommand
+  options.resolveTurnCommand = slash.resolveTurnCommand
+  options.supportsTurnCommand = slash.supportsTurnCommand
   options.executeSlashCommand = slash.executeSlashCommand
   return { slash, activatePlanMode }
 }
+
+describe('Plan prompt and project-init integration', () => {
+  it('retains explicit path suffixes and skills when the visible Plan command excludes reference chips', async () => {
+    const path = 'C:\\project\\report.csv'
+    const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+    const h = makeOptions({
+      inputText: ref(`/plan compare the data\n${path}`), commandText: ref('/plan compare the data'),
+      selectedSkills: ref([skill]), localPathReferences: ref([path]),
+      pendingSessionIntent: ref('new_chat'), methodAvailability: () => true,
+    })
+    connectPlanCommands(h)
+    await h.api.onSend()
+    expect(h.rpc.call).toHaveBeenCalledOnce()
+    expect(h.rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      message: `compare the data\n${path}`, collaborationMode: 'plan',
+      selectedSkills: [skill], localPathReferences: [path],
+    })
+    expect(h.rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('turnCommand')
+  })
+
+  it.each(['agent:main:webchat:test', 'agent:main:sidechat:child'])(
+    'queues explicit init with a real active steer capability in %s', async key => {
+      const h = makeOptions({
+        ...sameTurnSteerOptions(), sessionKey: ref(key),
+        inputText: ref('/init preserve existing guidance'), busySendMode: ref<BusySendMode>('steer'),
+      })
+      const { activatePlanMode } = connectPlanCommands(h)
+      h.stream.isStreaming.value = true
+      expect(h.api.supportsSameTurnSteer()).toBe(true)
+      await h.api.onSend()
+      expect(h.options.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('/init preserve existing guidance', undefined,
+        expect.objectContaining({ turnCommand: { name: 'project.init', args: 'preserve existing guidance' } }))
+      expect(activatePlanMode).not.toHaveBeenCalled()
+      expect(h.rpc.call).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['/init inspect the project', '//init inspect the project'])(
+    'sends Plan prompt %s without acquiring project-init intent', async prompt => {
+      const h = makeOptions({ inputText: ref(`/plan ${prompt}`), pendingSessionIntent: ref('new_chat') })
+      const { activatePlanMode } = connectPlanCommands(h)
+      await h.api.onSend()
+      expect(activatePlanMode).toHaveBeenCalledOnce()
+      expect(h.rpc.call).toHaveBeenCalledOnce()
+      expect(h.rpc.call.mock.calls[0]?.[1]).toMatchObject({ message: prompt, collaborationMode: 'plan' })
+      expect(h.rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('turnCommand')
+    },
+  )
+
+  it.each([
+    { prompt: '/init inspect the project', withReferences: false },
+    { prompt: '//init inspect the project', withReferences: false },
+    { prompt: '/init compare the data', withReferences: true },
+  ])('queues and drains literal Plan prompt $prompt (references=$withReferences)', async ({ prompt, withReferences }) => {
+    const path = 'C:\\project\\report.csv'
+    const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+    const body = `${prompt}${withReferences ? `\n${path}` : ''}`
+    const h = makeOptions({
+      ...sameTurnSteerOptions(), inputText: ref(`/plan ${body}`),
+      commandText: ref(`/plan ${prompt}`), busySendMode: ref<BusySendMode>('steer'),
+      selectedSkills: ref(withReferences ? [skill] : []),
+      localPathReferences: ref(withReferences ? [path] : []), methodAvailability: () => true,
+    })
+    const pending = useChatPendingQueue({
+      sessionKey: h.options.sessionKey, inputText: h.options.inputText,
+      pendingAttachments: h.options.pendingAttachments, pendingSessionIntent: h.options.pendingSessionIntent,
+      selectedSkills: h.options.selectedSkills, localPathReferences: h.options.localPathReferences,
+      isStreaming: h.stream.isStreaming, isBlocked: () => h.stream.isStreaming.value,
+      autoResizeTextarea: vi.fn(), sendCurrentInput: vi.fn(), resetInputHistory: vi.fn(),
+      hasComposer: () => true, pendingInputWal: h.options.pendingInputWal,
+      dispatchPendingItem: (item, key, guard) => h.api.sendQueuedFollowup(item, key, guard),
+    })
+    h.options.enqueuePendingInput = vi.fn(pending.enqueuePendingInput)
+    h.options.enqueuePendingPayload = vi.fn(pending.enqueuePendingPayload)
+    let finishMode!: (accepted: boolean) => void
+    const { activatePlanMode } = connectPlanCommands(h, () => new Promise<boolean>(resolve => { finishMode = resolve }))
+    try {
+      const sending = h.api.onSend()
+      await vi.waitFor(() => expect(activatePlanMode).toHaveBeenCalledOnce())
+      h.stream.isStreaming.value = true
+      finishMode(true)
+      await sending
+      expect(h.rpc.call).not.toHaveBeenCalled()
+      expect(h.options.inputText.value).toBe('')
+      expect(pending.pendingQueue.value).toHaveLength(1)
+      expect(pending.pendingQueue.value[0]?.text).toBe(`/${body}`)
+      expect(pending.pendingQueue.value[0]).not.toHaveProperty('turnCommand')
+
+      h.stream.isStreaming.value = false
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.waitFor(() => expect(h.rpc.call).toHaveBeenCalledOnce())
+      expect(h.rpc.call.mock.calls[0]?.[1]).toMatchObject({ message: body })
+      expect(h.rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('turnCommand')
+      if (withReferences) {
+        expect(h.rpc.call.mock.calls[0]?.[1]).toMatchObject({ selectedSkills: [skill], localPathReferences: [path] })
+      }
+      await vi.waitFor(() => expect(pending.pendingQueue.value).toHaveLength(0))
+    } finally { pending.cleanup() }
+  })
+})
 
 function usageReplayMessages(): ChatMessage[] {
   return [

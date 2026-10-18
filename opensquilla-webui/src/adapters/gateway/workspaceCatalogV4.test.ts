@@ -14,6 +14,7 @@ function transport() {
   const request = vi.fn(async (method: string) => {
     switch (method) {
       case 'workspaces.list': return { workspaces: [workspace] }
+      case 'workspaces.create': return { workspace }
       case 'workspaces.open': return { workspace }
       case 'workspaces.update': return { workspace: { ...workspace, name: 'Renamed' } }
       case 'workspaces.pin': return { workspace: { ...workspace, pinned: true } }
@@ -77,6 +78,35 @@ describe('createV4WorkspaceCatalog', () => {
 
     expect(source.request).toHaveBeenCalledWith('workspaces.open', { path: '/repo/a', trusted: true }, undefined)
     expect(source.request).toHaveBeenCalledWith('workspaces.pin', { workspaceId: 'project-a', pinned: true }, undefined)
+  })
+
+  it('creates a directory with explicit trust and without automatic mutation replay', async () => {
+    const source = transport()
+    const catalog = createV4WorkspaceCatalog(source as never)
+    const signal = new AbortController().signal
+    await expect(catalog.create!('/repo', 'a', { signal })).resolves.toEqual(workspace)
+    expect(source.request).toHaveBeenCalledWith('workspaces.create', {
+      parentPath: '/repo', name: 'a', trusted: true,
+    }, { signal, timeoutAction: 'reject', abortAction: 'reject', recoveryClass: 'mutation' })
+  })
+
+  it('keeps creation defaults with the catalog list and accepts older list responses', async () => {
+    const defaults = { parentPath: 'C:\\Projects', hostName: 'host-a', platform: 'windows' }
+    const request = vi.fn()
+      .mockResolvedValueOnce({ workspaces: [], creationDefaults: defaults })
+      .mockResolvedValueOnce({ workspaces: [workspace] })
+    const catalog = createV4WorkspaceCatalog({ request })
+    await catalog.list()
+    expect(catalog.creationDefaults).toEqual(defaults)
+    await catalog.list()
+    expect(catalog.creationDefaults).toBeNull()
+  })
+
+  it('reports unsupported creation without falling back to opening a directory', async () => {
+    const request = vi.fn().mockRejectedValue(Object.assign(new Error('old Gateway'), { code: 'METHOD_NOT_FOUND' }))
+    const catalog = createV4WorkspaceCatalog({ request })
+    await expect(catalog.create!('/repo', 'a')).rejects.toThrow('workspaces.create is unsupported')
+    expect(request).toHaveBeenCalledOnce()
   })
 
   it('keeps sandbox path browsing behind the workspace domain seam', async () => {

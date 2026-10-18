@@ -1329,6 +1329,7 @@ async def test_build_services_defers_sandbox_startup_until_gateway_ready(
         assert events == ["runtime"]
         assert scheduled == []
         assert services.sandbox_setup_task is None
+        assert services.tool_registry.get("agent_file") is None
     finally:
         await services.close()
     assert events == ["runtime", "runtime_reset"]
@@ -2089,6 +2090,8 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         mcp={"enabled": False},
     )
 
+    # Explicit shared roots must already exist; startup no longer creates projects.
+    Path(config.workspace_dir).mkdir(parents=True)
     services = await build_services(
         config=config,
         tool_registry=registry,

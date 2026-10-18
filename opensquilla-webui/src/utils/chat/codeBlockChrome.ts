@@ -13,7 +13,6 @@ import { copyTextWithFallback } from '@/utils/browser'
 
 export interface CodeBlockChromeLabels {
   copy: string
-  copied: string
   copyFailed: string
 }
 
@@ -31,11 +30,7 @@ function setCopyButtonState(
   labels: CodeBlockChromeLabels,
   state: 'idle' | 'copied' | 'error',
 ): void {
-  const label = state === 'copied'
-    ? labels.copied
-    : state === 'error'
-      ? labels.copyFailed
-      : labels.copy
+  const label = state === 'error' ? labels.copyFailed : labels.copy
   button.replaceChildren(copyIconSvg(state))
   button.title = label
   button.setAttribute('aria-label', label)
@@ -82,7 +77,7 @@ function svgNode(tag: string, attrs: Record<string, string>): SVGElement {
 // earlier blocks on every streaming append.
 export function createCodeBlockChrome() {
   const controls = new Map<HTMLButtonElement, { refresh: () => void; dispose: () => void }>()
-  let labels: CodeBlockChromeLabels = { copy: '', copied: '', copyFailed: '' }
+  let labels: CodeBlockChromeLabels = { copy: '', copyFailed: '' }
   let disposed = false
 
   function decorate(root: HTMLElement | null, nextLabels: CodeBlockChromeLabels, selector = 'pre'): void {

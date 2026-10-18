@@ -135,6 +135,22 @@
     "openDirectoryFailed": "无法打开项目目录，请重试。",
     "copyDirectoryFailed": "无法复制项目目录路径。",
     "projects": "项目",
+    "addProject": "添加项目",
+    "projectAction": "项目操作",
+    "openExistingProject": "打开已有项目",
+    "saveParentDirectory": "保存位置",
+    "projectLocation": "项目目录",
+    "chooseParentDirectory": "选择父目录",
+    "chooseExistingDirectory": "选择已有目录",
+    "executionHost": "执行主机：{host}",
+    "gatewayHost": "Gateway 所在主机",
+    "createLocationHint": "将在此位置创建新的项目目录。",
+    "openLocationHint": "将所选目录添加到项目列表。",
+    "createUnavailable": "此 Gateway 不支持直接创建并登记项目。你仍可打开已有项目，或使用目录选择器中的新建文件夹功能。",
+    "preparingProject": "正在准备…",
+    "projectOpened": "已打开项目「{name}」",
+    "createProjectUnconfirmed": "创建项目时遇到问题：{path}。重试前请先检查项目列表。{error}",
+    "openProjectFailed": "无法打开项目：{error}",
     "createProject": "创建项目",
     "projectNamePlaceholder": "项目名称",
     "sourceFolders": "源文件夹",
@@ -372,6 +388,7 @@
     },
     "resources": {
       "title": "文件", "count": "文件（{count}）", "empty": "暂无文件或链接。",
+      "currentWorkingFile": "当前工作文件", "publishedVersion": "已发布版本",
       "groups": { "files": "文件", "links": "链接", "attachments": "文件", "documents": "文件", "deliverables": "文件", "urls": "链接" },
       "open": "打开 {name}", "preparing": "正在准备编辑器…", "retry": "重试", "preview": "预览 {name}", "download": "下载 {name}", "edit": "创建 {name} 的可编辑副本", "publish": "发布 {name}",
       "imported": "{name} 已可编辑。", "published": "{name} 已可分享。",
@@ -566,6 +583,8 @@
       "documentEditingRetired": "请更新客户端并重新打开页面，将批注作为聊天输入发送。"
     },
     "artifactDocument": {
+      "fixedSnapshot": "固定版本",
+      "continueEditing": "继续编辑",
       "sections": "交付件文档区域",
       "preview": "预览",
       "source": "源码",
@@ -3834,6 +3853,7 @@
       "continue": "继续",
       "commandWithSkills": "已选择的技能仅用于普通消息；请移除技能标签后执行命令。",
       "commandDescriptions": {
+        "init": "根据当前项目创建或完善项目指南",
         "new": "新建聊天",
         "compact": "压缩当前对话上下文",
         "goal": "设置持续执行的目标",
@@ -4495,6 +4515,7 @@
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
     "slashCommands": {
+      "initUnavailable": "此 Gateway 不支持项目初始化。请更新后重试，草稿已保留。",
       "side": {
         "closed": "原侧边聊天已关闭，已保留草稿。请修改命令后再发送，以创建新的侧边聊天。",
         "description": "打开临时侧边聊天 · /btw 为同义命令",
