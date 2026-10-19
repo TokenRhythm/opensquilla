@@ -248,8 +248,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   let candidatesLoaded = false
   let candidateEpoch = 0
   let catalogEpoch = 0
+  let catalogLoad: Promise<void> | null = null
   watch(() => options.catalogScope?.(), () => {
     catalogEpoch += 1
+    catalogLoad = null
     slashCmds.value = []
     slashCatalogLoaded.value = false
     closeSlashMenu()
@@ -312,8 +314,16 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     slashOpen.value = true
   }
 
-  async function loadSlashCommands() {
+  function loadSlashCommands(): Promise<void> {
+    if (catalogLoad) return catalogLoad
     const epoch = ++catalogEpoch
+    const pending = fetchSlashCommands(epoch)
+    catalogLoad = pending
+    void pending.finally(() => { if (catalogLoad === pending) catalogLoad = null })
+    return pending
+  }
+
+  async function fetchSlashCommands(epoch: number) {
     try {
       const res = await commandCatalog.list('web_chat', options.catalogCallOptions)
       if (epoch !== catalogEpoch) return
@@ -380,7 +390,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       // Directory edits and mutations in another client have no push event.
       // Revalidate at the next palette opening, never on each search keystroke
       // or during client startup. The epoch also fences an earlier open's RPC.
-      if (!slashOpen.value) resetSkillCandidates()
+      if (!slashOpen.value) {
+        resetSkillCandidates()
+        if (!slashCatalogLoaded.value) void loadSlashCommands()
+      }
       slashIdx.value = 0
       updatePalette()
       void loadSkillCandidates()

@@ -62,6 +62,53 @@ describe('project initialization command intent', () => {
     rpc.call.mockResolvedValue({ commands: [] })
     await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
   })
+
+  it('reloads an invalidated catalog when the palette reopens and shares the pending request', async () => {
+    const scope = ref('epoch-1')
+    const { api, rpc, inputText } = harness(true, [initCatalogCommand, { name: '/compact', aliases: [] }],
+      Promise.resolve(), undefined, { catalogScope: () => scope.value })
+    await api.loadSlashCommands()
+    inputText.value = '/'
+    api.handleSlashInput()
+    expect(api.filteredSlashCmds.value.map(command => command.cmd)).toEqual(['/init', '/compact', '/plan'])
+    scope.value = 'epoch-2'
+    const ready = deferred()
+    rpc.call.mockImplementationOnce(async () => { await ready.promise; return { commands: [initCatalogCommand] } })
+    api.handleSlashInput()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    const supported = api.supportsTurnCommand({ name: 'project.init', args: '' })
+    inputText.value = '/in'
+    api.handleSlashInput()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    ready.resolve()
+    await expect(supported).resolves.toBe(true)
+    expect(inputText.value).toBe('/in')
+    expect(api.filteredSlashCmds.value.map(command => command.cmd)).toEqual(['/init'])
+  })
+
+  it('discards a late catalog from the previous scope', async () => {
+    const scope = ref('epoch-1')
+    const ready = deferred()
+    const { api, rpc } = harness(false, [initCatalogCommand], ready.promise, undefined, { catalogScope: () => scope.value })
+    const previous = api.loadSlashCommands()
+    scope.value = 'epoch-2'
+    rpc.call.mockResolvedValue({ commands: [] })
+    await api.loadSlashCommands()
+    ready.resolve()
+    await previous
+    expect(api.resolveTurnCommand('/init')).toBeNull()
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('retries a failed catalog when the palette is opened again', async () => {
+    const { api, rpc, inputText } = harness(false, [initCatalogCommand])
+    rpc.call.mockRejectedValueOnce(new Error('temporarily unavailable'))
+    await api.loadSlashCommands()
+    inputText.value = '/'
+    api.handleSlashInput()
+    await vi.waitFor(() => expect(api.filteredSlashCmds.value.some(command => command.cmd === '/init')).toBe(true))
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+  })
 })
 
 function harness(
@@ -215,7 +262,8 @@ describe('useChatSlashCommands compaction lifecycle', () => {
 describe('local side chat command palette', () => {
   it('has one primary entry searchable by its alias before the remote catalog loads', async () => {
     const run = vi.fn(async () => true)
-    const { api, inputText, rpc } = harness(false, [], Promise.resolve(), undefined, { sideChat: { run } })
+    const ready = deferred()
+    const { api, inputText, rpc } = harness(false, [], ready.promise, undefined, { sideChat: { run } })
     for (const query of ['/si', '/btw']) {
       inputText.value = query
       api.handleSlashInput()
@@ -225,7 +273,8 @@ describe('local side chat command palette', () => {
     await expect(api.classifySlashCommand('/btw question')).resolves.toBe('registered')
     await expect(api.executeSlashCommand('/btw question')).resolves.toBe(true)
     expect(run).toHaveBeenCalledWith('/btw question')
-    expect(rpc.call).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    ready.resolve()
   })
 
   it('completes only the leading token and preserves all prose after the caret', () => {

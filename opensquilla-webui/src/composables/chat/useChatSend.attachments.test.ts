@@ -25,6 +25,7 @@ import type {
   ChatRenderedMessage,
 } from '@/types/chat'
 import type { CollaborationMode } from '@/types/plans'
+import type { SelectedSkillRef } from '@/types/selectedSkills'
 import {
   useChatPendingQueue,
   type BusySendMode,
@@ -137,6 +138,88 @@ describe('ordinary project initialization turns', () => {
     expect(call.mock.calls.filter(([method]) => method === 'chat.send')).toHaveLength(1)
     expect(call).toHaveBeenCalledWith('turns.receipt.get', expect.objectContaining({ turnCommand: command }))
   })
+
+  it('reloads the catalog before retrying an explicitly rejected init with the same request', async () => {
+    const scope = ref('epoch-1')
+    const call = vi.fn().mockRejectedValueOnce(Object.assign(new Error('Synthetic busy'), { accepted: false, retryable: true }))
+      .mockResolvedValue({ sessionKey: 'agent:main:webchat:test' })
+    const h = makeOptions({ inputText: ref('/init keep existing guidance'), rpc: { call } })
+    const { list } = connectPlanCommands(h, undefined, () => scope.value)
+    await h.api.onSend()
+    expect(h.options.inputText.value).toBe('/init keep existing guidance')
+    scope.value = 'epoch-2'
+    await h.api.onSend()
+    const sends = call.mock.calls.filter(([method]) => method === 'chat.send')
+    expect(list).toHaveBeenCalledTimes(2)
+    expect(sends).toHaveLength(2)
+    expect(sends[1]?.[1]).toEqual(sends[0]?.[1])
+    expect(h.options.inputText.value).toBe('')
+  })
+
+  it.each(['unsupported', 'edited', 'session-changed'])(
+    'keeps a rejected init unsent if catalog refresh finishes after %s', async change => {
+      const scope = ref('epoch-1')
+      const call = vi.fn().mockRejectedValueOnce(Object.assign(new Error('Synthetic busy'), { accepted: false, retryable: true }))
+      const h = makeOptions({ inputText: ref('/init keep existing guidance'), rpc: { call } })
+      const { list } = connectPlanCommands(h, undefined, () => scope.value)
+      await h.api.onSend()
+      scope.value = 'epoch-2'
+      let release!: () => void
+      const ready = new Promise<void>(resolve => { release = resolve })
+      const original = list.getMockImplementation()!
+      list.mockImplementationOnce(async () => {
+        await ready
+        return change === 'unsupported' ? { commands: [] } : original()
+      })
+      const retry = h.api.onSend()
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2))
+      if (change === 'edited') h.options.inputText.value = 'a newer draft'
+      if (change === 'session-changed') h.options.sessionKey.value = 'agent:main:webchat:another'
+      release()
+      await retry
+      expect(call.mock.calls.filter(([method]) => method === 'chat.send')).toHaveLength(1)
+      expect(h.options.inputText.value).toBe(change === 'edited' ? 'a newer draft' : '/init keep existing guidance')
+    },
+  )
+
+  it.each(['supported', 'unsupported', 'draft-changed'])(
+    'refreshes catalog support for a rejected init toast retry while preserving a separate draft: %s', async state => {
+      const scope = ref('epoch-1')
+      let rejectFirst!: (error: unknown) => void
+      const call = vi.fn().mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectFirst = reject }))
+        .mockResolvedValue({ sessionKey: 'agent:main:webchat:test' })
+      const h = makeOptions({ inputText: ref('/init keep existing guidance'), rpc: { call },
+        deliveryIdentity: ref('same-gateway-owner'), selectedSkills: ref<SelectedSkillRef[]>([]) })
+      const { list } = connectPlanCommands(h, undefined, () => scope.value)
+      const first = h.api.onSend()
+      await vi.waitFor(() => expect(call).toHaveBeenCalledOnce())
+      const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+      h.options.inputText.value = 'newer explicit draft'
+      h.options.selectedSkills!.value = [skill]
+      rejectFirst(Object.assign(new Error('Synthetic busy'), { accepted: false, retryable: true }))
+      await first
+      const action = pushToast.mock.calls[pushToast.mock.calls.length - 1]?.[1]?.action
+      expect(action?.label).toBe('Retry')
+      scope.value = 'epoch-2'
+      let release!: () => void
+      const ready = new Promise<void>(resolve => { release = resolve })
+      const original = list.getMockImplementation()!
+      list.mockImplementationOnce(async () => {
+        await ready
+        return state === 'unsupported' ? { commands: [] } : original()
+      })
+      const retry = action.onClick()
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2))
+      if (state === 'draft-changed') h.options.inputText.value = 'edited again'
+      release()
+      await retry
+      const sends = call.mock.calls.filter(([method]) => method === 'chat.send')
+      expect(sends).toHaveLength(state === 'supported' ? 2 : 1)
+      if (state === 'supported') expect(sends[1]?.[1]).toEqual(sends[0]?.[1])
+      expect(h.options.inputText.value).toBe(state === 'draft-changed' ? 'edited again' : 'newer explicit draft')
+      expect(h.options.selectedSkills!.value).toEqual([skill])
+    },
+  )
 
   it('revokes fresh command admission if support disappears while the WAL is committing', async () => {
     const wal = memoryDeliveryWal()
@@ -324,6 +407,7 @@ function sameTurnSteerOptions(
 function connectPlanCommands(
   harness: ReturnType<typeof makeOptions>,
   activate?: () => boolean | Promise<boolean>,
+  catalogScope?: () => string,
 ) {
   const { options } = harness
   const mode = ref(options.initialCollaborationMode.value)
@@ -333,12 +417,14 @@ function connectPlanCommands(
     if (accepted) mode.value = 'plan'
     return accepted
   })
-  const slash = useChatSlashCommands({
-    commandCatalog: { list: vi.fn(async () => ({ commands: [
+  const list = vi.fn(async () => ({ commands: [
       { name: '/compact', aliases: [] }, { name: '/reset', aliases: [] },
       { name: '/init', aliases: [], category: 'turn', busy_policy: 'next_turn', presentation: 'turn',
         execution: { action: 'project.init' } },
-    ] })) },
+    ] }))
+  const slash = useChatSlashCommands({
+    commandCatalog: { list },
+    catalogScope,
     usageReporting: usageReportingDouble(),
     sessionMaintenance: {
       reset: vi.fn(async () => { throw new Error('Unexpected reset') }),
@@ -358,7 +444,7 @@ function connectPlanCommands(
   options.resolveTurnCommand = slash.resolveTurnCommand
   options.supportsTurnCommand = slash.supportsTurnCommand
   options.executeSlashCommand = slash.executeSlashCommand
-  return { slash, activatePlanMode }
+  return { slash, activatePlanMode, list }
 }
 
 describe('Plan prompt and project-init integration', () => {

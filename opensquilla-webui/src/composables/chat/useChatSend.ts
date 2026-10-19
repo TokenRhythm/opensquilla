@@ -2462,6 +2462,20 @@ export function useChatSend(options: UseChatSendOptions) {
       recoveredAttempt &&
       matchesRecoveredComposer()
     ) {
+      const retryAttempt = recoveredAttempt
+      if (retryAttempt.params.turnCommand) {
+        const supported = await options.supportsTurnCommand?.(retryAttempt.params.turnCommand)
+        if (
+          !deliveryStillMatches()
+          || recoveredAttempt !== retryAttempt
+          || !composerMatchesSnapshot(composerSnapshot)
+          || !queueOwnerMatchesSnapshot(composerSnapshot)
+        ) return
+        if (!supported) {
+          pushToast(i18n.global.t('chat.slashCommands.initUnavailable'), { tone: 'info' })
+          return
+        }
+      }
       return await dispatchSend(text, {
         composerText,
         draftIds: recoveredAttempt.draftIds,
@@ -3802,6 +3816,11 @@ export function useChatSend(options: UseChatSendOptions) {
               const handled = (outcome: ChatSendOutcome | undefined) => outcome && outcome !== 'not_sent'
                 ? true : unavailable('chat.toast.retryUnavailable')
               if (separateExplicitDraft) {
+                if (attempt.params.turnCommand) {
+                  const supported = await options.supportsTurnCommand?.(attempt.params.turnCommand)
+                  if (!canStillRetry()) return unavailable('chat.toast.retryUnavailable')
+                  if (!supported) return unavailable('chat.slashCommands.initUnavailable')
+                }
                 if (options.validateActiveProjectBeforeSend && await refreshedActiveProjectBlocksSend()) {
                   return unavailable('chat.toast.retryUnavailable')
                 }
