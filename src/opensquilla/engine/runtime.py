@@ -2819,7 +2819,6 @@ class _SelectorFallbackProvider:
         router_config = getattr(gateway_config, "squilla_router", None)
         if (
             not getattr(router_config, "enabled", False)
-            or getattr(router_config, "rollout_phase", "observe") == "observe"
             or not callable(self._image_catalog_lookup)
             or not _count_image_blocks(messages)
         ):
