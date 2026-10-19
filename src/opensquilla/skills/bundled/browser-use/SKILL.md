@@ -75,6 +75,10 @@ check each needed capability before using it.
   in the new evidence, and keep any retry within the returned recovery budget.
   Stop when that budget is exhausted or the page reports a blocker. Never
   invent refs, carry them across pages, or reopen a page to reset recovery.
+- For `STALE_OBSERVATION` with `outcome=not_started`, use the returned fresh
+  image or observe the same target before choosing new coordinates. Hover
+  effects may change target pixels during movement; confirm the intended
+  control in the new image before retrying within the recovery budget.
 - `argument_validation` with `outcome=not_started` means that request did not
   execute. For a timeout, protocol failure, or lost response, the outcome may
   be unknown: inspect the same target before deciding whether another action

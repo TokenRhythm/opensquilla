@@ -362,6 +362,69 @@ try {
   assert.equal(observationChecks.image.coordinateSpace, 'image-pixels')
   console.log('Observations, native image delivery, coordinate freshness, batches, and blocking dialog control verified.')
 
+  const zoomedCaptures = await app.evaluate(async ({ BrowserWindow, WebContentsView, nativeImage }, origin) => {
+    const owner = new BrowserWindow({ show: true, width: 900, height: 700, webPreferences: { sandbox: true } })
+    const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
+    owner.contentView.addChildView(view)
+    view.setBounds({ x: 0, y: 0, width: 800, height: 600 })
+    await view.webContents.loadURL(origin)
+    let visible = true
+    const driver = new globalThis.__BrowserPlaywrightDriver(view.webContents, () => visible)
+    const signal = new AbortController().signal
+    const read = expression => view.webContents.executeJavaScript(expression)
+    const results = []
+    try {
+      await read(`document.head.innerHTML='<style>html,body{margin:0;width:1800px;min-height:2400px;background:white}canvas{position:absolute;left:500px;top:1000px}</style>';
+        document.body.innerHTML='<canvas width="300" height="240"></canvas>';
+        window.hits=0;const canvas=document.querySelector('canvas'),ctx=canvas.getContext('2d');
+        ctx.fillStyle='black';ctx.fillRect(0,0,300,240);
+        ctx.fillStyle='blue';ctx.fillRect(20,20,90,70);ctx.fillStyle='red';ctx.fillRect(180,140,80,70);
+        canvas.onclick=event=>{const rect=canvas.getBoundingClientRect();
+          if(event.clientX-rect.x>=20&&event.clientX-rect.x<110&&event.clientY-rect.y>=20&&event.clientY-rect.y<90)window.hits++};void 0`)
+      for (const zoom of [0.8, 1, 1.25]) {
+        view.webContents.setZoomFactor(zoom)
+        await read('new Promise(resolve=>{scrollTo(400,920);requestAnimationFrame(()=>requestAnimationFrame(resolve))})')
+        const geometry = await read('({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY})')
+        const observed = await driver.observe(1, () => {}, signal)
+        const sample = image => {
+          const png = nativeImage.createFromBuffer(Buffer.from(image.dataBase64, 'base64'))
+          return { width: image.width, height: image.height,
+            blue: [...png.crop({ x: 165, y: 135, width: 1, height: 1 }).toBitmap()],
+            red: [...png.crop({ x: 320, y: 255, width: 1, height: 1 }).toBitmap()] }
+        }
+        const image = sample({ ...observed.observation.image, dataBase64: observed.dataBase64 })
+        const clicked = await driver.act({ action: 'click', x: 165, y: 135,
+          observationId: observed.observation.observationId, imageId: observed.observation.image.imageId }, 1, () => {}, signal)
+        visible = false
+        view.setVisible(false)
+        const hidden = sample(await driver.screenshot(() => {}, signal))
+        view.setVisible(true)
+        visible = true
+        results.push({ zoom, geometry, image, hidden, clicked: clicked.performed, hits: await read('window.hits') })
+      }
+      return results
+    } finally {
+      view.webContents.setZoomFactor(1)
+      await driver.dispose()
+      view.webContents.close()
+      owner.destroy()
+    }
+  }, origin)
+  for (const [index, capture] of zoomedCaptures.entries()) {
+    assert.deepEqual([capture.geometry.x, capture.geometry.y], [400, 920])
+    for (const image of [capture.image, capture.hidden]) {
+      assert.deepEqual([image.width, image.height], [capture.geometry.width, capture.geometry.height],
+        `zoom ${capture.zoom} must capture the entire CSS viewport`)
+      assert.ok(image.blue[0] > image.blue[1] + 100 && image.blue[0] > image.blue[2] + 100,
+        'the blue canvas target must occupy its reported image coordinates')
+      assert.ok(image.red[2] > image.red[0] + 100 && image.red[2] > image.red[1] + 100,
+        'the second canvas marker must preserve the screenshot origin and scale')
+    }
+    assert.equal(capture.clicked, true)
+    assert.equal(capture.hits, index + 1, 'each image-coordinate action must hit the canvas exactly once')
+  }
+  console.log('Scrolled native zoom captures preserve viewport pixels and coordinate input on shown and hidden pages.')
+
   const initialDialog = await app.evaluate(async ({ BrowserWindow, WebContentsView }, origin) => {
     const owner = new BrowserWindow({ show: true, webPreferences: { sandbox: true } })
     const view = new WebContentsView({ webPreferences: { sandbox: true, partition: 'initial-dialog-fixture' } })

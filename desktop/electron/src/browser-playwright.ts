@@ -140,6 +140,18 @@ class RendererTransport implements ConnectOverCDPTransport {
       return await this.contents.debugger.sendCommand(method, { ...params, waitForDebuggerOnStart: false },
         command.sessionId === this.sessionId ? this.nativeSessionId : command.sessionId)
     }
+    if (method === 'Page.captureScreenshot' && command.sessionId === this.sessionId && params.clip) {
+      // Electron's native zoom requires CDP clip bounds in device-independent
+      // pixels, while Playwright supplies CSS bounds for this attached page.
+      const zoom = this.contents.getZoomFactor()
+      if (zoom !== 1) {
+        const clip = params.clip as { x: number; y: number; width: number; height: number; scale: number }
+        return await this.contents.debugger.sendCommand(method, { ...params,
+          clip: { ...clip, x: clip.x * zoom, y: clip.y * zoom,
+            width: clip.width * zoom, height: clip.height * zoom },
+        }, this.nativeSessionId)
+      }
+    }
     if (method === 'Input.dispatchMouseEvent' && command.sessionId === this.sessionId) {
       const guard = this.guard
       const mouseGuard = this.mouseGuard
