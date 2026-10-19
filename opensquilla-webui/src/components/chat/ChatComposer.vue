@@ -357,7 +357,7 @@
               >
                 <Icon v-if="sessionRoutingMode === 'squilla_router'" name="router" :size="17" />
                 <Icon v-else-if="sessionRoutingMode === 'llm_ensemble'" name="fork" :size="17" />
-                <Icon v-else name="agents" :size="17" aria-hidden="true" />
+                <span v-else class="chat-model-routing-btn__dot" aria-hidden="true" />
                 <span class="chat-model-routing-btn__label">{{ modelRoutingTriggerLabel }}</span>
                 <span v-if="modelRoutingUsesDefault" class="chat-model-routing-btn__default">{{ t('chat.newTaskModel.defaultBadge') }}</span>
                 <Icon class="chat-model-routing-btn__chevron" name="chevronDown" :size="12" />
@@ -1800,6 +1800,22 @@ button.attachment-chip__primary:focus-visible {
   white-space: nowrap;
   font-size: var(--fs-xs);
   text-align: left;
+}
+
+.chat-model-routing-btn__dot {
+  flex: 0 0 17px;
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+}
+
+.chat-model-routing-btn__dot::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 .chat-model-routing-btn__default {

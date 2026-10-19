@@ -3,6 +3,7 @@ import { createApp, h, nextTick, reactive, type App } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import ChatComposer from './ChatComposer.vue'
+import { getIconSvg } from '@/utils/icons'
 
 const apps: App[] = []
 let panelWidth = 700
@@ -78,16 +79,24 @@ describe('ChatComposer responsive control identity', () => {
     expect(plan.closest('.chat-input-footer')).toBe(footer)
   })
 
-  it('keeps each open routing menu, focused menu item and trigger when shrinking and widening', async () => {
-    const { host } = await mount()
+  it.each(['off', 'squilla_router', 'llm_ensemble'] as const)(
+    'keeps the %s routing icon, open menu, focused item and trigger through resizing', async (sessionRoutingMode) => {
+    const { host } = await mount({ sessionRoutingMode })
     const route = host.querySelector<HTMLButtonElement>('.chat-model-routing-btn')!
     const plus = host.querySelector('.chat-plus-btn')
     const mode = host.querySelector('.chat-run-mode-btn')
     const editor = host.querySelector('[contenteditable="true"]')
-    expect(route.querySelector('.icon svg rect')).not.toBeNull()
-    expect(route.querySelector('.chat-model-routing-btn__dot')).toBeNull()
-    expect(route.title).toContain('A very long model name')
-    expect(route.getAttribute('aria-description')).toContain('A very long model name')
+    if (sessionRoutingMode === 'off') {
+      expect(route.querySelector('.chat-model-routing-btn__dot')).not.toBeNull()
+      expect(route.querySelector('.icon svg rect')).toBeNull()
+      expect(route.title).toContain('A very long model name')
+      expect(route.getAttribute('aria-description')).toContain('A very long model name')
+    } else {
+      expect(route.querySelector('.chat-model-routing-btn__dot')).toBeNull()
+      const expectedIcon = document.createElement('span')
+      expectedIcon.innerHTML = getIconSvg(sessionRoutingMode === 'squilla_router' ? 'router' : 'fork', 17)
+      expect(route.querySelector('.icon svg')?.isEqualNode(expectedIcon.firstElementChild)).toBe(true)
+    }
     route.click()
     await nextTick()
     const menu = document.querySelector('.composer-model-routing')
