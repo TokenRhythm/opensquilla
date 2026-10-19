@@ -32,17 +32,11 @@ _REASONING_FIELDS = {"enable_thinking", "thinking", "reasoning", "reasoning_effo
 
 
 @pytest.fixture(autouse=True)
-def isolate_catalog_and_network(tmp_path, monkeypatch):
+def isolate_catalog_and_state(tmp_path, monkeypatch):
     monkeypatch.setattr(model_catalog, "_shared_catalog", model_catalog.ModelCatalog())
     monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY", raising=False)
-
-    def reject_network(*_args, **_kwargs):
-        raise AssertionError("Naming reasoning tests must use MockTransport")
-
-    monkeypatch.setattr(socket.socket, "connect", reject_network)
-    monkeypatch.setattr(socket, "create_connection", reject_network)
 
 
 @pytest.mark.parametrize(("thinking", "thinking_level"), [
@@ -143,7 +137,15 @@ async def test_automatic_naming_preserves_reasoning_and_finalizes_its_usage(tmp_
             usage_event_sink=SessionUsageEventSink(storage, start_retry_delays=(), retry_delays=()),
         )
 
-        await generate_session_title(ctx, _KEY, "Inspect queue latency")
+        # Windows initializes event-loop socketpairs through loopback connections.
+        # Guard only the naming operation, leaving loop setup and cleanup intact.
+        with monkeypatch.context() as network_guard:
+            def reject_network(*_args, **_kwargs):
+                raise AssertionError("Naming reasoning tests must use MockTransport")
+
+            network_guard.setattr(socket.socket, "connect", reject_network)
+            network_guard.setattr(socket, "create_connection", reject_network)
+            await generate_session_title(ctx, _KEY, "Inspect queue latency")
 
         assert len(requests) == 1
         session = await storage.get_session(_KEY)

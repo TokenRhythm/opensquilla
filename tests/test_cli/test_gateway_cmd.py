@@ -1961,14 +1961,28 @@ def test_gateway_shutdown_watchdog_can_be_disarmed_or_force_exit(monkeypatch) ->
         fired.set()
 
     monkeypatch.setattr(gateway_cmd, "_force_process_exit", force_exit)
-    disarmed = gateway_cmd._GatewayShutdownWatchdog(timeout=0.01, exit_code=0)
-    disarmed.start()
-    disarmed.disarm()
-    assert fired.wait(0.05) is False
+    disarmed = gateway_cmd._GatewayShutdownWatchdog(timeout=0, exit_code=0)
+    release_disarmed = gateway_cmd.threading.Event()
 
-    armed = gateway_cmd._GatewayShutdownWatchdog(timeout=0.01, exit_code=1)
+    def run_after_disarm() -> None:
+        release_disarmed.wait()
+        disarmed._run()
+
+    disarmed._thread = gateway_cmd.threading.Thread(target=run_after_disarm, daemon=True)
+    disarmed.start()
+    try:
+        disarmed.disarm()
+    finally:
+        release_disarmed.set()
+    disarmed._thread.join(timeout=1.0)
+    assert not disarmed._thread.is_alive()
+    assert exits == []
+
+    armed = gateway_cmd._GatewayShutdownWatchdog(timeout=0, exit_code=1)
     armed.start()
     assert fired.wait(1.0) is True
+    armed._thread.join(timeout=1.0)
+    assert not armed._thread.is_alive()
     assert exits == [1]
 
 
