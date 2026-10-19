@@ -4,26 +4,36 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
+import os
 import subprocess
 import sys
 import threading
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.artifact_session import Actor, ActorKind
+from opensquilla.artifact_session import Actor, ActorKind, ArtifactSessionService
 from opensquilla.artifact_session import office_materialization as disk
 from opensquilla.artifact_session import working_files as wf
 from opensquilla.artifact_session.errors import ArtifactConflictError, ArtifactValidationError
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.gateway.document_resource_recovery import reconcile_pending_document_resources
+from opensquilla.gateway.page_context import resolve_page_context
 from opensquilla.gateway.rpc import RpcContext
+from opensquilla.office_format import OFFICE_MIMES
+from opensquilla.paths import native_io_path
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from tests.test_gateway.test_office_working_versions import office_env as office_env
-from tests.test_gateway.test_rpc_workbench_resources import SESSION_KEY
+from tests.test_gateway.test_rpc_workbench_resources import (
+    SESSION_KEY,
+    _append_attachment,
+    _dispatch,
+)
 from tests.test_office_format import office_package
 
 
@@ -522,3 +532,116 @@ def test_stage_integrity_is_checked_before_recording_fingerprint(tmp_path, monke
             allow_existing=False,
         )
     assert not (tmp_path / "file.docx").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows long Office staging path regression")
+@pytest.mark.parametrize("format", ["docx", "xlsx", "pptx"])
+async def test_long_office_staging_first_bind_recovers_sqlite_receipt(
+    resource_env, monkeypatch, format
+):
+    env = resource_env
+    workspace = Path(env.config.workspace_dir)
+    # Keep the canonical target below MAX_PATH while the durable staging path
+    # crosses it, as in the annotation incident. The disk tests also cover an
+    # entire workspace beyond MAX_PATH.
+    workspace /= "w" * max(1, 180 - len(str(workspace)) - 1)
+    native_io_path(workspace).mkdir(parents=True)
+    env.config.workspace_dir = str(workspace)
+    payload = office_package(format)
+    attachment = await _append_attachment(
+        env,
+        message_id="long-office",
+        name=f"Report.{format}",
+        mime=OFFICE_MIMES[format],
+        payload=payload,
+        staged=True,
+    )
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    original_apply = wf._apply_office_materialization
+
+    async def fail_after_apply(*args):
+        await original_apply(*args)
+        raise OSError("interrupted first bind after replacement")
+
+    async def no_finish(*args):
+        pass
+
+    params = {
+        "sessionKey": SESSION_KEY,
+        "resource": {"type": "attachment", "id": attachment["attachment_id"]},
+        "idempotencyKey": "long-office-open",
+        "expectedSha256": attachment["sha256_ref"],
+    }
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(wf, "_apply_office_materialization", fail_after_apply)
+            patch.setattr(wf, "_finish_office_materialization", no_finish)
+            failed = await _dispatch(env, "workbench.resources.open", params)
+        assert failed.error is not None
+        async with service.repository._read_transaction("test.long.office.receipt") as conn:
+            cursor = await conn.execute("SELECT * FROM artifact_office_materializations")
+            rows = await cursor.fetchall()
+        assert len(rows) == 1
+        plan = disk.OfficeFilePlan.from_dict(json.loads(rows[0]["plan_json"]))
+        assert len(str(plan.directory)) > 260
+        assert disk.read_office_file(plan.entry) == payload
+        assert await wf.get_working_files(service, plan.document_id) is None
+        assert await wf.reconcile_office_materializations(service, env.store) == (1, 0)
+        assert not native_io_path(plan.entry).exists()
+        assert not native_io_path(plan.directory).exists()
+        reopened = await _dispatch(env, "workbench.resources.open", params)
+        assert reopened.error is None, reopened.error
+        binding = await wf.get_working_files(service, plan.document_id)
+        assert binding is not None
+        assert disk.read_office_file(binding.entry) == payload
+        assert not str(binding.entry).startswith("\\\\?\\")
+        assert await wf.reconcile_office_materializations(service, env.store) == (0, 0)
+        resolved = await resolve_page_context(
+            reopened.payload["pageContext"],
+            env.ctx,
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            workspace=str(workspace),
+            candidate_id="long-office-turn",
+        )
+        candidate = resolved["_officeCandidate"]
+        candidate_scope = {
+            "session_key": SESSION_KEY,
+            "session_id": env.session.session_id,
+            "workspace": str(workspace),
+        }
+        candidate_path = await wf.prepare_office_candidate(
+            service, env.store, candidate, **candidate_scope
+        )
+        assert len(str(candidate_path)) > 260
+        assert not str(candidate_path).startswith("\\\\?\\")
+        assert disk.read_office_file(candidate_path) == payload
+        # A ZIP comment changes bytes without changing the package's validity
+        # or depending on a particular Office document/slide content fixture.
+        edited = io.BytesIO(payload)
+        with zipfile.ZipFile(edited, "a") as archive:
+            archive.comment = b"long-path candidate edit"
+        changed = edited.getvalue()
+        native_io_path(candidate_path).write_bytes(changed)
+        repeated = await wf.prepare_office_candidate(
+            service, env.store, candidate, **candidate_scope
+        )
+        assert repeated == candidate_path
+        assert disk.read_office_file(repeated) == changed
+        committed = await wf.commit_office_candidate(
+            service, env.store, candidate, actor_id="long-office-turn", **candidate_scope
+        )
+        assert committed is not None
+        assert disk.read_office_file(binding.entry) == changed
+        assert await wf.commit_office_candidate(
+            service, env.store, candidate, actor_id="long-office-turn", **candidate_scope
+        ) is None
+        sibling = native_io_path(candidate_path.parent / "unknown.txt")
+        sibling.write_bytes(b"retain")
+        await wf.discard_office_candidate(service, candidate, workspace=str(workspace))
+        await wf.discard_office_candidate(service, candidate, workspace=str(workspace))
+        assert not native_io_path(candidate_path).exists()
+        assert sibling.read_bytes() == b"retain"
+        assert await wf.reconcile_office_materializations(service, env.store) == (0, 0)
+    finally:
+        await service.close()

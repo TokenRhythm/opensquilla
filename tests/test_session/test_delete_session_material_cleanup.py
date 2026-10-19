@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import os
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -503,16 +504,57 @@ async def test_material_cleanup_rechecks_link_components_in_worker(
     await _seed_material(media_root, workspace, node.session_id)
     cleanup = await build_session_material_cleanup(_config(media_root, workspace))(node, None)
     original_is_symlink = type(workspace).is_symlink
+    loop_thread = threading.get_ident()
+    checked_threads: list[int] = []
 
     def replaced_component(path):
-        return path == workspace / ".opensquilla" or original_is_symlink(path)
+        # Filesystem checks may use Windows' extended spelling while captured
+        # workspace paths remain logical. Inject the same replaced component.
+        if native_io_path(path) == native_io_path(workspace / ".opensquilla"):
+            checked_threads.append(threading.get_ident())
+            return True
+        return original_is_symlink(path)
 
     monkeypatch.setattr(type(workspace), "is_symlink", replaced_component)
     await cleanup()
 
+    assert checked_threads and all(thread != loop_thread for thread in checked_threads)
     assert not transcript_material_dir(media_root, node.session_id).exists()
     assert _workspace_attachment_dir(workspace, node.session_id).is_dir()
     assert not list((media_root / "artifacts").rglob("meta.json"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a native Windows junction")
+async def test_material_cleanup_rejects_junction_created_after_preparation(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    media_root = tmp_path / "media"
+    node = SessionNode(session_key="agent:main:webchat:changed-junction", session_id="target")
+    await _seed_material(media_root, outside, node.session_id)
+    cleanup = await build_session_material_cleanup(_config(media_root, workspace))(node, None)
+    junction = workspace / ".opensquilla"
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(native_io_path(junction)),
+         str(native_io_path(outside / ".opensquilla"))],
+        capture_output=True,
+    )
+    assert linked.returncode == 0, linked.stderr.decode(errors="replace")
+    try:
+        with capture_logs() as logs:
+            await cleanup()
+
+        # The post-preparation filesystem change must not redirect deletion to
+        # the junction target; unrelated owned media still gets cleaned up.
+        assert any(entry["event"] == "session_material_cleanup.workspace_changed" for entry in logs)
+        assert (_workspace_attachment_dir(outside, node.session_id) / "doc.pdf").read_bytes() == (
+            b"%PDF-1.4\n"
+        )
+        assert native_io_path(junction).is_junction()
+        assert not transcript_material_dir(media_root, node.session_id).exists()
+        assert not list((media_root / "artifacts").rglob("meta.json"))
+    finally:
+        native_io_path(junction).rmdir()
 
 
 @pytest.mark.asyncio
