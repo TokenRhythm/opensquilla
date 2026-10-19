@@ -58,7 +58,7 @@ const batchActionNames = actionNames.filter(name => !('individual' in actionCont
 const operationContract = {
   list: { fields: [], required: [], readOnly: true },
   open: { fields: ['targetRef', 'url', 'contextTargetRef'], required: [], readOnly: false },
-  snapshot: { fields: ['targetRef', 'ref', 'maxChars', 'downloadId'], required: ['targetRef'], readOnly: true },
+  snapshot: { fields: ['targetRef', 'ref', 'maxChars', 'downloadId', 'scope'], required: ['targetRef'], readOnly: true },
   act: { fields: ['targetRef', 'action', 'ref', 'text', 'key', 'direction', 'amount', 'button', 'durationMs', 'endRef', 'fileId', 'chooserId'], required: ['targetRef', 'action'], readOnly: false },
   screenshot: { fields: ['targetRef'], required: ['targetRef'], readOnly: true },
   reload: { fields: ['targetRef'], required: ['targetRef'], readOnly: false },
@@ -74,6 +74,7 @@ const fields = {
   url: { ...identity(8192), description: 'HTTP or HTTPS URL without embedded credentials, or exactly about:blank for an empty page.' },
   contextTargetRef: { ...identity(), description: 'Owned page whose cookies and browser storage the new tab shares.' },
   ref: identity(), downloadId: identity(), maxChars: { type: 'integer', minimum: 1, maximum: 65536 },
+  scope: { ...identity(4096), description: 'CSS selector matching exactly one root in the main frame. Narrows page text and refs before their existing limits. Cannot be combined with ref or downloadId; iframe contents are not included.' },
   observationMode: { type: 'string', enum: ['auto', 'dom'], description: 'auto includes a viewport image when capture is available; dom returns text only.' },
   actions: { type: 'array', minItems: 1, maxItems: 3 },
   dialogId: identity(), accept: { type: 'boolean' }, promptText: { ...text(),
@@ -102,6 +103,7 @@ const dependencies: ReadonlyArray<{ operation: BrowserOperationName; field: Fiel
 ]
 const exclusivePairs: ReadonlyArray<readonly [BrowserOperationName, Field, Field]> = [
   ['open', 'contextTargetRef', 'targetRef'], ['snapshot', 'ref', 'downloadId'],
+  ['snapshot', 'scope', 'ref'], ['snapshot', 'scope', 'downloadId'],
 ]
 
 export const BROWSER_ARGUMENT_CONTRACT_VERSION = 1

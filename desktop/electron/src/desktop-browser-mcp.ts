@@ -93,6 +93,46 @@ export class DesktopBrowserMcp {
 
   clear(): void { this.receipts.clear(); this.faults.clear() }
 
+  replayLegacy(request: DesktopBrowserRequest, operationId: string, recoveryScope: string | undefined,
+    signal: AbortSignal): Promise<JsonObject> | undefined {
+    if (readOperations.has(request.operation) || !this.receipts.has(JSON.stringify([request.sessionKey, operationId]))) return undefined
+    return this.callLegacy(request, operationId, recoveryScope, signal)
+  }
+
+  /** Adapt authenticated old-tool calls without creating a second URL ref or recovery path. */
+  async callLegacy(request: DesktopBrowserRequest, operationId: string, recoveryScope: string | undefined,
+    signal: AbortSignal): Promise<JsonObject> {
+    const names: Partial<Record<DesktopBrowserRequest['operation'], string>> = {
+      list: 'browser_tabs',
+      open: request.targetRef ? 'browser_navigate' : 'browser_open',
+      snapshot: 'browser_inspect', act: 'browser_act', screenshot: 'browser_screenshot', reload: 'browser_reload',
+    }
+    const name = names[request.operation]
+    if (!name) throw new DesktopBrowserError('INVALID_REQUEST', 'Unsupported legacy browser operation.', 400)
+    const { sessionKey, operation: _operation, ...args } = request
+    let result: JsonObject
+    try {
+      result = await this.call({ name, arguments: args,
+        _meta: { sessionKey, operationId, ...(recoveryScope ? { recoveryScope } : {}) } }, signal)
+    } catch (error) {
+      if (error instanceof BrowserArgumentValidationError) throw browserArgumentFailure(error)
+      throw error
+    }
+    const value = object(result.structuredContent)
+    const execution = maybeObject(value.execution)
+    const outcome = value.outcome ?? execution?.outcome
+      ?? (execution?.state === 'blocked' ? 'unknown' : 'completed')
+    const image = Array.isArray(result.content)
+      ? result.content.map(maybeObject).find(block => block?.type === 'image') : undefined
+    if (request.operation === 'screenshot' && result.isError !== true && !image && execution?.state === 'blocked') {
+      return { ...value, ok: false, code: 'BROWSER_BLOCKED', outcome: 'not_started', retryable: false,
+        recovery: 'resolve_blocker' }
+    }
+    return { ...value, ok: result.isError !== true, outcome,
+      ...(image && typeof image.data === 'string'
+        ? { dataBase64: image.data, mimeType: image.mimeType } : {}) }
+  }
+
   async handle(value: unknown, signal: AbortSignal): Promise<JsonObject | null> {
     let id: unknown = null
     try {

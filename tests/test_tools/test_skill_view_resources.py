@@ -27,7 +27,6 @@ from opensquilla.skills.hub.source import SkillMeta
 from opensquilla.skills.injector import SkillInjector
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.skills.resources import SkillResources
-from opensquilla.tools.browser_policy import BROWSER_MCP_REQUIRED_TOOLS
 from opensquilla.tools.builtin import skill_tools as skill_tools_module
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import ToolContext, ToolError, current_tool_context
@@ -371,7 +370,7 @@ async def test_browser_skill_direct_tools_respect_required_tool_surface(tmp_path
         assert browser is not None
         required = set(browser.requires_tools)
         assert required == {
-            f"mcp__desktop-browser__{name}" for name in BROWSER_MCP_REQUIRED_TOOLS
+            "mcp__desktop-browser__browser_tabs", "mcp__desktop-browser__browser_inspect",
         }
         tool_names = required | {"skill_list", "skill_view"}
 
@@ -385,7 +384,7 @@ async def test_browser_skill_direct_tools_respect_required_tool_surface(tmp_path
         finally:
             current_tool_context.reset(token)
 
-        missing = "mcp__desktop-browser__browser_open"
+        missing = "mcp__desktop-browser__browser_inspect"
         token = current_tool_context.set(ToolContext(
             skill_catalog=snapshot,
             authorized_tool_names=frozenset(tool_names - {missing}),

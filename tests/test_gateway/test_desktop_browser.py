@@ -4,17 +4,21 @@ import asyncio
 import base64
 import json
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import httpx
 import pytest
 
 from opensquilla import browser as module
 from opensquilla.browser import DesktopBrowserClient, DesktopBrowserError
+from opensquilla.mcp.desktop_browser import DesktopBrowserMCPClient
+from opensquilla.mcp.types import MCPCallContext, current_mcp_call_context
 from opensquilla.tool_boundary import ToolCall
+from opensquilla.tools import browser_policy
 from opensquilla.tools.builtin.browser import browser
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry, get_default_registry
-from opensquilla.tools.types import SafeToolError, ToolContext, current_tool_context
+from opensquilla.tools.types import CallerKind, SafeToolError, ToolContext, current_tool_context
 
 
 @pytest.mark.parametrize(
@@ -74,10 +78,11 @@ async def test_request_authenticates_and_keeps_exact_target_identity(monkeypatch
         "operation": "snapshot",
         "targetRef": "target-one",
     }
-    with pytest.raises(DesktopBrowserError, match="target changed"):
+    with pytest.raises(DesktopBrowserError, match="target changed") as caught:
         await client.request(
             session_key="session-one", operation="snapshot", target_ref="target-two"
         )
+    assert caught.value.details["outcome"] == "unknown"
 
 
 async def test_image_bytes_use_ephemeral_media():
@@ -141,6 +146,9 @@ async def test_browser_investigation_uses_ordinary_dispatch(mode, operation, arg
     expected = {"session_key": "session-one", "operation": operation,
                 "target_ref": arguments.get("targetRef")}
     expected.update({k: v for k, v in arguments.items() if k != "targetRef"})
+    identity = requests[0].pop("operation_id")
+    scope = requests[0].pop("recovery_scope")
+    assert len(identity) == 64 and scope == "session-one"
     assert requests == [expected]
 
 
@@ -260,6 +268,9 @@ async def test_browser_transport_failure_keeps_timeout_distinct(monkeypatch, fai
     with pytest.raises(DesktopBrowserError) as caught:
         await client.request(session_key="session-one", operation="snapshot", target_ref="page")
     assert caught.value.code == public_code
+    assert caught.value.details == {
+        "outcome": "unknown", "retryable": False, "recovery": "inspect",
+    }
     assert "private transport diagnostic" not in str(caught.value)
 
 
@@ -276,3 +287,203 @@ async def test_browser_caller_cancellation_is_not_reported_as_timeout(monkeypatc
     client = DesktopBrowserClient("http://127.0.0.1:9000/v1/browser", "x" * 48)
     with pytest.raises(asyncio.CancelledError):
         await client.request(session_key="session-one", operation="snapshot", target_ref="page")
+
+
+async def test_browser_identity_headers_preserve_the_old_body_and_response(monkeypatch):
+    requests = []
+    async_client = httpx.AsyncClient
+
+    def respond(request):
+        requests.append(request)
+        # Older clients ignore the new headers and still return their original result shape.
+        return httpx.Response(200, json={"targetRef": "page", "refs": [{"ref": "old-ref"}]})
+
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient",
+        lambda **kwargs: async_client(**kwargs, transport=httpx.MockTransport(respond)),
+    )
+    client = DesktopBrowserClient("http://127.0.0.1:9000/v1/browser", "x" * 48)
+    result = await client.request(
+        session_key="session-one", operation="snapshot", target_ref="page",
+        operation_id="trusted-operation", recovery_scope="任务 / scope%一",
+    )
+    assert result["refs"] == [{"ref": "old-ref"}]
+    assert json.loads(requests[0].content) == {
+        "sessionKey": "session-one", "operation": "snapshot", "targetRef": "page",
+    }
+    assert requests[0].headers["x-opensquilla-browser-operation-id"] == "trusted-operation"
+    assert requests[0].headers["x-opensquilla-browser-recovery-scope"] == quote(
+        "任务 / scope%一", safe="",
+    )
+
+
+async def test_browser_tool_identity_is_stable_for_one_call_and_changes_for_another():
+    requests = []
+
+    async def request(**kwargs):
+        requests.append(kwargs)
+        return {"targetRef": "page"}
+
+    context = ToolContext(
+        is_owner=True, session_key="session-one", task_id="task-one",
+        desktop_browser=SimpleNamespace(request=request),
+    )
+    token = current_tool_context.set(context)
+    try:
+        await browser("act", "page", action="press", key="Enter", _tool_use_id="submit")
+        await browser("act", "page", action="press", key="Enter", _tool_use_id="submit")
+        await browser("act", "page", action="press", key="Enter", _tool_use_id="other-submit")
+    finally:
+        current_tool_context.reset(token)
+    assert requests[0]["operation_id"] == requests[1]["operation_id"]
+    assert requests[0]["operation_id"] != requests[2]["operation_id"]
+    assert len({item["recovery_scope"] for item in requests}) == 1
+
+
+async def test_browser_failure_keeps_recovery_facts_and_redacts_other_details(monkeypatch):
+    async_client = httpx.AsyncClient
+    response = {
+        "ok": False, "code": "TIMEOUT", "message": "private renderer diagnostic",
+        "targetRef": "page", "operationId": "trusted-operation", "outcome": "unknown",
+        "retryable": False, "recovery": "inspect", "dataBase64": "private pixels",
+        "navigation": {"url": "https://private.invalid/path?token=secret"},
+        "recoveryBudget": {"domain": "action", "attempts": 2, "limit": 2,
+                           "exhausted": True, "private": "secret"},
+    }
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient",
+        lambda **kwargs: async_client(**kwargs, transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=response),
+        )),
+    )
+    client = DesktopBrowserClient("http://127.0.0.1:9000/v1/browser", "x" * 48)
+    with pytest.raises(DesktopBrowserError) as caught:
+        await client.request(
+            session_key="session-one", operation="act", target_ref="page", action="press",
+            key="Enter", operation_id="trusted-operation",
+        )
+    assert caught.value.details == {
+        "targetRef": "page", "operationId": "trusted-operation", "outcome": "unknown",
+        "retryable": False, "recovery": "inspect",
+        "recoveryBudget": {"domain": "action", "attempts": 2, "limit": 2, "exhausted": True},
+    }
+    assert "private" not in str(caught.value) + json.dumps(caught.value.details)
+
+
+async def test_browser_rejects_an_unrelated_operation_receipt(monkeypatch):
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient",
+        lambda **kwargs: async_client(**kwargs, transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={
+                "targetRef": "page", "operationId": "foreign-operation",
+            }),
+        )),
+    )
+    client = DesktopBrowserClient("http://127.0.0.1:9000/v1/browser", "x" * 48)
+    with pytest.raises(DesktopBrowserError) as caught:
+        await client.request(
+            session_key="session-one", operation="act", target_ref="page", action="press",
+            key="Enter", operation_id="trusted-operation",
+        )
+    assert caught.value.code == "BROWSER_RESPONSE_INVALID"
+    assert caught.value.details["outcome"] == "unknown"
+    assert caught.value.details["operationId"] == "trusted-operation"
+
+
+@pytest.mark.parametrize("task_id", [None, "任务一"])
+async def test_old_tool_and_mcp_share_unicode_operation_and_recovery_identity(monkeypatch, task_id):
+    old_calls, mcp_calls = [], []
+
+    async def old_request(self, **kwargs):
+        old_calls.append(kwargs)
+        return {"targetRef": "page"}
+
+    async def mcp_request(method, params, **kwargs):
+        mcp_calls.append(params)
+        return {"result": {"content": [{"type": "text", "text": "{}"}]}}
+
+    monkeypatch.setattr(DesktopBrowserClient, "request", old_request)
+    client = DesktopBrowserClient("http://127.0.0.1:9000/v1/browser", "x" * 48)
+    mcp = DesktopBrowserMCPClient(client)
+    monkeypatch.setattr(mcp, "_request", mcp_request)
+    context = ToolContext(
+        is_owner=True, caller_kind=CallerKind.WEB, session_key="会话一", task_id=task_id,
+        desktop_browser=client,
+    )
+    token = current_tool_context.set(context)
+    mcp_token = current_mcp_call_context.set(MCPCallContext("same-call"))
+    try:
+        await browser("act", "page", action="press", key="Enter", _tool_use_id="same-call")
+        result = await mcp.call_tool("browser_act", {
+            "targetRef": "page", "action": "press", "key": "Enter",
+        })
+        assert not result.is_error
+    finally:
+        current_mcp_call_context.reset(mcp_token)
+        current_tool_context.reset(token)
+    assert old_calls[0]["operation_id"] == mcp_calls[0]["_meta"]["operationId"]
+    assert old_calls[0]["recovery_scope"] == mcp_calls[0]["_meta"]["recoveryScope"]
+
+
+@pytest.mark.parametrize("kind", ["url-preview", "unknown", None, {"malformed": True}])
+async def test_restricted_network_blocks_unconfirmed_or_url_targets(monkeypatch, kind):
+    requests = []
+
+    async def request(**kwargs):
+        requests.append(kwargs)
+        assert kwargs["operation"] == "list", "A denied URL action must never execute"
+        return {"targets": [{"targetRef": "page", "kind": kind}]}
+
+    monkeypatch.setattr(browser_policy, "browser_network_policy_supported", lambda _ctx: False)
+    token = current_tool_context.set(ToolContext(
+        is_owner=True, session_key="session-one", desktop_browser=SimpleNamespace(request=request),
+    ))
+    try:
+        with pytest.raises(SafeToolError, match="BROWSER_POLICY_UNSUPPORTED"):
+            await browser("act", "page", action="press", key="Enter", _tool_use_id="blocked")
+        with pytest.raises(SafeToolError, match="BROWSER_POLICY_UNSUPPORTED"):
+            await browser("open", url="https://example.invalid", _tool_use_id="blocked-open")
+    finally:
+        current_tool_context.reset(token)
+    assert len(requests) == 1
+
+
+async def test_restricted_network_keeps_confirmed_artifact_and_list_access(monkeypatch):
+    requests = []
+
+    async def request(**kwargs):
+        requests.append(kwargs)
+        if kwargs["operation"] == "list":
+            return {"targets": [{"targetRef": "artifact", "kind": "artifact-preview"}]}
+        return {"targetRef": "artifact", "performed": True}
+
+    monkeypatch.setattr(browser_policy, "browser_network_policy_supported", lambda _ctx: False)
+    token = current_tool_context.set(ToolContext(
+        is_owner=True, session_key="session-one", desktop_browser=SimpleNamespace(request=request),
+    ))
+    try:
+        result = json.loads(await browser("act", "artifact", action="press", key="Enter"))
+        assert result["performed"]
+        assert json.loads(await browser("list"))["targets"][0]["targetRef"] == "artifact"
+    finally:
+        current_tool_context.reset(token)
+    assert [item["operation"] for item in requests] == ["list", "act", "list"]
+
+
+async def test_blocked_browser_screenshot_keeps_recovery_instead_of_decoding_pixels(monkeypatch):
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        module.httpx, "AsyncClient",
+        lambda **kwargs: async_client(**kwargs, transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={
+                "ok": False, "code": "BROWSER_BLOCKED", "targetRef": "page",
+                "outcome": "not_started", "retryable": False, "recovery": "resolve_blocker",
+            }),
+        )),
+    )
+    client = DesktopBrowserClient("http://127.0.0.1:9000/v1/browser", "x" * 48)
+    with pytest.raises(DesktopBrowserError) as caught:
+        await client.request(session_key="session-one", operation="screenshot", target_ref="page")
+    assert caught.value.code == "BROWSER_BLOCKED"
+    assert caught.value.details["recovery"] == "resolve_blocker"

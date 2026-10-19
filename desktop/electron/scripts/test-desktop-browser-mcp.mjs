@@ -1063,7 +1063,154 @@ try {
     body: JSON.stringify(envelope('tools/list')),
   })
   assert.equal(response.status, 404, 'old Desktop configurations must not advertise an unusable MCP endpoint')
+  const oldResponse = await fetch(env[DESKTOP_BROWSER_URL_ENV], {
+    method: 'POST', headers: { Authorization: `Bearer ${env[DESKTOP_BROWSER_TOKEN_ENV]}`,
+      'Content-Type': 'application/json', 'x-opensquilla-browser-operation-id': 'new-gateway-call',
+      'x-opensquilla-browser-recovery-scope': 'new-gateway-task' },
+    body: JSON.stringify({ sessionKey: 'old-desktop-session', operation: 'list' }),
+  })
+  assert.equal(oldResponse.status, 200)
+  assert.deepEqual(await oldResponse.json(), { legacy: true }, 'new Gateway headers preserve old Desktop behavior')
 } finally {
   await legacyOnly.close()
+}
+
+// The old model tool gains canonical URL refs and receipts only when the new
+// Gateway supplies trusted header identities. Old callers and workspace
+// previews retain their original executor and result format.
+const adapterTargets = [
+  { targetRef: 'adapter-url', kind: 'url-preview' },
+  { targetRef: 'adapter-artifact', kind: 'artifact-preview' },
+]
+let oldActions = 0
+let canonicalActions = 0
+let adapterBudgetReady = false
+let adapterBudgetReads = 0
+const adapter = new DesktopBrowserServer(async request => {
+  if (request.operation === 'list') return { targets: adapterTargets }
+  if (request.operation === 'snapshot') return {
+    targetRef: request.targetRef, refs: [{ ref: 'old-tool-ref' }], text: 'old preview state',
+  }
+  if (request.operation === 'act') {
+    assert.equal(request.ref, 'old-tool-ref')
+    oldActions++
+    return { targetRef: request.targetRef, performed: true }
+  }
+  return { targetRef: request.targetRef, legacy: true }
+}, undefined, async request => {
+  if (request.operation === 'list') return { targets: adapterTargets.filter(target => target.kind === 'url-preview')
+    .map(target => ({ ...target, ...(request.sessionKey === 'adapter-budget'
+      ? { pageState: adapterBudgetReady ? 'ready' : 'loading' } : {}) })) }
+  if (request.operation === 'snapshot' && request.sessionKey === 'adapter-budget') {
+    adapterBudgetReads++
+    if (!adapterBudgetReady) throw new DesktopBrowserError('PAGE_NOT_READY', 'Synthetic loading page.', 409,
+      { targetRef: request.targetRef, operation: 'snapshot', pageState: 'loading', outcome: 'not_started' })
+  }
+  if (request.operation === 'snapshot') return {
+    targetRef: request.targetRef, refs: [{ ref: 'canonical-ref' }], text: 'canonical page state',
+  }
+  if (request.operation === 'screenshot' && request.sessionKey === 'adapter-blocked') return {
+    targetRef: request.targetRef, execution: { state: 'blocked', reason: 'permission' },
+  }
+  if (request.operation === 'screenshot') return {
+    targetRef: request.targetRef, mime: 'image/png', width: 1, height: 1, dataBase64: png,
+  }
+  if (request.operation === 'act') {
+    if (request.ref !== 'canonical-ref') throw new DesktopBrowserError('STALE_ELEMENT', 'Refresh the snapshot.')
+    canonicalActions++
+    if (request.sessionKey === 'adapter-unknown') throw new DesktopBrowserError('TIMEOUT', 'Synthetic lost result.', 504,
+      { targetRef: request.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
+    return { targetRef: request.targetRef, action: request.action, performed: true }
+  }
+  return { targetRef: request.targetRef ?? 'adapter-url', operation: request.operation }
+})
+try {
+  const env = await adapter.start()
+  const url = env[DESKTOP_BROWSER_URL_ENV]
+  const invokeLegacy = async (operation, args = {}, id, sessionKey = 'adapter-session', scope = 'adapter-task') => {
+    const response = await fetch(url, { method: 'POST', headers: {
+      Authorization: `Bearer ${env[DESKTOP_BROWSER_TOKEN_ENV]}`, 'Content-Type': 'application/json',
+      ...(id ? { 'x-opensquilla-browser-operation-id': id,
+        'x-opensquilla-browser-recovery-scope': encodeURIComponent(scope) } : {}),
+    }, body: JSON.stringify({ sessionKey, operation, ...args }) })
+    return { status: response.status, result: await response.json() }
+  }
+  const listed = await invokeLegacy('list', {}, 'adapter-list')
+  assert.deepEqual(listed.result.targets, adapterTargets, 'workspace previews remain visible')
+  const before = await invokeLegacy('snapshot', { targetRef: 'adapter-url' })
+  assert.equal(before.result.refs[0].ref, 'old-tool-ref')
+  assert.equal((await invokeLegacy('act', { targetRef: 'adapter-url', action: 'click',
+    ref: before.result.refs[0].ref })).result.performed, true)
+  assert.equal(oldActions, 1)
+
+  const current = await invokeLegacy('snapshot', { targetRef: 'adapter-url' }, 'adapter-snapshot')
+  assert.equal(current.result.refs[0].ref, 'canonical-ref')
+  assert.equal(current.result.operationId, 'adapter-snapshot')
+  const args = { targetRef: 'adapter-url', action: 'click', ref: current.result.refs[0].ref }
+  const first = await invokeLegacy('act', args, 'adapter-submit')
+  const replay = await invokeLegacy('act', args, 'adapter-submit')
+  assert.equal(first.result.performed, true)
+  assert.deepEqual(replay.result, first.result)
+  assert.equal(canonicalActions, 1, 'legacy duplicates reuse the canonical mutation receipt')
+  const conflict = await invokeLegacy('act', { ...args, ref: 'other-ref' }, 'adapter-submit')
+  assert.equal(conflict.status, 400)
+  assert.equal(conflict.result.outcome, undefined, 'a conflicting identity already belongs to the first execution')
+  assert.equal(canonicalActions, 1)
+  const stale = await invokeLegacy('act', { ...args, ref: before.result.refs[0].ref }, 'adapter-stale')
+  assert.equal(stale.result.code, 'STALE_ELEMENT')
+  assert.equal(stale.result.outcome, 'not_started')
+  assert.equal(oldActions, 1, 'canonical failure must never retry with the old ref executor')
+
+  const artifact = await invokeLegacy('snapshot', { targetRef: 'adapter-artifact' }, 'artifact-snapshot')
+  assert.equal(artifact.result.refs[0].ref, 'old-tool-ref')
+  assert.equal((await invokeLegacy('act', { targetRef: 'adapter-artifact', action: 'click',
+    ref: artifact.result.refs[0].ref }, 'artifact-click')).result.performed, true)
+  assert.equal(oldActions, 2)
+  const capture = await invokeLegacy('screenshot', { targetRef: 'adapter-url' }, 'adapter-image')
+  assert.equal(capture.result.dataBase64, png)
+  assert.equal(capture.result.mimeType, 'image/png')
+  assert.equal(capture.result.width, 1)
+  const blockedImage = await invokeLegacy('screenshot', { targetRef: 'adapter-url' }, 'blocked-image', 'adapter-blocked')
+  assert.equal(blockedImage.result.ok, false)
+  assert.equal(blockedImage.result.code, 'BROWSER_BLOCKED')
+  assert.equal(blockedImage.result.recovery, 'resolve_blocker')
+  assert.equal(blockedImage.result.dataBase64, undefined)
+
+  const budgetScope = '任务 / scope%一'
+  assert.equal((await invokeLegacy('snapshot', { targetRef: 'adapter-url' }, 'budget-one', 'adapter-budget', budgetScope)).result.code, 'PAGE_NOT_READY')
+  const secondBudget = await fetch(`${url}/mcp`, { method: 'POST', headers: {
+    Authorization: `Bearer ${env[DESKTOP_BROWSER_TOKEN_ENV]}`, 'Content-Type': 'application/json',
+  }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+    name: 'browser_inspect', arguments: { targetRef: 'adapter-url' },
+    _meta: { sessionKey: 'adapter-budget', operationId: 'budget-two', recoveryScope: budgetScope },
+  } }) })
+  assert.equal((await secondBudget.json()).result.structuredContent.code, 'PAGE_NOT_READY')
+  assert.equal((await invokeLegacy('snapshot', { targetRef: 'adapter-url' }, 'budget-blocked', 'adapter-budget', budgetScope)).result.code,
+    'BROWSER_RECOVERY_EXHAUSTED', 'both entry points must share the same Unicode recovery scope')
+  assert.equal(adapterBudgetReads, 2)
+  adapterBudgetReady = true
+  const readyList = await invokeLegacy('list', {}, 'budget-ready', 'adapter-budget', budgetScope)
+  assert.equal(readyList.result.targets.find(target => target.targetRef === 'adapter-url').pageState, 'ready')
+  assert.ok(readyList.result.targets.some(target => target.targetRef === 'adapter-artifact'))
+  assert.equal((await invokeLegacy('snapshot', { targetRef: 'adapter-url' }, 'budget-probe', 'adapter-budget', budgetScope)).result.ok, true,
+    'a ready legacy list must grant the canonical read-only recovery probe')
+  assert.equal(adapterBudgetReads, 3)
+
+  const unknown = await invokeLegacy('act', args, 'adapter-unknown-call', 'adapter-unknown')
+  assert.equal(unknown.result.outcome, 'unknown')
+  assert.equal(unknown.result.retryable, false)
+  assert.equal(unknown.result.recovery, 'inspect')
+  assert.deepEqual((await invokeLegacy('act', args, 'adapter-unknown-call', 'adapter-unknown')).result, unknown.result)
+  assert.equal(canonicalActions, 2, 'unknown results are retained and never resubmitted')
+  const missing = await invokeLegacy('act', { ...args, targetRef: 'missing-adapter-target' }, 'adapter-missing')
+  assert.equal(missing.result.code, 'TARGET_NOT_FOUND')
+  assert.equal(missing.result.outcome, 'not_started')
+  assert.equal(oldActions, 2)
+  adapterTargets.splice(0, 1)
+  assert.deepEqual((await invokeLegacy('act', args, 'adapter-submit')).result, first.result,
+    'closing the target after execution must not discard or relabel its receipt')
+  assert.equal(canonicalActions, 2)
+} finally {
+  await adapter.close()
 }
 console.log('Desktop browser MCP protocol, diagnostics, recovery limits, media, receipts and cancellation passed.')

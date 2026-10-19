@@ -79,18 +79,26 @@ async def test_prompt_contains_only_public_ordinary_skills(tmp_path: Path) -> No
     assert output.metadata["skills_catalog_omitted_count"] == 0
 
 @pytest.mark.asyncio
-async def test_browser_skill_requires_its_browser_tools_in_the_turn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("missing_tool", ["browser_tabs", "browser_inspect"])
+async def test_browser_skill_requires_its_read_tools_in_the_turn(
+    tmp_path: Path, missing_tool: str,
+) -> None:
     loader = _loader(tmp_path)
     available = _ctx(loader)
+    available.tool_defs = [
+        tool for tool in available.tool_defs
+        if tool.name in {
+            "mcp__desktop-browser__browser_tabs", "mcp__desktop-browser__browser_inspect",
+        }
+    ]
     assert "browser-use" in _rendered_names(
         (await resolve_skill_catalog(available)).system_prompt[0]
     )
 
     missing = _ctx(loader)
     missing.tool_defs = [
-        tool
-        for tool in missing.tool_defs
-        if tool.name != "mcp__desktop-browser__browser_open"
+        tool for tool in available.tool_defs
+        if tool.name != f"mcp__desktop-browser__{missing_tool}"
     ]
     assert "browser-use" not in _rendered_names(
         (await resolve_skill_catalog(missing)).system_prompt[0]

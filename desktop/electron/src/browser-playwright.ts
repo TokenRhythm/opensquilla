@@ -623,18 +623,50 @@ export class BrowserPlaywrightDriver {
       ...(stopReason ? { stopReason, stoppedAt } : {}) }, ...observation }
   }
 
-  async snapshot(generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<{
+  async snapshot(generation: number, assertCurrent: Guard, signal: AbortSignal, scope?: string): Promise<{
     text: string; refs: Record<string, unknown>[]; truncated: boolean
   }> {
+    let scopedRoot: ElementHandle<Element> | undefined
     return await this.run(assertCurrent, signal, async page => {
       this.invalidate()
       const epoch = this.invalidationEpoch
       const assertSnapshot = () => {
         if (epoch !== this.invalidationEpoch) throw new DesktopBrowserError('PAGE_CHANGED', 'The page changed during inspection. Request a new snapshot.')
       }
-      const frames = page.frames().slice(0, 16)
+      const scopeChanged = () => new DesktopBrowserError('SCOPE_CHANGED',
+        'The scope root changed during inspection. Inspect the page again.', 409,
+        { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+      const scopeLocator = scope === undefined ? undefined : page.mainFrame().locator(`css=${scope}`)
+      if (scopeLocator) {
+        const validCss = await page.mainFrame().evaluate(selector => {
+          try { document.querySelector(selector); return true } catch { return false }
+        }, scope!)
+        if (!validCss) throw new DesktopBrowserError('INVALID_SCOPE', 'The scope must be a valid CSS selector.', 400,
+          { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+        const count = await scopeLocator.count()
+        if (count !== 1) throw new DesktopBrowserError(count ? 'SCOPE_AMBIGUOUS' : 'SCOPE_NOT_FOUND',
+          count ? 'The scope matches more than one main-frame element. Use a narrower CSS selector.'
+            : 'The scope does not match a main-frame element. Inspect the page before selecting another scope.', 409,
+          { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+        try { scopedRoot = await scopeLocator.elementHandle({ timeout: ACTION_TIMEOUT_MS }) as ElementHandle<Element> | undefined }
+        catch { assertSnapshot(); throw scopeChanged() }
+        if (!scopedRoot) throw scopeChanged()
+        if (await scopedRoot.evaluate(node => node.matches('iframe,frame'))) {
+          throw new DesktopBrowserError('SCOPE_UNSUPPORTED', 'Scope supports main-frame elements only; iframe contents cannot be selected.', 400,
+            { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+        }
+      }
+      const assertScopeCurrent = async () => {
+        assertSnapshot()
+        if (scopeLocator && scopedRoot && !await scopeLocator.evaluateAll((nodes, root) =>
+          nodes.length === 1 && nodes[0] === root && root.isConnected, scopedRoot).catch(() => false)) {
+          throw scopeChanged()
+        }
+      }
+      await assertScopeCurrent()
+      const frames = scopeLocator ? [page.mainFrame()] : page.frames().slice(0, 16)
       const ranked = []
-      let truncated = page.frames().length > frames.length
+      let truncated = !scopeLocator && page.frames().length > frames.length
       for (const frame of frames) {
         if (frame.isDetached() || !frame.url()) { truncated = true; continue }
         try {
@@ -654,22 +686,25 @@ export class BrowserPlaywrightDriver {
         if (refs.length >= MAX_REFS) { truncated = true; break }
         let collection: Awaited<ReturnType<typeof frame.evaluateHandle>> | undefined
         try {
-          const text = await frame.locator('body').ariaSnapshot({ timeout: frame === page.mainFrame() ? ACTION_TIMEOUT_MS : 1500 })
+          const text = await (scopeLocator ?? frame.locator('body')).ariaSnapshot({ timeout: frame === page.mainFrame() ? ACTION_TIMEOUT_MS : 1500 })
+          await assertScopeCurrent()
           texts.push(`${modal ? '[Active modal]\n' : ''}${frame === page.mainFrame() ? '' : `[Frame ${frame.url().slice(0, 500)}]\n`}${text}`)
-          collection = await frame.evaluateHandle(({ limit, maxNodes, maxShadowRoots }) => {
+          collection = await frame.evaluateHandle(({ limit, maxNodes, maxShadowRoots, scopedRoot }) => {
             const visible = (node: Element) => {
               const rect = node.getBoundingClientRect(), style = getComputedStyle(node)
               return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
             }
             const dialogs = Array.from(document.querySelectorAll('dialog:modal,[role="dialog"][aria-modal="true"],[role="alertdialog"]')).filter(visible)
-            const root = dialogs.at(-1) ?? document
+            const root = scopedRoot ?? dialogs.at(-1) ?? document
             // Walk open shadow roots at their host's position in DOM order.
             // The global node/root ceilings keep large or nested pages bounded.
             const controls: Element[] = [], blocks: Element[] = [], textNodes: Element[] = []
             const walkers = [document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)]
+            let first: Element | undefined = scopedRoot ?? undefined
             let seen = 0, shadows = 0
-            while (walkers.length && seen < maxNodes) {
-              const node = walkers.at(-1)!.nextNode() as Element | null
+            while ((first || walkers.length) && seen < maxNodes) {
+              const node = first ?? walkers.at(-1)!.nextNode() as Element | null
+              first = undefined
               if (!node) { walkers.pop(); continue }
               seen++
               if (node.shadowRoot && shadows < maxShadowRoots) {
@@ -691,7 +726,7 @@ export class BrowserPlaywrightDriver {
             return Object.assign([...new Set([...controls, ...blocks, ...textNodes])].slice(0, limit),
               { truncated: walkers.length > 0 || shadows === maxShadowRoots })
           }, { limit: MAX_REFS - refs.length, maxNodes: MAX_SNAPSHOT_NODES,
-            maxShadowRoots: MAX_SNAPSHOT_SHADOW_ROOTS })
+            maxShadowRoots: MAX_SNAPSHOT_SHADOW_ROOTS, scopedRoot })
           for (const [key, handle] of await collection.getProperties()) {
             if (key === 'truncated') { truncated ||= await handle.jsonValue() === true; await handle.dispose(); continue }
             if (!/^\d+$/.test(key)) { await handle.dispose(); continue }
@@ -752,14 +787,16 @@ export class BrowserPlaywrightDriver {
           }
         } catch (error) {
           assertSnapshot()
+          await assertScopeCurrent()
           if (frame === page.mainFrame()) { this.invalidate(); throw error }
           truncated = true
         } finally { await collection?.dispose().catch(() => {}) }
       }
-      assertSnapshot()
+      await assertScopeCurrent()
       const text = texts.join('\n')
       return { text: text.slice(0, 24_000), refs, truncated: truncated || refs.length === MAX_REFS || text.length > 24_000 }
-    })
+    }).catch(error => { if (scope !== undefined) this.invalidate(); throw error })
+      .finally(async () => { await scopedRoot?.dispose().catch(() => {}) })
   }
 
   private async requireAnchor(ref: string | undefined, generation: number): Promise<Anchor> {
