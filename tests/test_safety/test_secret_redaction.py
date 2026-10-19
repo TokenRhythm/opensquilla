@@ -3,6 +3,17 @@ from __future__ import annotations
 from opensquilla.safety.secret_redaction import redact_secret_text, redact_secret_value
 
 
+def test_redact_secret_value_masks_credentials_in_dictionary_keys() -> None:
+    secret = "sk-FAKE_PUBLIC_DUMMY_KEY_123456789"
+    payload = {secret: "safe value", "authorization": "PUBLIC_DUMMY_AUTH"}
+
+    assert redact_secret_value(payload) == {
+        "[REDACTED]": "safe value",
+        "authorization": "[REDACTED]",
+    }
+    assert secret in payload
+
+
 def test_redact_secret_text_masks_env_assignments_and_provider_keys() -> None:
     text = (
         "env.OPENROUTER_API_KEY=sk-or-v1-abcdefghijklmnopqrstuvwxyz "
