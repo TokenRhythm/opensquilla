@@ -16,6 +16,7 @@ from pathlib import Path
 
 from opensquilla.artifacts import ArtifactBudgetError, _read_regular_bundle_file
 from opensquilla.office_format import MAX_OFFICE_BYTES, OfficeFormatError
+from opensquilla.paths import native_io_path
 
 from .errors import ArtifactConflictError, ArtifactValidationError
 
@@ -29,7 +30,7 @@ def read_office_file(path: Path) -> bytes:
 
 def _fingerprint(path: Path) -> tuple[int, ...] | None:
     try:
-        stat = path.stat()
+        stat = native_io_path(path).stat()
     except FileNotFoundError:
         return None
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
@@ -86,7 +87,7 @@ class OfficeFilePlan:
 
 
 def _write(path: Path, payload: bytes) -> None:
-    with path.open("xb") as stream:
+    with native_io_path(path).open("xb") as stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
@@ -147,8 +148,10 @@ def stage_office_file(
         before,
         old is not None and old_hash != expected_sha256,
     )
-    plan.directory.mkdir(parents=True, exist_ok=False)
-    plan.entry.parent.mkdir(parents=True, exist_ok=True)
+    # Keep plans and containment checks logical; only filesystem calls use the
+    # Windows extended spelling. Existing persisted plans retain their layout.
+    native_io_path(plan.directory).mkdir(parents=True, exist_ok=False)
+    native_io_path(plan.entry.parent).mkdir(parents=True, exist_ok=True)
     try:
         _write(plan.member("new"), payload)
         if old is not None:
@@ -169,7 +172,7 @@ def apply_office_file(plan: OfficeFilePlan) -> None:
         raise ArtifactConflictError("Office working file changed before replacement")
     if _fingerprint(plan.member("new")) != tuple(plan.staged_fingerprint or ()):
         raise ArtifactConflictError("Staged Office file changed before replacement")
-    os.replace(plan.member("new"), plan.entry)
+    os.replace(native_io_path(plan.member("new")), native_io_path(plan.entry))
 
 
 def office_stage_unconsumed(plan: OfficeFilePlan) -> bool:
@@ -202,12 +205,12 @@ def reconcile_office_file(
         # Recovery is outside SQLite. The immutable receipt supplies authority;
         # a second metadata check prevents overwriting an edit made while writing.
         staged = plan.member("new")
-        plan.directory.mkdir(parents=True, exist_ok=True)
-        staged.unlink(missing_ok=True)
+        native_io_path(plan.directory).mkdir(parents=True, exist_ok=True)
+        native_io_path(staged).unlink(missing_ok=True)
         _write(staged, payload)
         if _fingerprint(entry) != before:
             raise ArtifactConflictError("Office working file changed during recovery")
-        os.replace(staged, entry)
+        os.replace(native_io_path(staged), native_io_path(entry))
         return
     if digest == plan.old_sha256:
         return
@@ -216,7 +219,7 @@ def reconcile_office_file(
     if plan.old_sha256 is None:
         if _fingerprint(entry) != before:
             raise ArtifactConflictError("Office working file changed during recovery")
-        entry.unlink()
+        native_io_path(entry).unlink()
         return
     backup = plan.member("old")
     backup_fingerprint = _fingerprint(backup)
@@ -226,15 +229,15 @@ def reconcile_office_file(
         raise ArtifactConflictError("Office recovery backup changed during recovery")
     if _fingerprint(entry) != before:
         raise ArtifactConflictError("Office working file changed during recovery")
-    os.replace(backup, entry)
+    os.replace(native_io_path(backup), native_io_path(entry))
 
 
 def cleanup_office_plan(plan: OfficeFilePlan, *, preserve_backup: bool) -> None:
     # Never remove unknown siblings or sweep recovered-* directories.
-    plan.member("new").unlink(missing_ok=True)
+    native_io_path(plan.member("new")).unlink(missing_ok=True)
     if not preserve_backup:
-        plan.member("old").unlink(missing_ok=True)
+        native_io_path(plan.member("old")).unlink(missing_ok=True)
     try:
-        plan.directory.rmdir()
+        native_io_path(plan.directory).rmdir()
     except OSError:
         pass
