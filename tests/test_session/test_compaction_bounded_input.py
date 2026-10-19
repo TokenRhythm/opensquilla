@@ -4,6 +4,7 @@ from copy import deepcopy
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.types import ChatConfig, DoneEvent, TextDeltaEvent
 from opensquilla.session.compaction import (
@@ -11,8 +12,10 @@ from opensquilla.session.compaction import (
     CompactionRequest,
     CompactionRequestContext,
     _build_suffix_compaction_call,
+    _find_turn_boundary_cut,
     _sample_summary_rounds,
     compact_context,
+    estimate_entry_model_replay_tokens,
 )
 from opensquilla.session.compaction_budget import CompactionBudget
 from opensquilla.session.compaction_deployment import (
@@ -73,14 +76,15 @@ def _configuration(window):
     return provider, target, cfg
 
 
-def _history():
+def _history(*, repetitions=450):
     # More than one million conservative persisted tokens, with genuinely
-    # oversized model-visible input (not only inflated usage metadata).
+    # oversized model-visible input (not only inflated usage metadata). Each
+    # complete round also fits 32K's history budget under tokenizer fallback.
     return [
         {
             "role": "user" if i % 2 == 0 else "assistant",
             "content": f"Record {i}: "
-            + ("old state 123 alpha beta gamma. " * 900)
+            + ("old state 123 alpha beta gamma. " * repetitions)
             + f" END_RECORD_{i}",
             "token_count": 8192,
             "message_id": f"original-{i}",
@@ -90,10 +94,19 @@ def _history():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "force_tokenizer_fallback", [False, True], ids=["default-tokenizer", "fallback"],
+)
 @pytest.mark.parametrize("window", [32_768, 131_072, 200_000])
-async def test_million_token_history_uses_one_bounded_summary_and_keeps_soft_tail(window):
+async def test_million_token_history_uses_one_bounded_summary_and_keeps_soft_tail(
+    window, force_tokenizer_fallback, monkeypatch,
+):
+    if force_tokenizer_fallback:
+        monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
     provider, target, cfg = _configuration(window)
     entries = _history()
+    assert all(estimate_entry_model_replay_tokens(row) == row["token_count"] for row in entries)
+    assert sum(token_estimation.estimate_tokens(row["content"]) for row in entries) > 200_000
     frozen = deepcopy(entries)
     result = await compact_context(
         CompactionRequest(
@@ -112,6 +125,7 @@ async def test_million_token_history_uses_one_bounded_summary_and_keeps_soft_tai
     assert entries == frozen
     assert result.kept_entries == entries[result.removed_count :]
     kept_usage = sum(row["token_count"] for row in result.kept_entries)
+    assert result.tokens_after <= cfg.budget.history_capacity_tokens
     assert kept_usage >= window * 16 // 100
     assert kept_usage - 2 * 8192 < window * 16 // 100
     messages, _, config, proof = provider.calls[0]
@@ -129,6 +143,20 @@ async def test_million_token_history_uses_one_bounded_summary_and_keeps_soft_tai
     # 200K's 128K generation capability is not copied into a second future-
     # checkpoint reservation, and no new 8K hard cap is imposed on output.
     assert config.max_tokens == target.max_generation_tokens
+
+
+def test_tokenizer_fallback_does_not_keep_a_round_exceeding_real_history_capacity(monkeypatch):
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
+    _, _, cfg = _configuration(32_768)
+    entries = _history(repetitions=900)[-2:]
+    frozen = deepcopy(entries)
+    capacity = cfg.budget.history_capacity_tokens
+    assert sum(estimate_entry_model_replay_tokens(row) for row in entries) > capacity
+
+    cut = _find_turn_boundary_cut(entries, capacity, retain_tokens=32_768 * 16 // 100)
+
+    assert cut == len(entries)
+    assert entries == frozen
 
 
 def test_sampler_keeps_ends_and_explicit_middle_gaps_with_unicode():

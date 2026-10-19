@@ -116,7 +116,11 @@ async def test_retention_target_does_not_lower_the_pressure_trigger():
     assert not config.llm_plan.primary.provider.calls
 
 
-async def test_character_heavy_history_has_no_synthetic_sixteen_percent_character_cap():
+async def test_character_heavy_history_has_no_synthetic_sixteen_percent_character_cap(monkeypatch):
+    # Isolate character pressure with deterministic, cheap repetitive tokens.
+    monkeypatch.setattr(
+        "opensquilla.session.compaction._estimate_tokens", lambda text: max(1, len(text) // 8),
+    )
     entries = [
         {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 5000}
         for index in range(16)
@@ -157,7 +161,11 @@ def test_soft_target_never_overrides_the_existing_token_capacity(capacity, expec
     assert _find_turn_boundary_cut(entries, capacity, retain_tokens=5242) == expected_cut
 
 
-def test_soft_target_never_overrides_the_existing_character_capacity():
+def test_soft_target_never_overrides_the_existing_character_capacity(monkeypatch):
+    # Keep the token target unmet so this case exercises only the character guard.
+    monkeypatch.setattr(
+        "opensquilla.session.compaction._estimate_tokens", lambda text: max(1, len(text) // 8),
+    )
     entries = [
         {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 5000}
         for index in range(16)
