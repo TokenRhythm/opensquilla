@@ -34,6 +34,20 @@ def test_parse_cron_rejects_out_of_range_value() -> None:
         parse_cron("0 25 * * *")
 
 
+@pytest.mark.parametrize("step", ["", "/2"])
+@pytest.mark.parametrize("expression", ["50-10{step} * * * *", "0 9 * * fri-mon{step}"])
+def test_parse_cron_rejects_reversed_ranges(expression: str, step: str) -> None:
+    with pytest.raises(CronParseError, match="Range start > end"):
+        parse_cron(expression.format(step=step))
+
+
+def test_parse_cron_preserves_ascending_stepped_ranges() -> None:
+    expression = parse_cron("10-20/5 9 * * mon-fri/2")
+
+    assert expression.minute.values == frozenset({10, 15, 20})
+    assert expression.day_of_week.values == frozenset({1, 3, 5})
+
+
 def test_parse_cron_rejects_garbage() -> None:
     with pytest.raises(CronParseError):
         parse_cron("not-a-cron")
