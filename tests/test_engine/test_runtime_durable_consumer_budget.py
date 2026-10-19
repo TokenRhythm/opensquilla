@@ -111,8 +111,15 @@ async def test_routed_turn_binds_base_consumer_generation_config(
         tools=None,
         active_config=requests[0],
     )
-    assert projection is not None
+    assert projection is not None and projection.fits
     assert projection.payload["max_tokens"] == expected_durable_output
+    # The physical proof reserves the stable consumer's actual output cap once.
+    # The soft compaction watermark is not another 20K deduction here.
     assert projection.proof["raw_proof_token_budget"] == (
-        200000 - expected_durable_output - 20000
+        200000 - expected_durable_output
+    )
+    assert (
+        projection.proof["estimated_tokens"]
+        <= projection.proof["effective_proof_token_budget"]
+        < projection.proof["raw_proof_token_budget"]
     )
