@@ -1961,29 +1961,34 @@ def test_gateway_shutdown_watchdog_can_be_disarmed_or_force_exit(monkeypatch) ->
         fired.set()
 
     monkeypatch.setattr(gateway_cmd, "_force_process_exit", force_exit)
-    disarmed = gateway_cmd._GatewayShutdownWatchdog(timeout=0, exit_code=0)
-    release_disarmed = gateway_cmd.threading.Event()
+    monkeypatch.setattr(gateway_cmd, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    disarmed = gateway_cmd._GatewayShutdownWatchdog(timeout=1.0, exit_code=0)
+    entered_wait = gateway_cmd.threading.Event()
+    original_wait = disarmed._changed.wait
 
-    def run_after_disarm() -> None:
-        release_disarmed.wait()
-        disarmed._run()
+    def observe_wait(timeout: float | None = None) -> bool:
+        entered_wait.set()
+        return original_wait(timeout)
 
-    disarmed._thread = gateway_cmd.threading.Thread(target=run_after_disarm, daemon=True)
+    monkeypatch.setattr(disarmed._changed, "wait", observe_wait)
     disarmed.start()
     try:
+        assert entered_wait.wait(1.0) is True
+        assert not fired.is_set()
         disarmed.disarm()
     finally:
-        release_disarmed.set()
-    disarmed._thread.join(timeout=1.0)
-    assert not disarmed._thread.is_alive()
+        disarmed.disarm()
+        disarmed._thread.join()
     assert exits == []
 
     armed = gateway_cmd._GatewayShutdownWatchdog(timeout=0, exit_code=1)
     armed.start()
-    assert fired.wait(1.0) is True
-    armed._thread.join(timeout=1.0)
-    assert not armed._thread.is_alive()
-    assert exits == [1]
+    try:
+        assert fired.wait(1.0) is True
+        assert exits == [1]
+    finally:
+        armed.disarm()
+        armed._thread.join()
 
 
 def test_desktop_incomplete_shutdown_keeps_root_for_parent_force_stop(tmp_path, monkeypatch):
