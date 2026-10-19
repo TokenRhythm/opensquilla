@@ -71,10 +71,14 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
   let deleteUndoSnapshot: TextareaSnapshot | null = null
   let pendingUndoRepair: TextareaSnapshot | null = null
 
-  function resetInputHistory() {
+  function endInputHistoryNavigation() {
     inputHistoryIdx.value = null
     inputHistoryDraft.value = ''
     inputHistoryDraftPaths = []
+  }
+
+  function resetInputHistory() {
+    endInputHistoryNavigation()
     clearTextareaUndoState()
   }
 
@@ -84,6 +88,9 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
 
   function onTextareaInput(event?: Event) {
     updateTextareaUndoStateAfterInput(event)
+    // Editing a recalled message makes it the draft: Up/Down must not replace
+    // it with another history entry (#1954). Keep the undo state just updated.
+    endInputHistoryNavigation()
     options.autoResizeTextarea()
     const inputType = event && 'inputType' in event ? event.inputType : undefined
     if (
