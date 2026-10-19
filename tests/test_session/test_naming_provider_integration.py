@@ -247,7 +247,7 @@ async def test_naming_target_matches_http_and_ledger_without_mutating_selector(
     ("provider", "configured_cap", "output_tokens", "expected_budget", "expected_title"),
     [
         ("openrouter", None, 4, 512, _TITLE),
-        ("tokenrhythm", None, 700, 1024, _TITLE),
+        ("tokenrhythm", None, 1292, 2048, _TITLE),
         ("openrouter", 64, 4, 64, _TITLE),
         ("openrouter", 64, 65, 64, None),
     ],
@@ -314,7 +314,7 @@ async def test_naming_budget_uses_wire_kind_but_ledger_keeps_registry_identity(
     await generate_session_title(ctx, _KEY, "Inspect the database connection pool")
 
     assert len(requests) == 1
-    assert json.loads(requests[0].content)["max_tokens"] == 1024
+    assert json.loads(requests[0].content)["max_tokens"] == 2048
     await _assert_result(naming_runtime, provider=alias, model=_CHAT_MODEL, output_tokens=700)
 
 
