@@ -3369,7 +3369,8 @@ async def test_repeated_cancellation_drains_uninstall_compatibility_rollback_rel
     service = _service(tmp_path, source, loader=compatibility_loader)
 
     real_reload = loader.reload
-    rollback_reload_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    rollback_reload_started = asyncio.Event()
     release_rollback_reload = threading.Event()
     rollback_reload_finished = threading.Event()
 
@@ -3382,7 +3383,7 @@ async def test_repeated_cancellation_drains_uninstall_compatibility_rollback_rel
         )
 
     def blocking_rollback_reload(*args, **kwargs) -> SkillReloadResult:
-        rollback_reload_started.set()
+        loop.call_soon_threadsafe(rollback_reload_started.set)
         if not release_rollback_reload.wait(timeout=5):
             raise TimeoutError("test did not release uninstall rollback reload")
         try:
@@ -3394,9 +3395,9 @@ async def test_repeated_cancellation_drains_uninstall_compatibility_rollback_rel
     monkeypatch.setattr(compatibility_loader, "reload", blocking_rollback_reload)
 
     mutation = asyncio.create_task(service.uninstall("compatibility-uninstall"))
-    assert await asyncio.to_thread(rollback_reload_started.wait, 2)
     propagated: asyncio.CancelledError | None = None
     try:
+        await asyncio.wait_for(rollback_reload_started.wait(), timeout=2)
         assert service._mutation_lock.locked()
         assert loader._publication_barrier_depth == 1
 
