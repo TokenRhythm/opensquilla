@@ -18,6 +18,7 @@ from opensquilla.session.storage import (
     StorageBusyError,
     TaskCollectionUnavailableError,
     TurnIngressConflictError,
+    TurnIngressReceiptUnavailableError,
 )
 
 
@@ -26,6 +27,8 @@ from opensquilla.session.storage import (
     [
         (StaleEpochError("epoch"), domain.AdmissionStaleEpochError),
         (TurnIngressConflictError("identity"), domain.AdmissionIngressConflictError),
+        (TurnIngressReceiptUnavailableError("receipt"),
+         domain.AdmissionIngressReceiptUnavailableError),
         (PendingChatInputConflictError("revision"), domain.AdmissionPendingInputConflictError),
         (TaskCollectionUnavailableError("started"), domain.AdmissionTaskCollectionUnavailableError),
         (PlanConflictError("plan"), domain.AdmissionPlanConflictError),

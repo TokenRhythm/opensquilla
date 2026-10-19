@@ -6,13 +6,15 @@ import asyncio
 import hashlib
 import json
 import secrets
+import sqlite3
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 
@@ -33,6 +35,7 @@ from opensquilla.session.goals import (
     GoalCommandRequest,
     GoalConflictError,
     GoalGuardrailPause,
+    GoalRecoveryAction,
     GoalStatus,
     GoalTurnContext,
     StartGoalMutation,
@@ -61,6 +64,72 @@ _AUTOMATIC_GOAL_MESSAGE = (
     "update_plan for useful progress updates and update_goal when its terminal "
     "conditions are satisfied."
 )
+
+# Recovery owns a finite retry episode. Durable task/Goal ownership remains
+# available for a later external wake after that episode is exhausted.
+_GOAL_RECOVERY_BUDGET_SECONDS = 120.0
+_GOAL_RECOVERY_INITIAL_SECONDS = 0.25
+_GOAL_RECOVERY_MAX_SECONDS = 2.0
+
+
+@dataclass(slots=True)
+class _GoalRecoveryWindow:
+    expires_at: float
+    not_before: float = 0.0
+    failures: int = 0
+    exhausted: bool = False
+
+    def failed(self, error: BaseException) -> None:
+        delay = min(
+            _GOAL_RECOVERY_MAX_SECONDS,
+            _GOAL_RECOVERY_INITIAL_SECONDS * 2 ** min(self.failures, 8),
+        )
+        hint = getattr(error, "retry_after_ms", 0)
+        if isinstance(hint, (int, float)) and not isinstance(hint, bool):
+            delay = max(delay, max(0.0, hint / 1000))
+        self.not_before = max(self.not_before, time.monotonic() + delay)
+        self.failures += 1
+
+
+@dataclass(slots=True)
+class _GoalSettlementRecovery:
+    event: TaskLifecycleEvent
+    window: _GoalRecoveryWindow
+    goal_id: str | None = None
+    in_flight: bool = False
+    compensate: bool = False
+    compensation_kind: Literal["terminal", "activation", "defer"] = "terminal"
+    compensation_reason: str = "persistence_error"
+    settled_revision: int | None = None
+    empty_guard_done: bool = False
+    progress_guard_done: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _GoalIdleRetry:
+    error: BaseException
+
+
+class _GoalIdleOutcome(StrEnum):
+    COMPLETE = "complete"
+    SUSPENDED = "suspended"
+
+
+def _retryable_goal_dependency(error: BaseException) -> bool:
+    from opensquilla.application.admission_failures import AdmissionStorageBusyError
+    from opensquilla.session.storage import StorageBusyError
+
+    return isinstance(error, (StorageBusyError, AdmissionStorageBusyError, TimeoutError)) or (
+        isinstance(error, GoalConflictError)
+        and error.code == "GOAL_AUTHORITY_UNAVAILABLE"
+        and error.retryable is not False
+    )
+
+
+def _retryable_goal_settlement(error: BaseException) -> bool:
+    # Reconciliation is an idempotent owner-CAS write. SQLite statement errors
+    # can outlive the first compensation; they remain bounded, never proof of success.
+    return _retryable_goal_dependency(error) or isinstance(error, (sqlite3.Error, OSError))
 
 
 def _emit_goal_metric(
@@ -181,12 +250,20 @@ class GoalService:
         self._transition_registry_lock = asyncio.Lock()
         self._kick_tasks: dict[str, asyncio.Task[None]] = {}
         self._kick_dirty: set[str] = set()
+        self._kick_external: set[str] = set()
+        self._idle_recovery_windows: dict[str, tuple[GoalExecutionLease, _GoalRecoveryWindow]] = {}
+        self._settlement_recoveries: dict[
+            tuple[str, str | None, int | None, str], _GoalSettlementRecovery
+        ] = {}
+        self._settlement_tasks: dict[
+            tuple[str, str | None, int | None, str], asyncio.Task[None]
+        ] = {}
         self._closed = False
         # Process-local: a restart pauses Goals instead of inferring prior empty work.
         self._empty_automatic_turns: dict[str, tuple[str, int, int]] = {}
         # Repeated visible output/tool shape without a durable progress change
         # is a separate safety condition from a completely empty turn.
-        self._no_progress_automatic_turns: dict[str, tuple[int, str, int]] = {}
+        self._no_progress_automatic_turns: dict[str, tuple[int, str, int, str]] = {}
         # Goal leases are process-local and may be backed by a named token in
         # a different storage instance during tests or embedded operation.
         # Install the final provider-fence validator on the shared runtime so
@@ -276,6 +353,8 @@ class GoalService:
             raise GoalConflictError(
                 "EXECUTION_LEASE_REQUIRED",
                 "Subscribe to this session before starting Goal execution",
+                retryable=True,
+                recovery_action=GoalRecoveryAction.AWAIT_SUBSCRIPTION,
             )
 
     def _install_lease(
@@ -295,11 +374,15 @@ class GoalService:
                     "GOAL_AUTHORITY_UNAVAILABLE",
                     "Current Goal authority could not be read; "
                     "retry without revoking the existing lease",
+                    retryable=True,
+                    recovery_action=GoalRecoveryAction.RETRY,
                 )
             if not authority_state:
                 self._revoke_authority(goal.session_key)
                 raise GoalConflictError(
-                    "GOAL_AUTHORITY_UNAVAILABLE", "A current authorized Goal owner is required"
+                    "GOAL_AUTHORITY_UNAVAILABLE", "A current authorized Goal owner is required",
+                    retryable=False,
+                    recovery_action=GoalRecoveryAction.STOP,
                 )
         source_kind = "cli" if source_kind == "cli" else "web"
         lease = GoalExecutionLease(
@@ -417,12 +500,6 @@ class GoalService:
         if decision is None or getattr(decision, "status", "unavailable") == "unavailable":
             return None
         return self._decision_matches(principal, decision)
-
-    async def _principal_authority_current_async(self, principal: Any) -> bool:
-        decision = await self._authority_decision(principal)
-        return getattr(decision, "status", "unavailable") == "allow" and self._decision_matches(
-            principal, decision
-        )
 
     async def _principal_authority_state_async(self, principal: Any) -> str:
         """Return ``allow``, ``deny`` or ``unavailable`` without collapsing it.
@@ -568,11 +645,15 @@ class GoalService:
                 "GOAL_AUTHORITY_UNAVAILABLE",
                 "Current Goal authority could not be read; "
                 "retry without revoking the existing lease",
+                retryable=True,
+                recovery_action=GoalRecoveryAction.RETRY,
             )
         if authority_state != "allow":
             self._revoke_authority(goal.session_key)
             raise GoalConflictError(
-                "GOAL_AUTHORITY_UNAVAILABLE", "A current authorized Goal owner is required"
+                "GOAL_AUTHORITY_UNAVAILABLE", "A current authorized Goal owner is required",
+                retryable=False,
+                recovery_action=GoalRecoveryAction.STOP,
             )
         return self._install_lease(
             ctx,
@@ -818,14 +899,25 @@ class GoalService:
             self._revoke_authority(goal.session_key)
             return None
         authority_state = await self._principal_authority_state_async(principal)
-        if authority_state == "unavailable":
-            raise GoalConflictError(
-                "GOAL_AUTHORITY_UNAVAILABLE",
-                "Current Goal authority could not be read; "
-                "retry without revoking the existing lease",
-                current=goal,
-            )
-        if authority_state != "allow":
+        # Subscription/connection loss can occur while the authority lookup
+        # awaits SQLite; its observer may still be waiting for our Goal lock.
+        # Read the transport state itself before classifying an unavailable
+        # result as a live-lease error. Never recreate a lease revoked meanwhile.
+        if self._leases.get(goal.session_key) != lease:
+            return None
+        if authority_state not in {"allow", "unavailable"}:
+            self._revoke_authority(goal.session_key)
+            return None
+        current_connection = get_registry().get(lease.owner_connection_id)
+        if current_connection is None:
+            self._detach_authority(goal.session_key, expected=lease)
+            return None
+        current_principal = getattr(current_connection, "principal", None)
+        if (
+            current_principal is None
+            or _principal_identity(current_principal) != lease.principal_identity
+            or self._principal_authority_cached(current_principal) is False
+        ):
             self._revoke_authority(goal.session_key)
             return None
         if (
@@ -834,6 +926,15 @@ class GoalService:
         ):
             self._detach_authority(goal.session_key, expected=lease)
             return None
+        if authority_state == "unavailable":
+            raise GoalConflictError(
+                "GOAL_AUTHORITY_UNAVAILABLE",
+                "Current Goal authority could not be read; "
+                "retry without revoking the existing lease",
+                current=goal,
+                retryable=True,
+                recovery_action=GoalRecoveryAction.RETRY,
+            )
         return lease
 
     async def _execution_state(self, goal: GoalRecord) -> str:
@@ -979,11 +1080,15 @@ class GoalService:
             raise GoalConflictError(
                 "GOAL_AUTHORITY_UNAVAILABLE",
                 "Current Goal authority could not be read; retry without accepting the turn",
+                retryable=True,
+                recovery_action=GoalRecoveryAction.RETRY,
             )
         if status != "allow" or not self._decision_matches(principal, decision):
             raise GoalConflictError(
                 "GOAL_AUTHORITY_UNAVAILABLE",
                 "A current authorized Goal owner is required",
+                retryable=False,
+                recovery_action=GoalRecoveryAction.STOP,
             )
         # GoalService owns the live lease and performs the async token-store
         # check before durable Goal acceptance.  Its storage may be separate
@@ -1397,8 +1502,11 @@ class GoalService:
                                         acceptance.goal_context
                                     )
                                 )
-                            except Exception:
+                            except Exception as compensation_error:
                                 compensated = None
+                                self._retain_goal_activation_compensation(
+                                    acceptance.goal_context, key, compensation_error,
+                                )
                                 log.exception(
                                     "goal.activation_compensation_failed",
                                     session_key=key,
@@ -1464,7 +1572,9 @@ class GoalService:
             "operator.write", connection.principal.scopes
         ):
             raise GoalConflictError(
-                "GOAL_AUTHORITY_UNAVAILABLE", "A live authenticated Goal owner is required"
+                "GOAL_AUTHORITY_UNAVAILABLE", "A live authenticated Goal owner is required",
+                retryable=False,
+                recovery_action=GoalRecoveryAction.STOP,
             )
         ctx = RpcContext(conn_id=conn_id, principal=connection.principal)
         source_kind = "cli" if envelope.source_kind == "cli" else "web"
@@ -1969,6 +2079,8 @@ class GoalService:
                         "EXECUTION_LEASE_REQUIRED",
                         "The Goal already has an attached execution owner",
                         current=goal,
+                        retryable=False,
+                        recovery_action=GoalRecoveryAction.OWNER_ATTACHED,
                     )
                 token = secrets.token_urlsafe(32)
             else:
@@ -1985,12 +2097,20 @@ class GoalService:
                         "EXECUTION_LEASE_REQUIRED",
                         "Valid Goal execution continuity is required",
                         current=goal,
+                        retryable=False,
+                        recovery_action=(
+                            GoalRecoveryAction.OWNER_ATTACHED
+                            if live is not None
+                            else GoalRecoveryAction.REQUIRE_TAKEOVER
+                        ),
                     )
                 if live is not None and live.owner_connection_id != ctx.conn_id:
                     raise GoalConflictError(
                         "EXECUTION_LEASE_REQUIRED",
                         "The Goal already has an attached execution owner",
                         current=goal,
+                        retryable=False,
+                        recovery_action=GoalRecoveryAction.OWNER_ATTACHED,
                     )
 
             installed = await self._install_lease_async(
@@ -2221,20 +2341,39 @@ class GoalService:
     async def compensate_activation_failure(
         self,
         context_value: Mapping[str, Any],
+        *,
+        session_key: str,
     ) -> dict[str, Any] | None:
-        """Close an accepted Goal task that could not enter TaskRuntime."""
+        """Close an accepted Goal task after its runtime reservation was aborted.
+
+        The common admission caller supplies the committed receipt's key.
+        Cleanup cannot depend on reading a current Goal during a storage
+        outage, or on that Goal still existing after Clear/reset.
+        """
 
         context = GoalTurnContext.from_task_detail(context_value)
         if context is None:
             return None
-        goal = await self._storage.get_goal_by_id(context.goal_id)
-        if goal is None:
-            return None
-        async with self._lock(goal.session_key):
-            updated = await self._storage.compensate_goal_activation_failure(context)
+        key = canonicalize_session_key(session_key)
+        async with self._lock(key):
+            try:
+                updated = await self._storage.compensate_goal_activation_failure(
+                    context, require_unstarted=True,
+                )
+            except Exception as error:
+                self._retain_goal_activation_compensation(context, key, error)
+                grant = self._continuity_grants.get(key)
+                if (
+                    grant is not None
+                    and grant.session_id == context.session_id
+                    and grant.epoch == context.epoch
+                    and grant.goal_id == context.goal_id
+                ):
+                    self._revoke_authority(key)
+                raise
             if updated is None:
                 return None
-            self._revoke_authority(goal.session_key)
+            self._revoke_authority(key)
             await self._emit_goal(
                 updated,
                 event_type="updated",
@@ -2494,7 +2633,7 @@ class GoalService:
             return goal
         previous = self._no_progress_automatic_turns.get(goal.goal_id)
         count = (
-            previous[2] + 1
+            previous[2] + (previous[3] != context.task_id)
             if previous is not None
             and previous[0] == context.objective_revision
             and previous[1] == signature
@@ -2504,6 +2643,7 @@ class GoalService:
             context.objective_revision,
             signature,
             count,
+            context.task_id,
         )
         if count < 3:
             return goal
@@ -2526,9 +2666,10 @@ class GoalService:
             self._empty_automatic_turns.pop(goal.goal_id, None)
             return goal
         previous = self._empty_automatic_turns.get(goal.goal_id)
-        if previous is not None and previous[0] == context.task_id:
-            return goal
-        count = previous[2] + 1 if previous and previous[1] == context.objective_revision else 1
+        count = (
+            previous[2] + (previous[0] != context.task_id)
+            if previous and previous[1] == context.objective_revision else 1
+        )
         self._empty_automatic_turns[goal.goal_id] = (
             context.task_id,
             context.objective_revision,
@@ -2573,17 +2714,241 @@ class GoalService:
             return
         if event.phase != "terminal":
             return
+        await self._observe_terminal_goal(event)
+
+    @staticmethod
+    def _settlement_key(event: TaskLifecycleEvent) -> tuple[str, str | None, int | None, str]:
+        return (
+            canonicalize_session_key(event.session_key), event.session_id,
+            event.session_epoch, event.task_id,
+        )
+
+    async def _observe_terminal_goal(
+        self, event: TaskLifecycleEvent, *, external_wake: bool = False,
+    ) -> bool:
+        """Settle only Goal ownership, independently of session projection."""
+        if self._closed:
+            return False
+        identity = self._settlement_key(event)
+        recovery = self._settlement_recoveries.get(identity)
+        if recovery is None:
+            recovery = _GoalSettlementRecovery(
+                event=event,
+                window=_GoalRecoveryWindow(time.monotonic() + _GOAL_RECOVERY_BUDGET_SECONDS),
+                compensate=not event.terminal_persisted,
+            )
+            self._settlement_recoveries[identity] = recovery
+        elif external_wake and (
+            recovery.window.exhausted or time.monotonic() >= recovery.window.expires_at
+        ):
+            # Only a later outside wake can open another finite episode.
+            # Renew before joining an in-flight worker: its old episode may
+            # have expired while awaiting storage. The worker must retain
+            # this later wake rather than exit against the previous deadline.
+            recovery.window = _GoalRecoveryWindow(
+                time.monotonic() + _GOAL_RECOVERY_BUDGET_SECONDS,
+                not_before=recovery.window.not_before,
+            )
+        if recovery.in_flight or identity in self._settlement_tasks:
+            return False
+        delay = self._goal_settlement_retry_delay(identity, recovery)
+        if delay is None:
+            return False
+        if delay > 0:
+            self._start_goal_settlement_worker(identity, recovery)
+            return False
+        recovery.in_flight = True
+        try:
+            await self._reconcile_terminal_goal(recovery)
+        except Exception as error:
+            self._schedule_goal_settlement_recovery(identity, recovery, error)
+            return False
+        else:
+            if self._settlement_recoveries.get(identity) is recovery:
+                self._settlement_recoveries.pop(identity, None)
+            return True
+        finally:
+            recovery.in_flight = False
+
+    @staticmethod
+    def _goal_settlement_retry_delay(
+        identity: tuple[str, str | None, int | None, str],
+        recovery: _GoalSettlementRecovery,
+    ) -> float | None:
+        """Admit direct and worker attempts through the same finite window."""
+        window = recovery.window
+        if window.exhausted:
+            return None
+        now = time.monotonic()
+        if now >= window.expires_at:
+            window.exhausted = True
+            log.warning(
+                "goal.settlement_recovery_exhausted", session_key=identity[0],
+                task_id=identity[3], attempts=window.failures,
+            )
+            return None
+        return max(0.0, min(window.not_before, window.expires_at) - now)
+
+    def _start_goal_settlement_worker(
+        self,
+        identity: tuple[str, str | None, int | None, str],
+        recovery: _GoalSettlementRecovery,
+    ) -> None:
+        # Waiting is not another dependency failure and must not move either
+        # deadline or backoff. Sleep happens only in the worker, outside locks.
+        if (
+            not self._closed
+            and self._settlement_recoveries.get(identity) is recovery
+            and identity not in self._settlement_tasks
+        ):
+            self._settlement_tasks[identity] = asyncio.create_task(
+                self._run_goal_settlement_recovery(identity, recovery),
+                name=f"goal-settlement:{identity[3]}",
+            )
+
+    def _schedule_goal_settlement_recovery(
+        self,
+        identity: tuple[str, str | None, int | None, str],
+        recovery: _GoalSettlementRecovery,
+        error: BaseException,
+    ) -> None:
+        if self._closed or self._settlement_recoveries.get(identity) is not recovery:
+            return
+        recovery.window.failed(error)
+        if not _retryable_goal_settlement(error):
+            recovery.window.exhausted = True
+            log.warning(
+                "goal.settlement_recovery_stopped", session_key=identity[0],
+                task_id=identity[3], error_class=type(error).__name__,
+            )
+            return
+        self._start_goal_settlement_worker(identity, recovery)
+
+    def _retain_goal_activation_compensation(
+        self, context: GoalTurnContext, session_key: str, error: BaseException,
+        *, kind: Literal["activation", "defer"] = "activation",
+        reason: str = "activation_failed",
+    ) -> None:
+        """Own a failed compensation after durable admission, before activation.
+
+        The caller aborts its unstarted runtime reservation before releasing
+        the transition lock. The worker then rereads and CAS-settles that exact
+        persisted owner, without ever activating or replaying its lifecycle.
+        """
+        event = TaskLifecycleEvent(
+            phase="terminal", session_key=session_key, task_id=context.task_id,
+            task_status=AgentTaskStatus.ABANDONED, run_kind="goal",
+            terminal_persisted=False, session_id=context.session_id,
+            session_epoch=context.epoch,
+        )
+        identity = self._settlement_key(event)
+        recovery = self._settlement_recoveries.get(identity)
+        if recovery is None:
+            recovery = _GoalSettlementRecovery(
+                event=event, goal_id=context.goal_id, compensate=True,
+                compensation_kind=kind, compensation_reason=reason,
+                empty_guard_done=kind == "defer", progress_guard_done=kind == "defer",
+                window=_GoalRecoveryWindow(time.monotonic() + _GOAL_RECOVERY_BUDGET_SECONDS),
+            )
+            self._settlement_recoveries[identity] = recovery
+        self._schedule_goal_settlement_recovery(identity, recovery, error)
+
+    async def _run_goal_settlement_recovery(
+        self,
+        identity: tuple[str, str | None, int | None, str],
+        recovery: _GoalSettlementRecovery,
+    ) -> None:
+        try:
+            while not self._closed and self._settlement_recoveries.get(identity) is recovery:
+                delay = self._goal_settlement_retry_delay(identity, recovery)
+                if delay is None:
+                    return
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    continue
+                recovery.in_flight = True
+                try:
+                    await self._reconcile_terminal_goal(recovery)
+                except Exception as error:
+                    recovery.window.failed(error)
+                    if not _retryable_goal_settlement(error):
+                        recovery.window.exhausted = True
+                        log.warning(
+                            "goal.settlement_recovery_stopped", session_key=identity[0],
+                            task_id=identity[3], error_class=type(error).__name__,
+                        )
+                        return
+                else:
+                    self._settlement_recoveries.pop(identity, None)
+                    self.schedule_idle_evaluation(identity[0])
+                    return
+                finally:
+                    recovery.in_flight = False
+        finally:
+            if self._settlement_tasks.get(identity) is asyncio.current_task():
+                self._settlement_tasks.pop(identity, None)
+
+    async def _reconcile_terminal_goal(self, recovery: _GoalSettlementRecovery) -> None:
+        event = recovery.event
         task = await self._storage.get_agent_task(event.task_id)
         details = task.details if task is not None and isinstance(task.details, dict) else {}
         context = effective_goal_turn_context(details)
-        if context is None:
+        if context is None or task is None:
             return
         key = canonicalize_session_key(event.session_key)
+        if (
+            context.task_id != event.task_id
+            or task.session_key != key
+            or event.session_id is not None and context.session_id != event.session_id
+            or event.session_epoch is not None and context.epoch != event.session_epoch
+            or recovery.goal_id is not None and recovery.goal_id != context.goal_id
+        ):
+            return
+        recovery.goal_id = context.goal_id
+        if not recovery.compensate and task.status in {
+            AgentTaskStatus.QUEUED, AgentTaskStatus.RUNNING,
+        }:
+            # A terminal observation cannot substitute for a durable terminal
+            # task. Only the explicit persistence-failure path may abandon it.
+            return
         async with self._lock(key):
-            if not event.terminal_persisted:
-                updated = await self._storage.compensate_terminal_persistence_failure(
-                    context
-                )
+            if recovery.compensate and recovery.settled_revision is None:
+                # The accepted task owns a cleanup obligation independently
+                # of the current Goal. Clear/replacement must fence Goal
+                # mutation, not discard the old task's durable lease.
+                # Storage checks the task state and context transactionally
+                # before releasing it, then applies the original Goal CAS.
+                if recovery.compensation_kind == "terminal":
+                    updated = await self._storage.compensate_terminal_persistence_failure(context)
+                elif recovery.compensation_kind == "defer":
+                    updated = await self._storage.defer_goal_continuation(context)
+                else:
+                    updated = await self._storage.compensate_goal_activation_failure(
+                        context, reason=recovery.compensation_reason,
+                        require_unstarted=True,
+                    )
+                if updated is None:
+                    return
+                recovery.settled_revision = updated.state_revision
+            current = await self._storage.get_goal(key)
+            if (
+                current is None
+                or current.session_id != context.session_id
+                or current.session_epoch != context.epoch
+                or current.goal_id != context.goal_id
+            ):
+                return
+            if recovery.settled_revision is not None:
+                # Owner-CAS already committed. Finish its safety guards only
+                # while that exact revision still owns the idle state.
+                if (
+                    current.active_task_id is not None
+                    or current.state_revision != recovery.settled_revision
+                ):
+                    return
+                updated = current
+            elif current.active_task_id != context.task_id:
+                return
             else:
                 cancellation = details.get("cancellation")
                 cancellation_source = (
@@ -2638,21 +3003,32 @@ class GoalService:
                         session_key=key,
                         task_id=context.task_id,
                     )
+                    recovery.compensate = True
                     updated = (
                         await self._storage.compensate_terminal_persistence_failure(
                             context
                         )
                     )
             if updated is not None:
-                updated = await self._guard_empty_continuations(updated, task, context)
+                recovery.settled_revision = updated.state_revision
+                if updated.objective_revision != context.objective_revision:
+                    recovery.empty_guard_done = True
+                    recovery.progress_guard_done = True
+                if not recovery.empty_guard_done:
+                    updated = await self._guard_empty_continuations(updated, task, context)
+                    recovery.settled_revision = updated.state_revision
+                    recovery.empty_guard_done = True
                 if not context.automatic:
                     # A human-authored turn is a new opportunity for progress;
                     # never carry an automatic no-progress streak across it.
                     self._no_progress_automatic_turns.pop(context.goal_id, None)
-                elif updated.status == GoalStatus.ACTIVE.value:
+                    recovery.progress_guard_done = True
+                elif not recovery.progress_guard_done and updated.status == GoalStatus.ACTIVE.value:
                     updated = await self._guard_no_progress_continuations(
                         updated, task, context
                     )
+                    recovery.settled_revision = updated.state_revision
+                    recovery.progress_guard_done = True
                 if updated.status != GoalStatus.ACTIVE.value:
                     self._revoke_authority(key)
                 classification = "active"
@@ -2745,8 +3121,28 @@ class GoalService:
         if self._closed:
             return
         key = canonicalize_session_key(session_key)
+        self._kick_external.add(key)
+        retained = self._idle_recovery_windows.get(key)
+        if retained is not None:
+            lease, window = retained
+            grant = self._continuity_grants.get(key)
+            if grant is None or not self._same_continuity(grant, lease):
+                self._idle_recovery_windows.pop(key, None)
+            elif window.exhausted or time.monotonic() >= window.expires_at:
+                # A later external wake may start another finite episode,
+                # including when expiry happened while transport was detached.
+                # It cannot override a dependency's outstanding retry-after.
+                self._idle_recovery_windows[key] = (
+                    grant, _GoalRecoveryWindow(
+                        time.monotonic() + _GOAL_RECOVERY_BUDGET_SECONDS,
+                        not_before=window.not_before,
+                    ),
+                )
         current = self._kick_tasks.get(key)
         if current is not None and not current.done():
+            # Preserve a genuinely later wake even if the previous attempt
+            # crossed expiry while awaiting a dependency. Pre-expiry signals
+            # above leave the existing episode untouched.
             self._kick_dirty.add(key)
             return
         task = asyncio.create_task(
@@ -2758,41 +3154,134 @@ class GoalService:
     async def _run_scheduled_kick(self, session_key: str) -> None:
         try:
             while True:
+                if self._closed:
+                    return
                 self._kick_dirty.discard(session_key)
+                retained = self._idle_recovery_windows.get(session_key)
+                if retained is not None:
+                    lease, window = retained
+                    current = self._continuity_grants.get(session_key)
+                    if current is None or not self._same_continuity(current, lease):
+                        self._idle_recovery_windows.pop(session_key, None)
+                        if session_key not in self._kick_external:
+                            return
+                    else:
+                        now = time.monotonic()
+                        if now >= window.expires_at:
+                            window.exhausted = True
+                            log.warning(
+                                "goal.idle_recovery_exhausted", session_key=session_key,
+                                attempts=window.failures,
+                            )
+                            return
+                        delay = min(window.not_before, window.expires_at) - now
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                            continue
+                outcome: _GoalIdleRetry | _GoalIdleOutcome = _GoalIdleOutcome.COMPLETE
                 try:
-                    await self._kick_if_idle(session_key)
-                except Exception:
+                    outcome = await self._kick_if_idle(session_key)
+                except Exception as error:
                     log.warning(
                         "goal.idle_evaluation_failed",
                         session_key=session_key,
                         exc_info=True,
                     )
+                    if _retryable_goal_dependency(error):
+                        outcome = _GoalIdleRetry(error)
+                if isinstance(outcome, _GoalIdleRetry):
+                    lease = self._continuity_grants.get(session_key)
+                    if lease is None:
+                        self._idle_recovery_windows.pop(session_key, None)
+                        return
+                    retained = self._idle_recovery_windows.get(session_key)
+                    if retained is None or not self._same_continuity(retained[0], lease):
+                        retained = (lease, _GoalRecoveryWindow(
+                            time.monotonic() + _GOAL_RECOVERY_BUDGET_SECONDS,
+                        ))
+                        self._idle_recovery_windows[session_key] = retained
+                    retained[1].failed(outcome.error)
+                    continue
+                retained = self._idle_recovery_windows.get(session_key)
+                grant = self._continuity_grants.get(session_key)
+                if (
+                    outcome is _GoalIdleOutcome.COMPLETE
+                    or grant is None
+                    or retained is not None and not self._same_continuity(grant, retained[0])
+                ):
+                    self._idle_recovery_windows.pop(session_key, None)
+                # Suspension leaves the episode intact but does not poll.
+                # A concurrent external wake is still coalesced into this worker.
                 if session_key not in self._kick_dirty:
                     break
         finally:
             current = self._kick_tasks.get(session_key)
             if current is asyncio.current_task():
                 self._kick_tasks.pop(session_key, None)
+                self._kick_external.discard(session_key)
 
-    async def _kick_if_idle(self, session_key: str) -> None:
+    async def _kick_if_idle(self, session_key: str) -> _GoalIdleRetry | _GoalIdleOutcome:
         if self._closed:
-            return
+            return _GoalIdleOutcome.COMPLETE
         session_key = canonicalize_session_key(session_key)
+        external_wake = session_key in self._kick_external
+        self._kick_external.discard(session_key)
+        # Finish retained ownership or guard recovery first, including an
+        # unstarted accepted task whose compensation exhausted its episode.
+        for pending in list(self._settlement_recoveries.values()):
+            if (
+                pending.goal_id is not None
+                and canonicalize_session_key(pending.event.session_key) == session_key
+            ):
+                if not await self._observe_terminal_goal(
+                    pending.event, external_wake=external_wake,
+                ):
+                    return _GoalIdleOutcome.SUSPENDED
         goal = await self._storage.get_goal(session_key)
+        if goal is not None and goal.active_task_id:
+            # The durable terminal task is a recoverable settlement receipt,
+            # including when the original lifecycle observation was dropped.
+            task = await self._storage.get_agent_task(goal.active_task_id)
+            details = task.details if task is not None and isinstance(task.details, dict) else {}
+            context = effective_goal_turn_context(details)
+            if (
+                task is not None
+                and task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.RUNNING}
+                and context is not None and context.task_id == task.task_id
+                and task.session_key == session_key
+                and context.session_id == goal.session_id and context.epoch == goal.session_epoch
+                and context.goal_id == goal.goal_id
+            ):
+                recovered = await self._observe_terminal_goal(
+                    TaskLifecycleEvent(
+                        phase="terminal", session_key=session_key, task_id=task.task_id,
+                        task_status=task.status, run_kind=task.run_kind,
+                        terminal_reason=task.terminal_reason, terminal_persisted=True,
+                        session_id=context.session_id, session_epoch=context.epoch,
+                    ),
+                    external_wake=external_wake,
+                )
+                if not recovered:
+                    return _GoalIdleOutcome.SUSPENDED
+                goal = await self._storage.get_goal(session_key)
         if goal is None or goal.status != GoalStatus.ACTIVE.value or goal.active_task_id:
             if goal is not None and goal.active_task_id:
                 _emit_goal_metric(
                     "goal_continuation_deferred_total",
                     reason="busy",
                 )
-            return
+            return (
+                _GoalIdleOutcome.SUSPENDED
+                if goal is not None and goal.status == GoalStatus.ACTIVE.value
+                else _GoalIdleOutcome.COMPLETE
+            )
         from opensquilla.gateway.subagent_announce import active_background_completion_group_ids
 
         # sessions_yield releases the parent task while its existing completion
         # group owns the next wake. An ordinary Goal turn must not race that wake.
         if await active_background_completion_group_ids(session_key):
             _emit_goal_metric("goal_continuation_deferred_total", reason="busy")
-            return
+            return _GoalIdleOutcome.SUSPENDED
         session = await self._storage.get_session(session_key)
         if (
             session is not None
@@ -2802,7 +3291,7 @@ class GoalService:
                 "goal_continuation_deferred_total",
                 reason="plan_mode",
             )
-            return
+            return _GoalIdleOutcome.SUSPENDED
 
         async def _pause_current(reason: str) -> None:
             async with self._lock(session_key):
@@ -2842,7 +3331,7 @@ class GoalService:
                 reason="feature_disabled",
             )
             await _pause_current("feature_disabled")
-            return
+            return _GoalIdleOutcome.COMPLETE
         try:
             lease = await self._lease_for_async(goal)
         except GoalConflictError as exc:
@@ -2854,7 +3343,11 @@ class GoalService:
                     "goal_continuation_deferred_total",
                     reason="authority_unavailable",
                 )
-                return
+                return (
+                    _GoalIdleRetry(exc)
+                    if _retryable_goal_dependency(exc)
+                    else _GoalIdleOutcome.COMPLETE
+                )
             raise
         if lease is None:
             _emit_goal_metric("goal_active_without_owner_total")
@@ -2862,16 +3355,16 @@ class GoalService:
                 "goal_continuation_deferred_total",
                 reason="owner_disconnected",
             )
-            return
+            return _GoalIdleOutcome.SUSPENDED
         from opensquilla.gateway.websocket import get_registry
 
         connection = get_registry().get(lease.owner_connection_id)
         if connection is None:
             self._detach_authority(session_key, expected=lease)
-            return
+            return _GoalIdleOutcome.SUSPENDED
         principal = connection.principal
         if principal is None:
-            return
+            return _GoalIdleOutcome.SUSPENDED
         next_seq = goal.continuation_seq + 1
         task_id = automatic_goal_task_id(
             goal.goal_id,
@@ -2907,7 +3400,7 @@ class GoalService:
         )
         if session is None:
             self._revoke_authority(session_key)
-            return
+            return _GoalIdleOutcome.COMPLETE
         try:
             workspace_guard, accepted_run_mode_override = await self._prepare_execution_envelope(
                 envelope,
@@ -2917,7 +3410,9 @@ class GoalService:
             await self._stamp_activation_authority(
                 envelope, principal, owner_connection_id=lease.owner_connection_id,
             )
-        except Exception:
+        except Exception as error:
+            if _retryable_goal_dependency(error):
+                return _GoalIdleRetry(error)
             log.warning(
                 "goal.continuation_execution_preflight_failed",
                 session_key=session_key,
@@ -2928,7 +3423,7 @@ class GoalService:
                 reason="execution_preflight_failed",
             )
             await _pause_current("activation_failed")
-            return
+            return _GoalIdleOutcome.COMPLETE
         async with self._task_runtime.collect_admission(session_key):
             # Fast user-priority/idle check.  The intent fence and SQLite CAS
             # below are still the linearization points and repeat this check.
@@ -2941,7 +3436,7 @@ class GoalService:
                     "goal_continuation_deferred_total",
                     reason="pending_user" if has_user_intent else "busy",
                 )
-                return
+                return _GoalIdleOutcome.SUSPENDED
             reservation = await reserve_turn_via_runtime(
                 self._task_runtime,
                 envelope,
@@ -2963,22 +3458,26 @@ class GoalService:
                 await self._task_runtime.abort_reservation(reservation)
                 raise
 
-            async def _commit_and_activate() -> None:
+            async def _commit_and_activate() -> _GoalIdleOutcome:
                 async with self._task_runtime.automatic_ingress_fence(
                     session_key
                 ) as allowed:
                     if not allowed:
                         await self._task_runtime.abort_reservation(reservation)
-                        return
+                        return _GoalIdleOutcome.SUSPENDED
                     if await active_background_completion_group_ids(session_key):
                         await self._task_runtime.abort_reservation(reservation)
-                        return
+                        return _GoalIdleOutcome.SUSPENDED
                     async with self._lock(session_key):
-                        current = await self._storage.get_goal(session_key)
-                        live_lease = (
-                            await self._lease_for_async(current)
-                            if current is not None else None
-                        )
+                        try:
+                            current = await self._storage.get_goal(session_key)
+                            live_lease = (
+                                await self._lease_for_async(current)
+                                if current is not None else None
+                            )
+                        except BaseException:
+                            await self._task_runtime.abort_reservation(reservation)
+                            raise
                         if (
                             self._closed
                             or not self.execution_enabled
@@ -2987,11 +3486,20 @@ class GoalService:
                             or current.session_epoch != goal.session_epoch
                             or current.goal_id != goal.goal_id
                             or current.status != GoalStatus.ACTIVE.value
-                            or current.active_task_id is not None
+                        ):
+                            await self._task_runtime.abort_reservation(reservation)
+                            return _GoalIdleOutcome.COMPLETE
+                        if (
+                            current.active_task_id is not None
+                            or any(
+                                pending.goal_id == current.goal_id
+                                and pending.settled_revision == current.state_revision
+                                for pending in self._settlement_recoveries.values()
+                            )
                             or live_lease != lease
                         ):
                             await self._task_runtime.abort_reservation(reservation)
-                            return
+                            return _GoalIdleOutcome.SUSPENDED
                         try:
                             accepted = await self._storage.accept_goal_continuation(
                                 expected=ExpectedGoal(
@@ -3018,7 +3526,7 @@ class GoalService:
                                 operation="continuation",
                             )
                             await self._task_runtime.abort_reservation(reservation)
-                            return
+                            return _GoalIdleOutcome.SUSPENDED
                         except BaseException:
                             await self._task_runtime.abort_reservation(reservation)
                             raise
@@ -3038,9 +3546,14 @@ class GoalService:
                                 state_revision=accepted.goal.state_revision,
                                 progress_revision=accepted.goal.progress_revision,
                             )
-                            return
+                            return _GoalIdleOutcome.COMPLETE
                         try:
                             accepted_current = await self._storage.get_goal(session_key)
+                            accepted_lease = (
+                                await self._lease_for_async(accepted_current)
+                                if accepted_current is not None
+                                else None
+                            )
                         except Exception:
                             # Durable continuation acceptance has already
                             # installed the AgentTask/Goal owner.  A failed
@@ -3060,8 +3573,11 @@ class GoalService:
                                         accepted.context
                                     )
                                 )
-                            except Exception:
+                            except Exception as compensation_error:
                                 compensated = None
+                                self._retain_goal_activation_compensation(
+                                    accepted.context, session_key, compensation_error,
+                                )
                                 log.exception(
                                     "goal.continuation_compensation_failed",
                                     session_key=session_key,
@@ -3080,12 +3596,7 @@ class GoalService:
                                     state_revision=compensated.state_revision,
                                     progress_revision=compensated.progress_revision,
                                 )
-                            return
-                        accepted_lease = (
-                            await self._lease_for_async(accepted_current)
-                            if accepted_current is not None
-                            else None
-                        )
+                            return _GoalIdleOutcome.COMPLETE
                         activation_pause_reason: str | None = None
                         detached = False
                         if self._closed:
@@ -3106,8 +3617,16 @@ class GoalService:
                                 accepted_current.status == GoalStatus.ACTIVE.value
                                 and grant is not None
                                 and self._same_continuity(grant, lease)
-                                and await self._principal_authority_current_async(grant.principal)
                             )
+                            if detached:
+                                assert grant is not None
+                                authority = await self._principal_authority_state_async(
+                                    grant.principal,
+                                )
+                                # Unavailable is not a grant to execute, nor
+                                # proof of revocation. Defer this unstarted
+                                # launch with the original continuity detached.
+                                detached = authority != "deny"
                             if not detached:
                                 activation_pause_reason = "activation_failed"
                         elif not self._same_continuity(accepted_lease, lease):
@@ -3133,6 +3652,25 @@ class GoalService:
                                             reason=activation_pause_reason,
                                         )
                                     )
+                            except Exception as compensation_error:
+                                compensated = None
+                                self._retain_goal_activation_compensation(
+                                    accepted.context, session_key, compensation_error,
+                                    kind="defer" if detached else "activation",
+                                    reason=activation_pause_reason or "activation_failed",
+                                )
+                                if detached:
+                                    # The database outage does not revoke the
+                                    # already-proven continuity credential.
+                                    # Keep it detached; only explicit reattach
+                                    # can restore a live execution lease.
+                                    retain_continuity = True
+                                    self._detach_authority(session_key, expected=lease)
+                                log.exception(
+                                    "goal.continuation_compensation_failed",
+                                    session_key=session_key,
+                                    task_id=accepted.context.task_id,
+                                )
                             finally:
                                 if not retain_continuity:
                                     self._revoke_authority(session_key)
@@ -3147,7 +3685,10 @@ class GoalService:
                                     state_revision=compensated.state_revision,
                                     progress_revision=compensated.progress_revision,
                                 )
-                            return
+                            return (
+                                _GoalIdleOutcome.SUSPENDED
+                                if retain_continuity else _GoalIdleOutcome.COMPLETE
+                            )
                         try:
                             await self._task_runtime.activate(reservation)
                         except (Exception, asyncio.CancelledError) as exc:
@@ -3178,8 +3719,11 @@ class GoalService:
                                             accepted.context
                                         )
                                     )
-                                except Exception:
+                                except Exception as compensation_error:
                                     compensated = None
+                                    self._retain_goal_activation_compensation(
+                                        accepted.context, session_key, compensation_error,
+                                    )
                                     log.exception(
                                         "goal.continuation_compensation_failed",
                                         session_key=session_key,
@@ -3199,7 +3743,7 @@ class GoalService:
                                     )
                             if isinstance(exc, asyncio.CancelledError):
                                 raise
-                            return
+                            return _GoalIdleOutcome.COMPLETE
                         _emit_goal_metric(
                             "goal_continuations_total",
                             outcome="accepted",
@@ -3213,8 +3757,9 @@ class GoalService:
                             state_revision=accepted.goal.state_revision,
                             progress_revision=accepted.goal.progress_revision,
                         )
+                        return _GoalIdleOutcome.COMPLETE
 
-            await complete_durable_ingress(_commit_and_activate())
+            return await complete_durable_ingress(_commit_and_activate())
 
     async def on_mode_committed(self, session_key: str, mode: str) -> None:
         if mode == "default":
@@ -3315,13 +3860,17 @@ class GoalService:
         from opensquilla.gateway.websocket import get_registry
 
         get_registry().clear_unregister_listener(self.on_connection_unregistered)
-        tasks = list(self._kick_tasks.values())
+        tasks = [*self._kick_tasks.values(), *self._settlement_tasks.values()]
         self._kick_tasks.clear()
         self._kick_dirty.clear()
+        self._kick_external.clear()
+        self._idle_recovery_windows.clear()
+        self._settlement_tasks.clear()
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._settlement_recoveries.clear()
         granted = list(self._continuity_grants.items())
         self._leases.clear()
         self._continuity_grants.clear()

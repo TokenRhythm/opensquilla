@@ -98,6 +98,7 @@ export interface GoalCapabilities {
 }
 
 export type GoalCenterErrorCode = 'not-found' | 'unsupported' | 'forbidden' | 'conflict' | 'unavailable' | 'invalid'
+export type GoalRecoveryAction = 'retry' | 'await-subscription' | 'require-takeover' | 'owner-attached' | 'refresh-goal' | 'stop'
 
 export type GoalCenterFailureReason =
   | 'invalid-objective'
@@ -118,11 +119,15 @@ export class GoalCenterError extends Error {
   readonly code: GoalCenterErrorCode
   readonly reason?: GoalCenterFailureReason
   readonly retryable?: boolean
+  readonly recoveryAction?: GoalRecoveryAction
+  readonly retryAfterMs: number
   readonly details?: unknown
 
   constructor(code: GoalCenterErrorCode, message: string, options: {
     reason?: GoalCenterFailureReason
     retryable?: boolean
+    recoveryAction?: GoalRecoveryAction
+    retryAfterMs?: number
     details?: unknown
     cause?: unknown
   } = {}) {
@@ -131,6 +136,8 @@ export class GoalCenterError extends Error {
     this.code = code
     this.reason = options.reason
     this.retryable = options.retryable
+    this.recoveryAction = options.recoveryAction
+    this.retryAfterMs = Math.max(0, options.retryAfterMs ?? 0)
     this.details = options.details
     if (options.cause !== undefined) (this as Error & { cause?: unknown }).cause = options.cause
   }

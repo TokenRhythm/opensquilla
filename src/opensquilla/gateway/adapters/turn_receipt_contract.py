@@ -11,14 +11,15 @@ from opensquilla.gateway.adapters._generated_contract_bindings import (
 )
 
 
-def validate_turn_receipt_params(params: Any) -> None:
+def validate_turn_receipt_params(params: Any, *, method: str = "turns.receipt.get") -> None:
     # Keep the original tree for hashing; dumping this model would needlessly
     # duplicate large frozen attachment bodies on an indeterminate send.
-    GATEWAY_METHOD_CONTRACTS["turns.receipt.get"].params_model.model_validate(params, strict=True)
+    GATEWAY_METHOD_CONTRACTS[method].params_model.model_validate(params, strict=True)
 
 
-def register_turn_receipt_contract(registry: Any, implementation: Any, **kwargs: Any) -> Any:
-    method = "turns.receipt.get"
+def register_turn_receipt_contract(
+    registry: Any, implementation: Any, *, method: str = "turns.receipt.get", **kwargs: Any,
+) -> Any:
     return register_generated_contract_binding(
         registry, generated_contract_bindings((method,), ValueError), method,
         implementation, **kwargs,

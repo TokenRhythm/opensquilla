@@ -140,6 +140,19 @@ afterEach(() => {
 })
 
 describe('SessionReadLifecycle', () => {
+  it('forwards metadata admission without waiting before live or history', async () => {
+    const { adapter, lifecycle } = harness([fixture('alpha')])
+    const open = vi.spyOn(adapter, 'open')
+    const beforeMetadataRead = vi.fn(() => new Promise<void>(() => {}))
+    const lease = lifecycle.open({ sessionKey: 'alpha', beforeMetadataRead })
+    await lease.live
+    await lease.history.latest()
+    expect(open.mock.calls[0]?.[0].beforeMetadataRead).toBe(beforeMetadataRead)
+    // The physical adapter invokes this only when it needs a metadata read.
+    expect(beforeMetadataRead).not.toHaveBeenCalled()
+    await lease.close()
+  })
+
   it('forwards provisional identity only for the owning draft lease', async () => {
     const { adapter, lifecycle } = harness([fixture('alpha')])
     const open = vi.spyOn(adapter, 'open')

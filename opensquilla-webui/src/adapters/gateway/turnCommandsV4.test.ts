@@ -6,6 +6,7 @@ import { SESSIONS_PENDING_INPUTS_DISPATCH_METHOD } from '@/contracts/generated/v
 import { SESSIONS_PENDING_INPUTS_STEER_METHOD } from '@/contracts/generated/v4/pendingInputsSteer'
 import { SESSIONS_STEER_V2_METHOD } from '@/contracts/generated/v4/sessionsSteerV2'
 import { TURNS_RECEIPT_GET_METHOD } from '@/contracts/generated/v4/turnsReceiptGet'
+import { TURNS_RECEIPT_RESOLVE_METHOD } from '@/contracts/generated/v4/turnsReceiptResolve'
 
 import {
   createV4TurnCommands,
@@ -43,6 +44,39 @@ describe('read-only delivery receipt adapter', () => {
     clientRequestId: 'request-1', messageId: 'message-1', sessionEpoch: 2,
     taskId: 'task-1', taskStatus: 'running',
   } })
+
+  it('uses an explicit mutation for retirement and binds the negative proof to the original identity', async () => {
+    const request = vi.fn().mockResolvedValue({ status: 'retired', accepted: false,
+      requestFingerprint: `sha256:${'a'.repeat(64)}`, clientRequestId: 'request-1', requestSessionKey: 'source' })
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await expect(commands.resolveReceipt?.(send, { expectedGeneration: 8 })).resolves.toEqual({ status: 'retired' })
+    expect(request).toHaveBeenCalledExactlyOnceWith(TURNS_RECEIPT_RESOLVE_METHOD,
+      expect.objectContaining({ operation: CHAT_SEND_METHOD, originalRequest: expect.objectContaining({ clientRequestId: 'request-1' }) }),
+      { expectedGeneration: 8 })
+  })
+
+  it.each(['clientRequestId', 'requestSessionKey'] as const)('rejects retirement proof for another %s', async field => {
+    const proof = { status: 'retired', accepted: false, requestFingerprint: `sha256:${'a'.repeat(64)}`,
+      clientRequestId: 'request-1', requestSessionKey: 'source', [field]: 'another' }
+    const commands = createV4TurnCommands({ request: vi.fn().mockResolvedValue(proof), supports: () => true })
+    await expect(commands.resolveReceipt?.(send)).rejects.toBeInstanceOf(TurnCommandContractError)
+  })
+
+  it('projects an accepted result from explicit resolution without dispatching a send', async () => {
+    const request = vi.fn().mockResolvedValue(found())
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await expect(commands.resolveReceipt?.(send)).resolves.toMatchObject({ status: 'found', response: { taskId: 'task-1' } })
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(request.mock.calls[0]?.[0]).toBe(TURNS_RECEIPT_RESOLVE_METHOD)
+  })
+
+  it('keeps older Gateways on the read-only path without treating absence as proof', async () => {
+    const request = vi.fn().mockResolvedValue({ status: 'not_found', accepted: null })
+    const commands = createV4TurnCommands({ request, supports: method => method === TURNS_RECEIPT_GET_METHOD })
+    await expect(commands.resolveReceipt?.(send)).resolves.toEqual({ status: 'not-found' })
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(request.mock.calls[0]?.[0]).toBe(TURNS_RECEIPT_GET_METHOD)
+  })
 
   it('looks up the frozen request as a fenced safe read and retains the authoritative target', async () => {
     const request = vi.fn().mockResolvedValue(found())

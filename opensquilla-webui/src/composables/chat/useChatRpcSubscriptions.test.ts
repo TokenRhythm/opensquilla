@@ -107,7 +107,7 @@ describe('useChatRpcSubscriptions', () => {
     bridge.subscribe()
     sourceHandlers.onDecodeError?.(new Error('decode'))
     sourceHandlers.onConnectionState?.('connected')
-    expect(await sourceHandlers.onRecoveryRequired?.({ keys: ['child'], global: false })).toBe(false)
+    expect(await sourceHandlers.onRecoveryRequired?.({ keys: ['child'], global: false })).toEqual({ retryable: false })
     expect(error).not.toHaveBeenCalled()
     expect(connection).not.toHaveBeenCalled()
     expect(recover).not.toHaveBeenCalled()

@@ -36,7 +36,7 @@
     >
       {{ action }}
     </button>
-    <button v-if="isFailure" type="button" class="btn btn--icon btn--ghost" data-testid="chat-session-recovery-dismiss" :aria-label="t('common.close')" @click="emit('dismiss')">
+    <button v-if="isFailure && dismissible !== false" type="button" class="btn btn--icon btn--ghost" data-testid="chat-session-recovery-dismiss" :aria-label="t('common.close')" @click="emit('dismiss')">
       <Icon name="x" :size="14" />
     </button>
   </div>
@@ -55,8 +55,9 @@ const props = defineProps<{
   transportState?: 'disconnected' | 'connecting' | 'connected'
   transportPhase?: 'healthy' | 'checking' | 'suspect' | 'reconnecting'
   resumeSource?: DesktopResumeSource | null
-  action?: 'retry-history' | 'retry-live'
+  action?: 'retry-history' | 'retry-live' | 'retry-metadata'
   busy?: boolean
+  dismissible?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -69,12 +70,15 @@ const statusRef = ref<HTMLElement | null>(null)
 const isFailure = computed(() => (
   props.state === 'history-error'
   || props.state === 'live-degraded'
+  || props.state === 'metadata-error'
   || props.state === 'session-missing'
 ))
 const actionKey = computed(() => props.action)
 const isBusy = computed(() => !isFailure.value)
 const title = computed(() => {
   switch (props.state) {
+    case 'metadata-error':
+      return t('chat.sendTemporarilyUnavailable')
     case 'history-loading':
       return t('chat.loadingSession')
     case 'history-retrying':
@@ -99,6 +103,8 @@ const title = computed(() => {
 })
 const description = computed(() => {
   switch (props.state) {
+    case 'metadata-error':
+      return ''
     case 'history-loading':
       return t('chat.loadingSessionDescription')
     case 'history-retrying':
@@ -117,7 +123,7 @@ const description = computed(() => {
       return ''
     }
   })
-const action = computed(() => props.action === 'retry-live'
+const action = computed(() => props.action === 'retry-metadata' ? t('chat.retry') : props.action === 'retry-live'
   ? t('chat.reconnectLive')
   : t('chat.reloadSession'))
 
@@ -151,6 +157,7 @@ function requestRetry() {
 }
 
 .chat-session-recovery-status--history-error,
+.chat-session-recovery-status--metadata-error,
 .chat-session-recovery-status--live-degraded,
 .chat-session-recovery-status--session-missing {
   background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));

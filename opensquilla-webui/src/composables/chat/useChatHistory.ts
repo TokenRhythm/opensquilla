@@ -323,7 +323,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         : initialLoadError ? 'error' : 'ready',
       loadEarlierError: false,
       recoveryError: prepend ? historyState.value.recoveryError : initialLoadError,
-      sessionMissing: false,
+      // An empty provisional-history fallback is not proof that a session
+      // exists. Retain live-proven absence until canonical history proves it.
+      sessionMissing: historyState.value.sessionMissing && responseCanonicalAvailable(data) !== true,
     }
   }
 
@@ -375,6 +377,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       recoveryError: false,
       sessionMissing: true,
     }
+    return true
+  }
+
+  /** A fresh local key has no history; never erase a missing durable key in place. */
+  function beginProvisionalSession(key: string): boolean {
+    if (!key || key !== options.sessionKey.value || key === historySessionKey.value) return false
+    cancelActiveHistory()
+    resetForSession(key)
+    historyState.value = { ...historyState.value, initialLoadStatus: 'ready' }
     return true
   }
 
@@ -839,8 +850,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             : historyState.value.initialLoadStatus,
           loadEarlierError: Boolean(params.prepend),
           recoveryError: !params.prepend,
-          sessionMissing: !params.prepend
-            && error instanceof SessionReadSessionMissingError,
+          // A later timeout/cancellation cannot revoke prior positive absence.
+          sessionMissing: historyState.value.sessionMissing || (!params.prepend
+            && error instanceof SessionReadSessionMissingError),
         }
         flushPendingHistorySync()
       }
@@ -1071,6 +1083,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     loadEarlierHistory,
     retryHistory,
     markSessionMissing,
+    beginProvisionalSession,
     scheduleHistorySync,
     cancelActiveHistory,
     cleanup,

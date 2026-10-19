@@ -5013,35 +5013,11 @@ async def start_gateway_server(
     background_completion_manager.set_idle_listener(goal_service.schedule_idle_evaluation)
     background_completion_manager.set_cancel_listener(goal_service.on_completion_group_cancelled)
 
-    async def _ordered_task_lifecycle(event: TaskLifecycleEvent) -> None:
-        # Session projection remains first. Goal settlement is independently
-        # isolated so one observer cannot suppress the other.
-        projection_error: Exception | None = None
-        try:
-            await session_lifecycle_listener(event)
-        except Exception as exc:
-            projection_error = exc
-            log.warning(
-                "gateway.session_lifecycle_projection_failed",
-                session_key=event.session_key,
-                task_id=event.task_id,
-                exc_info=True,
-            )
-        try:
-            await goal_service.on_task_lifecycle(event)
-        except Exception:
-            log.warning(
-                "gateway.goal_lifecycle_settlement_failed",
-                session_key=event.session_key,
-                task_id=event.task_id,
-                exc_info=True,
-            )
-        if projection_error is not None:
-            # The runtime retries directory invalidation only, never Goal
-            # settlement or the old task's session-state projection.
-            raise projection_error
+    from opensquilla.gateway.goal_lifecycle import make_goal_lifecycle_listener
 
-    task_runtime.set_lifecycle_listener(_ordered_task_lifecycle)
+    task_runtime.set_lifecycle_listener(
+        make_goal_lifecycle_listener(session_lifecycle_listener, goal_service)
+    )
     task_runtime.set_activation_listener(goal_service.on_task_activation)
     task_runtime.set_idle_listener(goal_service.on_runtime_idle)
     task_runtime.set_goal_service(goal_service)

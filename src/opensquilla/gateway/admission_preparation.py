@@ -23,7 +23,6 @@ from opensquilla.gateway.project_workspace_runtime import (
     apply_accepted_run_mode_override,
     apply_run_context_route_metadata,
     authoritative_project_run_context,
-    map_project_workspace_error,
 )
 from opensquilla.gateway.routing import RouteEnvelope
 from opensquilla.gateway.rpc import RpcHandlerError
@@ -138,16 +137,15 @@ async def prepare_route(
         run_context = guest_profile.run_context()
         authoritative_guard = None
     else:
-        try:
-            run_context, authoritative_guard = await authoritative_project_run_context(
-                storage=storage,
-                session_manager=sessions,
-                session=session,
-                config=config,
-                default_workspace=workspace_dir,
-            )
-        except ProjectWorkspaceStateError as exc:
-            raise map_project_workspace_error(exc, owner=principal.is_owner) from exc
+        # Admission owns the durable rejection fence. Preserve the typed error
+        # until that boundary can distinguish a refusal from a competing commit.
+        run_context, authoritative_guard = await authoritative_project_run_context(
+            storage=storage,
+            session_manager=sessions,
+            session=session,
+            config=config,
+            default_workspace=workspace_dir,
+        )
         if authoritative_guard is not None:
             workspace_guard = authoritative_guard
         if not guest_safe and principal_has_host_execute(principal):

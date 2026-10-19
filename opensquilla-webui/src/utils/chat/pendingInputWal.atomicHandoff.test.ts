@@ -634,12 +634,12 @@ function deliveryRecord(id = 'synthetic-delivery'): DeliveryWalRecord {
   }
 }
 
-it('uses v4 and preserves delivery authority while handoff fields change', async () => {
+it('uses v5 and preserves delivery authority while handoff fields change', async () => {
   const factory = new ControlledIdbFactory()
   const wal = createPendingInputWal(factory.idbFactory)!
   const record = deliveryRecord()
   await wal.prepareDelivery!(record)
-  expect(factory.versions).toEqual([4])
+  expect(factory.versions).toEqual([5])
   const handoff: ResponseHandoffWalRecord = {
     schemaVersion: 1, ownerRequestId: record.ownerRequestId, requestSessionKey: record.requestSessionKey,
     clientRequestId: record.ownerRequestId, clientMessageId: 'synthetic-message', composerText: 'synthetic text',
@@ -657,6 +657,41 @@ it('uses v4 and preserves delivery authority while handoff fields change', async
   expect(await wal.getDelivery!(record.ownerRequestId)).toMatchObject({ schemaVersion: 2, phase: 'unknown' })
   expect(await wal.listHandoffs!()).toEqual([])
   expect(factory.snapshot([HANDOFF_STORE]).get(HANDOFF_STORE)?.size).toBe(1)
+  wal.close()
+})
+
+it('indexes v4 settled records by exact identity and session without restoring a consumed handoff', async () => {
+  vi.stubGlobal('IDBKeyRange', MemoryIdbKeyRange)
+  const factory = new MemoryIdbFactory()
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = factory.open('opensquilla-chat-pending-inputs', 4)
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(PENDING_STORE, { keyPath: 'pendingInputId' })
+        .createIndex('session_created', ['sessionKey', 'createdAt'])
+      request.result.createObjectStore(HANDOFF_STORE, { keyPath: 'ownerRequestId' })
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+  const retired = { ...deliveryRecord('retired'), phase: 'not-sent' as const, retired: true as const }
+  const accepted = { ...deliveryRecord('accepted'), phase: 'accepted' as const }
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(HANDOFF_STORE, 'readwrite')
+    const store = transaction.objectStore(HANDOFF_STORE)
+    store.put(retired)
+    store.put(accepted)
+    store.put({ ...deliveryRecord('other-identity'), deliveryIdentity: 'other' })
+    store.put({ ...deliveryRecord('other-session'), requestSessionKey: 'other', request: undefined })
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error)
+  })
+  database.close()
+  const wal = createPendingInputWal(factory)!
+  expect(await wal.listSessionDeliveries!('synthetic-identity', 'synthetic-session'))
+    .toEqual(expect.arrayContaining([retired, accepted]))
+  expect(await wal.listSessionDeliveries!('synthetic-identity', 'synthetic-session')).toHaveLength(2)
+  expect(await wal.listHandoffs!('synthetic-session')).toEqual([])
+  expect(await wal.getDelivery!('retired')).toMatchObject(retired)
   wal.close()
 })
 

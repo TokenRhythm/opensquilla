@@ -308,7 +308,9 @@ test('a tall four-notice stack keeps lower controls free and its last dismiss ke
   const host = page.getByTestId('toast-host')
   await expect(page.getByTestId('toast')).toHaveCount(4)
   const bounds = await host.boundingBox()
-  expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(320)
+  expect(bounds!.height).toBeLessThanOrEqual(320)
+  expect(bounds!.y).toBeGreaterThanOrEqual(8)
+  expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(632)
   expect(await host.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true)
   const dismiss = page.locator('.toast__dismiss').last()
   await dismiss.focus()
@@ -333,18 +335,30 @@ test('the final notice stays inside the bounded stack during its exit animation'
   })
   const exiting = await page.locator('.toast__dismiss').evaluate(button => {
     ;(button as HTMLButtonElement).click()
-    return new Promise<{ leaving: boolean; contained: boolean }>(resolve => requestAnimationFrame(() => {
-      const element = document.querySelector('.toast-stack-leave-active')
-      const row = element?.getBoundingClientRect()
-      const stack = element?.parentElement?.getBoundingClientRect()
-      resolve({ leaving: Boolean(element), contained: Boolean(row && stack && row.top >= stack.top && row.bottom <= stack.bottom) })
-    }))
+    return new Promise<{ leaving: boolean; contained: boolean }>(resolve => {
+      let leaving = false
+      let contained = true
+      let samples = 0
+      const sample = () => {
+        const element = document.querySelector('.toast-stack-leave-active')
+        if (element) {
+          leaving = true
+          const row = element.getBoundingClientRect()
+          const stack = element.parentElement!.getBoundingClientRect()
+          contained &&= row.top >= stack.top && row.bottom <= stack.bottom
+        }
+        // The first frame may precede the translation; sample its movement.
+        if (++samples < 6) requestAnimationFrame(sample)
+        else resolve({ leaving, contained })
+      }
+      requestAnimationFrame(sample)
+    })
   })
   expect(exiting).toEqual({ leaving: true, contained: true })
   await expect(toast).toHaveCount(0)
 })
 
-test('real App keeps notices above the composer while the 360px keyboard and tab bar change', async ({ page }, testInfo) => {
+test('real App keeps notices clear of the composer while the 360px keyboard and tab bar change', async ({ page }, testInfo) => {
   // Actual App, router, composer, ToastHost and bottom navigation. Gateway
   // traffic is synthetic; the viewport signal represents IME open/close,
   // without claiming a physical mobile keyboard or installed-client proof.
@@ -375,22 +389,28 @@ test('real App keeps notices above the composer while the 360px keyboard and tab
   await expect(toast).toContainText('此浏览器不支持语音输入')
   await page.locator('.toast__dismiss').focus()
   await expect(host).toHaveAttribute('aria-live', 'polite')
-  const initialTop = await host.evaluate(element => element.getBoundingClientRect().top)
-  expect(initialTop).toBeGreaterThanOrEqual(56)
+  const expectComposerClear = async () => {
+    await expect.poll(() => host.evaluate(element => {
+      const rect = element.getBoundingClientRect()
+      const composer = document.querySelector('.chat-composer')?.getBoundingClientRect()
+      return rect.top >= 8 && rect.bottom <= innerHeight - 8
+        && (!composer || rect.right <= composer.left || rect.left >= composer.right
+          || rect.bottom <= composer.top || rect.top >= composer.bottom)
+    })).toBe(true)
+  }
+  await expectComposerClear()
   const tabbarBox = await tabbar.boundingBox()
   const toastBox = await toast.boundingBox()
   expect(toastBox!.y + toastBox!.height).toBeLessThanOrEqual(tabbarBox!.y - 8)
   await page.screenshot({ path: testInfo.outputPath('notification-real-app-360-tabbar.png') })
   await page.evaluate(() => window.notificationSetKeyboard?.(true))
   await expect(tabbar).toHaveClass(/is-keyboard-open/)
-  await expect.poll(() => host.evaluate(element => element.getBoundingClientRect().top)).toBe(initialTop)
+  await expectComposerClear()
   await expect(page.locator('.toast__dismiss')).toBeFocused()
   await expect.poll(() => tabbar.evaluate(element => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(800)
   await page.screenshot({ path: testInfo.outputPath('notification-real-app-360-keyboard-state.png') })
   await page.evaluate(() => window.notificationSetKeyboard?.(false))
   await expect(tabbar).not.toHaveClass(/is-keyboard-open/)
-  await expect.poll(() => host.evaluate(element => element.getBoundingClientRect().top)).toBe(initialTop)
-  const composerBox = await page.locator('.chat-composer').boundingBox()
-  expect((await toast.boundingBox())!.y + (await toast.boundingBox())!.height).toBeLessThan(composerBox!.y)
+  await expectComposerClear()
   await expect(page.locator('.toast__dismiss')).toBeFocused()
 })

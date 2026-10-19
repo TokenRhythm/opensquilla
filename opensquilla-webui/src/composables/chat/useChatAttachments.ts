@@ -124,6 +124,7 @@ interface ChatAttachmentOptions {
   draftScopePending?: () => boolean
   draftOwnerState?: () => unknown
   draftStore?: AttachmentDraftStore | null
+  deferDraftSourceRetirement?: (source: AttachmentDraftScope, target: AttachmentDraftScope) => boolean
   native?: PlatformFilesApi
   nativeContext?: () => NativeAttachmentContext | null | Promise<NativeAttachmentContext | null>
   nativeIsCurrent?: (context: NativeAttachmentContext) => boolean
@@ -550,6 +551,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
       scope: options.draftScope,
       ownerState: options.draftOwnerState,
       store: options.draftStore,
+      deferSourceRetirement: options.deferDraftSourceRetirement,
       beforeScopeChange: clearAttachmentState,
       onError: message => pushToast(message, { tone: 'danger' }),
       restore: async restored => {
@@ -594,6 +596,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     prepareAttachmentsForSend,
     captureDraftConsumption: (attachments: readonly Attachment[]) => draftPersistence?.captureConsumption(attachments),
     flushAttachmentDraft: () => draftPersistence?.flush() ?? Promise.resolve(),
+    completeDraftHandoff: (source: string, target: string) => draftPersistence?.completeHandoff(source, target) ?? Promise.resolve(),
   }
 }
 

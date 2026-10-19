@@ -31,10 +31,13 @@ export type RealGoalGateway = {
   readProviderCalls: () => Promise<ProviderCall[]>
   releaseFirstTask: () => Promise<void>
   releaseSecondTask: () => Promise<void>
+  releaseActivationFault: () => Promise<void>
+  createOwnedWorkspace: () => Promise<void>
+  readActivationRecovery: () => Promise<Record<string, unknown>>
   stop: () => Promise<void>
 }
 
-export type RealGoalGatewayScenario = 'continuation' | 'lifecycle' | 'silent-reply'
+export type RealGoalGatewayScenario = 'continuation' | 'lifecycle' | 'silent-reply' | 'activation-orphan-clear'
 
 async function reserveLoopbackPort(): Promise<number> {
   const server = createServer()
@@ -106,6 +109,7 @@ export async function startRealGoalGateway(options: {
   scenario?: RealGoalGatewayScenario
   authMode?: 'none' | 'token'
   initialSessionKeys?: readonly string[]
+  workspaceInitiallyMissing?: boolean
 }): Promise<RealGoalGateway> {
   const requestedFlow = process.env.OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED
     ?.trim().toLowerCase()
@@ -119,6 +123,8 @@ export async function startRealGoalGateway(options: {
   const eventLog = join(options.outputDir, 'provider-events.jsonl')
   const firstReleaseFile = join(options.outputDir, 'release-first-task')
   const secondReleaseFile = join(options.outputDir, 'release-second-task')
+  const activationReleaseFile = join(options.outputDir, 'release-activation-fault')
+  const activationEvidenceFile = join(options.outputDir, 'activation-recovery.json')
   const logDir = join(options.outputDir, 'logs')
   const tempDir = join(options.outputDir, 'tmp')
   const appDataDir = join(stateDir, 'appdata')
@@ -177,9 +183,12 @@ export async function startRealGoalGateway(options: {
         OPENSQUILLA_WEBUI_GOAL_E2E_EVENT_LOG: eventLog,
         OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE_FIRST: firstReleaseFile,
         OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE: secondReleaseFile,
+        OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE_ACTIVATION_FAULT: activationReleaseFile,
+        OPENSQUILLA_WEBUI_GOAL_E2E_ACTIVATION_EVIDENCE: activationEvidenceFile,
         OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO: options.scenario || 'continuation',
         OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE: options.authMode || 'none',
         OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_SESSION_KEYS: JSON.stringify(options.initialSessionKeys ?? []),
+        OPENSQUILLA_WEBUI_GOAL_E2E_WORKSPACE_INITIALLY_MISSING: String(options.workspaceInitiallyMissing === true),
         OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN: options.webuiOrigin,
         OPENSQUILLA_HOME: stateDir,
         OPENSQUILLA_STATE_DIR: stateDir,
@@ -229,6 +238,20 @@ export async function startRealGoalGateway(options: {
     if (!response.ok) {
       throw new Error(`Goal Gateway health check returned ${response.status}`)
     }
+    if (options.scenario === 'activation-orphan-clear') {
+      // Health may precede installation of this opt-in, test-only fault owner.
+      // Never allow the browser to race the first activation injection.
+      while (Date.now() < deadline) {
+        try {
+          if (JSON.parse(await readFile(activationEvidenceFile, 'utf8')).fixtureReady === true) break
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      const evidence = JSON.parse(await readFile(activationEvidenceFile, 'utf8'))
+      if (evidence.fixtureReady !== true) throw new Error('Activation fault fixture did not become ready')
+    }
   } catch (error) {
     await stopProcess(child)
     throw new Error(
@@ -261,6 +284,16 @@ export async function startRealGoalGateway(options: {
     },
     async releaseSecondTask() {
       await writeFile(secondReleaseFile, 'continue\n', 'utf8')
+    },
+    async releaseActivationFault() {
+      await writeFile(activationReleaseFile, 'recover\n', 'utf8')
+    },
+    async createOwnedWorkspace() {
+      // Only this fixture's disposable configured workspace, never a user project.
+      await mkdir(join(stateDir, 'workspace'), { recursive: true })
+    },
+    async readActivationRecovery() {
+      return JSON.parse(await readFile(activationEvidenceFile, 'utf8')) as Record<string, unknown>
     },
     async stop() {
       await stopProcess(child)

@@ -4005,6 +4005,7 @@
     "historyAttachmentCount": "Attachments: {count}",
     "loadingSession": "Restoring conversation history…",
     "loadingSessionDescription": "You can keep using this conversation while history loads.",
+    "sendTemporarilyUnavailable": "Messages cannot be sent right now",
     "loadSessionFailed": "Conversation history temporarily unavailable",
     "loadSessionDescription": "Conversation history is temporarily unavailable.",
     "reloadSession": "Reload history",

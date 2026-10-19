@@ -18,7 +18,7 @@ export interface DeliverySnapshot {
   waitReason?: DeliveryWaitReason
 }
 export type DeliveryUpdate = Pick<DeliveryWalRecord,
-  'ownerRequestId' | 'deliveryIdentity' | 'requestSessionKey' | 'phase' | 'response' | 'stop'> & { kind?: 'send' | 'steer' }
+  'ownerRequestId' | 'deliveryIdentity' | 'requestSessionKey' | 'phase' | 'response' | 'stop' | 'retired'> & { kind?: 'send' | 'steer' }
 
 /** Application lifetime owner; subscribing never grants dispatch ownership. */
 export interface DurableDelivery {

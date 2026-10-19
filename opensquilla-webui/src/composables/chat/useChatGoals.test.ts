@@ -1,15 +1,22 @@
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref, type Ref } from 'vue'
+import { effectScope, nextTick, ref, watch, type Ref } from 'vue'
 import { createV4SessionReadPort } from '@/adapters/gateway/sessionReadPortV4'
+import { createV4GoalContinuity } from '@/adapters/gateway/goalContinuityV4'
 import type { TransportCallOptions } from '@/adapters/gateway/transportTypes'
 import {
+  createGoalSessionReadiness,
   goalHasRenderedTerminalAnchor,
   normalizeGoal,
   useChatGoals,
+  type UseChatGoalsOptions,
   type GoalContinuityStorage,
 } from './useChatGoals'
 import { GoalCenterError, type GoalCapabilities } from '@/modules/goalCenter'
 import type { GoalEvent, GoalReattachInput } from '@/modules/goalContinuity'
+import { useChatSessionBootstrap } from './useChatSessionBootstrap'
+import { useChatSessionSubscription } from './useChatSessionSubscription'
+import { createConversationRuntime } from '@/modules/conversationRuntime'
+import type { SessionReadLease, SessionReadLive, SessionReadMetadata } from '@/modules/sessionReadLifecycle'
 
 const SESSION_KEY = 'agent:main:webchat:test'
 const SESSION_ID = 'session-1'
@@ -103,6 +110,7 @@ function harness(
   streamGeneration?: Ref<string | null>,
   connectionEpoch = ref(0),
   localPathReferences = ref<string[]>([]),
+  authority = ref<string | null>('authority-a'),
 ) {
   const handlers = new Map<string, (...args: unknown[]) => void>()
   const toGoalEvent = (value: unknown): GoalEvent => {
@@ -151,7 +159,7 @@ function harness(
     clear: async (input: any) => rpc.call('goals.clear', input),
   }
   const goalContinuity = {
-    reattach: vi.fn((input: GoalReattachInput) => rpc.call('goals.reattach', input)),
+    reattach: vi.fn((input: GoalReattachInput, _options?: { signal?: AbortSignal }) => rpc.call('goals.reattach', input)),
     subscribe: vi.fn((listener: (event: GoalEvent) => void) => {
       const handler = (payload: unknown) => listener(toGoalEvent(payload))
       handlers.set('session.event.goal', handler)
@@ -164,7 +172,7 @@ function harness(
   const notify = vi.fn()
   const onSetAccepted = vi.fn()
   const ensureSessionKey = vi.fn(async () => sessionKey.value)
-  const ensureSubscribed = vi.fn(async () => true)
+  const ensureSubscribed = vi.fn<NonNullable<UseChatGoalsOptions['ensureSubscribed']>>(async () => true)
   const api = useChatGoals({
     goalCenter,
     goalContinuity,
@@ -173,6 +181,7 @@ function harness(
     currentEpoch,
     streamGeneration,
     connectionEpoch,
+    authority,
     ensureSessionKey,
     ensureSubscribed,
     onSetAccepted,
@@ -188,6 +197,7 @@ function harness(
     handlers,
     goalCenter,
     connectionEpoch,
+    authority,
     goalContinuity,
     ensureSessionKey,
     ensureSubscribed,
@@ -200,7 +210,549 @@ async function flushAsyncWork() {
   await Promise.resolve()
 }
 
+describe('Goal terminal decision projection and explicit continuity retry', () => {
+  const detached = () => goalPayload('active', {
+    continuationDeferredReason: 'owner_disconnected', executionState: 'idle', activeTaskId: null,
+  })
+  async function seeded() {
+    const storage = new MemoryContinuityStorage()
+    const seed = harness(storage)
+    seed.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), { continuityToken: 'saved-token' }))
+    await seed.api.startGoal('Seed continuity')
+    seed.api.reset()
+    const h = harness(storage)
+    const hydrate = (snapshot = detached(), watermark = 1) => h.api.applyHydration({
+      key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, goalSnapshotStreamSeq: watermark, goal: snapshot,
+    })
+    const emit = (snapshot: unknown, streamSeq = 2) => h.handlers.get('session.event.goal')?.({
+      eventType: snapshot ? 'updated' : 'cleared', sessionKey: SESSION_KEY,
+      sessionId: SESSION_ID, epoch: 1, streamSeq, goal: snapshot,
+    })
+    return { ...h, storage, hydrate, emit }
+  }
+
+  it.each(['require-takeover', 'owner-attached', 'stop'] as const)(
+    'preserves %s through a newer detached event without retrying or reclassifying a saved token', async recoveryAction => {
+      vi.useFakeTimers()
+      const h = await seeded()
+      const request = vi.fn(async () => { throw Object.assign(new Error('Server rejected continuity'), {
+        code: 'EXECUTION_LEASE_REQUIRED', retryable: false, details: { recoveryAction },
+      }) })
+      const adapter = createV4GoalContinuity({ request })
+      h.goalContinuity.reattach.mockImplementation((input, options) => adapter.reattach(input, options))
+      try {
+        h.hydrate()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(h.api.connectionTakeoverAvailable.value).toBe(recoveryAction === 'require-takeover')
+        const newer = { ...detached(), stateRevision: 2, objectiveRevision: 2, objective: 'Edited while detached' }
+        h.emit(newer)
+        await vi.advanceTimersByTimeAsync(125_000)
+        expect(h.api.connectionTakeoverAvailable.value).toBe(recoveryAction === 'require-takeover')
+        expect(h.api.connectionRetryAvailable.value).toBe(false)
+        await h.api.retryConnection()
+        h.connectionEpoch.value++
+        h.hydrate(newer, 2)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(h.api.connectionTakeoverAvailable.value).toBe(recoveryAction === 'require-takeover')
+        expect(request).toHaveBeenCalledOnce()
+      } finally { h.api.reset(); adapter.dispose(); vi.useRealTimers() }
+    },
+  )
+
+  it.each(['attached', 'paused', 'cleared', 'token', 'authority', 'epoch'] as const)(
+    'does not retain a prior takeover action after %s changes', async change => {
+      vi.useFakeTimers()
+      const h = await seeded()
+      h.goalContinuity.reattach.mockRejectedValue(new GoalCenterError('conflict', 'take over', {
+        retryable: false, recoveryAction: 'require-takeover',
+      }))
+      try {
+        h.hydrate()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(h.api.connectionTakeoverAvailable.value).toBe(true)
+        if (change === 'attached') h.emit({ ...detached(), continuationDeferredReason: null, stateRevision: 2 })
+        if (change === 'paused') h.emit({ ...detached(), status: 'paused', stateRevision: 2 })
+        if (change === 'cleared') h.emit(null)
+        if (change === 'token') {
+          const [key, value] = h.storage.entries()[0]!
+          h.storage.setItem(key, JSON.stringify({ ...JSON.parse(value), token: 'replacement-token' }))
+          h.emit({ ...detached(), stateRevision: 2 })
+        }
+        if (change === 'authority') h.authority.value = 'authority-b'
+        if (change === 'epoch') h.currentEpoch.value++
+        expect(h.api.connectionTakeoverAvailable.value).toBe(false)
+        expect(h.api.connectionRetryAvailable.value).toBe(false)
+      } finally { h.api.reset(); vi.useRealTimers() }
+    },
+  )
+
+  it('uses a manual same-token retry only after exhaustion, keeps Retry-After and does not block other Goal controls', async () => {
+    vi.useFakeTimers()
+    const h = await seeded()
+    const request = vi.fn(async (_method: string, _params?: Record<string, unknown>) => mutation(
+      goalPayload('active', { stateRevision: 2 }), { continuityToken: 'saved-token' }))
+      .mockRejectedValueOnce(Object.assign(new Error('Busy dependency'), {
+        code: 'STORAGE_BUSY', retryable: true, retry_after_ms: 180_000, details: { recoveryAction: 'retry' },
+      }))
+    const adapter = createV4GoalContinuity({
+      request: async <T>(method: string, params?: Record<string, unknown>) => await request(method, params) as T,
+    })
+    h.goalContinuity.reattach.mockImplementation((input, options) => adapter.reattach(input, options))
+    try {
+      h.hydrate()
+      await vi.advanceTimersByTimeAsync(120_001)
+      expect(h.api.connectionRetryAvailable.value).toBe(true)
+      expect(h.api.connectionTakeoverAvailable.value).toBe(false)
+      const newer = { ...detached(), stateRevision: 2 }
+      h.emit(newer)
+      h.connectionEpoch.value++
+      h.hydrate(newer, 2)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(request).toHaveBeenCalledOnce()
+      const retry = h.api.retryConnection()
+      expect(h.api.retryConnection()).toBe(retry)
+      await vi.advanceTimersByTimeAsync(50_000)
+      expect(h.api.busy.value).toBe(false)
+      expect(h.api.reattaching.value).toBe(true)
+      expect(h.api.connectionRetryAvailable.value).toBe(true)
+      expect(request).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(10_000)
+      await retry
+      expect(request).toHaveBeenCalledTimes(2)
+      expect(h.ensureSubscribed.mock.calls.map(call => call[1])).toEqual([{ explicit: false }, { explicit: true }])
+      expect(request.mock.calls[1]?.[1]).toMatchObject({ continuityToken: 'saved-token', expectedGoalId: 'g1' })
+      expect(request.mock.calls[1]?.[1]).not.toHaveProperty('takeover')
+      expect(h.rpc.call).not.toHaveBeenCalled()
+      expect(h.api.connectionRetryAvailable.value).toBe(false)
+      expect(h.api.goal.value?.continuationDeferredReason).toBeNull()
+    } finally { h.api.reset(); adapter.dispose(); vi.useRealTimers() }
+  })
+
+  it.each(['proof', 'authority', 'goal', 'token', 'pause', 'clear', 'navigation'] as const)(
+    'fences a manual retry waiting for subscription after %s changes', async change => {
+      vi.useFakeTimers()
+      const h = await seeded()
+      h.goalContinuity.reattach.mockRejectedValue(new GoalCenterError('unavailable', 'busy', {
+        retryable: true, recoveryAction: 'retry', retryAfterMs: 120_000,
+      }))
+      try {
+        h.hydrate()
+        await vi.advanceTimersByTimeAsync(120_001)
+        let resolve!: (ready: boolean | (() => boolean)) => void
+        h.ensureSubscribed.mockImplementation(() => new Promise(done => { resolve = done }))
+        const retry = h.api.retryConnection()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(h.ensureSubscribed).toHaveBeenLastCalledWith(SESSION_KEY, { explicit: true })
+        if (change === 'authority') h.authority.value = 'authority-b'
+        if (change === 'goal') h.emit({ ...detached(), goalId: 'successor', stateRevision: 2 })
+        if (change === 'token') {
+          const [key, value] = h.storage.entries()[0]!
+          h.storage.setItem(key, JSON.stringify({ ...JSON.parse(value), token: 'new-token' }))
+          h.emit({ ...detached(), stateRevision: 2 })
+        }
+        if (change === 'pause') h.emit({ ...detached(), status: 'paused', stateRevision: 2 })
+        if (change === 'clear') h.emit(null)
+        if (change === 'navigation') { h.sessionKey.value = 'other'; h.sessionKey.value = SESSION_KEY }
+        resolve(change === 'proof' ? () => false : true)
+        await vi.advanceTimersByTimeAsync(0)
+        if (change === 'proof') h.api.reset()
+        await retry
+        expect(h.goalContinuity.reattach).toHaveBeenCalledOnce()
+      } finally { h.api.reset(); vi.useRealTimers() }
+    },
+  )
+})
+
+describe('Goal operation admission and continuity contracts', () => {
+  const actions = ['start', 'takeover', 'resume', 'completed-edit'] as const
+  function prepare(action: typeof actions[number]) {
+    const h = harness()
+    if (action !== 'start') h.api.applyHydration({
+      key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, goalSnapshotStreamSeq: 1,
+      goal: goalPayload(action === 'resume' ? 'paused' : action === 'completed-edit' ? 'complete' : 'active', {
+        activeTaskId: null, executionState: 'idle',
+        continuationDeferredReason: action === 'takeover' ? 'owner_disconnected' : null,
+      }),
+    })
+    const invoke = () => action === 'start' ? h.api.startGoal('Admission goal')
+      : action === 'takeover' ? h.api.takeOverConnection()
+        : action === 'resume' ? h.api.resume() : h.api.edit('Reactivate completed goal')
+    return { ...h, invoke }
+  }
+
+  it.each(actions)('waits for current read authority before %s', async action => {
+    const h = prepare(action)
+    let release!: (value: () => boolean) => void
+    h.ensureSubscribed.mockImplementation(() => new Promise(resolve => { release = resolve }))
+    const pending = h.invoke()
+    await flushAsyncWork()
+    expect(h.rpc.call).not.toHaveBeenCalled()
+    release(() => true)
+    await expect(pending).resolves.toBe(true)
+    expect(h.rpc.call).toHaveBeenCalledOnce()
+    expect(h.rpc.call.mock.calls[0]![0]).toBe(action === 'start' ? 'goals.set'
+      : action === 'takeover' ? 'goals.reattach' : action === 'resume' ? 'goals.resume' : 'goals.edit')
+    h.api.reset()
+  })
+
+  for (const action of actions) {
+    it.each(['revision', 'replacement', 'navigation-return', 'authority-return'] as const)(`fences ${action} after %s during readiness`, async change => {
+      const h = prepare(action)
+      let release!: (value: () => boolean) => void
+      h.ensureSubscribed.mockImplementation(() => new Promise(resolve => { release = resolve }))
+      const pending = h.invoke()
+      await flushAsyncWork()
+      if (change === 'navigation-return') {
+        h.sessionKey.value = 'agent:main:webchat:other'
+        h.sessionKey.value = SESSION_KEY
+      } else if (change === 'authority-return') {
+        h.authority.value = 'authority-b'
+        h.authority.value = 'authority-a'
+      } else {
+        h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, goalSnapshotStreamSeq: 2,
+          goal: goalPayload(action === 'resume' ? 'paused' : action === 'completed-edit' ? 'complete' : 'active', {
+            goalId: change === 'replacement' ? 'replacement-goal' : 'g1', stateRevision: 2,
+            activeTaskId: null, executionState: 'idle',
+            continuationDeferredReason: action === 'takeover' ? 'owner_disconnected' : null,
+          }) })
+      }
+      release(() => true)
+      await expect(pending).resolves.toBe(false)
+      expect(h.rpc.call).not.toHaveBeenCalled()
+      h.api.reset()
+    })
+  }
+
+  it('does not project or notify a rejected Start after navigation returns to the same key', async () => {
+    const h = prepare('start')
+    let reject!: (error: unknown) => void
+    h.ensureSubscribed.mockImplementation(() => new Promise((_resolve, fail) => { reject = fail }))
+    const pending = h.invoke()
+    await flushAsyncWork()
+    h.sessionKey.value = 'agent:main:webchat:other'
+    h.sessionKey.value = SESSION_KEY
+    reject(new GoalCenterError('conflict', 'old response', { details: { current: goalPayload() } }))
+    await expect(pending).resolves.toBe(false)
+    expect(h.api.goal.value).toBeNull()
+    expect(h.notify).not.toHaveBeenCalled()
+    expect(h.rpc.call).not.toHaveBeenCalled()
+    h.api.reset()
+  })
+
+  it.each(['pause', 'clear'] as const)('keeps %s independent of session recovery admission', async action => {
+    const h = prepare('takeover')
+    h.ensureSubscribed.mockImplementation(() => new Promise(() => {}))
+    await expect(h.api[action]()).resolves.toBe(true)
+    expect(h.ensureSubscribed).not.toHaveBeenCalled()
+    expect(h.rpc.call).toHaveBeenCalledWith(`goals.${action}`, expect.anything())
+    h.api.reset()
+  })
+
+  it.each([
+    ['EXECUTION_LEASE_REQUIRED', 'require-takeover', true],
+    ['EXECUTION_LEASE_REQUIRED', 'owner-attached', false],
+    ['UNAVAILABLE', 'retry', false],
+    ['STALE_GOAL', 'refresh-goal', false],
+  ] as const)('composes actual adapter and consumer for terminal %s/%s', async (code, recoveryAction, takeover) => {
+    vi.useFakeTimers()
+    const storage = new MemoryContinuityStorage()
+    const first = harness(storage)
+    first.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), { continuityToken: 'continuity-token-1' }))
+    await first.api.startGoal('Seed continuity through accepted set')
+    const h = harness(storage)
+    const request = vi.fn(async () => { throw Object.assign(new Error('Server rejected recovery'), {
+      code, retryable: false, accepted: false, details: { recoveryAction },
+    }) })
+    const adapter = createV4GoalContinuity({ request })
+    h.goalContinuity.reattach.mockImplementation((input, options) => adapter.reattach(input, options))
+    const hydrate = () => h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1,
+      goalSnapshotStreamSeq: 1, goal: goalPayload('active', {
+        continuationDeferredReason: 'owner_disconnected', executionState: 'idle', activeTaskId: null,
+      }) })
+    try {
+      hydrate()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(request).toHaveBeenCalledOnce()
+      expect(h.ensureSubscribed).toHaveBeenCalledWith(SESSION_KEY, { explicit: false })
+      expect(h.api.connectionTakeoverAvailable.value).toBe(takeover)
+      h.connectionEpoch.value++
+      hydrate()
+      await vi.advanceTimersByTimeAsync(121_000)
+      expect(request).toHaveBeenCalledOnce()
+      expect(h.api.connectionTakeoverAvailable.value).toBe(takeover)
+      expect(h.rpc.call).not.toHaveBeenCalled()
+    } finally { first.api.reset(); h.api.reset(); adapter.dispose(); vi.useRealTimers() }
+  })
+
+  it('resumes hydrated continuity on first authority binding without another hydration or renewed budget', async () => {
+    vi.useFakeTimers()
+    const storage = new MemoryContinuityStorage()
+    const first = harness(storage)
+    first.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), { continuityToken: 'continuity-token-1' }))
+    await first.api.startGoal('Seed continuity')
+    const h = harness(storage, undefined, ref(0), ref([]), ref<string | null>(null))
+    const releases: Array<(value: boolean) => void> = []
+    h.ensureSubscribed.mockImplementation(() => new Promise(resolve => { releases.push(resolve) }))
+    h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, goalSnapshotStreamSeq: 1,
+      goal: goalPayload('active', { continuationDeferredReason: 'owner_disconnected', executionState: 'idle', activeTaskId: null }) })
+    try {
+      await vi.advanceTimersByTimeAsync(1_000)
+      h.authority.value = 'authority-a'
+      await vi.advanceTimersByTimeAsync(0)
+      expect(releases).toHaveLength(2)
+      releases[0]!(true)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.rpc.call).not.toHaveBeenCalled()
+      h.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), { continuityToken: 'continuity-token-2' }))
+      releases[1]!(true)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.rpc.call).toHaveBeenCalledOnce()
+      expect(storage.entries()[0]?.[1]).toContain('continuity-token-2')
+    } finally { first.api.reset(); h.api.reset(); vi.useRealTimers() }
+  })
+
+  it.each(['refresh', 'newer-event', 'navigation-return', 'status-rejected'] as const)('owns one bounded status correction after refresh-goal: %s', async outcome => {
+    vi.useFakeTimers()
+    const storage = new MemoryContinuityStorage()
+    const first = harness(storage)
+    first.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), { continuityToken: 'continuity-token-1' }))
+    await first.api.startGoal('Seed continuity')
+    const h = harness(storage)
+    let resolve!: (value: Awaited<ReturnType<typeof h.goalCenter.status>>) => void
+    let reject!: (error: unknown) => void
+    const status = vi.spyOn(h.goalCenter, 'status').mockImplementation(() => new Promise((done, fail) => { resolve = done; reject = fail }))
+    const request = vi.fn(async () => { throw Object.assign(new Error('Session generation changed'), {
+      code: 'SESSION_GENERATION_CHANGED', retryable: false, details: { recoveryAction: 'refresh-goal' },
+    }) })
+    const adapter = createV4GoalContinuity({ request })
+    h.goalContinuity.reattach.mockImplementation((input, options) => adapter.reattach(input, options))
+    const detached = goalPayload('active', { continuationDeferredReason: 'owner_disconnected', executionState: 'idle', activeTaskId: null })
+    const hydrate = () => h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, goalSnapshotStreamSeq: 1, goal: detached })
+    try {
+      hydrate()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(status).toHaveBeenCalledOnce()
+      if (outcome === 'newer-event') h.handlers.get('session.event.goal')?.({
+        sessionKey: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, streamSeq: 2,
+        goal: goalPayload('active', { goalId: 'newer-goal', stateRevision: 10 }),
+      })
+      if (outcome === 'navigation-return') {
+        h.sessionKey.value = 'agent:main:webchat:other'
+        h.sessionKey.value = SESSION_KEY
+      }
+      if (outcome === 'status-rejected') reject(new GoalCenterError('unavailable', 'status unavailable', { retryable: true }))
+      else resolve({ sessionKey: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, goal: goalPayload('paused', { stateRevision: 2 }) })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.api.goal.value?.goalId ?? null).toBe(outcome === 'navigation-return' ? null : outcome === 'newer-event' ? 'newer-goal' : 'g1')
+      if (outcome === 'refresh') expect(h.api.goal.value?.status).toBe('paused')
+      if (outcome === 'status-rejected') {
+        h.connectionEpoch.value++
+        hydrate()
+      }
+      await vi.advanceTimersByTimeAsync(121_000)
+      expect(request).toHaveBeenCalledOnce()
+      expect(status).toHaveBeenCalledOnce()
+      expect(h.api.connectionTakeoverAvailable.value).toBe(false)
+      expect(h.api.reattaching.value).toBe(false)
+    } finally { first.api.reset(); h.api.reset(); adapter.dispose(); vi.useRealTimers() }
+  })
+
+  it('fences late same-token recovery after authority A-B-A', async () => {
+    const storage = new MemoryContinuityStorage()
+    const first = harness(storage)
+    first.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), { continuityToken: 'continuity-token-1' }))
+    await first.api.startGoal('Seed continuity')
+    const h = harness(storage)
+    let resolve!: (value: ReturnType<typeof mutation>) => void
+    h.rpc.call.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1, goalSnapshotStreamSeq: 1,
+      goal: goalPayload('active', { continuationDeferredReason: 'owner_disconnected', executionState: 'idle', activeTaskId: null }) })
+    await vi.waitFor(() => expect(resolve).toBeDefined())
+    h.authority.value = 'authority-b'
+    h.authority.value = 'authority-a'
+    resolve(mutation(goalPayload('active', { continuationDeferredReason: null }), { continuityToken: 'late-token' }))
+    await flushAsyncWork()
+    expect(h.api.goal.value).toBeNull()
+    expect(storage.entries()[0]?.[1]).not.toContain('late-token')
+    first.api.reset(); h.api.reset()
+  })
+})
+
 describe('useChatGoals', () => {
+  it('joins bootstrap authority during takeover without replacing its subscription consumer', async () => {
+    const scope = effectScope()
+    const h = scope.run(() => harness())!
+    const metadata: SessionReadMetadata = {
+      sessionKey: SESSION_KEY, workspaceId: null, projectWorkspace: null, projectWorkspaceDeferred: false,
+      activeTaskGroupIds: [], runModeLock: { locked: false, runMode: null, source: null, additional: {} },
+      pendingUserInputs: [], collaboration: null, routing: null, currentPlan: null, activePlanRun: null,
+      goal: null, goalSnapshotStreamSeq: null, tasks: [], activeTask: null, lastTask: null,
+      runStatus: 'idle', queuedTaskIds: [], epoch: 1, hydrationComplete: true, deferredFields: [], additional: {},
+    }
+    let completeLive!: (live: SessionReadLive) => void
+    const pendingLive = new Promise<SessionReadLive>(resolve => { completeLive = resolve })
+    const live: SessionReadLive = { sessionKey: SESSION_KEY, activity: 'idle', activeTaskId: null,
+      initialMetadata: metadata, snapshot: null, reloadRequired: null }
+    const lease = {
+      criticalRequestsQueued: Promise.resolve(), live: pendingLive, metadata: Promise.resolve(metadata),
+      history: {}, retryMetadata: async () => metadata, reconcile: async () => live, close: async () => {},
+    } as unknown as SessionReadLease
+    let current: SessionReadLease | null = null
+    const subscription = scope.run(() => useChatSessionSubscription({
+      sessionReadLeaseReader: { current: () => current },
+      conversationRuntime: createConversationRuntime(), sessionKey: h.sessionKey, lastStreamSeq: ref(0),
+      runStatus: ref({ status: 'idle', label: 'Idle', task: null }), isStreaming: ref(false),
+      hasActiveInterrupt: ref(false), activeStreamTaskId: ref(''), activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: 'Idle', task: null }),
+      startStreaming() {}, loadHistory: async () => ({ ok: true }),
+      resetStreamIdleTimer() {}, resetStreamLiveTurnState() {},
+    }))!
+    const subscribeSession = vi.fn(subscription.subscribeSession)
+    const reconcileSession = vi.fn(subscription.reconcileSession)
+    const bootstrap = scope.run(() => useChatSessionBootstrap({
+      sessionKey: h.sessionKey, connectionState: ref('connected'),
+      sessionReadLifecycle: { open: () => { current = lease; return lease }, current: () => current },
+      loadHistory: async () => ({ ok: true }), subscribeSession, reconcileSession,
+      cancelHistory() {}, cancelSubscription: subscription.cancelActiveSubscription,
+    }))!
+    h.ensureSubscribed.mockImplementation(createGoalSessionReadiness({
+      sessionKey: h.sessionKey, waitForLiveReady: bootstrap.waitForLiveReady,
+    }))
+    try {
+      h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1,
+        goalSnapshotStreamSeq: 1, goal: goalPayload('active', { continuationDeferredReason: 'owner_disconnected' }) })
+      const initial = bootstrap.startSessionBootstrap()
+      await nextTick()
+      const takeover = h.api.takeOverConnection()
+      await flushAsyncWork()
+      expect(h.goalContinuity.reattach).not.toHaveBeenCalled()
+      expect(subscribeSession).toHaveBeenCalledOnce()
+
+      completeLive(live)
+      await expect(takeover).resolves.toBe(true)
+      await expect(initial.live).resolves.toMatchObject({ authoritative: true })
+      expect(bootstrap.livePhase.value).toBe('ready')
+      expect(subscribeSession).toHaveBeenCalledOnce()
+      expect(reconcileSession).not.toHaveBeenCalled()
+      expect(h.goalContinuity.reattach).toHaveBeenCalledOnce()
+      expect(h.goalContinuity.reattach).toHaveBeenCalledWith(expect.objectContaining({ takeover: true }))
+    } finally { bootstrap.cancelSessionBootstrap(); scope.stop() }
+  })
+
+  it('rejects Goal admission when navigation supersedes a pending coordinator result', async () => {
+    const sessionKey = ref(SESSION_KEY)
+    let complete!: (value: () => boolean) => void
+    const pending = new Promise<() => boolean>(resolve => { complete = resolve })
+    const waitForLiveReady = vi.fn(() => pending)
+    const ensureSubscribed = createGoalSessionReadiness({ sessionKey, waitForLiveReady })
+    const admitted = ensureSubscribed(SESSION_KEY)
+    sessionKey.value = 'agent:main:other'
+    complete(() => true)
+    await expect(admitted).resolves.toBe(false)
+    expect(waitForLiveReady).toHaveBeenCalledOnce()
+  })
+
+  it.each(['start', 'takeover'] as const)('keeps %s behind a fresh read requested after Goal began waiting', async action => {
+    const scope = effectScope()
+    const h = scope.run(() => harness())!
+    type Outcome = { authoritative: boolean; live: boolean; backgroundOnly: boolean }
+    const ready: Outcome = { authoritative: true, live: false, backgroundOnly: false }
+    let complete!: (value: Outcome) => void
+    let completeFresh!: (value: Outcome) => void
+    let current: SessionReadLease | null = null
+    const reconcileSession = vi.fn(() => new Promise<Outcome>(resolve => { completeFresh = resolve }))
+    const bootstrap = scope.run(() => useChatSessionBootstrap({
+      sessionKey: h.sessionKey, connectionState: ref('connected'),
+      sessionReadLifecycle: {
+        current: () => current,
+        open: () => current = { criticalRequestsQueued: Promise.resolve(), close: async () => {} } as SessionReadLease,
+      },
+      loadHistory: async () => ({ ok: true }),
+      subscribeSession: () => new Promise<Outcome>(resolve => { complete = resolve }),
+      reconcileSession, cancelHistory() {}, cancelSubscription() {},
+    }))!
+    h.ensureSubscribed.mockImplementation(createGoalSessionReadiness({
+      sessionKey: h.sessionKey, waitForLiveReady: bootstrap.waitForLiveReady,
+    }))
+    try {
+      if (action === 'takeover') h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1,
+        goalSnapshotStreamSeq: 1, goal: goalPayload('active', { continuationDeferredReason: 'owner_disconnected' }) })
+      const initial = bootstrap.startSessionBootstrap()
+      const command = action === 'start' ? h.api.startGoal('Wait for current recovery') : h.api.takeOverConnection()
+      await flushAsyncWork()
+      const recovery = bootstrap.retryLive(false)
+      complete(ready)
+      await initial.live
+      await vi.waitFor(() => expect(reconcileSession).toHaveBeenCalledOnce())
+      expect(bootstrap.livePhase.value).not.toBe('ready')
+      expect(h.rpc.call).not.toHaveBeenCalled()
+      completeFresh({ ...ready })
+      await recovery
+      await expect(command).resolves.toBe(true)
+      expect(h.rpc.call).toHaveBeenCalledOnce()
+      expect(h.rpc.call.mock.calls[0]![0]).toBe(action === 'start' ? 'goals.set' : 'goals.reattach')
+    } finally { bootstrap.cancelSessionBootstrap(); scope.stop() }
+  })
+
+  it.each(['start', 'takeover'] as const)('rechecks a revoked readiness proof at %s dispatch', async action => {
+    const h = harness()
+    if (action === 'takeover') h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1,
+      goalSnapshotStreamSeq: 1, goal: goalPayload('active', { continuationDeferredReason: 'owner_disconnected' }) })
+    h.ensureSubscribed.mockResolvedValue(() => false)
+    const command = action === 'start' ? h.api.startGoal('Revoked read') : h.api.takeOverConnection()
+    await expect(command).resolves.toBe(false)
+    expect(h.rpc.call).not.toHaveBeenCalled()
+  })
+
+  it.each(['start', 'takeover'] as const)('keeps %s behind a gap queued by the ready publication itself', async action => {
+    const scope = effectScope()
+    const h = scope.run(() => harness())!
+    type Outcome = { authoritative: boolean; live: boolean; backgroundOnly: boolean }
+    const ready: Outcome = { authoritative: true, live: false, backgroundOnly: false }
+    let current: SessionReadLease | null = null
+    let completeFresh!: (value: Outcome) => void
+    let command: Promise<boolean> | undefined
+    let recovery: Promise<Outcome> | undefined
+    let invalidated = false
+    const reconcileSession = vi.fn(() => new Promise<Outcome>(resolve => { completeFresh = resolve }))
+    const bootstrap = scope.run(() => useChatSessionBootstrap({
+      sessionKey: h.sessionKey, connectionState: ref('connected'),
+      sessionReadLifecycle: {
+        current: () => current,
+        open: () => current = { criticalRequestsQueued: Promise.resolve(), close: async () => {} } as SessionReadLease,
+      },
+      loadHistory: async () => ({ ok: true }),
+      subscribeSession: async () => ({ ...ready }),
+      reconcileSession, cancelHistory() {}, cancelSubscription() {},
+    }))!
+    h.ensureSubscribed.mockImplementation(createGoalSessionReadiness({
+      sessionKey: h.sessionKey, waitForLiveReady: bootstrap.waitForLiveReady,
+    }))
+    scope.run(() => watch(bootstrap.livePhase, phase => {
+      if (phase !== 'ready' || invalidated) return
+      invalidated = true
+      // The read has published its result, but its promise/finally has not
+      // settled. Queue a real successor and join it through Goal admission.
+      recovery = bootstrap.retryLive(false)
+      command = action === 'start'
+        ? h.api.startGoal('Wait for the publication-window gap')
+        : h.api.takeOverConnection()
+    }, { flush: 'sync' }))
+    try {
+      if (action === 'takeover') h.api.applyHydration({ key: SESSION_KEY, sessionId: SESSION_ID, epoch: 1,
+        goalSnapshotStreamSeq: 1, goal: goalPayload('active', { continuationDeferredReason: 'owner_disconnected' }) })
+      await bootstrap.startSessionBootstrap().live
+      await vi.waitFor(() => expect(reconcileSession).toHaveBeenCalledOnce())
+      expect(bootstrap.livePhase.value).toBe('connecting')
+      expect(h.rpc.call).not.toHaveBeenCalled()
+      completeFresh({ ...ready })
+      await recovery
+      await expect(command).resolves.toBe(true)
+      expect(h.rpc.call).toHaveBeenCalledOnce()
+      expect(h.rpc.call.mock.calls[0]![0]).toBe(action === 'start' ? 'goals.set' : 'goals.reattach')
+    } finally { bootstrap.cancelSessionBootstrap(); scope.stop() }
+  })
+
   it('freezes local references before subscription and retains them in the accepted message', async () => {
     const path = 'C:\\Users\\tester\\Downloads\\report.pdf'
     const references = ref([path])
@@ -671,6 +1223,7 @@ describe('useChatGoals', () => {
       goalSnapshotStreamSeq: 4,
       goal: detached,
     })).toBe(true)
+    await vi.waitFor(() => expect(refreshed.goalContinuity.reattach).toHaveBeenCalledOnce())
     expect(refreshed.goalContinuity.reattach).toHaveBeenCalledWith({
       sessionKey: SESSION_KEY,
       sessionId: SESSION_ID,
@@ -678,7 +1231,7 @@ describe('useChatGoals', () => {
       expectedGoalId: 'g1',
       continuityToken: 'continuity-token-1',
       sourceKind: 'web',
-    })
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(refreshed.rpc.call).not.toHaveBeenCalledWith('goals.resume', expect.anything())
 
     await flushAsyncWork()
@@ -711,6 +1264,7 @@ describe('useChatGoals', () => {
         activeTaskId: null,
       }),
     })
+    await vi.waitFor(() => expect(resolveReattach).toBeDefined())
     refreshed.handlers.get('session.event.goal')?.({
       session_key: SESSION_KEY,
       session_id: SESSION_ID,
@@ -807,7 +1361,7 @@ describe('useChatGoals', () => {
     await first.api.startGoal('Refactor the module')
 
     const refreshed = harness(storage)
-    refreshed.rpc.call.mockRejectedValueOnce(new Error('connection changed'))
+    refreshed.rpc.call.mockRejectedValueOnce(new GoalCenterError('unavailable', 'connection changed', { retryable: true }))
     refreshed.api.applyHydration({
       key: SESSION_KEY,
       sessionId: SESSION_ID,
@@ -837,7 +1391,7 @@ describe('useChatGoals', () => {
       expectedGoalId: 'g1',
       continuityToken: 'continuity-token-1',
       sourceKind: 'web',
-    })
+    }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(refreshed.rpc.call).not.toHaveBeenCalledWith('goals.resume', expect.anything())
     expect(refreshed.api.activeGoal.value?.continuationDeferredReason).toBeNull()
     expect(storage.entries()[0]?.[1]).toContain('continuity-token-2')

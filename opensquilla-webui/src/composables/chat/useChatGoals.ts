@@ -5,6 +5,24 @@ import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import { GoalCenterError, normalizeGoalUsageCoverage, type GoalCenter } from '@/modules/goalCenter'
 import type { GoalContinuity, GoalEvent } from '@/modules/goalContinuity'
 import { copyLocalPathReferences } from '@/types/localPathReferences'
+import type { SessionLiveReadiness } from './sessionRecoveryProof'
+import { createGoalContinuityRecovery, type GoalContinuityOwner } from './createGoalContinuityRecovery'
+
+/** Goal actions join the coordinator instead of replacing its subscription consumer. */
+export function createGoalSessionReadiness(options: {
+  sessionKey: Readonly<Ref<string>>
+  waitForLiveReady: (admission?: { explicit?: boolean }) => Promise<SessionLiveReadiness | false>
+}): (key: string, admission?: { explicit?: boolean }) => Promise<SessionLiveReadiness | false> {
+  return async (key, admission) => {
+    if (!key || key !== options.sessionKey.value) return false
+    const ready = await options.waitForLiveReady(admission)
+    return ready && key === options.sessionKey.value && ready() ? ready : false
+  }
+}
+
+function sessionAdmissionCurrent(ready: boolean | SessionLiveReadiness): boolean {
+  return typeof ready === 'function' ? ready() : ready
+}
 
 export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'complete'
 export type GoalExecutionState = 'idle' | 'queued' | 'working'
@@ -109,11 +127,13 @@ export interface UseChatGoalsOptions {
   streamGeneration?: Readonly<Ref<string | null>>
   /** Authenticated connection namespace; never a permission to take over. */
   connectionEpoch?: Readonly<Ref<number>>
+  /** Principal/target identity; transport reconnects are a separate namespace. */
+  authority?: Readonly<Ref<string | null>>
   connectionAvailable?: () => boolean
   // A Goal may only be accepted after the target session is materialized and
   // its message subscription is registered. The host owns those two steps.
   ensureSessionKey?: () => Promise<string>
-  ensureSubscribed?: (sessionKey: string) => Promise<boolean>
+  ensureSubscribed?: (sessionKey: string, admission?: { explicit?: boolean }) => Promise<boolean | SessionLiveReadiness>
   // The Goal mutation already durably accepted its transcript row. Let the
   // host project that confirmed row immediately instead of waiting for a
   // later history refresh to discover it.
@@ -438,6 +458,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   const goal = ref<GoalSnapshot | null>(null)
   const busy = ref(false)
   const connectionTakeoverAvailable = ref(false)
+  const connectionRetryAvailable = ref(false)
   const reattaching = ref(false)
   let acceptedSessionId = ''
   let acceptedEpoch = 0
@@ -449,14 +470,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   // expected provisional -> durable session switch resets generation state.
   let startGoalOwner: symbol | null = null
   const tombstones = new Map<string, number>()
-  const reattachInFlight = new Set<string>()
-  const automaticReattachWatermarks = new Map<string, number>()
-  let continuityRetryTimer: ReturnType<typeof setTimeout> | null = null
-  let continuityRetryAttempt = 0
-  function clearContinuityRetry() {
-    if (continuityRetryTimer !== null) clearTimeout(continuityRetryTimer)
-    continuityRetryTimer = null
-  }
+  let admissionGeneration = 0
   const continuityStorage = options.continuityStorage ?? browserContinuityStorage()
 
   const activeGoal = computed(() => {
@@ -471,19 +485,19 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   const lastGoalElapsed = computed(() => formatGoalDuration(lastGoal.value?.activeTimeMs))
 
   function resetGeneration(preserveStartAdmission = false) {
-    clearContinuityRetry()
-    continuityRetryAttempt = 0
+    admissionGeneration++
+    continuityRecovery.cancel()
     goal.value = null
     acceptedSessionId = ''
     acceptedEpoch = 0
     acceptedStreamSeq = -1
     acceptedStreamGeneration = null
     tombstones.clear()
-    automaticReattachWatermarks.clear()
     mutationOwner = null
     if (!preserveStartAdmission) startGoalOwner = null
     busy.value = startGoalOwner !== null
     connectionTakeoverAvailable.value = false
+    connectionRetryAvailable.value = false
     reattaching.value = false
   }
 
@@ -575,6 +589,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
         key,
         JSON.stringify(stored),
       )
+      syncContinuityActions()
       return true
     } catch {
       return false
@@ -747,9 +762,12 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       // (queued -> working). It may also already have advanced the same Goal
       // to a newer durable revision. In both cases the mutation was accepted;
       // keep the newer live state and let the caller project its transcript row.
+      syncContinuityActions()
       return true
     }
-    return applySnapshot(source, { allowClear: true })
+    const applied = applySnapshot(source, { allowClear: true })
+    if (applied) syncContinuityActions()
+    return applied
   }
 
   function applyHydration(value: unknown): boolean {
@@ -793,17 +811,42 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   ) {
     if (!current) {
       removeContinuityRecordsForSession(fallbackSessionKey ?? options.sessionKey.value)
+      syncContinuityActions()
       return
     }
     if (current.status !== 'active') {
       removeContinuityRecord(current)
-      connectionTakeoverAvailable.value = false
+      syncContinuityActions()
       return
     }
     removeContinuityRecordsForSession(current.sessionKey, continuityStorageKey(current))
+    syncContinuityActions()
+  }
+
+  function currentContinuityOwner(): GoalContinuityOwner | null {
+    const current = goal.value
+    if (!current || current.status !== 'active'
+      || current.continuationDeferredReason !== 'owner_disconnected') return null
     const stored = readContinuityRecord(current)
-    connectionTakeoverAvailable.value = current.continuationDeferredReason
-      === 'owner_disconnected' && !stored
+    return stored ? {
+      sessionKey: current.sessionKey, sessionId: current.sessionId, epoch: current.epoch,
+      goalId: current.goalId, token: stored.token, authority: options.authority?.value ?? null,
+    } : null
+  }
+
+  function syncContinuityActions() {
+    connectionTakeoverAvailable.value = false
+    connectionRetryAvailable.value = false
+    const current = goal.value
+    if (!current || current.status !== 'active'
+      || current.continuationDeferredReason !== 'owner_disconnected') return
+    const owner = currentContinuityOwner()
+    if (!owner) { connectionTakeoverAvailable.value = true; return }
+    const decision = continuityRecovery.decision(owner)
+    connectionRetryAvailable.value = continuityRecovery.canRetry(owner)
+    connectionTakeoverAvailable.value = decision?.action === 'require-takeover'
+      || Boolean(decision && !decision.action && decision.error instanceof GoalCenterError
+        && decision.error.code === 'conflict' && decision.error.reason === 'connection-required')
   }
 
   function applyReattachResponse(value: unknown, expected: GoalSnapshot): boolean {
@@ -830,104 +873,118 @@ export function useChatGoals(options: UseChatGoalsOptions) {
         ...current,
         continuationDeferredReason: incoming.continuationDeferredReason,
       }
-      connectionTakeoverAvailable.value = incoming.continuationDeferredReason
-        === 'owner_disconnected'
+      syncContinuityActions()
       return true
     }
-    return applySnapshot(source)
+    const applied = applySnapshot(source)
+    if (applied) syncContinuityActions()
+    return applied
   }
 
-  function reconcileContinuityAfterHydration(
-    current: GoalSnapshot | null,
-    watermark: number | undefined,
-  ) {
-    if (!current) {
-      removeContinuityRecordsForSession(options.sessionKey.value)
-      connectionTakeoverAvailable.value = false
-      return
-    }
-    if (current.status !== 'active') {
-      removeContinuityRecord(current)
-      connectionTakeoverAvailable.value = false
+  function continuityOwnerIsCurrent(owner: GoalContinuityOwner): boolean {
+    const current = goal.value
+    return Boolean(current && current.status === 'active'
+      && current.continuationDeferredReason === 'owner_disconnected'
+      && owner.sessionKey === options.sessionKey.value
+      && owner.authority === (options.authority?.value ?? null)
+      && current.goalId === owner.goalId && current.sessionId === owner.sessionId
+      && current.epoch === owner.epoch && readContinuityRecord(current)?.token === owner.token)
+  }
+
+  const continuityRecovery = createGoalContinuityRecovery({
+    isCurrent: continuityOwnerIsCurrent,
+    onWorking: working => { reattaching.value = working; syncContinuityActions() },
+    onTerminal: error => {
+      applyConflictSnapshot(error)
+      syncContinuityActions()
+    },
+    refresh: async (owner, signal) => {
+      if (signal.aborted || !continuityOwnerIsCurrent(owner)) return
+      // Cursorless status is one bounded correction, never an admission to
+      // retry the rejected token. Any intervening event/hydration owns state.
+      const admissionCurrent = captureGoalAdmission(goal.value)
+      const cursor = acceptedStreamSeq
+      try {
+        const response = await options.goalCenter.status(owner.sessionKey, { signal })
+        if (signal.aborted || !continuityOwnerIsCurrent(owner) || !admissionCurrent()
+          || cursor !== acceptedStreamSeq) return
+        if (applySnapshot(response, { allowClear: true, tombstoneReplacedCurrent: true })) {
+          discardInvalidContinuity(goal.value)
+        }
+      } catch { /* Keep the terminal decision; ordinary metadata recovery owns later refreshes. */ }
+    },
+    attempt: async (owner, signal, admission) => {
+      const ready = options.ensureSubscribed
+        ? await options.ensureSubscribed(owner.sessionKey, admission) : true
+      if (signal.aborted || !continuityOwnerIsCurrent(owner)) return false
+      if (!sessionAdmissionCurrent(ready) || options.connectionAvailable?.() === false) {
+        throw new GoalCenterError('unavailable', 'Goal subscription is recovering.', {
+          retryable: true, recoveryAction: 'await-subscription',
+        })
+      }
+      const response = await options.goalContinuity.reattach({
+        sessionKey: owner.sessionKey, sessionId: owner.sessionId, epoch: owner.epoch,
+        expectedGoalId: owner.goalId, continuityToken: owner.token, sourceKind: 'web',
+      }, { signal })
+      if (signal.aborted || !continuityOwnerIsCurrent(owner)) return false
+      if (!applyReattachResponse(response, goal.value!)) {
+        throw new GoalCenterError('conflict', 'Goal state changed during continuity recovery.', {
+          retryable: false, recoveryAction: 'refresh-goal',
+        })
+      }
+      rememberContinuityToken(response)
+      return true
+    },
+  })
+
+  function reconcileContinuityAfterHydration(current: GoalSnapshot | null, _watermark: number | undefined) {
+    if (!current || current.status !== 'active') {
+      continuityRecovery.cancel()
+      if (current) removeContinuityRecord(current)
+      else removeContinuityRecordsForSession(options.sessionKey.value)
+      syncContinuityActions()
       return
     }
     removeContinuityRecordsForSession(current.sessionKey, continuityStorageKey(current))
     const stored = readContinuityRecord(current)
     if (current.continuationDeferredReason !== 'owner_disconnected') {
-      connectionTakeoverAvailable.value = false
+      continuityRecovery.cancel()
+      syncContinuityActions()
       return
     }
     if (!stored) {
-      connectionTakeoverAvailable.value = true
+      continuityRecovery.cancel()
+      syncContinuityActions()
       return
     }
-    const fence = `${current.sessionKey}:${current.sessionId}:${current.epoch}:${current.goalId}`
-    const attemptWatermark = watermark ?? acceptedStreamSeq
-    if (
-      reattachInFlight.has(fence)
-      || automaticReattachWatermarks.get(fence) === attemptWatermark
-    ) return
-    reattachInFlight.add(fence)
-    automaticReattachWatermarks.set(fence, attemptWatermark)
-    reattaching.value = true
-    connectionTakeoverAvailable.value = false
-    void (async () => {
-      try {
-        const response = await options.goalContinuity.reattach({
-          sessionKey: current.sessionKey,
-          sessionId: current.sessionId,
-          epoch: current.epoch,
-          expectedGoalId: current.goalId,
-          continuityToken: stored.token,
-          sourceKind: 'web',
-        })
-        const latest = goal.value
-        const stillOwned = latest ? readContinuityRecord(latest) : null
-        if (
-          !latest
-          || latest.status !== 'active'
-          || latest.goalId !== current.goalId
-          || latest.sessionId !== current.sessionId
-          || latest.epoch !== current.epoch
-          || stillOwned?.token !== stored.token
-        ) return
-        if (applyReattachResponse(response, current)) rememberContinuityToken(response)
-        continuityRetryAttempt = 0
-        clearContinuityRetry()
-      } catch (error) {
-        // Retry only the same scoped token after transient transport failures.
-        // A permission/identity conflict remains explicit; never auto-Resume
-        // or replace the owner by issuing takeover during recovery.
-        const latest = goal.value
-        if (
-          latest?.goalId === current.goalId
-          && latest.status === 'active'
-          && latest.continuationDeferredReason === 'owner_disconnected'
-        ) {
-          const retryable = error instanceof GoalCenterError
-            ? error.code === 'unavailable' || error.retryable === true
-            : error instanceof Error && /connection|socket|network|timeout/i.test(error.message)
-          connectionTakeoverAvailable.value = !retryable
-          if (retryable) {
-            automaticReattachWatermarks.delete(fence)
-            clearContinuityRetry()
-            const delay = Math.min(15_000, 500 * 2 ** Math.min(continuityRetryAttempt++, 5))
-            continuityRetryTimer = setTimeout(() => {
-              continuityRetryTimer = null
-              const active = goal.value
-              if (!active || active.sessionKey !== options.sessionKey.value
-                || active.sessionId !== current.sessionId || active.epoch !== current.epoch
-                || active.goalId !== current.goalId || readContinuityRecord(active)?.token !== stored.token) return
-              if (options.connectionAvailable?.() === false) return
-              reconcileContinuityAfterHydration(active, attemptWatermark)
-            }, delay)
-          }
-        }
-      } finally {
-        reattachInFlight.delete(fence)
-        reattaching.value = false
-      }
-    })()
+    syncContinuityActions()
+    void continuityRecovery.recover({
+      sessionKey: current.sessionKey, sessionId: current.sessionId, epoch: current.epoch,
+      goalId: current.goalId, token: stored.token, authority: options.authority?.value ?? null,
+    })
+  }
+
+  function retryConnection(): Promise<void> {
+    const owner = currentContinuityOwner()
+    if (!owner || busy.value || !continuityRecovery.canRetry(owner)) return Promise.resolve()
+    return continuityRecovery.recover(owner, { explicit: true })
+  }
+
+  function captureGoalAdmission(current: GoalSnapshot | null): () => boolean {
+    const generation = admissionGeneration
+    const key = options.sessionKey.value
+    const sessionId = acceptedSessionId
+    const epoch = acceptedEpoch
+    return () => {
+      const latest = goal.value
+      return generation === admissionGeneration && key === options.sessionKey.value
+        && (!sessionId || (sessionId === acceptedSessionId && epoch === acceptedEpoch))
+        && (current === null ? latest === null : Boolean(latest
+          && latest.goalId === current.goalId && latest.sessionId === current.sessionId
+          && latest.epoch === current.epoch && latest.status === current.status
+          && latest.stateRevision === current.stateRevision
+          && latest.continuationDeferredReason === current.continuationDeferredReason))
+    }
   }
 
   async function takeOverConnection(): Promise<boolean> {
@@ -940,16 +997,13 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       || current.continuationDeferredReason !== 'owner_disconnected'
       || busy.value
     ) return false
-    try {
-      if (options.ensureSubscribed && !await options.ensureSubscribed(key)) return false
-    } catch (error) {
-      options.notify?.(localizeGoalRpcError(error))
-      return false
-    }
     const owner = Symbol('goals.reattach.takeover')
+    const admissionCurrent = captureGoalAdmission(current)
     mutationOwner = owner
     busy.value = true
     try {
+      if (options.ensureSubscribed && !sessionAdmissionCurrent(await options.ensureSubscribed(key))) return false
+      if (owner !== mutationOwner || !admissionCurrent()) return false
       const response = await options.goalContinuity.reattach({
         sessionKey: current.sessionKey,
         sessionId: current.sessionId,
@@ -961,9 +1015,10 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       if (owner !== mutationOwner || key !== options.sessionKey.value) return false
       const accepted = applyReattachResponse(response, current)
       if (accepted) rememberContinuityToken(response)
-      connectionTakeoverAvailable.value = !accepted
+      syncContinuityActions()
       return accepted
     } catch (error) {
+      if (owner !== mutationOwner || !admissionCurrent()) return false
       applyConflictSnapshot(error)
       options.notify?.(localizeGoalRpcError(error))
       return false
@@ -984,13 +1039,21 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     startGoalOwner = owner
     busy.value = true
     const resolveKey = options.ensureSessionKey ?? (async () => options.sessionKey.value)
+    const sourceGeneration = admissionGeneration
+    const sourceKey = options.sessionKey.value
     let key = ''
     let requestIdentity = ''
+    let admissionCurrent: (() => boolean) | null = null
     try {
       key = await resolveKey()
       if (owner !== startGoalOwner || !key || key !== options.sessionKey.value) return false
-      if (options.ensureSubscribed && !await options.ensureSubscribed(key)) return false
-      if (owner !== startGoalOwner || key !== options.sessionKey.value) return false
+      // Materializing a provisional draft may switch once to its durable key.
+      // Navigation away and back is not that one-way ownership transfer.
+      if (admissionGeneration !== sourceGeneration
+        && !(admissionGeneration === sourceGeneration + 1 && sourceKey !== key)) return false
+      admissionCurrent = captureGoalAdmission(goal.value)
+      if (options.ensureSubscribed && !sessionAdmissionCurrent(await options.ensureSubscribed(key))) return false
+      if (owner !== startGoalOwner || !admissionCurrent()) return false
       mutationOwner = owner
       busy.value = true
       requestIdentity = goalSetIdentity(key, options.currentEpoch?.value ?? 0, objective, localPathReferences)
@@ -1036,6 +1099,8 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       return applied && response.accepted === true
     } catch (error) {
       if (requestIdentity && record(error)?.accepted === false) forgetGoalSet(requestIdentity)
+      if (owner !== startGoalOwner || (key ? key !== options.sessionKey.value : admissionGeneration !== sourceGeneration)
+        || (admissionCurrent && !admissionCurrent())) return false
       applyConflictSnapshot(error)
       options.notify?.(localizeGoalRpcError(error))
       return false
@@ -1052,6 +1117,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     const data = record(source.data) ?? record(source.details) ?? source
     const current = data.current ?? data.goal ?? data.snapshot
     if (current !== undefined) applySnapshot(current)
+    syncContinuityActions()
   }
 
   async function mutate(
@@ -1062,9 +1128,14 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     const current = goal.value
     if (!key || !current || busy.value) return false
     const owner = Symbol(method)
+    const admissionCurrent = captureGoalAdmission(current)
     mutationOwner = owner
     busy.value = true
     try {
+      if (method === 'goals.resume' || (method === 'goals.edit' && current.status === 'complete')) {
+        if (options.ensureSubscribed && !sessionAdmissionCurrent(await options.ensureSubscribed(key))) return false
+        if (owner !== mutationOwner || !admissionCurrent()) return false
+      }
       const input = {
         sessionKey: key,
         clientRequestId: createClientRequestId(),
@@ -1092,8 +1163,10 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       if (method === 'goals.clear' && response.accepted === true) {
         forgetGoalSetsForSession(key)
       }
+      syncContinuityActions()
       return response.accepted === true
     } catch (error) {
+      if (owner !== mutationOwner || !admissionCurrent()) return false
       applyConflictSnapshot(error)
       options.notify?.(localizeGoalRpcError(error))
       return false
@@ -1150,16 +1223,29 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       acceptedEpoch = epoch
       acceptedStreamSeq = -1
       connectionTakeoverAvailable.value = false
+      connectionRetryAvailable.value = false
       reattaching.value = false
-      automaticReattachWatermarks.clear()
+      continuityRecovery.cancel()
     }, { flush: 'sync' })
   }
 
   if (options.connectionEpoch) watch(options.connectionEpoch, () => {
-    automaticReattachWatermarks.clear()
-    clearContinuityRetry()
+    continuityRecovery.cancel()
   }, { flush: 'sync' })
-  onBeforeUnmount(() => { goalSubscription.close(); clearContinuityRetry() })
+  if (options.authority) watch(options.authority, (authority, previous) => {
+    if (previous !== null || authority === null) resetGeneration()
+    else {
+      const current = goal.value
+      const stored = current ? readContinuityRecord(current) : null
+      if (current && stored) continuityRecovery.bindAuthority({
+        sessionKey: current.sessionKey, sessionId: current.sessionId, epoch: current.epoch,
+        goalId: current.goalId, token: stored.token, authority,
+      })
+      else continuityRecovery.cancel()
+      reconcileContinuityAfterHydration(current, undefined)
+    }
+  }, { flush: 'sync' })
+  onBeforeUnmount(() => { goalSubscription.close(); continuityRecovery.dispose() })
 
   return {
     draftArmed,
@@ -1168,6 +1254,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     lastGoal,
     busy,
     connectionTakeoverAvailable,
+    connectionRetryAvailable,
     reattaching,
     elapsed,
     lastGoalElapsed,
@@ -1178,6 +1265,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     pause,
     resume,
     takeOverConnection,
+    retryConnection,
     clear,
     status,
     reset: resetGeneration,

@@ -56,6 +56,17 @@ class GoalValidationError(ValueError):
         self.code = code
 
 
+class GoalRecoveryAction(StrEnum):
+    """Recovery intent; retryability alone never grants execution authority."""
+
+    AWAIT_SUBSCRIPTION = "await-subscription"
+    REQUIRE_TAKEOVER = "require-takeover"
+    OWNER_ATTACHED = "owner-attached"
+    REFRESH_GOAL = "refresh-goal"
+    RETRY = "retry"
+    STOP = "stop"
+
+
 class GoalConflictError(RuntimeError):
     """A stable Goal command/CAS conflict suitable for an RPC error response."""
 
@@ -65,10 +76,14 @@ class GoalConflictError(RuntimeError):
         message: str,
         *,
         current: GoalRecord | None = None,
+        retryable: bool | None = None,
+        recovery_action: GoalRecoveryAction | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.current = current
+        self.retryable = retryable
+        self.recovery_action = recovery_action
 
 
 @dataclass(frozen=True, slots=True)

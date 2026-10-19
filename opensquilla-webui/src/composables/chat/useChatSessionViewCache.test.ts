@@ -273,6 +273,35 @@ function unprovenIdentityHarness() {
 }
 
 describe('useChatSessionViewCache first delivery proof', () => {
+  it.each(['history', 'live'] as const)('preserves an exact display-only live receipt across first proof (%s first)', first => {
+    const h = unprovenIdentityHarness()
+    if (first === 'history') h.cache.historyInstalled('A')
+    else h.cache.liveInstalledWithoutMetadata('A')
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    if (first === 'history') h.cache.liveInstalledWithoutMetadata('A')
+    else h.cache.historyInstalled('A')
+    expect(h.cache.ready.value).toBe(true)
+    // Display readiness must not certify incomplete metadata for reuse.
+    h.sessionKey.value = 'B'
+    h.sessionKey.value = 'A'
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalledWithoutMetadata('A')
+    h.deliveryIdentity.value = 'gateway-two:owner'
+    expect(h.cache.ready.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it('rejects a display-only live receipt from a replaced lease at first proof', () => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalledWithoutMetadata('A')
+    h.replaceAuthority()
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(false)
+    h.scope.stop()
+  })
+
   it.each([
     ['history', 'live', 0], ['history', 'live', 1], ['history', 'live', 2],
     ['live', 'history', 0], ['live', 'history', 1], ['live', 'history', 2],
@@ -572,6 +601,58 @@ describe('useChatSessionViewCache complete presentation handoff', () => {
     h.switchTo('B')
     h.switchTo('C')
     expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it.each(['history', 'live'] as const)(
+    'publishes installed live content with unavailable metadata without certifying a new cache (%s first)', first => {
+      const h = liveHarness()
+      h.returnToA()
+      h.messages.value = [row('current-history')]
+      h.presentation.value = { live: { text: 'current live text', thinking: [] }, model: '' }
+      if (first === 'history') h.cache.historyInstalled('A')
+      else h.cache.liveInstalledWithoutMetadata('A')
+      expect(h.cache.ready.value).toBe(false)
+      expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+      if (first === 'history') h.cache.liveInstalledWithoutMetadata('A')
+      else h.cache.historyInstalled('A')
+      expect(h.cache.ready.value).toBe(true)
+      expect(h.cache.showingPreview.value).toBe(false)
+      expect(h.cache.presentation.value).toBeUndefined()
+      expect(h.cache.messages.value).toEqual([row('current-history')])
+      // A later recovery cannot capture incomplete presentation metadata.
+      h.cache.beginLiveRead('A')
+      expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+      h.switchTo('B')
+      h.switchTo('A')
+      expect(h.cache.messages.value).toEqual([row('a')])
+      expect(h.cache.presentation.value?.model).toBe('model-A')
+      h.scope.stop()
+    },
+  )
+
+  it('can certify a complete cache after display-only live installation is repaired', () => {
+    const h = liveHarness()
+    h.returnToA()
+    h.messages.value = [row('recovered-history')]
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalledWithoutMetadata('A')
+    h.presentation.value = { live: { text: 'recovered text', thinking: [] }, model: 'model-recovered' }
+    h.cache.liveInstalled('A')
+    h.switchTo('B')
+    h.switchTo('A')
+    expect(h.cache.messages.value).toEqual([row('recovered-history')])
+    expect(h.cache.presentation.value?.model).toBe('model-recovered')
+    h.scope.stop()
+  })
+
+  it('ignores display-only live installation for a different session', () => {
+    const h = liveHarness()
+    h.returnToA()
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalledWithoutMetadata('B')
+    expect(h.cache.ready.value).toBe(false)
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
     h.scope.stop()
   })
 

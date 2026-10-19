@@ -6,6 +6,8 @@ import uuid
 from collections.abc import Awaitable
 from typing import Any, cast
 
+import structlog
+
 from opensquilla.gateway.adapters.goals_contract import (
     register_goals_capabilities_contract,
     register_goals_clear_contract,
@@ -25,11 +27,13 @@ from opensquilla.gateway.rpc import (
 )
 from opensquilla.session.goals import (
     GoalConflictError,
+    GoalRecoveryAction,
     GoalValidationError,
     normalize_goal_objective,
 )
 
 _d = get_dispatcher()
+log = structlog.get_logger(__name__)
 
 
 def _require_params(params: dict | None) -> dict[str, Any]:
@@ -158,23 +162,38 @@ async def _translate_goal_errors(
             accepted=False,
         ) from exc
     except GoalConflictError as exc:
-        details: dict[str, Any] | None = None
+        stale = exc.code in {"STALE_GOAL", "SESSION_GENERATION_CHANGED"}
+        action = exc.recovery_action or (
+            GoalRecoveryAction.REFRESH_GOAL if stale else GoalRecoveryAction.STOP
+        )
+        details: dict[str, Any] = {"recoveryAction": action.value}
         if exc.current is not None and exc.code in {
             "STALE_GOAL",
             "GOAL_ACTIVE",
             "GOAL_BUSY",
         }:
-            snapshot = (
-                await service.snapshot(exc.current)
-                if service is not None and callable(getattr(service, "snapshot", None))
-                else None
-            )
-            details = {"goal": snapshot}
+            try:
+                snapshot = (
+                    await service.snapshot(exc.current)
+                    if service is not None and callable(getattr(service, "snapshot", None))
+                    else None
+                )
+            except Exception as snapshot_error:
+                # Optional state enrichment must not erase a known rejection
+                # or turn it into an ambiguous request-acceptance outcome.
+                log.warning(
+                    "goal.conflict_snapshot_unavailable",
+                    code=exc.code,
+                    error_class=type(snapshot_error).__name__,
+                )
+            else:
+                if snapshot is not None:
+                    details["goal"] = snapshot
         raise RpcHandlerError(
             exc.code,
             str(exc),
             details=details,
-            retryable=exc.code in {"STALE_GOAL", "SESSION_GENERATION_CHANGED"},
+            retryable=exc.retryable if exc.retryable is not None else stale,
             accepted=False,
         ) from exc
 

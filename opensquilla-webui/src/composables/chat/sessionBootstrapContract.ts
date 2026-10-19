@@ -3,6 +3,8 @@ import { ApprovalCenterError } from '@/modules/approvalCenter'
 
 export const SESSION_BOOTSTRAP_BUDGET_MS = 15_000
 export const SESSION_PHASE_ATTEMPT_BUDGET_MS = 7_000
+/** Operational deadline, independent of the 15-second presentation threshold. */
+export const SESSION_RECOVERY_BUDGET_MS = 120_000
 
 export type SessionHistoryPhase = 'idle' | 'loading' | 'ready' | 'error'
 export type SessionLivePhase = 'idle' | 'connecting' | 'ready' | 'degraded'

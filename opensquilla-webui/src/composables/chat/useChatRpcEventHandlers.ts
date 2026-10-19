@@ -38,6 +38,8 @@ import {
   type SessionSubscriptionOutcome,
 } from '@/composables/chat/useChatSessionSubscription'
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
+import type { SessionLivePhase } from '@/composables/chat/sessionBootstrapContract'
+import type { SessionRecoveryProof } from '@/composables/chat/sessionRecoveryProof'
 import type { FrameInput, ReasoningBlock } from '@/types/turnlog'
 import type { StatusPart } from '@/types/parts'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
@@ -196,6 +198,12 @@ export interface UseChatRpcEventHandlersOptions {
     | SessionSubscriptionOutcome
     | Promise<boolean | void | SessionSubscriptionOutcome>
   onSessionSubscribed?: () => void | Promise<void>
+  /** Reconcile through the current coordinator; true confirms current authority. */
+  recoverSession?: () => Promise<boolean>
+  /** Presentation state only; a ready edge cannot prove which read recovered. */
+  sessionLivePhase?: Readonly<Ref<SessionLivePhase>>
+  /** Coordinator-owned authority and fresh-read proof, including later automatic attempts. */
+  sessionRecoveryProof?: SessionRecoveryProof
   loadHistory?: () => void
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
@@ -380,6 +388,39 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   let recoveryFenced = false
   let recoveryOverflow = false
   let recoveryRevision = 0
+  // Snapshot-failure recovery may begin a queued read later. Its own
+  // beginRecovery must not invalidate the completion it is waiting for.
+  let terminalRecoveryRevision = 0
+  let pendingTerminalRecovery: {
+    key: string
+    revision: number
+    awaitingAutomaticRecovery: boolean
+    hasCurrentRecoveryProof?: () => boolean
+  } | null = null
+  function invalidateTerminalRecovery() {
+    terminalRecoveryRevision++
+    pendingTerminalRecovery = null
+  }
+  async function completeTerminalRecovery(request: NonNullable<typeof pendingTerminalRecovery>) {
+    if (pendingTerminalRecovery !== request || request.key !== sessionKey.value
+      || request.revision !== terminalRecoveryRevision) return
+    if (request.hasCurrentRecoveryProof && !request.hasCurrentRecoveryProof()) return
+    pendingTerminalRecovery = null
+    await options.onSessionSubscribed?.()
+  }
+  function completeAutomaticTerminalRecovery(request: NonNullable<typeof pendingTerminalRecovery>) {
+    // Legacy consumers may explicitly confirm success via recoverSession, but
+    // must never infer automatic recovery from presentation state alone.
+    if (!request.awaitingAutomaticRecovery || !request.hasCurrentRecoveryProof?.()) return
+    void completeTerminalRecovery(request).catch(() => {})
+  }
+  watch(sessionKey, invalidateTerminalRecovery, { flush: 'sync' })
+  if (options.sessionRecoveryProof) {
+    watch(options.sessionRecoveryProof.revision, () => {
+      const request = pendingTerminalRecovery
+      if (request) completeAutomaticTerminalRecovery(request)
+    }, { flush: 'sync' })
+  }
   const recoveryEvents: ConversationEvent[] = []
   function markRecoveryDirty() {
     pendingTerminalEvents.clear()
@@ -1276,7 +1317,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
   }, { flush: 'sync' })
 
-  onScopeDispose(clearTurnCommitTracking)
+  onScopeDispose(() => {
+    invalidateTerminalRecovery()
+    clearTurnCommitTracking()
+  })
 
   function isStaleEpoch(payload: ConversationEventIdentity): boolean {
     return conversationRuntime.isStaleEpoch(
@@ -1528,16 +1572,40 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       // B. Fail closed until a fresh authoritative projection arrives instead
       // of briefly declaring idle and draining C out of order.
       options.taskOwnership?.beginHydration()
-      const subscription = options.subscribeSession?.()
       const expectedKey = sessionKey.value
-      const expectedRevision = recoveryRevision
-      void Promise.resolve(subscription)
-        .then((subscribed) => {
-          if (expectedKey === sessionKey.value && expectedRevision === recoveryRevision && isAuthoritativeSessionSubscription(subscribed)) {
-            return options.onSessionSubscribed?.()
+      const expectedRevision = ++terminalRecoveryRevision
+      const request = {
+        key: expectedKey,
+        revision: expectedRevision,
+        awaitingAutomaticRecovery: false,
+        // Capture at the terminal event, before the deferred call can join or
+        // replace a read. The coordinator owns authority continuity and age.
+        hasCurrentRecoveryProof: options.sessionRecoveryProof?.capture(),
+      }
+      pendingTerminalRecovery = request
+      void Promise.resolve()
+        .then(() => {
+          if (expectedKey !== sessionKey.value || expectedRevision !== terminalRecoveryRevision) return false
+          return options.recoverSession?.()
+        })
+        .then((recovered) => {
+          if (expectedKey === sessionKey.value
+            && expectedRevision === terminalRecoveryRevision
+            && recovered === true
+            && (!request.hasCurrentRecoveryProof || request.hasCurrentRecoveryProof())) {
+            return completeTerminalRecovery(request)
+          }
+          if (pendingTerminalRecovery === request) {
+            request.awaitingAutomaticRecovery = true
+            completeAutomaticTerminalRecovery(request)
           }
         })
-        .catch(() => {})
+        .catch(() => {
+          if (pendingTerminalRecovery === request) {
+            request.awaitingAutomaticRecovery = true
+            completeAutomaticTerminalRecovery(request)
+          }
+        })
     }
     options.scheduleHistorySync()
     if (!options.taskOwnership?.hasAuthoritativeWork.value && !interrupted) {
@@ -2683,6 +2751,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function handleRpcConnectionState(state: string) {
     const stateGeneration = ++connectionStateGeneration
+    invalidateTerminalRecovery()
     const recovery = options.handleSessionConnectionState?.(state)
     if (recovery?.deferred) {
       // Navigation owns only the logical subscription epoch. While its target

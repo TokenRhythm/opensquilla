@@ -14,6 +14,7 @@ function deferred<T>() {
 function fixture(overrides: Partial<AttachmentDraftStore> = {}, options: {
   ownerState?: () => unknown
   restore?: (restored: Attachment[], attachments: ReturnType<typeof ref<Attachment[]>>) => Promise<void | boolean>
+  deferSourceRetirement?: (source: AttachmentDraftScope, target: AttachmentDraftScope) => boolean
 } = {}) {
   const data = new Map<string, Attachment[]>()
   const versions = new Map<string, string | undefined>()
@@ -38,6 +39,7 @@ function fixture(overrides: Partial<AttachmentDraftStore> = {}, options: {
   const persistence = useAttachmentDraftPersistence({ attachments, scope: () => scope.value, store,
     beforeScopeChange: () => { attachments.value = [] },
     ownerState: options.ownerState,
+    deferSourceRetirement: options.deferSourceRetirement,
     restore: restored => options.restore ? options.restore(restored, attachments) : Promise.resolve().then(() => { attachments.value = restored }), onError })
   return { data, versions, store, scope, attachments, persistence, onError }
 }
@@ -48,6 +50,57 @@ async function ready(persistence: ReturnType<typeof useAttachmentDraftPersistenc
 }
 
 describe('attachment draft ownership', () => {
+  it('retains the old URL attachment draft until both destination save and route handoff complete', async () => {
+    const f = fixture({}, { deferSourceRetirement: () => true })
+    await ready(f.persistence)
+    f.attachments.value = [item]
+    await f.persistence.flush()
+    const target = { ...initial, sessionKey: 'session-B' }
+    f.scope.value = target
+    await f.persistence.flush()
+    expect(await f.store.load(initial)).toEqual([item])
+    expect(await f.store.load(target)).toEqual([item])
+    await f.persistence.completeHandoff(initial.sessionKey, target.sessionKey)
+    expect(await f.store.load(initial)).toEqual([])
+    expect(await f.store.load(target)).toEqual([item])
+    f.persistence.dispose()
+  })
+
+  it('preserves a newer source attachment edit and another identity during deferred completion', async () => {
+    const f = fixture({}, { deferSourceRetirement: () => true })
+    await ready(f.persistence)
+    f.attachments.value = [item]
+    await f.persistence.flush()
+    const target = { ...initial, sessionKey: 'session-B' }
+    f.scope.value = target
+    await f.persistence.flush()
+    const newer = { ...item, name: 'newer.txt' }
+    await f.store.save(initial, [newer], 'newer-version')
+    await f.persistence.completeHandoff(initial.sessionKey, target.sessionKey)
+    expect(await f.store.load(initial)).toEqual([newer])
+    f.scope.value = { ...target, identity: 'another-owner' }
+    await f.persistence.completeHandoff(initial.sessionKey, target.sessionKey)
+    expect(await f.store.load(initial)).toEqual([newer])
+    f.persistence.dispose()
+  })
+
+  it('never retires the source if deferred destination persistence failed', async () => {
+    const f = fixture({}, { deferSourceRetirement: () => true })
+    await ready(f.persistence)
+    f.attachments.value = [item]
+    await f.persistence.flush()
+    const save = vi.mocked(f.store.save).getMockImplementation()!
+    vi.mocked(f.store.save).mockImplementation(async (scope, files, revision) => {
+      if (scope.sessionKey === 'session-B') throw new Error('Quota failed')
+      return save(scope, files, revision)
+    })
+    f.scope.value = { ...initial, sessionKey: 'session-B' }
+    await f.persistence.completeHandoff(initial.sessionKey, 'session-B')
+    expect(await f.store.load(initial)).toEqual([item])
+    expect(f.store.consume).not.toHaveBeenCalled()
+    f.persistence.dispose()
+  })
+
   it('restores a Blob-backed draft only for the matching gateway/user/session scope', async () => {
     const f = fixture({ load: vi.fn(async () => [{ ...item, file: new File(['text'], item.name) }]) })
     await ready(f.persistence)

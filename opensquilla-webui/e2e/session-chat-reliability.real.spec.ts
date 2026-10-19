@@ -19,6 +19,51 @@ const RECOVERY_READ_METHODS = new Set([
   'sessions.history.page.v2', 'sessions.read.open.v2', 'sessions.read.state.v2', 'sessions.read.install.v2',
 ])
 
+// Keep recovery work observable without logging conversation contents or
+// credentials. These are local test artifacts, not production telemetry.
+const recoveryEvidence = new WeakMap<Page, Array<Record<string, unknown>>>()
+test.beforeEach(async ({ page }) => {
+  const evidence: Array<Record<string, unknown>> = []
+  recoveryEvidence.set(page, evidence)
+  const started = performance.now()
+  page.on('websocket', socket => {
+    const methods = new Map<string, string>()
+    socket.on('framesent', ({ payload }) => {
+      const frame = JSON.parse(String(payload)) as Request
+      if (frame.type !== 'req') return
+      methods.set(frame.id, frame.method)
+      evidence.push({ direction: 'request', method: frame.method, atMs: performance.now() - started })
+    })
+    socket.on('framereceived', ({ payload }) => {
+      const frame = JSON.parse(String(payload)) as Record<string, unknown>
+      if (frame.type !== 'res') return
+      const body = record(frame.payload)
+      evidence.push({ direction: 'response', method: methods.get(String(frame.id)),
+        atMs: performance.now() - started, ok: frame.ok, code: record(frame.error).code,
+        status: body.status, installed: body.installed, hydrationComplete: body.hydration_complete })
+    })
+  })
+})
+test.afterEach(async ({ page }, testInfo) => {
+  const state = testInfo.status === 'passed' ? undefined : await page.evaluate(() => {
+    type Instance = { type?: { __name?: string }, parent?: Instance, setupState?: Record<string, unknown> }
+    let instance = (document.querySelector('.chat-thread') as Element & { __vueParentComponent?: Instance } | null)?.__vueParentComponent
+    while (instance && instance.type?.__name !== 'ChatView') instance = instance.parent
+    const setup = instance?.setupState ?? {}
+    const value = (item: unknown) => item && typeof item === 'object' && 'value' in item
+      ? (item as { value: unknown }).value : item
+    return Object.fromEntries(['livePhase', 'isHydrating', 'hydrationPending', 'sessionKey',
+      'presentationMetadataReady', 'gatewayConnectionState', 'historyState', 'canSend',
+      'sendDisabled', 'sessionMissing'].map(key => [key, value(setup[key])]))
+  }).catch(() => undefined)
+  const body = JSON.stringify({ outcome: testInfo.status, state, events: recoveryEvidence.get(page) ?? [] }, null, 2)
+  await writeFile(testInfo.outputPath('recovery-work.json'), body)
+  await testInfo.attach('recovery-work.json', {
+    body,
+    contentType: 'application/json',
+  })
+})
+
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {}
 }

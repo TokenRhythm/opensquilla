@@ -27,6 +27,17 @@ describe('App status and navigation ownership', () => {
     expect(appSource).toContain('<WorkbenchToggle')
     expect(appSource).toContain('@open-deliverables="chatRouteHeader.invoke(\'openDeliverables\')"')
   })
+  it('limits global connection feedback to sustained physical loss, without a rejected-connection shortcut', () => {
+    const notice = appSource.slice(appSource.indexOf('const connectionNoticeVisible ='), appSource.indexOf('// afterEach'))
+    expect(notice).toContain("computed(() => gatewayAccess.availability !== 'available')")
+    expect(notice).toContain('undefined,')
+    expect(notice).toContain('computed(() => gatewayAccess.isRuntimeStarting)')
+    expect(notice).toContain('CONNECTION_NOTICE_DELAY_MS')
+    expect(notice).not.toContain('effectiveConnectionState')
+    expect(notice).not.toContain('connectionBlocked')
+    expect(notice).not.toContain('connectionHealth')
+    expect(notice).not.toContain('connectionPhase')
+  })
   it('keeps the empty Workbench entry available in remote WebUI without native browser surfaces', () => {
     const toggles = appSource.match(/<WorkbenchToggle\b[\s\S]*?\/>/g) || []
     expect(toggles).toHaveLength(2)

@@ -3902,6 +3902,7 @@
     "historyAttachmentCount": "Anhänge: {count}",
     "loadingSession": "Unterhaltungsverlauf wird wiederhergestellt…",
     "loadingSessionDescription": "Sie können die Unterhaltung währenddessen weiter verwenden.",
+    "sendTemporarilyUnavailable": "Nachrichten können derzeit nicht gesendet werden",
     "loadSessionFailed": "Unterhaltungsverlauf vorübergehend nicht verfügbar",
     "loadSessionDescription": "Der Gesprächsverlauf ist vorübergehend nicht verfügbar.",
     "reloadSession": "Verlauf neu laden",

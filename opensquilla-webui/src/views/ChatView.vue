@@ -141,15 +141,16 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState && !chatSessionBootstrap.noticeDismissed.value"
+          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState && (recoveryNoticeState === 'metadata-error' || !chatSessionBootstrap.noticeDismissed.value)"
           :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
           :transport-phase="gatewayAccess.connectionPhase"
           :resume-source="gatewayAccess.resumeSource"
-          :action="recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
-          :busy="chatSessionBootstrap.retryBusy.value"
+          :action="recoveryNoticeState === 'metadata-error' ? 'retry-metadata' : recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
+          :busy="chatSessionBootstrap.retryBusy.value || chatSessionBootstrap.sessionRetryBusy.value"
+          :dismissible="recoveryNoticeState !== 'metadata-error'"
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
-          @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
+          @retry="recoveryNoticeState === 'metadata-error' ? chatSessionBootstrap.retrySession() : recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
         <div v-if="showTemporaryConversationEmpty" class="chat-temporary-empty" data-testid="temporary-conversation-empty">
           <Icon name="chat" :size="32" aria-hidden="true" />
@@ -473,11 +474,13 @@
           :busy="goalBusy"
           :plan-mode-active="initialCollaborationMode === 'plan'"
           :connection-takeover-available="goalConnectionTakeoverAvailable"
+          :connection-retry-available="goalConnectionRetryAvailable"
           :reattaching="goalReattaching"
           @edit="editGoalFromRibbon"
           @pause="pauseGoal"
           @resume="resumeGoal"
           @takeover="takeOverGoalConnection"
+          @retry-connection="retryGoalConnection"
           @clear="clearGoal"
         />
       </div>
@@ -544,12 +547,6 @@
       />
     </div>
 
-    <ChatDeliveryRecoveryStatus
-      v-if="!forkTransition && !shareMode"
-      :entries="chatSend.deliveryRecoveryEntries.value"
-      :checking-ids="chatSend.checkingDeliveryIds.value"
-      @check="chatSend.checkDelivery"
-    />
     <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"
@@ -559,10 +556,14 @@
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
       :send-pending="chatSend.sendPending.value"
+      :send-busy="chatSend.sendAcceptancePending.value"
       :send-disabled="chatSend.sendHydrationBlocked.value"
+      :recovery-action="composerRecoveryAction ? composerRecoveryAction.kind === 'check' ? 'check' : 'retry' : null"
+      :recovery-pending="composerRecoveryPending || chatSend.checkingDeliveryIds.value.length > 0"
+      :recovery-disabled="!gatewayAccess.isAvailable || Boolean(forkTransition) || shareMode"
       :is-streaming="isStreaming"
-      :can-stop="canStop"
-      :show-stop="showStableStop || showCachedStop"
+      :can-stop="canStop && !composerAwaitingAcceptance"
+      :show-stop="!composerAwaitingAcceptance && (showStableStop || showCachedStop)"
       :stop-targets-plan-run="composerStopsPlanRun"
       :stop-pending="planActionPending === 'cancel-run'"
       :is-new-landing="isNewChatLanding"
@@ -666,6 +667,7 @@
       @export-markdown="exportMarkdown"
       @send="onComposerSend"
       @stop="onComposerStop"
+      @recover="recoverComposer"
       @choose-project="openProjectPicker"
       @close-project="closeProjectDraft"
       @update-prompt-annotation="updatePromptAnnotation"
@@ -831,9 +833,11 @@ import { configureWorkbenchSessionCollaboration, configureWorkbenchSessionRoutin
 import { useChatFind } from '@/composables/chat/useChatFind'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useChatFindPresentation } from '@/composables/chat/useChatFindPresentation'
+import { createChatSessionRecovery } from '@/composables/chat/createChatSessionRecovery'
 import { isChatFindShortcut } from '@/utils/chat/chatFindShortcut'
 import { SESSION_MESSAGE_SEARCH_KEY } from '@/modules/sessionMessageSearch'
 import {
+  createGoalSessionReadiness,
   goalHasRenderedTerminalAnchor,
   goalStatusIsTerminal,
   type GoalSetAcceptedPayload,
@@ -869,7 +873,6 @@ import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCent
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { GOAL_CONTINUITY_KEY, type GoalContinuity } from '@/modules/goalContinuity'
 import { useChatHistory } from '@/composables/chat/useChatHistory'
-import ChatDeliveryRecoveryStatus from '@/components/chat/ChatDeliveryRecoveryStatus.vue'
 import { useChatHistoryDetails } from '@/composables/chat/useChatHistoryDetails'
 import { useChatMarkdownExport } from '@/composables/chat/useChatMarkdownExport'
 import { useChatMessageActions } from '@/composables/chat/useChatMessageActions'
@@ -896,6 +899,7 @@ import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandl
 import { useWorkspacePreviewOpening } from '@/composables/chat/useWorkspacePreviewOpening'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
+import { retiredMissingSessionCandidate } from '@/utils/chat/retiredMissingSession'
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
 import { chatTaskId, useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
 import {
@@ -923,10 +927,7 @@ import {
    useChatSessionBootstrap,
    type SessionBootstrapRun,
  } from '@/composables/chat/useChatSessionBootstrap'
- import {
-   autoSendDraftIsUnchanged,
-   sessionRecoverySucceeded,
- } from '@/composables/chat/sessionBootstrapContract'
+import { useChatAutoSendDraftGuard } from '@/composables/chat/useChatAutoSendDraftGuard'
 import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
@@ -1375,10 +1376,21 @@ const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
 // Hub task input); the landing suggestion chips stay out of the way then.
 const landingPrefilled = ref(false)
 // Holds the prefill text when the Sessions Hub hand-off requested a one-step
-// send ("Start task"). Flushed in onMounted once the draft subscription is live
-// so the first turn streams into this view. Empty string = nothing pending.
+// send ("Start task"). Initial mount and reconnect share one guarded claim,
+// after both the draft project and current subscription are ready.
 const pendingAutoSend = ref('')
 const pendingAutoSendSessionKey = ref('')
+let pendingAutoSendSnapshot: {
+  guard: ReturnType<typeof useChatAutoSendDraftGuard>
+  projectReady: boolean
+} | null = null
+
+function cancelPendingAutoSend() {
+  pendingAutoSend.value = ''
+  pendingAutoSendSessionKey.value = ''
+  pendingAutoSendSnapshot?.guard.dispose()
+  pendingAutoSendSnapshot = null
+}
 
 /* ── DOM refs ──────────────────────────────────────────────────────── */
 
@@ -1991,6 +2003,7 @@ const nativeAttachmentSession = ref<{ key: string; epoch: number } | null>(null)
 watch(sessionKey, () => { nativeAttachmentSession.value = null }, { flush: 'sync' })
 const attachmentDraftIdentity = ref<string | null>(null)
 const attachmentDraftIdentityPending = ref(false)
+let retainedMissingAttachmentDraft: { identity: string; source: string } | null = null
 watch(() => gatewayAccess.deliveryIdentity, async (identity, _previous, onCleanup) => {
   let current = true
   onCleanup(() => { current = false })
@@ -2012,6 +2025,9 @@ const chatAttachments = useChatAttachments(artifactWorkbench.content, {
   draftStore: props.attachmentDraftStore,
   draftOwnerState: () => [inputText.value, selectedSkills.value],
   draftScopePending: () => attachmentDraftIdentityPending.value,
+  deferDraftSourceRetirement: (source, target) => source.identity === target.identity
+    && source.identity === retainedMissingAttachmentDraft?.identity
+    && source.sessionKey === retainedMissingAttachmentDraft?.source,
   draftScope: () => attachmentDraftIdentity.value && (props.draftIdentity || sessionKey.value)
     ? { identity: attachmentDraftIdentity.value, sessionKey: props.draftIdentity || sessionKey.value } : null,
   native: platform.files,
@@ -2056,7 +2072,6 @@ watch(
 )
 
 let sendCurrentInput: () => void = () => {}
-let sendAutomaticInput: () => void = () => {}
 let sendUsageBarrierReplay: (payload: {
   text: string
   localPathReferences?: string[]
@@ -2839,9 +2854,8 @@ const chatMessageActions = useChatMessageActions({
     && !deliveryBlockedReason.value
   ),
   notifyDeliveryBlocked: () => {
-    if (deliveryBlockedReason.value) {
-      pushToast(deliveryBlockedReason.value, { tone: 'info' })
-    }
+    // Connection repair stays local to the existing composer recovery action.
+    // The application header owns sustained physical Gateway outages.
   },
   notifyMessagePending: () => pushToast(t('chat.toast.messageStillSaving'), { tone: 'info' }),
   notifyEditBlocked: () => pushToast(t('chat.pending.editWhileStreaming'), { tone: 'info' }),
@@ -2863,7 +2877,9 @@ async function handleRegenerateMessage(
 
 let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+let metadataApplicationAllowed = () => true
 const chatSessionSubscription = useChatSessionSubscription({
+  metadataApplicationAllowed: () => metadataApplicationAllowed(),
   sessionReadLeaseReader: sessionReadLifecycle,
   conversationRuntime,
   sessionKey,
@@ -2979,7 +2995,6 @@ const chatSessionSubscription = useChatSessionSubscription({
 const {
   subscribeSession,
   reconcileSession,
-  retrySessionMetadata,
   cancelActiveSubscription,
   streamGeneration,
   observeStreamGeneration,
@@ -3001,8 +3016,11 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   subscribeSession,
   reconcileSession,
   connectionState: gatewayConnectionState,
-  metadataRecoveryError: chatSessionSubscription.metadataRecoveryError,
-  retryMetadata: () => retrySessionMetadata(),
+  metadata: {
+    state: chatSessionSubscription.metadataState,
+    runAttempt: chatSessionSubscription.runMetadataAttempt,
+    cancelAttempt: chatSessionSubscription.cancelMetadataAttempt,
+  },
   incidentScope: () => deliveryIdentity.value ?? '',
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
@@ -3017,11 +3035,24 @@ const {
   setSessionHandoffTarget,
   isSessionBootstrapCurrent,
 } = chatSessionBootstrap
-watch([livePhase, presentationMetadataReady, chatSessionSubscription.metadataRecoveryError], ([phase, metadataReady, error]) => {
+metadataApplicationAllowed = chatSessionBootstrap.canApplyMetadata
+const retrySessionMetadata = chatSessionBootstrap.retryMetadata
+const recoverCurrentSession = createChatSessionRecovery({
+  sessionKey: () => sessionKey.value,
+  recoveryProof: chatSessionBootstrap.recoveryProof,
+  isDisposed: () => chatViewDisposed,
+  retryLive: () => retryLive(false),
+  isCurrentLiveResult: chatSessionBootstrap.isCurrentLiveResult,
+})
+watch([livePhase, presentationMetadataReady, chatSessionSubscription.metadataRecoveryError,
+  () => chatSessionBootstrap.metadataRecovery?.terminal.value ?? false], ([phase, metadataReady, error, terminal]) => {
   // Degraded transport must not hide readable history indefinitely. It still
   // grants no task authority; canStop/send retain their own admission checks.
+  // Metadata incidents outlive a replaced lease and its local error. Confirmed
+  // live content can replace the preview without certifying complete metadata.
   if (phase === 'ready' && metadataReady) sessionViewCache.liveInstalled(sessionKey.value)
-  else if (phase === 'degraded' || (phase === 'ready' && error)) sessionViewCache.liveInstalled(sessionKey.value, false)
+  else if (phase === 'ready' && (error || terminal)) sessionViewCache.liveInstalledWithoutMetadata(sessionKey.value)
+  else if (phase === 'degraded') sessionViewCache.liveInstalled(sessionKey.value, false)
 }, { flush: 'sync' })
 
 function holdOptionalRpcAdmission() {
@@ -3189,8 +3220,7 @@ function bindFreshGuestDraft() {
     cancelSessionBootstrap()
     draftPersistence.rebindCurrentDraft(key)
     // A change of authority preserves the editor but requires explicit Send.
-    pendingAutoSend.value = ''
-    pendingAutoSendSessionKey.value = ''
+    cancelPendingAutoSend()
     persistDraftHistoryState()
   })
 }
@@ -3305,6 +3335,21 @@ const canStop = computed(() => (
     )
   ))
 ))
+// A pre-acceptance request can be cancelled by the delivery owner, but it is
+// not yet a running turn. Keep actual task Stop available during follow-ups.
+const composerHasExecution = computed(() => canStop.value && Boolean(
+  taskOwnership.stopTargetTaskId.value
+  || (activeStreamTaskId.value && ![
+    PENDING_STREAM_TASK_ID, FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID,
+  ].includes(activeStreamTaskId.value))
+  || isCompactInFlightForCurrentSession()
+  || activeTaskGroups.value.size > 0
+  || activePlanRun.value?.status === 'queued'
+  || activePlanRun.value?.status === 'running'
+  || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+))
+const composerAwaitingAcceptance = computed(() =>
+  chatSend.sendAcceptancePending.value && !composerHasExecution.value)
 const { showStop: showStableStop } = useStableStopControl({
   identity: () => deliveryIdentity.value ? JSON.stringify([
     deliveryIdentity.value, sessionKey.value, nativeAttachmentSession.value?.epoch ?? null,
@@ -3386,6 +3431,8 @@ const chatSessionRuntime = useChatSessionRuntime({
   restoreWidgetState,
   resetStreamLiveTurnState,
   retireAttachments,
+  rebindDraftSession: key => draftPersistence.rebindCurrentDraft(key, { retainSource: true }),
+  prepareDraftSession: key => { chatHistory.beginProvisionalSession(key) },
   resetDraftComposer: () => {
     artifactImageLightbox.close()
     inputText.value = ''
@@ -3481,6 +3528,7 @@ function projectAcceptedGoalMessage({
 
 const chatGoals = useChatGoals({
   localPathReferences: localPaths,
+  authority: deliveryIdentity,
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
   connectionAvailable: () => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated,
   goalCenter,
@@ -3536,12 +3584,7 @@ const chatGoals = useChatGoals({
     await switchToSession(key)
     return key
   },
-  ensureSubscribed: async key => {
-    if (key !== sessionKey.value) return false
-    if (livePhase.value === 'ready') return true
-    const outcome = await subscribeSession()
-    return outcome.authoritative
-  },
+  ensureSubscribed: createGoalSessionReadiness({ sessionKey, waitForLiveReady: chatSessionBootstrap.waitForLiveReady }),
   onSetAccepted: projectAcceptedGoalMessage,
   notify: message => pushToast(message, { tone: 'danger', duration: 6000 }),
 })
@@ -3553,6 +3596,7 @@ const {
   lastGoal: lastGoalRun,
   busy: goalBusy,
   connectionTakeoverAvailable: goalConnectionTakeoverAvailable,
+  connectionRetryAvailable: goalConnectionRetryAvailable,
   reattaching: goalReattaching,
   elapsed: goalElapsed,
   lastGoalElapsed: goalLastElapsed,
@@ -3563,6 +3607,7 @@ const {
   pause: pauseGoal,
   resume: resumeGoal,
   takeOverConnection: takeOverGoalConnection,
+  retryConnection: retryGoalConnection,
   clear: clearGoalMutation,
   status: goalStatus,
 } = chatGoals
@@ -4043,8 +4088,7 @@ async function onSend(
     draftHandoffSourceKey.value = sessionKey.value
   }
   if (pendingAutoSendSessionKey.value === sessionKey.value) {
-    pendingAutoSend.value = ''
-    pendingAutoSendSessionKey.value = ''
+    cancelPendingAutoSend()
   }
   await dispatchCurrentInput(sendOptions)
 }
@@ -4096,27 +4140,49 @@ async function launchSideChat(request: SideChatLaunchRequest): Promise<boolean> 
 defineExpose({ launchSideChat })
 sendCurrentInput = onSend
 
-function flushPendingAutoSend(targetSessionKey: string): boolean {
+async function flushPendingAutoSend(targetSessionKey: string): Promise<boolean> {
+  const snapshot = pendingAutoSendSnapshot
   if (
     !pendingAutoSend.value
+    || !snapshot?.projectReady
     || pendingAutoSendSessionKey.value !== targetSessionKey
     || sessionKey.value !== targetSessionKey
   ) {
     return false
   }
-  const text = pendingAutoSend.value
+  const ready = await chatSessionBootstrap.waitForLiveReady({ explicit: false })
+  if (pendingAutoSendSnapshot !== snapshot) return false
+  if (!ready || !ready() || !chatViewActive || chatViewDisposed) return false
+  // First identity binding may still be restoring even an empty attachment
+  // draft from IndexedDB. Preserve the claim until that local work settles.
+  if (hasPendingAttachmentWork()) return false
+  // Claim once before either mount or reconnect can dispatch. Keep the same
+  // guard through sender preflight, including edits followed by undo.
   pendingAutoSend.value = ''
   pendingAutoSendSessionKey.value = ''
-  // The handoff is no longer automatic once the user edits its prefill while
-  // waiting for an authoritative reconnect.
-  if (inputText.value !== text) return false
-  sendComposerText(text)
-  return true
+  pendingAutoSendSnapshot = null
+  try {
+    if (!snapshot.guard.isUnchanged()) return false
+    // Submit the existing composer and its new_chat intent through the normal
+    // sender; staging the same text again would turn it into a follow-up.
+    await onSend({
+      cancelIfComposerChanged: true,
+      preflightGuard: () => ready() && snapshot.guard.isUnchanged(),
+      preDispatchGuard: ready,
+    })
+    return true
+  } finally { snapshot.guard.dispose() }
 }
 
 async function handleAuthoritativeSessionSubscription(targetSessionKey: string): Promise<void> {
-  if (chatViewActive && sessionKey.value === targetSessionKey) flushPendingAutoSend(targetSessionKey)
+  if (chatViewActive && sessionKey.value === targetSessionKey) await flushPendingAutoSend(targetSessionKey)
 }
+
+watch([pendingAutoSend, () => hasPendingAttachmentWork(), livePhase], ([text, busy, phase]) => {
+  if (text && !busy && phase === 'ready') {
+    void flushPendingAutoSend(sessionKey.value).catch(() => {})
+  }
+})
 
 const sameTurnSteerAvailable = computed(() => (
   isStreaming.value
@@ -4174,6 +4240,10 @@ watch(composerSameTurnSteerAvailable, (available) => {
 })
 
 async function onComposerSend() {
+  // The editor remains usable while submission runs; Enter must obey the same
+  // lock as the disabled button even when the user has already edited a draft.
+  if (chatSend.sendPending.value || composerRecoveryPending.value) return
+  if (composerRecoveryAction.value) { await recoverComposer(); return }
   if (parseSideChatCommand(composerText.value)) { await sideChatCommand.run(composerText.value); return }
   // All composer submission modes, including keyboard-driven plan revision,
   // share the same fail-closed delivery gate.
@@ -4236,9 +4306,6 @@ async function onComposerSend() {
 }
 
 sendCurrentInput = onComposerSend
-sendAutomaticInput = () => {
-  void onSend({ cancelIfComposerChanged: true })
-}
 dispatchQueuedItem = sendQueuedFollowup
 
 function editPendingMessage(pendingUiId: string) {
@@ -4458,6 +4525,9 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   popAllPendingIntoComposer,
   restoreSteerIntoComposer: text => appendComposerText(text),
   saveWidgetState,
+  recoverSession: () => recoverCurrentSession(),
+  sessionLivePhase: livePhase,
+  sessionRecoveryProof: chatSessionBootstrap.recoveryProof,
   onSessionSubscribed: () => {
     return handleAuthoritativeSessionSubscription(sessionKey.value)
   },
@@ -4814,27 +4884,6 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
   runtime: conversationSessionRuntime,
 })
 
-const sessionRecoveries = new WeakMap<NonNullable<ReturnType<typeof sessionReadLifecycle.current>>, Promise<boolean>>()
-function recoverCurrentSession(scope?: { readonly keys: readonly string[], readonly global: boolean }): Promise<boolean> {
-  if (scope && (scope.global || scope.keys.length === 0 || scope.keys.some(key => key !== sessionKey.value))) {
-    return Promise.resolve(false)
-  }
-  const key = sessionKey.value
-  const lease = sessionReadLifecycle.current()
-  if (!lease) return Promise.resolve(false)
-  const prior = sessionRecoveries.get(lease)
-  if (prior) return prior
-  const pending = retryLive(false).then(result => {
-    if (key !== sessionKey.value || sessionReadLifecycle.current() !== lease) return false
-    return sessionRecoverySucceeded(result)
-  })
-  const observed = pending.finally(() => {
-    if (sessionRecoveries.get(lease) === observed) sessionRecoveries.delete(lease)
-  })
-  sessionRecoveries.set(lease, observed)
-  return observed
-}
-
 // Session switches drop the previous session's stall tracking entirely.
 watch(sessionKey, () => {
   stallWatchdog.reset()
@@ -4938,13 +4987,172 @@ const liveRecoveryState = computed(() => {
   return null
 })
 
+const metadataRecoveryUnavailable = computed(() => (
+  (chatSessionBootstrap.metadataRecovery?.explicitRetryAvailable.value || chatSessionBootstrap.sessionRetryBusy.value)
+  && (!taskOwnership.hydrationResolved.value || ['unknown', 'resolving', 'error'].includes(activeWorkspaceStatus.value))
+))
+type ComposerRecoveryAction = { kind: 'check'; ids: readonly string[] } | { kind: 'session' | 'history' }
+const composerRecoveryPending = ref(false)
+const composerRecoverySelection = ref<ComposerRecoveryAction | null>(null)
+let composerRecoveryOwner: object | null = null
+const composerRecoveryAction = computed<ComposerRecoveryAction | null>(() => {
+  if (forkTransition.value || shareMode.value || chatSend.sendAcceptancePending.value) return null
+  const entries = chatSend.deliveryRecoveryEntries.value
+  // An unknown first send can outlive a session which was never created. Its
+  // identity-scoped durable receipt check must remain reachable after reload;
+  // a cached Stop projection is not proof that the missing session is running.
+  if (entries.length && (historyState.value.sessionMissing || !composerHasExecution.value)) {
+    return { kind: 'check', ids: entries.map(entry => entry.id) }
+  }
+  if (historyState.value.sessionMissing || composerHasExecution.value) return null
+  if (composerRecoveryPending.value && composerRecoverySelection.value?.kind !== 'check') {
+    return composerRecoverySelection.value
+  }
+  if (metadataRecoveryUnavailable.value || chatSessionBootstrap.liveRecoveryTerminal.value) {
+    return { kind: 'session' }
+  }
+  if (historyRecoveryState.value === 'history-error') return { kind: 'history' }
+  return null
+})
+watch([sessionKey, deliveryIdentity], () => {
+  // A completed action from another session must not release this one's UI.
+  composerRecoveryOwner = null
+  composerRecoverySelection.value = null
+  composerRecoveryPending.value = false
+}, { flush: 'sync' })
+let missingSessionDraftRecovery: { scope: string; promise: Promise<void>; rerun: boolean } | null = null
+const missingSessionRecoveryReading = ref(false)
+const missingSessionRecoveryScope = ref('')
+watch([sessionKey, deliveryIdentity, () => chatSend.deliveryRecoveryEntries.value.length], () => {
+  const scope = JSON.stringify([deliveryIdentity.value, sessionKey.value])
+  if (chatSend.deliveryRecoveryEntries.value.length) missingSessionRecoveryScope.value = scope
+  else if (missingSessionRecoveryScope.value !== scope) missingSessionRecoveryScope.value = ''
+}, { flush: 'sync', immediate: true })
+function recoverMissingRetiredSession(): Promise<void> {
+  const capturedIdentity = deliveryIdentity.value
+  const capturedKey = sessionKey.value
+  const capturedPath = route.fullPath
+  if (props.embedded || shareMode.value || forkTransition.value || !capturedIdentity
+    || !historyState.value.sessionMissing || !pendingInputWal?.listSessionDeliveries) return Promise.resolve()
+  const scope = JSON.stringify([capturedIdentity, capturedKey, capturedPath])
+  if (missingSessionDraftRecovery?.scope === scope) {
+    missingSessionDraftRecovery.rerun = true
+    return missingSessionDraftRecovery.promise
+  }
+  const recoveryIsCurrent = () => !chatViewDisposed && !props.embedded
+    && deliveryIdentity.value === capturedIdentity && sessionKey.value === capturedKey
+    && route.fullPath === capturedPath && historyState.value.sessionMissing
+    && !shareMode.value && !forkTransition.value
+  const promise = (async () => {
+    // A manual resolver can settle after its initial Check call returns. The
+    // same read-only resume also handles reload after the durable fence write.
+    await chatSend.recoverResponseHandoffs()
+    // A reload may restore the text before the attachment store finishes.
+    // Transfer the complete composer only after that existing read completes.
+    await chatAttachments.flushAttachmentDraft()
+    const records = await pendingInputWal.listSessionDeliveries!(capturedIdentity, capturedKey)
+    if (!recoveryIsCurrent() || chatSend.deliveryRecoveryEntries.value.length) return
+    const record = retiredMissingSessionCandidate(records, capturedIdentity, capturedKey)
+    if (!record || (!inputText.value && !pendingAttachments.value.length
+      && !selectedSkills.value.length && !localPaths.value.length)) return
+    missingSessionRecoveryScope.value = JSON.stringify([capturedIdentity, capturedKey])
+    const params = record.request?.kind === 'send' && record.request.request.kind === 'new-turn'
+      ? record.request.request.params : null
+    const agentId = agentIdFromSessionKey(capturedKey)
+    const projectId = pendingWorkspaceId.value || boundWorkspaceId.value || params?.workspaceId || ''
+    cancelPendingAutoSend()
+    // A retired request never authorizes recreating an absent durable session.
+    const attachmentHandoff = attachmentDraftIdentity.value
+      ? { identity: attachmentDraftIdentity.value, source: capturedKey } : null
+    retainedMissingAttachmentDraft = attachmentHandoff
+    let nextKey: string | undefined
+    try {
+      nextKey = await startDraftSession(agentId, {
+        preserveComposer: true, isCurrent: recoveryIsCurrent,
+      })
+    } finally {
+      if (retainedMissingAttachmentDraft === attachmentHandoff) retainedMissingAttachmentDraft = null
+    }
+    if (!nextKey || chatViewDisposed || deliveryIdentity.value !== capturedIdentity
+      || sessionKey.value !== nextKey || route.fullPath !== capturedPath) return
+    draftRouteCanonicalization = { key: nextKey, agent: agentId, project: projectId }
+    await router.replace({ path: '/chat/new', query: {
+      agent: agentId, ...(projectId ? { project: projectId } : {}),
+    }, state: { draftSessionKey: nextKey, draftAgentId: agentId, draftProjectId: projectId,
+      draftHasAttachments: pendingAttachments.value.length > 0 } })
+    if (chatViewDisposed || sessionKey.value !== nextKey
+      || deliveryIdentity.value !== capturedIdentity || !isDraftRoute()) return
+    // A reload may interrupt browser history mutation before Vue's awaited
+    // navigation returns. Keep the source fallback until the address itself
+    // points at the new draft; router state alone is not durable navigation.
+    if (window.location.pathname === new URL(router.resolve({ path: '/chat/new' }).href, window.location.href).pathname) {
+      draftPersistence.completeDraftRebind(capturedKey, nextKey)
+      await chatAttachments.completeDraftHandoff(capturedKey, nextKey)
+    }
+    if (chatViewDisposed || sessionKey.value !== nextKey
+      || deliveryIdentity.value !== capturedIdentity || !isDraftRoute()) return
+    const generation = draftProjectHydration.begin()
+    await syncDraftProjectFromRoute(generation)
+    persistDraftHistoryState()
+  })().catch(() => {}).finally(() => {
+    if (missingSessionDraftRecovery?.scope !== scope) return
+    const rerun = missingSessionDraftRecovery.rerun
+    missingSessionDraftRecovery = null
+    missingSessionRecoveryReading.value = false
+    // Do not lose a later retirement/editor event behind an older IDB read.
+    // Only an observed change grants this extra read; no polling loop starts.
+    if (rerun) void recoverMissingRetiredSession()
+  })
+  missingSessionDraftRecovery = { scope, promise, rerun: false }
+  missingSessionRecoveryReading.value = true
+  return promise
+}
+watch([
+  () => historyState.value.sessionMissing, sessionKey, deliveryIdentity, inputText,
+  () => pendingAttachments.value.length, () => selectedSkills.value.length, () => localPaths.value.length,
+  () => chatSend.deliveryRecoveryEntries.value.map(entry => `${entry.id}:${entry.phase}`).join(','),
+], () => { void recoverMissingRetiredSession() }, { flush: 'sync' })
+async function recoverComposer() {
+  const action = composerRecoveryAction.value
+  if (!action || composerRecoveryPending.value || !gatewayAccess.isAvailable) return
+  const owner = {}
+  composerRecoveryOwner = owner
+  composerRecoverySelection.value = action
+  composerRecoveryPending.value = true
+  try {
+    if (action.kind === 'check') {
+      // Every ID belongs to the captured current scope. The delivery owner
+      // rechecks identity/lease and obtains positive receipt or durable fence
+      // proof. A missing receipt alone never authorizes another send.
+      await Promise.all(action.ids.map(id => chatSend.checkDelivery(id)))
+      if (composerRecoveryOwner === owner) await recoverMissingRetiredSession()
+    } else if (action.kind === 'session') {
+      await chatSessionBootstrap.retrySession()
+    } else {
+      await retryHistory()
+    }
+  } catch {
+    // The recovery owner retains failure and retry admission. No second toast
+    // or new recovery scheduler is introduced by this presentation action.
+  } finally {
+    if (composerRecoveryOwner === owner) {
+      composerRecoveryOwner = null
+      composerRecoverySelection.value = null
+      composerRecoveryPending.value = false
+    }
+  }
+}
 const recoveryNoticeState = computed(() => historyState.value.sessionMissing
-  ? 'session-missing' as const
+  ? (missingSessionRecoveryReading.value
+    || missingSessionRecoveryScope.value === JSON.stringify([deliveryIdentity.value, sessionKey.value])
+    ? null : 'session-missing' as const)
+  : metadataRecoveryUnavailable.value ? 'metadata-error' as const
   : liveRecoveryState.value ?? visibleHistoryRecoveryState.value)
 const recoveryNoticeVisible = useChatRecoveryNotice(
   recoveryNoticeState,
   computed(() => gatewayAccess.isRuntimeStarting),
   computed(() => gatewayAccess.connectionBlocked === true),
+  chatSessionBootstrap.liveRecoveryTerminal,
 )
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
@@ -5134,7 +5342,7 @@ const composerSendBlockedTooltip = computed(() => {
   if (browserUseSelectionPending.value || forkTransition.value) return false
   if (modelImageSendBlockedMessage.value) return true
   if (offlineQueueIdentity.value || projectBindingBusy.value) return false
-  if (deliveryBlockedReason.value) return true
+  if (deliveryBlockedReason.value) return false
   if (promptAnnotationSendBlockedReason.value) return false
   return Boolean(newTaskModelSendBlockedReason.value)
 })
@@ -7245,6 +7453,7 @@ function consumeDraftPrefill() {
   const prefill = typeof state?.prefill === 'string' ? state.prefill : ''
   const skills = readSkillTaskPrefill(state)
   if (!prefill && !skills.length) return
+  cancelPendingAutoSend()
   inputText.value = prefill
   if (skills.length) {
     selectedSkills.value = skills
@@ -7256,6 +7465,16 @@ function consumeDraftPrefill() {
   if (state?.autosend === true && !skills.length) {
     pendingAutoSend.value = prefill
     pendingAutoSendSessionKey.value = sessionKey.value
+    pendingAutoSendSnapshot = {
+      projectReady: false,
+      guard: useChatAutoSendDraftGuard(() => ({
+        text: inputText.value, composerText: composerText.value,
+        localPaths: localPaths.value, attachments: pendingAttachments.value,
+        skills: selectedSkills.value, visualization: visualizeDraft.snapshot.value,
+        sessionKey: sessionKey.value, authority: deliveryIdentity.value,
+        projectKey: readProjectFromUrl(),
+      }), { isAuthorityCurrent: chatSessionBootstrap.recoveryProof.capture().isCurrent }),
+    }
   }
   try {
     window.history.replaceState({ ...window.history.state, prefill: undefined, autosend: undefined, selectedSkillPrefill: undefined }, '')
@@ -7528,6 +7747,7 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
 // Reset to a clean draft for the agent requested by the draft route. The
 // provisional key stays out of the URL and storage until the first send.
 function enterDraft() {
+  cancelPendingAutoSend()
   landingPrefilled.value = false
   const agentId = draftAgentId()
   const isFreshDraft = pendingSessionIntent.value === 'new_chat'
@@ -7543,6 +7763,7 @@ function enterDraft() {
 
 let chatViewActive = false
 let initialDraftRouteMayCanonicalize = true
+let draftRouteCanonicalization: { key: string; agent: string; project: string } | null = null
 if (!props.embedded) onBeforeRouteLeave(() => {
   workbenchPreparationNavigationEpoch += 1
   // A lazy destination has not updated route.fullPath yet. Once the operator
@@ -7621,24 +7842,16 @@ onMounted(async () => {
   // /chat/new entry. Explicit new-task handoffs always remain clean.
   sessionKey.value = initialSession.sessionKey
   let initialDraftProjectGeneration: number | null = null
-  let initialAutoSendSnapshot: {
-    text: string
-    revision: number
-    attachments: Attachment[]
-  } | null = null
   if (initialSession.draft && !props.embedded) {
     pendingSessionIntent.value = 'new_chat'
     initialDraftProjectGeneration = draftProjectHydration.begin()
+    // The route already owns this choice while live hydration is pending.
+    // Reserve its identity now; validation still waits for the current read.
+    const routeProjectId = readProjectFromUrl()
+    if (routeProjectId) activeProjectWorkspace.beginUnknownProjectDraft(routeProjectId)
     // Apply the hand-off before any asynchronous project/live work. A later
     // completion must never overwrite text the operator typed while waiting.
     consumeDraftPrefill()
-    if (pendingAutoSend.value) {
-      initialAutoSendSnapshot = {
-        text: pendingAutoSend.value,
-        revision: composerRevision.value,
-        attachments: [...pendingAttachments.value],
-      }
-    }
   } else if (initialSession.sessionKey) {
     activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
     persistSession(sessionKey.value, {
@@ -7646,6 +7859,7 @@ onMounted(async () => {
       source: 'chatView.initialSession',
     })
   }
+  const initialAutoSendSnapshot = pendingAutoSendSnapshot
 
   // Load elevated mode
   loadElevatedMode()
@@ -7719,6 +7933,9 @@ onMounted(async () => {
 
   if (initialDraftProjectGeneration !== null) {
     const synced = await initialDraftProjectSync
+    if (pendingAutoSendSnapshot && pendingAutoSendSnapshot === initialAutoSendSnapshot) {
+      pendingAutoSendSnapshot.projectReady = synced
+    }
     if (synced && initialDraftRouteMayCanonicalize && shouldCanonicalizeInitialDraftRoute({
       disposed: chatViewDisposed,
       initialFullPath: initialRouteFullPath,
@@ -7726,42 +7943,16 @@ onMounted(async () => {
       currentPathIsDraft: isDraftRoute(),
       hasLegacyNewChatQuery: hasLegacyNewChatQuery(),
     })) {
+      draftRouteCanonicalization = {
+        key: sessionKey.value, agent: readAgentFromUrl(), project: readProjectFromUrl(),
+      }
       goToDraft({ replace: true })
     }
   }
 
-  // Sessions Hub "Start task" hand-off: send the prefilled draft in one step.
-  // Wait for the subscription first so the first turn streams into this view
-  // rather than being missed before sessions.messages.subscribe registers.
-  if (pendingAutoSend.value && initialAutoSendSnapshot) {
-    const text = initialAutoSendSnapshot.text
-    const autoSendSessionKey = sessionKey.value
-    const autoSendGeneration = sessionBootstrap.generation
-    const subscription = await sessionBootstrap.live
-    pendingAutoSend.value = ''
-    const composerUnchanged = autoSendDraftIsUnchanged(
-      text,
-      inputText.value,
-      initialAutoSendSnapshot.attachments,
-      pendingAttachments.value,
-      initialAutoSendSnapshot.revision,
-      composerRevision.value,
-    )
-    if (
-      !chatViewDisposed
-      && sessionKey.value === autoSendSessionKey
-      && isSessionBootstrapCurrent(autoSendGeneration, autoSendSessionKey)
-      && subscription.authoritative
-      && livePhase.value === 'ready'
-      && composerUnchanged
-    ) {
-      sendAutomaticInput()
-    } else {
-      // Fail closed: the Sessions Hub hand-off remains an editable draft. The
-      // inline live-recovery state owns retry and explains why sending paused.
-      composerRef.value?.focusTextarea()
-    }
-  }
+  // A reconnect may also reach this flush; both share the same one-shot claim
+  // and current-read proof instead of consuming an obsolete mount outcome.
+  await flushPendingAutoSend(sessionKey.value)
 })
 
 watch(
@@ -7773,6 +7964,7 @@ watch(
 )
 
 onUnmounted(() => {
+  cancelPendingAutoSend()
   chatSend.dispose()
   cancelDraftProjectChoice()
   window.removeEventListener('pointerup', onThreadPointerEnd)
@@ -7908,6 +8100,16 @@ watch(
 // Entering the draft route resets to a clean draft for the requested agent.
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
   if (props.embedded) return
+  const canonicalization = draftRouteCanonicalization
+  draftRouteCanonicalization = null
+  if (canonicalization && isDraftRoute()
+    && canonicalization.key === sessionKey.value
+    && canonicalization.agent === readAgentFromUrl()
+    && canonicalization.project === readProjectFromUrl()) {
+    // This navigation only gives the already initialized draft its canonical
+    // URL. It must not cancel that draft's pending handoff or project sync.
+    return
+  }
   if (
     draftProjectChoice
     && draftProjectChoice.target !== undefined
@@ -7921,9 +8123,14 @@ watch(() => [route.path, route.query.agent, route.query.project], async () => {
   // already renders /chat/new here; retaining its old key would also admit
   // that session's delayed live events, history, and subscription snapshots.
   enterDraft()
+  const autoSendSnapshot = pendingAutoSendSnapshot
   const generation = draftProjectHydration.begin()
   if (!await syncDraftProjectFromRoute(generation)) return
   if (!draftProjectHydration.isCurrent(generation) || !isDraftRoute()) return
+  if (pendingAutoSendSnapshot && pendingAutoSendSnapshot === autoSendSnapshot) {
+    pendingAutoSendSnapshot.projectReady = true
+    await flushPendingAutoSend(sessionKey.value)
+  }
 })
 
 watch(inputText, (value) => {

@@ -292,6 +292,7 @@ METHOD_SCOPES: dict[str, str] = {
     "goals.reattach": WRITE_SCOPE,
     "sessions.steer.v2": WRITE_SCOPE,
     "turns.receipt.get": READ_SCOPE,
+    "turns.receipt.resolve": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,

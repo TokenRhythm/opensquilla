@@ -357,7 +357,7 @@
               >
                 <Icon v-if="sessionRoutingMode === 'squilla_router'" name="router" :size="17" />
                 <Icon v-else-if="sessionRoutingMode === 'llm_ensemble'" name="fork" :size="17" />
-                <Icon v-else name="agents" :size="17" aria-hidden="true" />
+                <span v-else class="chat-model-routing-btn__dot" aria-hidden="true" />
                 <span class="chat-model-routing-btn__label">{{ modelRoutingTriggerLabel }}</span>
                 <span v-if="modelRoutingUsesDefault" class="chat-model-routing-btn__default">{{ t('chat.newTaskModel.defaultBadge') }}</span>
                 <Icon class="chat-model-routing-btn__chevron" name="chevronDown" :size="12" />
@@ -416,7 +416,23 @@
               @keydown.esc="dismissSendHint"
             >
               <button
-                v-if="(canStop || showStop) && !showSkillQueueSend"
+                v-if="recoveryAction"
+                key="recover"
+                type="button"
+                class="btn btn--icon btn--primary chat-send-btn"
+                data-testid="chat-composer-recovery"
+                :data-recovery-action="recoveryAction"
+                :disabled="recoveryPending || recoveryDisabled"
+                :aria-busy="recoveryPending ? 'true' : 'false'"
+                :aria-label="recoveryAction === 'check' ? t('deliveryRecovery.checkStatus') : t('chat.retry')"
+                :title="recoveryPending ? undefined : recoveryAction === 'check' ? t('deliveryRecovery.checkStatus') : t('chat.retry')"
+                @click="!recoveryPending && !recoveryDisabled && emit('recover')"
+              >
+                <LoadingSpinner v-if="recoveryPending" />
+                <Icon v-else name="refresh" :size="17" />
+              </button>
+              <button
+                v-else-if="(canStop || showStop) && !showSkillQueueSend"
                 key="stop"
                 class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
                 :disabled="stopPending || !canStop"
@@ -440,11 +456,11 @@
                   : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
                 :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
                 :aria-describedby="sendControlHint ? sendTooltipId : undefined"
-                :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
+                :aria-busy="(sendBusy ?? sendPending) || sessionRoutingBusy ? 'true' : 'false'"
                 :disabled="sendPending || sendDisabled || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
                 @click="emit('send')"
               >
-                <LoadingSpinner v-if="sendPending" />
+                <LoadingSpinner v-if="sendBusy ?? sendPending" />
                 <Icon v-else name="arrowUp" :size="17" />
               </button>
               <span
@@ -536,7 +552,13 @@ const props = withDefaults(defineProps<{
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
   sendPending?: boolean
+  /** Admission feedback ends at acceptance; sendPending retains the transaction lock. */
+  sendBusy?: boolean
   sendDisabled?: boolean
+  /** Move existing recovery commands into the primary action, without status copy. */
+  recoveryAction?: 'retry' | 'check' | null
+  recoveryPending?: boolean
+  recoveryDisabled?: boolean
   isStreaming: boolean
   canStop: boolean
   /** Retain the current task's shape during recovery; never grants Stop permission. */
@@ -606,6 +628,7 @@ const props = withDefaults(defineProps<{
   sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
   inputDisabled: false,
+  sendBusy: undefined,
   safeSetupAvailable: false,
   floating: false,
   promptAnnotations: () => [],
@@ -630,6 +653,7 @@ const emit = defineEmits<{
   retryAttachment: [index: number]
   previewImage: [attachment: Attachment]
   send: []
+  recover: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
   refreshRunModeAvailability: []
@@ -668,6 +692,7 @@ const runModeLabel = computed(() => t(
 ))
 
 const showSkillQueueSend = computed(() => props.canStop
+  && !props.recoveryAction
   && props.isStreaming
   && !props.stopTargetsPlanRun
   && !props.replanActive
@@ -675,6 +700,7 @@ const showSkillQueueSend = computed(() => props.canStop
   && props.hasSendContent)
 
 const sendControlHint = computed(() => (props.showImageInputWarning || props.showSendBlockedTooltip)
+  && !props.recoveryAction
   && (!props.canStop || showSkillQueueSend.value)
   ? props.sendBlockedMessage || '' : '')
 const sendHintDismissed = ref(false)
@@ -1800,6 +1826,22 @@ button.attachment-chip__primary:focus-visible {
   white-space: nowrap;
   font-size: var(--fs-xs);
   text-align: left;
+}
+
+.chat-model-routing-btn__dot {
+  flex: 0 0 17px;
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+}
+
+.chat-model-routing-btn__dot::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 .chat-model-routing-btn__default {

@@ -21,10 +21,15 @@ from opensquilla.gateway.rpc.registry import RpcHandlerError
 from opensquilla.gateway.scopes import operator_scope_satisfies
 from opensquilla.gateway.turn_steering import decode_steering_command
 from opensquilla.session.keys import canonicalize_session_key
-from opensquilla.session.storage import SessionStorage, bounded_interactive_storage_reads
+from opensquilla.session.storage import (
+    SessionStorage,
+    TurnIngressConflictError,
+    bounded_interactive_storage_reads,
+)
 
 TURN_RECEIPT_METHOD: Final = "turns.receipt.get"
 TURN_RECEIPT_CAPABILITY: Final = "turns.receipt.read.v1"
+TURN_RECEIPT_RESOLVE_METHOD: Final = "turns.receipt.resolve"
 TURN_RECEIPT_OPERATIONS = frozenset({
     "chat.send", "sessions.send", "sessions.steer.v2",
     "sessions.pending_inputs.dispatch", "sessions.pending_inputs.steer",
@@ -40,6 +45,12 @@ def can_read_turn_receipts(principal: Principal) -> bool:
         and principal.auth_state not in {"guest", "invalid"}
         and "guest.safe" not in principal.capabilities
         and operator_scope_satisfies("operator.read", principal.scopes)
+    )
+
+
+def can_resolve_turn_receipts(principal: Principal) -> bool:
+    return can_read_turn_receipts(principal) and operator_scope_satisfies(
+        "operator.write", principal.scopes,
     )
 
 
@@ -247,3 +258,29 @@ async def read_turn_receipt(storage: SessionStorage, query: TurnReceiptQuery) ->
         "status": "found", "accepted": True,
         "requestFingerprint": receipt.request_fingerprint, "receipt": result,
     }
+
+
+async def resolve_turn_receipt(storage: SessionStorage, query: TurnReceiptQuery) -> dict[str, Any]:
+    """Explicitly retire one observed, unaccepted send under the acceptance writer lock."""
+    if query.operation != "chat.send":
+        raise ValueError("Only chat.send supports request retirement")
+    try:
+        status = await storage.resolve_turn_request_attempt(
+            source_scope=query.source_scope, request_session_key=query.session_key,
+            client_request_id=query.client_request_id,
+            request_fingerprint=query.request_fingerprint,
+        )
+    except TurnIngressConflictError as exc:
+        raise _conflict() from exc
+    if status == "found":
+        # Deletion between the transaction and this projection remains unknown,
+        # never a false negative. The retained accepted marker fences resolution.
+        return await read_turn_receipt(storage, query)
+    if status == "retired":
+        return {
+            "status": "retired", "accepted": False,
+            "requestFingerprint": query.request_fingerprint,
+            "clientRequestId": query.client_request_id,
+            "requestSessionKey": query.session_key,
+        }
+    return {"status": "not_found", "accepted": None}

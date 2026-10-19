@@ -92,7 +92,9 @@ it('keeps Send disabled through a metadata failure and enables one click after a
     metadata: pendingMetadata, retryMetadata, close: vi.fn(async () => {}),
   } as unknown as SessionReadLease
   const sessionKey = ref(KEY)
+  let applicationAllowed = () => true
   const subscription = scope.run(() => useChatSessionSubscription({
+    metadataApplicationAllowed: () => applicationAllowed(),
     sessionReadLeaseReader: { current: () => lease }, conversationRuntime: createConversationRuntime(),
     sessionKey, lastStreamSeq: ref(5), runStatus: ref({ status: 'idle', label: '', task: null }),
     isStreaming: ref(false), hasActiveInterrupt: ref(false), activeStreamTaskId: ref(''),
@@ -109,10 +111,12 @@ it('keeps Send disabled through a metadata failure and enables one click after a
   const bootstrap = scope.run(() => useChatSessionBootstrap({
     sessionKey, sessionReadLifecycle: { open: () => lease, current: () => lease } as SessionReadLifecycle,
     loadHistory: async () => ({ ok: true }), subscribeSession: subscription.subscribeSession,
-    connectionState: ref('connected'), metadataRecoveryError: subscription.metadataRecoveryError,
-    retryMetadata: subscription.retrySessionMetadata, cancelHistory: vi.fn(),
+    connectionState: ref('connected'),
+    metadata: { state: subscription.metadataState, runAttempt: subscription.runMetadataAttempt,
+      cancelAttempt: subscription.cancelMetadataAttempt }, cancelHistory: vi.fn(),
     cancelSubscription: subscription.cancelActiveSubscription,
   }))!
+  applicationAllowed = bootstrap.canApplyMetadata
   const liveBlocked = computed(() => bootstrap.livePhase.value !== 'ready' ? 'Connecting' : null)
   // ChatView leaves project errors to the send preflight; only pending or
   // unavailable project state disables the composer directly.

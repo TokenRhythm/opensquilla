@@ -3902,6 +3902,7 @@
     "historyAttachmentCount": "添付ファイル：{count}",
     "loadingSession": "会話履歴を復元しています…",
     "loadingSessionDescription": "履歴の読み込み中も、この会話を引き続き使用できます。",
+    "sendTemporarilyUnavailable": "現在メッセージを送信できません",
     "loadSessionFailed": "会話履歴を一時的に読み込めません",
     "loadSessionDescription": "会話履歴は一時的に利用できません。",
     "reloadSession": "履歴を再読み込み",

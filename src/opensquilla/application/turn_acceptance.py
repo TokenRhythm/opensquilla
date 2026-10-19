@@ -505,8 +505,29 @@ async def _accept_turn_in_scope(
                 }
             return replay_response
 
-
-
+    # Remember attempts before preparation so a later receipt reconciliation
+    # can fence this exact identity, including sends that fail before a session
+    # exists. A historical committed receipt always takes precedence above.
+    register_attempt = getattr(storage, "register_turn_request_attempt", None)
+    if command.source_scope.startswith("web:webchat:") and callable(register_attempt):
+        try:
+            await register_attempt(
+                source_scope=ingress_identity.source_scope,
+                request_session_key=ingress_identity.request_session_key,
+                client_request_id=ingress_identity.client_request_id,
+                request_fingerprint=ingress_identity.request_fingerprint,
+            )
+        except AdmissionIngressConflictError as exc:
+            raise AdmissionError(
+                "IDEMPOTENCY_CONFLICT", str(exc), retryable=False, accepted=exc.accepted,
+            ) from exc
+        except AdmissionStorageBusyError as exc:
+            raise AdmissionError(
+                "STORAGE_BUSY", "Session storage is temporarily busy. Retry this send.",
+                details={"operation": exc.operation, "waited_ms": exc.waited_ms},
+                # A competing writer may already be accepting this identity.
+                retryable=True, retry_after_ms=exc.retry_after_ms, accepted=None,
+            ) from exc
 
     if require_idle_for_current_plan_implementation:
         pending_user_inputs = getattr(ports.runtime, "pending_user_inputs", None)
@@ -535,8 +556,35 @@ async def _accept_turn_in_scope(
                     accepted=False,
                 )
 
-    def _project_workspace_error(exc: ProjectWorkspaceStateError) -> Exception:
-        return ports.workspace_error(exc)
+    def _project_workspace_error(
+        exc: ProjectWorkspaceStateError, *, accepted: bool | None = None
+    ) -> Exception:
+        return ports.workspace_error(exc, accepted=accepted)
+
+    async def _preaccept_project_workspace_error(exc: ProjectWorkspaceStateError) -> Exception:
+        resolve_attempt = getattr(storage, "resolve_turn_request_attempt", None)
+        if not command.source_scope.startswith("web:webchat:") or not callable(resolve_attempt):
+            return _project_workspace_error(exc, accepted=False)
+        try:
+            status = await resolve_attempt(
+                source_scope=ingress_identity.source_scope,
+                request_session_key=ingress_identity.request_session_key,
+                client_request_id=ingress_identity.client_request_id,
+                request_fingerprint=ingress_identity.request_fingerprint,
+            )
+        except AdmissionStorageBusyError as busy:
+            return AdmissionError(
+                "STORAGE_BUSY", "Session storage is temporarily busy. Retry this send.",
+                details={"operation": busy.operation, "waited_ms": busy.waited_ms},
+                retryable=True, retry_after_ms=busy.retry_after_ms, accepted=None,
+            )
+        # A second process can commit this same ID between the initial receipt
+        # read and preparation. Only a durable fence proves non-acceptance;
+        # an accepted/deleted receipt or failed fence stays indeterminate.
+        return ports.workspace_error(
+            exc, accepted=False if status == "retired" else None,
+            request_retired=status == "retired",
+        )
 
     def _preaccept_storage_busy_error(exc: AdmissionStorageBusyError) -> AdmissionError:
         return AdmissionError(
@@ -565,7 +613,7 @@ async def _accept_turn_in_scope(
         try:
             validated_workspace = await storage.resolve_workspace(workspace_id)
         except ProjectWorkspaceStateError as exc:
-            raise _project_workspace_error(exc) from exc
+            raise await _preaccept_project_workspace_error(exc) from exc
         selected_workspace = validated_workspace.workspace
         workspace_guard = validated_workspace.guard
 
@@ -658,6 +706,10 @@ async def _accept_turn_in_scope(
                 session, atomic_intent_plan = await _prepare_or_apply_intent()
     except AdmissionStorageBusyError as exc:
         raise _preaccept_storage_busy_error(exc) from exc
+    except ProjectWorkspaceStateError as exc:
+        # Preparing the intent can validate a configured execution root. No
+        # turn acceptance or runtime activation has occurred at this boundary.
+        raise await _preaccept_project_workspace_error(exc) from exc
 
     if (
         initial_collaboration_mode is not None
@@ -702,6 +754,8 @@ async def _accept_turn_in_scope(
                         atomic_intent_plan = await _prepare_prefix_intent()
             except AdmissionStorageBusyError as exc:
                 raise _preaccept_storage_busy_error(exc) from exc
+            except ProjectWorkspaceStateError as exc:
+                raise await _preaccept_project_workspace_error(exc) from exc
             session = atomic_intent_plan.node
             key = child_key
         else:
@@ -723,7 +777,7 @@ async def _accept_turn_in_scope(
             try:
                 validated_workspace = await storage.resolve_workspace(bound_workspace_id)
             except ProjectWorkspaceStateError as exc:
-                raise _project_workspace_error(exc) from exc
+                raise await _preaccept_project_workspace_error(exc) from exc
             workspace_guard = validated_workspace.guard
 
     canonical_session_id = getattr(session, "session_id", None)
@@ -938,14 +992,17 @@ async def _accept_turn_in_scope(
     if command.local_path_references:
         transcript_metadata["local_path_references"] = list(command.local_path_references)
 
-    prepared_route = await ports.prepare_route(
-        command,
-        session=session,
-        key=key,
-        session_id=session_id,
-        atomic_intent_plan=atomic_intent_plan,
-        workspace_guard=workspace_guard,
-    )
+    try:
+        prepared_route = await ports.prepare_route(
+            command,
+            session=session,
+            key=key,
+            session_id=session_id,
+            atomic_intent_plan=atomic_intent_plan,
+            workspace_guard=workspace_guard,
+        )
+    except ProjectWorkspaceStateError as exc:
+        raise await _preaccept_project_workspace_error(exc) from exc
     agent_id = prepared_route.agent_id
     route_envelope = prepared_route.envelope
     if workspace_files:
@@ -1539,7 +1596,7 @@ async def _accept_turn_in_scope(
                 "IDEMPOTENCY_CONFLICT",
                 str(exc),
                 retryable=False,
-                accepted=False,
+                accepted=exc.accepted,
             ) from exc
         except ProjectWorkspaceStateError as exc:
             _consumed_file_uuids = []
@@ -1885,7 +1942,7 @@ async def _accept_turn_in_scope(
                 "IDEMPOTENCY_CONFLICT",
                 str(exc),
                 retryable=False,
-                accepted=False,
+                accepted=exc.accepted,
             ) from exc
         except ProjectWorkspaceStateError as exc:
             _consumed_file_uuids = []

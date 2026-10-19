@@ -28,6 +28,15 @@ class AdmissionStaleEpochError(Exception):
 class AdmissionIngressConflictError(ValueError):
     """A request identity already belongs to a different input."""
 
+    accepted: bool | None = False
+
+
+class AdmissionIngressReceiptUnavailableError(AdmissionIngressConflictError):
+    """A previously accepted identity cannot replay its lost receipt."""
+
+    # Never turn a preserved acceptance marker into permission for a fresh send.
+    accepted = None
+
 
 class AdmissionPendingInputConflictError(ValueError):
     """The pending input identity or revision changed."""

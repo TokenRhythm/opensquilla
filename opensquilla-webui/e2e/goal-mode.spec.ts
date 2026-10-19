@@ -1149,9 +1149,9 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
     webuiOrigin: new URL(baseURL).origin,
     scenario: 'lifecycle',
   })
+  type RpcFrame = Record<string, unknown> & { direction: 'sent' | 'received' }
+  const rpcFrames: RpcFrame[] = []
   try {
-    type RpcFrame = Record<string, unknown> & { direction: 'sent' | 'received' }
-    const rpcFrames: RpcFrame[] = []
     page.on('websocket', socket => {
       socket.on('framesent', ({ payload }) => {
         try {
@@ -1341,9 +1341,45 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
       .toHaveCount(1)
     await expect.poll(providerCallNumbers).toEqual([1, 2])
     expect(sentRequests('goals.reattach')).toHaveLength(0)
-    if (gateway.flowEnabled) expect(sentRequests('transport.flow.update').length).toBeGreaterThan(0)
+    if (gateway.flowEnabled) {
+      // Each connection must return consumed credit through its negotiated
+      // protocol. Session-flow v2 does not send ordinary v1 cumulative ACKs.
+      const hellos = rpcFrames.filter(frame => frame.direction === 'received' && frame.type === 'hello-ok')
+      expect(hellos.length).toBeGreaterThanOrEqual(2)
+      for (const hello of hellos) {
+        const flow = (hello.policy as Record<string, unknown>).transport_flow as Record<string, unknown>
+        const sessionFlow = flow.capability === 'transport.session-flow.v2'
+          || flow.capability === 'transport.sessionFlow.v2'
+        const method = sessionFlow ? 'transport.sessionFlow.update.v2' : 'transport.flow.update'
+        await expect.poll(() => sentRequests(method).some(request => {
+          const params = request.params as Record<string, unknown>
+          const response = responseAfter(request)
+          const payload = response?.payload as Record<string, unknown> | undefined
+          if (response?.ok !== true || !payload) return false
+          if (!sessionFlow) return params.delivery_epoch === flow.delivery_epoch
+            && payload.delivery_epoch === flow.delivery_epoch
+            && Number(params.ack_delivery_id) > 0
+            && Number(payload.ack_delivery_id) >= Number(params.ack_delivery_id)
+          const consumed = params.consumed as Array<Record<string, unknown>> | undefined
+          const acknowledged = payload.consumed as Array<Record<string, unknown>> | undefined
+          return params.connection_epoch === flow.delivery_epoch
+            && payload.connection_epoch === flow.delivery_epoch
+            && Boolean(consumed?.length) && Array.isArray(acknowledged)
+            && consumed!.every(item => Number(item.through_delivery_id) > 0
+              && acknowledged.some(ack => ack.subscription_epoch === item.subscription_epoch
+                && Number(ack.through_delivery_id) >= Number(item.through_delivery_id)))
+        }), { message: `Consumed credit acknowledged for negotiated epoch ${String(flow.delivery_epoch)}` }).toBe(true)
+      }
+    }
   } finally {
-    await gateway.stop()
+    try {
+      await testInfo.attach('real-goal-lifecycle-wire.json', {
+        body: JSON.stringify(rpcFrames, null, 2),
+        contentType: 'application/json',
+      })
+    } finally {
+      await gateway.stop()
+    }
   }
 })
 

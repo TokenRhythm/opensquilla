@@ -1,4 +1,4 @@
-import type { GoalCenterError, GoalCenterFailureReason } from '@/modules/goalCenter'
+import type { GoalCenterError, GoalCenterFailureReason, GoalRecoveryAction } from '@/modules/goalCenter'
 import { GoalCenterError as GoalCenterErrorClass } from '@/modules/goalCenter'
 
 type JsonObject = Record<string, unknown>
@@ -49,15 +49,26 @@ export function mapGoalError(
       ? error.message
       : 'Goal request failed'
   const details = source?.details ?? data?.details
+  const detailObject = objectValue(details)
+  const rawAction = detailObject?.recoveryAction
+  const recoveryAction = typeof rawAction === 'string'
+    && ['retry', 'await-subscription', 'require-takeover', 'owner-attached', 'refresh-goal', 'stop'].includes(rawAction)
+    ? rawAction as GoalRecoveryAction : undefined
+  const rawRetryable = source?.retryable ?? data?.retryable
+  const retryable = typeof rawRetryable === 'boolean' ? rawRetryable : undefined
+  const rawRetryAfter = source?.retry_after_ms ?? source?.retryAfterMs ?? data?.retry_after_ms ?? data?.retryAfterMs
+  const retryAfterMs = typeof rawRetryAfter === 'number' && Number.isFinite(rawRetryAfter)
+    ? Math.max(0, rawRetryAfter) : 0
+  const policy = { details, recoveryAction, retryable, retryAfterMs, cause: error }
   const reason = GOAL_FAILURE_REASONS[code]
   if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
-    return new GoalCenterErrorClass('not-found', message, { details, cause: error })
+    return new GoalCenterErrorClass('not-found', message, policy)
   }
   if (code === 'METHOD_NOT_FOUND' || code === 'UNSUPPORTED') {
-    return new GoalCenterErrorClass('unsupported', message, { details, cause: error })
+    return new GoalCenterErrorClass('unsupported', message, policy)
   }
   if (code === 'UNAUTHORIZED' || code === 'FORBIDDEN') {
-    return new GoalCenterErrorClass('forbidden', message, { details, cause: error })
+    return new GoalCenterErrorClass('forbidden', message, policy)
   }
   if (code === 'GOAL_ACTIVE' || code === 'GOAL_BUSY' || code === 'SESSION_GENERATION_CHANGED'
     || code === 'PLAN_MODE_ACTIVE' || code === 'PLAN_RUN_ACTIVE' || code === 'IDEMPOTENCY_CONFLICT'
@@ -66,17 +77,19 @@ export function mapGoalError(
     || code === 'CONFLICT' || code === 'STALE_GOAL') {
     return new GoalCenterErrorClass('conflict', message, {
       reason,
-      details,
-      retryable: true,
-      cause: error,
+      ...policy,
+      // A server rejection is not permission to repeat an invalid token. Old
+      // lease errors have no safe transient interpretation without an action.
+      retryable: retryable ?? (code === 'EXECUTION_LEASE_REQUIRED' ? false : true),
     })
   }
   if (code === 'GOAL_EXECUTION_DISABLED') {
-    return new GoalCenterErrorClass('unsupported', message, { reason, details, cause: error })
+    return new GoalCenterErrorClass('unsupported', message, { reason, ...policy })
   }
   if (code === 'INVALID_REQUEST' || code === 'INVALID_PARAMS' || reason === 'invalid-command'
     || reason === 'invalid-objective') {
-    return new GoalCenterErrorClass('invalid', message, { reason, details, cause: error })
+    return new GoalCenterErrorClass('invalid', message, { reason, ...policy })
   }
-  return new GoalCenterErrorClass('unavailable', message, { details, cause: error })
+  const transient = ['UNAVAILABLE', 'STORAGE_BUSY', 'RPC_TIMEOUT', 'RPC_TRANSPORT_ERROR'].includes(code)
+  return new GoalCenterErrorClass('unavailable', message, { ...policy, retryable: retryable ?? transient })
 }

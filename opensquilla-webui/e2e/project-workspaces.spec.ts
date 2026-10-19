@@ -469,6 +469,10 @@ test.describe('Project workspaces', () => {
     // a second picker that can replace it before the binding is established.
     await expect(page.getByRole('button', { name: 'Choose project', exact: true })).toHaveCount(0)
     await expect(page.locator('.chat-project-chip')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
+    await message.press('Enter')
+    await message.press('Enter')
+    await expect(message).toHaveText('Keep the original project and draft')
     expect(state.sends).toHaveLength(0)
     state.initialWorkspaceListsReleased = true
     state.pendingInitialWorkspaceLists.splice(0).forEach(reply => reply())

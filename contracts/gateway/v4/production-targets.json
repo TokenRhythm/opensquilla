@@ -19,6 +19,14 @@
     },
     {
       "kind": "method",
+      "wireName": "turns.receipt.resolve",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "telemetry.product_active.record",
       "roles": [
         "result"

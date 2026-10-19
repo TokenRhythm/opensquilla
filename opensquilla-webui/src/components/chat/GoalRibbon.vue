@@ -89,7 +89,7 @@
           v-else-if="goal.status !== 'complete'"
           type="button"
           class="goal-ribbon__primary"
-          :disabled="busy"
+          :disabled="busy || (lifecycleAction === 'retry-connection' && reattaching)"
           :data-action="lifecycleAction"
           data-testid="goal-lifecycle-action"
           @click="invokeLifecycleAction"
@@ -163,6 +163,7 @@ const props = defineProps<{
   busy?: boolean
   planModeActive?: boolean
   connectionTakeoverAvailable?: boolean
+  connectionRetryAvailable?: boolean
   reattaching?: boolean
 }>()
 
@@ -171,6 +172,7 @@ const emit = defineEmits<{
   pause: []
   resume: []
   takeover: []
+  'retry-connection': []
   clear: []
 }>()
 
@@ -188,7 +190,7 @@ const editInputId = `goal-edit-${props.goal.goalId}`
 const EDIT_INPUT_MIN_HEIGHT = 64
 const EDIT_INPUT_MAX_HEIGHT = 180
 
-type LifecycleAction = 'pause' | 'resume' | 'takeover'
+type LifecycleAction = 'pause' | 'resume' | 'takeover' | 'retry-connection'
 
 const goalHasUnsettledTask = computed(() => (
   props.goal.activeTaskId !== null || props.goal.executionState !== 'idle'
@@ -207,11 +209,13 @@ const completeMenuAvailable = computed(() => (
 
 const lifecycleAction = computed<LifecycleAction>(() => {
   if (props.connectionTakeoverAvailable) return 'takeover'
+  if (props.connectionRetryAvailable) return 'retry-connection'
   return props.goal.status === 'active' ? 'pause' : 'resume'
 })
 
 const lifecycleLabel = computed(() => {
   if (lifecycleAction.value === 'takeover') return t('chat.goal.continue')
+  if (lifecycleAction.value === 'retry-connection') return t('chat.goal.retry')
   if (props.goal.status === 'active') {
     return goalHasUnsettledTask.value
       ? t('chat.goal.pauseAfterTurn')
@@ -236,10 +240,6 @@ watch(() => props.goal.objective, objective => {
 })
 
 const titleText = computed(() => {
-  if (
-    props.goal.status === 'active'
-    && props.goal.continuationDeferredReason === 'owner_disconnected'
-  ) return t('chat.goal.detachedTitle')
   switch (props.goal.status) {
     case 'active': return t('chat.goal.activeTitle')
     case 'paused': return t('chat.goal.pausedTitle')
@@ -280,11 +280,9 @@ const metaText = computed(() => {
   } else if (props.goal.status === 'usage_limited') {
     parts.push(t('chat.goal.usageLimitReached'))
   }
-  if (props.goal.continuationDeferredReason === 'owner_disconnected') {
-    parts.push(props.reattaching
-      ? t('chat.goal.reconnecting')
-      : t('chat.goal.waitingForConnection'))
-  } else if (props.planModeActive || props.goal.continuationDeferredReason === 'plan_mode') {
+  // Connection recovery is silent; lifecycle actions retain their existing
+  // explicit Retry/Continue commands without adding passive connection copy.
+  if (props.planModeActive || props.goal.continuationDeferredReason === 'plan_mode') {
     parts.push(t('chat.goal.waitingForPlan'))
   } else if (props.goal.executionState === 'queued') {
     parts.push(t('chat.goal.queued'))
@@ -351,6 +349,7 @@ function submitEdit() {
 function invokeLifecycleAction() {
   if (lifecycleAction.value === 'pause') emit('pause')
   else if (lifecycleAction.value === 'takeover') emit('takeover')
+  else if (lifecycleAction.value === 'retry-connection') emit('retry-connection')
   else emit('resume')
 }
 

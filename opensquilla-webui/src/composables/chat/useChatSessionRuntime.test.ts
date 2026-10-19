@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useChatSessionRuntime, type ChatUsageAccumulator, type UseChatSessionRuntimeOptions } from './useChatSessionRuntime'
 import { useChatAttachments } from './useChatAttachments'
+import { createMemoryChatDraftStorage, useChatDraftPersistence } from './useChatDraftPersistence'
 import type { ChatMessage } from '@/types/chat'
 
 const pushToast = vi.hoisted(() => vi.fn())
@@ -136,6 +137,57 @@ describe('useChatSessionRuntime attachment ownership', () => {
       expect(pushToast).not.toHaveBeenCalled()
     },
   )
+
+  it('moves a recovered editor to a fresh provisional key without dropping files or reviving stale Stop', async () => {
+    const sessionKey = ref('agent:main:webchat:missing')
+    const inputText = ref('recovered text')
+    const localPaths = ref(['C:/project/readme.md'])
+    const storage = createMemoryChatDraftStorage()
+    const draft = useChatDraftPersistence({ sessionKey, inputText, localPaths, storage })
+    const activeStreamTaskId = ref('old-unknown-owner')
+    const pendingSessionIntent = ref<string | null>(null)
+    const resetDraftComposer = vi.fn(() => { inputText.value = '' })
+    const prepareDraftSession = vi.fn()
+    const { runtime, attachments, addImage } = createRuntime({
+      sessionKey, pendingSessionIntent, activeStreamTaskId, resetDraftComposer, prepareDraftSession,
+      rebindDraftSession: draft.rebindCurrentDraft,
+    })
+    await addImage('original.jpg')
+    readers[0].finish()
+    const key = await runtime.startDraftSession('main', { preserveComposer: true, isCurrent: () => true })
+    expect(key).toBe('agent:main:webchat:new-draft')
+    expect(sessionKey.value).toBe(key)
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(activeStreamTaskId.value).toBe('')
+    expect(inputText.value).toBe('recovered text')
+    expect(localPaths.value).toEqual(['C:/project/readme.md'])
+    expect(attachments.pendingAttachments.value).toMatchObject([{ kind: 'inline', name: 'original.jpg' }])
+    expect(resetDraftComposer).not.toHaveBeenCalled()
+    expect(prepareDraftSession).toHaveBeenCalledExactlyOnceWith(key)
+    expect(draft.loadDraft('agent:main:webchat:missing')).toBe('')
+    expect(draft.loadDraft(key!)).toBe('recovered text')
+  })
+
+  it('does not move a recovered draft after its identity or route changes during queue handoff', async () => {
+    let finishQueue!: () => void
+    let current = true
+    const resetDraftComposer = vi.fn()
+    const prepareDraftSession = vi.fn()
+    const { runtime, sessionKey, attachments, addImage } = createRuntime({
+      switchPendingQueue: () => new Promise<void>(resolve => { finishQueue = resolve }),
+      resetDraftComposer, prepareDraftSession,
+    })
+    await addImage('original.jpg')
+    readers[0].finish()
+    const transition = runtime.startDraftSession('main', { preserveComposer: true, isCurrent: () => current })
+    current = false
+    finishQueue()
+    expect(await transition).toBeUndefined()
+    expect(sessionKey.value).toBe('agent:main:webchat:first')
+    expect(attachments.pendingAttachments.value).toMatchObject([{ name: 'original.jpg' }])
+    expect(resetDraftComposer).not.toHaveBeenCalled()
+    expect(prepareDraftSession).not.toHaveBeenCalled()
+  })
 
   it('retires attachments only when delayed navigation commits', async () => {
     let finishQueue!: () => void

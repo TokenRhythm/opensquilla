@@ -514,8 +514,8 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
     assert manifest["wireVersion"] == 4
     assert manifest["source"] == {
-        "schemaCount": 223,
-        "methodCount": 213,
+        "schemaCount": 224,
+        "methodCount": 214,
         "eventFamilyCount": 10,
         "schemaTreeSha256": runner._schema_tree_digest(specs),
         "generatorSha256": runner._generator_digest(),
@@ -551,7 +551,7 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         {entry["name"] for entry in manifest["methods"]}
     )
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
-        "stable": 210,
+        "stable": 211,
         "legacy": 3,
     }
     assert [
@@ -583,6 +583,11 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     )
     assert receipt_lookup["lifecycle"] == "stable"
     assert receipt_lookup["schema"] == "conversation/turns-receipt-get.schema.json"
+    receipt_resolution = next(
+        entry for entry in manifest["methods"] if entry["name"] == "turns.receipt.resolve"
+    )
+    assert receipt_resolution["lifecycle"] == "stable"
+    assert receipt_resolution["schema"] == "conversation/turns-receipt-resolve.schema.json"
     assert {
         entry["name"]: entry["canonicalName"]
         for entry in manifest["methods"]

@@ -47,6 +47,7 @@ import {
   type SessionReadHistoryPage,
   type SessionReadJsonObject,
   type SessionReadMetadata,
+  type SessionMetadataReadOptions,
   type SessionReadPort,
   type SessionReadPortHistoryRequest,
   type SessionReadPortLease,
@@ -125,7 +126,7 @@ interface OpenContext {
   readonly live: Promise<SessionReadPortLive>
   readonly metadata: Promise<SessionReadMetadata>
   readHistory(request: SessionReadPortHistoryRequest): Promise<SessionReadHistoryPage>
-  retryMetadata(): Promise<SessionReadMetadata>
+  retryMetadata(options?: SessionMetadataReadOptions): Promise<SessionReadMetadata>
   reconcile(): Promise<SessionReadPortLive>
 }
 
@@ -540,6 +541,7 @@ export function createV4SessionReadPort(
       let subscribedGeneration: number | null = null
       let v2Lease: SessionReadV2Lease | null = null
       let v2BaseApplied = false
+      let cancelInitialHistoryAdmission: (() => void) | null = null
 
       async function createContext(): Promise<OpenContext> {
         const admissionDeadline = performance.now() + READ_TIMEOUT_MS
@@ -557,6 +559,22 @@ export function createV4SessionReadPort(
         // durable identity for read-v2 until that send has been accepted.
         const v2Enabled = !request.provisionalDraft
           && rpc.sessionReadV2 === true && supportsSessionReadV2(rpc)
+        // read-v2 still shares the Gateway's ordinary request queue with
+        // history. Queue its final authoritative confirmation before history
+        // so a slow initial page cannot block its own session readiness.
+        const installedBeforeHistory = v2Enabled && request.includeInitialHistory
+          ? sentLatch() : null
+        let awaitingInitialInstallation = installedBeforeHistory !== null
+        if (installedBeforeHistory) {
+          const cancel = () => installedBeforeHistory.failed(abortError())
+          cancelInitialHistoryAdmission = cancel
+          request.signal.addEventListener('abort', cancel, { once: true })
+          void installedBeforeHistory.promise.finally(() => {
+            awaitingInitialInstallation = false
+            request.signal.removeEventListener('abort', cancel)
+            if (cancelInitialHistoryAdmission === cancel) cancelInitialHistoryAdmission = null
+          }).catch(() => {})
+        }
         const subscribeParams: SessionsMessagesSubscribeParams = {
           key: request.sessionKey,
           since_stream_generation: request.resumeFrom.streamGeneration,
@@ -713,11 +731,19 @@ export function createV4SessionReadPort(
         })
 
         const historySent = request.includeInitialHistory ? sentLatch() : null
+        let initialHistoryRequest: SessionReadPortHistoryRequest = {
+          direction: 'latest', limit: INITIAL_HISTORY_LIMIT, signal: request.signal,
+        }
+        let initialHistoryStarted = false
         const initialHistory = historySent
-          ? (v2Enabled ? Promise.all([liveFramesQueued, subscribePromise]) : liveFramesQueued).then(() => v2Enabled
-            ? requestV2SessionHistory(rpc, request.sessionKey, {
-                direction: 'latest', limit: INITIAL_HISTORY_LIMIT, signal: request.signal,
-              }, expectedGeneration, historySent.sent).then(result => {
+          ? (v2Enabled ? Promise.all([
+              liveFramesQueued, subscribePromise, installedBeforeHistory!.promise,
+            ]) : liveFramesQueued).then(() => {
+            initialHistoryStarted = true
+            if (initialHistoryRequest.signal.aborted) throw abortError()
+            return v2Enabled
+            ? requestV2SessionHistory(rpc, request.sessionKey, initialHistoryRequest,
+              expectedGeneration, historySent.sent).then(result => {
                 historySent.sent(expectedGeneration)
                 return result
               })
@@ -736,7 +762,8 @@ export function createV4SessionReadPort(
                   policy: historyPolicy,
                   contractError: invalidContract,
                 },
-              )).catch(error => {
+              )
+            }).catch(error => {
               historySent.failed(error)
               throw error
             })
@@ -746,6 +773,12 @@ export function createV4SessionReadPort(
         void initialHistory?.catch(() => {})
 
         const criticalRequestsQueued = liveFramesQueued.then(async () => {
+          // History is optional work after read-v2 installation. Waiting for
+          // its send here would deadlock the consumer that confirms live.
+          if (v2Enabled) {
+            if (historySent) await subscribePromise
+            return
+          }
           if (!historySent) return
           const historyGeneration = await historySent.promise
           assertFrameGeneration(expectedGeneration, [historyGeneration])
@@ -763,7 +796,7 @@ export function createV4SessionReadPort(
           activeTaskId: snapshot?.task_id ?? activeTaskId(subscription),
           initialMetadata: projectMetadata(subscription),
           snapshot: snapshot ? projectSnapshot(snapshot) : null,
-          ...snapshotInstallationHooks(stagedSnapshot, v2Lease),
+          ...installationHooks(stagedSnapshot, v2Lease),
           cursor: Object.freeze({
             sessionKey: request.sessionKey,
             sessionEpoch: subscription.epoch,
@@ -783,16 +816,58 @@ export function createV4SessionReadPort(
         } satisfies SessionReadPortLive)
         })
         void live.catch(() => {})
+        void live.catch(error => installedBeforeHistory?.failed(error))
+
+        function installationHooks(
+          staged: StagedSessionSnapshot | null,
+          modern: SessionReadV2Lease | null,
+        ): Pick<SessionReadPortLive, 'confirmInstalled' | 'assertInstalledCurrent'> {
+          const hooks = snapshotInstallationHooks(staged, modern)
+          if (!installedBeforeHistory) return hooks
+          return {
+            ...hooks,
+            async confirmInstalled() {
+              try {
+                await hooks.confirmInstalled?.()
+                assertAdmissionCurrent()
+                installedBeforeHistory.sent(expectedGeneration)
+              } catch (error) {
+                installedBeforeHistory.failed(error)
+                throw error
+              }
+            },
+          }
+        }
+
+        let pendingMetadata: Promise<SessionReadMetadata> | null = null
+        function readMetadata(
+          cursor: PendingUserInputsReadCursor,
+          requireFresh = false,
+        ): Promise<SessionReadMetadata> {
+          const previous = pendingMetadata
+          if (previous && !requireFresh) return previous
+          const current = (async () => {
+            // Reconciliation's cursor was captured after the prior read. Do
+            // not reuse that older result, but also do not overlap its RPC.
+            if (previous) await previous.catch(() => {})
+            assertAdmissionCurrent()
+            if (request.beforeMetadataRead) {
+              await waitForHistory(request.beforeMetadataRead(request.signal), request.signal)
+            }
+            assertAdmissionCurrent()
+            return hydrate(rpc, request.sessionKey, request.signal, expectedGeneration, cursor)
+          })().catch(error => { throw mapSessionReadError(error) })
+          const observed = current.finally(() => {
+            if (pendingMetadata === observed) pendingMetadata = null
+          })
+          pendingMetadata = observed
+          void observed.catch(() => {})
+          return observed
+        }
 
         const metadata = subscribePromise.then(subscription => {
           if (subscription.hydration_complete) return projectMetadata(subscription)
-          return criticalRequestsQueued.then(() => hydrate(
-            rpc,
-            request.sessionKey,
-            request.signal,
-            expectedGeneration,
-            subscription,
-          ))
+          return criticalRequestsQueued.then(() => readMetadata(subscription))
         })
         void metadata.catch(() => {})
         void criticalRequestsQueued.catch(() => {})
@@ -804,6 +879,12 @@ export function createV4SessionReadPort(
         function reconcile(): Promise<SessionReadPortLive> {
           if (closed || request.signal.aborted) return Promise.reject(abortError())
           if (reconciliation) return reconciliation
+          // The initial consumer can fail before calling its confirmation
+          // hook. Settle that waiting page before reconciliation joins any
+          // active history request, then let it request a fresh history page.
+          installedBeforeHistory?.failed(abortError('Initial session read was replaced by reconciliation.'))
+          awaitingInitialInstallation = false
+          initialHistoryAvailable = false
           const current = (async (): Promise<SessionReadPortLive> => {
             if (rpc.generation !== expectedGeneration) throw abortError('The connection generation changed.')
             const subscription = await ensureAdmission()
@@ -817,7 +898,7 @@ export function createV4SessionReadPort(
             // Legacy Gateways without snapshots retain the conservative bound.
             const metadata = supportsSnapshotRecovery(rpc)
               ? Object.freeze({ ...projectMetadata(subscription), hydrationComplete: false })
-              : await hydrate(rpc, request.sessionKey, request.signal, expectedGeneration, snapshot ?? subscription)
+              : await readMetadata(snapshot ?? subscription, true)
             assertSnapshotIdentity(metadata)
             // A staged snapshot must be applied by the domain and confirmed
             // before its watermark can prove read-v2 consumption. Its hook
@@ -837,7 +918,7 @@ export function createV4SessionReadPort(
               activeTaskId: snapshot?.task_id ?? textValue(metadata.activeTask?.task_id, metadata.activeTask?.taskId),
               initialMetadata: metadata,
               snapshot: snapshot ? projectSnapshot(snapshot) : null,
-              ...snapshotInstallationHooks(stagedSnapshot, v2Lease),
+              ...installationHooks(stagedSnapshot, v2Lease),
               cursor: Object.freeze({
                 sessionKey: request.sessionKey,
                 sessionEpoch: metadata.epoch,
@@ -871,15 +952,22 @@ export function createV4SessionReadPort(
           }
           if (
             historyRequest.direction === 'latest'
-            && historyRequest.limit === INITIAL_HISTORY_LIMIT
             && initialHistoryAvailable
             && initialHistory
+            && (v2Enabled && !initialHistoryStarted || historyRequest.limit === initialHistoryRequest.limit)
           ) {
+            // The UI requests 50 items normally and up to 200 for a restored
+            // window. Claim the unsent initial page at that actual limit;
+            // sending a second page here bypasses the confirmation ordering.
+            if (v2Enabled && !initialHistoryStarted) initialHistoryRequest = historyRequest
             initialHistoryAvailable = false
-            return initialHistory
+            return waitForHistory(initialHistory, historyRequest.signal)
           }
           if (v2Enabled) {
             await ensureAdmission()
+            if (awaitingInitialInstallation && installedBeforeHistory) {
+              await waitForHistory(installedBeforeHistory.promise, historyRequest.signal)
+            }
             return requestV2SessionHistory(rpc, request.sessionKey, historyRequest, expectedGeneration)
           }
           return requestV4SessionHistory(
@@ -895,19 +983,22 @@ export function createV4SessionReadPort(
           )
         }
 
-        function retryMetadata(): Promise<SessionReadMetadata> {
+        function waitForHistory<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+          if (signal.aborted) return Promise.reject(abortError())
+          return new Promise<T>((resolve, reject) => {
+            const cancel = () => reject(abortError())
+            signal.addEventListener('abort', cancel, { once: true })
+            void pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', cancel))
+          })
+        }
+
+        function retryMetadata(retryOptions?: SessionMetadataReadOptions): Promise<SessionReadMetadata> {
           if (closed || request.signal.aborted) return Promise.reject(abortError())
-          if (retry) return retry
+          if (retry && !retryOptions?.fresh) return retry
           const current = (async () => {
             const subscription = await ensureAdmission()
             if (!v2Enabled) await criticalRequestsQueued
-            return hydrate(
-              rpc,
-              request.sessionKey,
-              request.signal,
-              expectedGeneration,
-              subscription,
-            )
+            return readMetadata(subscription, retryOptions?.fresh)
           })()
           const observed = current.finally(() => {
             if (retry === observed) retry = null
@@ -952,6 +1043,7 @@ export function createV4SessionReadPort(
       async function close(): Promise<void> {
         if (closed) return
         closed = true
+        cancelInitialHistoryAdmission?.()
         transfer?.release()
         // No await before the ownership/send decision: a pending ready wait
         // cannot later send subscribe after this local close.
@@ -1001,7 +1093,7 @@ export function createV4SessionReadPort(
         live: initialSetup.then(context => context.live),
         metadata: initialSetup.then(context => context.metadata),
         readHistory: historyRead,
-        retryMetadata: () => acquireContext().then(context => context.retryMetadata()),
+        retryMetadata: (options?: SessionMetadataReadOptions) => acquireContext().then(context => context.retryMetadata(options)),
         reconcile: () => acquireContext().then(context => context.reconcile()),
         close,
       })

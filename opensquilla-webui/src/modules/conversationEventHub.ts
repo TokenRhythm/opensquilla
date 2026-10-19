@@ -163,14 +163,16 @@ export function createConversationEventHub<TEvent>(
       },
       onRecoveryRequired: async scope => {
         const keys = [...new Set([...scope.keys, ...(scope.global ? readAdmissions.keys() : [])])]
-        if (keys.length === 0) return false
+        if (keys.length === 0) return { retryable: false }
         for (const key of keys) invalidateConsumption(key)
         // A global signal covers every actual read admission, never just the
         // visible handle. Each key independently needs an explicit owner.
         const results = await Promise.all(keys.map(async key => {
           if (retiredKeys.has(key)) return true
           const admission = readAdmissions.get(key)
-          if (!admission) return false
+          // No owner can make progress by polling. Retain the flow receipts;
+          // a later read admission/installation supplies the missing proof.
+          if (!admission || recoveryListeners.size === 0) return { retryable: false } as const
           if (admission.blocked) return { retryable: false } as const
           const connection = connectionRevision
           const owners = await Promise.all([...recoveryListeners].map(listener =>

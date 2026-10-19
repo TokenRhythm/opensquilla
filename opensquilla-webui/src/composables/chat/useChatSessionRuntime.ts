@@ -80,6 +80,8 @@ export interface UseChatSessionRuntimeOptions {
   resetStreamLiveTurnState: () => void
   retireAttachments?: () => void
   resetDraftComposer?: () => void
+  rebindDraftSession?: (key: string) => void
+  prepareDraftSession?: (key: string) => void
 }
 
 const EMPTY_USAGE: ChatUsageAccumulator = {
@@ -303,11 +305,15 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
 
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
-  async function startDraftSession(agentId?: string) {
+  async function startDraftSession(agentId?: string, transition?: {
+    preserveComposer?: boolean
+    isCurrent?: () => boolean
+  }): Promise<string | undefined> {
     const key = options.createSessionKey(agentId)
     const sourceKey = options.sessionKey.value
     const { epoch, signal: handoffSignal } = beginHandoff(key)
     const shouldCommit = () => isCurrentHandoff(epoch, key, sourceKey)
+      && (transition?.isCurrent?.() ?? true)
     try {
       const pendingQueueSwitch = options.switchPendingQueue(
         key,
@@ -324,21 +330,24 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       return
     }
     options.cancelSessionBootstrap()
-    options.retireAttachments?.()
+    if (!transition?.preserveComposer) options.retireAttachments?.()
     resetCompactState()
-    options.sessionKey.value = key
+    if (transition?.preserveComposer && options.rebindDraftSession) options.rebindDraftSession(key)
+    else options.sessionKey.value = key
     resetSessionRuntimeState()
     // A brand-new provisional key cannot own a durable Gateway task yet. Its
     // first send must not wait for optional draft bootstrap metadata.
     options.taskOwnership?.reset(true)
     options.pendingSessionIntent.value = 'new_chat'
-    options.resetDraftComposer?.()
+    if (!transition?.preserveComposer) options.resetDraftComposer?.()
     resetSessionViewState()
+    options.prepareDraftSession?.(key)
     try {
       options.startSessionBootstrap({ includeHistory: false })
     } finally {
       finishHandoff(epoch, 'committed')
     }
+    return key
   }
 
   return {

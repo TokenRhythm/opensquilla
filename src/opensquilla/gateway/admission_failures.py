@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from opensquilla.application.admission_failures import (
     AdmissionIngressConflictError,
+    AdmissionIngressReceiptUnavailableError,
     AdmissionPendingInputConflictError,
     AdmissionPlanConflictError,
     AdmissionPlanSessionBusyError,
@@ -23,6 +24,7 @@ from opensquilla.session.storage import (
     StorageBusyError,
     TaskCollectionUnavailableError,
     TurnIngressConflictError,
+    TurnIngressReceiptUnavailableError,
 )
 
 
@@ -46,6 +48,8 @@ def admission_failure(error: Exception) -> Exception | None:
         )
     if isinstance(error, StaleEpochError):
         return AdmissionStaleEpochError(str(error))
+    if isinstance(error, TurnIngressReceiptUnavailableError):
+        return AdmissionIngressReceiptUnavailableError(str(error))
     if isinstance(error, TurnIngressConflictError):
         return AdmissionIngressConflictError(str(error))
     if isinstance(error, PendingChatInputConflictError):

@@ -70,6 +70,291 @@ function sharedQueuePermission() {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('application-owned durable delivery', () => {
+  function unknownStorage() {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session', phase: 'unknown',
+      request: { kind: 'send', request: request() }, revision: 1, createdAt: 1, updatedAt: 1 })
+    return storage
+  }
+
+  it('retires only on explicit checking and never dispatches the fenced identity again', async () => {
+    vi.useFakeTimers()
+    const resolveReceipt = vi.fn(async () => ({ status: 'retired' as const }))
+    const test = harness({ resolveReceipt }, unknownStorage())
+    try {
+      const background = test.owner.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await background
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(4)
+      expect(resolveReceipt).not.toHaveBeenCalled()
+      const updates: unknown[] = []
+      test.owner.observe(update => updates.push(update))
+      await Promise.all([test.owner.retry('synthetic-request'), test.owner.retry('synthetic-request')])
+      expect(resolveReceipt).toHaveBeenCalledOnce()
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', retired: true })
+      expect(updates).toContainEqual(expect.objectContaining({ phase: 'not-sent', retired: true }))
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ failureCode: 'DELIVERY_RETIRED', accepted: false })
+      expect(test.commands.send).not.toHaveBeenCalled()
+      await test.owner.commands.send(request('fresh-request'))
+      expect(test.commands.send).toHaveBeenCalledOnce()
+    } finally { test.owner.dispose() }
+  })
+
+  it('retains an already accepted receipt on manual checking without sending again', async () => {
+    const test = harness({ resolveReceipt: vi.fn(async () => ({ status: 'found' as const, response: { taskId: 'original-task' } })) }, unknownStorage())
+    try {
+      await test.owner.retry('synthetic-request')
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'accepted', response: { taskId: 'original-task' } })
+      expect(test.records.get('synthetic-request')?.retired).toBeUndefined()
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('retains an explicit Check through a competing automatic read without extending its deadline', async () => {
+    vi.useFakeTimers()
+    let release!: (value: TurnReceiptResult) => void
+    const lookupReceipt = vi.fn().mockImplementationOnce(() => new Promise<TurnReceiptResult>(resolve => { release = resolve }))
+      .mockResolvedValue({ status: 'not-found' })
+    const resolveReceipt = vi.fn(async () => ({ status: 'retired' as const }))
+    const test = harness({ lookupReceipt, resolveReceipt }, unknownStorage())
+    try {
+      const background = test.owner.wake()
+      await flush()
+      await test.owner.retry('synthetic-request')
+      expect(resolveReceipt).not.toHaveBeenCalled()
+      release({ status: 'not-found' })
+      await vi.advanceTimersByTimeAsync(6_000)
+      await background
+      await flush()
+      expect(resolveReceipt).toHaveBeenCalledOnce()
+      expect(test.records.get('synthetic-request')?.retired).toBe(true)
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('keeps receipt-event and Stop wakeups read-only after a budget is exhausted', async () => {
+    vi.useFakeTimers()
+    const resolveReceipt = vi.fn(async () => ({ status: 'retired' as const }))
+    const test = harness({ resolveReceipt }, unknownStorage())
+    try {
+      const background = test.owner.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await background
+      const event = test.owner.noteReceiptChanged('synthetic-request', 'new-receipt-event')
+      await vi.advanceTimersByTimeAsync(6_000)
+      await event
+      const stopped = test.owner.requestStop('synthetic-request')
+      await vi.advanceTimersByTimeAsync(6_000)
+      await stopped
+      expect(test.commands.lookupReceipt).toHaveBeenCalled()
+      expect(resolveReceipt).not.toHaveBeenCalled()
+      expect(test.records.get('synthetic-request')?.phase).toBe('unknown')
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('retains an initial admission Retry-After before automatic reads or manual resolution', async () => {
+    vi.useFakeTimers()
+    const test = harness({
+      send: vi.fn().mockRejectedValue(new TurnCommandError('unavailable', 'busy', 'STORAGE_BUSY', null, true, 90_000)),
+      resolveReceipt: vi.fn(async () => ({ status: 'retired' as const })),
+    })
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ failureCode: 'STORAGE_BUSY' })
+      const floor = test.records.get('synthetic-request')?.recoveryNotBefore
+      expect(floor).toBe(Date.now() + 90_000)
+      await vi.advanceTimersByTimeAsync(30_000)
+      const checking = test.owner.retry('synthetic-request')
+      await vi.advanceTimersByTimeAsync(30_000)
+      await checking
+      expect(test.records.get('synthetic-request')?.recoveryNotBefore).toBe(floor)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.resolveReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('persists an atomically fenced initial refusal and requires a fresh request identity', async () => {
+    const test = harness({ send: vi.fn().mockRejectedValueOnce(new TurnCommandError('rejected', 'missing workspace',
+      'WORKSPACE_UNAVAILABLE', false, false, undefined, { requestRetired: true }))
+      .mockResolvedValue({ taskId: 'fresh-task' }) })
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ accepted: false })
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', retired: true })
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ failureCode: 'DELIVERY_RETIRED' })
+      await test.owner.commands.send(request('fresh-request'))
+      expect(test.commands.send).toHaveBeenCalledTimes(2)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('keeps an unprovable legacy request unknown after bounded resolution', async () => {
+    vi.useFakeTimers()
+    const test = harness({ resolveReceipt: vi.fn(async () => ({ status: 'not-found' as const })) }, unknownStorage())
+    try {
+      const checking = test.owner.retry('synthetic-request')
+      await vi.advanceTimersByTimeAsync(6_000)
+      await checking
+      expect(test.commands.resolveReceipt).toHaveBeenCalledTimes(4)
+      expect(test.records.get('synthetic-request')?.phase).toBe('unknown')
+      expect(test.owner.snapshots()[0]?.waitReason).toBe('budget')
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('preserves a long server wait across repeated checking and a successor owner', async () => {
+    vi.useFakeTimers()
+    const storage = unknownStorage()
+    const resolveReceipt = vi.fn().mockRejectedValueOnce(new TurnCommandError('unavailable', 'wait', 'BUSY', null, true, 90_000))
+      .mockResolvedValue({ status: 'retired' })
+    const test = harness({ resolveReceipt }, storage)
+    try {
+      const first = test.owner.retry('synthetic-request')
+      await vi.advanceTimersByTimeAsync(30_000)
+      await first
+      expect(resolveReceipt).toHaveBeenCalledOnce()
+      const floor = storage.records.get('synthetic-request')!.recoveryNotBefore
+      const second = test.owner.retry('synthetic-request')
+      await vi.advanceTimersByTimeAsync(30_000)
+      await second
+      expect(resolveReceipt).toHaveBeenCalledOnce()
+      expect(storage.records.get('synthetic-request')!.recoveryNotBefore).toBe(floor)
+      test.owner.dispose()
+      const successor = harness({ resolveReceipt }, storage)
+      try {
+        const third = successor.owner.retry('synthetic-request')
+        await vi.advanceTimersByTimeAsync(30_000)
+        await third
+        expect(resolveReceipt).toHaveBeenCalledOnce()
+        await successor.owner.retry('synthetic-request')
+        expect(resolveReceipt).toHaveBeenCalledTimes(2)
+        expect(storage.records.get('synthetic-request')?.retired).toBe(true)
+      } finally { successor.owner.dispose() }
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not apply a late retirement after the identity changes', async () => {
+    let retire!: (value: TurnReceiptResult) => void
+    const test = harness({ resolveReceipt: vi.fn(() => new Promise<TurnReceiptResult>(resolve => { retire = resolve })) }, unknownStorage())
+    try {
+      const checking = test.owner.retry('synthetic-request')
+      await flush()
+      test.identity('another-identity')
+      retire({ status: 'retired' })
+      await checking
+      expect(test.records.get('synthetic-request')?.phase).toBe('unknown')
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not apply a late retirement over a successor lease for the same identity', async () => {
+    vi.useFakeTimers()
+    let retire!: (value: TurnReceiptResult) => void
+    const storage = unknownStorage()
+    const test = harness({ resolveReceipt: vi.fn(() => new Promise<TurnReceiptResult>(resolve => { retire = resolve })) }, storage)
+    try {
+      const checking = test.owner.retry('synthetic-request')
+      await flush()
+      expect(test.commands.resolveReceipt).toHaveBeenCalledOnce()
+      const previous = storage.records.get('synthetic-request')!
+      const successorLease = { owner: 'successor-owner', epoch: previous.lease!.epoch + 1, expiresAt: Date.now() + 60_000 }
+      storage.records.set(previous.ownerRequestId, { ...previous, revision: previous.revision + 1, lease: successorLease })
+      retire({ status: 'retired' })
+      await vi.advanceTimersByTimeAsync(6_000)
+      await checking
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'unknown', lease: successorLease })
+      expect(storage.records.get('synthetic-request')?.retired).toBeUndefined()
+      expect(test.commands.resolveReceipt).toHaveBeenCalledOnce()
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('expires a deferred manual resolution while a competing lease outlives its budget', async () => {
+    vi.useFakeTimers()
+    const storage = unknownStorage()
+    const previous = storage.records.get('synthetic-request')!
+    storage.records.set(previous.ownerRequestId, { ...previous,
+      lease: { owner: 'competing-owner', epoch: 7, expiresAt: Date.now() + 60_000 } })
+    const resolveReceipt = vi.fn(async () => ({ status: 'retired' as const }))
+    const test = harness({ resolveReceipt }, storage)
+    try {
+      await test.owner.retry('synthetic-request')
+      expect(resolveReceipt).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(66_000)
+      await flush()
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(4)
+      expect(resolveReceipt).not.toHaveBeenCalled()
+      expect(storage.records.get('synthetic-request')?.phase).toBe('unknown')
+      // A later deliberate Check may open a new bounded resolution episode.
+      await test.owner.retry('synthetic-request')
+      expect(resolveReceipt).toHaveBeenCalledOnce()
+      expect(storage.records.get('synthetic-request')?.retired).toBe(true)
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('bounds a lost admission reply and exhausts only receipt recovery without sending again', async () => {
+    vi.useFakeTimers()
+    let admissionSignal: AbortSignal | undefined
+    const test = harness({ send: vi.fn((_request, options) => new Promise<TurnSendResponse>((_resolve, reject) => {
+      admissionSignal = options?.signal
+      options?.signal?.addEventListener('abort', () => {
+        reject(new TurnCommandError('aborted', 'local admission wait ended', 'RPC_ABORTED', null))
+      }, { once: true })
+    })) })
+    try {
+      const failed = test.owner.commands.send(request()).catch(error => error)
+      await flush()
+      expect(test.commands.send).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(29_999)
+      expect(admissionSignal?.aborted).toBe(false)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.records.get('synthetic-request')?.phase).toBe('submitting')
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await failed).toMatchObject({ kind: 'aborted', accepted: null })
+      expect(admissionSignal?.aborted).toBe(true)
+      await vi.advanceTimersByTimeAsync(6_000)
+      await test.owner.wake()
+      expect(test.owner.snapshots()).toEqual([
+        expect.objectContaining({ id: 'synthetic-request', phase: 'unknown', waitReason: 'budget' }),
+      ])
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(4)
+      expect(test.commands.send).toHaveBeenCalledOnce()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(90_000)
+      await test.owner.wake()
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(4)
+
+      vi.mocked(test.commands.lookupReceipt!).mockResolvedValue({ status: 'found', response: { taskId: 'original-task' } })
+      await test.owner.retry('synthetic-request')
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'accepted', response: { taskId: 'original-task' } })
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(5)
+      expect(test.commands.send).toHaveBeenCalledOnce()
+      expect(test.commands.lookupReceipt).toHaveBeenLastCalledWith(
+        { kind: 'send', request: request() }, expect.objectContaining({ signal: expect.anything(), expectedGeneration: 1 }),
+      )
+    } finally { test.owner.dispose() }
+  })
+
+  it('clears the admission deadline on acceptance without aborting the accepted task', async () => {
+    vi.useFakeTimers()
+    let admissionSignal: AbortSignal | undefined
+    const test = harness({ send: vi.fn(async (_request, options) => {
+      admissionSignal = options?.signal
+      return { taskId: 'accepted-task' }
+    }) })
+    try {
+      await test.owner.commands.send(request())
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(admissionSignal?.aborted).toBe(false)
+      expect(test.records.get('synthetic-request')?.phase).toBe('accepted')
+      expect(test.commands.send).toHaveBeenCalledOnce()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
   it.each(['available', 'denied', 'unavailable'] as const)(
     'starts and cancels an exact task without randomUUID when storage is %s', async mode => {
       const storage = memoryWal()

@@ -3902,6 +3902,7 @@
     "historyAttachmentCount": "Archivos adjuntos: {count}",
     "loadingSession": "Restaurando el historial de la conversación…",
     "loadingSessionDescription": "Puedes seguir usando la conversación mientras se carga el historial.",
+    "sendTemporarilyUnavailable": "No se pueden enviar mensajes en este momento",
     "loadSessionFailed": "Historial de la conversación no disponible temporalmente",
     "loadSessionDescription": "El historial de la conversación no está disponible temporalmente.",
     "reloadSession": "Volver a cargar el historial",

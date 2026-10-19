@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from typing import Any
 from opensquilla import token_estimation
 from opensquilla.gateway.boot import start_gateway_server
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.websocket import SubscriptionManager
 from opensquilla.provider import (
     ChatConfig,
@@ -323,6 +325,104 @@ class DeterministicGoalSelector:
         return []
 
 
+async def _install_activation_orphan_fault(server: Any, provider: Any) -> asyncio.Task:
+    """Opt-in test fault: no production endpoint, storage shim, or real profile.
+
+    The exact first reservation fails before activation. A native SQLite trigger
+    keeps its compensation failing even after Clear deletes the original Goal.
+    Only the fixture release file removes that database fault; production recovery
+    remains responsible for every task/ownership transition.
+    """
+    services = server._services
+    assert services is not None
+    runtime = services.task_runtime
+    assert runtime is not None and services.goal_service is not None
+    storage = get_session_storage(services.session_manager)
+    assert storage is not None
+    evidence_file = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_ACTIVATION_EVIDENCE"])
+    release_file = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE_ACTIVATION_FAULT"])
+    original_activate = runtime.activate
+    failed_task_id: str | None = None
+    failed_session_key: str | None = None
+    fault_released = False
+    activated_task_ids: list[str] = []
+
+    def execute_fault_ddl(sql: str) -> None:
+        # An independent native SQLite connection must not commit or roll back
+        # a production transaction that happens to share the writer coroutine.
+        with sqlite3.connect(storage._db_path, timeout=5) as connection:
+            connection.execute(sql)
+
+    def publish(payload: dict[str, Any]) -> None:
+        temporary = evidence_file.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+        temporary.replace(evidence_file)
+
+    async def activate(reservation: Any, **kwargs: Any) -> Any:
+        nonlocal failed_task_id, failed_session_key
+        if failed_task_id is None:
+            assert not reservation.activated
+            failed_task_id = reservation.task_id
+            failed_session_key = reservation.session_key
+            task_literal = failed_task_id.replace("'", "''")
+            await asyncio.to_thread(execute_fault_ddl,
+                f"""CREATE TRIGGER e2e_deny_activation_compensation
+                BEFORE UPDATE OF status ON agent_tasks
+                WHEN OLD.task_id = '{task_literal}' AND OLD.status = 'queued'
+                  AND NEW.status != 'queued'
+                BEGIN SELECT RAISE(FAIL, 'controlled activation compensation outage'); END"""
+            )
+            raise RuntimeError("controlled preactivation failure before executor ownership")
+        result = await original_activate(reservation, **kwargs)
+        activated_task_ids.append(reservation.task_id)
+        return result
+
+    runtime.activate = activate
+    publish({"fixtureReady": True, "faultInjected": False})
+
+    async def observe() -> None:
+        nonlocal fault_released
+        previous: dict[str, Any] = {}
+        while True:
+            if failed_task_id is not None:
+                if not fault_released and release_file.exists():
+                    await asyncio.to_thread(execute_fault_ddl,
+                        "DROP TRIGGER e2e_deny_activation_compensation")
+                    fault_released = True
+                task = await storage.get_agent_task(failed_task_id)
+                goal = await storage.get_goal(failed_session_key)
+                assert task is not None
+                owner = task.details.get("admission_owner") or {}
+                payload = {
+                    "fixtureReady": True,
+                    "faultInjected": True,
+                    "faultReleased": fault_released,
+                    "failedTask": {
+                        "taskId": task.task_id, "sessionKey": task.session_key,
+                        "status": str(task.status), "startedAt": task.started_at,
+                        "admissionOwner": {key: owner.get(key) for key in (
+                            "resident_lease", "compute_lease", "settlement",
+                        )},
+                    },
+                    "currentGoal": None if goal is None else {
+                        "goalId": goal.goal_id, "status": goal.status,
+                        "activeTaskId": goal.active_task_id,
+                        "turnsStarted": goal.turns_started, "turnsSettled": goal.turns_settled,
+                    },
+                    "recoveryRecords": len(services.goal_service._settlement_recoveries),
+                    "runtimeReservations": len(runtime._reservations_by_session),
+                    "runtimeTasks": len(runtime._tasks),
+                    "activatedTaskIds": list(activated_task_ids),
+                    "providerCalls": provider.calls,
+                }
+                if payload != previous:
+                    publish(payload)
+                    previous = payload
+            await asyncio.sleep(0.05)
+
+    return asyncio.create_task(observe(), name="e2e-activation-recovery-observer")
+
+
 async def main() -> None:
     # Every fixture gets a fresh temporary directory, including tiktoken's
     # default download cache. Use the production conservative fallback so a
@@ -334,7 +434,7 @@ async def main() -> None:
     first_release_file = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE_FIRST"])
     second_release_file = Path(os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_RELEASE"])
     scenario = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_SCENARIO", "continuation")
-    if scenario not in {"continuation", "lifecycle", "silent-reply"}:
+    if scenario not in {"continuation", "lifecycle", "silent-reply", "activation-orphan-clear"}:
         raise ValueError(f"Unsupported Goal E2E scenario: {scenario}")
     auth_mode = os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_AUTH_MODE", "none")
     if auth_mode not in {"none", "token"}:
@@ -342,7 +442,11 @@ async def main() -> None:
     webui_origin = os.environ["OPENSQUILLA_WEBUI_GOAL_E2E_ORIGIN"]
     state_dir.mkdir(parents=True, exist_ok=True)
     workspace_dir = state_dir / "workspace"
-    workspace_dir.mkdir(parents=True, exist_ok=True)
+    missing_configured_workspace = (
+        os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_WORKSPACE_INITIALLY_MISSING") == "true"
+    )
+    if not missing_configured_workspace:
+        workspace_dir.mkdir(parents=True, exist_ok=True)
 
     # Read-only browser fixtures need durable identities for the real V2 lease
     # protocol. Seed these before Gateway startup without invoking a Provider.
@@ -361,6 +465,10 @@ async def main() -> None:
         host="127.0.0.1",
         port=port,
         auth=AuthConfig(mode=auth_mode, token="synthetic-real-gateway-owner-token"),
+        # Constructor provenance matches a loaded explicit workspace_dir. A
+        # later assignment alone retains the managed-workspace default, which
+        # would bypass the configured-directory failure under test.
+        **({"workspace_dir": str(workspace_dir)} if missing_configured_workspace else {}),
     )
     config.state_dir = str(state_dir)
     config.workspace_dir = str(workspace_dir)
@@ -393,15 +501,23 @@ async def main() -> None:
         event_log,
         first_release_file,
         second_release_file,
-        scenario=scenario,
+        scenario="lifecycle" if scenario == "activation-orphan-clear" else scenario,
     )
-    await start_gateway_server(
+    server = await start_gateway_server(
         config=config,
         provider_selector=DeterministicGoalSelector(provider),
         subscription_manager=SubscriptionManager(),
         run=True,
     )
-    await asyncio.Event().wait()
+    fault_observer = None
+    if scenario == "activation-orphan-clear":
+        fault_observer = await _install_activation_orphan_fault(server, provider)
+    # Propagate observer errors so the fixture fails visibly instead of serving
+    # indefinitely while the browser polls a stale observation file.
+    if fault_observer is not None:
+        await fault_observer
+    else:
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ import type {
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
 // Older clients must fail with VersionError rather than replay queued turns
 // after dropping their explicit command intent. Upgrading keeps both stores.
-const DATABASE_VERSION = 4
+const DATABASE_VERSION = 5
 const STORE_NAME = 'pending_chat_inputs'
 const HANDOFF_STORE_NAME = 'response_handoffs'
 
@@ -92,6 +92,10 @@ export interface DeliveryWalRecord {
   requestSessionKey: string
   request?: TurnReceiptRequest
   phase: 'prepared' | 'submitting' | 'unknown' | 'accepted' | 'not-sent'
+  /** Durable server fence: this ID can never be dispatched again. */
+  retired?: true
+  /** Preserve a server retry floor across leases, reconnects and manual checks. */
+  recoveryNotBefore?: number
   response?: TurnSendResponse | TurnSteerResponse
   stop?: { requested: true; request?: TurnCancelRequest; completed?: boolean }
   paused?: 'authority' | 'conflict'
@@ -152,6 +156,7 @@ export interface PendingInputWal {
   ) => Promise<AcceptedHandoffCommit | null>
   deleteHandoff?: (ownerRequestId: string) => Promise<void>
   listDeliveries?: () => Promise<DeliveryWalRecord[]>
+  listSessionDeliveries?: (identity: string, sessionKey: string) => Promise<DeliveryWalRecord[]>
   listRecoveryDeliveries?: (after?: string, limit?: number) => Promise<{ records: DeliveryWalRecord[]; next?: string }>
   findDeliveryByTask?: (identity: string, sessionKey: string, taskId: string) => Promise<DeliveryWalRecord | null>
   findSteerDeliveries?: (identity: string, sessionKey: string, expectedTurnId: string) => Promise<DeliveryWalRecord[]>
@@ -413,6 +418,7 @@ class BrowserPendingInputWal implements PendingInputWal {
         if (!handoffs.indexNames?.contains('task_scope')) handoffs.createIndex('task_scope', 'taskScope', { unique: false })
         if (!handoffs.indexNames?.contains('handoff_session')) handoffs.createIndex('handoff_session', 'handoff.requestSessionKey', { unique: false })
         if (!handoffs.indexNames?.contains('steer_scope')) handoffs.createIndex('steer_scope', 'steerScope', { unique: false })
+        if (!handoffs.indexNames?.contains('request_scope')) handoffs.createIndex('request_scope', ['deliveryIdentity', 'requestSessionKey'], { unique: false })
       }
       request.onsuccess = () => {
         if (abandoned || epoch !== this.openEpoch) {
@@ -701,6 +707,17 @@ class BrowserPendingInputWal implements PendingInputWal {
     const raw = await requestResult(transaction.objectStore(HANDOFF_STORE_NAME).getAll())
     await transactionDone(transaction)
     return (raw as unknown[]).filter(isDeliveryWalRecord).map(record => structuredClone(record))
+  }
+
+  async listSessionDeliveries(identity: string, sessionKey: string): Promise<DeliveryWalRecord[]> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
+    const raw = await requestResult(transaction.objectStore(HANDOFF_STORE_NAME)
+      .index('request_scope').getAll(IDBKeyRange.only([identity, sessionKey])))
+    await transactionDone(transaction)
+    return (raw as unknown[]).filter(isDeliveryWalRecord)
+      .filter(record => record.deliveryIdentity === identity && record.requestSessionKey === sessionKey)
+      .map(record => structuredClone(record))
   }
 
   async listRecoveryDeliveries(after?: string, limit = 16): Promise<{ records: DeliveryWalRecord[]; next?: string }> {

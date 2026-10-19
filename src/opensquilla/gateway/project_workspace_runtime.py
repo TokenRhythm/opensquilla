@@ -259,18 +259,26 @@ def map_project_workspace_error(
     error: ProjectWorkspaceStateError,
     *,
     owner: bool,
+    accepted: bool | None = None,
+    request_retired: bool = False,
 ) -> RpcHandlerError:
+    # Runtime callers can fail after acceptance. Only a caller that owns a
+    # proven preaccept boundary may declare that no input was accepted.
     del owner
     if error.reason in _NOT_FOUND_REASONS:
         return RpcHandlerError(
             "WORKSPACE_NOT_FOUND",
             "Project workspace not found.",
-            details={"reason": error.reason},
+            details={
+                "reason": error.reason, **({"requestRetired": True} if request_retired else {}),
+            },
+            accepted=accepted,
         )
     return RpcHandlerError(
         "WORKSPACE_UNAVAILABLE",
         "The project directory is unavailable.",
-        details={"reason": error.reason},
+        details={"reason": error.reason, **({"requestRetired": True} if request_retired else {})},
+        accepted=accepted,
     )
 
 

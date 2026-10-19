@@ -245,6 +245,16 @@ class AdmissionStorage(Protocol):
         client_request_id: str,
     ) -> AdmissionAcceptance | None: ...
 
+    async def register_turn_request_attempt(
+        self, *, source_scope: str, request_session_key: str,
+        client_request_id: str, request_fingerprint: str,
+    ) -> None: ...
+
+    async def resolve_turn_request_attempt(
+        self, *, source_scope: str, request_session_key: str,
+        client_request_id: str, request_fingerprint: str,
+    ) -> str: ...
+
     async def consume_replayed_pending_chat_input(
         self,
         *,
@@ -462,7 +472,10 @@ class AdmissionPrimitives(Protocol):
 
     def is_remote_guest(self, source: IncomingTurnSource) -> bool: ...
 
-    def workspace_error(self, error: ProjectWorkspaceStateError) -> Exception: ...
+    def workspace_error(
+        self, error: ProjectWorkspaceStateError, *, accepted: bool | None = None,
+        request_retired: bool = False,
+    ) -> Exception: ...
 
     def effective_agent_id(self, session: SessionIdentity | None, session_key: str) -> str: ...
 

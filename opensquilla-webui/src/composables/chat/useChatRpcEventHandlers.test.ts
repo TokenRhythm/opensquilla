@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { effectScope, nextTick, ref } from 'vue'
+import { effectScope, nextTick, ref, type Ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
 import { useChatRouterDecisionRuntime } from './useChatRouterDecisionRuntime'
 import { useChatRenderedMessages } from './useChatRenderedMessages'
-import type { SessionBootstrapRun } from './useChatSessionBootstrap'
+import { useChatSessionBootstrap, type SessionBootstrapRun } from './useChatSessionBootstrap'
+import type { SessionLivePhase } from './sessionBootstrapContract'
+import type { SessionRecoveryProof } from './sessionRecoveryProof'
+import { createChatSessionRecovery } from './createChatSessionRecovery'
+import { SessionReadFailure, type SessionReadLease } from '@/modules/sessionReadLifecycle'
 import type {
   ChatMessage,
   ChatPendingItem,
@@ -29,6 +33,7 @@ import type { InterruptViewState } from '@/types/parts'
 import { isVisibleActivityStatusStep, projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 
 function createHarness(options: {
+  sessionKey?: Ref<string>
   messages?: ChatMessage[]
   endStreaming?: (messages: ChatMessage[]) => void
   sessionRunStatus?: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
@@ -38,6 +43,9 @@ function createHarness(options: {
     | { authoritative: boolean, live: boolean, backgroundOnly: boolean }
     | Promise<boolean | void | { authoritative: boolean, live: boolean, backgroundOnly: boolean }>
   onSessionSubscribed?: () => void | Promise<void>
+  recoverSession?: () => Promise<boolean>
+  sessionLivePhase?: Readonly<Ref<SessionLivePhase>>
+  sessionRecoveryProof?: SessionRecoveryProof
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
@@ -56,7 +64,7 @@ function createHarness(options: {
   withCompactionRuntime?: boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
-  const sessionKey = ref('agent:main:test')
+  const sessionKey = options.sessionKey ?? ref('agent:main:test')
   const lastStreamSeq = ref(0)
   const currentEpoch = ref(0)
   const aborted = ref(false)
@@ -187,6 +195,9 @@ function createHarness(options: {
     restoreSteerIntoComposer,
     saveWidgetState: vi.fn(),
     subscribeSession,
+    recoverSession: options.recoverSession,
+    sessionLivePhase: options.sessionLivePhase,
+    sessionRecoveryProof: options.sessionRecoveryProof,
     onSessionSubscribed,
     loadHistory: vi.fn(),
     handleSessionConnectionState,
@@ -983,6 +994,456 @@ describe('Plan task settlement notification', () => {
       expect(plans.activePlanRun.value).toMatchObject({ status: 'paused', activeTaskId: undefined })
       expect(plans.activePlanRun.value?.steps[0].status).toBe('in_progress')
     } finally { scope.stop(); h.stop() }
+  })
+})
+
+describe('terminal snapshot failure recovery', () => {
+  function terminal(h: ReturnType<typeof createHarness>, taskId = 'task-owner') {
+    h.activeStreamTaskId.value = taskId
+    h.api.handlers.onWireEventFixture('sessions.changed', {
+      key: h.sessionKey.value, reason: 'task_terminal',
+      changed_task: { task_id: taskId, status: 'succeeded' },
+    })
+  }
+
+  async function flushRecovery() {
+    for (let i = 0; i < 8; i++) await Promise.resolve()
+  }
+
+  function mutableProof() {
+    const revision = ref(0)
+    let current = false
+    const proof: SessionRecoveryProof = {
+      revision, capture: () => Object.assign(() => current, { isCurrent: () => true }),
+    }
+    return { proof, publish(value = true) { current = value; revision.value++ } }
+  }
+
+  it('accepts a replacement lease through the production recovery callback and hands off once', async () => {
+    vi.useFakeTimers()
+    const scope = effectScope()
+    const sessionKey = ref('agent:main:test')
+    const taskOwnership = useChatTaskOwnership()
+    const ready = { authoritative: true, live: false, backgroundOnly: false }
+    let lease: SessionReadLease | null = null
+    const open = vi.fn(() => {
+      lease = { criticalRequestsQueued: Promise.resolve(), close: async () => {} } as SessionReadLease
+      return lease
+    })
+    let attempts = 0
+    const bootstrap = scope.run(() => useChatSessionBootstrap({
+      sessionKey, connectionState: ref('connected'), incidentScope: () => 'owner-a',
+      sessionReadLifecycle: { open, current: () => lease },
+      loadHistory: async () => ({ ok: true }),
+      subscribeSession: async () => {
+        if (attempts++ === 0) return { ...ready, authoritative: false,
+          error: new SessionReadFailure('rebase-required', 'Read base retired', true) }
+        taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+        return ready
+      },
+      reconcileSession: async () => ready,
+      cancelHistory() {}, cancelSubscription() {},
+    }))!
+    const recoverSession = vi.fn(createChatSessionRecovery({
+      sessionKey: () => sessionKey.value, recoveryProof: bootstrap.recoveryProof, isDisposed: () => false,
+      retryLive: () => bootstrap.retryLive(false), isCurrentLiveResult: bootstrap.isCurrentLiveResult,
+    }))
+    const pendingAutoSend = ref('Deliver after rebase')
+    const send = vi.fn()
+    const h = createHarness({
+      sessionKey, taskOwnership, recoverSession, sessionLivePhase: bootstrap.livePhase,
+      sessionRecoveryProof: bootstrap.recoveryProof,
+      onSessionSubscribed: () => {
+        if (!pendingAutoSend.value) return
+        const text = pendingAutoSend.value
+        pendingAutoSend.value = ''
+        send(text)
+      },
+    })
+    try {
+      await bootstrap.startSessionBootstrap().live
+      const originalLease = lease
+      taskOwnership.noteRunning('task-owner')
+      terminal(h)
+      await flushRecovery()
+      expect(send).not.toHaveBeenCalled()
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
+      await vi.advanceTimersByTimeAsync(500)
+      await expect(recoverSession.mock.results[0]!.value).resolves.toBe(true)
+      expect(lease).not.toBe(originalLease)
+      expect(open).toHaveBeenCalledTimes(2)
+      expect(bootstrap.livePhase.value).toBe('ready')
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+      expect(send).toHaveBeenCalledExactlyOnceWith('Deliver after rebase')
+
+      await bootstrap.retryLive(false)
+      await nextTick()
+      expect(send).toHaveBeenCalledOnce()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+    } finally { h.stop(); bootstrap.cancelSessionBootstrap(); scope.stop(); vi.useRealTimers() }
+  })
+
+  it('hands off after late first authority binding without another ready edge', async () => {
+    const scope = effectScope()
+    const sessionKey = ref('agent:main:test')
+    const authority = ref('')
+    const taskOwnership = useChatTaskOwnership()
+    const ready = { authoritative: true, live: false, backgroundOnly: false }
+    let lease: SessionReadLease | null = null
+    const bootstrap = scope.run(() => useChatSessionBootstrap({
+      sessionKey, connectionState: ref('connected'), incidentScope: () => authority.value,
+      sessionReadLifecycle: {
+        open: () => (lease = { criticalRequestsQueued: Promise.resolve(), close: async () => {} } as SessionReadLease),
+        current: () => lease,
+      },
+      loadHistory: async () => ({ ok: true }),
+      subscribeSession: async () => ready,
+      reconcileSession: async () => {
+        taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+        return { ...ready }
+      },
+      cancelHistory() {}, cancelSubscription() {},
+    }))!
+    const recoverSession = vi.fn(createChatSessionRecovery({
+      sessionKey: () => sessionKey.value, recoveryProof: bootstrap.recoveryProof, isDisposed: () => false,
+      retryLive: () => bootstrap.retryLive(false), isCurrentLiveResult: bootstrap.isCurrentLiveResult,
+    }))
+    const pendingAutoSend = ref('Deliver after identity is confirmed')
+    const send = vi.fn()
+    const h = createHarness({
+      sessionKey, taskOwnership, recoverSession, sessionLivePhase: bootstrap.livePhase,
+      sessionRecoveryProof: bootstrap.recoveryProof,
+      onSessionSubscribed: () => {
+        if (!pendingAutoSend.value) return
+        expect(taskOwnership.hydrationResolved.value).toBe(true)
+        const text = pendingAutoSend.value
+        pendingAutoSend.value = ''
+        send(text)
+      },
+    })
+    try {
+      await bootstrap.startSessionBootstrap().live
+      taskOwnership.noteRunning('task-owner')
+      terminal(h)
+      await flushRecovery()
+      await expect(recoverSession.mock.results[0]!.value).resolves.toBe(false)
+      await flushRecovery()
+      expect(bootstrap.livePhase.value).toBe('ready')
+      expect(send).not.toHaveBeenCalled()
+
+      authority.value = 'owner-a'
+      await nextTick()
+      await flushRecovery()
+      expect(bootstrap.livePhase.value).toBe('ready')
+      expect(send).toHaveBeenCalledExactlyOnceWith('Deliver after identity is confirmed')
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+
+      await bootstrap.retryLive(false)
+      await nextTick()
+      expect(send).toHaveBeenCalledOnce()
+    } finally { h.stop(); bootstrap.cancelSessionBootstrap(); scope.stop() }
+  })
+
+  it('keeps pending delivery and hydration blocked without a recovery implementation', async () => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-owner')
+    const pendingAutoSend = ref('Keep this draft')
+    const h = createHarness({
+      taskOwnership,
+      onSessionSubscribed: () => { pendingAutoSend.value = '' },
+    })
+    try {
+      terminal(h)
+      await flushRecovery()
+      expect(h.subscribeSession).not.toHaveBeenCalled()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+      expect(pendingAutoSend.value).toBe('Keep this draft')
+      expect(taskOwnership.hydrationResolved.value).toBe(false)
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
+      expect(h.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('waits for coordinator authority even when its queued read begins recovery later', async () => {
+    let complete!: (value: boolean) => void
+    const recovery = new Promise<boolean>(resolve => { complete = resolve })
+    const recoverSession = vi.fn(() => recovery)
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-owner')
+    const pendingAutoSend = ref('Send after recovery')
+    const h = createHarness({
+      taskOwnership, recoverSession,
+      onSessionSubscribed: () => { pendingAutoSend.value = '' },
+    })
+    try {
+      terminal(h)
+      await flushRecovery()
+      expect(recoverSession).toHaveBeenCalledOnce()
+      expect(h.subscribeSession).not.toHaveBeenCalled()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+      expect(pendingAutoSend.value).toBe('Send after recovery')
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
+
+      // A busy coordinator can start this requested reconciliation later.
+      h.api.beginRecovery()
+      taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+      h.api.finishRecovery()
+      complete(true)
+      await flushRecovery()
+
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+      expect(pendingAutoSend.value).toBe('')
+      expect(taskOwnership.hydrationResolved.value).toBe(true)
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+    } finally { h.stop() }
+  })
+
+  it.each(['false', 'rejected'] as const)('preserves pending delivery after %s recovery', async failure => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-owner')
+    const pendingAutoSend = ref('Keep this draft')
+    const h = createHarness({
+      taskOwnership,
+      recoverSession: async () => {
+        if (failure === 'rejected') throw new Error('Recovery unavailable')
+        return false
+      },
+      onSessionSubscribed: () => { pendingAutoSend.value = '' },
+    })
+    try {
+      terminal(h)
+      await flushRecovery()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+      expect(pendingAutoSend.value).toBe('Keep this draft')
+      expect(taskOwnership.hydrationResolved.value).toBe(false)
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
+    } finally { h.stop() }
+  })
+
+  it('hands off once after a failed attempt is followed by authoritative automatic recovery', async () => {
+    const sessionLivePhase = ref<SessionLivePhase>('ready')
+    const recoveryProof = mutableProof()
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-owner')
+    const pendingAutoSend = ref('Deliver once')
+    const send = vi.fn()
+    const h = createHarness({
+      taskOwnership, sessionLivePhase, sessionRecoveryProof: recoveryProof.proof,
+      recoverSession: async () => {
+        sessionLivePhase.value = 'degraded'
+        return false
+      },
+      onSessionSubscribed: () => {
+        if (!pendingAutoSend.value) return
+        const text = pendingAutoSend.value
+        pendingAutoSend.value = ''
+        send(text)
+      },
+    })
+    try {
+      terminal(h)
+      await flushRecovery()
+      expect(send).not.toHaveBeenCalled()
+      expect(pendingAutoSend.value).toBe('Deliver once')
+      expect(taskOwnership.hasAuthoritativeWork.value).toBe(true)
+
+      h.api.beginRecovery()
+      sessionLivePhase.value = 'connecting'
+      await nextTick()
+      taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+      h.api.finishRecovery()
+      sessionLivePhase.value = 'ready'
+      recoveryProof.publish()
+      await nextTick()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+      expect(send).toHaveBeenCalledExactlyOnceWith('Deliver once')
+
+      sessionLivePhase.value = 'connecting'
+      await nextTick()
+      sessionLivePhase.value = 'ready'
+      recoveryProof.publish()
+      await nextTick()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+      expect(send).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('does not hand off an older ready transition before the requested fresh recovery completes', async () => {
+    const sessionLivePhase = ref<SessionLivePhase>('connecting')
+    const recoveryProof = mutableProof()
+    let complete!: (value: boolean) => void
+    const recovery = new Promise<boolean>(resolve => { complete = resolve })
+    const h = createHarness({ sessionLivePhase, sessionRecoveryProof: recoveryProof.proof, recoverSession: () => recovery })
+    try {
+      terminal(h)
+      await flushRecovery()
+      sessionLivePhase.value = 'ready'
+      recoveryProof.publish(false)
+      await nextTick()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+      h.api.beginRecovery()
+      sessionLivePhase.value = 'connecting'
+      await nextTick()
+      sessionLivePhase.value = 'ready'
+      recoveryProof.publish()
+      complete(true)
+      await flushRecovery()
+      await nextTick()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it.each(['false', 'rejected'] as const)('consumes recovery already proven before the older request resolves %s', async failure => {
+    const recoveryProof = mutableProof()
+    let complete!: (value: boolean) => void
+    let reject!: (error: Error) => void
+    const recovery = new Promise<boolean>((resolve, rejectPromise) => { complete = resolve; reject = rejectPromise })
+    const pendingAutoSend = ref('Deliver after replacement')
+    const send = vi.fn()
+    const h = createHarness({
+      sessionRecoveryProof: recoveryProof.proof, recoverSession: () => recovery,
+      onSessionSubscribed: async () => {
+        if (!pendingAutoSend.value) return
+        const text = pendingAutoSend.value
+        pendingAutoSend.value = ''
+        await Promise.resolve()
+        send(text)
+      },
+    })
+    try {
+      terminal(h)
+      await flushRecovery()
+      recoveryProof.publish()
+      expect(send).not.toHaveBeenCalled()
+      if (failure === 'false') complete(false)
+      else reject(new Error('Older read was replaced'))
+      await flushRecovery()
+      expect(send).toHaveBeenCalledExactlyOnceWith('Deliver after replacement')
+      recoveryProof.publish()
+      await flushRecovery()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+      expect(send).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('requires coordinator proof even when the recovery callback reports success', async () => {
+    const recoveryProof = mutableProof()
+    const h = createHarness({ sessionRecoveryProof: recoveryProof.proof, recoverSession: async () => true })
+    try {
+      terminal(h)
+      await flushRecovery()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+      recoveryProof.publish()
+      await flushRecovery()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('does not infer automatic success from a ready edge without coordinator proof', async () => {
+    const sessionLivePhase = ref<SessionLivePhase>('connecting')
+    const h = createHarness({ sessionLivePhase, recoverSession: async () => false })
+    try {
+      terminal(h)
+      await flushRecovery()
+      sessionLivePhase.value = 'ready'
+      await nextTick()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('ignores an older terminal recovery when a newer terminal owns the handoff', async () => {
+    let completeFirst!: (value: boolean) => void
+    let completeSecond!: (value: boolean) => void
+    const first = new Promise<boolean>(resolve => { completeFirst = resolve })
+    const second = new Promise<boolean>(resolve => { completeSecond = resolve })
+    const recoverSession = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second)
+    const h = createHarness({ recoverSession })
+    try {
+      terminal(h, 'task-first')
+      await flushRecovery()
+      terminal(h, 'task-second')
+      await flushRecovery()
+      completeFirst(true)
+      await flushRecovery()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+      completeSecond(true)
+      await flushRecovery()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('keeps a newer terminal fenced when only the older read becomes proven', async () => {
+    const revision = ref(0)
+    const gates: { ready: boolean }[] = []
+    const proof: SessionRecoveryProof = {
+      revision,
+      capture: () => {
+        const gate = { ready: false }
+        gates.push(gate)
+        return Object.assign(() => gate.ready, { isCurrent: () => true })
+      },
+    }
+    const h = createHarness({ sessionRecoveryProof: proof, recoverSession: async () => false })
+    try {
+      terminal(h, 'task-first')
+      await flushRecovery()
+      terminal(h, 'task-second')
+      await flushRecovery()
+      gates[0]!.ready = true
+      revision.value++
+      await flushRecovery()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+      gates[1]!.ready = true
+      revision.value++
+      await flushRecovery()
+      expect(h.onSessionSubscribed).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it.each(['navigation', 'disconnect', 'dispose'] as const)('ignores authority after %s', async transition => {
+    let complete!: (value: boolean) => void
+    const recovery = new Promise<boolean>(resolve => { complete = resolve })
+    const h = createHarness({ recoverSession: () => recovery })
+    try {
+      terminal(h)
+      await flushRecovery()
+      if (transition === 'navigation') {
+        h.sessionKey.value = 'agent:main:other'
+        await nextTick()
+      } else if (transition === 'disconnect') {
+        h.api.handlers.onConnectionState('disconnected')
+      } else h.stop()
+      complete(true)
+      await flushRecovery()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it.each(['navigation', 'disconnect', 'dispose'] as const)('does not revive an automatic handoff after %s', async transition => {
+    const recoveryProof = mutableProof()
+    const h = createHarness({ sessionRecoveryProof: recoveryProof.proof, recoverSession: async () => false })
+    try {
+      terminal(h)
+      await flushRecovery()
+      if (transition === 'navigation') h.sessionKey.value = 'agent:main:other'
+      else if (transition === 'disconnect') h.api.handlers.onConnectionState('disconnected')
+      else h.stop()
+      recoveryProof.publish()
+      await flushRecovery()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('does not start obsolete recovery after navigating away in the same turn', async () => {
+    const recoverSession = vi.fn(async () => true)
+    const h = createHarness({ recoverSession })
+    try {
+      terminal(h)
+      h.sessionKey.value = 'agent:main:other'
+      await flushRecovery()
+      expect(recoverSession).not.toHaveBeenCalled()
+      expect(h.onSessionSubscribed).not.toHaveBeenCalled()
+    } finally { h.stop() }
   })
 })
 

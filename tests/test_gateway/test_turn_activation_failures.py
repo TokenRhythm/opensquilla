@@ -180,7 +180,9 @@ async def test_compensation_preserves_actual_terminal_state_and_accepted_identit
     async with ingress(tmp_path, surface) as (stack, send):
         await (seed_web_goal if surface == "web" else seed_channel_goal)(stack)
 
-        async def compensate(context):
+        async def compensate(context, *, session_key):
+            accepted_task = await stack.storage.get_agent_task(context["taskId"])
+            assert session_key == accepted_task.session_key
             if compensation == "raises":
                 raise RuntimeError("synthetic compensation failure")
             if compensation == "success":

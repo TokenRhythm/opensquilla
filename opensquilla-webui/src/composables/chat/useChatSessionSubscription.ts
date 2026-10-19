@@ -1,4 +1,4 @@
-import { ref, type Ref } from 'vue'
+import { ref, shallowReadonly, shallowRef, type Ref } from 'vue'
 import type {
   ChatRunStatus,
   ChatRunStatusSource,
@@ -6,6 +6,8 @@ import type {
 import {
   SessionReadSessionMissingError,
   SessionReadFailure,
+  SessionReadContractError,
+  SessionReadLeaseClosedError,
   type SessionReadActivity,
   type SessionReadLease,
   type SessionReadLeaseReader,
@@ -37,6 +39,8 @@ export interface UseChatSessionSubscriptionOptions {
   activeTaskGroups: Ref<Set<string>>
   taskOwnership?: ChatTaskOwnershipApi
   ownershipHydrationRequired?: () => boolean
+  /** The coordinator checks the monotonic incident deadline at application time. */
+  metadataApplicationAllowed?: () => boolean
   acceptanceStopPending?: Ref<boolean>
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   startStreaming: (
@@ -75,6 +79,33 @@ export interface UseChatSessionSubscriptionOptions {
 export interface SessionMetadataRetryOptions {
   signal?: AbortSignal
   timeoutMs?: number
+}
+
+export type SessionMetadataFailure = SessionReadFailure | SessionReadContractError | SessionReadSessionMissingError
+
+export interface SessionMetadataOutcome {
+  readonly ok: boolean
+  readonly error?: SessionMetadataFailure
+  readonly cancelled?: boolean
+  readonly sessionMissing?: boolean
+}
+
+export interface SessionMetadataState {
+  readonly phase: 'idle' | 'loading' | 'ready' | 'error'
+  readonly key: string
+  readonly lease: SessionReadLease | null
+  readonly attempt: number
+  readonly outcome: SessionMetadataOutcome | null
+}
+
+interface MetadataAttempt {
+  key: string
+  lease: SessionReadLease
+  sequence: number
+  attempt: number
+  controller: AbortController
+  promise: Promise<SessionMetadataOutcome>
+  subscription: SessionSubscriptionOutcome | null
 }
 
 const LIVE_RUN_STATES = ['queued', 'running', 'approval_pending']
@@ -117,7 +148,12 @@ function waitForMetadataRetry<T>(
   signal: AbortSignal,
   timeoutMs: number,
 ): Promise<T> {
-  if (signal.aborted) return Promise.reject(localAbortError('Metadata retry was cancelled.'))
+  if (signal.aborted) {
+    // The operation may synchronously revoke its owner before returning its
+    // promise. Observe that physical failure even when the caller has left.
+    void operation.catch(() => {})
+    return Promise.reject(localAbortError('Metadata retry was cancelled.'))
+  }
   return new Promise<T>((resolve, reject) => {
     let settled = false
     const finish = (callback: () => void) => {
@@ -129,7 +165,7 @@ function waitForMetadataRetry<T>(
     }
     const abort = () => finish(() => reject(localAbortError('Metadata retry was cancelled.')))
     const timer = setTimeout(
-      () => finish(() => reject(new Error('Session metadata recovery timed out.'))),
+      () => finish(() => reject(new SessionReadFailure('timeout', 'Session metadata recovery timed out.', true))),
       timeoutMs,
     )
     signal.addEventListener('abort', abort, { once: true })
@@ -140,14 +176,37 @@ function waitForMetadataRetry<T>(
   })
 }
 
+function metadataFailure(cause: unknown): SessionMetadataFailure {
+  if (cause instanceof SessionReadFailure || cause instanceof SessionReadContractError
+    || cause instanceof SessionReadSessionMissingError) return cause
+  if (cause instanceof SessionReadLeaseClosedError || cause instanceof Error && cause.name === 'AbortError') {
+    return new SessionReadFailure('aborted', 'Session metadata owner was cancelled.', false, 0, cause)
+  }
+  // Transport/domain adapters supply typed failures. An unexpected operation
+  // failure remains bounded by the coordinator, without parsing message text.
+  return new SessionReadFailure('unavailable', 'Session metadata could not be read.', true, 0, cause)
+}
+
+function metadataFailureOutcome(cause: unknown): SessionMetadataOutcome {
+  const error = metadataFailure(cause)
+  return {
+    ok: false, error,
+    cancelled: error instanceof SessionReadFailure && error.kind === 'aborted',
+    sessionMissing: error instanceof SessionReadSessionMissingError,
+  }
+}
+
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
   const isHydrating = ref(false)
   const metadataRecoveryError = ref<unknown>(null)
+  const metadataState = shallowRef<SessionMetadataState>({
+    phase: 'idle', key: options.sessionKey.value, lease: null, attempt: 0, outcome: null,
+  })
   const streamGeneration = ref<string | null>(null)
   const conversationRuntime = options.conversationRuntime
   let activeSubscriptionController: AbortController | null = null
   let subscriptionSequence = 0
-  let activeMetadataController: AbortController | null = null
+  let activeMetadataAttempt: MetadataAttempt | null = null
   let metadataHydrationSequence = 0
 
   function cursor() {
@@ -174,6 +233,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const lease = options.sessionReadLeaseReader.current()
     if (!lease) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
     const sequence = ++subscriptionSequence
+    cancelMetadataAttempt()
     activeSubscriptionController?.abort()
     const controller = new AbortController()
     activeSubscriptionController = controller
@@ -212,13 +272,27 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     metadata: SessionReadMetadata,
     activity: SessionReadActivity = 'unknown',
     ownershipRevision?: number,
+    isCurrent?: () => boolean,
   ): SessionSubscriptionOutcome {
+    const assertCurrent = () => {
+      if (isCurrent && !isCurrent()) throw localAbortError('Session metadata owner changed during installation.')
+      if (options.metadataApplicationAllowed?.() === false) {
+        throw new SessionReadFailure('budget-exhausted', 'Session metadata recovery deadline elapsed.', false)
+      }
+    }
+    assertCurrent()
+    if (metadata.sessionKey !== key || !metadata.hydrationComplete) {
+      // The hydrate contract requires hydration_complete: true. Deferred
+      // project facets are allowed, but a partial hydrate response is invalid.
+      throw new SessionReadContractError('Session metadata hydration returned an incomplete or mismatched result.')
+    }
     assertOwnershipSnapshotCurrent(ownershipRevision)
-    metadataRecoveryError.value = null
     if (metadataGeneration !== undefined) {
       options.onSessionMetadata?.(key, metadataGeneration, metadata)
     }
+    assertCurrent()
     options.onRunModeLock?.(metadata.runModeLock)
+    assertCurrent()
     const source = metadataRunStatusSource(metadata)
     const rawActiveTask = source.activeTask || null
     const rawActiveTaskId = chatTaskId(rawActiveTask)
@@ -231,7 +305,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       : metadata
     const effectiveSource = metadataRunStatusSource(effectiveMetadata)
     options.onSnapshot?.(effectiveMetadata)
-    options.taskOwnership?.applySnapshot(effectiveSource, true, ownershipRevision)
+    assertCurrent()
+    assertOwnershipSnapshotCurrent(ownershipRevision)
+    if (options.taskOwnership && !options.taskOwnership.applySnapshot(effectiveSource, true, ownershipRevision)) {
+      throw new SessionReadFailure('busy', 'Task ownership changed before session metadata was installed.', true)
+    }
+    assertCurrent()
     // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
     // The subscription can race ahead of the original ingress commit, so only
     // the matching send transaction (receipt/rejection) or an explicit session
@@ -306,6 +385,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       backgroundOnly: groupLive && !taskOrInterruptLive,
     }
     if (!outcome.live) options.onAuthoritativeIdle?.()
+    assertCurrent()
+    metadataRecoveryError.value = null
     return outcome
   }
 
@@ -340,42 +421,80 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     }
   }
 
-  function scheduleMetadataHydration(
+  function isCurrentMetadataAttempt(attempt: MetadataAttempt): boolean {
+    return activeMetadataAttempt === attempt
+      && attempt.attempt === metadataHydrationSequence
+      && isCurrentSubscription(attempt.lease, attempt.key, attempt.sequence, attempt.controller.signal)
+  }
+
+  function cancelMetadataAttempt() {
+    const attempt = activeMetadataAttempt
+    if (!attempt) return
+    activeMetadataAttempt = null
+    attempt.controller.abort()
+    if (metadataState.value.attempt === attempt.attempt) {
+      metadataState.value = {
+        ...metadataState.value,
+        phase: 'error',
+        outcome: metadataFailureOutcome(localAbortError('Session metadata attempt was cancelled.')),
+      }
+    }
+  }
+
+  /** One bounded operation. The bootstrap owner, not this adapter, retries it. */
+  function startMetadataAttempt(
     lease: SessionReadLease,
     key: string,
     sequence: number,
-    metadataHydration: number,
     metadataGeneration: number | undefined,
     activity: SessionReadActivity,
-    signal: AbortSignal,
+    signal: AbortSignal | undefined,
     ownershipRevision: number | undefined,
-    reconciliation: boolean,
-  ): void {
-    // A recovery must sample current control state, not reinstall the initial
-    // plan/task snapshot captured before the missed events.
-    void (reconciliation ? lease.retryMetadata() : lease.metadata).then((metadata) => {
-      if (
-        !isCurrentSubscription(lease, key, sequence, signal)
-        || metadataHydration !== metadataHydrationSequence
-      ) return
-      if (!metadata.hydrationComplete) {
-        throw new Error('Session state hydration remained incomplete')
+    operation: () => Promise<SessionReadMetadata>,
+    timeoutMs = SESSION_PHASE_ATTEMPT_BUDGET_MS,
+  ): MetadataAttempt {
+    cancelMetadataAttempt()
+    const controller = new AbortController()
+    const relayAbort = () => controller.abort()
+    if (signal?.aborted) controller.abort()
+    else signal?.addEventListener('abort', relayAbort, { once: true })
+    let complete!: (outcome: SessionMetadataOutcome) => void
+    const attempt: MetadataAttempt = {
+      key, lease, sequence, attempt: ++metadataHydrationSequence, controller,
+      promise: new Promise(resolve => { complete = resolve }), subscription: null,
+    }
+    activeMetadataAttempt = attempt
+    metadataState.value = { phase: 'loading', key, lease, attempt: attempt.attempt, outcome: null }
+    // A synchronous owner watcher can reject this attempt before it starts,
+    // for example when the retained incident deadline has already elapsed.
+    void (async (): Promise<SessionMetadataOutcome> => {
+      try {
+        if (!isCurrentMetadataAttempt(attempt)) return metadataFailureOutcome(localAbortError('Session metadata owner changed.'))
+        const metadata = await waitForMetadataRetry(operation(), controller.signal, Math.max(1, timeoutMs))
+        if (!isCurrentMetadataAttempt(attempt)) return metadataFailureOutcome(localAbortError('Session metadata owner changed.'))
+        attempt.subscription = applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity,
+          ownershipRevision, () => isCurrentMetadataAttempt(attempt))
+        if (!isCurrentMetadataAttempt(attempt)) return metadataFailureOutcome(localAbortError('Session metadata owner changed during installation.'))
+        const outcome: SessionMetadataOutcome = { ok: true }
+        metadataState.value = { phase: 'ready', key, lease, attempt: attempt.attempt, outcome }
+        return outcome
+      } catch (cause) {
+        if (!isCurrentMetadataAttempt(attempt)) return metadataFailureOutcome(localAbortError('Session metadata owner changed.'))
+        const outcome = metadataFailureOutcome(cause)
+        if (isCurrentMetadataAttempt(attempt)) {
+          metadataRecoveryError.value = outcome.error
+          if (metadataGeneration !== undefined) options.onSessionMetadataError?.(key, metadataGeneration)
+          if (outcome.sessionMissing) options.onSessionMissing?.(key)
+          metadataState.value = { phase: 'error', key, lease, attempt: attempt.attempt, outcome }
+          if (!outcome.cancelled) console.warn('Session metadata hydration failed:', outcome.error?.message)
+        }
+        return outcome
+      } finally {
+        signal?.removeEventListener('abort', relayAbort)
+        if (activeMetadataAttempt === attempt) activeMetadataAttempt = null
       }
-      applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity, ownershipRevision)
-    }).catch((cause) => {
-      if (
-        !isCurrentSubscription(lease, key, sequence, signal)
-        || metadataHydration !== metadataHydrationSequence
-      ) return
-      metadataRecoveryError.value = cause
-      if (metadataGeneration !== undefined) {
-        options.onSessionMetadataError?.(key, metadataGeneration)
-      }
-      console.warn(
-        'Session metadata hydration failed:',
-        cause instanceof Error ? cause.message : cause,
-      )
-    })
+    })().then(complete)
+    return attempt
   }
 
   async function runSubscription(
@@ -387,7 +506,6 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     reconciliation = false,
   ): Promise<SessionSubscriptionOutcome> {
     let ownershipRevision = options.taskOwnership?.captureSnapshotRevision()
-    const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
     if (options.lastStreamSeq.value === 0) isHydrating.value = true
     try {
@@ -446,35 +564,37 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
       if (live.initialMetadata.hydrationComplete) {
-        const outcome = applyHydratedSubscriptionState(
-          key,
-          metadataGeneration,
-          live.initialMetadata,
-          live.activity,
-          ownershipRevision,
-        )
-        if (reconciliation) await options.onReconciliationInstalled?.()
+        const attempt = startMetadataAttempt(lease, key, sequence, metadataGeneration, live.activity,
+          signal, ownershipRevision, () => Promise.resolve(live.initialMetadata))
+        const metadataOutcome = await attempt.promise
+        if (metadataOutcome.ok) {
+          if (reconciliation) await options.onReconciliationInstalled?.()
+          if (!isCurrentSubscription(lease, key, sequence, signal)) return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
+          await finishInstallation()
+          return attempt.subscription!
+        }
+        // Metadata can be terminal while delivery registration remains sound.
+        // Keep task ownership unresolved; only an actual subscription change
+        // cancels live installation. The coordinator owns metadata recovery.
         if (!isCurrentSubscription(lease, key, sequence, signal)) return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
-        await finishInstallation()
-        return outcome
-      }
-      if (options.ownershipHydrationRequired?.() !== false) {
-        options.taskOwnership?.applySnapshot(
-          metadataRunStatusSource(live.initialMetadata),
-          false,
+      } else {
+        if (options.ownershipHydrationRequired?.() !== false) {
+          options.taskOwnership?.applySnapshot(
+            metadataRunStatusSource(live.initialMetadata),
+            false,
+          )
+        }
+        startMetadataAttempt(
+          lease,
+          key,
+          sequence,
+          metadataGeneration,
+          live.activity,
+          signal,
+          ownershipRevision,
+          () => reconciliation ? lease.retryMetadata({ fresh: true }) : lease.metadata,
         )
       }
-      scheduleMetadataHydration(
-        lease,
-        key,
-        sequence,
-        metadataHydration,
-        metadataGeneration,
-        live.activity,
-        signal,
-        ownershipRevision,
-        reconciliation,
-      )
       // Fast ACK is authoritative for delivery registration. Deferred storage
       // metadata may refine task/workspace state later but cannot make history
       // or the real-time channel non-terminal.
@@ -522,76 +642,42 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     }
   }
 
-  async function retrySessionMetadata(
+  function runMetadataAttempt(
     retryOptions: SessionMetadataRetryOptions = {},
-  ): Promise<boolean> {
+  ): Promise<SessionMetadataOutcome> {
+    if (retryOptions.signal?.aborted) return Promise.resolve(metadataFailureOutcome(localAbortError('Metadata caller was cancelled.')))
     const key = options.sessionKey.value
-    if (!key) return false
     const lease = options.sessionReadLeaseReader.current()
-    if (!lease) return false
-    const ownershipRevision = options.taskOwnership?.captureSnapshotRevision()
-
-    const metadataHydration = ++metadataHydrationSequence
-    const metadataGeneration = options.beginSessionMetadataResolution?.(key)
-    activeMetadataController?.abort()
-    const controller = new AbortController()
-    activeMetadataController = controller
-    const externalSignal = retryOptions.signal
-    const relayAbort = () => controller.abort()
-    if (externalSignal?.aborted) controller.abort()
-    else externalSignal?.addEventListener('abort', relayAbort, { once: true })
-
-    const timeoutMs = Math.max(
-      1,
-      retryOptions.timeoutMs ?? SESSION_PHASE_ATTEMPT_BUDGET_MS,
-    )
-    const isCurrent = () => (
-      metadataHydration === metadataHydrationSequence
-      && key === options.sessionKey.value
-      && options.sessionReadLeaseReader.current() === lease
-      && !controller.signal.aborted
-    )
-
-    try {
-      const hydration = await waitForMetadataRetry(
-        lease.retryMetadata(),
-        controller.signal,
-        timeoutMs,
-      )
-      if (!isCurrent()) return false
-      if (!hydration.hydrationComplete) {
-        throw new Error('Session state hydration remained incomplete')
-      }
-      applyHydratedSubscriptionState(key, metadataGeneration, hydration, 'unknown', ownershipRevision)
-      return true
-    } catch (cause) {
-      if (isCurrent() && metadataGeneration !== undefined) {
-        options.onSessionMetadataError?.(key, metadataGeneration)
-      }
-      if (isCurrent()) {
-        metadataRecoveryError.value = cause
-        console.warn(
-          'Session metadata recovery failed:',
-          cause instanceof Error ? cause.message : cause,
-        )
-      }
-      return false
-    } finally {
-      externalSignal?.removeEventListener('abort', relayAbort)
-      if (activeMetadataController === controller) {
-        activeMetadataController = null
-      }
+    if (!key || !lease) return Promise.resolve(metadataFailureOutcome(localAbortError('Session metadata has no current read owner.')))
+    let attempt = activeMetadataAttempt
+    if (!attempt || !isCurrentMetadataAttempt(attempt)) {
+      attempt = startMetadataAttempt(lease, key, subscriptionSequence,
+        options.beginSessionMetadataResolution?.(key), 'unknown', undefined,
+        options.taskOwnership?.captureSnapshotRevision(), () => lease.retryMetadata({ fresh: true }),
+        retryOptions.timeoutMs)
     }
+    // Callers share the operation; a short caller timeout or cancellation only
+    // stops that wait. The coordinator explicitly cancels the owned attempt.
+    if (!retryOptions.signal && retryOptions.timeoutMs === undefined) return attempt.promise
+    return waitForMetadataRetry(attempt.promise, retryOptions.signal ?? new AbortController().signal,
+      Math.max(1, retryOptions.timeoutMs ?? SESSION_PHASE_ATTEMPT_BUDGET_MS))
+      .catch(metadataFailureOutcome)
+  }
+
+  async function retrySessionMetadata(retryOptions: SessionMetadataRetryOptions = {}): Promise<boolean> {
+    return (await runMetadataAttempt(retryOptions)).ok
   }
 
   function cancelActiveSubscription() {
     ++subscriptionSequence
-    ++metadataHydrationSequence
+    cancelMetadataAttempt()
     activeSubscriptionController?.abort()
     activeSubscriptionController = null
-    activeMetadataController?.abort()
-    activeMetadataController = null
     metadataRecoveryError.value = null
+    metadataState.value = {
+      phase: 'idle', key: options.sessionKey.value, lease: null,
+      attempt: metadataHydrationSequence, outcome: null,
+    }
     isHydrating.value = false
   }
 
@@ -664,11 +750,14 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   return {
     isHydrating,
     metadataRecoveryError,
+    metadataState: shallowReadonly(metadataState),
     streamGeneration,
     observeStreamGeneration,
     subscribeSession,
     reconcileSession: (bootstrap?: SessionBootstrapPhaseContext) => subscribeSession(bootstrap, true),
     retrySessionMetadata,
+    runMetadataAttempt,
+    cancelMetadataAttempt,
     unsubscribeSession,
     cancelActiveSubscription,
     applySessionRunState,

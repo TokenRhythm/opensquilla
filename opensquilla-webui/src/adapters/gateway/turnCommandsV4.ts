@@ -51,6 +51,15 @@ import {
   validateTurnsReceiptGetResult,
 } from '@/contracts/generated/v4/turnsReceiptGetValidators.mjs'
 import {
+  TURNS_RECEIPT_RESOLVE_METHOD,
+  type ChatSendReceiptQuery,
+  type TurnsReceiptResolveResult,
+} from '@/contracts/generated/v4/turnsReceiptResolve'
+import {
+  validateTurnsReceiptResolveParams,
+  validateTurnsReceiptResolveResult,
+} from '@/contracts/generated/v4/turnsReceiptResolveValidators.mjs'
+import {
   type TurnSendRequest,
   type TurnCancelRequest,
   type TurnCancelResponse,
@@ -575,14 +584,15 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
     transport.supports?.(method) ?? false
   )
 
-  return {
-    supportsReceiptLookup: () => hasRpcMethod(TURNS_RECEIPT_GET_METHOD),
-
-    lookupReceipt: async (
+  const readReceipt = async (
       query: TurnReceiptRequest,
       options?: TurnCommandRequestOptions,
+      resolve = false,
     ): Promise<TurnReceiptResult> => {
-      if (!hasRpcMethod(TURNS_RECEIPT_GET_METHOD)) return { status: 'unsupported' }
+      const resolving = resolve && query.kind === 'send' && query.request.kind === 'new-turn'
+        && hasRpcMethod(TURNS_RECEIPT_RESOLVE_METHOD)
+      const method = resolving ? TURNS_RECEIPT_RESOLVE_METHOD : TURNS_RECEIPT_GET_METHOD
+      if (!hasRpcMethod(method)) return { status: 'unsupported' }
       const originalRequest = query.kind === 'steer'
         ? toWireSteerParams(query.request)
         : query.request.kind === 'pending-input'
@@ -591,19 +601,30 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
       const operation = query.kind === 'steer'
         ? query.request.pendingInputId ? SESSIONS_PENDING_INPUTS_STEER_METHOD : SESSIONS_STEER_V2_METHOD
         : query.request.kind === 'pending-input' ? SESSIONS_PENDING_INPUTS_DISPATCH_METHOD : CHAT_SEND_METHOD
-      const params = response<TurnsReceiptGetParams>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetParams, { operation, originalRequest })
+      const params = resolving
+        ? response<ChatSendReceiptQuery>(method, validateTurnsReceiptResolveParams, { operation, originalRequest })
+        : response<TurnsReceiptGetParams>(method, validateTurnsReceiptGetParams, { operation, originalRequest })
       let raw: unknown
       try {
-        raw = await transport.request(TURNS_RECEIPT_GET_METHOD, params as unknown as Record<string, unknown>, {
-          ...requestOptions(options), recoveryClass: 'safe-read',
+        raw = await transport.request(method, params as unknown as Record<string, unknown>, {
+          ...requestOptions(options), ...(!resolving ? { recoveryClass: 'safe-read' as const } : {}),
         })
       } catch (error) {
         const failure = readTransportFailure(error)
         if (failure.code === 'METHOD_NOT_FOUND' || failure.code === 'UNSUPPORTED') return { status: 'unsupported' }
         throw mapTurnCommandError(error)
       }
-      const result = response<TurnsReceiptGetResult>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetResult, raw)
+      const result = resolving
+        ? response<TurnsReceiptResolveResult>(method, validateTurnsReceiptResolveResult, raw)
+        : response<TurnsReceiptGetResult>(method, validateTurnsReceiptGetResult, raw)
       if (result.status === 'not_found') return { status: 'not-found' }
+      if (result.status === 'retired') {
+        if (result.clientRequestId !== firstDefined(originalRequest, 'clientRequestId', 'client_request_id')
+          || result.requestSessionKey !== firstDefined(originalRequest, 'sessionKey', 'session_key', 'key')) {
+          throw new TurnCommandContractError(method)
+        }
+        return { status: 'retired' }
+      }
       const { receipt } = result
       // A valid shape is not enough to bind a late response to this logical
       // delivery. Fail closed before it can supply a target to a pending Stop.
@@ -630,7 +651,12 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
           },
         },
       }
-    },
+    }
+
+  return {
+    supportsReceiptLookup: () => hasRpcMethod(TURNS_RECEIPT_GET_METHOD),
+    lookupReceipt: (query, options) => readReceipt(query, options),
+    resolveReceipt: (query, options) => readReceipt(query, options, true),
 
     send: async (
       request: TurnSendRequest,

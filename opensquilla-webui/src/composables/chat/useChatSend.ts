@@ -71,6 +71,7 @@ import {
 } from '@/utils/chat/messageIdentity'
 
 import type {
+  DeliveryWalRecord,
   PendingInputWal,
   ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
@@ -203,6 +204,8 @@ interface SendAttempt {
   onAccepted?: () => void
   /** Original delivery owner; retained when a manual retry replaces its UI callback. */
   onDeliveryAccepted?: () => void
+  /** Current composer presentation, separate from the immutable delivery owner. */
+  onSubmissionAccepted?: () => void
   stopOwner?: symbol
 }
 
@@ -269,6 +272,7 @@ interface DispatchSendOptions {
   beforeDispatch?: () => boolean
   onAccepted?: () => void
   onDeliveryAccepted?: () => void
+  onSubmissionAccepted?: () => void
   /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
   requirePreparedHandoff?: boolean
   /** Stable cross-tab identity for one protocol-owned replay. */
@@ -668,13 +672,22 @@ export function useChatSend(options: UseChatSendOptions) {
     acceptanceStopPending.value = false
   }, { flush: 'sync' })
   const pendingDeliveryStops = new Set<string>()
-  const composerSubmissions = new Map<symbol, { sessionKey: string; identity: string | null; snapshot: ComposerSnapshot }>()
+  const composerSubmissions = new Map<symbol, {
+    sessionKey: string; identity: string | null; snapshot: ComposerSnapshot; acceptancePending: boolean
+  }>()
   const composerSubmissionVersion = ref(0)
   const sendPending = computed(() => {
     composerSubmissionVersion.value
     const identity = options.deliveryIdentity?.value
     return Boolean(identity && [...composerSubmissions.values()].some(entry => (
       entry.sessionKey === options.sessionKey.value && entry.identity === identity
+    )))
+  })
+  const sendAcceptancePending = computed(() => {
+    composerSubmissionVersion.value
+    const identity = options.deliveryIdentity?.value
+    return Boolean(identity && [...composerSubmissions.values()].some(entry => (
+      entry.acceptancePending && entry.sessionKey === options.sessionKey.value && entry.identity === identity
     )))
   })
   const sendHydrationBlocked = computed(() => {
@@ -702,6 +715,8 @@ export function useChatSend(options: UseChatSendOptions) {
     item.phase === 'unknown' || item.stopPending
   )))
   const deliveryChecks = ref(new Set<string>())
+  const retiredRecoveries = new Map<string, Promise<void>>()
+  const restoredRetiredDeliveries = new Set<string>()
   const checkingDeliveryIds = computed(() => deliveryRecoveryEntries.value
     .filter(item => deliveryChecks.value.has(item.id)).map(item => item.id))
 
@@ -715,6 +730,8 @@ export function useChatSend(options: UseChatSendOptions) {
       // The application owner rechecks the original receipt under its identity
       // and lease. This action never submits a new message or a Stop intent.
       await options.durableDelivery.retry(id)
+      const record = await options.durableDelivery.get(id)
+      if (record?.retired) await recoverRetiredDelivery(record)
     } catch {
       if (!disposed && options.deliveryIdentity?.value === identity && options.sessionKey.value === key) {
         pushToast(i18n.global.t('deliveryRecovery.reason.storage-check'), { tone: 'warn' })
@@ -770,6 +787,10 @@ export function useChatSend(options: UseChatSendOptions) {
   const stopDeliveryObserver = options.durableDelivery.observe(record => {
     if (disposed) return
     if (record.deliveryIdentity !== options.deliveryIdentity?.value) return
+    if (record.phase === 'not-sent' && record.retired) {
+      void recoverRetiredDelivery(record)
+      return
+    }
     if (record.phase === 'not-sent' && record.stop?.requested && record.stop.completed) {
       // This is proof about the original request, unlike a rejection of a
       // later receipt read. Mark an in-flight attempt before its catch runs.
@@ -1176,6 +1197,95 @@ export function useChatSend(options: UseChatSendOptions) {
     if (recoveredAttempt === attempt) recoveredAttempt = null
   }
 
+  function recoverRetiredDelivery(update: DeliveryUpdate): Promise<void> {
+    const recoveryKey = `${update.deliveryIdentity}\u0000${update.ownerRequestId}`
+    if (restoredRetiredDeliveries.has(recoveryKey)) return Promise.resolve()
+    const existing = retiredRecoveries.get(recoveryKey)
+    if (existing) return existing
+    const operation = (async () => {
+      const attempt = [observedAttempts.get(update.ownerRequestId), recoveredAttempt,
+        activeAcceptanceTransaction?.attempt].find(candidate => candidate
+        && candidate.clientRequestId === update.ownerRequestId
+        && candidate.deliveryIdentity === update.deliveryIdentity
+        && candidate.requestSessionKey === update.requestSessionKey)
+      // The durable server fence, unlike a missing receipt, proves this ID
+      // cannot execute. The next deliberate Send must get a fresh identity.
+      if (attempt) releaseStoppedAttempt(attempt)
+      const record = await options.durableDelivery.get(update.ownerRequestId)
+      if (disposed || !record?.retired || record.phase !== 'not-sent'
+        || record.deliveryIdentity !== options.deliveryIdentity?.value
+        || record.requestSessionKey !== options.sessionKey.value) return
+      const gate = activeResponseHandoff?.ownerRequestId === record.ownerRequestId
+        ? activeResponseHandoff : null
+      if (gate) {
+        try {
+          await markResponseHandoffFailed(gate, new TurnCommandError(
+            'rejected', 'The original request was safely retired', 'DELIVERY_RETIRED', false, false,
+          ))
+        } finally { finishResponseHandoff(gate) }
+      }
+      if (disposed || record.deliveryIdentity !== options.deliveryIdentity?.value
+        || record.requestSessionKey !== options.sessionKey.value) return
+      const handoff = gate?.durableRecord ?? record.handoff
+      const finishRestoration = async () => {
+        // Consume only the composer projection. The retired delivery and its
+        // immutable request remain durable; reload must not resurrect a draft
+        // already restored and subsequently sent with a fresh request ID.
+        if (!handoff || await deleteResponseHandoff(handoff)) restoredRetiredDeliveries.add(recoveryKey)
+      }
+      if (handoff?.restoreComposerOnFailure === false || attempt?.restoreComposerOnHandoffFailure === false) {
+        await finishRestoration()
+        return
+      }
+      const params = handoff?.params || (record.request?.kind === 'send'
+        && record.request.request.kind === 'new-turn' ? record.request.request.params : null)
+      if (!params) return
+      // A newer draft has its own text and references. Keep the old payload in
+      // its retired WAL record rather than mixing it into that new draft.
+      if (options.inputText.value || options.pendingAttachments.value.length
+        || options.selectedSkills?.value.length || options.localPathReferences?.value.length) {
+        await finishRestoration()
+        return
+      }
+      const text = attempt?.composerText ?? handoff?.composerText ?? params.message
+      if (options.restoreInput) options.restoreInput(text, params.localPathReferences)
+      else {
+        options.inputText.value = text
+        if (options.localPathReferences) options.localPathReferences.value = copyLocalPathReferences(params.localPathReferences, text)
+      }
+      if (options.selectedSkills) options.selectedSkills.value = copySelectedSkills(params.selectedSkills)
+      options.pendingAttachments.value = attempt?.attachments.map(snapshotAttachment)
+        ?? retiredRecoveryAttachments(record, params)
+      if (!options.pendingSessionIntent.value) options.pendingSessionIntent.value = params.intent ?? null
+      if (!options.pendingForkBeforeMessageId.value) options.pendingForkBeforeMessageId.value = params.forkBeforeMessageId ?? null
+      if (options.pendingWorkspaceId && !options.pendingWorkspaceId.value) options.pendingWorkspaceId.value = params.workspaceId ?? null
+      const clientMessageId = attempt?.clientMessageId ?? handoff?.clientMessageId ?? params.clientMessageId
+      if (clientMessageId) options.messages.value = options.messages.value.filter(message => message.clientId !== clientMessageId)
+      options.autoResizeTextarea()
+      await finishRestoration()
+    })().catch(() => {}).finally(() => { retiredRecoveries.delete(recoveryKey) })
+    retiredRecoveries.set(recoveryKey, operation)
+    return operation
+  }
+
+  function retiredRecoveryAttachments(record: DeliveryWalRecord, params: TurnSendParams): Attachment[] {
+    if (record.handoff?.recoveryAttachments.length) return record.handoff.recoveryAttachments.map(snapshotAttachment)
+    // Older ordinary-send WAL records retain the wire payload but no local
+    // attachment projection. Restore those bytes/references without uploading.
+    let localId = -Date.now()
+    return [
+      ...(params.attachments || []).flatMap((file): Attachment[] => {
+        const common = { local_id: localId--, name: file.name, mime: file.mime, size: file.size }
+        if (file.file_uuid) return [{ ...common, kind: 'staged', file_uuid: file.file_uuid }]
+        return file.data ? [{ ...common, kind: 'inline', data: file.data }] : []
+      }),
+      ...(params.workspaceFiles || []).map((workspaceFile): Attachment => ({
+        kind: 'workspace', local_id: localId--, name: workspaceFile.name, mime: workspaceFile.mime,
+        size: workspaceFile.size, workspaceFile: { ...workspaceFile },
+      })),
+    ]
+  }
+
   function settleRecoveredAcceptance(
     attempt: SendAttempt,
     response: TurnSendResponse,
@@ -1223,10 +1333,13 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function notifySendAccepted(attempt: SendAttempt) {
+    const onSubmissionAccepted = attempt.onSubmissionAccepted
     const onDeliveryAccepted = attempt.onDeliveryAccepted
     const onAccepted = attempt.onAccepted
     attempt.onDeliveryAccepted = undefined
     attempt.onAccepted = undefined
+    attempt.onSubmissionAccepted = undefined
+    onSubmissionAccepted?.()
     onDeliveryAccepted?.()
     onAccepted?.()
   }
@@ -1890,7 +2003,8 @@ export function useChatSend(options: UseChatSendOptions) {
         if (delivery.phase === 'accepted' && delivery.response) {
           await finalizeRecoveredHandoff(record,
             delivery.response.sessionKey || delivery.response.key || record.requestSessionKey)
-        } else void options.durableDelivery.wake()
+        } else if (delivery.retired) await recoverRetiredDelivery(delivery)
+        else void options.durableDelivery.wake()
       }
     })().finally(() => {
       handoffRecoveryPromise = null
@@ -2306,22 +2420,30 @@ export function useChatSend(options: UseChatSendOptions) {
       entry.identity === identity && entry.sessionKey === key && composerMatchesSnapshot(entry.snapshot)
     ))) return
     const token = Symbol('composer-send')
-    composerSubmissions.set(token, { sessionKey: key, identity, snapshot: captureComposerSnapshot() })
+    composerSubmissions.set(token, { sessionKey: key, identity, snapshot: captureComposerSnapshot(), acceptancePending: true })
     composerSubmissionVersion.value += 1
+    const onSubmissionAccepted = () => {
+      const entry = composerSubmissions.get(token)
+      if (!entry || !entry.acceptancePending) return
+      entry.acceptancePending = false
+      if (!disposed) composerSubmissionVersion.value += 1
+    }
     try {
       const resumeQueue = invocation.resumeQueueOnSuccess
         ? options.capturePendingAutoSendResume?.() : undefined
       const onAccepted = invocation.onAccepted
         ? () => { resumeQueue?.(); invocation.onAccepted?.() }
         : resumeQueue
-      return await sendComposerInput(invocation, onAccepted)
+      return await sendComposerInput(invocation, onAccepted, onSubmissionAccepted)
     } finally {
       composerSubmissions.delete(token)
       if (!disposed) composerSubmissionVersion.value += 1
     }
   }
 
-  async function sendComposerInput(invocation: SendInvocation, onAccepted?: () => void): Promise<ChatSendOutcome | undefined> {
+  async function sendComposerInput(
+    invocation: SendInvocation, onAccepted?: () => void, onSubmissionAccepted?: () => void,
+  ): Promise<ChatSendOutcome | undefined> {
     const requestSessionKey = options.sessionKey.value
     const requestDeliveryIdentity = options.deliveryIdentity?.value
     const deliveryStillMatches = () => (
@@ -2385,6 +2507,7 @@ export function useChatSend(options: UseChatSendOptions) {
         preDispatchGuard: deliveryStillMatches,
         onAccepted,
         onDeliveryAccepted: invocation.onDeliveryAccepted,
+        onSubmissionAccepted,
       })
     }
 
@@ -2486,6 +2609,7 @@ export function useChatSend(options: UseChatSendOptions) {
         preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
         onAccepted,
         onDeliveryAccepted: invocation.onDeliveryAccepted,
+        onSubmissionAccepted,
       })
     }
 
@@ -2654,7 +2778,7 @@ export function useChatSend(options: UseChatSendOptions) {
           consumeComposerOnQueue: true,
           cancelIfComposerChanged: true,
           requireNewTurn: true,
-        }, onAccepted)
+        }, onAccepted, onSubmissionAccepted)
       }
       if (handled) return
     }
@@ -2670,6 +2794,7 @@ export function useChatSend(options: UseChatSendOptions) {
       preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
       onAccepted,
       onDeliveryAccepted: invocation.onDeliveryAccepted,
+      onSubmissionAccepted,
     })
   }
 
@@ -3025,6 +3150,9 @@ export function useChatSend(options: UseChatSendOptions) {
     // immutable SendAttempt. Never put the same idempotency key on the wire
     // twice concurrently.
     if (retryAttempt?.acceptanceInFlight) return 'retryable_failure'
+    if (retryAttempt && sendOpts.onSubmissionAccepted) {
+      retryAttempt.onSubmissionAccepted = sendOpts.onSubmissionAccepted
+    }
     const attemptAnnotationDraftIds = retryAttempt?.draftIds
       ?? requestedAnnotationDraftIds
     // Finish local overlay edits before taking the immutable send snapshot.
@@ -3203,6 +3331,7 @@ export function useChatSend(options: UseChatSendOptions) {
         deliveryIdentity: requestDeliveryIdentity,
         onAccepted: sendOpts.onAccepted,
         onDeliveryAccepted: sendOpts.onDeliveryAccepted,
+        onSubmissionAccepted: sendOpts.onSubmissionAccepted,
         draftIds: [...attemptAnnotationDraftIds],
         promptAnnotations: sentSnapshots,
         pageContext: attemptPageContext,
@@ -4197,6 +4326,7 @@ export function useChatSend(options: UseChatSendOptions) {
     },
     onSend,
     sendPending,
+    sendAcceptancePending,
     sendHydrationBlocked,
     deliveryRecoveryEntries,
     checkingDeliveryIds,

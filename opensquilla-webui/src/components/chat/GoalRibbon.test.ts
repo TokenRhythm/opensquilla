@@ -88,6 +88,30 @@ afterEach(() => {
 })
 
 describe('GoalRibbon', () => {
+  it('reuses the lifecycle action for same-token retry without emitting Resume or Takeover', () => {
+    const onRetry = vi.fn()
+    const onResume = vi.fn()
+    const onTakeover = vi.fn()
+    const host = mountRibbon({
+      goal: goal({ continuationDeferredReason: 'owner_disconnected', activeTaskId: null, executionState: 'idle' }),
+      connectionRetryAvailable: true, 'onRetry-connection': onRetry, onResume, onTakeover,
+    })
+    const action = host.querySelector<HTMLButtonElement>('[data-testid="goal-lifecycle-action"]')!
+    expect(action.dataset.action).toBe('retry-connection')
+    expect(action.textContent).toContain('Retry')
+    action.click()
+    expect(onRetry).toHaveBeenCalledOnce()
+    expect(onResume).not.toHaveBeenCalled()
+    expect(onTakeover).not.toHaveBeenCalled()
+  })
+
+  it('keeps the same retry action disabled while recovery runs without disabling the Goal menu', async () => {
+    const host = mountRibbon({ connectionRetryAvailable: true, reattaching: true })
+    expect(host.querySelector<HTMLButtonElement>('[data-action="retry-connection"]')?.disabled).toBe(true)
+    await openActions(host)
+    expect(host.querySelectorAll('[role="menuitem"]')).toHaveLength(2)
+  })
+
   it('edits the objective without budget or continuous-run controls', async () => {
     const onEdit = vi.fn()
     const host = mountRibbon({ onEdit })
@@ -262,7 +286,7 @@ describe('GoalRibbon', () => {
     expect(host.querySelector('details')).not.toBeNull()
   })
 
-  it('keeps a disconnected Goal active and offers explicit continuation', () => {
+  it('keeps a disconnected Goal active and offers explicit continuation without recovery copy', () => {
     const onTakeover = vi.fn()
     const host = mountRibbon({
       goal: goal({
@@ -275,8 +299,9 @@ describe('GoalRibbon', () => {
       onTakeover,
     })
 
-    expect(host.textContent).toContain('Goal still active')
-    expect(host.textContent).toContain('automatic progress is waiting for this tab to reconnect')
+    expect(host.textContent).toContain('Goal')
+    expect(host.textContent).not.toContain('Goal still active')
+    expect(host.textContent).not.toContain('automatic progress is waiting for this tab to reconnect')
     const continueButton = host.querySelector<HTMLButtonElement>(
       '[data-testid="goal-lifecycle-action"]',
     )
@@ -284,6 +309,20 @@ describe('GoalRibbon', () => {
     continueButton?.click()
     expect(onTakeover).toHaveBeenCalledOnce()
     expect(host.textContent).not.toContain('Goal paused')
+  })
+
+  it.each([false, true])('keeps owner recovery quiet while preserving the explicit retry action: reattaching=%s', reattaching => {
+    const host = mountRibbon({
+      goal: goal({ continuationDeferredReason: 'owner_disconnected', activeTaskId: null, executionState: 'idle' }),
+      connectionRetryAvailable: true,
+      reattaching,
+    })
+    expect(host.querySelector('.goal-ribbon__meta')?.textContent).not.toContain('reconnect')
+    expect(host.textContent).not.toContain('Goal still active')
+    expect(host.textContent).toContain('2 turns')
+    const action = host.querySelector<HTMLButtonElement>('[data-action="retry-connection"]')!
+    expect(action.textContent).toContain('Retry')
+    expect(action.disabled).toBe(reattaching)
   })
 
   it('edits the objective with a labeled multiline field', async () => {

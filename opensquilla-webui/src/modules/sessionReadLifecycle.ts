@@ -231,8 +231,15 @@ export interface SessionReadOpenRequest {
   readonly sessionKey: string
   /** Local new-chat intent, before its first send creates a durable session. */
   readonly provisionalDraft?: boolean
-  /** Queue the first latest-history frame behind subscribe/snapshot. Defaults to true. */
+  /** Prefetch latest history after the adapter's required live installation. Defaults to true. */
   readonly includeInitialHistory?: boolean
+  /** Admit metadata storage work without delaying live registration or history. */
+  readonly beforeMetadataRead?: (signal: AbortSignal) => Promise<void>
+}
+
+export interface SessionMetadataReadOptions {
+  /** A new logical attempt must not install a sample captured by an older one. */
+  readonly fresh?: boolean
 }
 
 /**
@@ -244,7 +251,7 @@ export interface SessionReadLease {
   readonly live: Promise<SessionReadLive>
   readonly metadata: Promise<SessionReadMetadata>
   readonly history: SessionReadHistoryReader
-  retryMetadata(): Promise<SessionReadMetadata>
+  retryMetadata(options?: SessionMetadataReadOptions): Promise<SessionReadMetadata>
   /** Refresh the current subscription without releasing its delivery authority. */
   reconcile(): Promise<SessionReadLive>
   close(): Promise<void>
@@ -270,6 +277,7 @@ export interface SessionReadPortOpenRequest {
   readonly includeInitialHistory: boolean
   readonly resumeFrom: SessionReadPortCursor
   readonly signal: AbortSignal
+  readonly beforeMetadataRead?: (signal: AbortSignal) => Promise<void>
 }
 
 export interface SessionReadPortLive extends Omit<SessionReadLive, 'reloadRequired'> {
@@ -299,7 +307,7 @@ export interface SessionReadPortLease {
   readonly live: Promise<SessionReadPortLive>
   readonly metadata: Promise<SessionReadMetadata>
   readHistory(request: SessionReadPortHistoryRequest): Promise<SessionReadHistoryPage>
-  retryMetadata(): Promise<SessionReadMetadata>
+  retryMetadata(options?: SessionMetadataReadOptions): Promise<SessionReadMetadata>
   reconcile(): Promise<SessionReadPortLive>
   close(): Promise<void>
 }
@@ -526,6 +534,7 @@ export function createSessionReadLifecycle(
         sessionKey,
         ...(request.provisionalDraft ? { provisionalDraft: true } : {}),
         includeInitialHistory: request.includeInitialHistory !== false,
+        beforeMetadataRead: request.beforeMetadataRead,
         resumeFrom: {
           streamGeneration: seed.streamGeneration,
           streamSeq: seed.streamSeq,
@@ -668,10 +677,10 @@ export function createSessionReadLifecycle(
       ),
     })
 
-    async function retryMetadata(): Promise<SessionReadMetadata> {
+    async function retryMetadata(retryOptions?: SessionMetadataReadOptions): Promise<SessionReadMetadata> {
       assertCurrent(state, options.subscriptions)
       const portLease = await acquire
-      const value = await portLease.retryMetadata()
+      const value = await portLease.retryMetadata(retryOptions)
       assertCurrent(state, options.subscriptions)
       if (value.sessionKey !== sessionKey) {
         throw new SessionReadContractError(

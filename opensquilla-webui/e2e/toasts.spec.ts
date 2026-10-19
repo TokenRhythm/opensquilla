@@ -38,7 +38,7 @@ test.describe('Failure toasts and composer copy', () => {
     expect(placeholder).not.toMatch(/[一-鿿]/)
   })
 
-  for (const mobile of [false, true]) test(`unsupported voice input stays at the bottom and auto-dismisses (${mobile ? 'mobile' : 'desktop'})`, async ({ page }) => {
+  for (const mobile of [false, true]) test(`unsupported voice input clears the composer and auto-dismisses (${mobile ? 'mobile' : 'desktop'})`, async ({ page }) => {
     await page.setViewportSize(mobile ? { width: 390, height: 844 } : { width: 1280, height: 900 })
     await page.addInitScript(() => {
       Object.defineProperty(window, 'MediaRecorder', { value: undefined, configurable: true })
@@ -55,20 +55,25 @@ test.describe('Failure toasts and composer copy', () => {
 
     // The host is a polite live region and does not steal focus.
     await expect(page.getByTestId('toast-host')).toHaveAttribute('aria-live', 'polite')
+    await expect.poll(() => page.getByTestId('toast-host').evaluate(host => {
+      const rect = host.getBoundingClientRect()
+      const composer = document.querySelector('.chat-composer')?.getBoundingClientRect()
+      return !composer || rect.right <= composer.left || rect.left >= composer.right
+        || rect.bottom <= composer.top || rect.top >= composer.bottom
+    })).toBe(true)
     const position = await page.getByTestId('toast-host').evaluate(host => {
       const rect = host.getBoundingClientRect()
       const tabbar = document.querySelector('.mobile-tabbar')?.getBoundingClientRect()
       return { rightGap: innerWidth - rect.right, bottomGap: innerHeight - rect.bottom,
         top: rect.top, bottom: rect.bottom, tabbarTop: tabbar?.top ?? innerHeight }
     })
-    expect(position.top).toBeGreaterThan(400)
+    expect(position.top).toBeGreaterThanOrEqual(8)
     expect(position.rightGap).toBeGreaterThan(0)
     expect(position.rightGap).toBeLessThan(30)
     if (mobile) {
       expect(position.bottom).toBeLessThan(position.tabbarTop)
     } else {
       expect(position.bottomGap).toBeGreaterThan(0)
-      expect(position.bottomGap).toBeLessThan(30)
     }
 
     // Auto-dismisses without user action.

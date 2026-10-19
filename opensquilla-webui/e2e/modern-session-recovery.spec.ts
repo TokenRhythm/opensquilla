@@ -1,4 +1,5 @@
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test'
+import { writeFile } from 'node:fs/promises'
 import { helloOkResponse } from './support/gateway-fixture'
 import {
   chatHistoryPayload,
@@ -28,7 +29,7 @@ type Request = {
 type Observed = Request & { connection: number }
 type HeldPiece = { frame: Observed; send: () => void; index: number; delivery: number }
 
-async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' | 'lost-subscribe') {
+async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' | 'lost-subscribe' | 'goal-gap') {
   await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') })
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   await page.route('**/api/**', route => route.fulfill({ json: {} }))
@@ -42,6 +43,10 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const snapshots = new Map<string, { id: string; bytes: Buffer; subscribed: boolean }>()
   const rejectedResumes: Observed[] = []
   const heldSubscriptions: Observed[] = []
+  const initialSubscriptionReplies: Array<() => void> = []
+  let holdInitialSubscription = false
+  let holdHandshake = false
+  const heldHandshakes: Array<() => void> = []
   const hydratedPlanRevisions: string[] = []
   const sentHistory: Array<Record<string, unknown>> = []
   const liveFrames: string[] = []
@@ -91,12 +96,13 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
       }
       if (frame.method === 'sessions.messages.subscribe') subscriptions.add(key)
       if (frame.method === 'connect') {
-        socket.send(helloOkResponse({
+        const sendHello = () => socket.send(helloOkResponse({
           protocol: 4,
           server: { conn_id: `synthetic-modern-${connection}` },
           features: { methods: [
             READ, RESUME, RELEASE, 'transport.flow.update', 'sessions.messages.subscribe',
             'sessions.messages.hydrate', 'sessions.messages.unsubscribe', 'chat.history',
+            ...(mode === 'goal-gap' ? ['goals.set', 'goals.capabilities', 'sessions.create'] : []),
           ] },
           policy: {
             transport_probe_nonce: true,
@@ -104,6 +110,8 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
             transport_flow: { delivery_epoch: epoch, window_frames: 128, window_bytes: 4 * 1024 * 1024 },
           },
         }))
+        if (holdHandshake) heldHandshakes.push(sendHello)
+        else sendHello()
         return
       }
       if (frame.method === READ) {
@@ -141,7 +149,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
           session_id: null, session_epoch: null,
           delivery: { delivery_epoch: epoch, delivery_id: delivery },
         }
-        if (key === SESSION && (mode === 'stalled' || mode === 'progressing')) {
+        if (key === SESSION && (mode === 'stalled' || mode === 'progressing' || mode === 'goal-gap')) {
           held.push({ frame: observed, send: () => respond(payload), index, delivery })
         } else respond(payload)
         return
@@ -172,6 +180,26 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
       }
       if (frame.method === RELEASE) {
         respond({ ...observed.params, retired: true })
+        return
+      }
+      if (frame.method === 'sessions.create' && mode === 'goal-gap') {
+        respond({ key: SESSION, sessionId: 'synthetic-goal-session' })
+        return
+      }
+      if (frame.method === 'goals.set' && mode === 'goal-gap') {
+        const goal = {
+          goalId: 'synthetic-recovery-goal', sessionKey: key, sessionId: 'synthetic-goal-session', epoch: 1,
+          objective: observed.params.objective, status: 'active', stateRevision: 1, objectiveRevision: 1,
+          progressRevision: 0, progress: null, continuationSeq: 0, activeTaskId: 'synthetic-goal-task',
+          sourceMessageId: 'synthetic-goal-message', executionState: 'working', continuationDeferredReason: null,
+          turnsStarted: 1, turnsSettled: 0, windowTurnsStarted: 1, activeTimeMs: 0, windowActiveTimeMs: 0,
+          usage: { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0,
+            cacheWriteTokens: 0, totalTokens: 0 },
+          pauseReason: null, blockedReason: null, terminalReason: null, createdAt: 1, updatedAt: 1, finishedAt: null,
+        }
+        respond({ accepted: true, clientRequestId: observed.params.clientRequestId, sessionKey: key,
+          sessionId: goal.sessionId, epoch: 1, taskId: goal.activeTaskId, userMessageId: goal.sourceMessageId,
+          previousGoalId: null, goal })
         return
       }
       if (frame.method === 'chat.send') {
@@ -223,7 +251,10 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
         'sessions.subscribe': { subscribed: true },
         'usage.status': { sessions: [] },
       }
-      respond(Object.hasOwn(payloads, frame.method) ? payloads[frame.method] : {})
+      const response = Object.hasOwn(payloads, frame.method) ? payloads[frame.method] : {}
+      if (frame.method === 'sessions.messages.subscribe' && holdInitialSubscription) {
+        initialSubscriptionReplies.push(() => respond(response))
+      } else respond(response)
     })
   })
   const tick = () => sockets.forEach(socket => socket.send(JSON.stringify({
@@ -243,7 +274,23 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
         payload: { key: SESSION, session_key: SESSION, reason: 'task_terminal', ...metadata() } }))
     },
     replayTurn: () => { for (const frame of liveFrames) sockets.at(-1)!.send(frame) },
-    releaseFault: () => { faultActive = false } }
+    releaseFault: () => { faultActive = false },
+    holdNextHandshake: () => { holdHandshake = true },
+    releaseHandshake: () => {
+      holdHandshake = false
+      for (const respond of heldHandshakes.splice(0)) respond()
+    },
+    invalidateSession: (key = SESSION) => {
+      const connection = sockets.length
+      sockets.at(-1)!.send(JSON.stringify({ type: 'event', event: 'transport.flow.dirty', payload: {
+        delivery_epoch: `synthetic-delivery-${connection}`, dirty_keys: [key], global_dirty: false,
+      } }))
+    },
+    holdNextSubscription: () => { holdInitialSubscription = true },
+    releaseInitialSubscription: () => {
+      holdInitialSubscription = false
+      for (const respond of initialSubscriptionReplies.splice(0)) respond()
+    } }
 }
 
 async function advance(page: Page, milliseconds: number) {
@@ -259,11 +306,112 @@ function calls(requests: Observed[], method: string, connection?: number) {
     && (connection === undefined || item.connection === connection))
 }
 
+async function recordRecoveryOutcome(page: Page, requests: Observed[], started: number, ready: boolean) {
+  const work = Object.fromEntries([...new Set(requests.map(item => item.method))]
+    .map(method => [method, calls(requests, method).length]))
+  const body = JSON.stringify({ evidence: 'Chromium with a synthetic Gateway and controlled clock',
+    ready, observedRecoveryMs: (await page.evaluate(() => performance.now())) - started,
+    requestsByMethod: work }, null, 2)
+  await writeFile(test.info().outputPath('recovery-outcome.json'), body)
+  await test.info().attach('recovery-outcome.json', { body, contentType: 'application/json' })
+}
+
+async function recordHandoffOutcome(requests: Observed[], entry = 'warm public route/history-state handoff contract') {
+  const body = JSON.stringify({
+    evidence: `Chromium with a synthetic Gateway; ${entry}`,
+    acceptedRequests: calls(requests, 'chat.send').map(request => request.params),
+    connectionCount: calls(requests, 'connect').length,
+  }, null, 2)
+  await writeFile(test.info().outputPath('handoff-outcome.json'), body)
+  await test.info().attach('handoff-outcome.json', { body, contentType: 'application/json' })
+}
+
+async function openWarmAutoSendHandoff(page: Page) {
+  const gateway = await prepare(page, 'healthy')
+  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+  await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+  // History state is a supported consumer contract. Mount a fresh ChatView
+  // with an established transport, using only public navigation/state inputs.
+  // This does not establish a currently shipped autosend-producing UI button.
+  await page.getByRole('link', { name: 'Skills & Channels', exact: true }).click()
+  await expect(page).toHaveURL(/\/control\/skills$/)
+  await expect(page.locator('.chat-textarea')).toHaveCount(0)
+  gateway.holdNextSubscription()
+  await page.evaluate(prefill => {
+    window.history.pushState({ ...window.history.state, prefill, autosend: true }, '', '/control/chat/new?agent=main')
+    window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }))
+  }, DRAFT)
+  await expect.poll(() => calls(gateway.requests, 'sessions.messages.subscribe').length).toBe(2)
+  const input = page.locator('.chat-textarea')
+  await expectComposerValue(input, DRAFT)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  return { gateway, input }
+}
+
+test('automatically sends an unchanged new-task handoff exactly once after subscription readiness', async ({ page }) => {
+  test.setTimeout(90_000)
+  const { gateway, input } = await openWarmAutoSendHandoff(page)
+  const subscribedKey = calls(gateway.requests, 'sessions.messages.subscribe')[1]!.params.key
+  gateway.releaseInitialSubscription()
+  await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+  expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({
+    sessionKey: subscribedKey, message: DRAFT, intent: 'new_chat',
+  })
+  await expectComposerValue(input, '')
+  await advance(page, 10_000)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+  await expect(page.getByText(DRAFT, { exact: true })).toHaveCount(1)
+  await recordHandoffOutcome(gateway.requests)
+})
+
+test('suppresses new-task handoff autosend after an edit and sends the edited draft only on user action', async ({ page }) => {
+  test.setTimeout(90_000)
+  const { gateway, input } = await openWarmAutoSendHandoff(page)
+  const edited = 'User edited the automatic handoff while waiting for the initial subscription.'
+  await input.fill(edited)
+  gateway.releaseInitialSubscription()
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  await expect(send).toBeEnabled()
+  await advance(page, 10_000)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await expectComposerValue(input, edited)
+
+  await input.press('Enter')
+  await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+  expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ message: edited, intent: 'new_chat' })
+  await expectComposerValue(input, '')
+  await advance(page, 10_000)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+  await expect(page.getByText(edited, { exact: true })).toHaveCount(1)
+  await expect(page.getByText(DRAFT, { exact: true })).toHaveCount(0)
+  await recordHandoffOutcome(gateway.requests)
+})
+
+test('keeps autosend cancelled after edit then undo until an explicit send', async ({ page }) => {
+  test.setTimeout(90_000)
+  const { gateway, input } = await openWarmAutoSendHandoff(page)
+  await input.fill('A deliberate temporary user edit.')
+  await input.fill(DRAFT)
+  gateway.releaseInitialSubscription()
+  await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+  await advance(page, 10_000)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await expectComposerValue(input, DRAFT)
+  await input.press('Enter')
+  await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+  expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ message: DRAFT, intent: 'new_chat' })
+  await expectComposerValue(input, '')
+  await advance(page, 10_000)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+  await expect(page.getByText(DRAFT, { exact: true })).toHaveCount(1)
+  await recordHandoffOutcome(gateway.requests)
+})
+
 test('automatically replaces a stale snapshot after a lost subscribe and hydrates the recovered ACK', async ({ page }) => {
   const gateway = await prepare(page, 'lost-subscribe')
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
-  // This is the first Chromium page in the job. Bound its cold startup and
-  // mocked Gateway handshake separately from the fake-clock recovery budgets.
+  // Bound page startup and the mocked Gateway handshake separately from the
+  // fake-clock recovery budgets.
   await expect.poll(() => ({
     connects: calls(gateway.requests, 'connect').length,
     reads: calls(gateway.requests, READ).length,
@@ -274,9 +422,10 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await input.fill(DRAFT)
   const editor = await input.elementHandle()
   const originalUrl = page.url()
+  const recoveryStarted = await page.evaluate(() => performance.now())
   await advance(page, 7_100)
   const notice = page.getByTestId('chat-session-recovery-status')
-  await expect(notice).toHaveAttribute('data-recovery-state', 'live-degraded')
+  await expect(notice).toHaveCount(0)
   await expect(send).toBeDisabled()
 
   gateway.releaseFault()
@@ -304,6 +453,7 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await expect(page.getByText('Outdated recovery proposal', { exact: true })).toHaveCount(0)
   await expect(notice).toHaveCount(0)
   await expect(send).toBeEnabled()
+  await recordRecoveryOutcome(page, gateway.requests, recoveryStarted, true)
   await expectComposerValue(input, DRAFT)
   expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
   expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
@@ -345,20 +495,23 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   expect(gateway.sockets).toHaveLength(1)
 })
 
-test('stays degraded beyond the foreground deadline and does not resurrect a dismissed notice', async ({ page }) => {
+test('keeps exhausted live recovery quiet and exposes a bounded composer retry', async ({ page }) => {
   const gateway = await prepare(page, 'stalled')
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
   await expect.poll(() => gateway.held.length).toBeGreaterThan(0)
   await page.locator('.chat-textarea').fill(DRAFT)
+  const recoveryStarted = await page.evaluate(() => performance.now())
   await advance(page, 16_000)
   const notice = page.getByTestId('chat-session-recovery-status')
-  await expect(notice).toHaveAttribute('data-recovery-state', 'live-degraded')
+  await expect(notice).toHaveCount(0)
   await expect(page.getByText('Synthetic cached history remains available.', { exact: true })).toBeVisible()
-  const retry = page.getByTestId('chat-session-recovery-retry')
-  await expect(retry).toBeVisible()
-  await retry.click()
-  await expect(notice).toHaveAttribute('data-recovery-state', 'live-degraded')
-  await notice.getByRole('button', { name: 'Close', exact: true }).click()
+  await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeDisabled()
+  await advance(page, 105_000)
+  await expect(notice).toHaveCount(0)
+  const retry = page.getByTestId('chat-composer-recovery')
+  await expect(retry).toHaveAttribute('data-recovery-action', 'retry')
+  await expect(retry).toBeEnabled()
+  const readsAtDeadline = calls(gateway.requests, READ).length
   await expect(notice).toHaveCount(0)
 
   for (let seconds = 0; seconds < 60; seconds += 5) {
@@ -370,6 +523,8 @@ test('stays degraded beyond the foreground deadline and does not resurrect a dis
     await expect(notice).toHaveCount(0)
     await expectComposerValue(page.locator('.chat-textarea'), DRAFT)
   }
+  expect(calls(gateway.requests, READ)).toHaveLength(readsAtDeadline)
+  await recordRecoveryOutcome(page, gateway.requests, recoveryStarted, false)
   expect(gateway.sockets).toHaveLength(1)
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
   expect(calls(gateway.requests, 'sessions.messages.snapshot')).toHaveLength(0)
@@ -388,6 +543,7 @@ test('finishes a progressing 48 second transfer with its original sync revision'
   await expect.poll(() => gateway.held.length).toBe(1)
   await page.locator('.chat-textarea').fill(DRAFT)
   const revision = gateway.held[0]!.frame.params.sync_revision
+  const recoveryStarted = await page.evaluate(() => performance.now())
   const notice = page.getByTestId('chat-session-recovery-status')
   for (let index = 0; index < 8; index++) {
     await expect.poll(() => gateway.held.length).toBe(index + 1)
@@ -395,7 +551,7 @@ test('finishes a progressing 48 second transfer with its original sync revision'
     expect(piece.index).toBe(index)
     expect(piece.frame.params.sync_revision).toBe(revision)
     await advance(page, 6_000)
-    if (index >= 2) await expect(notice).toHaveAttribute('data-recovery-state', 'live-degraded')
+    await expect(notice).toHaveCount(0)
     // Production sends an ordinary heartbeat every 30 seconds. It must not
     // become a Conversation invalidation and queue another complete snapshot.
     if (index === 4) gateway.tick()
@@ -407,6 +563,10 @@ test('finishes a progressing 48 second transfer with its original sync revision'
   await expect.poll(() => calls(gateway.requests, RESUME).length).toBe(1)
   expect(calls(gateway.requests, RESUME)[0]!.params.sync_revision).toBe(revision)
   await expect(notice).toHaveCount(0)
+  // This snapshot contains an active task, so authoritative task control is
+  // the visible readiness affordance rather than an idle Send button.
+  await expect(page.getByRole('button', { name: 'Stop current response', exact: true })).toBeEnabled()
+  await recordRecoveryOutcome(page, gateway.requests, recoveryStarted, true)
   await expectComposerValue(page.locator('.chat-textarea'), DRAFT)
   expect(calls(gateway.requests, READ)).toHaveLength(8)
   expect(calls(gateway.requests, RELEASE)).toHaveLength(0)
@@ -425,10 +585,12 @@ test('reconnects through modern resume while preserving the draft and sends it e
   const originalUrl = page.url()
   const firstRevision = calls(gateway.requests, READ, 1)[0]!.params.sync_revision
   expect(JSON.stringify(calls(gateway.requests, 'connect')[0]!.params)).toContain('transport.recovery.v1')
+  const recoveryStarted = await page.evaluate(() => performance.now())
   gateway.sockets[0]!.close({ code: 1012, reason: 'synthetic restart' })
   await advance(page, 2_000)
   await expect.poll(() => calls(gateway.requests, RESUME, 2).length).toBe(1)
   await expect(send).toBeEnabled()
+  await recordRecoveryOutcome(page, gateway.requests, recoveryStarted, true)
   await expectComposerValue(input, DRAFT)
   expect(page.url()).toBe(originalUrl)
   expect(calls(gateway.requests, READ, 2)[0]!.params.sync_revision).not.toBe(firstRevision)
@@ -442,3 +604,266 @@ test('reconnects through modern resume while preserving the draft and sends it e
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
   expect(gateway.sockets).toHaveLength(2)
 })
+
+
+for (const { edit, entry } of [
+  { edit: 'unchanged', entry: '/control/chat/new?agent=main' },
+  { edit: 'edited', entry: '/control/chat/new?agent=main' },
+  { edit: 'edit-undo', entry: '/control/chat/new?agent=main' },
+  { edit: 'unchanged', entry: '/control/chat' },
+] as const) {
+  test(`cold ${entry === '/control/chat' ? 'canonical route ' : ''}handoff first authority binding ${edit === 'unchanged' ? 'sends once' : `preserves ${edit} cancellation`}`, async ({ page }) => {
+    test.setTimeout(90_000)
+    const gateway = await prepare(page, 'healthy')
+    gateway.holdNextHandshake()
+    await page.addInitScript(prefill => {
+      window.history.replaceState({ ...window.history.state, prefill, autosend: true }, '', window.location.href)
+    }, DRAFT)
+    await page.goto(entry)
+    const input = page.locator('.chat-textarea')
+    await expectComposerValue(input, DRAFT)
+    await expect.poll(() => calls(gateway.requests, 'connect').length).toBe(1)
+    expect(calls(gateway.requests, 'sessions.messages.subscribe')).toHaveLength(0)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+    const edited = 'User edited a cold handoff before the first authority proof.'
+    if (edit !== 'unchanged') await input.fill(edited)
+    if (edit === 'edit-undo') await input.fill(DRAFT)
+    gateway.releaseHandshake()
+    if (edit === 'unchanged') {
+      try {
+        await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+      } finally {
+        const observation = { url: page.url(), entry, requests: gateway.requests,
+          composerText: await input.innerText(),
+          sendEnabled: await page.locator('.chat-send-btn[aria-label="Send"]').isEnabled().catch(() => false),
+          historyState: await page.evaluate(() => window.history.state),
+        }
+        await writeFile(test.info().outputPath('cold-observation.json'), JSON.stringify(observation, null, 2))
+      }
+    } else {
+      await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+      await advance(page, 10_000)
+      expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+      await expectComposerValue(input, edit === 'edited' ? edited : DRAFT)
+      await input.press('Enter')
+      await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+    }
+    expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({
+      message: edit === 'edited' ? edited : DRAFT, intent: 'new_chat',
+    })
+    await expectComposerValue(input, '')
+    await advance(page, 10_000)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+    expect(calls(gateway.requests, 'connect')).toHaveLength(1)
+    await recordHandoffOutcome(gateway.requests, `cold initial mount, held first authenticated hello, ${edit}`)
+  })
+}
+
+test('Goal materialization waits for a fresh read after a wire gap during initial installation', async ({ page }) => {
+  test.setTimeout(90_000)
+  const gateway = await prepare(page, 'goal-gap')
+  await page.goto('/control/chat/new?agent=main')
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  await expect(send).toBeEnabled()
+  await expect.poll(() => calls(gateway.requests, RESUME).length).toBe(1)
+  await advance(page, 100)
+  await page.getByRole('button', { name: 'Add', exact: true }).click()
+  await expect(page.getByRole('menuitem', { name: /Goal mode/ })).toBeVisible()
+  await page.getByRole('menuitem', { name: /Goal mode/ }).click()
+  await expect(page.locator('.composer-goal-mode')).toBeVisible()
+  const objective = 'Wait for the current session recovery before accepting this Goal.'
+  await input.fill(objective)
+  await send.click()
+  await expect.poll(() => calls(gateway.requests, 'sessions.create').length).toBe(1)
+  await expect.poll(() => gateway.held.length).toBe(1)
+  expect(calls(gateway.requests, 'goals.set')).toHaveLength(0)
+  gateway.invalidateSession()
+  await advance(page, 100)
+  gateway.held[0]!.send()
+  await advance(page, 100)
+  await expect.poll(() => gateway.held.length).toBe(2)
+  expect(calls(gateway.requests, 'goals.set')).toHaveLength(0)
+  await advance(page, 1_000)
+  expect(calls(gateway.requests, 'goals.set')).toHaveLength(0)
+  // Only the read launched after the dirty event may complete admission.
+  gateway.held[1]!.send()
+  await advance(page, 100)
+  await expect.poll(() => calls(gateway.requests, 'goals.set').length).toBe(1)
+  expect(calls(gateway.requests, 'goals.set')[0]!.params).toMatchObject({ sessionKey: SESSION, objective })
+  await expect(page.locator('.goal-ribbon')).toContainText(objective)
+  await advance(page, 10_000)
+  expect(calls(gateway.requests, 'goals.set')).toHaveLength(1)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  const reads = calls(gateway.requests, READ).filter(item => item.params.key === SESSION)
+  const resumes = calls(gateway.requests, RESUME).filter(item => item.params.key === SESSION)
+  expect(reads).toHaveLength(2)
+  // The real adapter invalidates the first installation before resume. This
+  // public browser path complements the composed stale-result unit contract.
+  expect(resumes).toHaveLength(1)
+  expect(resumes[0]!.params.sync_revision).toBe(reads[1]!.params.sync_revision)
+  expect(reads[1]!.params.sync_revision).not.toBe(reads[0]!.params.sync_revision)
+  const body = JSON.stringify({ evidence: 'Chromium public Goal composer, materialization RPC and wire dirty event; synthetic Gateway',
+    requests: gateway.requests, predecessor: reads[0]!.params.sync_revision, successor: reads[1]!.params.sync_revision,
+    goalsSetCount: calls(gateway.requests, 'goals.set').length }, null, 2)
+  await writeFile(test.info().outputPath('goal-readiness-outcome.json'), body)
+  await test.info().attach('goal-readiness-outcome.json', { body, contentType: 'application/json' })
+})
+
+
+test('a reconnect replacement becomes ready after the previous connection queued gap recovery', async ({ page }) => {
+  test.setTimeout(90_000)
+  const gateway = await prepare(page, 'stalled')
+  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+  await expect.poll(() => gateway.held.length).toBe(1)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  await input.fill(DRAFT)
+  await expect(send).toBeDisabled()
+  const originalRevision = gateway.held[0]!.frame.params.sync_revision
+  const recoveryStarted = await page.evaluate(() => performance.now())
+  gateway.invalidateSession()
+  await advance(page, 100)
+  gateway.sockets[0]!.close({ code: 1012, reason: 'synthetic reconnect with queued gap recovery' })
+  await advance(page, 2_000)
+  await expect.poll(() => gateway.held.filter(piece => piece.frame.connection === 2).length).toBe(1)
+  const current = gateway.held.find(piece => piece.frame.connection === 2)!
+  expect(current.frame.params.sync_revision).not.toBe(originalRevision)
+  // A real browser response completes asynchronously. The separate unit test
+  // covers synchronous Promise completion during coordinator replacement.
+  current.send()
+  await advance(page, 100)
+  await expect.poll(() => calls(gateway.requests, RESUME, 2).length).toBe(1)
+  await expect(send).toBeEnabled()
+  await expectComposerValue(input, DRAFT)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await advance(page, 10_000)
+  await expect(send).toBeEnabled()
+  expect(calls(gateway.requests, READ, 2)).toHaveLength(1)
+  await input.press('Enter')
+  await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+  expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
+  await expectComposerValue(input, '')
+  await recordRecoveryOutcome(page, gateway.requests, recoveryStarted, true)
+})
+
+
+for (const edit of ['unchanged', 'edited', 'edit-undo'] as const) {
+  test(`same ChatView route handoff ${edit === 'unchanged' ? 'sends once' : `preserves ${edit} cancellation`}`, async ({ page }) => {
+    test.setTimeout(90_000)
+    const gateway = await prepare(page, 'healthy')
+    await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+    const input = page.locator('.chat-textarea')
+    await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+    const originalEditor = await input.elementHandle()
+    gateway.holdNextSubscription()
+    // Supported history-state consumer contract on the existing ChatView.
+    // No private Vue/router state or currently shipped producer is assumed.
+    await page.evaluate(prefill => {
+      window.history.pushState({ ...window.history.state, prefill, autosend: true }, '', '/control/chat/new?agent=main')
+      window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }))
+    }, DRAFT)
+    await expect.poll(() => calls(gateway.requests, 'sessions.messages.subscribe').length).toBe(2)
+    await expectComposerValue(input, DRAFT)
+    expect(await input.evaluate((node, original) => node === original, originalEditor)).toBe(true)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+    const edited = 'User edited a prefill while reusing the current ChatView.'
+    if (edit !== 'unchanged') await input.fill(edited)
+    if (edit === 'edit-undo') await input.fill(DRAFT)
+    gateway.releaseInitialSubscription()
+    if (edit === 'unchanged') {
+      await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+    } else {
+      await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+      await advance(page, 10_000)
+      expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+      await expectComposerValue(input, edit === 'edited' ? edited : DRAFT)
+      await input.press('Enter')
+      await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+    }
+    expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({
+      message: edit === 'edited' ? edited : DRAFT, intent: 'new_chat',
+    })
+    await expectComposerValue(input, '')
+    await advance(page, 10_000)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+    expect(await input.evaluate((node, original) => node === original, originalEditor)).toBe(true)
+    await recordHandoffOutcome(gateway.requests, `same ChatView and composer DOM, public history-state route entry, ${edit}`)
+  })
+}
+
+
+for (const editUndo of [false, true]) {
+  test(`cold canonical handoff waits for real attachment draft restoration${editUndo ? ' and retains edit-undo cancellation' : ''}`, async ({ page }) => {
+    test.setTimeout(90_000)
+    const gateway = await prepare(page, 'healthy')
+    gateway.holdNextHandshake()
+    await page.addInitScript(prefill => {
+      window.history.replaceState({ ...window.history.state, prefill, autosend: true }, '', window.location.href)
+      // Fault injection at the public IndexedDB API: let the native database
+      // open and upgrade normally, but hold its success notification. The
+      // real application load/empty transaction still executes after release.
+      const originalOpen = IDBFactory.prototype.open
+      let holding = true
+      const releases: Array<() => void> = []
+      const observation = { held: 0, released: 0 }
+      Object.defineProperty(window, '__attachmentDbGate', { value: observation })
+      IDBFactory.prototype.open = function(name, version) {
+        const request = version === undefined ? originalOpen.call(this, name) : originalOpen.call(this, name, version)
+        if (name !== 'opensquilla-attachment-drafts') return request
+        request.addEventListener('success', event => {
+          if (!holding) return
+          event.stopImmediatePropagation()
+          observation.held++
+          releases.push(() => {
+            observation.released++
+            request.dispatchEvent(new Event('success'))
+          })
+        }, { once: true })
+        return request
+      }
+      window.addEventListener('e2e-release-attachment-db', () => {
+        holding = false
+        for (const release of releases.splice(0)) release()
+      })
+    }, DRAFT)
+    await page.goto('/control/chat')
+    const input = page.locator('.chat-textarea')
+    await expectComposerValue(input, DRAFT)
+    gateway.releaseHandshake()
+    await expect.poll(() => page.evaluate(() => (
+      window as unknown as { __attachmentDbGate: { held: number } }
+    ).__attachmentDbGate.held)).toBe(1)
+    await expect.poll(() => calls(gateway.requests, RESUME).length).toBeGreaterThan(0)
+    await expect(page).toHaveURL(/\/control\/chat\/new$/)
+    await advance(page, 2_000)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+    await expectComposerValue(input, DRAFT)
+    if (editUndo) {
+      await input.fill('A deliberate edit while attachment restoration is pending.')
+      await input.fill(DRAFT)
+    }
+    await page.evaluate(() => window.dispatchEvent(new Event('e2e-release-attachment-db')))
+    if (editUndo) {
+      await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+      await advance(page, 10_000)
+      expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+      await expectComposerValue(input, DRAFT)
+      await input.press('Enter')
+    }
+    await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+    expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ message: DRAFT, intent: 'new_chat' })
+    await expectComposerValue(input, '')
+    await advance(page, 10_000)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+    await expect(page.getByText('Wait for file attachment processing to finish', { exact: true })).toHaveCount(0)
+    const observation = await page.evaluate(() => (
+      window as unknown as { __attachmentDbGate: { held: number; released: number } }
+    ).__attachmentDbGate)
+    expect(observation).toEqual({ held: 1, released: 1 })
+    const body = JSON.stringify({ evidence: 'Native IndexedDB with held public open success notification, ordinary ChatView and synthetic Gateway',
+      editUndo, observation, requests: gateway.requests }, null, 2)
+    await writeFile(test.info().outputPath('attachment-restore-outcome.json'), body)
+    await test.info().attach('attachment-restore-outcome.json', { body, contentType: 'application/json' })
+  })
+}

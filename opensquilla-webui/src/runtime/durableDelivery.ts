@@ -102,6 +102,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   const controllerIdentities = new Map<AbortController, string>()
   const roundTriggers = new Map<string, string>()
   const manualRetries = new Set<string>()
+  const resolutionIntents = new Map<string, { identity: string; expiresAt: number }>()
   const receiptEventTokens = new Map<string, string>()
   const activeLeases = new Map<string, number>()
   // A revoked first dispatch has direct not-sent evidence even if its WAL
@@ -158,7 +159,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     const update: DeliveryUpdate = {
       ownerRequestId: record.ownerRequestId, deliveryIdentity: record.deliveryIdentity,
       requestSessionKey: record.requestSessionKey, phase: record.phase,
-      response: record.response, stop: record.stop, kind: record.request?.kind,
+      response: record.response, stop: record.stop, kind: record.request?.kind, retired: record.retired,
     }
     const signature = JSON.stringify(update)
     if (observed.get(record.ownerRequestId) !== signature) {
@@ -171,7 +172,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       && !item.stopPending && item.waitReason !== 'storage')
     for (const item of completed.slice(0, Math.max(0, completed.length - 128))) {
       summaries.delete(item.id); observed.delete(item.id); summaryIdentities.delete(item.id)
-      if (!stopIntents.has(item.id)) { roundTriggers.delete(item.id); manualRetries.delete(item.id) }
+      if (!stopIntents.has(item.id)) { roundTriggers.delete(item.id); manualRetries.delete(item.id); resolutionIntents.delete(item.id) }
     }
   }
 
@@ -336,13 +337,31 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     return result
   }
 
-  async function lookupRecord(record: DeliveryWalRecord, signal: AbortSignal | undefined, epoch: number): Promise<TurnReceiptResult> {
+  async function lookupRecord(record: DeliveryWalRecord, signal: AbortSignal | undefined, epoch: number,
+    resolve = false): Promise<TurnReceiptResult> {
     if (!record.request || !options.commands.lookupReceipt || options.commands.supportsReceiptLookup?.() === false) {
       publish(record, 'receipt-unsupported')
       return { status: 'unsupported' }
     }
-    const result = await fenced(record, signal, opts => options.commands.lookupReceipt!(record.request!, opts))
+    const command = resolve && record.request.kind === 'send' && record.request.request.kind === 'new-turn'
+      && options.commands.resolveReceipt ? options.commands.resolveReceipt : options.commands.lookupReceipt
+    const result = await fenced(record, signal, opts => command!(record.request!, opts))
     if (result.status === 'found') await receive(record.ownerRequestId, result.response, epoch)
+    else if (result.status === 'retired') {
+      let applied = false
+      await update(record.ownerRequestId, current => {
+        applied = !disposed && !invalidated && !signal?.aborted
+          && current.deliveryIdentity === options.access.identity()
+          && current.lease?.owner === owner && current.lease.epoch === epoch && current.lease.expiresAt > now()
+          && current.phase !== 'accepted' && !current.response
+        if (!applied) return null
+        return { ...current, phase: 'not-sent', retired: true,
+          ...(current.stop ? { stop: { ...current.stop, completed: true } } : {}) }
+      })
+      if (!applied) throw new TurnCommandError('session-changed', 'Delivery lease changed', 'DELIVERY_LEASE_LOST', null, true)
+      const intent = stopIntents.get(record.ownerRequestId)
+      if (intent) { intent.completed = true; stopIntents.delete(record.ownerRequestId) }
+    }
     else publish(record, result.status === 'unsupported' ? 'receipt-unsupported' : 'receipt-missing')
     return result
   }
@@ -386,10 +405,10 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       if (!record || record.deliveryIdentity !== identity) {
         throw new TurnCommandError('conflict', 'Delivery belongs to another identity or an older client', 'DELIVERY_QUARANTINED', null, false)
       }
-      if (record.phase === 'not-sent' && record.stop?.completed) {
+      if (record.retired || (record.phase === 'not-sent' && record.stop?.completed)) {
         publish(record, null)
         throw new TurnCommandError('aborted', 'This delivery was stopped; a new send requires a new request identity',
-          'DELIVERY_STOPPED', false, false)
+          record.retired ? 'DELIVERY_RETIRED' : 'DELIVERY_STOPPED', false, false)
       }
       if (stopIntents.has(id)) await requestStop(id)
       publish(record)
@@ -398,6 +417,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       // missing or a new frame would be locally rejected before transmission.
       const result = await slot(false, () => leased(record, async (controller, claimed) => {
         if (claimed.phase === 'accepted' && claimed.response) return claimed.response
+        if (claimed.retired) throw new TurnCommandError('aborted', 'This request was retired; send with a new identity', 'DELIVERY_RETIRED', false, false)
         if (claimed.phase !== 'prepared' && claimed.phase !== 'not-sent') {
           const receipt = await lookupRecord(claimed, controller.signal, claimed.lease!.epoch)
           if (receipt.status === 'found') return receipt.response
@@ -412,7 +432,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
               || (current.phase !== 'prepared' && current.phase !== 'not-sent')) {
               throw new TurnCommandError('session-changed', 'Delivery lease changed', 'DELIVERY_LEASE_LOST', null)
             }
-            if (current.stop?.requested || stopIntents.get(id)?.identity === identity) {
+            if (current.retired || current.stop?.requested || stopIntents.get(id)?.identity === identity) {
               throw new TurnCommandError('aborted', 'Delivery stopped before dispatch', 'DELIVERY_STOPPED', false, false)
             }
             return { ...current, phase: 'submitting', response: undefined }
@@ -423,6 +443,11 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           commandOptions?.signal?.addEventListener('abort', abort, { once: true })
           if (commandOptions?.signal?.aborted) controller.abort()
           let response: TurnSendResponse | TurnSteerResponse
+          // A healthy socket can still lose one admission response. Bound this
+          // wait at the delivery owner, then keep the original request unknown
+          // and resolve it through the existing receipt-only recovery round.
+          // Aborting the local RPC wait does not cancel or resend the command.
+          const admissionDeadline = globalThis.setTimeout(() => controller.abort(), ROUND_MS)
           try { response = await fenced(armed, controller.signal, opts => {
             // No asynchronous work may separate this check from the first
             // transport call. A peer Stop can revoke queue permission during
@@ -436,7 +461,10 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
             return frozen.kind === 'send'
               ? options.commands.send(frozen.request, opts) : options.commands.steer(frozen.request, opts)
           })
-          } finally { commandOptions?.signal?.removeEventListener('abort', abort) }
+          } finally {
+            clearTimeout(admissionDeadline)
+            commandOptions?.signal?.removeEventListener('abort', abort)
+          }
           initialResponseReceived = true
           initiallyRejected = frozen.kind === 'steer' && 'accepted' in response && response.accepted === false
           await receive(id, response, epoch)
@@ -456,10 +484,15 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
             throw error
           }
           const notSent = initiallyRejected || (!initialResponseReceived && error instanceof TurnCommandError && error.accepted === false)
+          const retired = notSent && error instanceof TurnCommandError && error.details !== null
+            && typeof error.details === 'object' && 'requestRetired' in error.details && error.details.requestRetired === true
           let rejectedCandidate: DeliveryWalRecord | undefined
           await update(id, current => {
             if (current.lease?.owner !== owner || current.lease.epoch !== epoch) return null
             const next: DeliveryWalRecord = { ...current, phase: notSent ? 'not-sent' : 'unknown',
+              ...(retired ? { retired: true as const } : {}),
+              ...(error instanceof TurnCommandError && Number.isFinite(error.retryAfterMs) && error.retryAfterMs! > 0
+                ? { recoveryNotBefore: Math.max(current.recoveryNotBefore || 0, now() + error.retryAfterMs!) } : {}),
               ...(notSent && current.stop ? { stop: { ...current.stop, completed: true } } : {}) }
             if (notSent) rejectedCandidate = next
             return next
@@ -778,9 +811,12 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     if (!manualRetries.has(record.ownerRequestId) && roundTriggers.get(record.ownerRequestId) === trigger) return
     const run = () => leased(record, async (controller, claimed) => {
       const epoch = claimed.lease!.epoch
+      const intent = resolutionIntents.get(record.ownerRequestId)
+      resolutionIntents.delete(record.ownerRequestId)
+      const resolve = !!intent && intent.identity === claimed.deliveryIdentity && intent.expiresAt > now()
       roundTriggers.set(record.ownerRequestId, trigger)
       manualRetries.delete(record.ownerRequestId)
-      const deadline = globalThis.setTimeout(() => controller.abort(), ROUND_MS)
+      const deadline = globalThis.setTimeout(() => controller.abort(), resolve ? Math.min(ROUND_MS, intent!.expiresAt - now()) : ROUND_MS)
       try {
         for (let calls = 0; calls < MAX_CALLS && !controller.signal.aborted; calls += 1) {
           const current = await wal!.getDelivery!(record.ownerRequestId)
@@ -788,14 +824,31 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           if (current.lease?.owner !== owner || current.lease.epoch !== epoch) return
           const waiting = allowed(current)
           if (waiting) { publish(current, waiting); return }
+          const notBefore = current.recoveryNotBefore || 0
+          if (notBefore > now()) {
+            await new Promise<void>(done => {
+              const timer = globalThis.setTimeout(finish, Math.min(notBefore - now(), ROUND_MS))
+              function finish() { clearTimeout(timer); controller.signal.removeEventListener('abort', finish); done() }
+              controller.signal.addEventListener('abort', finish, { once: true })
+              if (controller.signal.aborted) finish()
+            })
+            if (controller.signal.aborted) break
+            // Reread the lease and identity before using a deferred call slot.
+            calls -= 1
+            continue
+          }
           try {
             if (current.phase === 'prepared') { publish(current, 'not-sent'); return }
             if (current.phase === 'accepted' && current.stop) await stopRecord(current, controller.signal, epoch, true)
             else if (current.request) {
-              const result = await lookupRecord(current, controller.signal, epoch)
+              const result = await lookupRecord(current, controller.signal, epoch, resolve)
               if (result.status === 'unsupported') return
             }
           } catch (error) {
+            if (error instanceof TurnCommandError && Number.isFinite(error.retryAfterMs) && error.retryAfterMs! > 0) {
+              await update(current.ownerRequestId, value => value.lease?.owner === owner && value.lease.epoch === epoch
+                ? { ...value, recoveryNotBefore: Math.max(value.recoveryNotBefore || 0, now() + error.retryAfterMs!) } : null)
+            }
             if (error instanceof TurnCommandError && (error.kind === 'conflict'
               || /FORBIDDEN|UNAUTHORIZED|PERMISSION|SCOPE|IDENTITY|FINGERPRINT/i.test(error.failureCode || ''))) {
               const paused = error.kind === 'conflict' ? 'conflict' : 'authority'
@@ -932,6 +985,12 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           if (!currentIdentity() || recordIdentity !== identity) return
           summaryIdentities.set(id, identity)
           manualRetries.add(id)
+          // Only an explicit Check grants this authority. Preserve it through
+          // a competing lease, without extending its original local deadline.
+          const pendingResolution = resolutionIntents.get(id)
+          if (!pendingResolution || pendingResolution.identity !== identity || pendingResolution.expiresAt <= now()) {
+            resolutionIntents.set(id, { identity, expiresAt: now() + ROUND_MS })
+          }
           if (intent) intent.paused = undefined
           if (intent) await persistStopIntent(id, intent)
           const record = await update(id, current => currentIdentity() && current.deliveryIdentity === identity
@@ -970,6 +1029,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       stopIntents.clear()
       receiptEventTokens.clear()
       revokedDispatches.clear()
+      resolutionIntents.clear()
       wal?.close()
     },
   }
@@ -982,6 +1042,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     const record = await wal?.getDelivery?.(id)
     if (!record || allowed(record)) return { status: 'not-found' }
     if (record.phase === 'accepted' && record.response) return { status: 'found', response: record.response }
+    if (record.retired) return { status: 'retired' }
     // Recovery stays owned by the app scheduler and its bounded leases.
     void wake()
     return { status: options.commands.supportsReceiptLookup?.() === false ? 'unsupported' : 'not-found' }

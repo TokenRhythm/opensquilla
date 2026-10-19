@@ -43,6 +43,7 @@ export async function withIsolatedRealGateway(
     scenario?: RealGoalGatewayScenario
     authMode?: 'none' | 'token'
     initialSessionKeys?: readonly string[]
+    workspaceInitiallyMissing?: boolean
   },
   use: (gateway: IsolatedRealGateway) => Promise<void>,
 ): Promise<void> {
@@ -56,6 +57,7 @@ export async function withIsolatedRealGateway(
     scenario: options.scenario,
     authMode: options.authMode,
     initialSessionKeys: options.initialSessionKeys,
+    workspaceInitiallyMissing: options.workspaceInitiallyMissing,
   })
   const gatewayHttpUrl = gateway.wsUrl.replace(/^ws:/, 'http:').replace(/\/ws$/, '')
   const webuiRoot = fileURLToPath(new URL('..', import.meta.url))
@@ -106,17 +108,20 @@ export const test = base.extend<{
   isolatedRealGatewayAuthMode: 'none' | 'token'
   isolatedRealGatewayInitialSessionKeys: readonly string[]
   isolatedRealGatewayNativeDesktop: boolean
+  isolatedRealGatewayWorkspaceInitiallyMissing: boolean
 }>({
   isolatedRealGatewayScenario: ['lifecycle', { option: true }],
   isolatedRealGatewayAuthMode: ['none', { option: true }],
   isolatedRealGatewayInitialSessionKeys: [[], { option: true }],
   isolatedRealGatewayNativeDesktop: [false, { option: true }],
-  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode, isolatedRealGatewayInitialSessionKeys }, use, testInfo) =>
+  isolatedRealGatewayWorkspaceInitiallyMissing: [false, { option: true }],
+  isolatedRealGateway: async ({ isolatedRealGatewayScenario, isolatedRealGatewayAuthMode, isolatedRealGatewayInitialSessionKeys, isolatedRealGatewayWorkspaceInitiallyMissing }, use, testInfo) =>
     withIsolatedRealGateway({
       outputDir: testInfo.outputPath('isolated-real-gateway'),
       scenario: isolatedRealGatewayScenario,
       authMode: isolatedRealGatewayAuthMode,
       initialSessionKeys: isolatedRealGatewayInitialSessionKeys,
+      workspaceInitiallyMissing: isolatedRealGatewayWorkspaceInitiallyMissing,
     }, use),
   page: async ({ page, isolatedRealGateway, isolatedRealGatewayNativeDesktop }, use, testInfo) => {
     // Native-capable specs explicitly opt in: other tests may use the browser

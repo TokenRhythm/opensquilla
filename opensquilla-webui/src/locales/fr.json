@@ -3902,6 +3902,7 @@
     "historyAttachmentCount": "Pièces jointes : {count}",
     "loadingSession": "Restauration de l’historique de la conversation…",
     "loadingSessionDescription": "Vous pouvez continuer à utiliser la conversation pendant le chargement.",
+    "sendTemporarilyUnavailable": "Impossible d’envoyer des messages pour le moment",
     "loadSessionFailed": "Historique de la conversation temporairement indisponible",
     "loadSessionDescription": "L’historique de la conversation est temporairement indisponible.",
     "reloadSession": "Recharger l’historique",

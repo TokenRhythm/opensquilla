@@ -45,6 +45,12 @@ class CommittedTurn(Protocol):
     def goal_context(self) -> AdmissionGoalContext | None: ...
 
 
+class GoalActivationCompensator(Protocol):
+    async def __call__(
+        self, context_value: dict[str, object], *, session_key: str,
+    ) -> object | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class TurnActivation[Acceptance: CommittedTurn]:
     acceptance: Acceptance
@@ -62,7 +68,7 @@ async def commit_reserved_turn[Acceptance: CommittedTurn](
     commit: Callable[[AdmissionTaskRecord], Awaitable[Acceptance]],
     before_activate: Callable[[Acceptance], None] | None = None,
     on_unactivated: Callable[[], None] | None = None,
-    compensate_goal: Callable[[dict[str, object]], Awaitable[object | None]] | None = None,
+    compensate_goal: GoalActivationCompensator | None = None,
 ) -> TurnActivation[Acceptance]:
     """Run inside the caller's shielded admission gate, after any atomic collect.
 
@@ -115,7 +121,10 @@ async def commit_reserved_turn[Acceptance: CommittedTurn](
             if acceptance.goal_context is not None and compensate_goal is not None:
                 try:
                     compensated = (
-                        await compensate_goal(acceptance.goal_context.as_task_detail()) is not None
+                        await compensate_goal(
+                            acceptance.goal_context.as_task_detail(),
+                            session_key=receipt.accepted_session_key,
+                        ) is not None
                     )
                 except Exception:
                     log.exception(

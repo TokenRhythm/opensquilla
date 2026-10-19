@@ -14,6 +14,7 @@ from scripts.contracts.generate_gateway_contracts import discover_contracts
 
 EXPECTED_METHOD_METADATA = {
     "turns.receipt.get": ("operator.read", "query", "read-only"),
+    "turns.receipt.resolve": ("operator.write", "command", "idempotent"),
     "models.capacity.resolve": ("operator.read", "query", "read-only"),
     "memory.import.info": ("operator.read", "query", "read-only"),
     "memory.import.start": ("operator.admin", "command", "idempotent"),
@@ -178,9 +179,9 @@ def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     assert not {"router.selflearning.status", "router.feedback.submit"} & {
         spec.wire_name for spec in specs
     }
-    assert len(specs) == 223
+    assert len(specs) == 224
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 213,
+        "method": 214,
         "event": 10,
     }
     assert {spec.wire_name for spec in specs if spec.wire_name.startswith("agents.")} == {

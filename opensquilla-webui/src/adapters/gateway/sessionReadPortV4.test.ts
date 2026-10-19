@@ -548,6 +548,100 @@ describe('read-v2 consumption covered by an installed snapshot', () => {
 describe('read-v2 admission and retirement ownership', () => {
   const historyRequest = (signal: AbortSignal) => ({ direction: 'latest' as const, limit: 100, signal })
 
+  it.each([50, 100, 200])('confirms read-v2 before its actual %i-item initial history without a duplicate page', async limit => {
+    const h = v2AdmissionHarness()
+    const delayedHistory = deferred<unknown>()
+    const page = h.results.get(HISTORY_V2)
+    h.results.set(HISTORY_V2, delayedHistory.promise)
+    const request = openRequest()
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    const history = lease.readHistory({ ...historyRequest(request.signal), limit })
+    try {
+      const live = await lease.live
+      await lease.criticalRequestsQueued
+      expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(false)
+      await live.confirmInstalled!()
+      await vi.waitFor(() => expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(true))
+      const methods = h.calls.map(call => call.method)
+      expect(methods.lastIndexOf(READ_INSTALL_V2)).toBeLessThan(methods.indexOf(HISTORY_V2))
+      expect(h.calls.filter(call => call.method === READ_INSTALL_V2)).toHaveLength(2)
+      expect(h.calls.filter(call => call.method === HISTORY_V2)).toHaveLength(1)
+      expect(h.calls.find(call => call.method === HISTORY_V2)?.params?.target_items).toBe(limit)
+      delayedHistory.resolve(page)
+      await expect(history).resolves.toMatchObject({ messages: [] })
+      h.results.set(HISTORY_V2, page)
+      await lease.readHistory({ direction: 'before', cursor: 'older-page', limit: 20, signal: request.signal })
+      expect(h.calls.filter(call => call.method === HISTORY_V2)).toHaveLength(2)
+      expect(h.calls[h.calls.length - 1]?.params).toMatchObject({ direction: 'before', cursor: 'older-page', target_items: 20 })
+    } finally { delayedHistory.resolve(page); await lease.close() }
+  })
+
+  it('cancels a waiting history consumer without preventing final live installation', async () => {
+    const h = v2AdmissionHarness()
+    const request = openRequest()
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    const historyController = new AbortController()
+    const rejected = expect(lease.readHistory({ ...historyRequest(historyController.signal), limit: 50 }))
+      .rejects.toMatchObject({ name: 'AbortError' })
+    const live = await lease.live
+    historyController.abort()
+    await rejected
+    await live.confirmInstalled!()
+    await flushAsyncWork()
+    expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(false)
+    await lease.close()
+  })
+
+  it('rejects deferred history when final confirmation fails instead of leaving it pending', async () => {
+    const h = v2AdmissionHarness()
+    const request = openRequest()
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    const history = lease.readHistory(historyRequest(request.signal))
+    const rejected = expect(history).rejects.toMatchObject({ kind: 'busy', retryable: true })
+    try {
+      const live = await lease.live
+      h.results.set(READ_STATE_V2, Object.assign(new Error('storage busy'), { code: 'STORAGE_BUSY' }))
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'busy', retryable: true })
+      await rejected
+      expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(false)
+    } finally { await lease.close() }
+  })
+
+  it.each(['abort', 'close'] as const)('settles unsent initial history on %s', async action => {
+    const h = v2AdmissionHarness()
+    const controller = new AbortController()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(controller.signal))
+    const history = lease.readHistory(historyRequest(controller.signal))
+    const rejected = expect(history).rejects.toMatchObject({ name: 'AbortError' })
+    await lease.live
+    await lease.criticalRequestsQueued
+    if (action === 'abort') controller.abort()
+    else await lease.close()
+    await rejected
+    expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(false)
+    await lease.close()
+  })
+
+  it('settles an unconfirmed initial page before reconciliation joins active history', async () => {
+    const h = v2AdmissionHarness()
+    const lifecycle = createSessionReadLifecycle({
+      port: createV4SessionReadPort(h.rpc), runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: true })
+    const initialHistory = lease.history.latest().then(value => ({ value }), error => ({ error }))
+    try {
+      await lease.live
+      const recovered = await lease.reconcile()
+      // useChatHistory.reconcileHistory first joins its active request, then
+      // starts the fresh read; runSubscription confirms only afterwards.
+      expect(await initialHistory).toMatchObject({ error: { name: 'AbortError' } })
+      await expect(lease.history.latest()).resolves.toMatchObject({ messages: [] })
+      await recovered.confirmInstalled!()
+      expect(h.calls.filter(call => call.method === HISTORY_V2)).toHaveLength(1)
+    } finally { await lease.close() }
+  })
+
   it.each(['REBASE_REQUIRED', 'READ_STALE'])('projects %s as a read-base replacement request', code => {
     expect(mapSessionReadError(Object.assign(new Error('Reload state'), { code })))
       .toMatchObject({ kind: 'rebase-required', retryable: true })
@@ -568,14 +662,15 @@ describe('read-v2 admission and retirement ownership', () => {
     const request = openRequest()
     const lease = createV4SessionReadPort(h.rpc).open(request)
     try {
+      const live = await lease.live
+      await live.confirmInstalled!()
       const results = await Promise.allSettled([
         lease.live, lease.metadata, lease.criticalRequestsQueued,
         lease.readHistory(historyRequest(request.signal)),
       ])
-      expect(results.map(result => result.status)).toEqual(failure === 'response'
-        ? ['fulfilled', 'fulfilled', 'fulfilled', 'rejected']
-        : ['rejected', 'rejected', 'rejected', 'rejected'])
-      expect(h.calls.some(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toBe(failure === 'response')
+      expect(results.map(result => result.status))
+        .toEqual(['fulfilled', 'fulfilled', 'fulfilled', 'rejected'])
+      expect(h.calls.some(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toBe(true)
     } finally { await lease.close() }
   })
 
@@ -632,8 +727,10 @@ describe('read-v2 admission and retirement ownership', () => {
       h.setGeneration(generation)
       const durable = port.open(openRequest())
       try {
-        const [live, page] = await Promise.all([durable.live, durable.readHistory(historyRequest(new AbortController().signal))])
+        const history = durable.readHistory(historyRequest(new AbortController().signal))
+        const live = await durable.live
         await live.confirmInstalled?.()
+        const page = await history
         expect(page.messages).toEqual([])
       } finally { await durable.close() }
     }
@@ -674,8 +771,9 @@ describe('read-v2 admission and retirement ownership', () => {
       expect(h.calls).toEqual([])
       negotiated = true
       ready.resolve()
-      const [live, page] = await Promise.all([lease.live, history, lease.metadata, lease.criticalRequestsQueued])
+      const [live] = await Promise.all([lease.live, lease.metadata, lease.criticalRequestsQueued])
       await live.confirmInstalled?.()
+      const page = await history
       expect(h.calls.some(call => call.method === READ_OPEN_V2)).toBe(true)
       expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(true)
       expect(h.calls.some(call => call.method === CHAT_HISTORY_METHOD)).toBe(false)
@@ -1604,6 +1702,132 @@ describe('v4 SessionReadPort Adapter', () => {
     expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD))
       .toHaveLength(1)
 
+    await lease.close()
+  })
+
+  it('gates only physical metadata while live installation and history keep progressing', async () => {
+    const h = makeHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult(metadataFields(false)))
+    const gate = deferred<void>()
+    const beforeMetadataRead = vi.fn(() => gate.promise)
+    const request = { ...openRequest(), beforeMetadataRead }
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    await expect(lease.live).resolves.toMatchObject({ sessionKey: 'alpha' })
+    await expect(lease.readHistory({ direction: 'latest', limit: 100, signal: request.signal }))
+      .resolves.toMatchObject({ loadedCount: 1 })
+    expect(beforeMetadataRead).toHaveBeenCalledExactlyOnceWith(request.signal)
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(0)
+    gate.resolve()
+    await expect(lease.metadata).resolves.toMatchObject({ hydrationComplete: true })
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(1)
+    await lease.close()
+  })
+
+  it('does not send metadata when its admission gate rejects', async () => {
+    const h = makeHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult(metadataFields(false)))
+    const failure = new SessionReadFailure('budget-exhausted', 'Metadata recovery budget expired', false)
+    const lease = createV4SessionReadPort(h.rpc).open({
+      ...openRequest(), beforeMetadataRead: async () => { throw failure },
+    })
+    const failed = expect(lease.metadata).rejects.toBe(failure)
+    await expect(lease.live).resolves.toMatchObject({ sessionKey: 'alpha' })
+    await expect(lease.readHistory({ direction: 'latest', limit: 100, signal: new AbortController().signal }))
+      .resolves.toMatchObject({ loadedCount: 1 })
+    await failed
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(0)
+    await lease.close()
+  })
+
+  it.each(['abort', 'generation'] as const)('does not dispatch a gated metadata read after %s changes', async transition => {
+    const h = makeHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult(metadataFields(false)))
+    const gate = deferred<void>()
+    const controller = new AbortController()
+    const beforeMetadataRead = vi.fn(() => gate.promise)
+    const lease = createV4SessionReadPort(h.rpc).open({ ...openRequest(controller.signal), beforeMetadataRead })
+    await lease.live
+    await flushAsyncWork()
+    expect(beforeMetadataRead).toHaveBeenCalledOnce()
+    const failed = expect(lease.metadata).rejects.toMatchObject({ kind: 'aborted' })
+    if (transition === 'abort') controller.abort()
+    else h.setGeneration(8)
+    gate.resolve()
+    await failed
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(0)
+    await lease.close()
+  })
+
+  it('shares a pending initial hydration with retries but reads freshly after it settles', async () => {
+    const h = makeHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult(metadataFields(false)))
+    const gate = deferred<void>()
+    const hydration = deferred<SessionsMessagesHydrateResult>()
+    h.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydration.promise)
+    const beforeMetadataRead = vi.fn(() => gate.promise)
+    const lease = createV4SessionReadPort(h.rpc).open({ ...openRequest(), beforeMetadataRead })
+    await lease.live
+    const first = lease.retryMetadata()
+    const second = lease.retryMetadata()
+    await flushAsyncWork()
+    expect(beforeMetadataRead).toHaveBeenCalledOnce()
+    gate.resolve()
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(1)
+    hydration.resolve(hydrateResult({ routing: { mode: 'initial' } }))
+    const values = await Promise.all([lease.metadata, first, second])
+    expect(values.every(value => value.routing?.mode === 'initial')).toBe(true)
+
+    h.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydrateResult({ routing: { mode: 'fresh' } }))
+    await expect(lease.retryMetadata()).resolves.toMatchObject({ routing: { mode: 'fresh' } })
+    expect(beforeMetadataRead).toHaveBeenCalledTimes(2)
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(2)
+    await lease.close()
+  })
+
+  it('serializes reconciliation after pending hydration and retains its newer cursor', async () => {
+    const h = makeHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult(metadataFields(false)))
+    const initial = deferred<SessionsMessagesHydrateResult>()
+    h.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, initial.promise)
+    const beforeMetadataRead = vi.fn(async () => {})
+    const lease = createV4SessionReadPort(h.rpc).open({ ...openRequest(), beforeMetadataRead })
+    await lease.live
+    await flushAsyncWork()
+    h.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ current_stream_seq: 42 }))
+    const recovery = lease.reconcile()
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(1)
+    h.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydrateResult({ routing: { mode: 'fresh' } }))
+    initial.resolve(hydrateResult({ routing: { mode: 'initial' } }))
+    await lease.metadata
+    await expect(recovery).resolves.toMatchObject({ initialMetadata: {
+      routing: { mode: 'fresh' },
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 42 },
+    } })
+    expect(beforeMetadataRead).toHaveBeenCalledTimes(2)
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(2)
+    await lease.close()
+  })
+
+  it('starts a fresh logical retry after an older physical sample instead of reusing it', async () => {
+    const h = makeHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult(metadataFields(false)))
+    const initial = deferred<SessionsMessagesHydrateResult>()
+    h.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, initial.promise)
+    const beforeMetadataRead = vi.fn(async () => {})
+    const lease = createV4SessionReadPort(h.rpc).open({ ...openRequest(), beforeMetadataRead })
+    await lease.live
+    await flushAsyncWork()
+    const fresh = lease.retryMetadata({ fresh: true })
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(1)
+    h.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydrateResult({ run_status: 'running', active_task: { task_id: 'new-task' } }))
+    initial.resolve(hydrateResult({ run_status: 'idle', active_task: null }))
+    await expect(lease.metadata).resolves.toMatchObject({ runStatus: 'idle' })
+    await expect(fresh).resolves.toMatchObject({ runStatus: 'running', activeTask: { task_id: 'new-task' } })
+    expect(beforeMetadataRead).toHaveBeenCalledTimes(2)
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(2)
     await lease.close()
   })
 

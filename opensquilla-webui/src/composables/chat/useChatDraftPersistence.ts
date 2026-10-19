@@ -112,16 +112,28 @@ export interface UseChatDraftPersistenceOptions {
  * pending queue retain their own persistence. Storage failures are swallowed.
  */
 export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions) {
-  let pendingRebind: { from: string; to: string } | null = null
+  let pendingRebind: { from: string; to: string; retainSource?: boolean } | null = null
+  let retainedRebind: { from: string; to: string; snapshot: string | null } | null = null
   const draftStorage = () => options.storage === undefined ? localStorage : options.storage
 
   /** Move one proven fresh draft without loading another session's composer. */
-  function rebindCurrentDraft(key: string): void {
+  function rebindCurrentDraft(key: string, rebindOptions?: { retainSource?: boolean }): void {
     const previous = options.sessionKey.value
     if (!previous || !key || previous === key) return
     const from = pendingRebind?.to === previous ? pendingRebind.from : previous
-    pendingRebind = { from, to: key }
+    pendingRebind = { from, to: key, retainSource: rebindOptions?.retainSource }
     options.sessionKey.value = key
+  }
+
+  /** Release a crash fallback only after its new route has actually committed. */
+  function completeDraftRebind(from: string, to: string): void {
+    const retained = retainedRebind
+    if (!retained || retained.from !== from || retained.to !== to || options.sessionKey.value !== to) return
+    retainedRebind = null
+    try {
+      // Another tab may have edited the source while navigation was pending.
+      if (draftStorage()?.getItem(draftKey(from)) === retained.snapshot) clearDraft(from)
+    } catch { /* The retained source remains a safe local draft. */ }
   }
 
   function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = [], localPaths: readonly string[] = [], skillPositions: Record<string, number> = {}): void {
@@ -230,7 +242,11 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
       if (rebind && rebind.from === previousKey && rebind.to === key) {
         // Read text at watcher execution, not at Hello: typing may continue
         // before Vue flushes. In-memory preservation also works without storage.
-        clearDraft(previousKey)
+        if (rebind.retainSource) {
+          saveDraft(previousKey, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
+          try { retainedRebind = { from: previousKey, to: key, snapshot: draftStorage()?.getItem(draftKey(previousKey)) ?? null } }
+          catch { retainedRebind = null }
+        } else clearDraft(previousKey)
         saveDraft(key, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
         return
       }
@@ -256,5 +272,5 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     saveDraft(options.sessionKey.value, text, options.selectedSkills?.value, options.localPaths?.value, options.skillPositions?.value)
   }, { deep: true })
 
-  return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft, consumeAcceptedDraft }
+  return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft, completeDraftRebind, consumeAcceptedDraft }
 }

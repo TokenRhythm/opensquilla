@@ -209,6 +209,14 @@ class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
 
 
+class TurnIngressRetiredError(TurnIngressConflictError):
+    """The request was durably retired and can never be accepted later."""
+
+
+class TurnIngressReceiptUnavailableError(TurnIngressConflictError):
+    """Acceptance is recorded but its original receipt can no longer be replayed."""
+
+
 class SessionRoutingConflictError(ValueError):
     """Raised when a session routing compare-and-set fence is stale."""
 
@@ -1290,6 +1298,19 @@ CREATE TABLE IF NOT EXISTS turn_ingress_receipts (
 _CREATE_IDX_TURN_INGRESS_REQUEST = """
 CREATE UNIQUE INDEX IF NOT EXISTS uq_turn_ingress_receipts_request
 ON turn_ingress_receipts(source_scope, request_session_key, client_request_id)
+"""
+
+_CREATE_TURN_REQUEST_RESOLUTION = """
+CREATE TABLE IF NOT EXISTS turn_request_resolution (
+    source_scope TEXT NOT NULL,
+    request_session_key TEXT NOT NULL,
+    client_request_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'retired', 'accepted')),
+    updated_at INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (source_scope, request_session_key, client_request_id)
+)
 """
 
 _CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION = """
@@ -2809,6 +2830,17 @@ class SessionStorage:
         await self._conn.execute(_CREATE_TURN_INGRESS_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_REQUEST)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
+        await self._conn.execute(_CREATE_TURN_REQUEST_RESOLUTION)
+        # Preserve accepted identity even if the owning session is later deleted.
+        # An absent historical receipt must never become proof of non-acceptance.
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO turn_request_resolution "
+            "(source_scope, request_session_key, client_request_id, "
+            "request_fingerprint, state, updated_at) "
+            "SELECT source_scope, request_session_key, client_request_id, "
+            "request_fingerprint, 'accepted', accepted_at FROM turn_ingress_receipts "
+            "WHERE source_scope LIKE 'web:webchat:%'"
+        )
         await self._conn.execute(_CREATE_PENDING_CHAT_INPUTS)
         await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_REQUEST)
         await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_MESSAGE)
@@ -6771,6 +6803,17 @@ class SessionStorage:
                 (session.session_key,),
             )
         await conn.execute(
+            "INSERT INTO turn_request_resolution "
+            "(source_scope, request_session_key, client_request_id, "
+            "request_fingerprint, state, updated_at) "
+            "SELECT source_scope, request_session_key, client_request_id, "
+            "request_fingerprint, 'accepted', accepted_at FROM turn_ingress_receipts "
+            "WHERE accepted_session_key = ? AND source_scope LIKE 'web:webchat:%' "
+            "ON CONFLICT(source_scope, request_session_key, client_request_id) "
+            "DO UPDATE SET state = 'accepted', updated_at = excluded.updated_at",
+            (session.session_key,),
+        )
+        await conn.execute(
             "DELETE FROM turn_ingress_receipts WHERE accepted_session_key = ?",
             (session.session_key,),
         )
@@ -10040,6 +10083,7 @@ class SessionStorage:
         reason: str,
         now_ms: int | None,
         preserve_unstarted_continuation: bool = False,
+        require_unstarted: bool = False,
     ) -> GoalRecord | None:
         timestamp = _now_ms() if now_ms is None else now_ms
         async with self._write_transaction(f"compensate_goal_{reason}") as conn:
@@ -10063,9 +10107,15 @@ class SessionStorage:
                         "STALE_GOAL", "Only an automatic Goal continuation can be deferred"
                     )
                 if task.status != AgentTaskStatus.QUEUED or task.started_at is not None:
-                    # Repeated/stale compensation must never abandon started
-                    # work or settle the same accepted turn twice.
                     return None
+            if require_unstarted and (
+                task.status == AgentTaskStatus.RUNNING or task.started_at is not None
+            ):
+                # A delayed activation recovery must never abandon work that
+                # crossed the runtime boundary. A generic activation fallback
+                # may already have failed this never-started task; preserve its
+                # terminal record while still settling the original Goal CAS.
+                return None
             usage = await self._turn_usage_totals_on_conn(conn, context=context)
             duration_ms = 0
             if task.started_at is not None:
@@ -10212,6 +10262,7 @@ class SessionStorage:
         *,
         reason: str = "activation_failed",
         now_ms: int | None = None,
+        require_unstarted: bool = False,
     ) -> GoalRecord | None:
         if reason not in {
             "activation_failed",
@@ -10227,6 +10278,7 @@ class SessionStorage:
             context,
             reason=reason,
             now_ms=now_ms,
+            require_unstarted=require_unstarted,
         )
 
     async def compensate_terminal_persistence_failure(
@@ -12369,6 +12421,103 @@ class SessionStorage:
             ),
         )
 
+    @staticmethod
+    async def _select_turn_request_resolution(
+        conn: Any, *, source_scope: str, request_session_key: str, client_request_id: str,
+    ) -> dict[str, Any] | None:
+        async with conn.execute(
+            "SELECT request_fingerprint, state FROM turn_request_resolution "
+            "WHERE source_scope = ? AND request_session_key = ? AND client_request_id = ?",
+            (source_scope, request_session_key, client_request_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def register_turn_request_attempt(
+        self, *, source_scope: str, request_session_key: str,
+        client_request_id: str, request_fingerprint: str,
+    ) -> None:
+        """Record an observed WebChat attempt before admission can have side effects.
+
+        This is not acceptance. The marker only gives explicit resolution a safe
+        writer-serialized boundary. Legacy absent requests remain indeterminate.
+        """
+        key = canonicalize_session_key(request_session_key)
+        if not source_scope.startswith("web:webchat:"):
+            return
+        async with self._write_transaction("register_turn_request_attempt") as conn:
+            accepted = await self._select_turn_ingress_receipt(
+                conn, source_scope=source_scope, request_session_key=key,
+                client_request_id=client_request_id,
+            )
+            previous = await self._select_turn_request_resolution(
+                conn, source_scope=source_scope, request_session_key=key,
+                client_request_id=client_request_id,
+            )
+            if accepted is not None:
+                if accepted[0].request_fingerprint != request_fingerprint:
+                    raise TurnIngressConflictError("Request identity belongs to a different input")
+                return
+            if previous is not None:
+                if previous["request_fingerprint"] != request_fingerprint:
+                    raise TurnIngressConflictError("Request identity belongs to a different input")
+                if previous["state"] == "accepted":
+                    raise TurnIngressReceiptUnavailableError(
+                        "This request was already accepted; its receipt is unavailable",
+                    )
+                if previous["state"] != "pending":
+                    raise TurnIngressRetiredError("This request identity cannot be sent again")
+                return
+            await conn.execute(
+                "INSERT INTO turn_request_resolution "
+                "(source_scope, request_session_key, client_request_id, "
+                "request_fingerprint, state, updated_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+                (source_scope, key, client_request_id, request_fingerprint,
+                 int(time.time() * 1000)),
+            )
+
+    async def resolve_turn_request_attempt(
+        self, *, source_scope: str, request_session_key: str,
+        client_request_id: str, request_fingerprint: str,
+    ) -> str:
+        """Atomically fence a registered unaccepted request, never infer from a miss.
+
+        Admission and this command share SQLite's writer boundary. Whichever
+        commits first wins: accepted receipts cannot be retired, and retired
+        requests cannot subsequently create a transcript entry or runtime task.
+        """
+        key = canonicalize_session_key(request_session_key)
+        if not source_scope.startswith("web:webchat:"):
+            return "not_found"
+        async with self._write_transaction("resolve_turn_request_attempt") as conn:
+            accepted = await self._select_turn_ingress_receipt(
+                conn, source_scope=source_scope, request_session_key=key,
+                client_request_id=client_request_id,
+            )
+            if accepted is not None:
+                if accepted[0].request_fingerprint != request_fingerprint:
+                    raise TurnIngressConflictError("Request identity belongs to a different input")
+                return "found"
+            previous = await self._select_turn_request_resolution(
+                conn, source_scope=source_scope, request_session_key=key,
+                client_request_id=client_request_id,
+            )
+            if previous is None:
+                return "not_found"
+            if previous["request_fingerprint"] != request_fingerprint:
+                raise TurnIngressConflictError("Request identity belongs to a different input")
+            if previous["state"] == "accepted":
+                # The positive receipt may have been deleted with its session.
+                # Keep that history ambiguous; never authorize a duplicate send.
+                return "not_found"
+            if previous["state"] == "pending":
+                await conn.execute(
+                    "UPDATE turn_request_resolution SET state = 'retired', updated_at = ? "
+                    "WHERE source_scope = ? AND request_session_key = ? AND client_request_id = ?",
+                    (int(time.time() * 1000), source_scope, key, client_request_id),
+                )
+        return "retired"
+
     @_serialized_read
     async def get_turn_receipt_context(
         self, session_id: str, message_id: str,
@@ -13790,6 +13939,20 @@ class SessionStorage:
                     ),
                 )
 
+            resolution = await self._select_turn_request_resolution(
+                conn, source_scope=source_scope, request_session_key=request_session_key,
+                client_request_id=client_request_id,
+            )
+            if resolution is not None:
+                if resolution["request_fingerprint"] != request_fingerprint:
+                    raise TurnIngressConflictError("Request identity belongs to a different input")
+                if resolution["state"] == "accepted":
+                    raise TurnIngressReceiptUnavailableError(
+                        "This request was already accepted; its receipt is unavailable",
+                    )
+                if resolution["state"] != "pending":
+                    raise TurnIngressRetiredError("This request identity cannot be sent again")
+
             if pending_input_id is not None:
                 pending = await self._select_pending_chat_input(
                     conn,
@@ -14577,6 +14740,16 @@ class SessionStorage:
                 f"VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
+            if source_scope.startswith("web:webchat:"):
+                await conn.execute(
+                    "INSERT INTO turn_request_resolution "
+                    "(source_scope, request_session_key, client_request_id, "
+                    "request_fingerprint, state, updated_at) VALUES (?, ?, ?, ?, 'accepted', ?) "
+                    "ON CONFLICT(source_scope, request_session_key, client_request_id) "
+                    "DO UPDATE SET state = 'accepted', updated_at = excluded.updated_at",
+                    (source_scope, request_session_key, client_request_id,
+                     request_fingerprint, receipt.accepted_at),
+                )
             if pending_input_id is not None:
                 if pending_dispatch_client_message_id is None:
                     raise AssertionError(

@@ -205,6 +205,8 @@ export type TurnReceiptRequest =
 
 export type TurnReceiptResult =
   | { status: 'found'; response: TurnSendResponse | TurnSteerResponse }
+  /** Server committed a permanent fence against this original request ID. */
+  | { status: 'retired' }
   | { status: 'not-found' | 'unsupported' }
 
 export interface TurnCancelRequest {
@@ -242,6 +244,12 @@ export interface TurnCommands {
     options?: TurnCommandRequestOptions,
   ): Promise<TurnReceiptResult>
   supportsReceiptLookup?(): boolean
+  /** Explicit user recovery only. May retire an unaccepted request atomically;
+   * never sends a message and must not run as an ordinary background read. */
+  resolveReceipt?(
+    request: TurnReceiptRequest,
+    options?: TurnCommandRequestOptions,
+  ): Promise<TurnReceiptResult>
   send(
     request: TurnSendRequest,
     options?: TurnCommandRequestOptions,

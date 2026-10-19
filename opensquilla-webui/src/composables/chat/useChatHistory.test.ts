@@ -1458,6 +1458,38 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('clears missing history only for a different current provisional key without reading or creating a session', () => {
+    const missing = 'agent:main:webchat:missing'
+    const sessionKey = ref(missing)
+    const { api, historyFixture } = makeHistory(false, { sessionKey })
+    expect(api.markSessionMissing(missing)).toBe(true)
+    expect(api.beginProvisionalSession(missing)).toBe(false)
+    expect(api.historyState.value.sessionMissing).toBe(true)
+    const fresh = 'agent:main:webchat:fresh'
+    expect(api.beginProvisionalSession(fresh)).toBe(false)
+    sessionKey.value = fresh
+    expect(api.beginProvisionalSession(fresh)).toBe(true)
+    expect(api.historySessionKey.value).toBe(fresh)
+    expect(api.historyState.value).toMatchObject({ sessionMissing: false, initialLoadStatus: 'ready' })
+    expect(api.markSessionMissing(missing)).toBe(false)
+    expect(historyFixture).not.toHaveBeenCalled()
+  })
+
+  it('retains live-proven absence across a later empty provisional fallback and transient failure', async () => {
+    const key = 'agent:main:webchat:missing'
+    const { api, historyFixture } = makeHistory(false, { sessionKey: ref(key) })
+    api.markSessionMissing(key)
+    historyFixture.mockResolvedValueOnce({ messages: [], hasMore: false, canonicalAvailable: false, canonicalComplete: true })
+    await api.loadHistory()
+    expect(api.historyState.value.sessionMissing).toBe(true)
+    historyFixture.mockRejectedValueOnce(new Error('Temporary history failure'))
+    await api.loadHistory()
+    expect(api.historyState.value.sessionMissing).toBe(true)
+    historyFixture.mockResolvedValueOnce({ messages: [], hasMore: false, canonicalAvailable: true, canonicalComplete: true })
+    await api.loadHistory()
+    expect(api.historyState.value.sessionMissing).toBe(false)
+  })
+
   it('keeps loaded messages visible and exposes an inline recovery error after refresh fails', async () => {
     const { api, historyFixture, messages } = makeHistory()
     await api.loadHistory()

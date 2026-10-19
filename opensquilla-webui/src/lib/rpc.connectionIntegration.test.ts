@@ -104,6 +104,34 @@ afterEach(() => {
 })
 
 describe('production connection integration boundaries', () => {
+  it('aborts only the local turn-admission wait and ignores its late ACK without cancelling or repeating the command', async () => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const commands = createV4TurnCommands(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws')
+    const socket = Socket.instances[0]
+    hello(socket, localOwner, { cancellable_request_methods: ['chat.send'] })
+    const controller = new AbortController()
+    const received = vi.fn()
+    const sending = commands.send({ kind: 'new-turn', params: {
+      sessionKey: 'original-session', message: 'one message', clientRequestId: 'original-request',
+    } }, { signal: controller.signal, expectedGeneration: rpc.connectionGeneration })
+      .then(received).catch(error => error)
+    const frames = () => socket.sent.map(frame => JSON.parse(frame))
+    const admission = frames().find(frame => frame.method === 'chat.send')
+    expect(admission).toBeDefined()
+    controller.abort()
+    expect(await sending).toMatchObject({ kind: 'aborted', failureCode: 'RPC_ABORTED' })
+    socket.receive({ type: 'res', id: admission.id, ok: true, payload: {
+      sessionKey: 'original-session', taskId: 'original-task', messageId: 'original-message',
+    } })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(received).not.toHaveBeenCalled()
+    expect(frames().filter(frame => frame.method === 'chat.send')).toHaveLength(1)
+    expect(frames().filter(frame => frame.type === 'cancel' || frame.method === 'chat.abort')).toHaveLength(0)
+    expect(rpc.state).toBe('connected')
+  })
+
   it('waits for a probe before sending a directory read once while still rejecting writes', async () => {
     const rpc = client()
     const { transport } = transports(rpc)

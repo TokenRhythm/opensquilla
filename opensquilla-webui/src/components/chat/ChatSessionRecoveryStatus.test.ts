@@ -12,7 +12,8 @@ async function mountState(
   state: ChatSessionRecoveryState,
   onRetry = vi.fn(),
   transportState: 'disconnected' | 'connecting' | 'connected' = 'connected',
-  action?: 'retry-history' | 'retry-live',
+  action?: 'retry-history' | 'retry-live' | 'retry-metadata',
+  extra: { busy?: boolean; dismissible?: boolean } = {},
 ) {
   const host = document.createElement('div')
   host.className = 'chat-thread'
@@ -24,6 +25,7 @@ async function mountState(
       transportState,
       action,
       onRetry,
+      ...extra,
     }),
   })
   app.use(i18n)
@@ -44,6 +46,29 @@ afterEach(() => {
 })
 
 describe('ChatSessionRecoveryStatus', () => {
+  it('exposes metadata retry without claiming live updates or history failed', async () => {
+    i18n.global.locale.value = 'zh-Hans'
+    const { host, onRetry } = await mountState('metadata-error', vi.fn(), 'connected', 'retry-metadata', { dismissible: false })
+    expect(host.textContent).toContain('暂时无法发送消息')
+    expect(host.textContent).not.toContain('历史')
+    expect(host.textContent).not.toContain('实时')
+    expect(host.querySelector('[data-testid="chat-session-recovery-dismiss"]')).toBeNull()
+    const retry = host.querySelector<HTMLButtonElement>('[data-testid="chat-session-recovery-retry"]')!
+    expect(retry.textContent?.trim()).toBe('重试')
+    retry.click()
+    await nextTick()
+    expect(onRetry).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the existing metadata action present but disabled during its recovery wait', async () => {
+    const { host, onRetry } = await mountState('metadata-error', vi.fn(), 'connected', 'retry-metadata', { busy: true, dismissible: false })
+    const retry = host.querySelector<HTMLButtonElement>('[data-testid="chat-session-recovery-retry"]')!
+    expect(retry.disabled).toBe(true)
+    expect(retry.getAttribute('aria-busy')).toBe('true')
+    retry.click()
+    expect(onRetry).not.toHaveBeenCalled()
+  })
+
   it('renders compact localized history progress as a live status', async () => {
     i18n.global.locale.value = 'zh-Hans'
     const { host } = await mountState('history-loading')

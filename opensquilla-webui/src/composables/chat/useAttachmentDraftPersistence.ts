@@ -9,6 +9,7 @@ export function useAttachmentDraftPersistence(options: {
   scope: () => AttachmentDraftScope | null
   ownerState?: () => unknown
   store?: AttachmentDraftStore | null
+  deferSourceRetirement?: (source: AttachmentDraftScope, target: AttachmentDraftScope) => boolean
   beforeScopeChange: () => void
   restore: (attachments: Attachment[]) => Promise<void | boolean>
   onError: (message: string) => void
@@ -31,6 +32,7 @@ export function useAttachmentDraftPersistence(options: {
   let restoration = Promise.resolve()
   let nextWrite = 0
   const latestWrite = new Map<string, number>()
+  const deferredRetirements = new Map<string, { source: AttachmentDraftScope; target: AttachmentDraftScope; revision: string; indexes: number[] }>()
   function report(error: unknown) {
     if (failureReported) return
     failureReported = true
@@ -50,6 +52,7 @@ export function useAttachmentDraftPersistence(options: {
     try { key = attachmentDraftKey(target) } catch (error) { report(error); return }
     const version = ++nextWrite
     const savedContentRevision = contentRevision
+    const deferRetirement = retireSource && options.deferSourceRetirement?.(retireSource, target)
     latestWrite.set(key, version)
     writes = writes.then(async () => {
       if (latestWrite.get(key) !== version) return
@@ -57,6 +60,15 @@ export function useAttachmentDraftPersistence(options: {
       if (latestWrite.get(key) === version) latestWrite.delete(key)
       if (retireSource) {
         const previousKey = attachmentDraftKey(retireSource)
+        if (deferRetirement) {
+          // Retain the old URL's durable copy through the navigation crash
+          // window. Completion consumes exactly this revision, never a later edit.
+          deferredRetirements.set(JSON.stringify([previousKey, key]), {
+            source: { ...retireSource }, target: { ...target }, revision: savedContentRevision,
+            indexes: snapshot.map((_attachment, index) => index),
+          })
+          return
+        }
         // Destination storage must acknowledge ownership before the source is
         // removed. A quota failure retains the old durable draft for recovery.
         // A return to the source or a newer source write also keeps it alive.
@@ -65,6 +77,20 @@ export function useAttachmentDraftPersistence(options: {
         }
       }
     }).catch(report)
+  }
+  function completeHandoff(sourceSessionKey: string, targetSessionKey: string): Promise<void> {
+    const target = scope ? { ...scope } : null
+    if (!target || target.sessionKey !== targetSessionKey) return Promise.resolve()
+    const source = { identity: target.identity, sessionKey: sourceSessionKey }
+    const key = JSON.stringify([attachmentDraftKey(source), attachmentDraftKey(target)])
+    // Join the destination save before looking for its acknowledged handoff.
+    writes = writes.then(async () => {
+      const handoff = deferredRetirements.get(key)
+      if (!handoff || scopeKey !== attachmentDraftKey(target) || !store?.consume) return
+      await store.consume(handoff.source, handoff.revision, handoff.indexes)
+      deferredRetirements.delete(key)
+    }).catch(report)
+    return writes
   }
   const stopAttachments = watch(options.attachments, () => {
     revision += 1
@@ -222,5 +248,5 @@ export function useAttachmentDraftPersistence(options: {
     stopScope()
   }
   if (getCurrentScope()) onScopeDispose(dispose)
-  return { restoring, retire, resume, captureConsumption, dispose, flush: async () => { await restoration; await writes } }
+  return { restoring, retire, resume, captureConsumption, completeHandoff, dispose, flush: async () => { await restoration; await writes } }
 }

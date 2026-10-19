@@ -111,12 +111,14 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     // lease. A replacement/revoked identity always needs fresh installations.
     const adopt = firstProof && authority !== null
     const keepHistory = adopt && historyReady.value && historyConfirmed && historyAuthority === authority
-    const keepLive = adopt && liveReady.value && liveConfirmed && liveAuthority === authority
+    const keepLive = adopt && liveReady.value && liveAuthority === authority
+    const keepCompleteLive = keepLive && liveConfirmed
     const keepEpoch = adopt && epochAuthority === authority ? epoch : null
     invalidate()
     if (keepEpoch !== null) observeEpoch(options.sessionKey.value, keepEpoch)
     if (keepHistory) historyInstalled(options.sessionKey.value)
-    if (keepLive) liveInstalled(options.sessionKey.value)
+    if (keepCompleteLive) liveInstalled(options.sessionKey.value)
+    else if (keepLive) liveInstalledWithoutMetadata(options.sessionKey.value)
   }, { flush: 'sync' })
   watch(options.sessionKey, (key, previous) => {
     capture(previous)
@@ -186,6 +188,20 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     releasePreview()
   }
 
+  /** The live read succeeded, but full presentation metadata is unavailable. */
+  function liveInstalledWithoutMetadata(key: string) {
+    if (key !== options.sessionKey.value) return
+    // Publish current history/live instead of freezing a healthy subscription
+    // behind its previous preview. This does not certify a complete cache entry
+    // or grant task authority; a rejected live read still uses liveInstalled(false).
+    liveReady.value = true
+    liveConfirmed = false
+    // Keep the exact live receipt for initial identity proof, independently of
+    // whether its full presentation metadata can be cached.
+    liveAuthority = currentAuthority()
+    releasePreview()
+  }
+
   function releasePreview() {
     if (!historyReady.value || !liveReady.value) return
     // Publish history and the live tail together. A fast history response must
@@ -218,6 +234,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     beginLiveRead,
     retirePreview,
     liveInstalled,
+    liveInstalledWithoutMetadata,
     observeEpoch,
     invalidate,
   }

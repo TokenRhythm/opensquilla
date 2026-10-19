@@ -1,9 +1,11 @@
 <template>
   <TransitionGroup
+    ref="host"
     name="toast-stack"
     tag="div"
     class="toast-host"
     :class="{ 'toast-host--above-tabbar': mobileTabbarVisible }"
+    :style="placementStyle"
     aria-live="polite"
     data-testid="toast-host"
   >
@@ -43,15 +45,23 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, watchPostEffect } from 'vue'
+import { nextTick, ref, watchPostEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useToasts, type ToastItem } from '@/composables/useToasts'
+import { useToastPlacement } from '@/composables/useToastPlacement'
 
-defineProps<{ mobileTabbarVisible?: boolean }>()
+const props = defineProps<{ mobileTabbarVisible?: boolean; avoidSelector?: string }>()
 
 const { t } = useI18n()
 const { toasts, dismissToast, pauseToast, resumeToast, runToastAction } = useToasts()
+const host = ref<{ $el: HTMLElement } | null>(null)
+const placementStyle = useToastPlacement({
+  host: () => host.value?.$el ?? null,
+  visible: () => toasts.value.length > 0,
+  avoidSelector: () => props.avoidSelector,
+  layoutKey: () => props.mobileTabbarVisible,
+})
 
 function onFocusOut(event: FocusEvent, id: number) {
   if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node | null)) resumeToast(id, 'focus')
@@ -76,11 +86,14 @@ watchPostEffect(() => {
 
 <style scoped>
 .toast-host {
+  --toast-base-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px));
   position: fixed;
   right: var(--sp-4);
-  bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px));
+  bottom: calc(var(--toast-base-bottom) + var(--toast-avoidance-offset, 0px));
   max-width: calc(100% - 2 * var(--sp-4));
-  max-height: 50dvh;
+  max-height: min(50dvh, calc(100dvh - var(--toast-base-bottom) - var(--toast-avoidance-offset, 0px) - var(--sp-4)));
+  /* Reserve the exit translation inside the scroll viewport. */
+  padding-bottom: var(--sp-1);
   overflow: auto;
   overscroll-behavior: contain;
   z-index: 1000;
@@ -207,7 +220,7 @@ watchPostEffect(() => {
 .toast-stack-enter-from,
 .toast-stack-leave-to {
   opacity: 0;
-  transform: translateY(4px);
+  transform: translateY(var(--sp-1));
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -225,7 +238,7 @@ watchPostEffect(() => {
   }
 
   .toast-host--above-tabbar {
-    bottom: calc(var(--mobile-tabbar-h) + env(safe-area-inset-bottom, 0px) + var(--sp-4));
+    --toast-base-bottom: calc(var(--mobile-tabbar-h) + env(safe-area-inset-bottom, 0px) + var(--sp-4));
   }
 
   .toast {

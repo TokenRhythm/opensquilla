@@ -29,6 +29,39 @@ afterEach(() => {
 })
 
 describe('useChatDraftPersistence', () => {
+  it('keeps a retired missing-session draft recoverable until its new browser route commits', async () => {
+    const source = 'agent:main:webchat:missing'
+    const target = 'agent:main:webchat:fresh'
+    const key = ref(source)
+    const text = ref('Restore this draft')
+    const { api, scope } = mount(key, text)
+    api.rebindCurrentDraft(target, { retainSource: true })
+    expect(api.loadDraft(source)).toBe('Restore this draft')
+    expect(api.loadDraft(target)).toBe('Restore this draft')
+    scope.stop()
+    // Simulate a document crash before history.replaceState: the old URL is
+    // restored by a new instance, after its response handoff was consumed.
+    const restoredText = ref('')
+    const reloaded = mount(ref(source), restoredText)
+    expect(restoredText.value).toBe('Restore this draft')
+    reloaded.api.rebindCurrentDraft(target, { retainSource: true })
+    reloaded.api.completeDraftRebind(source, target)
+    expect(reloaded.api.loadDraft(source)).toBe('')
+    expect(reloaded.api.loadDraft(target)).toBe('Restore this draft')
+    reloaded.scope.stop()
+  })
+
+  it('does not clear a newer source edit when a retained draft route commits', () => {
+    const source = 'agent:main:webchat:missing'
+    const target = 'agent:main:webchat:fresh'
+    const { api, scope } = mount(ref(source), ref('Old text'))
+    api.rebindCurrentDraft(target, { retainSource: true })
+    api.saveDraft(source, 'New text from another tab')
+    api.completeDraftRebind(source, target)
+    expect(api.loadDraft(source)).toBe('New text from another tab')
+    scope.stop()
+  })
+
   it('keeps temporary drafts in the owner storage and preserves first-send rebinding', async () => {
     const parentKey = 'agent:main:webchat:parent'
     localStorage.setItem(RECENT_DRAFT_SESSION_KEY, parentKey)

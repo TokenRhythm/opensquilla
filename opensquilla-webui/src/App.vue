@@ -382,7 +382,7 @@
   </nav>
 
   <Teleport to="body">
-    <ToastHost :mobile-tabbar-visible="!mobileKeyboardOpen" />
+    <ToastHost :mobile-tabbar-visible="!mobileKeyboardOpen" :avoid-selector="isChatRoute ? '.chat-composer' : undefined" />
   </Teleport>
 
   <ConfirmModal />
@@ -771,11 +771,12 @@ const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewa
   : gatewayConnectionPhase.value === 'healthy' || gatewayConnectionPhase.value === 'disconnected'
   ? t(`chrome.connectionState.${effectiveConnectionState.value}`)
   : t(`chrome.connectionState.${gatewayConnectionPhase.value}`))
-// Only the presentation waits. RPC readiness, sending and recovery keep using
-// their real state. A rejected connection cannot recover silently, so show it now.
+// Only a sustained absence of the physical Gateway connection needs global
+// feedback. A connected socket checking liveness or recovering a session stays
+// quiet; readiness, sending and retry budgets still use their actual state.
 const connectionNoticeVisible = useDelayedNotice(
-  computed(() => effectiveConnectionState.value !== 'connected'),
-  computed(() => gatewayAccess.connectionBlocked === true),
+  computed(() => gatewayAccess.availability !== 'available'),
+  undefined,
   computed(() => gatewayAccess.isRuntimeStarting),
   CONNECTION_NOTICE_DELAY_MS,
 )
