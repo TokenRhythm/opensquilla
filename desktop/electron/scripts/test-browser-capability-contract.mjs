@@ -88,6 +88,18 @@ for (const action of ['upload', 'cancelUpload', 'download']) {
 }
 console.log('Browser gesture, text, related-tab and file request contracts passed.')
 
+// Examples advertised to the model must pass the same parser as actual calls.
+const batchTool = browserToolDefinitions.find(tool => tool.name === 'browser_batch')
+for (const form of ['DOM', 'Coordinate']) {
+  const example = batchTool.description.match(new RegExp(`${form} drag example: (\\{.*?\\})\\.`))
+  assert.ok(example, `${form} drag must have a complete argument example`)
+  const args = JSON.parse(example[1])
+  const parsed = parseDesktopBrowserRequest({ sessionKey: target.sessionKey, operation: 'batch', ...args })
+  assert.equal(parsed.targetRef, args.targetRef)
+  assert.deepEqual(parsed.actions, args.actions)
+  assert.equal(Object.hasOwn(parsed.actions[0], 'targetRef'), false)
+}
+
 // Argument diagnostics identify rejection before dispatch without retaining submitted values.
 const diagnostic = (request, field, rule, expected) => assert.throws(
   () => parseDesktopBrowserRequest({ sessionKey: target.sessionKey, ...request }),
@@ -125,6 +137,20 @@ diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: [null] },
 diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: 'synthetic-secret-value' }, 'actions', 'type', 'array')
 diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: [{ action: 'click', ...image, x: Infinity }] },
   'actions.0.x', 'type', 'finite_number')
+for (const field of ['ref', 'endRef']) {
+  diagnostic({ operation: 'batch', targetRef: target.targetRef,
+    actions: [{ action: 'drag', ...image, toX: 100, toY: 200, [field]: 'synthetic-secret-ref' }] },
+  `actions.0.${field}`, 'conflict', 'exclusive_fields')
+}
+diagnostic({ operation: 'batch', targetRef: target.targetRef,
+  actions: [{ action: 'fill', ...image, text: 'synthetic-secret-value' }] },
+  'actions.0.action', 'dependency', 'related_fields')
+for (const field of ['imageId', 'observationId']) {
+  const action = { action: 'drag', ...image, toX: 100, toY: 200 }
+  delete action[field]
+  diagnostic({ operation: 'batch', targetRef: target.targetRef, actions: [action] },
+    `actions.0.${field}`, 'required', 'present')
+}
 assert.throws(() => parseDesktopBrowserRequest({ operation: 'list', sessionKey: '' }), error => {
   assert.equal(error.details.phase, undefined, 'authenticated identity is outside public argument diagnostics')
   return true

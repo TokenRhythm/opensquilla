@@ -67,6 +67,8 @@ check each needed capability before using it.
    with the expected change. If the result lacks enough evidence, observe or
    inspect the same target. Verify the user's goal or exact destination value
    before reporting success; a completed tool call alone does not prove it.
+   If a page rejects a submission, check the corrected input with the page's
+   validation action and read its new result before reporting completion.
 
 ## Page changes and recovery
 
@@ -102,6 +104,9 @@ check each needed capability before using it.
   with its matching observation/image identity and image-pixel dimensions.
   Never infer coordinates from an ID, filename, scaled preview, or old image.
   If visual input is unavailable, use DOM evidence or report the blocked step.
+  Public `observationId` and `imageId` arguments identify the image you saw;
+  copy them from that observation when the live tool schema requires them.
+  They do not replace the runtime's private image-delivery evidence.
 - Page overviews can summarize text. For exact copying, read the specific
   element with the available precise-text operation, check truncation, and
   read back the destination. Do not treat a truncated or processed result as

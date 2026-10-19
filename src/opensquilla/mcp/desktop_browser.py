@@ -126,26 +126,28 @@ def _safe_validation_token(value: Any) -> bool:
     return isinstance(value, str) and bool(_VALIDATION_TOKEN.fullmatch(value))
 
 
-def _field_in_schema(field: str, schema: dict[str, Any] | None) -> bool:
+def _validation_field_schema(
+    field: str, schema: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if field == "$":
-        return True
+        return schema
     node: Any = schema
     for part in field.split("."):
         if not isinstance(node, dict):
-            return False
+            return None
         if part.isdigit():
             maximum = node.get("maxItems")
             if node.get("type") != "array" or (
                 type(maximum) is int and int(part) >= maximum
             ):
-                return False
+                return None
             node = node.get("items")
         else:
             properties = node.get("properties")
             if not isinstance(properties, dict) or part not in properties:
-                return False
+                return None
             node = properties[part]
-    return True
+    return node if isinstance(node, dict) else None
 
 
 def _argument_validation_result(
@@ -179,12 +181,18 @@ def _argument_validation_result(
             return None
         if not _safe_validation_token(expected):
             return None
-        if not _field_in_schema(field, schema):
+        field_schema = _validation_field_schema(field, schema)
+        if field != "$" and field_schema is None:
             field = "$"
         if expected not in _VALIDATION_EXPECTATIONS.get(rule, ()):
             rule, expected = "unrecognized", "see_tool_schema"
         issues.append({"field": field, "rule": rule, "expected": expected})
-        descriptions.append(f"{field}: {rule}; expected {expected}")
+        description = f"{field}: {rule}; expected {expected}"
+        # Reuse the advertised contract, never submitted arguments or server error text.
+        guidance = field_schema.get("description") if field_schema and field != "$" else None
+        if rule != "unrecognized" and isinstance(guidance, str) and 0 < len(guidance) <= 512:
+            description += f". {guidance}"
+        descriptions.append(description)
     result = {
         "ok": False, "code": "INVALID_REQUEST", "phase": "argument_validation",
         "contractVersion": 1, "outcome": "not_started", "retryable": False,

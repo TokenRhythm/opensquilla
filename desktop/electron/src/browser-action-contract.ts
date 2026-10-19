@@ -70,13 +70,14 @@ const operationContract = {
 export type BrowserOperationName = keyof typeof operationContract
 const fields = {
   operation: { type: 'string', enum: Object.keys(operationContract) },
-  targetRef: { ...identity(), description: 'Opaque targetRef returned by browser_tabs or browser_open.' },
+  targetRef: { ...identity(), description: 'Page targetRef returned by browser_tabs or browser_open. Supply once at the argument root, never inside actions.' },
   url: { ...identity(8192), description: 'HTTP or HTTPS URL without embedded credentials, or exactly about:blank for an empty page.' },
   contextTargetRef: { ...identity(), description: 'Owned page whose cookies and browser storage the new tab shares.' },
-  ref: identity(), downloadId: identity(), maxChars: { type: 'integer', minimum: 1, maximum: 65536 },
+  ref: { ...identity(), description: 'Current DOM element ref returned by page inspection. For coordinate actions, omit both ref and endRef.' },
+  downloadId: identity(), maxChars: { type: 'integer', minimum: 1, maximum: 65536 },
   scope: { ...identity(4096), description: 'CSS selector matching exactly one root in the main frame. Narrows page text and refs before their existing limits. Cannot be combined with ref or downloadId; iframe contents are not included.' },
   observationMode: { type: 'string', enum: ['auto', 'dom'], description: 'auto includes a viewport image when capture is available; dom returns text only.' },
-  actions: { type: 'array', minItems: 1, maxItems: 3 },
+  actions: { type: 'array', minItems: 1, maxItems: 3, description: 'One to three actions. Only fill/select may precede the final action; split longer sequences into separate calls.' },
   dialogId: identity(), accept: { type: 'boolean' }, promptText: { ...text(),
     maxLength: BROWSER_PROMPT_MAX_LENGTH, description: 'Prompt response, at most 16384 Unicode code points.' },
   tabAction: { type: 'string', enum: ['switch', 'close'] },
@@ -84,10 +85,12 @@ const fields = {
   direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
   amount: { type: 'integer', minimum: 1, maximum: 10000, default: 600 },
   button: { type: 'string', enum: ['left', 'middle', 'right'] },
-  durationMs: { type: 'integer', minimum: 1, maximum: 10000 }, endRef: identity(),
+  durationMs: { type: 'integer', minimum: 1, maximum: 10000 },
+  endRef: { ...identity(), description: 'Destination DOM ref for a DOM drag. For coordinate drag, omit ref/endRef and use x, y, toX, toY, imageId and observationId.' },
   fileId: { ...identity(512), description: 'User attachment fileId from availableUploads; never a filesystem path.' },
   chooserId: { ...identity(), description: 'Opaque pending file chooser ID returned by the browser.' },
-  observationId: identity(), imageId: identity(),
+  observationId: { ...identity(), description: 'Copy observationId from the current observation whose image you viewed. Required together with imageId for every coordinate action.' },
+  imageId: { ...identity(), description: 'Copy image.imageId from that same observation. Required together with observationId for every coordinate action.' },
   x: coordinate('Horizontal image-pixel coordinate in the referenced screenshot.'),
   y: coordinate('Vertical image-pixel coordinate in the referenced screenshot.'),
   toX: coordinate('Drag destination horizontal image-pixel coordinate in the same screenshot.'),
@@ -165,8 +168,9 @@ function parseAction(value: unknown, prefix = '', batch = false): DesktopBrowser
   const spec = actionContract[action]
   if (batch && !batchActionNames.includes(action)) fail(path('action', prefix), 'enum', 'supported_value')
   const coordinates = batch && coordinateTriggers.some(field => body[field] !== undefined)
-  if (coordinates && (!spec.coordinates || body.ref !== undefined || body.endRef !== undefined)) {
-    fail(prefix, 'conflict', 'exclusive_fields')
+  if (coordinates && !spec.coordinates) fail(path('action', prefix), 'dependency', 'related_fields')
+  if (coordinates && (body.ref !== undefined || body.endRef !== undefined)) {
+    fail(path(body.ref !== undefined ? 'ref' : 'endRef', prefix), 'conflict', 'exclusive_fields')
   }
   if (!coordinates && batch && [...coordinateTriggers, 'toX', 'toY'].some(field => Object.hasOwn(body, field))) {
     fail(prefix, 'unknown_field', 'known_fields')
@@ -238,7 +242,10 @@ function fieldSchema(field: Field, batch = false): JsonObject {
   const { characters, ...shape } = fields[field] as FieldDefinition
   const schema = { ...shape, ...(characters ? { pattern: characters === 'identity' ? '^[^\\u0000-\\u001f\\u007f]*$' : '^[^\\u0000]*$' } : {}) }
   if (field === 'action' && batch) return { ...schema, enum: batchActionNames }
-  if (field === 'actions') return { ...schema, items: objectSchema(batchFields, ['action'], true) }
+  if (field === 'actions') return { ...schema, items: {
+    ...objectSchema(batchFields, ['action'], true),
+    description: 'One action object. targetRef belongs at the argument root, outside actions. Choose DOM refs or image coordinates with observationId/imageId; do not mix the two forms.',
+  } }
   return schema
 }
 function objectSchema(names: readonly Field[], required: readonly Field[], batch = false): JsonObject {
@@ -258,7 +265,7 @@ function operationDescription(operation: BrowserOperationName, exposedFields: re
   for (const dependency of dependencies.filter(item => item.operation === operation)) {
     pairs.push(`${dependency.field} requires ${dependency.anyOf.join(' or ')}.`)
   }
-  if (operation === 'batch') pairs.push(`For DOM actions: ${actionDescription(batchActionNames)} For coordinate actions, ref/endRef are replaced by image coordinates. Use ${fields.actions.minItems} to ${fields.actions.maxItems} actions. Only ${batchPredecessors.join('/')} may precede the final action. Coordinate ${batchActionNames.filter(name => actionContract[name].coordinates).join('/')} actions require ${coordinateTriggers.join(', ')} without ref/endRef; coordinate drag also requires toX/toY. File actions run individually.`)
+  if (operation === 'batch') pairs.push(`Supply targetRef at the argument root, outside actions. Choose one form per action. For DOM actions: ${actionDescription(batchActionNames)} For coordinate actions, ref/endRef are replaced by image coordinates. Use ${fields.actions.minItems} to ${fields.actions.maxItems} actions. Only ${batchPredecessors.join('/')} may precede the final action. Coordinate ${batchActionNames.filter(name => actionContract[name].coordinates).join('/')} actions require ${coordinateTriggers.join(', ')} without ref/endRef; coordinate drag also requires toX/toY. Copy both IDs from the same current observation image. File actions run individually. DOM drag example: {"targetRef":"<targetRef>","actions":[{"action":"drag","ref":"<startRef>","endRef":"<endRef>"}]}. Coordinate drag example: {"targetRef":"<targetRef>","actions":[{"action":"drag","x":20,"y":30,"toX":80,"toY":90,"imageId":"<imageId>","observationId":"<observationId>"}]}.`)
   return pairs.join(' ')
 }
 const tools = [

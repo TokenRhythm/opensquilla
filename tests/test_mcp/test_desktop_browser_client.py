@@ -769,6 +769,72 @@ async def test_contract_argument_diagnostics_are_safe_and_not_replayed(
 
 
 @pytest.mark.parametrize(
+    ("field", "rule", "expected", "guidance"),
+    [
+        ("targetRef", "required", "present", "Supply targetRef at the argument root."),
+        ("actions", "range", "within_bounds", "Use one to three actions."),
+        ("actions.0", "unknown_field", "known_fields", "Keep targetRef outside actions."),
+        ("actions.0.endRef", "conflict", "exclusive_fields", "Omit endRef for coordinates."),
+        ("actions.0.observationId", "required", "present", "Copy the viewed observation ID."),
+    ],
+)
+async def test_argument_recovery_uses_advertised_field_guidance(
+    browser, field, rule, expected, guidance,
+):
+    schema = diagnostic_input_schema()
+    schema["properties"]["targetRef"] = {"type": "string"}
+    item = schema["properties"]["actions"]["items"]
+    item["properties"].update({
+        "endRef": {"type": "string"}, "observationId": {"type": "string"},
+    })
+    node = schema
+    for part in field.split("."):
+        node = node["items"] if part.isdigit() else node["properties"][part]
+    node["description"] = guidance
+    error = argument_validation_error()
+    error["data"]["issues"] = [{"field": field, "rule": rule, "expected": expected}]
+    calls = []
+
+    async def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": json.loads(request.content)["id"], "error": error,
+        })
+
+    client = DesktopBrowserMCPClient(browser)
+    client._tool_schemas["browser_batch"] = schema
+    client._available_tools = frozenset({"browser_batch"})
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    token = current_tool_context.set(context(browser))
+    call_token = current_mcp_call_context.set(MCPCallContext("recovery-guidance"))
+    try:
+        result = await client.call_tool("browser_batch", {
+            "actions": [{"action": "fill", "text": "synthetic-private-argument"}],
+        })
+        assert result.is_error
+        assert guidance in result.structured_content["message"]
+        assert result.structured_content["issues"] == error["data"]["issues"]
+        assert result.structured_content["outcome"] == "not_started"
+        assert "synthetic-private" not in result.content
+        assert len(calls) == 1
+    finally:
+        current_tool_context.reset(token)
+        current_mcp_call_context.reset(call_token)
+        await client.close()
+
+
+@pytest.mark.parametrize("description", [None, 123, "", "x" * 513])
+def test_argument_guidance_remains_bounded(description):
+    from opensquilla.mcp.desktop_browser import _argument_validation_result
+
+    schema = diagnostic_input_schema()
+    schema["properties"]["ref"]["description"] = description
+    result = _argument_validation_result(argument_validation_error(), schema)
+    assert result is not None
+    assert result["structuredContent"]["message"].endswith("ref: required; expected present.")
+
+
+@pytest.mark.parametrize(
     ("location", "changes"),
     [
         ("error", {"code": -32603}),
