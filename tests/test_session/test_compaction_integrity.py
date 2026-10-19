@@ -65,7 +65,7 @@ def no_network(monkeypatch):
     assert not attempts, "an integrity test attempted an external request"
 
 
-@pytest.fixture(params=["default", "unavailable"])
+@pytest.fixture(params=["default", "unavailable"], autouse=True)
 def tokenizer_mode(request, monkeypatch):
     # A runner without a cached encoding can retain this fallback for its whole
     # lifetime. Budget fixtures must keep their intended bounds in either mode.
@@ -242,7 +242,6 @@ def test_final_fit_cannot_hide_previously_covered_goals():
     assert coverage.status == "pass"
 
 
-@pytest.mark.usefixtures("tokenizer_mode")
 async def test_fitting_refuses_to_delete_unextracted_fact_from_nonempty_summary():
     fact = "The retired route uses copper while the current route uses silver."
     text = (
@@ -539,7 +538,6 @@ async def test_nonshrinking_candidate_does_not_report_pressure_released(manual, 
 
 @pytest.mark.parametrize("reasoning_control", [True, False])
 @pytest.mark.parametrize("output_case", ["short_body", "long_body", "input_reserve"])
-@pytest.mark.usefixtures("tokenizer_mode")
 async def test_reasoning_and_body_use_current_generation_budget_without_a_body_cap(
     monkeypatch, reasoning_control, output_case,
 ):
@@ -599,15 +597,22 @@ async def test_necessary_chunks_can_use_more_than_two_calls_without_losing_sourc
     entries = [
         {
             "role": "user" if index % 2 == 0 else "assistant",
-            "content": f"item-{index} " + "unique long background " * 140,
+            "content": f"item-{index} " + "x!" * 210,
             "token_count": 600,
         }
         for index in range(20)
     ]
-    result = await compact_context(CompactionRequest(
+    request = CompactionRequest(
         session_id="necessary-chunks", entries=entries, context_window_tokens=8000,
         config=cfg, forced_prefix_cut=18 if forced else None,
-    ))
+    )
+    # A complete round must fit even with the conservative fallback, while the
+    # complete source must still require more than two provider calls.
+    budget = _compaction_target_input_budget(request)
+    assert estimate_tokens(_rolling_chunk_text("", entries[:2])) < budget
+    assert estimate_tokens(_rolling_chunk_text("", entries[:4])) > budget
+    assert estimate_tokens(_rolling_chunk_text("", entries[:18])) > budget * 2
+    result = await compact_context(request)
     if forced:
         assert result.removed_count == 18
     else:
@@ -735,7 +740,7 @@ def character_bounded_compaction_case(rounds=2, summary="Complete portable check
         entry
         for index in range(rounds)
         for entry in [
-            {"role": "user", "content": f"Round {index}: " + "layout " * 700},
+            {"role": "user", "content": f"Round {index}: " + "layout " * 650},
             {"role": "assistant", "content": f"Acknowledged round {index}"},
         ]
     ] + [
