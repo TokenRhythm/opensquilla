@@ -18,7 +18,7 @@ IMAGE_GENERATION_OFFICIAL_BASE_URLS: dict[str, str] = {
 # replacement: https://developers.openai.com/api/docs/deprecations
 OPENAI_IMAGE_GENERATION_DEFAULT_MODEL = "gpt-image-2.5-flare"
 DEFAULT_IMAGE_GENERATION_PRIMARY = f"openai/{OPENAI_IMAGE_GENERATION_DEFAULT_MODEL}"
-# Earlier releases wrote this default into saved configs; it still means "not chosen".
+# Older saved defaults without an explicit custom binding retain implicit routing.
 LEGACY_DEFAULT_IMAGE_GENERATION_PRIMARY = "openai/gpt-image-1"
 _PROVIDER_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

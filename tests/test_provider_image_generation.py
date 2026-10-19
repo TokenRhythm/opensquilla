@@ -1951,7 +1951,7 @@ def test_image_generation_nondefault_primary_does_not_auto_add_llm_provider(monk
     assert _resolve_image_generation_candidates(None, image_config) == ["openai/custom-image-model"]
 
 
-def test_image_generation_persisted_default_primary_still_adds_llm_provider(
+def test_image_generation_persisted_legacy_default_still_adds_llm_provider(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1963,7 +1963,10 @@ def test_image_generation_persisted_default_primary_still_adds_llm_provider(
         configure_image_generation,
     )
 
-    config = GatewayConfig.model_validate(GatewayConfig().model_dump(mode="python"))
+    # Older saved defaults predate the explicit binding ownership marker.
+    config = GatewayConfig.model_validate({
+        "image_generation": {"primary": "openai/gpt-image-1"},
+    })
     config.llm = LlmProviderConfig(provider="openrouter", api_key="sk-or-configured")
     configure_image_generation(config.image_generation, llm_config=config.llm)
 
@@ -2006,6 +2009,161 @@ def test_image_generation_legacy_default_primary_still_adds_llm_provider(monkeyp
     assert "openrouter/google/gemini-3.1-flash-image-preview" in (
         _resolve_image_generation_candidates(None, image_config)
     )
+
+
+@pytest.fixture
+def image_routing_with_openrouter(monkeypatch):
+    from opensquilla.gateway.config import LlmProviderConfig
+    from opensquilla.tools.builtin.media import configure_image_generation
+
+    for env_key in (
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "TOKENRHYTHM_API_KEY",
+        "QWEN_TOKEN_PLAN_API_KEY",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
+
+    def configure(config):
+        configure_image_generation(
+            config,
+            llm_config=LlmProviderConfig(
+                provider="openrouter", api_key="synthetic-openrouter-routing-key",
+            ),
+        )
+
+    yield configure
+    configure_image_generation(None)
+
+
+def test_image_generation_implicit_default_still_adds_llm_provider(
+    image_routing_with_openrouter,
+) -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.tools.builtin.media import _resolve_image_generation_candidates
+
+    config = ImageGenerationConfig(enabled=True)
+    image_routing_with_openrouter(config)
+
+    assert _resolve_image_generation_candidates(None, config) == [
+        "openai/gpt-image-2.5-flare",
+        "openrouter/google/gemini-3.1-flash-image-preview",
+    ]
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    ["primary", "custom", "copy", "roundtrip", "custom_default", "legacy_custom", "untyped"],
+)
+def test_image_generation_explicit_default_does_not_add_llm_provider(
+    configuration, image_routing_with_openrouter,
+) -> None:
+    from types import SimpleNamespace
+
+    from opensquilla.gateway.config import GatewayConfig, ImageGenerationConfig
+    from opensquilla.tools.builtin.media import _resolve_image_generation_candidates
+
+    primary = "openai/gpt-image-2.5-flare"
+    config = ImageGenerationConfig(primary=primary)
+    if configuration == "custom":
+        config = ImageGenerationConfig(binding="custom", primary=primary)
+    elif configuration == "copy":
+        config = config.model_copy(deep=True)
+    elif configuration == "roundtrip":
+        gateway = GatewayConfig(image_generation=config)
+        config = GatewayConfig.model_validate(
+            gateway.model_dump(mode="python"),
+        ).image_generation
+    elif configuration == "custom_default":
+        config = ImageGenerationConfig(binding="custom")
+    elif configuration == "legacy_custom":
+        primary = "openai/gpt-image-1"
+        config = ImageGenerationConfig(binding="custom", primary=primary)
+    elif configuration == "untyped":
+        config = SimpleNamespace(primary=primary, fallbacks=[])
+    image_routing_with_openrouter(config)
+
+    assert _resolve_image_generation_candidates(None, config) == [primary]
+
+
+@pytest.mark.parametrize("model", [None, "openai/one-off-image-model"])
+def test_image_generation_explicit_candidates_keep_order_and_do_not_expand(
+    model, image_routing_with_openrouter,
+) -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.tools.builtin.media import _resolve_image_generation_candidates
+
+    primary = "openai/gpt-image-2.5-flare"
+    fallback = "openai/explicit-fallback-model"
+    config = ImageGenerationConfig(
+        binding="custom", primary=primary, fallbacks=[fallback, primary, fallback],
+    )
+    image_routing_with_openrouter(config)
+
+    expected = [primary, fallback]
+    if model:
+        expected.insert(0, model)
+    assert _resolve_image_generation_candidates(model, config) == expected
+
+
+def test_image_generation_explicit_model_does_not_expand_implicit_default(
+    image_routing_with_openrouter,
+) -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.tools.builtin.media import _resolve_image_generation_candidates
+
+    config = ImageGenerationConfig()
+    image_routing_with_openrouter(config)
+
+    assert _resolve_image_generation_candidates("openai/one-off-image-model", config) == [
+        "openai/one-off-image-model",
+        "openai/gpt-image-2.5-flare",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_image_generation_explicit_default_failure_does_not_call_openrouter(
+    monkeypatch,
+) -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.provider import image_generation
+    from opensquilla.tools.builtin.media import _resolve_image_generation_candidates
+
+    calls: list[str] = []
+
+    class FakeProvider:
+        auth_env_vars: tuple[str, ...] = ()
+
+        def __init__(self, provider_id: str, default_model: str) -> None:
+            self.provider_id = provider_id
+            self.default_model = default_model
+
+        async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+            calls.append(self.provider_id)
+            if self.provider_id == "openai":
+                raise RuntimeError("synthetic OpenAI timeout")
+            return ImageGenerationResult(
+                image_bytes=_test_png_bytes(),
+                mime_type="image/png",
+                model=request.model,
+                provider=self.provider_id,
+            )
+
+    monkeypatch.setattr(image_generation, "_PROVIDERS", {
+        "openai": FakeProvider("openai", "gpt-image-2.5-flare"),
+        "openrouter": FakeProvider("openrouter", "google/gemini-3.1-flash-image-preview"),
+    })
+    config = ImageGenerationConfig(
+        binding="custom", primary="openai/gpt-image-2.5-flare", fallbacks=[],
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic OpenAI timeout"):
+        await image_generation.generate_with_fallbacks(
+            request=ImageGenerationRequest(prompt="draw a squid", model="", size="1024x1024"),
+            candidates=_resolve_image_generation_candidates(None, config),
+        )
+
+    assert calls == ["openai"]
 
 
 def test_image_generation_capability_exposes_agent_tool_when_configured(monkeypatch) -> None:

@@ -104,7 +104,14 @@ def config_set(
         from opensquilla.gateway.model_routing import (
             reconcile_model_routing_write,
         )
+        from opensquilla.onboarding.image_generation_state import (
+            preserve_image_routing_provenance,
+        )
 
+        preserve_image_routing_provenance(cfg, updated, {key})
+        if key in {"image_generation.primary", "image_generation.binding"}:
+            # A default-equal image route is still an explicit operator choice.
+            updated.mark_force_persist(key)
         reconcile_model_routing_write(updated, {key}, previous=cfg)
         # Canonical mode reconciliation can enable Router after model validation.
         # Resolve the same provider defaults a reload would apply before checking

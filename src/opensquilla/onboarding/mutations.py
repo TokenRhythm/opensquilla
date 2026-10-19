@@ -1904,6 +1904,9 @@ def upsert_image_generation_provider(
     new_cfg.mark_force_persist("image_generation.enabled")
     new_cfg.mark_force_persist("image_generation.binding")
     new_cfg.image_generation.primary = primary_model
+    # A direct provider save selects this route even when it matches the
+    # schema default. Keep the selection through sparse persistence/reload.
+    new_cfg.mark_force_persist("image_generation.primary")
     new_cfg.image_generation.size = effective_size
     new_cfg.image_generation.output_format = cast(ImageOutputFormat, effective_output_format)
     new_cfg.image_generation.fallbacks = effective_fallbacks

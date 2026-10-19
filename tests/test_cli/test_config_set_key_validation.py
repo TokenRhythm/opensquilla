@@ -321,3 +321,63 @@ def test_no_key_the_previous_check_accepted_is_now_refused(tmp_path: Path) -> No
 
     refused = [key for key in keys if not _set_key(copy.deepcopy(document), key, "X")]
     assert refused == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("primary", "openai/gpt-image-2.5-flare"), ("binding", "custom")],
+)
+def test_explicit_default_image_route_survives_cli_save_and_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str,
+) -> None:
+    from opensquilla.gateway.config import LlmProviderConfig
+    from opensquilla.onboarding.config_store import load_config
+    from opensquilla.tools.builtin.media import (
+        _resolve_image_generation_candidates,
+        configure_image_generation,
+    )
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    target = _empty_config(tmp_path)
+    target.write_text("[image_generation]\nenabled = true\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["config", "set", f"image_generation.{field}", value, "--config", str(target)],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    document = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert document["image_generation"][field] == value
+    config = load_config(target)
+    configure_image_generation(
+        config.image_generation,
+        llm_config=LlmProviderConfig(
+            provider="openrouter", api_key="synthetic-cli-image-routing-key",
+        ),
+    )
+    try:
+        assert _resolve_image_generation_candidates(None, config.image_generation) == [
+            "openai/gpt-image-2.5-flare",
+        ]
+    finally:
+        configure_image_generation(None)
+
+
+def test_unrelated_cli_save_keeps_image_route_implicit(tmp_path: Path) -> None:
+    from opensquilla.onboarding.config_store import load_config
+
+    target = _empty_config(tmp_path)
+    target.write_text("[image_generation]\nenabled = true\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["config", "set", "log_level", "INFO", "--config", str(target)],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    document = tomllib.loads(target.read_text(encoding="utf-8"))
+    assert document["log_level"] == "INFO"
+    assert document["image_generation"] == {"enabled": True}
+    config = load_config(target)
+    assert "primary" not in config.image_generation.model_fields_set
+    assert "binding" not in config.image_generation.model_fields_set
