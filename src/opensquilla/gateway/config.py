@@ -1539,8 +1539,9 @@ def validate_compaction_deployment_write(payload: dict[str, Any]) -> None:
 class SessionNamingConfig(BaseSettings):
     """LLM-generated session titles (auto-naming).
 
-    After the first user message, a one-shot LLM call summarizes it into a short
-    title written to SessionNode.derived_title. Explicit ``model`` and ``tier``
+    After the first user message, a bounded LLM operation summarizes it into a
+    short title written to SessionNode.derived_title. Transient failures can be
+    retried twice within ``timeout_seconds``. Explicit ``model`` and ``tier``
     settings override the selected physical deployment: routed turns reuse the
     chosen model and Ensemble turns reuse their aggregator, through a separate
     naming request. Legacy callers without a selected deployment retain their

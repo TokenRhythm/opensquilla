@@ -610,7 +610,7 @@ async def test_call_naming_llm_builds_versioned_api_url(
 @pytest.mark.parametrize(
     ("provider", "base_url", "expected_max_tokens"),
     [
-        ("tokenrhythm", "https://custom-tokenrhythm.example/v1", 1024),
+        ("tokenrhythm", "https://custom-tokenrhythm.example/v1", 2048),
         ("openrouter", "https://openrouter.ai/api/v1", 512),
     ],
 )
@@ -1538,11 +1538,11 @@ async def test_call_naming_provider_empty_result_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_call_naming_provider_reasoning_budget_exceeded_returns_none():
-    # A reasoning-default model streams a long thinking block; the visible
-    # title must still fit the budget, so an oversized thinking block fails.
+async def test_call_naming_provider_reasoning_memory_limit_returns_none():
+    # Bound a provider that ignores the requested output cap without trying
+    # to infer its actual token usage from a different tokenizer.
     provider = _AdapterProvider(
-        lambda: _ProviderStream([ReasoningDeltaEvent(text="x" * 3000), _done(0)])
+        lambda: _ProviderStream([ReasoningDeltaEvent(text="x" * 65_537), _done(0)])
     )
     title = await call_naming_provider(
         "hello", provider=provider, model="provider/model"
@@ -1680,13 +1680,22 @@ async def test_call_naming_provider_bounds_cancellation_resistant_cleanup(monkey
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", [
     DoneEvent(output_tokens=2, reasoning_tokens=513),
-    DoneEvent(output_tokens=2, reasoning_content="reason " * 600),
+    DoneEvent(output_tokens=2, reasoning_content="reason " * 10_000),
 ])
 async def test_call_naming_provider_checks_terminal_reasoning_budget(terminal):
     provider = _AdapterProvider(lambda: _ProviderStream([_delta("Useful Topic"), terminal]))
     assert await call_naming_provider(
         "hello", provider=provider, model="provider/model",
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_call_naming_provider_accepts_terminal_reasoning_with_valid_reported_usage():
+    terminal = DoneEvent(output_tokens=2, reasoning_tokens=300, reasoning_content="reason " * 600)
+    provider = _AdapterProvider(lambda: _ProviderStream([_delta("Useful Topic"), terminal]))
+    assert await call_naming_provider(
+        "hello", provider=provider, model="provider/model",
+    ) == "Useful Topic"
 
 
 @pytest.mark.asyncio
