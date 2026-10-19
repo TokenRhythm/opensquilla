@@ -826,7 +826,7 @@ describe('AssistantMessage activity disclosure', () => {
   })
 
   it.each([
-    ['request_scoped', 'History temporarily reduced; continuing'],
+    ['request_scoped', 'Context organized'],
     ['durable', 'Context organized'],
   ])('keeps %s wording in the process body under the total elapsed summary', async (durability, label) => {
     const el = mountMessage(baseMessage({
@@ -847,7 +847,13 @@ describe('AssistantMessage activity disclosure', () => {
     const body = el.querySelector('.assistant-activity__body')
     expect(body?.getAttribute('aria-hidden')).toBe('false')
     expect(body?.textContent).toContain(label)
-    if (durability === 'request_scoped') expect(body?.textContent).not.toContain('Context organized')
+    const marker = body?.querySelector('.compaction-recovery-marker__button')
+    expect(body?.textContent).not.toContain('History temporarily reduced; continuing')
+    if (durability === 'request_scoped') {
+      expect(marker?.getAttribute('aria-label')).toBe('History temporarily reduced; continuing')
+    } else {
+      expect(marker).toBeNull()
+    }
   })
 
   it('hides routine phase rows while keeping settled reasoning content expandable', async () => {

@@ -746,6 +746,8 @@ class _CandidateResult:
     ttft_ms: int | None = None
     error: str = ""
     error_code: str = ""
+    error_http_status: int | None = None
+    error_provider_code: str = ""
     message_limit_proof: ProviderMessageLimitProof | None = None
     execution: dict[str, Any] = field(default_factory=dict)
     usage_reported: bool = False
@@ -1471,6 +1473,38 @@ def _uniform_request_budget_error(
     return next(
         (candidate.error for candidate in candidates if candidate.error),
         "provider_request_budget_exhausted",
+    )
+
+
+def _uniform_native_context_error(
+    candidates: Sequence[_CandidateResult],
+) -> ErrorEvent | None:
+    """Expose agreed native capacity failures to the existing Agent recovery."""
+
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if (
+            not candidate.request_started
+            or candidate.ok
+            or not candidate.error
+            or candidate.text.strip()
+        ):
+            return None
+        status = candidate.error_http_status
+        if status is None and candidate.error_code.isdigit():
+            status = int(candidate.error_code)
+        if classify_provider_error(
+            provider_name=candidate.provider,
+            status_code=status,
+            raw_code=candidate.error_provider_code or candidate.error_code,
+            message=candidate.error,
+        ) is not ProviderFailureKind.CONTEXT_OVERFLOW:
+            return None
+    first = candidates[0]
+    return ErrorEvent(
+        message=first.error, code=first.error_code,
+        http_status=first.error_http_status, provider_code=first.error_provider_code,
     )
 
 
@@ -3508,6 +3542,8 @@ class EnsembleProvider:
         candidate.ttft_ms = attempt.ttft_ms
         candidate.error = attempt.error
         candidate.error_code = attempt.error_code
+        candidate.error_http_status = attempt.error_http_status
+        candidate.error_provider_code = attempt.error_provider_code
         candidate.message_limit_proof = attempt.message_limit_proof
         candidate.execution = dict(attempt.execution)
         candidate.model = attempt.model
@@ -3673,6 +3709,11 @@ class EnsembleProvider:
                 )
                 result.error_code = redact_upstream_error_code(
                     event.code,
+                    api_key=member.provider_config.api_key,
+                )
+                result.error_http_status = event.http_status
+                result.error_provider_code = redact_upstream_error_code(
+                    event.provider_code,
                     api_key=member.provider_config.api_key,
                 )
                 result.message_limit_proof = event.message_limit_proof
@@ -5155,6 +5196,7 @@ class EnsembleProvider:
             )
 
         request_budget_error = _uniform_request_budget_error(candidates)
+        native_context_error = _uniform_native_context_error(candidates)
         if self.all_failed_policy != "fallback_single":
             message_limit_proof = _uniform_message_limit_proof(candidates)
             if request_budget_error is not None:
@@ -5176,6 +5218,8 @@ class EnsembleProvider:
                         message_limit_proof=message_limit_proof,
                     )
                 )
+            elif native_context_error is not None:
+                yield proposer_error(native_context_error)
             else:
                 yield proposer_error(ErrorEvent(message=reason, code=code))
             return
@@ -5240,6 +5284,8 @@ class EnsembleProvider:
                         message_limit_proof=message_limit_proof,
                     )
                 )
+            elif native_context_error is not None:
+                yield proposer_error(native_context_error)
             else:
                 yield proposer_error(ErrorEvent(message=reason, code=code))
             return

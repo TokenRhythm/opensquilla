@@ -72,12 +72,18 @@ class GrowingProvider(OpenAIProvider):
         yield DoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
-def setup_case(monkeypatch, *, retries=1, refuse_retry=False, fallback_estimation=False):
+def setup_case(
+    monkeypatch, *, retries=1, refuse_retry=False, fallback_estimation=False,
+    character_pressure=True,
+):
     # These lifecycle counts require character pressure with token headroom.
     # Tokenizer loading is environmental; exercise its conservative fallback
     # separately below, where token pressure changes the recovery boundaries.
     encoding = None if fallback_estimation else _CharacterBudgetEncoding()
     monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
+    # Fix the character-only boundary independently of dynamic output fitting.
+    # Tokenizer fallback and the default-budget case use the actual derived cap.
+    explicit_character_cap = character_pressure and not fallback_estimation
     summaries = []
 
     async def compact(request):
@@ -106,6 +112,8 @@ def setup_case(monkeypatch, *, retries=1, refuse_retry=False, fallback_estimatio
             context_window_tokens_global_override=16_000,
             context_window_known=True,
             max_tokens=4096,
+            provider_request_proof_max_chars=39_616 if explicit_character_cap else 0,
+            provider_request_proof_max_chars_explicit=explicit_character_cap,
             max_iterations=6,
             max_provider_retries=0,
             max_overflow_retries=retries,
@@ -174,6 +182,28 @@ async def test_new_tool_progress_after_failed_summary_gets_local_only_second_rec
     assert_pairs(final.payload)
     assert [m.model_dump(mode="json") for m in history] == before
     assert [m.model_dump(mode="json") for m in agent.history_snapshot()[: len(history)]] == before
+
+
+async def test_default_dynamic_budget_does_not_buy_unnecessary_recoveries(monkeypatch):
+    agent, provider, summaries, executed, history, before = setup_case(
+        monkeypatch, character_pressure=False,
+    )
+    events = [event async for event in agent.run_turn(CURRENT)]
+
+    assert provider.projections[0].fits
+    assert provider.rejections == 1 and provider.calls == 4
+    assert len(summaries) == 1
+    assert executed == ["live-0-0", "live-0-1", "live-1-1"]
+    assert not any(isinstance(event, AgentErrorEvent) for event in events)
+    assert any(
+        getattr(event, "text", "") == "Continued after local window recovery." for event in events
+    )
+    assert provider.projections[-1].fits
+    assert_pairs(provider.projections[-1].payload)
+    assert [message.model_dump(mode="json") for message in history] == before
+    assert [
+        message.model_dump(mode="json") for message in agent.history_snapshot()[: len(history)]
+    ] == before
 
 
 async def test_tokenizer_fallback_recovers_token_pressure_without_another_paid_summary(monkeypatch):

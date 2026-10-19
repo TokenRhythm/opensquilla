@@ -18,7 +18,7 @@
           'assistant-activity-status__row--routine': isRoutineActivityPhaseStep(step),
           'assistant-activity-status__row--animating': step.isCurrent && executing && activityVisible && step.providerRecovery?.phase !== 'retry_wait',
           'assistant-activity-status__row--maintenance': step.category === 'maintenance',
-          'assistant-activity-status__row--failed': step.state === 'failed',
+          'assistant-activity-status__row--failed': isFailure(step),
         }"
         :data-testid="step.category === 'maintenance' ? 'compaction-event' : undefined"
         :data-compaction-id="step.id"
@@ -26,29 +26,24 @@
         :data-source="step.source"
         :data-durability="step.durability"
       >
-        <span v-if="!isRoutineActivityPhaseStep(step)" class="assistant-activity-status__dot" aria-hidden="true" />
+        <CompactionRecoveryMarker v-if="isTemporaryRecovery(step)" />
+        <span v-else-if="!isRoutineActivityPhaseStep(step)" class="assistant-activity-status__dot" aria-hidden="true" />
         <ActivityMotion
           class="assistant-activity-status__content"
           :active="isRoutineActivityPhaseStep(step) && step.isCurrent && executing && activityVisible"
-          :role="step.category === 'maintenance' ? (step.state === 'failed' ? 'alert' : 'status') : undefined"
-          :aria-live="step.category === 'maintenance' ? (step.state === 'failed' ? 'assertive' : 'polite') : undefined"
+          :role="step.category === 'maintenance' ? (isFailure(step) ? 'alert' : 'status') : undefined"
+          :aria-live="step.category === 'maintenance' ? (isFailure(step) ? 'assertive' : 'polite') : undefined"
           :aria-atomic="step.category === 'maintenance' ? 'true' : undefined"
         >
           <span :aria-hidden="step.providerRecovery?.phase === 'retry_wait' ? 'true' : undefined">{{ statusText(step) }}</span>
           <span v-if="step.providerRecovery?.phase === 'retry_wait'" class="sr-only">{{ statusText(step, true) }}</span>
-          <span v-if="step.httpStatus && (step.providerRecovery?.phase === 'retry_wait' || step.state === 'failed')" class="assistant-activity-status__detail">{{ t('chat.httpStatus', { status: step.httpStatus }) }}</span>
+          <span v-if="step.category !== 'maintenance' && step.httpStatus && (step.providerRecovery?.phase === 'retry_wait' || step.state === 'failed')" class="assistant-activity-status__detail">{{ t('chat.httpStatus', { status: step.httpStatus }) }}</span>
           <span
-            v-if="!isRoutineActivityPhaseStep(step) && step.durationSeconds !== undefined"
+            v-if="step.category !== 'maintenance' && !isRoutineActivityPhaseStep(step) && step.durationSeconds !== undefined"
             class="assistant-activity-status__duration"
             aria-hidden="true"
           >
             · {{ formatDuration(step.durationSeconds) }}
-          </span>
-          <span
-            v-if="step.category === 'maintenance' && step.durability === 'request_scoped'"
-            class="assistant-activity-status__detail"
-          >
-            {{ t('chat.compact.requestScoped') }}
           </span>
         </ActivityMotion>
       </li>
@@ -90,6 +85,7 @@ import { useI18n } from 'vue-i18n'
 import { chatErrorPresentation } from '@/utils/chat/chatErrorPresentation'
 import { useProviderRecoveryClock } from '@/composables/chat/useProviderRecoveryClock'
 import ActivityMotion from '@/components/chat/ActivityMotion.vue'
+import CompactionRecoveryMarker from './CompactionRecoveryMarker.vue'
 import ActivityNarration from '@/components/chat/ActivityNarration.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import type {
@@ -162,7 +158,15 @@ const statusSteps = computed(() => {
 })
 
 const now = useProviderRecoveryClock(() => activityVisible.value && statusSteps.value.some(step => step.isCurrent && step.providerRecovery?.phase === 'retry_wait'))
+function isFailure(step: AssistantActivityStatusStep): boolean {
+  return step.state === 'failed' && (step.category !== 'maintenance' || step.source === 'manual')
+}
+function isTemporaryRecovery(step: AssistantActivityStatusStep): boolean {
+  return step.category === 'maintenance' && step.state === 'completed' && step.durability === 'request_scoped'
+}
 function statusText(step: AssistantActivityStatusStep, announce = false): string {
+  if (isTemporaryRecovery(step)) return String(t('chat.compact.compacted'))
+  if (step.category === 'maintenance' && step.state === 'failed' && !isFailure(step)) return String(t('chat.compact.incomplete'))
   if (step.state === 'failed' && step.failureKind) return `${t(step.label.code, step.label.params)} · ${t(chatErrorPresentation({ failureKind: step.failureKind }).messageKey)}`
   const descriptor = providerActivityLabel(step, now.value, announce)
   const recovery = String(t(descriptor.code, descriptor.params))

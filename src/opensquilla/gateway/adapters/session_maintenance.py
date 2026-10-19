@@ -595,6 +595,7 @@ class GatewaySessionMaintenancePorts(
                 failure_kind=str(getattr(result, "failure_kind", "") or ""),
                 failure_detail=getattr(result, "failure_detail", None),
                 quality_report=dict(getattr(result, "quality_report", None) or {}),
+                cancellation_reconciled=bool(getattr(result, "cancellation_reconciled", False)),
             )
 
         try:

@@ -170,3 +170,42 @@ def smoke_router() -> None:
     typer.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if not result.get("success"):
         raise typer.Exit(1)
+
+
+def _smoke_tokenizer_runtime() -> dict[str, object]:
+    from unittest.mock import patch
+
+    import tiktoken
+
+    from opensquilla.token_estimation import estimate_tokens_with_source
+
+    # read_file_cached reads a verified cache file directly. Deny its fallback
+    # fetch before constructing the encoding, so this probe cannot warm itself
+    # from the network and conceal a missing packaged asset.
+    with patch("tiktoken.load.read_file", side_effect=RuntimeError("offline tokenizer cache miss")):
+        encoding = tiktoken.get_encoding("cl100k_base")
+        text = "OpenSquilla offline tokenizer verification. 离线编码验证。"
+        tokens = encoding.encode(text, disallowed_special=())
+        count, source = estimate_tokens_with_source(text)
+    return {
+        "success": bool(tokens)
+        and encoding.decode(tokens) == text
+        and count == len(tokens)
+        and source == "tiktoken_cl100k_base",
+        "encoding": encoding.name,
+        "token_count": len(tokens),
+        "estimate_source": source,
+        "offline": True,
+    }
+
+
+@diagnostics_app.command("smoke-tokenizer")
+def smoke_tokenizer() -> None:
+    """Resolve and use the packaged tokenizer without downloading encoding data."""
+    try:
+        result = _smoke_tokenizer_runtime()
+    except Exception as exc:
+        result = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+    typer.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if not result.get("success"):
+        raise typer.Exit(1)

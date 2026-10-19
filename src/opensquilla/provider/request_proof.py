@@ -17,7 +17,7 @@ from typing import Any
 
 from PIL import Image
 
-from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.context_budget import hard_input_tokens
 
 from .types import ChatConfig, ContentBlockText, ProviderFinalRequestProjection
 
@@ -218,6 +218,109 @@ def effective_proof_token_budget(token_budget: int) -> tuple[int, int]:
     return max(0, token_budget - headroom), min(token_budget, headroom)
 
 
+def fit_generation_tokens(
+    context_window_tokens: int,
+    requested_generation_tokens: int,
+    estimated_input_tokens: int,
+    *,
+    minimum_generation_tokens: int = 1,
+) -> int:
+    """Keep the largest requested output cap that fits the complete input.
+
+    Zero means no positive output budget fits; callers must reduce input or
+    recover. A small legal output budget is not proof of task completion.
+    Unknown windows retain the caller's existing policy. The binary search
+    inverts the existing proof margin, so no second safety reserve is added.
+    """
+    requested = max(0, int(requested_generation_tokens))
+    if context_window_tokens <= 0:
+        return requested
+    minimum = min(requested, max(1, int(minimum_generation_tokens)))
+    input_tokens = max(0, int(estimated_input_tokens))
+
+    def fits(output_tokens: int) -> bool:
+        usable, _ = effective_proof_token_budget(
+            hard_input_tokens(context_window_tokens, output_tokens)
+        )
+        return input_tokens <= usable
+
+    if requested <= 0 or not fits(minimum):
+        return 0
+    low, high = minimum, requested
+    while low < high:
+        candidate = (low + high + 1) // 2
+        if fits(candidate):
+            low = candidate
+        else:
+            high = candidate - 1
+    return low
+
+
+def fit_payload_generation_budget(
+    payload: dict[str, Any], config: ChatConfig,
+    *, envelope_shape: ProviderRequestEnvelopeShape = CHAT_REQUEST_ENVELOPE,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Lower only the wire output cap after all request fields are assembled.
+
+    The same builder calls this for projection and transport. Raw messages and
+    explicit reasoning budgets are unchanged; returned metadata is local-only.
+    """
+    requested = projected_generation_budget(payload, config.max_tokens)
+    result = payload
+    effective = requested
+    key = next((name for name in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+                if isinstance(payload.get(name), int) and not isinstance(payload[name], bool)
+                and payload[name] > 0), None)
+    if config.provider_context_window_tokens > 0 and key is not None:
+        minimum = 1
+        # Read actual adapter fields, not generic config thinking estimates:
+        # effort-only APIs already include reasoning in their generation cap.
+        thinking = payload.get("thinking")
+        reasoning = payload.get("reasoning")
+        budgets = [payload.get("thinking_budget")]
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            budgets.append(thinking.get("budget_tokens"))
+        if isinstance(reasoning, dict):
+            budgets.append(reasoning.get("max_tokens"))
+        thinking_tokens = max((value for value in budgets
+                               if isinstance(value, int) and not isinstance(value, bool)
+                               and value > 0), default=0)
+        if thinking_tokens:
+            minimum = thinking_tokens + min(requested, 1024)
+        # A changed numeric cap can change the tokenizer result by a token.
+        # Reprice the exact candidate and only move downward, with bounded work.
+        for _ in range(3):
+            budget_payload, media = _budget_projection(result, envelope_shape)
+            serialized = json.dumps(budget_payload, ensure_ascii=False, separators=(",", ":"),
+                                    allow_nan=False)
+            input_tokens, _ = _serialized_token_estimate(serialized)
+            # The derived character guard must fit too; ASCII-heavy source can
+            # use more than four characters per estimated token. One token
+            # covers the independent character/token headroom rounding.
+            priced_input = max(
+                input_tokens + media.reserve_tokens,
+                (len(serialized) + media.reserve_chars + 3) // 4 + 1,
+            )
+            candidate = fit_generation_tokens(
+                config.provider_context_window_tokens, effective,
+                priced_input,
+                minimum_generation_tokens=minimum,
+            )
+            if candidate <= 0 or candidate < minimum:
+                # Leave a real rejection for the existing recovery path.
+                result, effective = payload, requested
+                break
+            if candidate == effective:
+                break
+            result = {**result, key: candidate}
+            effective = candidate
+    return result, {
+        "requested_generation_tokens": requested,
+        "effective_generation_tokens": effective,
+        "generation_budget_adjusted": effective != requested,
+    }
+
+
 def projected_generation_budget(payload: dict[str, Any], fallback_max_tokens: int) -> int:
     """Read the final wire cap, or use a backend's configured output reserve.
 
@@ -243,12 +346,7 @@ def provider_request_token_budget(payload: dict[str, Any], config: ChatConfig) -
     window = config.provider_context_window_tokens
     if window <= 0:
         return None
-    return ContextBudgetGovernor.from_values(
-        context_window_tokens=window,
-        max_output_tokens=projected_generation_budget(payload, config.max_tokens),
-        thinking_budget_tokens=0,
-        context_overflow_threshold=0.85,
-    ).snapshot().usable_tokens
+    return hard_input_tokens(window, projected_generation_budget(payload, config.max_tokens))
 
 
 def provider_request_character_budget(payload: dict[str, Any], config: ChatConfig) -> int:
@@ -1417,6 +1515,7 @@ def _emergency_compact_current_turn_payload_once(
     *,
     active_user_message_index: int | None = None,
     protected_tool_result_indexes: Collection[int] | None = None,
+    preserve_user_content: bool = False,
 ) -> dict[str, Any]:
     compacted = deepcopy(payload)
     messages = compacted.get("messages", [])
@@ -1443,6 +1542,7 @@ def _emergency_compact_current_turn_payload_once(
         )
         if (
             role == "user"
+            and not preserve_user_content
             and index != active_user_index
             and not contains_protected_tool_result
         ):
@@ -2030,24 +2130,35 @@ def prove_or_compact_provider_payload(
             protected_tool_result_indexes=protected_tool_result_indexes,
         )
     except ProviderRequestBudgetExceededError as tail_error:
-        emergency_compacted = _emergency_compact_current_turn_payload_once(
-            tail_compacted,
-            active_user_message_index=active_user_message_index,
-            protected_tool_result_indexes=protected_tool_result_indexes,
-        )
-        emergency_compacted_chars = _payload_chars(emergency_compacted)
         try:
-            proof = prove_provider_payload(
-                emergency_compacted,
-                projection_adapter=projection_adapter,
-                proof_budget=proof_budget,
-                token_budget=token_budget,
-                status_projection_mode=status_projection_mode,
-                fallback_reason=fallback_reason,
-                envelope_shape=envelope_shape,
-                active_user_message_index=active_user_message_index,
-                protected_tool_result_indexes=protected_tool_result_indexes,
-            )
+            # Reducing completed replies may already free enough room for the
+            # original task. Only excerpt historical user content if that full
+            # request still fails proof. Both candidates use the same preimage.
+            for preserve_user_content in (True, False):
+                emergency_compacted = _emergency_compact_current_turn_payload_once(
+                    tail_compacted,
+                    active_user_message_index=active_user_message_index,
+                    protected_tool_result_indexes=protected_tool_result_indexes,
+                    preserve_user_content=preserve_user_content,
+                )
+                emergency_compacted_chars = _payload_chars(emergency_compacted)
+                try:
+                    proof = prove_provider_payload(
+                        emergency_compacted,
+                        projection_adapter=projection_adapter,
+                        proof_budget=proof_budget,
+                        token_budget=token_budget,
+                        status_projection_mode=status_projection_mode,
+                        fallback_reason=fallback_reason,
+                        envelope_shape=envelope_shape,
+                        active_user_message_index=active_user_message_index,
+                        protected_tool_result_indexes=protected_tool_result_indexes,
+                    )
+                except ProviderRequestBudgetExceededError:
+                    if not preserve_user_content:
+                        raise
+                else:
+                    break
         except ProviderRequestBudgetExceededError as exc:
             hard_compacted = _final_hard_cap_payload_once(
                 emergency_compacted,

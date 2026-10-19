@@ -549,6 +549,8 @@ class CompactionEvent:
     coverage_status: str = "unknown"
     missing_obligations: list[str] | None = None
     critical_carry_forward: list[str] | None = None
+    source_snapshot: Any | None = field(default=None, repr=False, compare=False)
+    persist_result: Any | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -574,6 +576,7 @@ class CompactionOutcome:
     # Request-scoped projection only. The canonical turn transcript remains
     # raw and no CompactionEvent may be persisted for this outcome.
     ephemeral_only: bool = False
+    source_snapshot: Any | None = field(default=None, repr=False, compare=False)
     # Runtime-only owner for a multi-stage overflow recovery. Durable and
     # request-scoped projections share its absolute deadline and physical LLM
     # call counter; it must never enter persistence, logs, or event reprs.
@@ -692,6 +695,8 @@ class AgentConfig:
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None
+    # Durable checkpoint contribution, kept separate from volatile context.
+    compaction_summary_context: str | None = None
     # Initial facts; physical request boundaries rebind this immutable snapshot.
     execution_identity: ExecutionIdentity | None = None
     # Per-turn user-role skill context injected after persisted history

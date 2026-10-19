@@ -9,16 +9,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from opensquilla.provider.types import ContentBlockCompaction, Message
-from opensquilla.session.compaction_state import (
-    StructuredCompactionSummary,
-    render_structured_summary,
-)
+from opensquilla.session.compaction_state import render_structured_summary
 from opensquilla.session.context_state_selection import (
     latest_context_state,
     latest_context_states_by_covered_through_id,
-    ordered_context_states,
 )
-from opensquilla.session.models import SessionContextState, SessionSummary
+from opensquilla.session.models import SessionContextState, SessionSummary, TranscriptEntry
 
 _ANTHROPIC_COMPACTION_STATE_KIND = "anthropic_compaction_block"
 _COMPACTION_SUMMARY_CONTEXT_HEADER = "[Compacted Session Summaries]"
@@ -79,6 +75,12 @@ class CompactionContextItem:
     compaction_id: str | None
     source: str
     covered_through_id: int
+    source_entries: tuple[TranscriptEntry, ...] = ()
+    verified_attachment_paths: tuple[str, ...] = ()
+
+
+class CompactionCheckpointUnavailableError(ValueError):
+    """An active checkpoint has no safely correlated text representation."""
 
 
 @dataclass(frozen=True)
@@ -397,14 +399,18 @@ def compaction_context_fingerprint(
     *,
     context_states: Sequence[SessionContextState],
     summaries: Sequence[SessionSummary],
+    canonical_entries: Sequence[TranscriptEntry] | None = None,
+    canonical_boundary: int | None = None,
 ) -> str:
-    """Hash the exact active portable context projection for CAS validation."""
+    """Hash active text and the metadata used to inherit/replace its source."""
 
-    records = build_compaction_context_records(
-        context_states=context_states,
-        summaries=summaries,
-    )
-    payload = [
+    try:
+        records = build_compaction_context_records(
+            context_states=context_states, summaries=summaries,
+        )
+    except CompactionCheckpointUnavailableError:
+        records = []
+    payload = {"records": [
         {
             "text": record.text,
             "compaction_id": record.compaction_id,
@@ -412,14 +418,40 @@ def compaction_context_fingerprint(
             "covered_through_id": record.covered_through_id,
         }
         for record in records
-    ]
+    ], "states": [
+        {
+            "session_id": state.session_id,
+            "session_key": state.session_key,
+            "covered_through_id": state.covered_through_id,
+            "schema_version": state.schema_version,
+            "payload": state.payload,
+        }
+        for state in _active_structured_summary_states(context_states, now_ms=_now_ms())
+    ]}
+    if not records:
+        # A damaged latest state must still have a stable identity. Include
+        # backups too: adding or repairing one changes the recoverable source.
+        payload["summaries"] = [summary.model_dump(mode="json") for summary in summaries]
     serialized = json.dumps(
         payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    if canonical_entries is None:
+        return digest
+    if canonical_boundary is None or canonical_boundary <= 0:
+        raise ValueError("canonical recovery requires a positive source boundary")
+    raw = json.dumps(
+        [entry.model_dump(mode="json") for entry in canonical_entries
+         if entry.id is not None and entry.id <= canonical_boundary],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return (
+        f"canonical:{canonical_boundary}:{digest}:"
+        + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    )
 
 
 def _now_ms() -> int:
@@ -439,7 +471,6 @@ def _valid_structured_summary_state(
         state.provider == "portable"
         and state.state_kind == "structured_summary_v1"
         and state.portable
-        and isinstance(state.payload, dict)
     )
 
 
@@ -470,6 +501,21 @@ def _replaces_prior_context(payload: object) -> bool:
         isinstance(coverage, dict)
         and coverage.get("replaces_prior_context") is True
     )
+
+
+def _active_structured_summary_states(
+    context_states: Sequence[SessionContextState], *, now_ms: int,
+) -> list[SessionContextState]:
+    """Choose the replacement boundary before parsing model-owned content."""
+    selected = latest_context_states_by_covered_through_id([
+        state for state in context_states
+        if _valid_structured_summary_state(state, now_ms=now_ms)
+    ])
+    replacement_index = next((
+        index for index in range(len(selected) - 1, -1, -1)
+        if _replaces_prior_context(selected[index].payload)
+    ), 0)
+    return selected[replacement_index:]
 
 
 def build_provider_compaction_context(
@@ -552,55 +598,78 @@ def build_compaction_context_records(
     items: list[CompactionContextItem] = []
     state_covered_ids: set[int] = set(skip_covered_through_ids or set())
 
-    structured_states = [
-        state
-        for state in ordered_context_states(context_states)
-        if _valid_structured_summary_state(state, now_ms=now)
-    ]
-    selected_states = latest_context_states_by_covered_through_id(
-        structured_states
+    selected_states = _active_structured_summary_states(context_states, now_ms=now)
+    replacement_active = bool(
+        selected_states and _replaces_prior_context(selected_states[0].payload)
     )
-    validated_states: list[tuple[SessionContextState, StructuredCompactionSummary, str]] = []
+    replacement_floor = selected_states[0].covered_through_id if replacement_active else 0
+
     for state in selected_states:
-        try:
-            structured = StructuredCompactionSummary.model_validate(state.payload)
-        except Exception:
-            continue
-        rendered = render_structured_summary(structured)
-        if rendered.strip():
-            validated_states.append((state, structured, rendered))
-
-    replacement_index = next(
-        (
-            index
-            for index in range(len(validated_states) - 1, -1, -1)
-            if _replaces_prior_context(validated_states[index][0].payload)
-        ),
-        None,
-    )
-    replacement_active = replacement_index is not None
-    replacement_floor = 0
-    if replacement_index is not None:
-        validated_states = validated_states[replacement_index:]
-        replacement_floor = validated_states[0][0].covered_through_id
-
-    for state, _structured, rendered in validated_states:
         if state.covered_through_id in state_covered_ids:
             continue
-        compaction_id = None
-        if isinstance(state.payload, dict):
-            raw_compaction_id = state.payload.get("compaction_id")
-            if isinstance(raw_compaction_id, str) and raw_compaction_id.strip():
-                compaction_id = raw_compaction_id.strip()
+        if not isinstance(state.payload, dict):
+            # Dropping this row would silently select an older task. Without a
+            # correlation id the coverage boundary alone cannot prove a backup
+            # belongs to this generation (checkpoint-only updates share it).
+            raise CompactionCheckpointUnavailableError(
+                "compaction_checkpoint_unavailable: invalid payload at "
+                f"covered_through_id={state.covered_through_id}"
+            )
+        raw_compaction_id = state.payload.get("compaction_id")
+        compaction_id = (
+            raw_compaction_id.strip()
+            if isinstance(raw_compaction_id, str) and raw_compaction_id.strip()
+            else None
+        )
+        # A malformed newer payload must not revive an older checkpoint, even
+        # for checkpoint-only updates sharing the exact same coverage boundary.
+        state_covered_ids.add(state.covered_through_id)
+        try:
+            rendered = render_structured_summary(state.payload)
+        except (TypeError, ValueError):
+            rendered = ""
+        source = "context_state"
+        if not rendered.strip() or rendered.strip() == _STRUCTURED_COMPACTION_SUMMARY_HEADER:
+            same_generation = [
+                summary for summary in summaries
+                if compaction_id is not None
+                and summary.compaction_id == compaction_id
+                and summary.session_id == state.session_id
+                and summary.session_key == state.session_key
+                and summary.covered_through_id == state.covered_through_id
+                and summary.summary_text.strip()
+                and summary.summary_text.strip() != _STRUCTURED_COMPACTION_SUMMARY_HEADER
+            ]
+            if not same_generation:
+                raise CompactionCheckpointUnavailableError(
+                    "compaction_checkpoint_unavailable: no same-generation fallback "
+                    f"for compaction_id={compaction_id!r}, "
+                    f"covered_through_id={state.covered_through_id}"
+                )
+            fallback = max(same_generation, key=lambda summary: (
+                summary.created_at, summary.id or 0,
+            ))
+            rendered = fallback.summary_text.strip()
+            source = "summary"
         items.append(
             CompactionContextItem(
                 text=rendered,
                 compaction_id=compaction_id,
-                source="context_state",
+                source=source,
                 covered_through_id=state.covered_through_id,
+                verified_attachment_paths=tuple(
+                    item["path"]
+                    for item in (
+                        state.payload.get("files_and_artifacts", [])
+                        if source == "context_state" else ()
+                    )
+                    if isinstance(item, dict)
+                    and item.get("provenance") == "verified_attachment"
+                    and isinstance(item.get("path"), str)
+                    and item["path"]
+                ),
             )
         )
-        state_covered_ids.add(state.covered_through_id)
 
     for summary in summaries:
         if summary.covered_through_id in state_covered_ids:
@@ -611,15 +680,19 @@ def build_compaction_context_records(
         ):
             continue
         text = summary.summary_text.strip()
-        if text:
-            items.append(
-                CompactionContextItem(
-                    text=text,
-                    compaction_id=summary.compaction_id,
-                    source="summary",
-                    covered_through_id=summary.covered_through_id,
-                )
+        if not text or text == _STRUCTURED_COMPACTION_SUMMARY_HEADER:
+            raise CompactionCheckpointUnavailableError(
+                "compaction_checkpoint_unavailable: empty summary at "
+                f"covered_through_id={summary.covered_through_id}"
             )
+        items.append(
+            CompactionContextItem(
+                text=text,
+                compaction_id=summary.compaction_id,
+                source="summary",
+                covered_through_id=summary.covered_through_id,
+            )
+        )
 
     for marker in legacy_summary_markers:
         text = marker.strip()

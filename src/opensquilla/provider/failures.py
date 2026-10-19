@@ -209,6 +209,20 @@ def _is_gateway_transient(signal: FailureSignal) -> bool:
     return bool(_GATEWAY_TRANSIENT_RE.search(signal.text))
 
 
+def _is_input_length_range_error(signal: FailureSignal) -> bool:
+    """Recognize the observed input-size range, excluding explicit empty input.
+
+    Qwen errors may be wrapped in a LiteLLM message. The upper bound identifies
+    an input-capacity error, not a tokenizer count or a replacement model limit.
+    """
+    return bool(re.search(
+        r"\brange of input length should be\s*\[\s*1\s*,\s*[1-9][0-9]*\s*\]",
+        signal.text,
+    )) and not bool(re.search(
+        r"\bempty\b|\binput length\s*(?:is|:|=)\s*(?:0|zero)\b", signal.text,
+    ))
+
+
 def _is_anthropic_missing_model(signal: FailureSignal) -> bool:
     """Anthropic's missing-resource type needs an explicit model target.
 
@@ -309,6 +323,14 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
             "provider_request_budget_exhausted",
             "too many tokens",
         ),
+    ),
+    FailureMatcher(
+        ProviderFailureKind.CONTEXT_OVERFLOW,
+        status_codes=frozenset({400}),
+        raw_codes=frozenset({
+            "", "400", "litellm_error", "invalid_parameter_error", "invalid_request_error",
+        }),
+        predicate=_is_input_length_range_error,
     ),
     FailureMatcher(
         ProviderFailureKind.POLICY_REFUSAL,

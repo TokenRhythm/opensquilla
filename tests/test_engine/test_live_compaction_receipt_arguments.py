@@ -180,8 +180,8 @@ def test_nested_path_values_keep_structure_and_exact_long_strings():
 
 
 @pytest.mark.parametrize("window,output,count,chars", [
-    (16_000, 4096, 5, 8000), (16_000, 4096, 8, 8000),
-    (128_000, 16384, 11, 32000), (128_000, 16384, 16, 32000),
+    (16_000, 4096, 5, 16000), (16_000, 4096, 8, 8000),
+    (128_000, 16384, 11, 48000), (128_000, 16384, 16, 32000),
 ])
 async def test_summary_and_local_window_fit_after_completed_large_writes(
     monkeypatch, window, output, count, chars,
@@ -193,6 +193,7 @@ async def test_summary_and_local_window_fit_after_completed_large_writes(
     for index in range(count):
         messages.extend(tool_round(index, {"path": f"output-{index}.txt", "content": body(chars)}))
     before = copy.deepcopy(messages)
+    # Bulk input must still overflow after the adapter fits its output cap.
     assert not project(agent, config, messages).fits
     summary = await recover(agent, config, messages)
     assert summary is not None and summary.ephemeral_only
@@ -232,7 +233,7 @@ async def test_projected_receipts_survive_two_recoveries_without_reexpansion(mon
     assert third == list(receipts)
 
 
-@pytest.mark.parametrize("kind", ["unreturned", "pending", "current_input", "long_path"])
+@pytest.mark.parametrize("kind", ["unreturned", "pending", "current_input"])
 def test_mandatory_raw_state_is_still_rejected_when_it_cannot_fit(kind):
     agent, config = make_agent()
     current = Message(role="user", content=CURRENT)
@@ -241,8 +242,7 @@ def test_mandatory_raw_state_is_still_rejected_when_it_cannot_fit(kind):
         agent._current_turn_message = current.content
         messages = [current]
     else:
-        arguments = {"path": body(64000) if kind == "long_path" else "pending.txt",
-                     "content": "small" if kind == "long_path" else body(64000)}
+        arguments = {"path": "pending.txt", "content": body(64000)}
         rounds = tool_round(0, arguments, status="unknown" if kind == "pending" else "success",
                             reason="pending" if kind == "pending" else "completed")
         messages = [current, *rounds[:1 if kind == "unreturned" else 2]]
@@ -259,11 +259,9 @@ def test_mandatory_raw_state_is_still_rejected_when_it_cannot_fit(kind):
     )
     assert fallback is None
     assert messages == before
-    if kind in {"unreturned", "pending", "current_input"}:
-        assert agent._live_turn_compaction_boundary(messages, protected_turn_start_index=0) is None
-    else:
-        receipt = agent._live_turn_execution_receipts(messages[1:])[0]
-        assert receipt["arguments"]["path"] == body(64000)
+    assert agent._live_turn_compaction_boundary(messages, protected_turn_start_index=0) is None
+    # A returned call's long path is optional receipt text, covered by the
+    # >=32K recovery fixtures in test_live_compaction_receipt_budget.py.
 
 
 def test_user_authored_projection_marker_is_not_trusted_as_a_receipt():

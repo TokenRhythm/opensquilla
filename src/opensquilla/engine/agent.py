@@ -2064,6 +2064,20 @@ class _ProviderRetryPolicy:
 class _CompactionSummaryMessage(Message):
     """Runtime-generated summary or acknowledgement; never inferred from user text."""
 
+    _replaces_checkpoint: bool = PrivateAttr(default=False)
+
+    @classmethod
+    def from_summary(cls, text: str, *, replaces_checkpoint: bool = False) -> Message:
+        message = cls(role="user", content=f"[Context summary]\n{text}")
+        message._replaces_checkpoint = replaces_checkpoint
+        return message
+
+
+class _CompactionRequestContextMessage(Message):
+    """Frozen request context whose old checkpoint can be replaced independently."""
+
+    _dynamic_context: str | None = PrivateAttr(default=None)
+
 
 class _LiveTurnCheckpointMessage(Message):
     """Request-local checkpoint with non-wire execution provenance.
@@ -2074,6 +2088,8 @@ class _LiveTurnCheckpointMessage(Message):
 
     _compaction_tool_receipts: tuple[dict[str, Any], ...] = PrivateAttr(default=())
     _compaction_has_summary: bool = PrivateAttr(default=False)
+    _compaction_receipt_prefix: str = PrivateAttr(default="")
+    _compaction_receipt_text: str = PrivateAttr(default="")
 
 
 class _LiveTurnContinuationMessage(Message):
@@ -2404,6 +2420,8 @@ class Agent:
         self._compaction_failed_this_turn = False
         self._pending_durable_compaction_event: CompactionEvent | None = None
         self._pending_durable_compaction_source: _PendingCompactionSource | None = None
+        self._durable_compaction_source: Any | None = None
+        self._durable_compaction_source_bound = False
         self._compaction_request_context: CompactionRequestContext | None = None
         # Stable session/base consumer identity. Turn routing and ensemble
         # wrapping may replace ``self.provider`` with a narrower physical leg,
@@ -2745,7 +2763,28 @@ class Agent:
             kept_entries=outcome.kept_entries,
             kept_count=len(outcome.messages),
             removed_count=outcome.removed_count,
+            source_snapshot=outcome.source_snapshot,
         )
+
+    def bind_compaction_source(self, snapshot: Any | None) -> None:
+        """Install a host-verified source for future candidates, never pending ones."""
+        self._durable_compaction_source_bound = True
+        self._durable_compaction_source = snapshot
+        # The request may already contain an admitted, request-only projection
+        # of this checkpoint. Source identity must not restore omitted content.
+        # A successful writer refreshes the visible checkpoint separately.
+
+    def _current_request_context_message(self) -> Message | None:
+        dynamic = self.config.request_context_prompt
+        summary = self.config.compaction_summary_context
+        if not summary:
+            return self._request_context_message(dynamic)
+        combined = "\n\n".join(part.strip() for part in (summary, dynamic) if part and part.strip())
+        message = self._request_context_message(combined)
+        assert message is not None
+        result = _CompactionRequestContextMessage(role=message.role, content=message.content)
+        result._dynamic_context = dynamic
+        return result
 
     def _record_provider_context_overflow_reason(
         self,
@@ -3050,6 +3089,7 @@ class Agent:
         return CompactionRequestContext(
             chat_config=chat_config.model_copy(deep=True),
             tools=tuple(tool.model_copy(deep=True) for tool in tools) if tools else None,
+            recoverable_reference_resolver=self._verified_tool_result_references,
         )
 
     def _project_durable_consumer_final_request(
@@ -3198,9 +3238,13 @@ class Agent:
         thinking_enabled, _thinking_budget = self.config.resolve_thinking(active_user_message)
         preserve_reasoning_content = True
         history, _sanitize_result = sanitize_session_messages(history)
+        references = self._verified_tool_result_references(
+            limit_turns(history, self.config.max_history_turns),
+        )
         history, _projection_result = project_historical_tool_payloads(
             history,
             preserve_reasoning_content=preserve_reasoning_content,
+            recoverable_references=references,
         )
         history = repair_tool_pairing(history)
         history = drop_reasoning(
@@ -3410,6 +3454,14 @@ class Agent:
             capacity_project=capacity_project if active_user_in_history else None,
             physical_context_window_tokens=context_window_tokens,
             generation_reserve_tokens=int(max_output_tokens or self.config.max_tokens or 0),
+            request_character_limit=(
+                max(0, int(consumer_provider_request_max_chars))
+                if consumer_provider_request_max_chars is not None
+                else (
+                    max(0, int(self.config.provider_request_proof_max_chars or 0))
+                    if self.config.provider_request_proof_max_chars_explicit else 0
+                )
+            ),
             provider_identity=(
                 f"{metadata.provider_id or metadata.provider_kind}/"
                 f"{consumer_model_id or metadata.model}:{consumer_deployment_fingerprint}"
@@ -3479,7 +3531,7 @@ class Agent:
         skills_message = self._skills_context_message()
         if skills_message is not None:
             fixed_messages.append(skills_message)
-        request_context_message = self._request_context_message(self.config.request_context_prompt)
+        request_context_message = self._current_request_context_message()
         if request_context_message is None:
             # Durable compaction creates this request-scoped wrapper even when
             # the turn had no pre-existing request context. Reserve the
@@ -6190,7 +6242,7 @@ class Agent:
             if isinstance(runtime_context_message.content, str)
             else self._runtime_context_block()
         )
-        request_context_message = self._request_context_message(self.config.request_context_prompt)
+        request_context_message = self._current_request_context_message()
         runtime_context_hash = hashlib.sha256(runtime_context.encode("utf-8")).hexdigest()[:16]
 
         chat_cfg = self._provider_admission_chat_config(
@@ -7537,6 +7589,7 @@ class Agent:
 
                     self._compaction_request_context = CompactionRequestContext(
                         chat_config=call_chat_cfg.model_copy(deep=True),
+                        recoverable_reference_resolver=self._verified_tool_result_references,
                         tools=(
                             tuple(
                                 tool.model_copy(deep=True) for tool in provider_tools_for_call
@@ -7580,6 +7633,59 @@ class Agent:
                             ensemble_request_count_baseline = (
                                 continuation_snapshot.physical_request_count
                             )
+                    async def _recover_capacity_limited_output_window(
+                        *, reason: str = "reasoning_output_budget_exhausted",
+                    ) -> bool:
+                        """Use the existing retry slot to recover capacity-limited output."""
+                        nonlocal message_count_request_view
+                        before = project_provider_final_request(
+                            self.provider, request_messages, provider_tools_for_call, call_chat_cfg,
+                        )
+                        if before is None or not before.fits:
+                            return False
+                        desired = max(0, int(call_chat_cfg.max_tokens or 0))
+                        actual = projected_generation_budget(before.payload, desired)
+                        if desired <= 0 or actual >= desired:
+                            return False
+                        window = await self._recover_progressed_request_window(
+                            base_request_turn_messages,
+                            rejected_messages=request_messages,
+                            protected_turn_start_index=active_protected_turn_start_index,
+                            request_context_insert_index=active_request_context_insert_index,
+                            runtime_context_insert_index=active_runtime_context_insert_index,
+                            chat_config=call_chat_cfg, tools=provider_tools_for_call,
+                            request_context_message=request_context_message,
+                            runtime_context_message=runtime_context_message,
+                            request_suffix_messages=request_suffix_messages,
+                            reason=reason,
+                            force_shrink=True, increase_generation_budget=True,
+                        )
+                        if window is None:
+                            return False
+                        message_count_request_view = _MessageCountRequestView(
+                            messages=window.messages, canonical_tail_start=len(turn_messages),
+                            request_context_insert_index=(
+                                window.request_context_insert_index
+                                if window.request_context_insert_index is not None
+                                else active_request_context_insert_index
+                            ),
+                            runtime_context_insert_index=(
+                                window.runtime_context_insert_index
+                                if window.runtime_context_insert_index is not None
+                                else active_runtime_context_insert_index
+                            ),
+                            protected_turn_start_index=(
+                                window.protected_turn_start_index
+                                if window.protected_turn_start_index is not None
+                                else active_protected_turn_start_index
+                            ),
+                        )
+                        self._notify_admitted_request_window(
+                            window, source_count=len(base_request_turn_messages),
+                            reason=reason,
+                        )
+                        return True
+
                     async def _recover_pending_cooling_window(reason: str) -> bool:
                         nonlocal turn_messages, request_context_insert_index
                         nonlocal runtime_context_insert_index, current_turn_start_index
@@ -9644,6 +9750,9 @@ class Agent:
                                     attempt_classification.stop_reason or ""
                                 ).lower() == "length"
                                 if reasoning_output_budget_exhausted:
+                                    output_window_recovered = (
+                                        await _recover_capacity_limited_output_window()
+                                    )
                                     self._log_reasoning_output_budget_exhausted(
                                         model=(last_actual_model or self.config.model_id or ""),
                                         observed_provider=last_actual_provider,
@@ -9665,9 +9774,11 @@ class Agent:
                                     yield WarningEvent(
                                         code="provider_reasoning_only_retry",
                                         message=(
-                                            "The provider used the configured output budget "
+                                            "The provider used the available output budget "
                                             "for reasoning without returning visible content; "
-                                            "retrying once without changing max_tokens."
+                                            + ("retrying once after freeing context for output."
+                                               if output_window_recovered else
+                                               "retrying once without changing max_tokens.")
                                         ),
                                     )
                                 else:
@@ -9700,7 +9811,7 @@ class Agent:
                             if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
                                 if (attempt_classification.stop_reason or "").lower() == "length":
                                     large_context_message = (
-                                        "The provider used the configured output budget for "
+                                        "The provider used the available output budget for "
                                         "reasoning without returning a visible answer. Increase "
                                         "llm.max_tokens or choose another model or provider."
                                     )
@@ -9764,6 +9875,9 @@ class Agent:
                                 attempt_classification.stop_reason or ""
                             ).lower() == "length"
                             if reasoning_output_budget_exhausted:
+                                output_window_recovered = (
+                                    await _recover_capacity_limited_output_window()
+                                )
                                 configured_max_tokens = max(
                                     0,
                                     int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
@@ -9780,9 +9894,11 @@ class Agent:
                                 yield WarningEvent(
                                     code="provider_reasoning_only_retry",
                                     message=(
-                                        "The provider used the configured output budget for "
+                                        "The provider used the available output budget for "
                                         "reasoning without returning visible content; retrying "
-                                        "once without changing max_tokens."
+                                        + ("once after freeing context for output."
+                                           if output_window_recovered else
+                                           "once without changing max_tokens.")
                                     ),
                                 )
                             else:
@@ -9921,6 +10037,14 @@ class Agent:
                             )
                         ):
                             _attempt_retries_used[_ProviderAttemptKind.LENGTH_CAPPED] += 1
+                            # Install the recovered view before appending the visible
+                            # partial and continuation. Its canonical tail boundary
+                            # must include those new messages on the next attempt.
+                            # A full output cap or no improving safe window leaves
+                            # the existing bounded continuation unchanged.
+                            await _recover_capacity_limited_output_window(
+                                reason="visible_output_budget_exhausted",
+                            )
                             visible_text = _append_length_capped_continuation(
                                 turn_messages,
                                 response_text=response_text,
@@ -10067,7 +10191,7 @@ class Agent:
                         if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
                             if (attempt_classification.stop_reason or "").lower() == "length":
                                 terminal_message = (
-                                    "The provider used the configured output budget for "
+                                    "The provider used the available output budget for "
                                     "reasoning without returning a visible answer. Increase "
                                     "llm.max_tokens or choose another model or provider."
                                 )
@@ -10591,6 +10715,25 @@ class Agent:
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
                             self._record_provider_context_overflow_reason(provider_error)
+                            native_overflow_after_admission = False
+
+                            def capacity_fallback_event() -> ProviderActivityEvent | None:
+                                self._require_compaction_parent_time(call_chat_cfg)
+                                fallback = getattr(
+                                    self.provider, "fallback_after_context_overflow", None,
+                                )
+                                if not callable(fallback) or not fallback(
+                                    call_chat_cfg, requires_tools=bool(provider_tools_for_call),
+                                    requires_vision=self._count_image_blocks(request_messages) > 0,
+                                ):
+                                    return None
+                                return ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    model=self._provider_activity_model(), phase="fallback",
+                                    reason="context_overflow", retry_attempt=_call_attempt + 1,
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
+
                             provider_budget_proof = self._provider_request_budget_proof(
                                 provider_error
                             )
@@ -10656,16 +10799,13 @@ class Agent:
                                 self._last_compaction_refusal_reason = (
                                     "provider_native_overflow_after_admission"
                                 )
+                                native_overflow_after_admission = True
                                 self._write_turn_call_log(
-                                    "provider_request_budget_recovery_refused",
+                                    "provider_request_window_recovery",
                                     reason=("provider_native_overflow_after_final_admission"),
                                     iteration=iterations,
                                     attempt=_call_attempt,
                                 )
-                                yield self._transition(AgentState.ERROR)
-                                terminal_error = self._context_overflow_error()
-                                yield terminal_error
-                                break
                             compaction_budget_proof = provider_budget_proof
                             if (
                                 durable_consumer_overflow_proven is True
@@ -10708,9 +10848,8 @@ class Agent:
                                     provider_compaction_window_tokens
                                     or self.config.context_window_tokens
                                 ) + 1
-                            effective_overflow_retries = min(
-                                1,
-                                max(0, int(self.config.max_overflow_retries or 0)),
+                            effective_overflow_retries = max(
+                                0, int(self.config.max_overflow_retries or 0),
                             )
                             recovery_progress = frozenset(completed_tool_progress)
                             recovery_view = hashlib.sha256(json.dumps(
@@ -10776,6 +10915,12 @@ class Agent:
                                         )
                                         _call_attempt += 1
                                         continue
+                                if native_overflow_after_admission:
+                                    capacity_event = capacity_fallback_event()
+                                    if capacity_event is not None:
+                                        yield capacity_event
+                                        _call_attempt += 1
+                                        continue
                                 yield self._transition(AgentState.ERROR)
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
@@ -10783,6 +10928,61 @@ class Agent:
                             overflow_retries += 1
                             last_overflow_recovery_progress = recovery_progress
                             overflow_recovery_views.add(recovery_view)
+                            if native_overflow_after_admission:
+                                # Local admission cannot disprove a physical
+                                # rejection. Retry only a strictly smaller local
+                                # view, without turning estimator drift into a
+                                # durable history rewrite or another summary.
+                                window = await self._recover_progressed_request_window(
+                                    base_request_turn_messages,
+                                    rejected_messages=request_messages,
+                                    protected_turn_start_index=active_protected_turn_start_index,
+                                    request_context_insert_index=active_request_context_insert_index,
+                                    runtime_context_insert_index=active_runtime_context_insert_index,
+                                    chat_config=call_chat_cfg,
+                                    tools=provider_tools_for_call,
+                                    request_context_message=request_context_message,
+                                    runtime_context_message=runtime_context_message,
+                                    request_suffix_messages=request_suffix_messages,
+                                    reason="provider_native_overflow_after_admission",
+                                    force_shrink=True,
+                                )
+                                if window is None:
+                                    capacity_event = capacity_fallback_event()
+                                    if capacity_event is not None:
+                                        yield capacity_event
+                                        _call_attempt += 1
+                                        continue
+                                    yield self._transition(AgentState.ERROR)
+                                    terminal_error = self._context_overflow_error()
+                                    yield terminal_error
+                                    break
+                                message_count_request_view = _MessageCountRequestView(
+                                    messages=window.messages,
+                                    canonical_tail_start=len(turn_messages),
+                                    request_context_insert_index=(
+                                        window.request_context_insert_index
+                                        if window.request_context_insert_index is not None
+                                        else active_request_context_insert_index
+                                    ),
+                                    runtime_context_insert_index=(
+                                        window.runtime_context_insert_index
+                                        if window.runtime_context_insert_index is not None
+                                        else active_runtime_context_insert_index
+                                    ),
+                                    protected_turn_start_index=(
+                                        window.protected_turn_start_index
+                                        if window.protected_turn_start_index is not None
+                                        else active_protected_turn_start_index
+                                    ),
+                                )
+                                self._last_compaction_refusal_reason = None
+                                self._notify_admitted_request_window(
+                                    window, source_count=len(base_request_turn_messages),
+                                    reason="provider_native_overflow_after_admission",
+                                )
+                                _call_attempt += 1
+                                continue
                             yield WarningEvent(
                                 code="context_auto_compaction_start",
                                 message=(
@@ -14147,9 +14347,7 @@ class Agent:
                 )},
             ))
         if request_context_message is None:
-            request_context_message = self._request_context_message(
-                self.config.request_context_prompt,
-            )
+            request_context_message = self._current_request_context_message()
         if runtime_context_message is None:
             runtime_context_message = self._freeze_preflight_runtime_context_message()
         tools = (
@@ -14183,6 +14381,7 @@ class Agent:
             project=project,
             physical_context_window_tokens=chat_config.provider_context_window_tokens,
             generation_reserve_tokens=chat_config.max_tokens,
+            request_character_limit=chat_config.provider_request_max_chars_explicit_cap or 0,
             provider_identity=f"{metadata.provider_id or metadata.provider_kind}/{metadata.model}:",
             trigger_ratio=self.config.compaction_trigger_ratio,
             # A reused operation config can carry the previous request view's
@@ -14462,7 +14661,7 @@ class Agent:
             "omitted from this request window. Their contents are unavailable here; "
             "do not infer missing result details.\n\n"
         )
-        checkpoint = _LiveTurnCheckpointMessage(role="assistant", content=(
+        receipt_prefix = (
             introduction
             + "[Tool execution receipts for the current request]\n"
             "These are records of calls that already returned results, not new tool "
@@ -14475,10 +14674,15 @@ class Agent:
                 "are not executable arguments.\n"
                 if any(receipt.get("arguments_complete") is False for receipt in receipts) else ""
             )
-            + json.dumps(receipts, ensure_ascii=False, sort_keys=True)
-        ))
+        )
+        receipt_text = json.dumps(receipts, ensure_ascii=False, sort_keys=True)
+        checkpoint = _LiveTurnCheckpointMessage(
+            role="assistant", content=receipt_prefix + receipt_text,
+        )
         checkpoint._compaction_tool_receipts = tuple(copy.deepcopy(receipts))
         checkpoint._compaction_has_summary = summary is not None
+        checkpoint._compaction_receipt_text = receipt_text
+        checkpoint._compaction_receipt_prefix = receipt_prefix
         return [
             checkpoint,
             _LiveTurnContinuationMessage(role="user", content=(
@@ -14487,6 +14691,78 @@ class Agent:
                 "completed calls solely because their raw results were summarized or omitted."
             )),
         ]
+
+    def _fit_live_turn_receipts(
+        self,
+        messages: list[Message],
+        *,
+        project: Callable[[list[Message]], ProviderFinalRequestProjection | None],
+        fits: Callable[[ProviderFinalRequestProjection | None], bool],
+        chat_config: ChatConfig | None = None,
+    ) -> tuple[list[Message], ProviderFinalRequestProjection | None]:
+        """Shrink only visible completed receipts, proving the complete request.
+
+        The existing private receipts remain intact for subsequent recovery.
+        No raw call, current user message, summary prose or permission is changed.
+        Each local attempt halves a finite text budget; no provider call is made.
+        """
+        self._require_compaction_parent_time(chat_config)
+        projection = project(messages)
+        if fits(projection):
+            return messages, projection
+        checkpoints = [
+            (index, message) for index, message in enumerate(messages)
+            if isinstance(message, _LiveTurnCheckpointMessage)
+            and message._compaction_receipt_prefix
+            and message._compaction_tool_receipts
+        ]
+        if not checkpoints:
+            return messages, projection
+        # This status-only projection is unchanged across budget probes.
+        compact_receipts = [
+            [{key: value for key, value in receipt.items() if key in (
+                "tool_call_id", "name", "result_received", "is_error", "execution_status",
+            )} | {"arguments_complete": False} for receipt in message._compaction_tool_receipts]
+            for _, message in checkpoints
+        ]
+        limits = [len(message._compaction_receipt_text) for _, message in checkpoints]
+        while any(limits):
+            self._require_compaction_parent_time(chat_config)
+            limits = [limit // 2 for limit in limits]
+            candidate = list(messages)
+            for (index, message), compact, limit in zip(
+                checkpoints, compact_receipts, limits, strict=True,
+            ):
+                # Recent returned calls are the most useful continuation evidence.
+                # Keep each status intact; never turn omitted/unknown into success.
+                def render(count: int) -> str:
+                    return json.dumps({
+                        "returned_calls": len(compact),
+                        "omitted_receipts": len(compact) - count,
+                        "note": (
+                            "Omitted details are unavailable. Do not repeat work solely because "
+                            "details were omitted; use execution status and current instructions."
+                        ),
+                        "receipts": compact[-count:] if count else [],
+                    }, ensure_ascii=False, sort_keys=True)
+
+                low, high = 0, len(compact)
+                while low < high:
+                    self._require_compaction_parent_time(chat_config)
+                    mid = (low + high + 1) // 2
+                    if len(render(mid)) <= limit:
+                        low = mid
+                    else:
+                        high = mid - 1
+                body = render(low)
+                replacement = message.model_copy()
+                replacement.content = message._compaction_receipt_prefix + body
+                replacement._compaction_receipt_text = body
+                candidate[index] = replacement
+            projection = project(candidate)
+            if fits(projection):
+                return candidate, projection
+        return candidate, projection
 
     @staticmethod
     def _live_turn_mapped_index(
@@ -14523,6 +14799,7 @@ class Agent:
         compaction_config: CompactionConfig | None = None,
         reason: str = "summary_failed",
         notify_recovery: bool = True,
+        rejected_payload: dict[str, Any] | None = None,
     ) -> CompactionOutcome | None:
         """Admit a temporary raw window without changing canonical history."""
 
@@ -14554,17 +14831,26 @@ class Agent:
             context_window_tokens=self.config.context_window_tokens,
         )
         if request_context_message is None:
-            request_context_message = self._request_context_message(
-                self.config.request_context_prompt,
-            )
+            request_context_message = self._current_request_context_message()
         if runtime_context_message is None:
             runtime_context_message = self._freeze_preflight_runtime_context_message()
 
         last_proof: dict[str, Any] | None = None
+        rejected_payload_bytes = (
+            len(json.dumps(
+                self._live_request_jsonable(rejected_payload),
+                ensure_ascii=False, sort_keys=True,
+            ).encode()) if rejected_payload is not None else None
+        )
 
         def _fits(projection: ProviderFinalRequestProjection | None) -> bool:
             nonlocal last_proof
             if projection is None:
+                return False
+            if rejected_payload_bytes is not None and len(json.dumps(
+                self._live_request_jsonable(projection.payload),
+                ensure_ascii=False, sort_keys=True,
+            ).encode()) >= rejected_payload_bytes:
                 return False
             proof = projection.proof
             if "estimated_tokens" not in proof or "estimated_chars" not in proof:
@@ -14606,6 +14892,14 @@ class Agent:
                 runtime_context_insert_index=runtime_context_insert_index,
                 protected_turn_start_index=protected_start,
             )
+        user_text_caps = [limit for limit in (
+            input_budget_tokens,
+            self._positive_int(unchanged_projection.proof.get("effective_proof_token_budget"))
+            if unchanged_projection is not None else None,
+        ) if limit is not None and limit > 0]
+        user_text_max_chars = (
+            min(user_text_caps) if user_text_caps else chat_config.provider_context_window_tokens
+        )
         pruned_messages = compact_request_window_tools(messages)
         # Prefer complete checkpoints produced by this runtime before discarding
         # raw completed rounds. User-authored prefix strings are not provenance.
@@ -14651,6 +14945,8 @@ class Agent:
                     protected_indexes=protected_indexes - (retained_indexes - retained),
                     retained_indexes=retained,
                     active_user_index=active_user,
+                    retain_user_messages=True,
+                    user_text_max_chars=user_text_max_chars,
                 )
                 if released < len(summary_groups):
                     retained.difference_update(summary_groups[released])
@@ -14699,11 +14995,16 @@ class Agent:
                     insertion = candidate.map_index(omitted_live_indices[-1] + 1)
                     assert insertion is not None
                     progress = self._live_turn_checkpoint_messages(None, receipts)
+                    checkpoint = cast(_LiveTurnCheckpointMessage, progress[0])
                     # The generated window notice belongs with the execution
                     # record. Moving it avoids an extra wire message while
                     # keeping every omission explicit after the current user.
-                    progress[0].content = (
-                        f"{candidate_messages[0].content}\n\n{progress[0].content}"
+                    checkpoint.content = (
+                        f"{candidate_messages[0].content}\n\n{checkpoint.content}"
+                    )
+                    checkpoint._compaction_receipt_prefix = (
+                        f"{candidate_messages[0].content}\n\n"
+                        + checkpoint._compaction_receipt_prefix
                     )
                     candidate_messages = [
                         *candidate_messages[1:insertion],
@@ -14716,30 +15017,31 @@ class Agent:
                         runtime_index += 1 if runtime_index >= insertion else -1
                     if protected_index is not None:
                         protected_index += 1 if protected_index >= insertion else -1
-            request_messages = self._provider_request_messages_for_count_projection(
-                [*candidate_messages, *(request_suffix_messages or [])],
-                request_context_message=request_context_message,
-                request_context_insert_index=(
-                    request_index if request_index is not None else len(candidate_messages)
-                ),
-                runtime_context_message=runtime_context_message,
-                runtime_context_insert_index=(
-                    runtime_index if runtime_index is not None else len(candidate_messages)
-                ),
-            )
-            active_index = _active_user_message_index_for_request(
-                request_messages,
-                current_user_text=getattr(self, "_current_turn_message", "") or "",
-            )
-            candidate_config = chat_config.model_copy(
-                update={"active_user_message_index": active_index},
-            )
-            projection = project_provider_final_request(
-                self.provider,
-                request_messages,
-                self.tool_definitions,
-                candidate_config,
-                message_limit=target_wire_messages,
+            def project_receipts(view: list[Message]) -> ProviderFinalRequestProjection | None:
+                request_messages = self._provider_request_messages_for_count_projection(
+                    [*view, *(request_suffix_messages or [])],
+                    request_context_message=request_context_message,
+                    request_context_insert_index=(
+                        request_index if request_index is not None else len(view)
+                    ),
+                    runtime_context_message=runtime_context_message,
+                    runtime_context_insert_index=(
+                        runtime_index if runtime_index is not None else len(view)
+                    ),
+                )
+                active_index = _active_user_message_index_for_request(
+                    request_messages,
+                    current_user_text=getattr(self, "_current_turn_message", "") or "",
+                )
+                return project_provider_final_request(
+                    self.provider, request_messages, self.tool_definitions,
+                    chat_config.model_copy(update={"active_user_message_index": active_index}),
+                    message_limit=target_wire_messages,
+                )
+
+            candidate_messages, projection = self._fit_live_turn_receipts(
+                candidate_messages, project=project_receipts, fits=_fits,
+                chat_config=chat_config,
             )
             if not _fits(projection):
                 continue
@@ -14795,15 +15097,47 @@ class Agent:
         request_suffix_messages: list[Message] | None,
         compaction_config: CompactionConfig | None = None,
         reason: str = "later_tool_progress",
+        force_shrink: bool = False,
+        increase_generation_budget: bool = False,
     ) -> CompactionOutcome | None:
         """Admit a local request window without starting another summary."""
         parent_deadline = self._require_compaction_parent_time(chat_config)
         rejected = project_provider_final_request(
             self.provider, rejected_messages, tools, chat_config,
         )
-        if rejected is None or rejected.fits:
+        if rejected is None or (rejected.fits and not force_shrink):
             return None
         proof = rejected.proof
+        token_budget = self._positive_int(proof.get("effective_proof_token_budget"))
+        char_budget = self._positive_int(proof.get("effective_proof_budget"))
+        if force_shrink:
+            # A service rejection or output exhaustion needs a smaller input.
+            # Reuse the proof's existing headroom below its current size, so
+            # dropping a small wrapper is
+            # not sufficient progress. This is a temporary recovery budget,
+            # not a calibrated model window or a new compaction trigger.
+            before_tokens = self._positive_int(proof.get("estimated_tokens"))
+            before_chars = self._positive_int(proof.get("estimated_chars"))
+            if before_tokens is None and before_chars is None:
+                return None
+            recovery_proof = project_provider_payload(
+                self._live_request_jsonable(rejected.payload),
+                projection_adapter="native_overflow_recovery",
+                proof_budget=before_chars or 0,
+                token_budget=before_tokens,
+            )
+            for metric, current, capacity in (
+                ("estimated_tokens", token_budget, "effective_proof_token_budget"),
+                ("estimated_chars", char_budget, "effective_proof_budget"),
+            ):
+                before = self._positive_int(proof.get(metric))
+                if before is not None:
+                    limit = int(recovery_proof[capacity])
+                    limit = min(current, limit) if current is not None else limit
+                    if metric == "estimated_tokens":
+                        token_budget = limit
+                    else:
+                        char_budget = limit
         outcome = self._recover_local_request_window(
             messages,
             protected_turn_start_index=protected_turn_start_index,
@@ -14813,11 +15147,12 @@ class Agent:
             request_context_message=request_context_message,
             runtime_context_message=runtime_context_message,
             request_suffix_messages=request_suffix_messages,
-            input_budget_tokens=self._positive_int(proof.get("effective_proof_token_budget")),
-            input_budget_chars=self._positive_int(proof.get("effective_proof_budget")),
+            input_budget_tokens=token_budget,
+            input_budget_chars=char_budget,
             reason=reason,
             compaction_config=compaction_config,
             notify_recovery=False,
+            rejected_payload=rejected.payload if force_shrink else None,
         )
         if outcome is None:
             return None
@@ -14860,21 +15195,37 @@ class Agent:
         )
         if physical is None or not physical.fits or stable is None or not stable.fits:
             return None
-        # Compare complete requests under the unchanged physical controls. Do
-        # not gain admission by increasing generation capacity or by merely
-        # moving bytes into tools/system framing. Every pressured dimension
+        if increase_generation_budget and projected_generation_budget(
+            physical.payload, chat_config.max_tokens,
+        ) <= projected_generation_budget(rejected.payload, chat_config.max_tokens):
+            return None
+        # Compare complete inputs under the same model/output ceiling. Do not
+        # gain admission merely by moving bytes into tools/system framing.
+        # A smaller input may restore a previously lowered wire output cap.
+        # Every pressured dimension
         # must shrink; final proofs decide admissibility of the other dimensions.
-        pressured = False
+        pressured = force_shrink
+        if force_shrink and len(json.dumps(
+            self._live_request_jsonable(physical.payload), ensure_ascii=False, sort_keys=True,
+        ).encode()) >= len(json.dumps(
+            self._live_request_jsonable(rejected.payload), ensure_ascii=False, sort_keys=True,
+        ).encode()):
+            return None
         for metric, capacity in (
             ("estimated_chars", "effective_proof_budget"),
             ("estimated_tokens", "effective_proof_token_budget"),
         ):
-            before = self._positive_int(proof.get(metric))
-            after = self._positive_int(physical.proof.get(metric))
-            limit = self._positive_int(proof.get(capacity))
-            if before is not None and limit is not None and before > limit:
+            metric_before = self._positive_int(proof.get(metric))
+            metric_after = self._positive_int(physical.proof.get(metric))
+            metric_limit = self._positive_int(proof.get(capacity))
+            if metric_before is not None and (
+                force_shrink or (metric_limit is not None and metric_before > metric_limit)
+            ):
                 pressured = True
-                if after is None or after >= before:
+                if metric_after is None or metric_after >= metric_before:
+                    return None
+                recovery_limit = char_budget if metric == "estimated_chars" else token_budget
+                if force_shrink and recovery_limit is not None and metric_after > recovery_limit:
                     return None
         if not pressured:
             return None
@@ -14972,6 +15323,10 @@ class Agent:
         config.protect_semantic_tail = False
         config.protect_profile_tail = False
         config.protected_recent_messages = 0
+        if request_context_message is None:
+            request_context_message = self._current_request_context_message()
+        if runtime_context_message is None:
+            runtime_context_message = self._freeze_preflight_runtime_context_message()
         mapped_request_index = self._live_turn_mapped_index(
             request_context_insert_index,
             protected_start=protected_start,
@@ -14990,13 +15345,43 @@ class Agent:
         def project_messages(summary: str, kept: list[dict[str, Any]]) -> tuple[
             list[Message], int, int
         ]:
-            return ([
+            candidate = [
                 *active_prefix,
                 *self._live_turn_checkpoint_messages(summary, receipts),
                 *(summary_messages[-len(kept):] if kept else []),
                 *raw_tail,
                 *(request_suffix_messages or []),
-            ], int(mapped_request_index or 0), int(mapped_runtime_index or 0))
+            ]
+            active_config = consumer_chat_config or self._provider_admission_chat_config(
+                self._current_turn_message or "",
+                context_window_tokens=self.config.context_window_tokens,
+            )
+
+            def project_receipts(view: list[Message]) -> ProviderFinalRequestProjection | None:
+                assembled = self._provider_request_messages_for_count_projection(
+                    view, request_context_message=request_context_message,
+                    request_context_insert_index=int(mapped_request_index or 0),
+                    runtime_context_message=runtime_context_message,
+                    runtime_context_insert_index=int(mapped_runtime_index or 0),
+                )
+                active_index = _active_user_message_index_for_request(
+                    assembled, current_user_text=self._current_turn_message or "",
+                )
+                return project_provider_final_request(
+                    self.provider, assembled, (
+                        list(self._compaction_request_context.tools or ())
+                        if self._compaction_request_context is not None
+                        else self.tool_definitions
+                    ),
+                    active_config.model_copy(update={"active_user_message_index": active_index}),
+                )
+
+            candidate, _ = self._fit_live_turn_receipts(
+                candidate, project=project_receipts,
+                fits=lambda proof: proof is not None and proof.fits,
+                chat_config=active_config,
+            )
+            return candidate, int(mapped_request_index or 0), int(mapped_runtime_index or 0)
 
         try:
             budget = self._resolve_in_turn_compaction_budget(
@@ -15298,9 +15683,12 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
             )
 
-        placeholder_summary = Message(
-            role="user",
-            content="[Context summary]\n[message-count projection placeholder]",
+        replaces_checkpoint = any(
+            isinstance(message, _CompactionSummaryMessage) and message._replaces_checkpoint
+            for message in messages
+        )
+        placeholder_summary = _CompactionSummaryMessage.from_summary(
+            "[message-count projection placeholder]", replaces_checkpoint=replaces_checkpoint,
         )
         summary_ack = _CompactionSummaryMessage(
             role="assistant",
@@ -15371,7 +15759,9 @@ class Agent:
         ]:
             cut = len(messages) - len(kept)
             return ([
-                _CompactionSummaryMessage(role="user", content=f"[Context summary]\n{summary}"),
+                _CompactionSummaryMessage.from_summary(
+                    summary, replaces_checkpoint=replaces_checkpoint,
+                ),
                 summary_ack,
                 *messages[cut:],
                 *request_suffix_messages,
@@ -15471,7 +15861,9 @@ class Agent:
             return None, str(getattr(result, "skip_reason", None) or "summary_failed")
 
         compacted = [
-            _CompactionSummaryMessage(role="user", content=f"[Context summary]\n{replay_summary}"),
+            _CompactionSummaryMessage.from_summary(
+                replay_summary, replaces_checkpoint=replaces_checkpoint,
+            ),
             summary_ack,
             *messages[selected_cut:],
         ]
@@ -15625,6 +16017,15 @@ class Agent:
         runtime_context_insert_index: int,
     ) -> list[Message]:
         result = list(messages)
+        if isinstance(request_context_message, _CompactionRequestContextMessage) and any(
+            isinstance(message, _CompactionSummaryMessage) and message._replaces_checkpoint
+            for message in messages
+        ):
+            # S1 in the candidate replaces only the old checkpoint contribution.
+            # This is a request projection, not evidence that its writer committed.
+            request_context_message = Agent._request_context_message(
+                request_context_message._dynamic_context,
+            )
         runtime_idx = max(0, min(runtime_context_insert_index, len(result)))
         if request_context_message is not None:
             request_idx = max(0, min(request_context_insert_index, len(result)))
@@ -16050,23 +16451,27 @@ class Agent:
             )
 
         recovery_config: CompactionConfig | None = None
+        recovery_messages = messages
+        recovery_request_index = request_context_insert_index
+        recovery_runtime_index = runtime_context_insert_index
+        recovery_protected_index = protected_turn_start_index
 
         def _local_after_failure(reason: str) -> CompactionOutcome | None:
             active_index = _active_user_message_index_for_request(
-                messages,
+                recovery_messages,
                 current_user_text=getattr(self, "_current_turn_message", "") or "",
             )
             boundary = (
-                protected_turn_start_index
-                if protected_turn_start_index is not None else active_index
+                recovery_protected_index
+                if recovery_protected_index is not None else active_index
             )
             if boundary is None:
                 return None
             outcome = self._recover_local_request_window(
-                messages,
+                recovery_messages,
                 protected_turn_start_index=boundary,
-                request_context_insert_index=request_context_insert_index,
-                runtime_context_insert_index=runtime_context_insert_index,
+                request_context_insert_index=recovery_request_index,
+                runtime_context_insert_index=recovery_runtime_index,
                 config=consumer_chat_config,
                 request_context_message=request_context_message,
                 runtime_context_message=runtime_context_message,
@@ -16209,6 +16614,37 @@ class Agent:
                 )
                 return _local_after_failure("provider_recent_tail_too_large")
 
+        source_snapshot = self._durable_compaction_source
+        previous_summary = (
+            source_snapshot.previous_summary if source_snapshot is not None else ""
+        )
+        replaces_checkpoint = bool(previous_summary)
+        # Runtime summaries are separate source material, never archived raw rows.
+        summary_prefix = 0
+        while summary_prefix < len(messages) and isinstance(
+            messages[summary_prefix], _CompactionSummaryMessage,
+        ):
+            summary_message = cast(_CompactionSummaryMessage, messages[summary_prefix])
+            if summary_message.role == "user" and not previous_summary:
+                previous_summary = str(summary_message.content).partition("\n")[2]
+            replaces_checkpoint = (
+                replaces_checkpoint or summary_message._replaces_checkpoint
+            )
+            summary_prefix += 1
+        if summary_prefix:
+            messages = messages[summary_prefix:]
+            request_context_insert_index = (
+                max(0, request_context_insert_index - summary_prefix)
+                if request_context_insert_index is not None else None
+            )
+            runtime_context_insert_index = (
+                max(0, runtime_context_insert_index - summary_prefix)
+                if runtime_context_insert_index is not None else None
+            )
+            protected_turn_start_index = (
+                max(0, protected_turn_start_index - summary_prefix)
+                if protected_turn_start_index is not None else None
+            )
         protected_start: int | None = None
         compaction_id = new_compaction_id()
         compaction_config = self._build_compaction_config()
@@ -16229,7 +16665,9 @@ class Agent:
         ]:
             cut = len(messages) - len(kept)
             return ([
-                _CompactionSummaryMessage(role="user", content=f"[Context summary]\n{summary}"),
+                _CompactionSummaryMessage.from_summary(
+                    summary, replaces_checkpoint=replaces_checkpoint,
+                ),
                 _CompactionSummaryMessage(
                     role="assistant", content="Understood. Continuing from summary.",
                 ),
@@ -16303,6 +16741,11 @@ class Agent:
             context_window_chars=budget.history_capacity_chars,
             config=compaction_config,
             consumer_admission=budget.consumer_admission,
+            previous_summary=previous_summary or None,
+            previous_attachment_paths=(
+                getattr(source_snapshot, "previous_attachment_paths", ())
+                if source_snapshot is not None else ()
+            ),
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
                 execution_id=uuid.uuid4().hex,
@@ -16520,10 +16963,10 @@ class Agent:
                     ),
                 )
             return CompactionOutcome(
-                messages=messages,
-                request_context_insert_index=request_context_insert_index,
-                runtime_context_insert_index=runtime_context_insert_index,
-                protected_turn_start_index=protected_turn_start_index,
+                messages=recovery_messages,
+                request_context_insert_index=recovery_request_index,
+                runtime_context_insert_index=recovery_runtime_index,
+                protected_turn_start_index=recovery_protected_index,
             )
 
         # ``compact_context`` is prefix-only. Keep the exact original tail in
@@ -16532,8 +16975,8 @@ class Agent:
         # projection used solely as summarizer input.
         compacted: list[Message] = []
         if replay_summary:
-            compacted.append(_CompactionSummaryMessage(
-                role="user", content=f"[Context summary]\n{replay_summary}",
+            compacted.append(_CompactionSummaryMessage.from_summary(
+                replay_summary, replaces_checkpoint=replaces_checkpoint,
             ))
             compacted.append(
                 _CompactionSummaryMessage(
@@ -16591,6 +17034,11 @@ class Agent:
             runtime_context_insert_index=adjusted_runtime_idx,
             protected_turn_start_index=adjusted_protected_idx,
             runtime_compaction_config=compaction_config,
+            source_snapshot=source_snapshot,
+            ephemeral_only=(
+                self._durable_compaction_source_bound
+                and (source_snapshot is None or not source_snapshot.valid)
+            ),
         )
 
 

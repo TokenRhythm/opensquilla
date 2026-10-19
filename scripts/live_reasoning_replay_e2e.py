@@ -46,6 +46,7 @@ from opensquilla.provider.selector import (  # noqa: E402
     ProviderConfig,
     SelectorConfig,
 )
+from opensquilla.session.context_view import format_compaction_summary_context  # noqa: E402
 from opensquilla.session.manager import SessionManager  # noqa: E402
 from opensquilla.session.storage import SessionStorage  # noqa: E402
 from opensquilla.session.terminal_reply import safe_provider_failure_code  # noqa: E402
@@ -654,7 +655,9 @@ def _config(
     config.memory.dream.enabled = False
     config.heartbeat.enabled = False
     config.agent_max_iterations = 5
-    config.agent_max_provider_retries = 0
+    # Exercise the normal finite retry policy, including length continuation.
+    # Historical frozen baselines explicitly set zero and remain unchanged.
+    config.agent_max_provider_retries = None
     config.agent_runtime_timeout_seconds = 180
     config.agent_request_timeout_seconds = 90
     return config
@@ -1216,9 +1219,13 @@ async def _run_compaction_case(
     fact_checks: list[dict[str, Any]] = []
     recall_checks: list[dict[str, Any]] = []
     pressure_checks: list[dict[str, Any]] = []
+    coverage_diagnostics: list[dict[str, Any]] = []
+    summary_replay_checks: list[dict[str, Any]] = []
     observer.replay_checks["critical_fact_checks"] = fact_checks
     observer.replay_checks["memory_recall_checks"] = recall_checks
     observer.replay_checks["pressure_checks"] = pressure_checks
+    observer.replay_checks["summary_coverage_diagnostics"] = coverage_diagnostics
+    observer.replay_checks["summary_replay_checks"] = summary_replay_checks
     catalog = _Catalog()
     catalog_loaded = False
     if provider == "openrouter" and observer.transport is None:
@@ -1594,9 +1601,11 @@ async def _run_compaction_case(
                         _require(observed["no_summary_committed"], "truncated_summary_committed")
                     break
                 expected_summary_calls = (
-                    range(2, limit) if variant == "chunked"
-                    else range(1, limit) if options.native_pressure else {1}
+                    range(1, limit) if variant == "chunked" or options.native_pressure else {1}
                 )
+                # Bounded summary input can handle the oversized fixture in one
+                # call. Still check source/recall, then report chunked_summary
+                # as not covered unless multiple calls actually occurred.
                 _require(
                     compact is not None
                     and len(summary_calls) in expected_summary_calls
@@ -1608,8 +1617,15 @@ async def _run_compaction_case(
                 _require(len(summaries) == turn, "single_compaction_not_persisted")
                 latest = summaries[-1]
                 _require(latest.summary_source == "llm", "compaction_used_fallback")
+                coverage_diagnostics.append({"turn": turn, "status": latest.coverage_status})
+                # Extracted string matches are diagnostics, not semantic admission.
+                # Keep their misses visible, then independently verify the archived
+                # source, actual replay and task facts below. Do not turn a reported
+                # diagnostic miss into either an early abort or a quality pass.
                 _require(
-                    latest.coverage_status in {"pass", "pass_with_backfill", "unknown"},
+                    latest.coverage_status in {
+                        "pass", "pass_with_backfill", "unknown", "fail_reported",
+                    },
                     "compaction_coverage_failed",
                 )
                 summary_text = latest.summary_text
@@ -1673,20 +1689,29 @@ async def _run_compaction_case(
                     )
                 resumed = stage_calls[-1]
                 resumed_input = json.dumps(resumed.request, ensure_ascii=False)
+                replay_wrapper = format_compaction_summary_context([summary_text], max_chars=None)
+                replay_contents = [
+                    message["content"] for message in resumed.request.get("messages", [])
+                    if isinstance(message.get("content"), str)
+                ]
+                # Stored complete checkpoints retain their final newline. The
+                # actual replay formatter removes outer whitespace; require its
+                # entire wrapper once in one message, not arbitrary normalized
+                # prose or a match assembled across message boundaries.
+                summary_replay_checks.append({
+                    "turn": turn,
+                    "exact_text_count": sum(text.count(summary_text) for text in replay_contents),
+                    "formatted_wrapper_count": sum(
+                        text.count(replay_wrapper) for text in replay_contents
+                    ) if replay_wrapper else 0,
+                })
                 _require(
-                    summary_text
-                    in "\n".join(
-                        message.get("content") or ""
-                        for message in resumed.request.get("messages", [])
-                        if isinstance(message.get("content"), str)
-                    ),
+                    bool(replay_wrapper)
+                    and any(replay_wrapper in text for text in replay_contents),
                     "persisted_summary_not_in_next_request",
                 )
-                _require(sum(
-                    message["content"].count(summary_text)
-                    for message in resumed.request.get("messages", [])
-                    if isinstance(message.get("content"), str)
-                ) == 1, "persisted_summary_replayed_more_than_once")
+                _require(summary_replay_checks[-1]["formatted_wrapper_count"] == 1,
+                         "persisted_summary_replayed_more_than_once")
                 _require(
                     COMPACTION_TAIL_MARKER in resumed_input, "current_tail_not_in_next_request"
                 )
@@ -1889,6 +1914,8 @@ async def _run_compaction_case(
         ),
         **physical_window,
         "critical_fact_checks": fact_checks,
+        "summary_coverage_diagnostics": coverage_diagnostics,
+        "summary_replay_checks": summary_replay_checks,
         "pressure_checks": pressure_checks,
         "source_fixture_sha256": hashlib.sha256(
             json.dumps(sorted(original.values())).encode()

@@ -452,14 +452,15 @@ _GOLDEN_PAYLOAD_JSON: dict[int, str] = {
         '123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
         '789abcdef0123456789abcdef0123456789abcdef"}]}'
     ),
+    # Emergency recovery keeps the complete user request when it already fits.
     5500: (
-        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You'
-        ' are a synthetic conversation fixture."},{"role":"user","content":"Summarise the build'
-        ' results. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
-        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456\\n\\n[provid'
-        'er_request_user_context_emergency_compacted: omitted 129 chars; original_chars=349; sh'
-        'a256=1b95b386d19eac8884426943ac35590ace8b2e23a6034abe983121b27e6913da]\\n\\n89abcdef0123'
-        '456789abcdef0123456789abcdef"},{"role":"assistant","content":"Starting with the build.'
+        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":'
+        '"You are a synthetic conversation fixture."},{"role":"user","content":"Summarise t'
+        'he build results. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
+        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef"},{"role":"assistant","content":"Starting with the build.'
         '","reasoning_content":"weighing tradeoffs before acting 0123456789abcdef0123456789abcd'
         'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
         '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
@@ -595,7 +596,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
     ),
     5500: (
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_proje'
-        'ction_mode":"native_or_none","estimated_chars":4903,"estimated_tokens":1225,"proof_b'
+        'ction_mode":"native_or_none","estimated_chars":4861,"estimated_tokens":1215,"proof_b'
         'udget":5500,"raw_proof_budget":5500,"effective_proof_budget":4950,"proof_headroom_ch'
         'ars":550,"fits":true,"compact_needed":true,"compaction_tier":3,"compaction_protect_r'
         'ecent_assistant":false,"recent_tail_too_large":false,"compaction_not_smaller":false,'
@@ -603,7 +604,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '"$.messages[2].reasoning_content","chars":913},{"path":"$.messages[4].content[1].inp'
         'ut.note","chars":695},{"path":"$.messages[2].tool_calls[0].function.arguments","char'
         's":389},{"path":"$.messages[3].content","chars":388},{"path":"$.messages[6].content"'
-        ',"chars":388}],"retry_count":3,"messages_chars":4848,"tools_chars":0,"system_chars":'
+        ',"chars":388}],"retry_count":3,"messages_chars":4806,"tools_chars":0,"system_chars":'
         '73,"top_level_chars":43,"tool_schema_too_large":false,"tool_payload_compaction_not_s'
         'maller":false,"tail_compaction_not_smaller":false,"emergency_current_turn_compacted"'
         ':true,"emergency_compaction_not_smaller":false,"aggregate_tool_arguments_compacted":'
@@ -661,6 +662,8 @@ def test_explicit_rollbacks_reproduce_baseline_payload(tier: int) -> None:
     compacted, proof = _run_ladder(budget)
     assert proof is not None
     assert proof["compaction_tier"] == tier
+    if tier == 3:
+        assert compacted["messages"][1] == _golden_payload()["messages"][1]
     assert _canon(compacted) == _GOLDEN_PAYLOAD_JSON[budget]
     assert _canon(_legacy_proof_view(proof)) == _GOLDEN_PROOF_JSON[budget]
 

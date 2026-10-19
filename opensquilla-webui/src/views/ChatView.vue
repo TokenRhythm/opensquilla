@@ -298,9 +298,10 @@
           :aria-live="compactStatus.tone === 'err' ? 'assertive' : 'polite'"
           aria-atomic="true"
         >
-          <span class="chat-compaction-event__marker" aria-hidden="true" />
-          <span class="chat-compaction-event__title">{{ compactStatus.message }}</span>
-          <span v-if="compactStatus.detail" class="chat-compaction-event__detail">
+          <CompactionRecoveryMarker v-if="temporaryCompactionRecovery" />
+          <span v-else class="chat-compaction-event__marker" aria-hidden="true" />
+          <span class="chat-compaction-event__title">{{ temporaryCompactionRecovery ? t('chat.compact.compacted') : compactStatus.message }}</span>
+          <span v-if="compactStatus.detail && !temporaryCompactionRecovery" class="chat-compaction-event__detail">
             {{ compactStatus.detail }}
           </span>
         </div>
@@ -788,6 +789,7 @@ import {
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
 import ConversationLiveEdge from '@/components/chat/ConversationLiveEdge.vue'
+import CompactionRecoveryMarker from '@/components/chat/CompactionRecoveryMarker.vue'
 import ConversationSurface from '@/components/chat/ConversationSurface.vue'
 import { MAIN_CONVERSATION_POLICY, conversationSlashActionAllowed, type ConversationPolicy } from '@/modules/conversationPolicy'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
@@ -2178,6 +2180,8 @@ const {
   handleStreamGenerationChange: handleCompactionStreamGenerationChange,
   cleanup: cleanupCompaction,
 } = chatCompaction
+const temporaryCompactionRecovery = computed(() => compactStatus.value.durability === 'request_scoped'
+  && ['completed', 'emergency_ephemeral'].includes(compactStatus.value.status))
 isCompactInFlightForCurrentSession = chatCompaction.isCompactInFlightForCurrentSession
 
 function transcriptCompactionState(status: string): ChatMaintenanceEvent['state'] {

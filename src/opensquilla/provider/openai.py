@@ -79,6 +79,7 @@ from .reasoning_dialects import (
 )
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    fit_payload_generation_budget,
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
@@ -3455,6 +3456,7 @@ class OpenAIProvider:
         int | None,
         str | None,
         _ReasoningReplayStats,
+        dict[str, Any],
     ]:
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
@@ -3700,6 +3702,7 @@ class OpenAIProvider:
             has_tools=bool(tools),
         )
         merge_extra_body(payload, self._extra_body)
+        payload, generation_budget_proof = fit_payload_generation_budget(payload, cfg)
         fallback_reason = (
             "native_is_error_unavailable"
             if any(message.get("role") == "tool" for message in openai_messages)
@@ -3710,6 +3713,7 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             reasoning_replay_stats,
+            generation_budget_proof,
         )
 
     def project_final_request(
@@ -3728,13 +3732,14 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             _reasoning_replay_stats,
+            generation_budget_proof,
         ) = self._build_payload(
             messages,
             tools,
             cfg,
         )
         protected_result_indexes = protected_tool_result_indexes(messages)
-        return project_final_request_payload(
+        projection = project_final_request_payload(
             payload,
             projection_adapter=self._provider_kind,
             proof_budget=provider_request_character_budget(payload, cfg),
@@ -3745,6 +3750,8 @@ class OpenAIProvider:
             message_limit=message_limit,
             protected_tool_result_indexes=protected_result_indexes,
         )
+        projection.proof.update(generation_budget_proof)
+        return projection
 
     def chat(
         self,
@@ -3808,6 +3815,7 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             reasoning_replay_stats,
+            generation_budget_proof,
         ) = self._build_payload(
             messages,
             tools,
@@ -3864,6 +3872,8 @@ class OpenAIProvider:
             active_user_message_index=wire_active_user_index,
             protected_tool_result_indexes=protected_result_indexes,
         )
+        if budget_decision.proof is not None:
+            budget_decision.proof.update(generation_budget_proof)
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
             log.warning("provider.request_budget_exhausted", **proof)
@@ -3893,6 +3903,7 @@ class OpenAIProvider:
                 protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
+            exc.proof.update(generation_budget_proof)
             log.warning("provider.request_budget_exhausted", **exc.proof)
             yield ErrorEvent(
                 message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),

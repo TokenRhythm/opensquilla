@@ -110,6 +110,8 @@ class CompactionExecutionTarget:
     deployment_fingerprint: str = ""
     portable: bool = True
     source: str = "active_provider"
+    model_capabilities: Any | None = field(default=None, repr=False, compare=False)
+    model_vision_support: str | None = None
     credential_pool_provider: str = field(default="", repr=False)
     credential_pool_session_key: str = field(default="", repr=False)
     credential_pool_failure_reporter: Callable[[str, str, Any], None] | None = field(
@@ -439,14 +441,16 @@ def resolve_compaction_execution_plan(
     active_only: bool = False,
     active_chat_config: ChatConfig | None = None,
 ) -> CompactionExecutionPlan | None:
-    """Freeze only the current physical responder, never route for a summary.
+    """Freeze the physical responder and explicitly authorized capacity targets.
 
-    Legacy override/fallback/active_only arguments remain accepted for callers
-    upgrading in place. They cannot change the summary deployment. A composite
+    Legacy override/previous/fallback config arguments never grant authority.
+    A selector may expose its already-authorized static remaining targets when
+    active_only is false; these never advance its execution state. A composite
     provider resolves its already-selected response leg, including a sticky
     fixed takeover; this never executes proposers or selects a new fallback.
     """
 
+    capacity_targets = getattr(active_provider, "compaction_fallback_targets", None)
     config = active_provider_config
     provider = active_provider
     chat_config = active_chat_config
@@ -514,6 +518,12 @@ def resolve_compaction_execution_plan(
                 credential_pool_session_key=session_key,
                 credential_pool_failure_reporter=credential_pool_failure_reporter,
             ),))
+        if plan is not None and not active_only and callable(capacity_targets):
+            try:
+                extra = tuple(capacity_targets(chat_config or ChatConfig()))
+            except Exception:
+                extra = ()
+            plan = replace(plan, candidates=(*plan.candidates, *extra))
         return plan
     except Exception:
         # A broken current deployment is a summary failure, not permission to

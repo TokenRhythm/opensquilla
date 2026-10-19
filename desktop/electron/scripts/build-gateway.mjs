@@ -2,6 +2,7 @@ import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync,
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { assertRouterIntegrity, gatewayInputs, writeGatewayBuildRecord } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -9,6 +10,11 @@ const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const pyinstallerWorkDir = join(packageRoot, '.pyinstaller')
+const tokenizerCacheDir = join(pyinstallerWorkDir, 'tiktoken-cache')
+// Match the locked tiktoken cl100k_base constructor and its content checksum.
+const tokenizerUrl = 'https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken'
+const tokenizerSha256 = '223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7'
+const tokenizerCacheKey = createHash('sha1').update(tokenizerUrl).digest('hex')
 const entryPath = join(scriptDir, 'gateway-entry.py')
 const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_ca_trust.py')
 // The WebUI package owns its generated output.  Desktop packaging consumes
@@ -330,6 +336,28 @@ if (freezeRegistry.status !== 0) {
   throw new Error(`Migration registry build failed: ${freezeRegistry.stderr || freezeRegistry.stdout}`)
 }
 
+// Package the cache as well as the dynamically discovered encoding plugin.
+// A fresh/offline Desktop must not depend on the user's first-run network.
+const prepareTokenizer = spawnSync('uv', [
+  ...gatewayUvArgs, 'python', '-c', [
+    'import hashlib, pathlib, sys, urllib.request',
+    'target, url, expected = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]',
+    'data = target.read_bytes() if target.is_file() else b""',
+    'if hashlib.sha256(data).hexdigest() != expected:',
+    '    with urllib.request.urlopen(url, timeout=60) as response:',
+    '        data = response.read()',
+    '    if hashlib.sha256(data).hexdigest() != expected:',
+    '        raise ValueError("cl100k_base encoding checksum mismatch")',
+    '    target.parent.mkdir(parents=True, exist_ok=True)',
+    '    target.write_bytes(data)',
+    'print("Verified offline cl100k_base encoding asset.")',
+  ].join('\n'), join(tokenizerCacheDir, tokenizerCacheKey), tokenizerUrl, tokenizerSha256,
+], { cwd: repoRoot, encoding: 'utf8', windowsHide: true, timeout: 120000 })
+if (prepareTokenizer.error) throw prepareTokenizer.error
+if (prepareTokenizer.status !== 0) {
+  throw new Error(`Tokenizer asset preparation failed: ${prepareTokenizer.stderr || prepareTokenizer.stdout}`)
+}
+
 const lightgbmBinaryArgs = addBinaryArg(
   pythonPackageFile('lightgbm', platformLightgbmLibraryPath()),
   platformLightgbmBundleDir(),
@@ -418,6 +446,8 @@ const args = [
   '--hidden-import',
   'tiktoken',
   '--hidden-import',
+  'tiktoken_ext.openai_public',
+  '--hidden-import',
   'onnxruntime',
   '--hidden-import',
   'mcp',
@@ -425,6 +455,8 @@ const args = [
   'yoyo.backends.core.sqlite3',
   '--runtime-hook',
   caRuntimeHookPath,
+  '--add-data',
+  `${join(tokenizerCacheDir, tokenizerCacheKey)}${addDataSeparator}tiktoken-cache`,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
   '--add-data',

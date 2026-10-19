@@ -16017,8 +16017,10 @@ class SessionStorage:
         an anchor in this session; missing, foreign, or deleted anchors fail
         instead of becoming an unpositioned latest read.
         """
-        if content_mode not in {"full", "bounded", "tool_preview"}:
-            raise ValueError("content_mode must be 'full', 'bounded' or 'tool_preview'")
+        if content_mode not in {"full", "bounded", "tool_preview", "metadata"}:
+            raise ValueError(
+                "content_mode must be 'full', 'bounded', 'tool_preview', or 'metadata'"
+            )
         page_size = max(1, int(limit))
         fetch_size = page_size + 1
         # SQLite performs the substring before the row crosses the Python
@@ -16038,13 +16040,6 @@ class SessionStorage:
                 "THEN json_type(content) = 'array' ELSE 0 END"
             )
             envelope_sql = "NULL"
-        details_sql = (
-            "NULL AS tool_calls, NULL AS tool_call_id, NULL AS reasoning_content, "
-            "NULL AS assistant_replay, NULL AS turn_usage, NULL AS turn_context"
-            if tool_preview else
-            f"tool_calls, tool_call_id, reasoning_content, {replay_sql} AS assistant_replay, "
-            "turn_usage, turn_context"
-        )
         provenance_sql = (
             "NULL AS provenance_kind, NULL AS provenance_origin_session_id, "
             "NULL AS provenance_source_session_key, NULL AS provenance_source_channel, "
@@ -16054,6 +16049,24 @@ class SessionStorage:
             "provenance_source_channel, provenance_source_tool"
         )
         visible_roles_sql = "AND role IN ('user', 'assistant')" if tool_preview else ""
+
+        # Archive discovery must not pull a huge tool argument or reasoning
+        # body into Python just to identify the next original entry to read.
+        metadata_only = content_mode == "metadata"
+        if metadata_only:
+            content_sql, truncated_sql, envelope_sql = "NULL", "1", "NULL"
+        tool_calls_sql = "NULL" if metadata_only else "tool_calls"
+        reasoning_sql = "NULL" if metadata_only else "reasoning_content"
+        usage_sql = "NULL" if metadata_only else "turn_usage"
+        context_sql = "NULL" if metadata_only else "turn_context"
+        details_sql = (
+            "NULL AS tool_calls, NULL AS tool_call_id, NULL AS reasoning_content, "
+            "NULL AS assistant_replay, NULL AS turn_usage, NULL AS turn_context"
+            if tool_preview else
+            f"{tool_calls_sql} AS tool_calls, tool_call_id, "
+            f"{reasoning_sql} AS reasoning_content, {replay_sql} AS assistant_replay, "
+            f"{usage_sql} AS turn_usage, {context_sql} AS turn_context"
+        )
 
         cursor = before
         ascending = False
@@ -16212,11 +16225,88 @@ class SessionStorage:
             entries.reverse()
         return entries, has_more
 
+    async def get_canonical_transcript_fragment(
+        self,
+        session_id: str,
+        *,
+        message_id: str | None = None,
+        entry_id: int | None = None,
+        offset: int = 0,
+        limit: int = 4096,
+        revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Read a bounded JSON fragment of one original entry, never a summary.
+
+        Offsets count Unicode characters in the serialized JSON, not bytes or
+        tokens. Existing content-range reads omit tool_calls; this projection
+        includes the original arguments and results without fetching an entire
+        oversized record into Python. Both identity alternatives remain scoped
+        to the admitted session, including archived original_entry_id values.
+        """
+        if ((message_id is None) == (entry_id is None)
+                or offset < 0 or not 1 <= limit <= 4096):
+            raise ValueError("Specify one entry identity and a valid bounded range")
+        key = "message_id" if message_id is not None else "id"
+        archive_key = "message_id" if message_id is not None else "original_entry_id"
+        identity = message_id if message_id is not None else entry_id
+        sql = f"""
+            WITH original AS (
+                SELECT id, message_id, role, content, tool_calls, tool_call_id,
+                       reasoning_content, created_at, content_revision,
+                       'active' AS source, 0 AS source_rank
+                FROM transcript_entries WHERE session_id = ? AND {key} = ?
+                UNION ALL
+                SELECT original_entry_id AS id, message_id, role, content,
+                       tool_calls, tool_call_id, reasoning_content, created_at,
+                       content_revision, 'compacted' AS source, 1 AS source_rank
+                FROM compacted_transcript_entries
+                WHERE session_id = ? AND {archive_key} = ?
+            ), selected AS (
+                SELECT * FROM original ORDER BY source_rank LIMIT 1
+            ), envelope AS (
+                SELECT id, message_id, source, created_at, content_revision,
+                       json_object('entry_id', id, 'message_id', message_id,
+                           'role', role, 'content', content,
+                           'tool_calls', CASE WHEN json_valid(tool_calls)
+                               THEN json(tool_calls) ELSE tool_calls END,
+                           'tool_call_id', tool_call_id,
+                           'reasoning_content', reasoning_content,
+                           'created_at', created_at) AS body
+                FROM selected
+            )
+            SELECT id, message_id, source, created_at, content_revision,
+                   length(body) AS total_chars, substr(body, ?, ?) AS text
+            FROM envelope
+        """
+        rows = await self._read_history_query(
+            sql, [session_id, identity, session_id, identity, offset + 1, limit],
+            operation="canonical_fragment",
+        )
+        if not rows:
+            raise ContentNotFoundError("Original entry was not found in this session")
+        row = dict(rows[0])
+        current_revision = (
+            f"{row['source']}:{row['id']}:{row['created_at']}:"
+            f"{row['content_revision'] or 0}:{row['total_chars']}"
+        )
+        if revision is not None and revision != current_revision:
+            raise ContentNotFoundError("Original entry changed; restart the fragment read")
+        if offset > row["total_chars"]:
+            raise ContentRangeError("Fragment offset exceeds original entry length")
+        return {
+            "entry_id": row["id"], "message_id": row["message_id"],
+            "source": row["source"], "revision": current_revision,
+            "offset": offset, "total_chars": row["total_chars"], "text": row["text"],
+        }
+
     async def get_canonical_transcript_coverage(
         self,
         session_id: str,
     ) -> CanonicalTranscriptCoverage:
         """Read canonical coverage and current session metadata in one snapshot."""
+        # A replacement that only rewrites a checkpoint archives no new rows.
+        # Accept its positive boundary only when an earlier row-removing summary
+        # already covered it; all archive/count checks below still apply.
         sql = """
             SELECT
                 session.compaction_count,
@@ -16240,7 +16330,23 @@ class SessionStorage:
                  WHERE summary.session_id = session.session_id
                    AND (
                      summary.compaction_id IS NULL
-                     OR (summary.removed_count = 0 AND summary.covered_through_id > 0)
+                     OR (
+                       summary.removed_count = 0 AND summary.covered_through_id > 0
+                       AND NOT (
+                         summary.summary_format = 'structured_v1'
+                         AND COALESCE(CASE WHEN json_valid(summary.summary_payload) THEN
+                           json_type(summary.summary_payload,
+                             '$.source_coverage.replaces_prior_context') = 'true'
+                         ELSE 0 END, 0)
+                         AND EXISTS (
+                           SELECT 1 FROM session_summaries AS prior
+                           WHERE prior.session_id = summary.session_id
+                             AND prior.id < summary.id
+                             AND prior.removed_count > 0
+                             AND prior.covered_through_id = summary.covered_through_id
+                         )
+                       )
+                     )
                      OR COALESCE((
                        SELECT COUNT(*)
                        FROM compacted_transcript_entries AS archived
@@ -17416,9 +17522,22 @@ class SessionStorage:
         source_matches = True
         archive_rows: list[dict[str, Any]] | None = None
         if expected_source_entries is not None:
-            source_rows = await self._read_transcript_rows(
-                node.session_id, len(expected_source_entries),
-            )
+            read_started = self._monotonic()
+            try:
+                source_rows = await self._read_transcript_rows(
+                    node.session_id, len(expected_source_entries),
+                )
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_busy(exc):
+                    raise
+                # No rewrite transaction has started. Preserve that evidence
+                # rather than letting callers mistake a read refusal for an unknown commit.
+                raise StorageBusyError(
+                    "rewrite_compacted_session",
+                    waited_ms=max(0, int((self._monotonic() - read_started) * 1000)),
+                    retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                    stage="preflight_read", resource="sqlite_reader",
+                ) from exc
             source_matches = await asyncio.to_thread(
                 _compaction_source_matches, source_rows, expected_source_entries,
                 expected_source_preimage, archived_entries or [], entries,
@@ -17497,10 +17616,29 @@ class SessionStorage:
                     SessionContextState(**_deserialize_row(dict(row)))
                     for row in context_rows
                 ]
+                recovery_kwargs: dict[str, Any] = {}
+                if expected_context_fingerprint.startswith("canonical:"):
+                    try:
+                        boundary = int(expected_context_fingerprint.split(":", 2)[1])
+                    except (ValueError, IndexError):
+                        return False
+                    if boundary <= 0:
+                        return False
+                    # Recovery candidates are bound to archived bytes as well
+                    # as damaged checkpoint metadata. Reuse the canonical
+                    # reader on this transaction; ordinary commits do no read.
+                    canonical_rows = await self._fetch_canonical_transcript_rows(
+                        conn, node.session_id,
+                    )
+                    recovery_kwargs = {
+                        "canonical_entries": _decode_transcript_rows(canonical_rows),
+                        "canonical_boundary": boundary,
+                    }
                 if (
                     compaction_context_fingerprint(
                         context_states=current_context_states,
                         summaries=current_summaries,
+                        **recovery_kwargs,
                     )
                     != expected_context_fingerprint
                 ):

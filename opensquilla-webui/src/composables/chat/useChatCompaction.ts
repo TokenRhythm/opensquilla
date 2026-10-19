@@ -198,9 +198,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
 
   function compactFailureBlocksPending(payload: ChatCompactPayload): boolean {
     if (!payload) return false
-    if (payload.refused === true || payload.safe_to_send === false || payload.safeToSend === false) return true
-    const reason = String(payload.reason || payload.error_reason || payload.errorClass || payload.error_class || payload.error?.reason || payload.error?.code || '').toLowerCase()
-    return ['compaction_insufficient', 'context_overflow'].includes(reason)
+    // Refusing a summary does not prove that execution cannot use a local
+    // window. Only an explicit execution-safety verdict retains the queue.
+    return payload.safe_to_send === false || payload.safeToSend === false
   }
 
   function settleCompactInFlight(payload: ChatCompactPayload = {}, settleOptions: SettleCompactOptions = {}) {
@@ -308,8 +308,14 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (!status && Object.prototype.hasOwnProperty.call(payload, 'compacted')) {
       status = payload.compacted ? 'completed' : 'skipped'
     }
-    const source = String(payload.source || '').toLowerCase()
     const compactionId = payloadCompactionId(payload)
+    // Legacy terminal events may omit their source. Retain the source only
+    // for the same operation; never borrow it from an unrelated receipt.
+    const source = String(payload.source
+      || (compactionId && compactionId === compactStatus.value.compactionId ? compactStatus.value.source : '')
+      || (compactInFlight.value && (!compactionId || compactionId === activeCompactionId.value) ? 'manual' : '')
+      || '').toLowerCase()
+    const manualFailure = source === 'manual' || !source
     // Capture the active id before a terminal event settles it. Legacy id-less
     // lifecycles still get one stable slot per source.
     const placementKey = compactionId
@@ -438,11 +444,11 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       if (inActivity) return placement
       const reason = String(payload.reason || payload.skip_reason || payload.error_reason || '')
       const failure = compactionFailurePresentation(reason)
-      showCompactStatus('failed', i18n.global.t(failure.title), {
-        tone: failure.warning ? 'warn' : 'err',
+      showCompactStatus('failed', i18n.global.t(manualFailure ? failure.title : 'chat.compact.incomplete'), {
+        tone: !manualFailure ? 'info' : failure.warning ? 'warn' : 'err',
         httpStatus: payload.compactionFailure?.httpStatus,
         failureKind: payload.compactionFailure?.failureKind,
-        detail: source === 'manual' ? i18n.global.t(failure.detail) : '',
+        detail: manualFailure ? i18n.global.t(failure.detail) : '',
         source,
         compactionId,
         reason,
@@ -457,9 +463,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       })
       if (inActivity) return placement
       const failure = compactionFailurePresentation('timed_out')
-      showCompactStatus('timed_out', i18n.global.t(failure.title), {
-        tone: 'warn',
-        detail: source === 'manual' ? i18n.global.t(failure.detail) : '',
+      showCompactStatus('timed_out', i18n.global.t(manualFailure ? failure.title : 'chat.compact.incomplete'), {
+        tone: manualFailure ? 'warn' : 'info',
+        detail: manualFailure ? i18n.global.t(failure.detail) : '',
         source,
         compactionId,
         reason: 'compaction_deadline_exceeded',
@@ -480,10 +486,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
       showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.temporarilyReduced'), {
-        tone: 'warn',
-        detail: typeof payload.detail === 'string'
-          ? payload.detail
-          : i18n.global.t('chat.compact.requestScoped'),
+        tone: 'ok',
         source,
         compactionId,
         durability: 'request_scoped',

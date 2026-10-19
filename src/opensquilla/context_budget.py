@@ -15,6 +15,22 @@ LARGE_CONTEXT_MIN_RESULT_CHARS = 128_000
 LARGE_CONTEXT_MAX_RESULT_CHARS = 160_000
 
 
+def hard_input_tokens(context_window_tokens: int, generation_tokens: int) -> int:
+    """Physical input capacity before the final proof's single safety margin."""
+    return max(0, int(context_window_tokens) - max(0, int(generation_tokens)))
+
+
+def soft_input_tokens(context_window_tokens: int) -> int:
+    """Planning capacity; keep future-turn room without reserving a maximum output."""
+    window = max(0, int(context_window_tokens))
+    reserve = (
+        CONTEXT_RESERVE_FLOOR_TOKENS
+        if window >= LARGE_CONTEXT_MIN_TOKENS
+        else max(512, window // 8)
+    )
+    return max(0, window - reserve)
+
+
 class ContextBudgetClass(StrEnum):
     EXTERNAL = "external"
     LOCAL = "local"

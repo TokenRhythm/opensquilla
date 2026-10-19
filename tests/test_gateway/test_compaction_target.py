@@ -442,7 +442,12 @@ def test_manual_consumer_admission_reserves_the_next_authoritative_envelope() ->
     # This payload is below the adapter's raw cap, but durable history must
     # leave room for canonical system/tools plus the next user/media turn.
     assert budget.next_request_reserve_tokens >= 1024
-    assert admission("x" * 8_000, []) is False
+    checkpoint = "x" * 10_000
+    without_reserve, _ = build_gateway_consumer_admission(replace(
+        budget, next_request_reserve_tokens=0, next_request_reserve_chars=0,
+    ))
+    assert without_reserve(checkpoint, []) is True
+    assert admission(checkpoint, []) is False
 
 
 def test_manual_consumer_admission_fails_closed_without_projector() -> None:
@@ -481,7 +486,7 @@ def test_manual_consumer_uses_adapter_generation_cap_once_for_thinking() -> None
     # already includes reasoning and must not reserve another 10000 tokens.
     assert budget.max_output_tokens == 1024
     assert budget.generation_reserve_tokens == 14_096
-    assert budget.provider_request_max_chars == (64_000 - 20_000 - 14_096) * 4
+    assert budget.provider_request_max_chars == (64_000 - 14_096) * 4
     assert budget.provider_request_max_chars_explicit_cap == 0
     admission, _ = build_gateway_consumer_admission(budget)
     assert admission("synthetic complete checkpoint", []) is True
@@ -588,7 +593,7 @@ def test_gateway_summary_target_preserves_character_cap_provenance(explicit_cap:
     # An adapter that raises its generation allowance must be able to update
     # a derived character cap, while an operator's cap remains independent.
     final_cap = provider_request_character_budget({"max_tokens": 8_000}, chat_config)
-    assert final_cap == (explicit_cap or (32_000 - 4_000 - 8_000) * 4)
+    assert final_cap == (explicit_cap or (32_000 - 8_000) * 4)
 
 
 def _native_consumer_fixture(opaque: str = "synthetic-native-data"):

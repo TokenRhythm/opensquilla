@@ -65,6 +65,10 @@ def setup_case(monkeypatch, tmp_path, *, body_timeout=False):
             context_window_tokens=16_000, max_tokens=4096, max_provider_retries=0,
             max_overflow_retries=1, timeout=5.0, iteration_timeout=5.0,
             compaction_total_timeout_seconds=0.1,
+            # Keep character pressure explicit: dynamic output headroom may
+            # otherwise admit this fixture before the rebuild fault is reached.
+            provider_request_proof_max_chars=39_616,
+            provider_request_proof_max_chars_explicit=True,
         ),
     )
     history = [Message(role="user", content="Earlier question " + "q" * 20000),

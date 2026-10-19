@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from opensquilla.provider import ContentBlockCompaction
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
@@ -9,6 +11,7 @@ from opensquilla.session.context_view import (
     build_compaction_context_items,
     build_compaction_context_records,
     build_provider_compaction_context,
+    compaction_context_fingerprint,
     compaction_replay_is_complete,
     format_compaction_summary_context,
 )
@@ -303,7 +306,7 @@ def test_rolling_context_state_supersedes_older_checkpoint_chain() -> None:
     assert "obsolete summary fallback" not in rendered
 
 
-def test_invalid_replacement_state_preserves_prior_context_and_text_fallback() -> None:
+def test_invalid_replacement_state_uses_same_generation_without_reviving_old_context() -> None:
     older = SessionContextState(
         session_id="session",
         session_key="agent:main:ctx",
@@ -326,6 +329,7 @@ def test_invalid_replacement_state_preserves_prior_context_and_text_fallback() -
         payload={
             "schema_version": {"invalid": True},
             "current_status": "must not suppress fallbacks",
+            "compaction_id": "replacement",
             "source_coverage": {"replaces_prior_context": True},
         },
         covered_through_id=9,
@@ -337,6 +341,7 @@ def test_invalid_replacement_state_preserves_prior_context_and_text_fallback() -
         session_id="session",
         session_key="agent:main:ctx",
         summary_text="usable replacement text fallback",
+        compaction_id="replacement",
         covered_through_id=9,
     )
 
@@ -347,6 +352,97 @@ def test_invalid_replacement_state_preserves_prior_context_and_text_fallback() -
     )
 
     rendered = "\n".join(items)
-    assert "still usable prior checkpoint" in rendered
+    assert "still usable prior checkpoint" not in rendered
     assert "usable replacement text fallback" in rendered
     assert "must not suppress fallbacks" not in rendered
+
+
+@pytest.mark.parametrize("mismatch", ["compaction_id", "session_id", "session_key", "boundary"])
+def test_invalid_checkpoint_cannot_use_another_generation_as_fallback(mismatch) -> None:
+    state = SessionContextState(
+        session_id="session", session_key="agent:main:ctx", provider="portable",
+        state_kind="structured_summary_v1", portable=True, covered_through_id=9,
+        payload={
+            "compaction_id": "new", "known_failures": [{"count": 5}],
+            "source_coverage": {"replaces_prior_context": True},
+        },
+    )
+    summary = SessionSummary(
+        session_id="session", session_key="agent:main:ctx", compaction_id="new",
+        covered_through_id=9, summary_text="must not resurrect another task",
+    )
+    field = "covered_through_id" if mismatch == "boundary" else mismatch
+    summary = summary.model_copy(update={field: 8 if mismatch == "boundary" else "other"})
+    with pytest.raises(ValueError, match="compaction_checkpoint_unavailable"):
+        build_compaction_context_items(context_states=[state], summaries=[summary])
+
+
+def test_checkpoint_only_corruption_never_falls_back_to_same_boundary_older_task() -> None:
+    older = SessionContextState(
+        id=1, session_id="session", session_key="agent:main:ctx", provider="portable",
+        state_kind="structured_summary_v1", portable=True, covered_through_id=9,
+        created_at=1000,
+        payload={"compaction_id": "old", "current_status": "obsolete plan"},
+    )
+    newer = older.model_copy(update={
+        "id": 2,
+        "payload": {
+            "compaction_id": "new", "files_and_artifacts": [{"ref": {"handle": "bad"}}],
+            "source_coverage": {"replaces_prior_context": True},
+        },
+    })
+    summaries = [SessionSummary(
+        session_id="session", session_key="agent:main:ctx", covered_through_id=9,
+        compaction_id=generation, summary_text=text,
+    ) for generation, text in [("old", "obsolete plan"), ("new", "current task only")]]
+    records = build_compaction_context_records(context_states=[older, newer], summaries=summaries)
+    assert [(record.text, record.compaction_id) for record in records] == [
+        ("current task only", "new"),
+    ]
+
+
+def test_source_fingerprint_covers_metadata_even_when_rendered_text_is_identical() -> None:
+    state = SessionContextState(
+        session_id="session", session_key="agent:main:ctx", provider="portable",
+        state_kind="structured_summary_v1", portable=True, covered_through_id=9,
+        payload={
+            "compaction_id": "current", "current_status": "same text",
+            "source_coverage": {"replaces_prior_context": False},
+        },
+    )
+    replaced = state.model_copy(update={"payload": {
+        **state.payload, "source_coverage": {"replaces_prior_context": True},
+    }})
+    assert build_compaction_context_items(context_states=[state], summaries=[]) == (
+        build_compaction_context_items(context_states=[replaced], summaries=[])
+    )
+    assert compaction_context_fingerprint(context_states=[state], summaries=[]) != (
+        compaction_context_fingerprint(context_states=[replaced], summaries=[])
+    )
+
+
+@pytest.mark.parametrize("damaged_payload", [None, [], "broken"])
+def test_non_mapping_latest_checkpoint_cannot_silently_revive_prior_task(damaged_payload) -> None:
+    older = SessionContextState(
+        id=1, session_id="session", session_key="agent:main:ctx", provider="portable",
+        state_kind="structured_summary_v1", portable=True, covered_through_id=5,
+        created_at=1000, payload={"current_status": "obsolete task"},
+    )
+    damaged = older.model_copy(update={
+        "id": 2, "covered_through_id": 9, "created_at": 2000, "payload": damaged_payload,
+    })
+    with pytest.raises(ValueError, match="compaction_checkpoint_unavailable"):
+        build_compaction_context_items(context_states=[older, damaged], summaries=[])
+    # A later trusted replacement has already retired the corrupt record.
+    latest = older.model_copy(update={
+        "id": 3, "covered_through_id": 12, "created_at": 3000,
+        "payload": {
+            "current_status": "current task",
+            "source_coverage": {"replaces_prior_context": True},
+        },
+    })
+    rendered = "\n".join(build_compaction_context_items(
+        context_states=[older, damaged, latest], summaries=[],
+    ))
+    assert "current task" in rendered
+    assert "obsolete task" not in rendered

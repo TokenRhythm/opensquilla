@@ -216,7 +216,7 @@ describe('manual compaction with the real pending composer queue', () => {
         expect(await h.queue.enqueuePendingInput(h.inputText.value)).toBe(true)
         h.inputText.value = 'Still editing'
         expect(h.queue.pendingQueue.value).toHaveLength(1)
-        compact.showCompactionToast({ source: 'manual', status: 'failed', reason, compaction_id: 'cmp-draft' })
+        compact.showCompactionToast({ source: 'manual', status: 'failed', reason, refused: true, compaction_id: 'cmp-draft' })
         await nextTick()
         expect(compact.isCompactInFlightForCurrentSession()).toBe(false)
         await vi.waitFor(() => expect(h.queue.pendingQueue.value).toEqual([]))

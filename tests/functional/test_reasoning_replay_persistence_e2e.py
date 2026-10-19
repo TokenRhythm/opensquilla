@@ -566,25 +566,14 @@ async def test_native_window_pressure_uses_production_trigger_and_real_storage(
 
 
 @pytest.mark.asyncio
-async def test_native_pressure_accepts_two_complete_summary_chunks(tmp_path, monkeypatch):
+async def test_native_pressure_uses_one_bounded_summary(tmp_path, monkeypatch):
     from opensquilla.provider.model_catalog import DeploymentModelLimits, shared_catalog
-    from opensquilla.session import compaction
 
     monkeypatch.setattr(shared_catalog(), "resolve_deployment_limits", lambda *args, **kwargs:
                         DeploymentModelLimits(200000, 4096, True, True))
-    original = compaction._chunk_entries
-
-    def two_chunks(entries, budget, **kwargs):
-        chunks = original(entries, budget, **kwargs)
-        if len(chunks) == 1 and len(chunks[0]) >= 4:
-            cut = (len(chunks[0]) // 4) * 2
-            return [chunks[0][:cut], chunks[0][cut:]]
-        return chunks
-
-    monkeypatch.setattr(compaction, "_chunk_entries", two_chunks)
     await test_compaction_task_facts_use_both_layouts_and_real_storage(
         tmp_path, monkeypatch, "tokenrhythm", "suffix", "coding", native_window=200000,
-        expected_summary_calls=2,
+        expected_summary_calls=1,
     )
 
 

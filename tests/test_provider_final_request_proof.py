@@ -625,8 +625,7 @@ def test_physical_budget_projection_matches_sent_payload(
     generation = projection.payload.get(
         "max_completion_tokens", projection.payload.get("max_tokens"),
     )
-    reserve = 20_000 if window >= 64_000 else max(512, window // 8)
-    usable = max(0, window - generation - reserve)
+    usable = max(0, window - generation)
     assert projection.proof["effective_proof_token_budget"] == max(
         0, usable - min(4_096, max(128, usable // 10)),
     )
@@ -652,11 +651,11 @@ def test_anthropic_budget_reserves_adjusted_generation_once() -> None:
         ),
     )
     assert projection.payload["max_tokens"] == 9_096
-    assert projection.proof["effective_proof_token_budget"] == 17_014
+    assert projection.proof["effective_proof_token_budget"] == 20_614
     assert projection.fits
 
 
-def test_generation_reserve_cannot_be_silently_halved(monkeypatch: Any) -> None:
+def test_generation_adjustment_does_not_fake_fit_with_no_useful_output(monkeypatch: Any) -> None:
     requests: list[httpx.Request] = []
     client = httpx.AsyncClient
 
@@ -669,8 +668,9 @@ def test_generation_reserve_cannot_be_silently_halved(monkeypatch: Any) -> None:
         lambda **kwargs: client(**{**kwargs, "transport": httpx.MockTransport(handler)}),
     )
     provider = OpenAIProvider(api_key="test", model="gpt-test")
-    config = ChatConfig(max_tokens=8_192, provider_context_window_tokens=8_192)
-    messages = [Message(role="user", content="Continue.")]
+    _use_deterministic_token_estimator(monkeypatch)
+    config = ChatConfig(max_tokens=32_000, provider_context_window_tokens=32_000)
+    messages = [Message(role="user", content="x" * 124_000)]
     projection = provider.project_final_request(messages, config=config)
     assert not projection.fits
     assert projection.proof["effective_proof_token_budget"] == 0
