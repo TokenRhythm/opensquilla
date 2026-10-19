@@ -90,6 +90,15 @@ console.log('Browser gesture, text, related-tab and file request contracts passe
 
 // Examples advertised to the model must pass the same parser as actual calls.
 const batchTool = browserToolDefinitions.find(tool => tool.name === 'browser_batch')
+const actionGuidance = batchTool.inputSchema.properties.actions.items.properties.action.description
+assert.ok(typeof actionGuidance === 'string' && actionGuidance.length > 0 && actionGuidance.length <= 512,
+  'The reported action-order field must supply bounded recovery guidance')
+assert.equal(browserToolDefinitions.find(tool => tool.name === 'browser_act')
+  .inputSchema.properties.action.description, undefined)
+const orderedActions = [{ action: 'fill', ref: 'e1', text: 'synthetic-value' }, { action: 'click', ref: 'e2' }]
+assert.deepEqual(parseDesktopBrowserRequest({ ...target, operation: 'batch', actions: orderedActions }).actions,
+  orderedActions)
+rejected(() => parseDesktopBrowserRequest({ ...target, operation: 'batch', actions: [...orderedActions].reverse() }))
 for (const form of ['DOM', 'Coordinate']) {
   const example = batchTool.description.match(new RegExp(`${form} drag example: (\\{.*?\\})\\.`))
   assert.ok(example, `${form} drag must have a complete argument example`)

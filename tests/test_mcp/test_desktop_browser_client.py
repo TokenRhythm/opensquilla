@@ -774,6 +774,11 @@ async def test_contract_argument_diagnostics_are_safe_and_not_replayed(
         ("targetRef", "required", "present", "Supply targetRef at the argument root."),
         ("actions", "range", "within_bounds", "Use one to three actions."),
         ("actions.0", "unknown_field", "known_fields", "Keep targetRef outside actions."),
+        (
+            "actions.0.action", "order", "field_update_before_final",
+            "Only field updates may precede the final action; "
+            "split other actions into separate calls.",
+        ),
         ("actions.0.endRef", "conflict", "exclusive_fields", "Omit endRef for coordinates."),
         ("actions.0.observationId", "required", "present", "Copy the viewed observation ID."),
     ],
@@ -785,6 +790,7 @@ async def test_argument_recovery_uses_advertised_field_guidance(
     schema["properties"]["targetRef"] = {"type": "string"}
     item = schema["properties"]["actions"]["items"]
     item["properties"].update({
+        "action": {"type": "string"},
         "endRef": {"type": "string"}, "observationId": {"type": "string"},
     })
     node = schema

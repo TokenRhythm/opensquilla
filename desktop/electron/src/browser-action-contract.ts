@@ -241,7 +241,10 @@ export function parseBrowserArguments(value: unknown): Omit<DesktopBrowserReques
 function fieldSchema(field: Field, batch = false): JsonObject {
   const { characters, ...shape } = fields[field] as FieldDefinition
   const schema = { ...shape, ...(characters ? { pattern: characters === 'identity' ? '^[^\\u0000-\\u001f\\u007f]*$' : '^[^\\u0000]*$' } : {}) }
-  if (field === 'action' && batch) return { ...schema, enum: batchActionNames }
+  if (field === 'action' && batch) return {
+    ...schema, enum: batchActionNames,
+    description: `Only ${batchPredecessors.join('/')} may precede the final action. Put other actions last and split multiple such actions into separate calls.`,
+  }
   if (field === 'actions') return { ...schema, items: {
     ...objectSchema(batchFields, ['action'], true),
     description: 'One action object. targetRef belongs at the argument root, outside actions. Choose DOM refs or image coordinates with observationId/imageId; do not mix the two forms.',
