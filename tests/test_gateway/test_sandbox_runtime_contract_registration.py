@@ -160,8 +160,14 @@ def test_production_registry_uses_contract_wrappers_without_surface_drift() -> N
     registry = get_dispatcher()
 
     # V2 recovery, video discovery, message search, five interactive terminal
-    # methods and side create/close add fifteen to the previous 269-method surface.
-    assert len(registry.list_methods()) == 284
+    # methods, side create/close and workspace creation add sixteen to the
+    # previous 269-method surface.
+    assert len(registry.list_methods()) == 285
+    workspace_entry = registry.get_entry("workspaces.create")
+    assert workspace_entry is not None
+    assert workspace_entry.required_scope == "operator.write"
+    assert workspace_entry.generated_contract_name == "workspaces.create"
+    assert workspace_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     for method in (
         "terminal.create", "terminal.write", "terminal.resize", "terminal.close",
         "terminal.consume",

@@ -2864,6 +2864,8 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
             assert outcomes["outside_after_standard"] is False
             assert [operation.kind for operation in native_operations] == ["write_text"]
 
+            # The ordinary Full turn uses the configured default workspace.
+            (tmp_path / "default-workspace").mkdir()
             full_completed = asyncio.Event()
 
             class FullRunner:

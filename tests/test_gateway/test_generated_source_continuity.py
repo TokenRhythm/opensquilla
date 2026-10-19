@@ -669,6 +669,10 @@ async def test_restore_recovers_exact_version_collection_settings(
     env.source = nested / "index.html"
     env.style = nested / "style.css"
     (site / "owned.txt").write_text("directory resource")
+    if "none" in (before, after):
+        # Single-file delivery must be self-contained; this test exercises
+        # restoring the collection boundary, including directory-only members.
+        env.source.write_text('<!doctype html><style>h1{color:navy}</style><h1>First</h1>')
 
     def arguments(mode):
         result = {"path": "site/nested/index.html", "bundle": mode}
@@ -923,6 +927,11 @@ async def test_source_publication_retains_original_mime_and_collection_scope(
     env = source_environment
     env.source.rename(env.workspace / name)
     env.source = env.workspace / name
+    if mime == "text/plain":
+        # Exercise HTML sniffing without changing the caller-declared MIME.
+        env.source.write_text("<!doctype html><html><body><h1>First</h1></body></html>")
+    elif mode == "none":
+        env.source.write_text('<html xmlns="http://www.w3.org/1999/xhtml"><h1>First</h1></html>')
     await _publish(env.context, env.adopter, path=name, mime=mime, bundle=mode)
     binding = await _binding(env)
     assert binding.entry == env.source

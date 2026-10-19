@@ -178,6 +178,8 @@ def test_tool_context_appends_new_runtime_fields_after_ordinary_fields() -> None
         "explicitly_allowed_tools",
         "sandboxed_workspace_authoring",
         "process_event_emitter",
+        "memory_notes_dir",
+        "bootstrap_source_dir",
     ]
 
     assert ToolContext().skill_install_turn is None
@@ -190,6 +192,8 @@ def test_tool_context_appends_new_runtime_fields_after_ordinary_fields() -> None
     assert ToolContext().explicitly_allowed_tools == set()
     assert ToolContext().sandboxed_workspace_authoring is None
     assert ToolContext().process_event_emitter is None
+    assert ToolContext().memory_notes_dir is None
+    assert ToolContext().bootstrap_source_dir is None
 
 
 def test_tool_context_preserves_workspace_authoring_positional_constructor() -> None:

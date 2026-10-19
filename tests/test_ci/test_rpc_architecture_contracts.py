@@ -133,7 +133,7 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
 # Add video-generation model discovery without changing existing method names.
-RUNTIME_RPC_METHOD_BASELINE = 284
+RUNTIME_RPC_METHOD_BASELINE = 285
 RUNTIME_RPC_METHOD_DIGEST = "29b0b13c082534442371c559806c483c45d16be045f132a304fc328a6512f9ca"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
@@ -1417,21 +1417,24 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         "terminal.consume",
     }
     sidechat_methods = {"sessions.sidechat.create", "sessions.sidechat.close"}
+    workspace_methods = {"workspaces.create"}
     assert terminal_methods.issubset(methods)
     assert sidechat_methods.issubset(methods)
+    assert workspace_methods.issubset(methods)
     consume_entry = registry.get_entry("terminal.consume")
     assert consume_entry is not None
     assert consume_entry.required_scope == "operator.write"
     assert len(methods) == RUNTIME_RPC_METHOD_BASELINE
     assert len(methods) == len(set(methods))
-    # The terminal and sidechat slices are intentionally additive to the frozen
+    # The terminal, sidechat and workspace creation methods add to the frozen
     # legacy inventory. Keep the historical digest meaningful while pinning
     # new methods explicitly above.
-    legacy_methods = set(methods) - terminal_methods - sidechat_methods
+    legacy_methods = set(methods) - terminal_methods - sidechat_methods - workspace_methods
     digest = hashlib.sha256(("\n".join(sorted(legacy_methods)) + "\n").encode()).hexdigest()
     assert digest == RUNTIME_RPC_METHOD_DIGEST
 
     for method, scope in (
+        ("workspaces.create", "operator.write"),
         ("sessions.messages.search", "operator.read"),
         ("sessions.processes.list", "operator.read"),
         ("sessions.processes.log", "operator.read"),
