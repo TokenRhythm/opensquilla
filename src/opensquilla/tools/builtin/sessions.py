@@ -709,6 +709,8 @@ async def sessions_spawn(
         child_origin: dict[str, object] = {
             "kind": "subagent",
             "parent_session_key": parent_session_key,
+            "parent_session_id": parent_owner[0] if parent_owner is not None else None,
+            "parent_session_epoch": parent_owner[1] if parent_owner is not None else None,
             "parent_task_id": parent_task_id,
             "task_id": subagent_run_id,
             "task": task,

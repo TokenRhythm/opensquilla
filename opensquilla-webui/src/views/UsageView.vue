@@ -4,7 +4,7 @@
       <div class="usage-stage__title-block control-stage__title-block">
         <h1 class="usage-stage__title control-stage__title">{{ t('usageLogs.usage.title') }}</h1>
         <p class="usage-stage__subtitle control-stage__subtitle">{{ t('usageLogs.usage.subtitle') }}</p>
-        <small class="usage-range-notice" aria-live="polite">{{ rangeHiddenHint }}</small>
+        <small v-if="rangeHiddenHint" class="usage-range-notice" aria-live="polite">{{ rangeHiddenHint }}</small>
       </div>
       <div
         class="usage-stage__actions control-stage__actions mobile-action-strip"
@@ -39,8 +39,6 @@
       :total-tokens="totalTokensDisplay"
       :token-parts="tokensBreakdownParts"
       :total-cost="totalCostDisplay"
-      :cost-hint-text="costHintText"
-      :cost-hint-title="costHintTitle"
       :session-count="sessionCountDisplay"
       :avg-cost="avgCostDisplay"
     />
@@ -58,9 +56,6 @@
       :model-cards="modelCards"
       :models-meta="modelsMeta"
       :fmt-cost="fmtCost"
-      :cost-source-classes-for-model-card="costSourceClassesForModelCard"
-      :cost-source-label-for-model-card="costSourceLabelForModelCard"
-      :cost-source-tooltip-for-model-card="costSourceTooltipForModelCard"
     />
 
     <div v-if="usageLoading && sortedRows.length === 0" class="state">
@@ -79,14 +74,10 @@
       :sessions-meta="sessionsMeta"
       :expanded-sessions="expandedSessions"
       :fmt-cost="fmtCost"
-      :cost-source-label="costSourceLabel"
-      :cost-source-tooltip="costSourceTooltip"
-      :cost-source-classes="costSourceClasses"
       :cost-source-classes-for-breakdown="costSourceClassesForBreakdown"
       :cost-source-label-for-breakdown="costSourceLabelForBreakdown"
       :cost-source-tooltip-for-breakdown="costSourceTooltipForBreakdown"
       :model-display-label="modelDisplayLabel"
-      :row-key="rowKey"
       :row-breakdown="rowBreakdown"
       :row-breakdown-total-tokens="rowBreakdownTotalTokens"
       :row-breakdown-total-cost="rowBreakdownTotalCost"
@@ -135,8 +126,6 @@ const {
   totalTokensDisplay,
   tokensBreakdownParts,
   totalCostDisplay,
-  costHintText,
-  costHintTitle,
   sessionCountDisplay,
   avgCostDisplay,
   chartCaption,
@@ -153,17 +142,10 @@ const {
   loadData,
   exportCsv,
   fmtCost,
-  costSourceLabel,
-  costSourceTooltip,
-  costSourceClasses,
   costSourceClassesForBreakdown,
   costSourceLabelForBreakdown,
   costSourceTooltipForBreakdown,
-  costSourceClassesForModelCard,
-  costSourceLabelForModelCard,
-  costSourceTooltipForModelCard,
   modelDisplayLabel,
-  rowKey,
   rowBreakdown,
   rowBreakdownTotalTokens,
   rowBreakdownTotalCost,
@@ -624,10 +606,11 @@ async function refresh() {
 }
 .usage-expand__row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 120px 80px 80px 100px;
+  grid-template-columns: minmax(160px, 1fr) 104px minmax(180px, 240px) 88px 72px;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
+  min-height: 40px;
+  padding: 8px 12px;
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -646,6 +629,8 @@ async function refresh() {
 .usage-expand__share {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
   gap: 6px;
 }
 .usage-expand__share-track {
@@ -663,14 +648,28 @@ async function refresh() {
 }
 .usage-expand__share-pct {
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   color: var(--text-dim);
-  min-width: 36px;
+  flex: 0 0 44px;
   text-align: right;
 }
 .usage-expand__tokens,
 .usage-expand__cost {
+  min-width: 0;
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   text-align: right;
+  line-height: 1.5;
+}
+.usage-expand__cost {
+  white-space: nowrap;
+}
+.usage-expand__cost--unpriced {
+  color: var(--text-muted);
+}
+.usage-expand__source {
+  text-align: right;
+  white-space: nowrap;
 }
 .usage-expand__metric-label {
   display: none;
@@ -704,10 +703,6 @@ async function refresh() {
 .usage-source--mixed {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
   color: var(--accent);
-}
-.usage-source--unavailable {
-  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
-  color: var(--danger);
 }
 .usage-source--ephemeral {
   opacity: 0.7;
@@ -780,6 +775,12 @@ async function refresh() {
     min-width: 0;
     overflow-wrap: anywhere;
     white-space: normal;
+  }
+  .usage-expand__source {
+    text-align: left;
+  }
+  .usage-expand__source:empty {
+    display: none;
   }
   .usage-expand__share {
     display: none;

@@ -69,6 +69,7 @@ class ImageGenerationRequest:
         default=None,
         repr=False,
     )
+    max_output_tokens: int | None = None
 
 
 @dataclass
@@ -212,6 +213,7 @@ class OpenAIImageGenerationProvider:
             provider=self.provider_id,
             model=request.model,
             base_url=self._base_url,
+            operation_kind="image_generation",
         )
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
@@ -426,12 +428,17 @@ class OpenRouterImageGenerationProvider:
             "stream": False,
             "image_config": self._image_config_for_size(request.size),
         }
+        if request.max_output_tokens is not None:
+            if type(request.max_output_tokens) is not int or request.max_output_tokens <= 0:
+                raise ValueError("max_output_tokens must be a positive integer")
+            payload["max_tokens"] = request.max_output_tokens
         from opensquilla.engine.usage_http import reserve_direct_usage_call
 
         usage = await reserve_direct_usage_call(
             provider=self.provider_id,
             model=request.model,
             base_url=self._base_url,
+            operation_kind="image_generation",
         )
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
@@ -602,6 +609,7 @@ class TokenRhythmImageGenerationProvider:
             provider=self.provider_id,
             model=request.model,
             base_url=self._base_url,
+            operation_kind="image_generation",
         )
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
@@ -830,6 +838,7 @@ class QwenTokenPlanImageGenerationProvider:
             provider=self.provider_id,
             model=request.model,
             base_url=self._base_url,
+            operation_kind="image_generation",
         )
         try:
             async with httpx.AsyncClient(

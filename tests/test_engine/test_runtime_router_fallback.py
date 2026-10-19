@@ -637,3 +637,53 @@ async def test_router_readiness_skips_nonrouting_pipeline_inputs(monkeypatch, in
     runner = TurnRunner(provider_selector=None, config=config)
     await runner._run_pipeline("hello", session_key, _Provider(), None, [], "system", [])
     assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_fails", [False, True])
+async def test_pipeline_budget_refresh_awaits_exact_owner_and_preserves_known_spend(refresh_fails):
+    from unittest.mock import AsyncMock
+
+    cached = SimpleNamespace(
+        session_id="reserved-owner",
+        epoch=7,
+        billed_cost_usd=2.0,
+        total_cost_usd=2.0,
+        estimated_cost_usd=0.0,
+        cost_source="provider_billed",
+    )
+    refreshed = SimpleNamespace(**(vars(cached) | {"billed_cost_usd": 3.0, "total_cost_usd": 3.0}))
+    reconcile = AsyncMock(
+        return_value=refreshed,
+        side_effect=OSError("temporary fixture failure") if refresh_fails else None,
+    )
+    manager = SimpleNamespace(
+        get_session=AsyncMock(return_value=cached),
+        storage=SimpleNamespace(reconcile_session_usage_totals_from_ledger=reconcile),
+    )
+    runner = TurnRunner(
+        provider_selector=None,
+        session_manager=manager,
+        config=GatewayConfig(
+            squilla_router={
+                "enabled": False,
+                "budget": {"action": "cap", "limit_usd": 1.0},
+            }
+        ),
+    )
+    turn, _ = await runner._run_pipeline(
+        "hello",
+        "agent:main:budget-refresh",
+        _Provider(),
+        None,
+        [],
+        "system",
+        [],
+    )
+    reconcile.assert_awaited_once_with(
+        session_key="agent:main:budget-refresh",
+        expected_session_id="reserved-owner",
+        expected_epoch=7,
+    )
+    assert turn.metadata["session_billed_cost_usd"] == (2.0 if refresh_fails else 3.0)
+    assert turn.metadata["session_total_cost_usd"] == (2.0 if refresh_fails else 3.0)

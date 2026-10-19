@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from opensquilla.search.registry import register_provider
 from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import SearchErrorKind, SearchProviderError, SearchResult
+from opensquilla.usage_request import accounted_request
 
 _DDHTML_URL = "https://html.duckduckgo.com/html"
 _HEADERS = {
@@ -57,8 +58,13 @@ class DuckDuckGoProvider:
                 trust_env=self._trust_env,
                 transport=self._transport,
             ) as client:
-                response = await client.post(
+                response = await accounted_request(
+                    client,
+                    "POST",
                     _DDHTML_URL,
+                    provider=self.name,
+                    operation="web_search",
+                    base_url="https://html.duckduckgo.com",
                     data={"q": query, "b": "", "kl": ""},
                     headers=_HEADERS,
                 )

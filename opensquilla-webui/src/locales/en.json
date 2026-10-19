@@ -3655,6 +3655,45 @@
     "bundleDifferentGateway": "Open the connected Gateway's own WebUI to download its support bundle."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Unknown",
+      "partialMeter": "{value} · {count} unknown",
+      "metrics": {
+        "input_tokens": "Input tokens",
+        "output_tokens": "Output tokens",
+        "cache_read_tokens": "Cache read tokens",
+        "cache_write_tokens": "Cache write tokens",
+        "input_images": "Input images",
+        "input_video_seconds": "Input video duration",
+        "output_audio_seconds": "Output audio duration",
+        "requested_audio_seconds": "Requested audio duration",
+        "requests": "Requests",
+        "output_images": "Output images",
+        "input_audio_seconds": "Input audio",
+        "input_characters": "Input characters",
+        "requested_video_seconds": "Requested video duration",
+        "video_seconds": "Generated video duration",
+        "search_credits": "Search credits",
+        "scrape_credits": "Extraction credits",
+        "character_credits": "Character credits",
+        "cost_in_usd_ticks": "Provider cost units",
+        "input_text_tokens": "Input text tokens",
+        "output_text_tokens": "Output text tokens",
+        "input_audio_tokens": "Input audio tokens",
+        "output_audio_tokens": "Output audio tokens",
+        "input_image_tokens": "Input image tokens",
+        "output_image_tokens": "Output image tokens"
+      },
+      "units": {
+        "request": "requests",
+        "image": "images",
+        "second": "seconds",
+        "character": "characters",
+        "credit": "credits",
+        "token": "tokens",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Untitled task"
     },
@@ -3684,10 +3723,6 @@
       "cacheRead": "Cache R",
       "cacheWrite": "Cache W"
     },
-    "costHintTitle": "CNY values use baked-in rate {rate}. Verify against current FX for accounting use.",
-    "nativeCostHintTitle": "The original provider bill is in CNY; USD uses the fixed normalization rate recorded on the receipt.",
-    "nativeMixedCostHintTitle": "Mixed-currency or pending billing stays in canonical USD; original confirmed receipts are shown separately.",
-    "nativeBillingSubtotals": "Original receipts: {amounts}",
     "rangeHiddenHint": "{count} undated historical tasks hidden",
     "coverage": {
       "approximate": "Some historical usage is estimated from task totals.",
@@ -3745,10 +3780,10 @@
       "cacheRead": "Cache R",
       "cacheWrite": "Cache W",
       "cost": "Cost",
-      "source": "Source",
       "model": "Model"
     },
     "breakdown": {
+      "callTitle": "Call details",
       "title": "Model breakdown",
       "modelCount": "{count} models",
       "total": "{tokens} tokens · {cost}",
@@ -3757,35 +3792,28 @@
     "costSource": {
       "actual": {
         "label": "Actual",
-        "tooltip": "Actual — cost billed by the provider",
-        "short": "actual"
+        "tooltip": "Actual — cost billed by the provider"
       },
       "estimated": {
         "label": "Estimated",
-        "tooltip": "Estimated — derived locally from token counts",
-        "short": "estimated"
+        "tooltip": "Estimated — provider quote or a recorded local price"
       },
       "mixed": {
         "label": "Mixed",
-        "tooltip": "Mixed — partial billing data, rest estimated",
-        "short": "mixed"
+        "tooltip": "Mixed — partial billing data, rest estimated"
       },
       "unpriced": {
         "label": "Unpriced",
-        "tooltip": "Unpriced — no pricing table entry for this model",
-        "short": "unpriced"
+        "tooltip": "Unpriced — no pricing table entry for this model"
       },
       "none": {
-        "label": "None",
-        "tooltip": "No cost recorded",
-        "short": "none"
+        "label": "No cost recorded",
+        "tooltip": "No cost recorded"
       },
       "ephemeral": {
         "label": "Ephemeral",
-        "tooltip": "Ephemeral session — cost not yet persisted",
-        "short": "ephemeral"
-      },
-      "cacheBlindHint": "Includes estimates that price cached tokens at the full input rate — treat as an upper bound."
+        "tooltip": "Ephemeral session — cost not yet persisted"
+      }
     },
     "relTime": {
       "justNow": "just now",

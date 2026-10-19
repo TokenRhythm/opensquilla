@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import hmac
 import io
 import json
 import os
 import re
-import secrets
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
@@ -138,8 +136,6 @@ _video_gateway_config: Any | None = None
 _video_job_sessions: dict[str, _VideoJobReceipt] = {}
 _video_job_sessions_lock = threading.Lock()
 _MAX_TRACKED_VIDEO_JOBS = 1024
-_VIDEO_JOB_FINGERPRINT_SALT = secrets.token_bytes(32)
-_VIDEO_JOB_FINGERPRINT_ITERATIONS = 600_000
 
 
 @dataclass(frozen=True)
@@ -1287,17 +1283,50 @@ async def _video_result_payload(result: Any, *, max_bytes: int, source: str) -> 
 
 
 def _video_credential_fingerprint(api_key: str) -> str:
-    """Bind token identity to this process without retaining the token itself."""
+    """Bind token identity across restarts without retaining the token itself."""
+    from opensquilla.provider.media_jobs import credential_fingerprint
 
-    # The random salt stays private to this process. A KDF also protects weaker
-    # operator-authored credentials if a receipt fingerprint is exposed.
-    return hashlib.pbkdf2_hmac(
-        "sha256",
-        api_key.encode("utf-8"),
-        _VIDEO_JOB_FINGERPRINT_SALT,
-        _VIDEO_JOB_FINGERPRINT_ITERATIONS,
-        dklen=32,
-    ).hex()
+    return credential_fingerprint(api_key)
+
+
+def _persist_video_receipt(handle: str, receipt: _VideoJobReceipt) -> None:
+    from dataclasses import asdict
+
+    from opensquilla.provider.media_jobs import job_record
+
+    result = asdict(receipt.completed_result) if receipt.completed_result is not None else None
+    if result is not None:
+        result["output_path"] = str(result["output_path"])
+    job_record(
+        "handles",
+        handle,
+        {
+            "session_key": receipt.session_key,
+            "credential_fingerprint": receipt.credential_fingerprint,
+            "provider": receipt.provider,
+            "model": receipt.model,
+            "base_url": receipt.base_url,
+            "native_job_id": receipt.native_job_id,
+            "credential_env": receipt.credential_env,
+            "completed_result": result,
+            "completed_payload": receipt.completed_payload,
+        },
+    )
+
+
+def _restore_video_receipts() -> None:
+    from opensquilla.provider.media_jobs import job_records
+    from opensquilla.provider.video_generation import VideoGenerationResult
+
+    for handle, value in job_records("handles").items():
+        if handle in _video_job_sessions:
+            continue
+        value = dict(value)
+        if value.get("completed_result") is not None:
+            result = dict(value["completed_result"])
+            result["output_path"] = Path(result["output_path"])
+            value["completed_result"] = VideoGenerationResult(**result)
+        _video_job_sessions[handle] = _VideoJobReceipt(**value)
 
 
 def _remember_video_job(
@@ -1332,12 +1361,14 @@ def _remember_video_job(
         status_lock=status_lock if status_lock is not None else asyncio.Lock(),
     )
     with _video_job_sessions_lock:
+        _restore_video_receipts()
         existing = _video_job_sessions.get(job_id)
         handle = job_id
         if existing is not None:
             while handle in _video_job_sessions:
                 handle = f"vjob-{uuid.uuid4().hex}"
         _video_job_sessions[handle] = receipt
+        _persist_video_receipt(handle, receipt)
         if len(_video_job_sessions) > _MAX_TRACKED_VIDEO_JOBS:
             del _video_job_sessions[next(iter(_video_job_sessions))]
     return handle
@@ -1345,6 +1376,7 @@ def _remember_video_job(
 
 def _video_job_receipt(job_id: str) -> _VideoJobReceipt | None:
     with _video_job_sessions_lock:
+        _restore_video_receipts()
         return _video_job_sessions.get(job_id)
 
 
@@ -1362,6 +1394,7 @@ def _remember_video_completion(job_id: str, result: Any, payload: str | None = N
                 completed_result=result,
                 completed_payload=completed_payload,
             )
+            _persist_video_receipt(job_id, _video_job_sessions[job_id])
 
 
 async def _complete_video_delivery(
@@ -1401,6 +1434,8 @@ async def _complete_video_delivery(
 def video_status_available(ctx: ToolContext | None = None) -> bool:
     """Keep recovery visible for a caller with a retained accepted job."""
 
+    with _video_job_sessions_lock:
+        _restore_video_receipts()
     if ctx is None:
         with _video_job_sessions_lock:
             return bool(_video_job_sessions)
@@ -1757,6 +1792,20 @@ async def video_status(job_id: str, filename: str | None = None) -> str:
     status_lock = receipt.status_lock if receipt is not None else asyncio.Lock()
     async with status_lock:
         receipt = _video_job_receipt(safe_job_id)
+        if receipt is not None and provider == "tokenrhythm" and (
+            receipt.completed_payload is not None or receipt.completed_result is not None
+        ):
+            from opensquilla.provider.tokenrhythm_video_generation import (
+                refresh_tokenrhythm_video_billing,
+            )
+
+            try:
+                await refresh_tokenrhythm_video_billing(
+                    base_url=base_url, api_key=credential.api_key, job_id=native_job_id
+                )
+            except VideoGenerationError:
+                # Delivery remains usable when a later billing GET is unavailable.
+                pass
         if receipt is not None and receipt.completed_payload is not None:
             return receipt.completed_payload
         if receipt is not None and receipt.completed_result is not None:

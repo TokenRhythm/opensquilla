@@ -36,6 +36,12 @@ from opensquilla.session.usage_ledger import (
     UsageEventStart,
     UsageItemBillingReceipt,
 )
+from opensquilla.usage_metering import (
+    UsageItemMetering,
+    UsageMeter,
+    UsagePriceSnapshot,
+    UsageSettlementRevision,
+)
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 log = structlog.get_logger(__name__)
@@ -219,6 +225,12 @@ def _reconciled_items(
             estimate_basis=result.estimate_basis,
             price_source=result.price_source,
             billing_receipt=billing_receipt,
+            # Inconsistent adapter items cannot lend an authoritative valuation
+            # to this defensive envelope-only projection.
+            meters=(),
+            price_snapshot=None,
+            settlement=None,
+            token_usage_known=all(item.token_usage_known for item in items),
         ),
     )
 
@@ -272,7 +284,7 @@ class SessionUsageEventSink:
         attempt = 0
         while True:
             try:
-                await self._storage.start_usage_event(record)
+                await self._storage.start_usage_event(record, preserve_session_epoch=True)
                 return
             except StorageBusyError as exc:
                 if attempt >= len(self._start_retry_delays):
@@ -326,10 +338,19 @@ class SessionUsageEventSink:
             for value in reconciled
             if (receipt := _receipt(call.event_id, value)) is not None
         )
+        metering = {
+            value.ordinal: UsageItemMetering(
+                value.meters, value.price_snapshot, value.settlement, value.token_usage_known
+            )
+            for value in reconciled
+            if value.meters or value.price_snapshot is not None or value.settlement is not None
+        }
         try:
             kwargs: dict[str, Any] = {"items": items}
             if receipts:
                 kwargs["receipts"] = receipts
+            if metering and hasattr(self._storage, "append_usage_settlement"):
+                kwargs["metering"] = metering
             record = await self._storage.finalize_usage_event(call.event_id, completion, **kwargs)
             await self._notify_goal_usage(record)
         except Exception:
@@ -339,16 +360,35 @@ class SessionUsageEventSink:
             # still replace unknown with its exact receipt later.
             with contextlib.suppress(Exception):
                 record = await self._storage.mark_usage_event_unknown(
-                    call.event_id, completed_at_ms=completion.completed_at_ms,
+                    call.event_id,
+                    completed_at_ms=completion.completed_at_ms,
                     reason="usage_unknown",
                 )
                 await self._notify_goal_usage(record)
             self._schedule_retry(
-                self._retry_finalize(call.event_id, completion, items, receipts),
+                self._retry_finalize(call.event_id, completion, items, receipts, metering),
                 event_id=call.event_id,
                 operation="finalize",
             )
             raise
+
+    async def revise(
+        self,
+        call: UsageCallStart,
+        revision: UsageSettlementRevision,
+        *,
+        ordinal: int = 0,
+        meters: tuple[UsageMeter, ...] = (),
+        price_snapshot: UsagePriceSnapshot | None = None,
+    ) -> dict[str, Any]:
+        """Replace the valuation of the original physical item, never its identity."""
+        result = await self._storage.append_usage_settlement(
+            call.event_id, ordinal, revision, meters=meters, price_snapshot=price_snapshot
+        )
+        from types import SimpleNamespace
+
+        await self._notify_goal_usage(SimpleNamespace(**result))
+        return result
 
     async def mark_unknown(self, call: UsageCallStart, reason: str) -> None:
         completed_at_ms = max(call.started_at_ms, time.time_ns() // 1_000_000)
@@ -400,6 +440,7 @@ class SessionUsageEventSink:
         completion: UsageEventCompletion,
         items: tuple[UsageEventItem, ...],
         receipts: tuple[UsageItemBillingReceipt, ...],
+        metering: dict[int, UsageItemMetering] | None = None,
     ) -> None:
         for delay in self._retry_delays:
             await asyncio.sleep(delay)
@@ -407,6 +448,8 @@ class SessionUsageEventSink:
                 kwargs: dict[str, Any] = {"items": items}
                 if receipts:
                     kwargs["receipts"] = receipts
+                if metering and hasattr(self._storage, "append_usage_settlement"):
+                    kwargs["metering"] = metering
                 record = await self._storage.finalize_usage_event(event_id, completion, **kwargs)
                 await self._notify_goal_usage(record)
                 return

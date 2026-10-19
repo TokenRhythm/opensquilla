@@ -1,4 +1,5 @@
 import { serializeNativeBilling } from './nativeBilling'
+import { usageTaskRows } from './usageTaskRows'
 import type { UsageSession, UsageSnapshot } from '@/types/usage'
 
 const DEFAULT_CNY_RATE = 7.25
@@ -47,6 +48,8 @@ export function buildUsageCsv(
     snapshot?.timezone || '',
   ]
   const totals = snapshot?.totals
+  const taskRows = snapshot?.taskGroups !== undefined
+  const exportedRows = taskRows ? usageTaskRows(snapshot) : visibleRows
   const summary = [
     'summary',
     ...common,
@@ -72,12 +75,12 @@ export function buildUsageCsv(
     snapshot?.coverage.nativeBilling.missingConfirmedReceiptCount ?? '',
     snapshot?.coverage.nativeBilling.pendingReceiptCount ?? '',
   ]
-  const rows = visibleRows.map(row => {
+  const rows = exportedRows.map(row => {
     const costUsd = row.costUsd
     return [
-      'session',
+      taskRows ? 'task' : 'session',
       ...common,
-      row.session || row.sessionKey,
+      taskRows ? row.title || row.session || row.sessionKey : row.session || row.sessionKey,
       row.inputTokens ?? '',
       row.outputTokens ?? '',
       row.cacheReadTokens ?? '',
@@ -100,6 +103,24 @@ export function buildUsageCsv(
       snapshot?.coverage.nativeBilling.pendingReceiptCount ?? '',
     ]
   })
+  // Keep legacy CSV columns byte-compatible. New accounting projections are
+  // audit payloads, not additional monetary rows to accidentally sum twice.
+  if (snapshot?.taskGroups !== undefined || snapshot?.capabilities !== undefined) {
+    headers.push('task_group_id', 'session_id', 'session_epoch', 'parent_session_id',
+      'parent_session_epoch', 'attribution_status', 'task_groups_json', 'capabilities_json',
+      'meters_json', 'settlement_summary_json', 'attribution_coverage_json', 'cost_usd_exact', 'task_count')
+    summary.push('', '', '', '', '', snapshot.coverage.attribution?.status || '',
+      JSON.stringify(snapshot.taskGroups || []), JSON.stringify(snapshot.capabilities || []),
+      JSON.stringify(snapshot.meters || []), JSON.stringify(snapshot.settlementSummary || {}),
+      JSON.stringify(snapshot.coverage.attribution || {}), snapshot.totals.costUsdExact || '',
+      taskRows ? snapshot.totals.taskCount ?? snapshot.taskGroups?.length ?? 0 : '')
+    rows.forEach((row, index) => {
+      const session = exportedRows[index]
+      row.push(session.taskGroupId || '', session.sessionId, session.sessionEpoch ?? '',
+        session.parentSessionId || '', session.parentSessionEpoch ?? '', session.attributionStatus || '',
+        '', '', '', '', '', session.costUsdExact || '', taskRows ? 1 : '')
+    })
+  }
   return [headers, summary, ...rows]
     .map(row => row.map(item => '"' + String(item).replace(/"/g, '""') + '"').join(','))
     .join('\n')

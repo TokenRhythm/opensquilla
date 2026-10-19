@@ -10486,10 +10486,27 @@ class TurnRunner:
             and getattr(budget_cfg, "limit_usd", None)
             and self._session_manager is not None
         ):
+            budget_session = None
             try:
                 budget_session = await self._session_manager.get_session(session_key)
+                reconcile_usage = getattr(
+                    getattr(self._session_manager, "storage", None),
+                    "reconcile_session_usage_totals_from_ledger",
+                    None,
+                )
+                if budget_session is not None and callable(reconcile_usage):
+                    budget_session = (
+                        await reconcile_usage(
+                            session_key=session_key,
+                            expected_session_id=budget_session.session_id,
+                            expected_epoch=budget_session.epoch,
+                        )
+                        or budget_session
+                    )
             except Exception:  # noqa: BLE001 - budget seeding must never break a turn
-                budget_session = None
+                # A failed refresh must not erase spend already read from the
+                # exact session generation's compatibility cache.
+                pass
             if budget_session is not None:
                 initial_metadata["session_billed_cost_usd"] = float(
                     getattr(budget_session, "billed_cost_usd", 0.0) or 0.0

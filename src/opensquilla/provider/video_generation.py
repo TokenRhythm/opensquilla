@@ -11,6 +11,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -22,6 +23,7 @@ from opensquilla.provider.error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
+from opensquilla.provider.media_jobs import accounted_video_submission, observe_video_job
 from opensquilla.provider.video_generation_policy import is_valid_video_generation_base_url
 from opensquilla.secrets import clean_header_secret
 
@@ -252,6 +254,24 @@ async def read_video_json(
         raise VideoGenerationError(f"{label} endpoint returned invalid JSON") from None
     if not isinstance(result, dict):
         raise VideoGenerationError(f"{label} endpoint returned invalid JSON")
+    # Preserve monetary JSON numbers before float conversion can round them.
+    # Keep all ordinary metadata at its historical JSON types for callers.
+    exact = json.loads(body, parse_float=Decimal)
+    for key in ("cost_cny", "billing"):
+        if key in exact:
+            result[key] = exact[key]
+    if isinstance(result.get("usage"), dict) and isinstance(exact.get("usage"), dict):
+        for key in ("cost", "total_cost", "cost_in_usd_ticks"):
+            if key in exact["usage"]:
+                result["usage"][key] = exact["usage"][key]
+    if isinstance(result.get("data"), list) and isinstance(exact.get("data"), list):
+        for row, exact_row in zip(result["data"], exact["data"], strict=True):
+            if (
+                isinstance(row, dict)
+                and isinstance(exact_row, dict)
+                and "pricing_skus" in exact_row
+            ):
+                row["pricing_skus"] = exact_row["pricing_skus"]
     return result
 
 
@@ -329,6 +349,11 @@ async def _validate_model_options(
     entries = payload.get("data")
     if not isinstance(entries, list):
         raise VideoGenerationError("OpenRouter video model catalog is malformed")
+    from opensquilla.provider.media_pricing import register_media_catalog
+
+    register_media_catalog(
+        "openrouter", entries, base_url=api_root, source_url=f"{api_root}/videos/models"
+    )
     entry = next(
         (item for item in entries if isinstance(item, dict) and item.get("id") == model),
         None,
@@ -376,6 +401,7 @@ async def _validate_model_options(
     return selected_duration
 
 
+@accounted_video_submission("openrouter")
 async def _submit(
     client: httpx.AsyncClient,
     *,
@@ -488,6 +514,14 @@ async def _poll_until_complete(
         if status == "completed":
             return payload
         if status in {"failed", "cancelled", "expired"}:
+            await observe_video_job(
+                "openrouter",
+                polling_url.rsplit("/videos/", 1)[0],
+                job_id,
+                payload,
+                api_key=api_key,
+                outcome="failed",
+            )
             reason = _error_text(payload.get("error"), api_key=api_key)
             raise VideoGenerationError(f"Video job {job_id} {status}: {reason}", job_id=job_id)
         if status not in {"pending", "in_progress"}:
@@ -627,6 +661,7 @@ async def _complete_job(
         poll_interval_seconds=poll_interval_seconds,
         initial=initial,
     )
+    await observe_video_job("openrouter", api_root, job_id, completed, api_key=api_key)
     bytes_written = await _download(
         client,
         api_root=api_root,

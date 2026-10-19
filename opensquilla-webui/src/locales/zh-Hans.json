@@ -3654,6 +3654,45 @@
     "bundleDifferentGateway": "请在当前连接的 Gateway 自己提供的 WebUI 中下载支持包。"
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "未知",
+      "partialMeter": "{value} · {count} 项未知",
+      "metrics": {
+        "input_tokens": "输入词元",
+        "output_tokens": "输出词元",
+        "cache_read_tokens": "缓存读取词元",
+        "cache_write_tokens": "缓存写入词元",
+        "input_images": "输入图片",
+        "input_video_seconds": "输入视频时长",
+        "output_audio_seconds": "输出音频时长",
+        "requested_audio_seconds": "请求音频时长",
+        "requests": "请求次数",
+        "output_images": "输出图片",
+        "input_audio_seconds": "输入音频时长",
+        "input_characters": "输入字符",
+        "requested_video_seconds": "请求视频时长",
+        "video_seconds": "生成视频时长",
+        "search_credits": "搜索积分",
+        "scrape_credits": "网页提取积分",
+        "character_credits": "字符积分",
+        "cost_in_usd_ticks": "供应商费用单位",
+        "input_text_tokens": "输入文本词元",
+        "output_text_tokens": "输出文本词元",
+        "input_audio_tokens": "输入音频词元",
+        "output_audio_tokens": "输出音频词元",
+        "input_image_tokens": "输入图片词元",
+        "output_image_tokens": "输出图片词元"
+      },
+      "units": {
+        "request": "次",
+        "image": "张",
+        "second": "秒",
+        "character": "字符",
+        "credit": "积分",
+        "token": "词元",
+        "usd_tick_1e_10": "美元 × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "未命名任务"
     },
@@ -3683,10 +3722,6 @@
       "cacheRead": "缓存读",
       "cacheWrite": "缓存写"
     },
-    "costHintTitle": "人民币金额使用内置汇率 {rate}。用于记账时请核对当前汇率。",
-    "nativeCostHintTitle": "原始服务商账单为人民币；美元金额按收据所载固定归一化汇率折算。",
-    "nativeMixedCostHintTitle": "混合币种或待结算账单继续使用规范化美元汇总，并单独展示已确认的原生币种收据。",
-    "nativeBillingSubtotals": "原始账单小计：{amounts}",
     "rangeHiddenHint": "已隐藏 {count} 条无日期的历史任务记录",
     "coverage": {
       "approximate": "部分历史用量按任务累计值估算。",
@@ -3744,10 +3779,10 @@
       "cacheRead": "缓存读",
       "cacheWrite": "缓存写",
       "cost": "成本",
-      "source": "来源",
       "model": "模型"
     },
     "breakdown": {
+      "callTitle": "调用明细",
       "title": "模型明细",
       "modelCount": "{count} 个模型",
       "total": "{tokens} Token · {cost}",
@@ -3756,35 +3791,28 @@
     "costSource": {
       "actual": {
         "label": "实际",
-        "tooltip": "实际 — 由服务商计费的成本",
-        "short": "实际"
+        "tooltip": "实际 — 由服务商计费的成本"
       },
       "estimated": {
         "label": "估算",
-        "tooltip": "估算 — 本地根据 Token 数推算",
-        "short": "估算"
+        "tooltip": "估算 — 采用供应商报价或已记录的本地价格"
       },
       "mixed": {
         "label": "混合",
-        "tooltip": "混合 — 部分为计费数据，其余为估算",
-        "short": "混合"
+        "tooltip": "混合 — 部分为计费数据，其余为估算"
       },
       "unpriced": {
         "label": "无定价",
-        "tooltip": "无定价 — 该模型没有定价表条目",
-        "short": "无定价"
+        "tooltip": "无定价 — 该模型没有定价表条目"
       },
       "none": {
-        "label": "无",
-        "tooltip": "未记录成本",
-        "short": "无"
+        "label": "未记录费用",
+        "tooltip": "未记录成本"
       },
       "ephemeral": {
         "label": "临时",
-        "tooltip": "临时会话 — 成本尚未持久化",
-        "short": "临时"
-      },
-      "cacheBlindHint": "包含按全价输入费率计价缓存令牌的估算 — 视为上限。"
+        "tooltip": "临时会话 — 成本尚未持久化"
+      }
     },
     "relTime": {
       "justNow": "刚刚",

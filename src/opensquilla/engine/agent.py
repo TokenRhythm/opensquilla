@@ -728,6 +728,11 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     ),
                 )
             )
+        if (
+            (item.get("cost_source") or item.get("costSource")) == "unavailable"
+            and (item.get("estimate_basis") or item.get("estimateBasis")) != "free"
+        ):
+            item["missing_cost_entries"] = max(1, _usage_int(item.get("missing_cost_entries")))
         enriched.append(item)
     return enriched
 
@@ -13177,14 +13182,20 @@ class Agent:
         )
         from opensquilla.engine.pricing import estimate_cost, resolve_model_price
 
-        turn_estimate = estimate_cost(
-            input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens,
-            cache_read_tokens=total_cached_tokens,
-            cache_write_tokens=total_cache_write_tokens,
-            price=resolve_model_price(done_model, done_provider).entry,
+        resolved_turn_price = resolve_model_price(done_model, done_provider)
+        turn_estimate = (
+            estimate_cost(
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_read_tokens=total_cached_tokens,
+                cache_write_tokens=total_cache_write_tokens,
+                price=resolved_turn_price.entry,
+            )
+            if resolved_turn_price.has_accounting_price
+            else None
         )
-        estimated_cost = turn_estimate.cost_usd
+        estimated_cost = turn_estimate.cost_usd if turn_estimate is not None else 0.0
+        turn_estimate_basis = turn_estimate.basis if turn_estimate is not None else None
         estimate_basis: str | None
         if total_provider_billed_entries and not total_unbilled_entries:
             done_cost = total_billed_cost
@@ -13196,11 +13207,11 @@ class Agent:
             # even when its confirmed amount is zero.
             done_cost = total_billed_cost
             cost_source = "mixed"
-            estimate_basis = turn_estimate.basis
+            estimate_basis = turn_estimate_basis
         elif estimated_cost > 0.0:
             done_cost = estimated_cost
             cost_source = "opensquilla_static_estimate"
-            estimate_basis = turn_estimate.basis
+            estimate_basis = turn_estimate_basis
         else:
             done_cost = 0.0
             cost_source = "unavailable"
@@ -13210,7 +13221,23 @@ class Agent:
                 or total_cached_tokens
                 or total_cache_write_tokens
             )
-            estimate_basis = "free" if turn_estimate.basis == "free" and has_turn_tokens else None
+            estimate_basis = "free" if turn_estimate_basis == "free" and has_turn_tokens else None
+
+        if turn_model_usage_breakdown:
+            previous_missing = sum(
+                _usage_int(row.get("missing_cost_entries")) for row in turn_model_usage_breakdown
+            )
+            priced_rows = _with_model_usage_cost_fields(turn_model_usage_breakdown)
+            total_missing_cost_entries += max(
+                0,
+                sum(_usage_int(row.get("missing_cost_entries")) for row in priced_rows)
+                - previous_missing,
+            )
+            # Preserve each physical call's price evidence for the final model
+            # rollup; a billed sibling cannot hide an unpriced request.
+            turn_model_usage_breakdown = [
+                {**row, "_opensquilla_reported_cost": True} for row in priced_rows
+            ]
 
         error_usage_report_rows: list[dict[str, Any]] = []
         if turn_has_error_usage_receipt and turn_model_usage_breakdown:
@@ -13255,7 +13282,7 @@ class Agent:
             elif cost_source in {"mixed", "opensquilla_estimate"}:
                 # The delta includes an estimated component; disclose the
                 # turn-level estimator basis for it.
-                estimate_basis = turn_estimate.basis
+                estimate_basis = turn_estimate_basis
             elif estimate_basis != "free":
                 # "unavailable": no estimated dollars in the reported cost.
                 estimate_basis = None

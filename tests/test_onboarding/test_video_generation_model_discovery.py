@@ -125,6 +125,41 @@ async def test_tokenrhythm_video_discovery_uses_only_fixed_public_endpoint(monke
 
 
 @pytest.mark.asyncio
+async def test_tokenrhythm_video_discovery_preserves_exact_catalog_price(monkeypatch) -> None:
+    from opensquilla.provider import media_pricing
+
+    monkeypatch.setattr(media_pricing, "_FEEDS", {})
+    original_client = httpx.AsyncClient
+    raw = (
+        b'{"data":[{"id":"exact-video","status":"online","type":"video",'
+        b'"videoPricing":{"pricingScheme":"wan_total_seconds",'
+        b'"outputPerSecondCny":{"720P":0.123456789012345678},'
+        b'"inputVideoPerSecondCny":{"720P":0},'
+        b'"inputImagePerImageCny":0,"inputAudioPerSecondCny":0}}]}'
+    )
+    monkeypatch.setattr(
+        discovery.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, content=raw)),
+            **kwargs,
+        ),
+    )
+    result = await discovery.discover_video_generation_models("tokenrhythm")
+    snapshot = media_pricing.resolve_media_price(
+        "tokenrhythm",
+        "exact-video",
+        "video_generation",
+        "https://tokenrhythm.studio/v1",
+        {"resolution": "720p"},
+    )
+    assert result["models"][0]["id"] == "exact-video"
+    assert snapshot is not None
+    output = next(rule for rule in snapshot.rules if rule.metric == "video_seconds")
+    assert output.amount == "0.123456789012345678"
+
+
+@pytest.mark.asyncio
 async def test_tokenrhythm_documented_model_is_not_mislabeled_as_live(monkeypatch) -> None:
     async def no_live_models() -> list[dict[str, Any]]:
         return []

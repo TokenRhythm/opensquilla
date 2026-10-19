@@ -1062,6 +1062,54 @@ def test_tokenrhythm_single_done_reconciles_native_receipt_and_all_token_buckets
     assert result.billed_cost_nanos == sum(row.billed_cost_nanos for row in result.items)
 
 
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic", "tokenrhythm"])
+@pytest.mark.parametrize("stale_source", ["free", "opensquilla_estimate"])
+def test_unpriced_usage_does_not_trust_stale_estimate_labels(monkeypatch, provider, stale_source):
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    result = normalize_provider_usage(
+        ProviderDone(input_tokens=10, output_tokens=2, cost_source=stale_source),
+        default_provider=provider,
+        default_model="fixture-unpriced-model",
+        completed_at_ms=1234,
+    )
+    [item] = result.items
+    assert result.cost_source == "unavailable"
+    assert result.estimate_basis is None and result.estimated_cost_nanos == 0
+    assert item.price_snapshot is None
+    assert item.settlement.authority == "unknown" and item.settlement.native_amount is None
+
+
+@pytest.mark.parametrize("native_receipt", [True, False])
+def test_confirmed_bill_precedes_supplied_estimate(monkeypatch, native_receipt):
+    from opensquilla.usage_metering import UsageSettlementRevision
+
+    def unexpected_price(*args, **kwargs):
+        pytest.fail("confirmed provider bill must not resolve a fallback price")
+
+    monkeypatch.setattr("opensquilla.engine.usage_accounting.resolve_model_price", unexpected_price)
+    result = normalize_provider_usage(
+        SimpleNamespace(
+            input_tokens=10,
+            output_tokens=2,
+            billed_cost=0.000002,
+            cost_source="provider_billed",
+            billing_receipt=_tokenrhythm_receipt(usd_nanos=2_000) if native_receipt else None,
+            settlement=UsageSettlementRevision(
+                "initial", "local_estimate", "final", native_amount="1", usd_amount="1"
+            ),
+        ),
+        default_provider="tokenrhythm",
+        default_model="fixture-unpriced-model",
+        completed_at_ms=1234,
+    )
+    [item] = result.items
+    assert result.cost_source == "provider_billed"
+    assert result.billed_cost_nanos == 2_000 and result.estimated_cost_nanos == 0
+    assert item.price_snapshot is None
+    assert item.settlement.authority == "provider_confirmed"
+    assert item.settlement.currency == ("CNY" if native_receipt else "USD")
+
+
 def test_tokenrhythm_inline_router_c0_c3_reconciles_each_physical_request() -> None:
     preset = get_preset("tokenrhythm")
     assert preset is not None

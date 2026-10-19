@@ -12,6 +12,7 @@ import httpx
 
 from opensquilla.env import trust_env
 from opensquilla.provider.error_redaction import redact_upstream_error_text, redacted_httpx_error
+from opensquilla.provider.media_jobs import accounted_video_submission, observe_video_job
 from opensquilla.provider.video_generation import (
     VideoGenerationError,
     VideoGenerationPending,
@@ -100,6 +101,7 @@ def _validate_request(
     return duration if duration is not None else 5
 
 
+@accounted_video_submission("qwen")
 async def _submit(
     client: httpx.AsyncClient,
     *,
@@ -111,6 +113,7 @@ async def _submit(
     aspect_ratio: str,
     resolution: str,
     deadline: float,
+    provider: str,
     on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> str:
     parameters: dict[str, object] = {"duration": duration}
@@ -178,6 +181,7 @@ async def _poll_until_complete(
     job_id: str,
     deadline: float,
     poll_interval_seconds: float,
+    provider: str,
 ) -> str:
     while True:
         try:
@@ -220,11 +224,15 @@ async def _poll_until_complete(
             )
         status = output.get("task_status")
         if status == "SUCCEEDED":
+            await observe_video_job(provider, api_root, job_id, payload, api_key=api_key)
             video_url = output.get("video_url")
             if not isinstance(video_url, str) or not video_url:
                 raise VideoGenerationPending("DashScope video has no download URL", job_id=job_id)
             return video_url
         if status in {"FAILED", "CANCELED", "UNKNOWN"}:
+            await observe_video_job(
+                provider, api_root, job_id, payload, api_key=api_key, outcome="failed"
+            )
             reason = payload.get("message")
             safe_reason = (
                 redact_upstream_error_text(reason, api_key=api_key)
@@ -263,6 +271,7 @@ async def _complete_job(
         job_id=job_id,
         deadline=deadline,
         poll_interval_seconds=poll_interval_seconds,
+        provider=provider,
     )
     bytes_written = await download_video_url(
         url=url,
@@ -329,6 +338,7 @@ async def generate_qwen_video(
             aspect_ratio=aspect_ratio or "16:9",
             resolution=resolution or "720p",
             deadline=deadline,
+            provider=provider,
             on_job_accepted=on_job_accepted,
         )
         return await _complete_job(

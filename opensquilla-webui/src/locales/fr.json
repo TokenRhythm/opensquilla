@@ -3554,6 +3554,45 @@
     "bundleDifferentGateway": "Ouvrez la WebUI de la Gateway connectée pour télécharger son dossier de diagnostic."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Inconnu",
+      "partialMeter": "{value} · {count} inconnus",
+      "metrics": {
+        "input_tokens": "Jetons d’entrée",
+        "output_tokens": "Jetons de sortie",
+        "cache_read_tokens": "Jetons lus en cache",
+        "cache_write_tokens": "Jetons écrits en cache",
+        "input_images": "Images d’entrée",
+        "input_video_seconds": "Durée de la vidéo d’entrée",
+        "output_audio_seconds": "Durée de l’audio de sortie",
+        "requested_audio_seconds": "Durée audio demandée",
+        "requests": "Requêtes",
+        "output_images": "Images produites",
+        "input_audio_seconds": "Audio entrant",
+        "input_characters": "Caractères entrants",
+        "requested_video_seconds": "Durée vidéo demandée",
+        "video_seconds": "Durée vidéo produite",
+        "search_credits": "Crédits de recherche",
+        "scrape_credits": "Crédits d’extraction",
+        "character_credits": "Crédits de caractères",
+        "cost_in_usd_ticks": "Unités de coût du fournisseur",
+        "input_text_tokens": "Jetons de texte entrants",
+        "output_text_tokens": "Jetons de texte sortants",
+        "input_audio_tokens": "Jetons audio entrants",
+        "output_audio_tokens": "Jetons audio sortants",
+        "input_image_tokens": "Jetons d’image entrants",
+        "output_image_tokens": "Jetons d’image sortants"
+      },
+      "units": {
+        "request": "requêtes",
+        "image": "images",
+        "second": "secondes",
+        "character": "caractères",
+        "credit": "crédits",
+        "token": "jetons",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Tâche sans titre"
     },
@@ -3583,10 +3622,6 @@
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache"
     },
-    "costHintTitle": "Les valeurs en CNY utilisent le taux intégré {rate}. Vérifiez par rapport au taux de change actuel pour un usage comptable.",
-    "nativeCostHintTitle": "La facture d’origine du fournisseur est en CNY ; la valeur USD utilise le taux fixe enregistré sur le reçu.",
-    "nativeMixedCostHintTitle": "La facturation multidevise ou en attente reste en USD canonique ; les reçus d’origine confirmés sont affichés séparément.",
-    "nativeBillingSubtotals": "Reçus d’origine : {amounts}",
     "rangeHiddenHint": "{count} tâches historiques sans date masquées",
     "coverage": {
       "approximate": "Une partie de l’usage historique est estimée à partir des totaux par tâche.",
@@ -3644,10 +3679,10 @@
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache",
       "cost": "Coût",
-      "source": "Source",
       "model": "Modèle"
     },
     "breakdown": {
+      "callTitle": "Détails des appels",
       "title": "Répartition par modèle",
       "modelCount": "{count} modèles",
       "total": "{tokens} jetons · {cost}",
@@ -3656,35 +3691,28 @@
     "costSource": {
       "actual": {
         "label": "Réel",
-        "tooltip": "Réel — coût facturé par le fournisseur",
-        "short": "réel"
+        "tooltip": "Réel — coût facturé par le fournisseur"
       },
       "estimated": {
         "label": "Estimé",
-        "tooltip": "Estimé — dérivé localement à partir du nombre de jetons",
-        "short": "estimé"
+        "tooltip": "Estimation — devis du fournisseur ou tarif local enregistré"
       },
       "mixed": {
         "label": "Mixte",
-        "tooltip": "Mixte — données de facturation partielles, le reste estimé",
-        "short": "mixte"
+        "tooltip": "Mixte — données de facturation partielles, le reste estimé"
       },
       "unpriced": {
         "label": "Sans tarif",
-        "tooltip": "Sans tarif — aucune entrée de table de tarification pour ce modèle",
-        "short": "sans tarif"
+        "tooltip": "Sans tarif — aucune entrée de table de tarification pour ce modèle"
       },
       "none": {
-        "label": "Aucun",
-        "tooltip": "Aucun coût enregistré",
-        "short": "aucun"
+        "label": "Coût non enregistré",
+        "tooltip": "Aucun coût enregistré"
       },
       "ephemeral": {
         "label": "Éphémère",
-        "tooltip": "Session éphémère — coût pas encore persisté",
-        "short": "éphémère"
-      },
-      "cacheBlindHint": "Inclut des estimations qui tarifient les jetons en cache au tarif d'entrée plein — à considérer comme un plafond."
+        "tooltip": "Session éphémère — coût pas encore persisté"
+      }
     },
     "relTime": {
       "justNow": "à l'instant",

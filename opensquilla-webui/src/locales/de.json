@@ -3554,6 +3554,45 @@
     "bundleDifferentGateway": "Öffnen Sie die eigene WebUI des verbundenen Gateways, um dessen Support-Paket herunterzuladen."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Unbekannt",
+      "partialMeter": "{value} · {count} unbekannt",
+      "metrics": {
+        "input_tokens": "Eingabe-Token",
+        "output_tokens": "Ausgabe-Token",
+        "cache_read_tokens": "Cache-Lese-Token",
+        "cache_write_tokens": "Cache-Schreib-Token",
+        "input_images": "Eingabebilder",
+        "input_video_seconds": "Dauer des Eingabevideos",
+        "output_audio_seconds": "Dauer der Audioausgabe",
+        "requested_audio_seconds": "Angeforderte Audiodauer",
+        "requests": "Anfragen",
+        "output_images": "Ausgabebilder",
+        "input_audio_seconds": "Eingabeaudio",
+        "input_characters": "Eingabezeichen",
+        "requested_video_seconds": "Angeforderte Videodauer",
+        "video_seconds": "Erzeugte Videodauer",
+        "search_credits": "Suchguthaben",
+        "scrape_credits": "Extraktionsguthaben",
+        "character_credits": "Zeichenguthaben",
+        "cost_in_usd_ticks": "Kostenpunkte des Anbieters",
+        "input_text_tokens": "Eingabetext-Token",
+        "output_text_tokens": "Ausgabetext-Token",
+        "input_audio_tokens": "Eingabeaudio-Token",
+        "output_audio_tokens": "Ausgabeaudio-Token",
+        "input_image_tokens": "Eingabebild-Token",
+        "output_image_tokens": "Ausgabebild-Token"
+      },
+      "units": {
+        "request": "Anfragen",
+        "image": "Bilder",
+        "second": "Sekunden",
+        "character": "Zeichen",
+        "credit": "Guthabenpunkte",
+        "token": "Token",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Unbenannte Aufgabe"
     },
@@ -3583,10 +3622,6 @@
       "cacheRead": "Cache L",
       "cacheWrite": "Cache S"
     },
-    "costHintTitle": "CNY-Werte verwenden den festen Kurs {rate}. Für buchhalterische Zwecke mit dem aktuellen Wechselkurs abgleichen.",
-    "nativeCostHintTitle": "Die ursprüngliche Anbieterrechnung ist in CNY; USD verwendet den auf dem Beleg gespeicherten festen Normierungskurs.",
-    "nativeMixedCostHintTitle": "Gemischte Währungen oder ausstehende Abrechnungen bleiben in kanonischen USD; bestätigte Originalbelege werden separat angezeigt.",
-    "nativeBillingSubtotals": "Originalbelege: {amounts}",
     "rangeHiddenHint": "{count} undatierte historische Aufgaben ausgeblendet",
     "coverage": {
       "approximate": "Einige historische Werte werden aus Aufgabensummen geschätzt.",
@@ -3644,10 +3679,10 @@
       "cacheRead": "Cache L",
       "cacheWrite": "Cache S",
       "cost": "Kosten",
-      "source": "Quelle",
       "model": "Modell"
     },
     "breakdown": {
+      "callTitle": "Aufrufdetails",
       "title": "Modellaufschlüsselung",
       "modelCount": "{count} Modelle",
       "total": "{tokens} Tokens · {cost}",
@@ -3656,35 +3691,28 @@
     "costSource": {
       "actual": {
         "label": "Tatsächlich",
-        "tooltip": "Tatsächlich — vom Anbieter abgerechnete Kosten",
-        "short": "tatsächlich"
+        "tooltip": "Tatsächlich — vom Anbieter abgerechnete Kosten"
       },
       "estimated": {
         "label": "Geschätzt",
-        "tooltip": "Geschätzt — lokal aus Token-Zahlen abgeleitet",
-        "short": "geschätzt"
+        "tooltip": "Geschätzt — Anbieterangebot oder aufgezeichneter lokaler Preis"
       },
       "mixed": {
         "label": "Gemischt",
-        "tooltip": "Gemischt — teilweise Abrechnungsdaten, Rest geschätzt",
-        "short": "gemischt"
+        "tooltip": "Gemischt — teilweise Abrechnungsdaten, Rest geschätzt"
       },
       "unpriced": {
         "label": "Ohne Preis",
-        "tooltip": "Ohne Preis — kein Eintrag in der Preistabelle für dieses Modell",
-        "short": "ohne Preis"
+        "tooltip": "Ohne Preis — kein Eintrag in der Preistabelle für dieses Modell"
       },
       "none": {
-        "label": "Keine",
-        "tooltip": "Keine Kosten erfasst",
-        "short": "keine"
+        "label": "Keine Kosten erfasst",
+        "tooltip": "Keine Kosten erfasst"
       },
       "ephemeral": {
         "label": "Flüchtig",
-        "tooltip": "Flüchtige Sitzung — Kosten noch nicht persistiert",
-        "short": "flüchtig"
-      },
-      "cacheBlindHint": "Enthält Schätzungen, die zwischengespeicherte Tokens zum vollen Eingabepreis bewerten — als Obergrenze zu verstehen."
+        "tooltip": "Flüchtige Sitzung — Kosten noch nicht persistiert"
+      }
     },
     "relTime": {
       "justNow": "gerade eben",

@@ -1820,8 +1820,9 @@ def _billing_result(
             if usage.billed_cost_present
             else None
         )
-        # Keep OpenRouter's historical positive-only billed-cost contract.
-        if amount is not None and amount > 0:
+        # A present, valid zero is a confirmed receipt (e.g. a free model).
+        # Missing and malformed cost fields must still remain unconfirmed.
+        if amount is not None and amount >= 0:
             amount_nanos = _money_to_nanos(amount)
             if amount_nanos is None:
                 return 0.0, "none", None

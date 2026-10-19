@@ -3554,6 +3554,45 @@
     "bundleDifferentGateway": "Abra la WebUI del Gateway conectado para descargar su paquete de soporte."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Desconocido",
+      "partialMeter": "{value} · {count} desconocidos",
+      "metrics": {
+        "input_tokens": "Tokens de entrada",
+        "output_tokens": "Tokens de salida",
+        "cache_read_tokens": "Tokens leídos de caché",
+        "cache_write_tokens": "Tokens escritos en caché",
+        "input_images": "Imágenes de entrada",
+        "input_video_seconds": "Duración del vídeo de entrada",
+        "output_audio_seconds": "Duración del audio de salida",
+        "requested_audio_seconds": "Duración de audio solicitada",
+        "requests": "Solicitudes",
+        "output_images": "Imágenes generadas",
+        "input_audio_seconds": "Audio de entrada",
+        "input_characters": "Caracteres de entrada",
+        "requested_video_seconds": "Duración de vídeo solicitada",
+        "video_seconds": "Duración de vídeo generada",
+        "search_credits": "Créditos de búsqueda",
+        "scrape_credits": "Créditos de extracción",
+        "character_credits": "Créditos de caracteres",
+        "cost_in_usd_ticks": "Unidades de coste del proveedor",
+        "input_text_tokens": "Tokens de texto de entrada",
+        "output_text_tokens": "Tokens de texto de salida",
+        "input_audio_tokens": "Tokens de audio de entrada",
+        "output_audio_tokens": "Tokens de audio de salida",
+        "input_image_tokens": "Tokens de imagen de entrada",
+        "output_image_tokens": "Tokens de imagen de salida"
+      },
+      "units": {
+        "request": "solicitudes",
+        "image": "imágenes",
+        "second": "segundos",
+        "character": "caracteres",
+        "credit": "créditos",
+        "token": "tokens",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Tarea sin título"
     },
@@ -3583,10 +3622,6 @@
       "cacheRead": "Lectura de caché",
       "cacheWrite": "Escritura de caché"
     },
-    "costHintTitle": "Los valores en CNY usan la tasa fija integrada {rate}. Verifícala con el tipo de cambio actual para uso contable.",
-    "nativeCostHintTitle": "La factura original del proveedor está en CNY; el valor USD usa la tasa fija registrada en el recibo.",
-    "nativeMixedCostHintTitle": "La facturación en monedas mixtas o pendiente permanece en USD canónicos; los recibos originales confirmados se muestran por separado.",
-    "nativeBillingSubtotals": "Recibos originales: {amounts}",
     "rangeHiddenHint": "{count} tareas históricas sin fecha ocultas",
     "coverage": {
       "approximate": "Parte del uso histórico se estima a partir de los totales por tarea.",
@@ -3644,10 +3679,10 @@
       "cacheRead": "Lectura de caché",
       "cacheWrite": "Escritura de caché",
       "cost": "Coste",
-      "source": "Origen",
       "model": "Modelo"
     },
     "breakdown": {
+      "callTitle": "Detalles de llamadas",
       "title": "Desglose por modelo",
       "modelCount": "{count} modelos",
       "total": "{tokens} tokens · {cost}",
@@ -3656,35 +3691,28 @@
     "costSource": {
       "actual": {
         "label": "Real",
-        "tooltip": "Real: coste facturado por el proveedor",
-        "short": "real"
+        "tooltip": "Real: coste facturado por el proveedor"
       },
       "estimated": {
         "label": "Estimado",
-        "tooltip": "Estimado: derivado localmente a partir de los recuentos de tokens",
-        "short": "estimado"
+        "tooltip": "Estimación — cotización del proveedor o precio local registrado"
       },
       "mixed": {
         "label": "Mixto",
-        "tooltip": "Mixto: datos de facturación parciales, el resto estimado",
-        "short": "mixto"
+        "tooltip": "Mixto: datos de facturación parciales, el resto estimado"
       },
       "unpriced": {
         "label": "Sin precio",
-        "tooltip": "Sin precio: no hay entrada en la tabla de precios para este modelo",
-        "short": "sin precio"
+        "tooltip": "Sin precio: no hay entrada en la tabla de precios para este modelo"
       },
       "none": {
-        "label": "Ninguno",
-        "tooltip": "No se registró ningún coste",
-        "short": "ninguno"
+        "label": "Coste no registrado",
+        "tooltip": "No se registró ningún coste"
       },
       "ephemeral": {
         "label": "Efímera",
-        "tooltip": "Sesión efímera: el coste aún no se ha persistido",
-        "short": "efímera"
-      },
-      "cacheBlindHint": "Incluye estimaciones que valoran los tokens en caché a la tarifa de entrada completa — considérelo un límite superior."
+        "tooltip": "Sesión efímera: el coste aún no se ha persistido"
+      }
     },
     "relTime": {
       "justNow": "ahora mismo",

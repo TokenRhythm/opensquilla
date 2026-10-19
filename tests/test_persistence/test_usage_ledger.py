@@ -263,7 +263,10 @@ async def test_initialize_cutover_is_set_based_and_repairs_legacy_components(
             for statement in traced
             if "INSERT INTO usage_legacy_baselines" in statement
         ]
-        assert len(baseline_inserts) == 1
+        # SQLite repeats a statement in its trace callback while executing
+        # each accounting-revision row trigger. It is still one set-based SQL.
+        assert len(set(baseline_inserts)) == 1
+        assert "FROM ranked" in baseline_inserts[0]
     finally:
         await storage.close()
 

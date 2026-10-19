@@ -1186,6 +1186,15 @@ async def _fetch_tokenrhythm_catalog[CatalogModelT](
                 ),
                 api_key,
             )
+            if source == "published" and url == TOKENRHYTHM_PUBLIC_CATALOG_URL:
+                from opensquilla.provider.media_pricing import register_media_catalog
+
+                register_media_catalog(
+                    "tokenrhythm",
+                    payload.get("data", []),
+                    base_url=TOKENRHYTHM_API_BASE_URL,
+                    source_url=url,
+                )
     except asyncio.CancelledError:
         cancelled_request_error = asyncio.CancelledError()
     except httpx.HTTPError as exc:

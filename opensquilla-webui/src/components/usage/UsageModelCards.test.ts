@@ -37,9 +37,6 @@ describe('UsageModelCards metric layout', () => {
       modelCards: [model],
       modelsMeta: '1 model',
       fmtCost: () => '$1.2500',
-      costSourceClassesForModelCard: () => ({}),
-      costSourceLabelForModelCard: () => 'Estimated',
-      costSourceTooltipForModelCard: () => 'Estimated locally',
     })
     app.use(i18n)
     app.mount(root)
@@ -58,5 +55,7 @@ describe('UsageModelCards metric layout', () => {
     expect(rows[0]?.classList.contains('usage-model-card__total')).toBe(true)
     expect(rows[0]?.textContent).toContain('Tokens120')
     expect(rows[0]?.textContent).toContain('Tasks6')
+    expect(root.querySelector('.usage-source')).toBeNull()
+    expect(rows[5]?.textContent).toContain('$1.2500')
   })
 })

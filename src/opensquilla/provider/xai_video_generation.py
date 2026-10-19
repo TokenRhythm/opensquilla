@@ -12,6 +12,7 @@ import httpx
 
 from opensquilla.env import trust_env
 from opensquilla.provider.error_redaction import redact_upstream_error_text, redacted_httpx_error
+from opensquilla.provider.media_jobs import accounted_video_submission, observe_video_job
 from opensquilla.provider.video_download import download_video_url
 from opensquilla.provider.video_generation import (
     VideoGenerationError,
@@ -103,6 +104,7 @@ async def _read_json(response: httpx.Response) -> dict[str, object]:
     return await read_video_json(response, max_bytes=_MAX_JSON_BYTES, label="xAI video")
 
 
+@accounted_video_submission("xai")
 async def _submit(
     client: httpx.AsyncClient,
     *,
@@ -220,8 +222,12 @@ async def _poll_until_complete(
 
         status = str(payload.get("status", "")).strip().lower()
         if status == "done":
+            await observe_video_job("xai", api_root, job_id, payload, api_key=api_key)
             return payload
         if status in {"failed", "expired", "cancelled", "canceled", "error"}:
+            await observe_video_job(
+                "xai", api_root, job_id, payload, api_key=api_key, outcome="failed"
+            )
             reason = _error_message(payload.get("error"), api_key=api_key)
             raise VideoGenerationError(f"Video job {job_id} failed: {reason}", job_id=job_id)
         if status not in {"pending", "queued", "running", "processing", "submitted"}:

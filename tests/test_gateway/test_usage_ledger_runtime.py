@@ -84,7 +84,8 @@ class _Storage:
         self.unknown = []
         self.fail_finalize = 0
 
-    async def start_usage_event(self, event):
+    async def start_usage_event(self, event, *, preserve_session_epoch=False):
+        assert preserve_session_epoch is True
         self.start_attempts.append(event)
         if self.start_failures:
             raise self.start_failures.pop(0)

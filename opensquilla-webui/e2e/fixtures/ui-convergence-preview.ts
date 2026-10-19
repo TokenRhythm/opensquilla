@@ -72,7 +72,7 @@ const Preview = defineComponent({
           ]),
           h(UsageSummaryStats, {
             totalTokens: '989,345,677', tokenParts: [{ label: t('usageLogs.metrics.input'), value: '900M' }, { label: t('usageLogs.metrics.output'), value: '89M' }],
-            totalCost: '$1,250.3701', costHintText: t('usageLogs.costSource.mixed.label'), costHintTitle: t('usageLogs.costSource.mixed.tooltip'),
+            totalCost: '$1,250.3701',
             sessionCount: '4', avgCost: '$312.5925',
           }),
           h(UsageChart, {

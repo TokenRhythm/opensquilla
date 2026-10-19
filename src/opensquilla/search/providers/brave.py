@@ -10,6 +10,7 @@ from opensquilla.search.registry import register_provider
 from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import Recency, SearchErrorKind, SearchProviderError, SearchResult
 from opensquilla.secrets import clean_header_secret
+from opensquilla.usage_request import accounted_request
 
 _API_URL = "https://api.search.brave.com/res/v1/web/search"
 _RECENCY_FRESHNESS = {
@@ -69,8 +70,13 @@ class BraveSearchProvider:
                 trust_env=self._trust_env,
                 transport=self._transport,
             ) as client:
-                response = await client.get(
+                response = await accounted_request(
+                    client,
+                    "GET",
                     _API_URL,
+                    provider=self.name,
+                    operation="web_search",
+                    base_url="https://api.search.brave.com",
                     params=params,
                     headers={
                         "Accept": "application/json",

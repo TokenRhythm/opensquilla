@@ -2801,13 +2801,21 @@ const {
   cleanup: cleanupSessionArtifacts,
 } = chatSessionArtifacts
 
-const voiceInput = useVoiceInput(injectedAudioTranscription)
+const voiceInput = useVoiceInput(injectedAudioTranscription, async () => {
+  const key = sessionKey.value
+  const epoch = currentEpoch.value
+  if (!key) return {}
+  const resolved = await sessionDirectory.resolve({ key })
+  if (key !== sessionKey.value || epoch !== currentEpoch.value) throw new Error('Recording session changed')
+  return { sessionKey: key, sessionId: resolved.id, sessionEpoch: epoch }
+})
 const {
   voiceBusy,
   voiceRecording,
   toggleVoiceInput,
   cleanup: cleanupVoiceInput,
 } = voiceInput
+watch([sessionKey, currentEpoch], () => voiceInput.cancel(), { flush: 'sync' })
 
 // Gate the composer mic button on real transcription readiness. onboarding.status
 // resolves whether audio is enabled AND an ElevenLabs key is present server-side

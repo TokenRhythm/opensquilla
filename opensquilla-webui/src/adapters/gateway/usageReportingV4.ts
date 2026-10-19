@@ -37,6 +37,11 @@ import type {
   UsageSession,
   UsageSnapshot,
   UsageTotals,
+  UsageTaskGroup,
+  UsageTaskRun,
+  UsageMeterSummary,
+  UsageCapability,
+  UsageSettlementSummary,
 } from '@/types/usage'
 
 interface UsageReportingTransport {
@@ -112,6 +117,8 @@ function nullableNumber(value: unknown): number | null {
 }
 
 function costUsd(source: WireRecord | undefined, prefix = ''): number | null {
+  const exact = rawValue(source, prefix ? `${prefix}CostUsdExact` : 'costUsdExact')
+  if (exact != null) return nullableNumber(exact)
   for (const [camel, snake, scale] of [
     ['CostNanos', 'cost_nanos', NANO_USD],
     ['CostMicroUsd', 'cost_micro_usd', MICRO_USD],
@@ -148,6 +155,11 @@ function normalizeNativeBilling(value: unknown): NativeBilledByCurrency {
       ),
       receiptCount: finiteNumber(rawValue(entry, 'receiptCount', 'receipt_count')),
       normalizationRatesNativePerUsd: Array.isArray(rates) ? rates.map(String) : [],
+      ...(entry.usdEquivalentExact != null ? { usdEquivalentExact: text(entry.usdEquivalentExact) } : {}),
+      ...(Array.isArray(entry.normalizationSources) ? { normalizationSources: entry.normalizationSources.map(raw => {
+        const evidence = record(raw)
+        return { source: text(evidence?.source), revision: text(evidence?.revision), rate: text(evidence?.rate) }
+      }) } : {}),
     }
   })
   return normalized
@@ -190,10 +202,14 @@ function normalizeTotals(value: unknown, fallbackSessions = 0): UsageTotals {
   return {
     input,
     output,
+    ...(source?.costUsdExact != null ? { costUsdExact: text(source.costUsdExact) } : {}),
+    ...(source?.billedCostUsdExact != null ? { billedCostUsdExact: text(source.billedCostUsdExact) } : {}),
+    ...(source?.estimatedCostUsdExact != null ? { estimatedCostUsdExact: text(source.estimatedCostUsdExact) } : {}),
     cost: costUsd(source) ?? 0,
     cacheRead: finiteNumber(rawValue(source, 'cacheReadTokens', 'cache_read_tokens')),
     cacheWrite: finiteNumber(rawValue(source, 'cacheWriteTokens', 'cache_write_tokens')),
     sessions: finiteNumber(rawValue(source, 'sessionCount', 'session_count'), fallbackSessions),
+    ...(source?.taskCount != null ? { taskCount: finiteNumber(source.taskCount) } : {}),
     totalTokens: finiteNumber(rawValue(source, 'totalTokens', 'total_tokens'), input + output),
     billedCost: costUsd(source, 'billed') ?? 0,
     estimatedCost: costUsd(source, 'estimated') ?? 0,
@@ -232,6 +248,11 @@ function normalizeBreakdown(value: unknown): ModelBreakdownItem[] {
     const totals = normalizeTotals(record(rawValue(source, 'totals')) || source)
     return {
       model: text(rawValue(source, 'model') || 'unknown'),
+      provider: text(rawValue(source, 'provider')),
+      capability: text(rawValue(source, 'capability')),
+      meters: normalizeMeters(rawValue(source, 'meters')),
+      tokenUnknownItemCount: finiteNumber(rawValue(source, 'tokenUnknownItemCount')),
+      missingCostEntries: totals.missingCostEntries,
       inputTokens: totals.input,
       outputTokens: totals.output,
       cacheReadTokens: totals.cacheRead,
@@ -276,6 +297,7 @@ function normalizeSession(value: unknown, legacySessionAlias = false): UsageSess
     cacheWriteTokens: legacySessionAlias
       ? nullableNumber(rawValue(source, 'cache_write_tokens', 'cacheWriteTokens')) : totals.cacheWrite,
     costUsd: legacySessionAlias ? costUsd(source) : totals.cost,
+    ...(totals.costUsdExact != null ? { costUsdExact: totals.costUsdExact } : {}),
     billedCostUsd: legacySessionAlias ? costUsd(source, 'billed') : totals.billedCost,
     estimatedCostUsd: legacySessionAlias ? costUsd(source, 'estimated') : totals.estimatedCost,
     estimatedEventCount: legacySessionAlias
@@ -302,6 +324,9 @@ function normalizeSession(value: unknown, legacySessionAlias = false): UsageSess
     ['displayName', 'displayName', 'display_name'],
     ['subject', 'subject'],
     ['derivedTitle', 'derivedTitle', 'derived_title'],
+    ['taskGroupId', 'taskGroupId', 'task_group_id'],
+    ['sessionKind', 'sessionKind', 'session_kind'],
+    ['attributionStatus', 'attributionStatus', 'attribution_status'],
   ] as const
   for (const [target, ...aliases] of optionalTextFields) {
     const field = text(rawValue(source, ...aliases))
@@ -317,6 +342,9 @@ function normalizeSession(value: unknown, legacySessionAlias = false): UsageSess
     const field = rawValue(source, ...aliases)
     if (typeof field === 'number' || typeof field === 'string') result[target] = field
   }
+  if (source?.sessionEpoch != null) result.sessionEpoch = finiteNumber(source.sessionEpoch)
+  if (source && 'parentSessionId' in source) result.parentSessionId = text(source.parentSessionId) || null
+  if (source && 'parentSessionEpoch' in source) result.parentSessionEpoch = nullableNumber(source.parentSessionEpoch)
   return result
 }
 
@@ -415,10 +443,9 @@ function normalizeModels(value: unknown): ModelCard[] {
       cacheReadTokens: totals.cacheRead,
       cacheWriteTokens: totals.cacheWrite,
       costUsd: totals.cost,
-      sessions: finiteNumber(
-        rawValue(source, 'sessionCount', 'session_count'),
-        totals.sessions,
-      ),
+      sessions: rawValue(source, 'taskCount', 'task_count') != null
+        ? finiteNumber(rawValue(source, 'taskCount', 'task_count'))
+        : totals.taskCount ?? finiteNumber(rawValue(source, 'sessionCount', 'session_count'), totals.sessions),
       share: 0,
       totalTokens: totals.totalTokens,
       costSource: totals.costSource,
@@ -445,7 +472,18 @@ function normalizeCoverage(value: unknown): UsageCoverage {
   const reasonCodes = rawValue(source, 'reasonCodes', 'reason_codes')
   const native = record(rawValue(source, 'nativeBilling', 'native_billing'))
   const nativeReasons = rawValue(native, 'reasonCodes', 'reason_codes')
+  const attribution = record(source?.attribution)
+  const measurements = record(source?.measurements)
   return {
+    ...(attribution ? { attribution: {
+      status: text(attribution.status) || 'partial',
+      missingEventCount: finiteNumber(attribution.missingEventCount),
+      reasonCodes: Array.isArray(attribution.reasonCodes) ? attribution.reasonCodes.map(String) : [],
+    } } : {}),
+    ...(measurements ? { measurements: {
+      tokenUnknownItemCount: finiteNumber(measurements.tokenUnknownItemCount),
+      unknownMeterCount: finiteNumber(measurements.unknownMeterCount),
+    } } : {}),
     status: text(rawValue(source, 'status') || 'complete'),
     timeAttribution: text(
       rawValue(source, 'timeAttribution', 'time_attribution') || 'complete',
@@ -473,6 +511,68 @@ function normalizeCoverage(value: unknown): UsageCoverage {
       ),
     },
   }
+}
+
+function normalizeMeters(value: unknown): UsageMeterSummary[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap(raw => {
+    const row = record(raw)
+    if (!row || !text(row.metric) || !text(row.unit)) return []
+    const dimensions = Object.fromEntries(Object.entries(record(row.dimensions) || {})
+      .map(([key, dimension]) => [key, text(dimension)]))
+    return [{ metric: text(row.metric), unit: text(row.unit), dimensions,
+      quantity: text(row.quantity) || '0', unknownCount: finiteNumber(row.unknownCount),
+      measurementCount: finiteNumber(row.measurementCount) }]
+  })
+}
+
+function normalizeTaskGroups(value: unknown): UsageTaskGroup[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.flatMap(raw => {
+    const row = record(raw)
+    if (!row || !text(row.taskGroupId)) return []
+    const branches = record(row.branches)
+    const runs: UsageTaskRun[] = Array.isArray(row.runs) ? row.runs.flatMap(rawRun => {
+      const run = record(rawRun)
+      if (!run || !text(run.runId)) return []
+      const relation = text(run.relation)
+      return [{ runId: text(run.runId), sessionId: text(run.sessionId),
+        sessionEpoch: finiteNumber(run.sessionEpoch), parentRunId: text(run.parentRunId) || null,
+        title: text(run.title), totals: normalizeTotals(run.totals),
+        relation: (['self', 'inline_subagent', 'subsession', 'sidechat'].includes(relation)
+          ? relation : 'unattributed') as UsageTaskRun['relation'] }]
+    }) : []
+    return [{ taskGroupId: text(row.taskGroupId), rootSessionId: text(row.rootSessionId),
+      rootSessionEpoch: finiteNumber(row.rootSessionEpoch), sessionKey: text(row.sessionKey) || null,
+      title: text(row.title), attributionStatus: text(row.attributionStatus) || 'partial',
+      firstUsageAtMs: nullableNumber(row.firstUsageAtMs),
+      lastUsageAtMs: nullableNumber(row.lastUsageAtMs),
+      modelBreakdown: normalizeBreakdown(row.modelBreakdown),
+      totals: normalizeTotals(row.totals), runs, branches: {
+        self: normalizeTotals(branches?.self),
+        inlineSubagents: normalizeTotals(branches?.inlineSubagents),
+        subsessions: normalizeTotals(branches?.subsessions),
+        sideChats: normalizeTotals(branches?.sideChats),
+        unattributed: normalizeTotals(branches?.unattributed),
+      } }]
+  })
+}
+
+function normalizeCapabilities(value: unknown): UsageCapability[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.map(raw => {
+    const row = record(raw)
+    return { capability: text(row?.capability) || 'unknown', totals: normalizeTotals(row?.totals),
+      meters: normalizeMeters(row?.meters), tokenUnknownItemCount: finiteNumber(row?.tokenUnknownItemCount) }
+  })
+}
+
+function normalizeSettlementSummary(value: unknown): UsageSettlementSummary | undefined {
+  const row = record(value)
+  if (!row) return undefined
+  return { provider_confirmed: finiteNumber(row.provider_confirmed),
+    provider_estimate: finiteNumber(row.provider_estimate),
+    local_estimate: finiteNumber(row.local_estimate), unknown: finiteNumber(row.unknown) }
 }
 
 function normalizeFxRates(value: unknown): Record<string, string> {
@@ -516,6 +616,10 @@ function normalizeQuery(value: unknown): UsageSnapshot {
     },
     totals,
     sessions,
+    taskGroups: normalizeTaskGroups(source?.taskGroups),
+    capabilities: normalizeCapabilities(source?.capabilities),
+    meters: source?.meters == null ? undefined : normalizeMeters(source.meters),
+    settlementSummary: normalizeSettlementSummary(source?.settlementSummary),
     models: normalizeModels(rawValue(source, 'models')),
     days,
     coverage,
