@@ -85,6 +85,7 @@ function i18n() {
         workspaces: {
           projects: 'Projects',
           createProject: 'Create project',
+          addProject: 'Add project',
           projectInfo: '{path}; {count} tasks',
           taskCount: '{count} tasks',
           newTask: 'New project task',
@@ -170,7 +171,7 @@ describe('SidebarConversations project workspaces', () => {
     const createProject = host.querySelector<HTMLButtonElement>('[data-testid="sidebar-create-project"]')
     const createTask = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
 
-    expect(createProject?.getAttribute('aria-label')).toBe('Create project')
+    expect(createProject?.getAttribute('aria-label')).toBe('Add project')
     expect(createTask?.getAttribute('aria-label')).toBe('New project task')
 
     createProject?.click()

@@ -52,6 +52,34 @@ async def test_filesystem_write_notifies_bootstrap_or_memory_sources(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_write_notifications_follow_independent_actual_agent_sources(tmp_path) -> None:
+    memory_calls = []
+    bootstrap_calls = []
+    ctx = ToolContext(
+        is_owner=True, workspace_dir=str(tmp_path),
+        memory_source_dir=str(tmp_path / "memory-root"),
+        memory_notes_dir=str(tmp_path / "external-notes"),
+        bootstrap_source_dir=str(tmp_path / "bootstrap"),
+        on_memory_source_write=lambda agent, path: memory_calls.append((agent, path)),
+        on_bootstrap_source_write=lambda agent, path: bootstrap_calls.append((agent, path)),
+    )
+    token = current_tool_context.set(ctx)
+    write_file = _original_async(filesystem.write_file)
+    try:
+        await write_file("USER.md", "task profile deliverable")
+        await write_file("MEMORY.md", "task memory deliverable")
+        assert memory_calls == [] and bootstrap_calls == []
+        await write_file("bootstrap/USER.md", "actual profile")
+        await write_file("memory-root/MEMORY.md", "actual memory")
+        await write_file("memory-root/memory/not-a-source.md", "ordinary file task")
+        await write_file("external-notes/preferences.md", "actual notes")
+    finally:
+        current_tool_context.reset(token)
+    assert bootstrap_calls == [("main", "USER.md")]
+    assert memory_calls == [("main", "MEMORY.md"), ("main", "memory/preferences.md")]
+
+
+@pytest.mark.asyncio
 async def test_filesystem_write_tools_record_workspace_writes(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

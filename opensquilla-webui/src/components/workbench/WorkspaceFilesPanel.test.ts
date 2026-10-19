@@ -476,10 +476,19 @@ describe('workspace files panel request ownership', () => {
     expect(el.textContent).not.toContain('stale search result')
   })
 
-  it('cancels a pending whole-file copy when selection changes', async () => {
+  it('copies the whole file with a check and cancels a pending copy when selection changes', async () => {
     const files = fixture()
     const { el } = await mount(files)
     await select(el, 'a.ts')
+    const copy = el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')!
+    const icon = copy.innerHTML
+    copy.click()
+    await vi.waitFor(() => expect(clipboard).toHaveBeenCalledExactlyOnceWith('whole file'))
+    await vi.waitFor(() => expect(copy.disabled).toBe(false))
+    expect(copy.title).toBe('Copy file contents')
+    expect(copy.innerHTML).not.toBe(icon)
+    expect(copy.getAttribute('aria-label')).toBe('Copy file contents')
+    clipboard.mockClear()
     const pending = deferred<Blob>()
     files.read.mockReturnValueOnce(pending.promise)
     el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')!.click()
@@ -488,6 +497,7 @@ describe('workspace files panel request ownership', () => {
     pending.resolve(new Blob(['stale clipboard contents'])); await flush()
     expect(clipboard).not.toHaveBeenCalled()
     expect(el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')?.disabled).toBe(false)
+    expect(el.querySelector<HTMLButtonElement>('button[aria-label="Copy file contents"]')?.innerHTML).toBe(icon)
   })
 
   it('filters by a loaded descendant even after its nonmatching parent is collapsed', async () => {

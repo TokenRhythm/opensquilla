@@ -166,6 +166,17 @@ def test_policy_runtime_hides_git_tools_when_git_is_unavailable() -> None:
     assert result.allowed_tools == {"read_file"}
 
 
+def test_owner_runtime_surface_does_not_add_a_profile_file_tool() -> None:
+    for caller_kind in (CallerKind.AGENT, CallerKind.WEB, CallerKind.CLI, CallerKind.CHANNEL):
+        ctx = ToolContext(
+            is_owner=True, caller_kind=caller_kind, session_key="agent:main:owner",
+            channel_admin_verified=caller_kind is CallerKind.CHANNEL,
+            surfaced_tools={"read_file"},
+        )
+        result = resolve_runtime_tool_surface(ctx)
+        assert result.surfaced_tools == {"read_file"}
+
+
 def test_policy_runtime_detects_git_with_unified_capability_probe(monkeypatch) -> None:
     monkeypatch.setattr(
         "opensquilla.git_runtime.resolve_git_capability",

@@ -106,18 +106,20 @@ describe('ErrorBoundary', () => {
     )
   })
 
-  it('copies only sanitized details and confirms success', async () => {
+  it('copies only sanitized details without success feedback', async () => {
     const error = new Error('API key api_key=sk-private')
     error.stack = 'Error: API key api_key=sk-private\n    at send (client.ts:4)'
     const el = await mountBoundary(error)
 
-    el.querySelector<HTMLButtonElement>('[data-testid="error-boundary-copy"]')!.click()
+    const copyButton = el.querySelector<HTMLButtonElement>('[data-testid="error-boundary-copy"]')!
+    const copyLabel = copyButton.textContent
+    copyButton.click()
     await flush()
 
     expect(mocks.copyText).toHaveBeenCalledWith(
       'Error: API key api_key=[redacted]\n    at send (client.ts:4)',
     )
-    expect(el.querySelector('[data-testid="error-boundary-copy"]')?.textContent).toContain('Copied')
+    expect(copyButton.textContent).toBe(copyLabel)
   })
 
   it('reports a clipboard failure without throwing out of the fallback', async () => {

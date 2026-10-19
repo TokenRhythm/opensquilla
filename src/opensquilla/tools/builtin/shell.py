@@ -5889,7 +5889,10 @@ def _resolve_process_wait_timeout(timeout: float | int | None) -> float:
 
 
 def _effective_workdir(workdir: str | None) -> str | None:
+    from opensquilla.tools.path_policy import resolve_bound_workspace
+
     ctx = current_tool_context.get()
+    workspace = resolve_bound_workspace(ctx.workspace_dir if ctx is not None else None)
     if workdir:
         translated = (
             _windows_translate_posix_tmp_path(workdir)
@@ -5898,11 +5901,11 @@ def _effective_workdir(workdir: str | None) -> str | None:
         )
         reject_foreign_host_path(translated, platform=os.name)
         raw = Path(translated).expanduser()
-        if not raw.is_absolute() and ctx and ctx.workspace_dir:
-            return str((Path(ctx.workspace_dir).expanduser().resolve() / raw).resolve())
+        if not raw.is_absolute() and workspace is not None:
+            return str((workspace / raw).resolve())
         return str(raw.resolve())
-    if ctx and ctx.workspace_dir:
-        return str(Path(ctx.workspace_dir).expanduser().resolve())
+    if workspace is not None:
+        return str(workspace)
     return None
 
 

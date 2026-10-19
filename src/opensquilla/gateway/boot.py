@@ -1070,6 +1070,7 @@ def _ensure_configured_agent_workspaces(
     config: GatewayConfig,
     *,
     extra_agent_ids: list[str] | None = None,
+    maintenance_policy: Any | None = None,
 ) -> None:
     """Seed bootstrap templates for explicitly configured agent workspaces."""
     if not config.workspace_dir:
@@ -1077,10 +1078,20 @@ def _ensure_configured_agent_workspaces(
 
     from opensquilla.gateway.workspace_template_upgrade import upgrade_workspace_defaults
     from opensquilla.identity.bootstrap import ensure_agent_workspace
+    from opensquilla.memory.source_protection import SourceMaintenancePolicy
+
+    maintenance_policy = maintenance_policy or SourceMaintenancePolicy(config)
 
     seen_workspaces: set[Path] = set()
 
     for agent_id in _configured_agent_ids(config, extra_agent_ids):
+        if not maintenance_policy.bootstrap_allowed(agent_id):
+            log.info(
+                "build_services.workspace_maintenance_skipped",
+                agent_id=agent_id,
+                reason="project_source_overlap",
+            )
+            continue
         result = ensure_agent_workspace(resolve_agent_workspace_dir(agent_id, config))
         physical_workspace = result.workspace_dir.resolve()
         if physical_workspace not in seen_workspaces:
@@ -3143,8 +3154,6 @@ async def build_services(
     from opensquilla.memory.embedding_resolver import resolve_memory_embedding
 
     resolve_memory_embedding(config.memory, local_available=lambda *_: False)
-    if seed_agent_workspaces:
-        _ensure_configured_agent_workspaces(config, extra_agent_ids=extra_agent_ids)
 
     # Inject config into admin tool (needed by both gateway and standalone)
     from opensquilla.tools.builtin.admin import set_gateway_config
@@ -3338,6 +3347,15 @@ async def build_services(
     set_session_manager(session_manager)
     _set_sessions_gateway_config(config)
     session_storage = get_session_storage(session_manager)
+    from opensquilla.memory.source_protection import policy_for_storage
+
+    source_maintenance_policy = policy_for_storage(config, session_storage)
+    if seed_agent_workspaces:
+        _ensure_configured_agent_workspaces(
+            config,
+            extra_agent_ids=extra_agent_ids,
+            maintenance_policy=source_maintenance_policy,
+        )
     if session_storage is not None and callable(
         getattr(session_storage, "_write_transaction", None)
     ):
@@ -3666,6 +3684,8 @@ async def build_services(
                     memory_source=getattr(config.memory, "source", "state"),
                     on_memory_write=_on_memory_write,
                     memory_config=config.memory,
+                    memory_managers=memory_managers,
+                    maintenance_allowed=source_maintenance_policy.allows,
                     workspace_base=config.workspace_dir
                     if getattr(config.memory, "source", "state") == "workspace"
                     else None,
@@ -4353,6 +4373,7 @@ def build_turn_runner_from_services(
         memory_sync_managers=getattr(svc, "memory_sync_managers", None) or None,
         model_catalog=getattr(svc, "model_catalog", None),
         memory_retrievers=getattr(svc, "memory_retrievers", None) or None,
+        memory_managers=getattr(svc, "memory_managers", None),
         turn_capture_services=getattr(svc, "turn_capture_services", None) or None,
         session_lock_provider=_standalone_lock_provider,
         diagnostics_state=diagnostics_state,
@@ -5268,6 +5289,7 @@ async def start_gateway_server(
             build_dream=build_dream_factory(
                 config=config,
                 turn_runner=turn_runner,
+                memory_managers=svc.memory_managers,
             ),
             should_skip=lambda: (
                 "disabled" if not getattr(config.memory.dream, "enabled", False) else None

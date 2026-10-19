@@ -21,12 +21,12 @@ function setup() {
 }
 
 describe('App sidebar session link action', () => {
-  it('copies the clicked row without navigating to it', async () => {
+  it('copies the clicked row without navigating or showing success feedback', async () => {
     const app = setup()
     await app.run('agent:main:webchat:other-row')
     expect(app.link).toHaveBeenCalledExactlyOnceWith('agent:main:webchat:other-row', app.platform)
     expect(app.copy).toHaveBeenCalledExactlyOnceWith('https://qa.example/control/chat?session=agent:main:webchat:other-row')
-    expect(app.toast).toHaveBeenCalledExactlyOnceWith('chat.copied', { tone: 'ok' })
+    expect(app.toast).not.toHaveBeenCalled()
   })
 
   it('does not copy a result resolved after changing Gateway', async () => {
@@ -77,6 +77,6 @@ describe('App sidebar session link action', () => {
       'https://qa.example/control/chat?session=older',
       'https://qa.example/control/chat?session=newer',
     ])
-    expect(app.toast).toHaveBeenCalledExactlyOnceWith('chat.copied', { tone: 'ok' })
+    expect(app.toast).not.toHaveBeenCalled()
   })
 })

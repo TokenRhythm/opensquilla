@@ -176,7 +176,6 @@ export function useCronJobs(scheduler: CronScheduler, options: {
   async function toggleJob(job: CronJob) {
     try {
       await scheduler.setEnabled(job.id, !job.enabled)
-      pushToast(job.enabled ? t('cronSkills.jobs.toastPaused') : t('cronSkills.jobs.toastResumed'), { tone: 'ok' })
       void refresh()
     } catch (err) {
       pushToast(t('cronSkills.jobs.toastUpdateFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
@@ -234,7 +233,6 @@ export function useCronJobs(scheduler: CronScheduler, options: {
 
   async function removeJob(id: string) {
     await scheduler.remove(id)
-    pushToast(t('cronSkills.jobs.toastDeleted'), { tone: 'ok' })
     void refresh()
   }
 

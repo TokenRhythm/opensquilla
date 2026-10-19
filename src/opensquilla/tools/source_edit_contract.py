@@ -88,6 +88,8 @@ def _validate_line_range(*, start_line: Any, end_line: Any, line_count: int) -> 
         or isinstance(end_line, bool)
     ):
         raise SourceEditContractError("line ranges must use integer start_line and end_line")
+    if line_count == 0 and start_line == 0 and end_line == 0:
+        return 0, 0
     if start_line < 1 or end_line < 1:
         raise SourceEditContractError("line ranges must be positive")
     if start_line > end_line:
@@ -119,8 +121,9 @@ def build_line_receipt(
         if end_line is None
         else end_line
     )
+    empty_default = total_lines == 0 and start_line == 1 and end_line is None
     start, end = _validate_line_range(
-        start_line=start_line,
+        start_line=0 if empty_default else start_line,
         end_line=effective_end_line,
         line_count=total_lines,
     )
@@ -133,7 +136,7 @@ def build_line_receipt(
         "total_lines": total_lines,
         "lines": [
             {"line": line_number, "text": lines[line_number - 1]}
-            for line_number in range(start, end + 1)
+            for line_number in range(start, end + 1) if total_lines
         ],
     }
     reference = workspace_file_reference(
@@ -144,7 +147,7 @@ def build_line_receipt(
         session_key=session_key,
         workspace_id=workspace_id,
     )
-    if reference is not None:
+    if reference is not None and total_lines:
         receipt["reference"] = reference
     return receipt
 
@@ -165,6 +168,8 @@ def _normalized_edits(
         raise SourceEditContractError("edits must be a non-empty array")
 
     line_count = _line_count(original)
+    if line_count == 0 and len(edits) != 1:
+        raise SourceEditContractError("an empty file accepts exactly one insertion")
     normalized: list[tuple[int, int, list[str]]] = []
     for index, edit in enumerate(edits):
         if not isinstance(edit, dict):
@@ -182,7 +187,7 @@ def _normalized_edits(
             )
         )
 
-    previous_end = 0
+    previous_end = -1
     for start, end, _replacement in sorted(normalized, key=lambda item: item[0]):
         if start <= previous_end:
             raise SourceEditContractError("edits must not overlap")
@@ -191,12 +196,12 @@ def _normalized_edits(
 
 
 def apply_line_edits(original: str, edits: list[dict[str, object]]) -> str:
-    """Apply inclusive 1-based line edits to source text."""
+    """Apply inclusive 1-based edits, or a single [0, 0] empty-file insertion."""
 
     normalized = _normalized_edits(original, edits)
     lines = original.splitlines(keepends=True)
     for start, end, replacement in sorted(normalized, key=lambda item: item[0], reverse=True):
-        lines[start - 1 : end] = replacement
+        lines[max(0, start - 1) : end] = replacement
     return "".join(lines)
 
 

@@ -3,6 +3,7 @@ import type {
   WorkbenchPreviewMode,
 } from '@/platform/types'
 import type { ArtifactPayload } from '@/types/artifacts'
+import type { WorkbenchResourceRef } from '@/types/workbenchResources'
 import type { ArtifactDocumentWorkspaceSnapshot } from '@/types/artifactDocuments'
 import type { ArtifactDocumentActions } from '@/types/artifactDocuments'
 import type {
@@ -35,7 +36,10 @@ import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresen
 import { artifactProductClientError, classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import { previewPagePathFromUrl } from '@/utils/workbench/previewPagePath'
 import {
-  artifactFromWorkbenchItem,
+  artifactFromWorkbenchItem as rawArtifactFromWorkbenchItem,
+  artifactResourceRefFromWorkbenchItem,
+  fixedArtifactTarget,
+  isFixedArtifactPreview,
   initialSectionFromWorkbenchItem,
   initialSectionRequestIdFromWorkbenchItem,
   preparedPreviewFromWorkbenchItem,
@@ -118,6 +122,7 @@ export interface ArtifactWorkbenchProviderOptions {
   }): Promise<void>
   platform: Platform
   previewLeasesEnabled?: boolean
+  editCurrentResource?(resource: WorkbenchResourceRef, item: WorkbenchItem, isCurrent: () => boolean): Promise<void>
   pushToast(message: string, options?: {
     tone?: 'info' | 'ok' | 'warn' | 'danger'
     duration?: number
@@ -227,9 +232,9 @@ function previewLeaseEnabledForItem(
     && item.payload.previewLeaseEligible !== false
 }
 
-function isPreparedImmutableResourcePreview(item: WorkbenchItem): boolean {
-  const prepared = preparedPreviewFromWorkbenchItem(item)
-  return prepared !== null && prepared.resource.type !== 'document'
+function artifactFromWorkbenchItem(item: WorkbenchItem): ArtifactPayload | null {
+  const artifact = rawArtifactFromWorkbenchItem(item)
+  return artifact && isFixedArtifactPreview(item) ? fixedArtifactTarget(artifact) : artifact
 }
 
 async function downloadArtifact(
@@ -341,6 +346,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private component: ArtifactPreviewPanelHandle | null = null
   private officeAnnotationId = ''
   private officeAnnotationPending = false
+  private editingCurrent = false
   private blockedHeadRevisionId = ''
   private createdSurface = false
   private generation = 0
@@ -419,7 +425,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   async initialize() {
     const artifact = artifactFromWorkbenchItem(this.item)
-    const documentLoad = artifact && !isPreparedImmutableResourcePreview(this.item)
+    const documentLoad = artifact && !isFixedArtifactPreview(this.item)
       ? this.options.artifactDocuments?.load(
           artifact,
           artifactSessionKey(this.item, this.options),
@@ -514,7 +520,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       return
     }
     if (event.type === 'artifact-document-publish') {
-      if (isPreparedImmutableResourcePreview(item)) return
+      if (isFixedArtifactPreview(item)) return
       if (this.context.getRenderState().documentPublishing === true) return
       const artifact = artifactFromWorkbenchItem(item)
       const sessionKey = artifactSessionKey(item, this.options)
@@ -670,7 +676,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       return
     }
     if (event.type === 'artifact-head-changed') {
-      if (isPreparedImmutableResourcePreview(this.item)) return
+      if (isFixedArtifactPreview(this.item)) return
       const renderedMode = runtimeContextStateValue(
         this.context.getRenderState(),
         'annotationMode',
@@ -772,7 +778,26 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         || actionId === 'toggle-remote-resources'
       )
     ) return
-    if (actionId === 'toggle-annotation-mode') {
+    if (actionId === 'edit-current') {
+      const resource = artifactResourceRefFromWorkbenchItem(item)
+      if (resource?.type !== 'deliverable' || !this.options.editCurrentResource || this.editingCurrent) return
+      this.editingCurrent = true
+      const generation = this.generation
+      const isCurrent = () => generation === this.generation && this.context.isItemOpen()
+      this.context.updateRenderState({ openingCurrent: true })
+      try {
+        await this.options.editCurrentResource(resource, item, isCurrent)
+      } catch (error) {
+        if (isCurrent()) {
+          const classified = classifyArtifactProductError(error)
+          const translated = this.options.t(classified.messageKey)
+          this.options.pushToast(translated === classified.messageKey ? classified.fallbackMessage : translated, { tone: 'danger' })
+        }
+      } finally {
+        this.editingCurrent = false
+        if (isCurrent()) this.context.updateRenderState({ openingCurrent: false })
+      }
+    } else if (actionId === 'toggle-annotation-mode') {
       if (runtimeContextStateValue(
         this.context.getRenderState(),
         'annotationModeStopping',
@@ -788,7 +813,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       if (this.annotationMode) await this.setAnnotationMode(false)
       else this.invalidateAnnotationSelectionAttempt()
       let refreshedDocument = false
-      if (artifact && !isPreparedImmutableResourcePreview(this.item)) {
+      if (artifact && !isFixedArtifactPreview(this.item)) {
         await this.options.artifactDocuments?.load(
           artifact,
           artifactSessionKey(item, this.options),
@@ -857,10 +882,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       })
       this.defaultMode = this.mode
       this.context.updateRenderState({ previewDefaultMode: this.defaultMode })
-      this.options.pushToast(
-        this.options.t('workbench.artifactPreview.defaultModeSaved'),
-        { tone: 'ok' },
-      )
     } else if (actionId === 'restore-default-preview-mode') {
       if (this.mode === this.defaultMode) return
       this.mode = this.defaultMode
@@ -884,7 +905,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         await this.component?.reload()
       }
     } else if ((actionId === 'open-external' || actionId === 'download') && artifact) {
-      const immutableResource = isPreparedImmutableResourcePreview(this.item)
+      const immutableResource = isFixedArtifactPreview(this.item)
       const target = artifactPreviewActionTarget(
         immutableResource ? artifact : this.options.artifactDocuments?.headArtifact(
           artifact,
@@ -1992,6 +2013,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   private officeDocument() {
+    if (isFixedArtifactPreview(this.item)) return null
     const artifact = artifactFromWorkbenchItem(this.item)
     const sessionKey = artifactSessionKey(this.item, this.options)
     const workspace = artifact ? this.options.artifactDocuments?.snapshot(artifact, sessionKey).workspace : null
@@ -2065,7 +2087,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   private currentDocument() {
-    if (isPreparedImmutableResourcePreview(this.item)) return null
+    if (isFixedArtifactPreview(this.item)) return null
     const artifact = artifactFromWorkbenchItem(this.item)
     if (!artifact) return null
     const sessionKey = artifactSessionKey(this.item, this.options)
@@ -2195,7 +2217,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     // The stable download URL and immutable preview identity serve different
     // purposes. The lease broker receives the current revision's real
     // artifact-store ID; downloads continue to use the document-head URL.
-    const artifact = this.options.artifactDocuments?.headArtifact(
+    const artifact = !isFixedArtifactPreview(this.item) && this.options.artifactDocuments?.headArtifact(
       originalArtifact,
       artifactSessionKey(this.item, this.options),
     ) || originalArtifact
@@ -2857,7 +2879,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private nativeRecoveryKey(): string {
     const artifact = artifactFromWorkbenchItem(this.item)
     const sessionKey = artifactSessionKey(this.item, this.options)
-    const workspace = artifact
+    const workspace = artifact && !isFixedArtifactPreview(this.item)
       ? this.options.artifactDocuments?.snapshot(artifact, sessionKey).workspace
       : null
     const headRevisionId = workspace?.source === 'document-api'
@@ -2989,6 +3011,15 @@ function artifactToolbarItems(
   const artifact = artifactFromWorkbenchItem(item)
   if (!artifact) return []
   const items: WorkbenchToolbarItem[] = []
+  if (isFixedArtifactPreview(item)) {
+    items.push({ kind: 'status', id: 'fixed-snapshot', icon: 'clock',
+      label: options.t('workbench.artifactDocument.fixedSnapshot'), text: options.t('workbench.artifactDocument.fixedSnapshot') })
+    if (artifactResourceRefFromWorkbenchItem(item)?.type === 'deliverable' && options.editCurrentResource) {
+      items.push({ kind: 'action', id: 'edit-current', icon: 'pencil',
+        label: options.t('workbench.artifactDocument.continueEditing'),
+        disabled: runtimeStateValue(state, 'openingCurrent', false) })
+    }
+  }
   const previewState = runtimeStateValue<ArtifactPreviewResourceState>(
     state,
     'previewState',
@@ -3171,7 +3202,7 @@ export function createArtifactWorkbenchDefinitions(
         previewReading: artifactReadingCheckpoint(state.runtimeState.previewReading),
         artifact: artifactFromWorkbenchItem(item),
         documentActions: (() => {
-          if (isPreparedImmutableResourcePreview(item)) return undefined
+          if (isFixedArtifactPreview(item)) return undefined
           const documents = options.artifactDocuments
           if (
             !documents?.restoreRevision
@@ -3183,7 +3214,7 @@ export function createArtifactWorkbenchDefinitions(
           } satisfies ArtifactDocumentActions
         })(),
         documentSnapshot: (() => {
-          if (isPreparedImmutableResourcePreview(item)) return undefined
+          if (isFixedArtifactPreview(item)) return undefined
           const artifact = artifactFromWorkbenchItem(item)
           return artifact
             ? options.artifactDocuments?.snapshot(
@@ -3193,7 +3224,7 @@ export function createArtifactWorkbenchDefinitions(
             : undefined
         })(),
         documentFeatures: (() => {
-          if (isPreparedImmutableResourcePreview(item)) return false
+          if (isFixedArtifactPreview(item)) return false
           const artifact = artifactFromWorkbenchItem(item)
           if (!artifact) return false
           return options.artifactDocuments?.snapshot(
@@ -3232,6 +3263,7 @@ export function createArtifactWorkbenchDefinitions(
         publishing: runtimeStateValue(state, 'documentPublishing', false),
         annotationFallback: runtimeStateValue(state, 'annotationFallback', null),
         officeAnnotationEnabled: (() => {
+          if (isFixedArtifactPreview(item)) return false
           const artifact = artifactFromWorkbenchItem(item)
           if (!artifact || !options.officePromptAnnotations) return false
           const workspace = options.artifactDocuments?.snapshot(artifact, artifactSessionKey(item, options)).workspace

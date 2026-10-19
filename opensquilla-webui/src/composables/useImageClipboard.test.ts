@@ -76,7 +76,7 @@ describe('useImageClipboard', () => {
     expect(fetchArtifact).toHaveBeenCalledWith(source.value!.kind === 'artifact' ? source.value!.artifact : null,
       { sessionKey: state.session, signal: expect.any(AbortSignal), maxBytes: SVG_CLIPBOARD_MAX_BYTES })
     expect(await accepted[0]!.text()).toBe(SVG)
-    expect(mocks.toast).toHaveBeenCalledWith(i18n.global.t('imageClipboard.copiedSource'), { tone: 'ok' })
+    expect(mocks.toast).not.toHaveBeenCalled()
     expect(copy.busy.value).toBe(false)
   })
 

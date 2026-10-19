@@ -257,6 +257,7 @@ def load_daily_notes(
     *,
     per_note_max_chars: int | None = None,
     total_max_chars: int | None = None,
+    notes_dir: str | Path | None = None,
 ) -> dict[str, str]:
     """Load today and yesterday's daily notes from memory/ directory.
 
@@ -266,7 +267,7 @@ def load_daily_notes(
     from datetime import date, timedelta
 
     root = Path(workspace_dir).expanduser()
-    memory_dir = root / "memory"
+    memory_dir = Path(notes_dir).expanduser() if notes_dir is not None else root / "memory"
     native_memory_dir = native_io_path(memory_dir)
     if not native_memory_dir.is_dir():
         return {}
@@ -300,7 +301,7 @@ def load_daily_notes(
                 continue
             if not name.startswith(prefix):
                 continue
-            if not _is_within_root(root, candidate):
+            if not _is_within_root(memory_dir if notes_dir is not None else root, candidate):
                 continue
             content = _read_file_sync(candidate)
             if content is not None:

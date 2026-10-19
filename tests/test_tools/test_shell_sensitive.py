@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -258,7 +259,8 @@ def test_effective_workdir_rejects_foreign_posix_absolute_path_on_windows(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    monkeypatch.setattr(shell.os, "name", "nt")
+    # Keep pathlib on the actual host while simulating shell's platform check.
+    monkeypatch.setattr(shell, "os", SimpleNamespace(name="nt"))
     token = current_tool_context.set(ToolContext(workspace_dir=str(workspace)))
     try:
         with pytest.raises(ToolError, match="foreign_host_path"):

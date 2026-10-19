@@ -52,10 +52,10 @@ def test_system_prompt_routes_profile_to_user_md() -> None:
 
     assert "USER.md" in prompt
     assert "name, preferred address, pronouns, timezone" in prompt
-    assert "Do not use `memory_save` for `USER.md`" in prompt
-    assert "MEMORY.md` for durable non-profile facts" in prompt
+    assert "do not create a task-local profile or memory file as a substitute" in prompt
+    assert "Profile and memory files belong to configured Agent sources" in prompt
     assert "`MEMORY.md` + `memory/**/*.md`" in prompt
-    assert "relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file" in prompt
+    assert "use ordinary file tools to create or edit" not in prompt
     assert "decisions, dates, people, preferences, or todos" not in prompt
     assert "prior work, decisions, dated history, todos" in prompt
 
@@ -120,12 +120,18 @@ def test_system_prompt_routes_exact_transcript_search_to_session_search() -> Non
 def test_system_prompt_routes_agent_identity_away_from_memory_md() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),
-        tools=["memory_search", "memory_get", "write_file", "edit_file", "apply_patch"],
+        tools=["memory_search", "memory_get", "write_file", "memory_save"],
     )
 
-    assert "Agent identity: `IDENTITY.md`" in prompt
-    assert "Agent persona: `SOUL.md`" in prompt
-    assert "Do not put assistant rename/persona requests into `MEMORY.md`" in prompt
+    assert "USER.md holds the stable user profile" in prompt
+    assert "IDENTITY.md holds assistant identity" in prompt
+    assert "SOUL.md holds persona guidance" in prompt
+    assert (
+        "when the configured source path is known and current file permissions allow it" in prompt
+    )
+    assert "Do not infer the source path from the task workspace" in prompt
+    assert "agent_file" not in prompt
+    assert "Do not use memory_save for USER.md, IDENTITY.md, or SOUL.md" in prompt
 
 
 def test_system_prompt_only_documents_canonical_tool_names() -> None:
@@ -331,12 +337,13 @@ def test_system_prompt_guides_generated_file_delivery() -> None:
 
     assert "## Generated File Delivery" in prompt
     assert "Do not paste full file source" in prompt
-    assert "call `publish_artifact` for the final file" in prompt
+    assert "prepare the final workspace file and its required local materials" in prompt
     assert "complete workspace-relative paths, including subdirectories" in prompt
     assert "Exact local paths in inline code also work" in prompt
     assert "Follow the tool's delivery instructions for the current surface" in prompt
     assert "Do not invent artifact download URLs" in prompt
-    assert "do not call `publish_artifact` again" in prompt
+    assert "do not register it again" in prompt
+    assert "do not claim native channel delivery without a confirmed delivery receipt" in prompt
     assert "If `publish_artifact` reports" in prompt
     assert "registered, published, or delivered" not in prompt
     assert "Publication does not end the turn" in prompt

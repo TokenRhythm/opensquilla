@@ -2488,7 +2488,7 @@ async function saveDirtySections() {
 
     // A behavior-only save is fully confirmed by its mutation response.
     if (completed.size === 1 && completed.has('behavior')) {
-      pushToast(t(feedback.some(item => item.restartRequired) ? 'setup.toast.settingsSavedRestart' : 'setup.toast.settingsSaved'))
+      if (feedback.some(item => item.restartRequired)) pushToast(t('setup.toast.settingsSavedRestart'))
       return
     }
     try {
@@ -2505,7 +2505,7 @@ async function saveDirtySections() {
     ) {
       applyConfiguredProviderSelection(selectedProviderId)
     }
-    pushToast(t(feedback.some(item => item.restartRequired) ? 'setup.toast.settingsSavedRestart' : 'setup.toast.settingsSaved'))
+    if (feedback.some(item => item.restartRequired)) pushToast(t('setup.toast.settingsSavedRestart'))
   } finally {
     saveAllPending.value = false
     saveAllRequestPending = false
@@ -3118,10 +3118,6 @@ async function removeProviderCredential() {
         provider: providerLabel,
         envKey: response.entry.credentialEnv || credential.envKey,
       }), { tone: 'warn' })
-    } else {
-      pushToast(t('setup.toast.providerCredentialRemoved', {
-        provider: providerLabel,
-      }))
     }
     // Refresh saved credential status without reinitializing any form. Removing
     // one secret must not silently discard drafts in Provider, Routing, or any
@@ -3267,11 +3263,6 @@ async function removeProviderProfile(providerId: string) {
       pushToast(t('setup.toast.providerProfileRemovedImageNeedsCredential', {
         provider: providerLabel,
       }), { tone: 'warn' })
-    } else {
-      pushToast(t(
-        'setup.toast.providerProfileRemoved',
-        { provider: providerLabel },
-      ))
     }
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })
@@ -3482,7 +3473,6 @@ async function resetRecommendedRouter(): Promise<boolean> {
     await providerConfiguration.resetRecommended!({ providerId, activateRouter: false })
     acknowledged = true
     await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, forceResetRouter: true, throwOnError: true })
-    pushToast(t('setup.modelStrategy.resetSaved', { provider: providerCatalogLabel(providerId) }))
     return true
   } catch (error) {
     if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' })
@@ -3843,9 +3833,7 @@ async function resetCapability(name: CapabilityId) {
     } else {
       promotedForm.initAudioFromConfig(config.value)
     }
-    pushToast(response?.restartRequired
-      ? t('setup.toast.capabilityResetRestart', { capability: title })
-      : t('setup.toast.capabilityReset', { capability: title }))
+    if (response?.restartRequired) pushToast(t('setup.toast.capabilityResetRestart', { capability: title }))
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })
   } finally {
@@ -3997,8 +3985,8 @@ function saveResultWithRestart(message: string, restartRequired: boolean): strin
 // notification. Independent operations (copy, probes, removals) are unaffected.
 function saveToast(options: SaveOptions, message: string, presentation?: { tone?: ToastTone }, restartRequired = false) {
   if (options.feedback) options.feedback({ message, tone: presentation?.tone, restartRequired })
-  else if (presentation) pushToast(saveResultWithRestart(message, restartRequired), presentation)
-  else pushToast(message)
+  else if (message && presentation) pushToast(saveResultWithRestart(message, restartRequired), presentation)
+  else if (message) pushToast(message)
 }
 
 async function finishSave(options: SaveOptions, section: string, message: string, restartRequired = false): Promise<boolean> {
@@ -4073,9 +4061,9 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       if (thinkingPatch && options.reload !== false) {
         await loadData({ preserveDirtySectionDrafts: true, throwOnError: true })
       }
-      pushToast(thinkingPatch
-        ? t(restartRequired ? 'setup.toast.providerSavedRestart' : 'setup.toast.providerSaved')
-        : saveResultWithRestart(t('setup.capacity.saved'), restartRequired))
+      if (restartRequired) pushToast(thinkingPatch
+        ? t('setup.toast.providerSavedRestart')
+        : saveResultWithRestart(t('setup.capacity.saved'), true))
       return true
     } catch (err) {
       if (writesCompleted) saveToast(options, t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' }, restartRequired)
@@ -4227,7 +4215,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       if (activateProfile) {
         pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter,
           restartRequired ? t('setup.toast.providerSavedRestart') : '')
-      } else {
+      } else if (restartRequired) {
         pushToast(saveResultWithRestart(t('setup.toast.providerProfileSaved', {
           provider: providerCatalogLabel(selectedProviderId),
         }), restartRequired))
@@ -4280,7 +4268,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       return true
     }
     pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter,
-      restartRequired ? t('setup.toast.providerSavedRestart') : t('setup.toast.providerSaved'))
+      restartRequired ? t('setup.toast.providerSavedRestart') : '')
     return true
   } catch (err) {
     if (primaryAcknowledged) {
@@ -4330,7 +4318,7 @@ async function saveBehavior(options: SaveOptions = {}, patches = behaviorForm.pa
     behaviorForm.acceptSaved(submitted)
     // The mutation response confirms this preference. Avoid unrelated setup
     // reads and retain a newer draft while still sharing the batch feedback.
-    saveToast(options, restart ? t('setup.toast.behaviorSavedRestart') : t('setup.toast.behaviorSaved'), undefined, restart)
+    saveToast(options, restart ? t('setup.toast.behaviorSavedRestart') : '', undefined, restart)
     return true
   } catch (err) {
     saveToast(options, primaryMutationResultUncertain(err) ? t('setup.modelStrategy.resultUncertain') : saveFailedMessage(err), { tone: 'danger' })
@@ -4360,7 +4348,7 @@ async function savePrivacy(
       }
       disableNetworkObservability.value = value
     }
-    return await finishSave(options, 'privacy', restart ? t('setup.toast.privacySavedRestart') : t('setup.toast.privacySaved'), restart)
+    return await finishSave(options, 'privacy', restart ? t('setup.toast.privacySavedRestart') : '', restart)
   } catch (err) {
     return await reportSaveFailure(err, options)
   }
@@ -4379,7 +4367,7 @@ async function saveMemoryAutoCapture(options: SaveOptions = {}): Promise<boolean
       }
       promotedForm.initMemoryCaptureFromConfig(config.value)
     }
-    return await finishSave(options, 'memoryCapture', restart ? t('setup.toast.captureSavedRestart') : t('setup.toast.captureSaved'), restart)
+    return await finishSave(options, 'memoryCapture', restart ? t('setup.toast.captureSavedRestart') : '', restart)
   } catch (err) {
     return await reportSaveFailure(err, options)
   }
@@ -4399,7 +4387,7 @@ async function saveRouter() {
       routingAcknowledged = true
     }
     const restart = await safePatchConfig(routerForm.visualModePatches())
-    await finishSave({}, 'router', restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'), restart)
+    await finishSave({}, 'router', restart ? t('setup.toast.routerSavedRestart') : '', restart)
   } catch (err) {
     if (routingAcknowledged) {
       const message = t('setup.toast.modelStrategyPartialSaved')
@@ -4421,7 +4409,7 @@ async function saveEnsemble() {
     if (Object.keys(params).length) {
       await setupWorkflow.capability.configureEnsemble(params)
     }
-    await finishSave({}, 'ensemble', t('setup.toast.ensembleSaved'))
+    await finishSave({}, 'ensemble', '')
   } catch (err) {
     await reportSaveFailure(err, {})
   } finally {
@@ -4608,7 +4596,7 @@ async function saveModelStrategy(options: SaveOptions & {
       refreshStarted = true
       await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, forceResetModelStrategy: true, throwOnError: true })
     }
-    if (savedAny) saveToast(options, t(restartRequired ? 'setup.toast.modelSettingsSavedRestart' : 'setup.toast.modelSettingsSaved'), undefined, restartRequired)
+    if (savedAny) saveToast(options, restartRequired ? t('setup.toast.modelSettingsSavedRestart') : '', undefined, restartRequired)
     return savedAny
   } catch (err) {
     if (refreshStarted) saveToast(options, t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' }, restartRequired)
@@ -4635,7 +4623,7 @@ async function saveSearch(options: SaveOptions = {}): Promise<boolean> {
   const params = capabilitiesForm.searchPayload()
   try {
     await setupWorkflow.capability.configureSearch(params)
-    return await finishSave(options, 'search', t('setup.toast.searchSaved'))
+    return await finishSave(options, 'search', '')
   } catch (err) {
     return await reportSaveFailure(err, options)
   }
@@ -4644,7 +4632,7 @@ async function saveSearch(options: SaveOptions = {}): Promise<boolean> {
 async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
   const embeddingDirty = capabilitiesForm.memoryDirty.value
   try {
-    let message = embeddingDirty ? t('setup.toast.memorySavedRestart') : t('setup.toast.memorySaved')
+    let message = embeddingDirty ? t('setup.toast.memorySavedRestart') : ''
     let restartRequired = embeddingDirty
     if (embeddingDirty) {
       const params = capabilitiesForm.memoryPayload()
@@ -4671,7 +4659,8 @@ async function saveImage(options: SaveOptions = {}): Promise<boolean> {
     }
     const entry = res?.entry || {}
     const message = envReferenceSaveMessage(t('setup.image.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)
-    return await finishSave(options, 'image', message || t('setup.toast.imageSaved'), res?.restartRequired === true)
+    const restartRequired = res?.restartRequired === true
+    return await finishSave(options, 'image', message || (restartRequired ? saveResultWithRestart(t('setup.toast.imageSaved'), true) : ''), restartRequired)
   } catch (err) {
     return await reportSaveFailure(err, options)
   }
@@ -4679,7 +4668,6 @@ async function saveImage(options: SaveOptions = {}): Promise<boolean> {
 
 async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
   if (!promotedForm.audioDirty.value) {
-    saveToast(options, t('setup.toast.noAudioChanges'))
     return true
   }
   try {
@@ -4689,7 +4677,7 @@ async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
     }
     const entry = res?.entry || {}
     const message = envReferenceSaveMessage(t('setup.audio.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)
-    return await finishSave(options, 'audio', message || (res?.restartRequired ? t('setup.toast.audioSavedRestart') : t('setup.toast.audioSaved')), res?.restartRequired === true)
+    return await finishSave(options, 'audio', message || (res?.restartRequired ? t('setup.toast.audioSavedRestart') : ''), res?.restartRequired === true)
   } catch (err) {
     return await reportSaveFailure(err, options)
   }
@@ -4718,22 +4706,21 @@ function tierLabel(tier: string): string {
   return t(routerTierLabelKey(tier))
 }
 
-async function copyText(text: string, successMessage: string) {
+async function copyText(text: string) {
   if (!text) return
   try {
     await copyTextWithFallback(text)
-    pushToast(successMessage)
   } catch (err) {
     pushToast(t('setup.toast.copyFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
   }
 }
 
 async function copyCommand(command: string) {
-  await copyText(command, t('setup.toast.copiedCommand'))
+  await copyText(command)
 }
 
 async function copyConfigPath() {
-  await copyText(configPath.value, t('setup.toast.copiedPath'))
+  await copyText(configPath.value)
 }
 
   return {

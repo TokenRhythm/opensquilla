@@ -60,8 +60,7 @@ const actionLabel = computed(() => isTruncated.value
   ? t(props.downloadError ? 'shared.runTrace.downloadContentFailed' : props.view.partial ? 'chat.download' : 'shared.runTrace.downloadFullContent') : copyLabel.value)
 const exitCode = computed(() => props.view.exitCode !== undefined && !/^\s*exit[_ ]code\s*[:=]/im.test(source.value)
   ? `exit_code=${props.view.exitCode}` : '')
-const copyLabel = computed(() => props.copyState === 'copied' ? t('chat.copied')
-  : props.copyState === 'error' ? t('chat.toast.copyFailed')
+const copyLabel = computed(() => props.copyState === 'error' ? t('chat.toast.copyFailed')
     : t(props.view.partial ? 'shared.runTrace.copyPreview' : 'chat.copy'))
 const openLabel = computed(() => t(props.view.kind === 'edit'
   ? 'shared.runTrace.codeViewDiff' : 'shared.runTrace.codeViewSource'))
@@ -102,7 +101,7 @@ const diffLines = computed(() => source.value.split('\n').map(text => ({
           <Icon :name="isTruncated ? (downloadError ? 'x' : 'download') : copyState === 'copied' ? 'check' : copyState === 'error' ? 'x' : 'copy'" :size="14" aria-hidden="true" />
         </button>
       </div>
-      <span class="activity-code-details__sr" aria-live="polite" aria-atomic="true">{{ isTruncated ? (downloadError ? actionLabel : '') : copyState === 'idle' ? '' : copyLabel }}</span>
+      <span class="activity-code-details__sr" aria-live="polite" aria-atomic="true">{{ isTruncated ? (downloadError ? actionLabel : '') : copyState === 'error' ? copyLabel : '' }}</span>
     </header>
     <div ref="viewport" class="activity-code-details__viewport" role="region" tabindex="0" :aria-label="title"
       @scroll.passive="checkScrollEnd" @wheel.passive="onWheel" @keydown="onPageKey">

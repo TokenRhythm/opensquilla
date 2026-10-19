@@ -17,6 +17,7 @@ from opensquilla.gateway.adapters.contract_method import (
 
 WORKSPACE_CATALOG_CONTRACT_METHODS: Final = (
     "workspaces.list",
+    "workspaces.create",
     "workspaces.open",
     "workspaces.update",
     "workspaces.pin",

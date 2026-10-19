@@ -135,6 +135,22 @@
     "openDirectoryFailed": "No se pudo abrir el directorio del proyecto. Inténtalo de nuevo.",
     "copyDirectoryFailed": "No se pudo copiar la ruta del directorio del proyecto.",
     "projects": "Proyectos",
+    "addProject": "Añadir proyecto",
+    "projectAction": "Acción del proyecto",
+    "openExistingProject": "Abrir existente",
+    "saveParentDirectory": "Guardar en",
+    "projectLocation": "Directorio del proyecto",
+    "chooseParentDirectory": "Elegir directorio principal",
+    "chooseExistingDirectory": "Elegir directorio existente",
+    "executionHost": "Equipo: {host}",
+    "gatewayHost": "Equipo del Gateway",
+    "createLocationHint": "Se creará un nuevo directorio de proyecto en esta ubicación.",
+    "openLocationHint": "El directorio seleccionado se añadirá a sus proyectos.",
+    "createUnavailable": "Este Gateway no permite crear y registrar un proyecto directamente. Puede abrir un proyecto existente o crear una carpeta desde el selector de directorios.",
+    "preparingProject": "Preparando…",
+    "projectOpened": "Proyecto «{name}» abierto",
+    "createProjectUnconfirmed": "Se produjo un problema al crear el proyecto en {path}. Revise la lista de proyectos antes de intentarlo de nuevo. {error}",
+    "openProjectFailed": "No se pudo abrir el proyecto: {error}",
     "createProject": "Crear proyecto",
     "projectNamePlaceholder": "Nombre del proyecto",
     "sourceFolders": "Carpetas de origen",
@@ -364,6 +380,7 @@
     },
     "resources": {
       "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
+      "currentWorkingFile": "Archivo de trabajo actual", "publishedVersion": "Versión publicada",
       "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
       "open": "Abrir {name}", "preparing": "Preparando el editor…", "retry": "Reintentar", "preview": "Vista previa de {name}", "download": "Descargar {name}", "edit": "Editar una copia de {name}", "publish": "Publicar {name}",
       "imported": "Ya puedes editar {name}.", "published": "Ya puedes compartir {name}.",
@@ -548,6 +565,8 @@
       "documentEditingRetired": "Actualiza el cliente y vuelve a abrir la página para enviar anotaciones como mensajes."
     },
     "artifactDocument": {
+      "fixedSnapshot": "Versión fija",
+      "continueEditing": "Seguir editando",
       "sections": "Secciones del documento del artefacto",
       "preview": "Vista previa",
       "source": "Código fuente",
@@ -3734,6 +3753,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Crear o mejorar las instrucciones a partir del proyecto actual",
         "new": "Iniciar un chat nuevo",
         "compact": "Reducir el contexto actual",
         "goal": "Establecer un objetivo continuo",
@@ -4393,6 +4413,7 @@
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
     "slashCommands": {
+      "initUnavailable": "Este Gateway no admite la inicialización de proyectos. Actualícelo e inténtelo de nuevo. Se conservó el borrador.",
       "side": {
         "closed": "El chat lateral original se cerró. Se conservó tu borrador. Edita el comando antes de enviarlo de nuevo para crear otro chat lateral.",
         "description": "Abrir chat lateral temporal · alias /btw",

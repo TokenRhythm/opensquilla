@@ -694,6 +694,10 @@ async def test_artifact_delivery_preserves_fallback_on_structured_failure(
         expected_session_id="session-1",
     )
 
+    assert len(undelivered) == 1
+    assert undelivered[0].pop("channel_delivery_issue") == (
+        "Channel file delivery failed; no confirmed receipt."
+    )
     assert undelivered == [ref.to_dict()]
 
 

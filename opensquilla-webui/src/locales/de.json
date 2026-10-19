@@ -135,6 +135,22 @@
     "openDirectoryFailed": "Projektverzeichnis konnte nicht geöffnet werden. Bitte erneut versuchen.",
     "copyDirectoryFailed": "Projektverzeichnispfad konnte nicht kopiert werden.",
     "projects": "Projekte",
+    "addProject": "Projekt hinzufügen",
+    "projectAction": "Projektaktion",
+    "openExistingProject": "Vorhandenes öffnen",
+    "saveParentDirectory": "Speichern unter",
+    "projectLocation": "Projektordner",
+    "chooseParentDirectory": "Übergeordneten Ordner wählen",
+    "chooseExistingDirectory": "Vorhandenen Ordner wählen",
+    "executionHost": "Computer: {host}",
+    "gatewayHost": "Gateway-Host",
+    "createLocationHint": "An diesem Ort wird ein neuer Projektordner erstellt.",
+    "openLocationHint": "Der gewählte Ordner wird Ihren Projekten hinzugefügt.",
+    "createUnavailable": "Dieses Gateway unterstützt das direkte Erstellen und Registrieren eines Projekts nicht. Sie können weiterhin ein vorhandenes Projekt öffnen oder in der Ordnerauswahl einen neuen Ordner erstellen.",
+    "preparingProject": "Wird vorbereitet…",
+    "projectOpened": "Projekt „{name}“ geöffnet",
+    "createProjectUnconfirmed": "Beim Erstellen des Projekts unter {path} ist ein Problem aufgetreten. Prüfen Sie vor einem erneuten Versuch die Projektliste. {error}",
+    "openProjectFailed": "Projekt konnte nicht geöffnet werden: {error}",
     "createProject": "Projekt erstellen",
     "projectNamePlaceholder": "Projektname",
     "sourceFolders": "Quellordner",
@@ -364,6 +380,7 @@
     },
     "resources": {
       "title": "Dateien", "count": "Dateien ({count})", "empty": "Noch keine Dateien oder Links.",
+      "currentWorkingFile": "Aktuelle Arbeitsdatei", "publishedVersion": "Veröffentlichte Version",
       "groups": { "files": "Dateien", "links": "Links", "attachments": "Dateien", "documents": "Dateien", "deliverables": "Dateien", "urls": "Links" },
       "open": "{name} öffnen", "preparing": "Editor wird vorbereitet…", "retry": "Erneut versuchen", "preview": "{name} ansehen", "download": "{name} herunterladen", "edit": "Kopie von {name} bearbeiten", "publish": "{name} veröffentlichen",
       "imported": "{name} kann jetzt bearbeitet werden.", "published": "{name} kann jetzt geteilt werden.",
@@ -548,6 +565,8 @@
       "documentEditingRetired": "Aktualisieren Sie die App und öffnen Sie die Seite erneut, um Anmerkungen als Chatnachricht zu senden."
     },
     "artifactDocument": {
+      "fixedSnapshot": "Fester Stand",
+      "continueEditing": "Weiter bearbeiten",
       "sections": "Bereiche des Artefaktdokuments",
       "preview": "Vorschau",
       "source": "Quelltext",
@@ -3734,6 +3753,7 @@
       "continue": "Continue",
       "commandWithSkills": "Selected skills apply to a chat message. Remove the skill labels before running a command.",
       "commandDescriptions": {
+        "init": "Projektanweisungen aus dem aktuellen Projekt erstellen oder verbessern",
         "new": "Neuen Chat starten",
         "compact": "Aktuellen Kontext kürzen",
         "goal": "Langfristiges Ziel festlegen",
@@ -4393,6 +4413,7 @@
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
     "slashCommands": {
+      "initUnavailable": "Dieses Gateway unterstützt keine Projektinitialisierung. Aktualisieren Sie es und versuchen Sie es erneut. Ihr Entwurf wurde beibehalten.",
       "side": {
         "closed": "Der ursprüngliche Seitenchat wurde geschlossen. Der Entwurf wurde behalten. Bearbeite den Befehl vor dem erneuten Senden, um einen neuen Seitenchat zu starten.",
         "description": "Temporären Seitenchat öffnen · Alias /btw",

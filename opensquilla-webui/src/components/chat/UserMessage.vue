@@ -241,7 +241,7 @@
       <button
         type="button"
         class="msg-action"
-        :class="{ 'msg-action--ok': copyState === 'ok', 'msg-action--err': copyState === 'err' }"
+        :class="{ 'msg-action--err': copyState === 'err' }"
         :title="copyTitle"
         @click="onCopyClick"
       >
@@ -1075,11 +1075,6 @@ function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {
 .msg-action.msg-action--disabled:hover {
   color: var(--text-dim);
   background: none;
-}
-
-.msg-action.msg-action--ok,
-.msg-action.msg-action--ok:hover {
-  color: var(--ok);
 }
 
 .msg-action.msg-action--err,

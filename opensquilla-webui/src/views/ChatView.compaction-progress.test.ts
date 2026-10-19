@@ -111,7 +111,8 @@ describe('compaction maintenance presentation', () => {
     copy.click()
     await nextTick()
     expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith('cmp-failed-123')
-    await vi.waitFor(() => expect(copy.textContent).toBe(i18n.global.t('chat.copiedDiagnosticId')))
+    expect(copy.textContent).toBe(i18n.global.t('chat.copyDiagnosticId'))
+    expect(host.querySelector('.chat-compaction-event__body [role="status"]')).toBeNull()
   })
 
   it.each([

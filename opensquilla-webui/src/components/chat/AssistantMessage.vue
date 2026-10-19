@@ -449,7 +449,7 @@
           <button
             type="button"
             class="msg-action"
-            :class="{ 'msg-action--ok': copyState === 'ok', 'msg-action--err': copyState === 'err' }"
+            :class="{ 'msg-action--err': copyState === 'err' }"
             :title="copyTitle"
             :aria-label="copyTitle"
             @click="onCopyClick"

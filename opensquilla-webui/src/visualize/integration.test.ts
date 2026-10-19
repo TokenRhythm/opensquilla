@@ -412,7 +412,7 @@ describe('Visualize production chat components', () => {
     expect(toasts).not.toHaveBeenCalled()
     const png = new Blob(['captured pixels'], { type: 'image/png' }); resolveCapture(png); await settle()
     expect(await image).toBe(png)
-    expect(host.querySelector('.visualize-export-feedback')?.textContent).toBe('Image copied')
+    expect(host.querySelector('.visualize-export-feedback')).toBeNull()
     expect(toasts).not.toHaveBeenCalled()
     expect(host.querySelector('dialog')?.getAttribute('aria-modal')).toBeNull()
     expect(mounts).toHaveLength(1)

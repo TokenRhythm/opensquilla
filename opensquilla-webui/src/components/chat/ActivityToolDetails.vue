@@ -41,7 +41,6 @@
         type="button"
         class="activity-tool-details__copy"
         :class="{
-          'is-copied': copyState === 'copied',
           'is-error': copyState === 'error',
         }"
         data-share-control
@@ -56,7 +55,7 @@
         class="activity-tool-details__copy-status"
         aria-live="polite"
         aria-atomic="true"
-      >{{ copyState === 'idle' ? '' : copyLabel }}</span>
+      >{{ copyState === 'error' ? copyLabel : '' }}</span>
       <div
         class="activity-tool-details__window"
         role="region"
@@ -315,19 +314,13 @@ const isBoundedDetail = computed(() => !projection.value.codeView
   && Boolean(projection.value.rawContent || genericLog.value))
 
 const copyLabel = computed(() => (
-  copyState.value === 'copied'
-    ? t('chat.copied')
-    : copyState.value === 'error'
-      ? t('chat.toast.copyFailed')
-      : t(detailPartial.value ? 'shared.runTrace.copyPreview' : 'chat.copy')
+  copyState.value === 'error'
+    ? t('chat.toast.copyFailed')
+    : t(detailPartial.value ? 'shared.runTrace.copyPreview' : 'chat.copy')
 ))
 
 const copyIcon = computed(() => (
-  copyState.value === 'copied'
-    ? 'check'
-    : copyState.value === 'error'
-      ? 'x'
-      : 'copy'
+  copyState.value === 'copied' ? 'check' : copyState.value === 'error' ? 'x' : 'copy'
 ))
 
 function clearCopyReset() {
@@ -534,7 +527,6 @@ const detailActionLabel = computed(() => {
 .activity-tool-details__copy { position: absolute; top: 0.25rem; right: 0.375rem; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-muted); cursor: pointer; }
 .activity-tool-details__copy:hover { background: var(--bg-hover); color: var(--text); }
 .activity-tool-details__copy:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-.activity-tool-details__copy.is-copied { color: var(--ok); }
 .activity-tool-details__copy.is-error { color: var(--danger); }
 .activity-tool-details__copy-status { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .activity-tool-details__summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 0.35rem; width: fit-content; max-width: 100%; min-width: 0; color: var(--text-muted); }

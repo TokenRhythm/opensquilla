@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { nextTick, ref } from 'vue'
+import { IDBFactory as MemoryIdbFactory, IDBKeyRange as MemoryIdbKeyRange } from 'fake-indexeddb'
 import { useChatPendingQueue } from '@/composables/chat/useChatPendingQueue'
 import { createPendingQueuePolicy } from './pendingQueuePolicy'
 
@@ -13,6 +14,44 @@ import {
 const PENDING_STORE = 'pending_chat_inputs'
 const HANDOFF_STORE = 'response_handoffs'
 afterEach(() => vi.unstubAllGlobals())
+
+it('upgrades v3 without erasing queued drafts and fences clients that would drop command intent', async () => {
+  vi.stubGlobal('IDBKeyRange', MemoryIdbKeyRange)
+  const factory = new MemoryIdbFactory()
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = factory.open('opensquilla-chat-pending-inputs', 3)
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(PENDING_STORE, { keyPath: 'pendingInputId' })
+        .createIndex('session_created', ['sessionKey', 'createdAt'])
+      request.result.createObjectStore(HANDOFF_STORE, { keyPath: 'ownerRequestId' })
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+  const legacy: PendingInputWalRecord = { schemaVersion: 1, pendingInputId: 'legacy', sessionKey: 'session',
+    clientRequestId: 'legacy-request', clientMessageId: 'legacy-message', text: 'keep this draft', attachments: [],
+    intent: null, state: 'local_only', createdAt: 1, updatedAt: 1 }
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(PENDING_STORE, 'readwrite')
+    transaction.objectStore(PENDING_STORE).put(legacy)
+    transaction.oncomplete = () => resolve()
+    transaction.onerror = () => reject(transaction.error)
+  })
+  database.close()
+  const wal = createPendingInputWal(factory)!
+  const command = { ...legacy, pendingInputId: 'init', turnCommand: { name: 'project.init' as const, args: '' }, text: '/init' }
+  await wal.put(command)
+  expect(await wal.list('session')).toEqual(expect.arrayContaining([legacy, command]))
+  wal.close()
+  await expect(new Promise((resolve, reject) => {
+    const request = factory.open('opensquilla-chat-pending-inputs', 3)
+    request.onsuccess = () => { request.result.close(); resolve(request.result) }
+    request.onerror = () => reject(request.error)
+  })).rejects.toMatchObject({ name: 'VersionError' })
+  const reopened = createPendingInputWal(factory)!
+  expect(await reopened.list('session')).toHaveLength(2)
+  reopened.close()
+})
 
 async function stoppedQueueHandoffFixture() {
   vi.stubGlobal('IDBKeyRange', { bound: (lower: unknown, upper: unknown) => ({ lower, upper }) })
@@ -595,12 +634,12 @@ function deliveryRecord(id = 'synthetic-delivery'): DeliveryWalRecord {
   }
 }
 
-it('uses v3 and preserves delivery authority while handoff fields change', async () => {
+it('uses v4 and preserves delivery authority while handoff fields change', async () => {
   const factory = new ControlledIdbFactory()
   const wal = createPendingInputWal(factory.idbFactory)!
   const record = deliveryRecord()
   await wal.prepareDelivery!(record)
-  expect(factory.versions).toEqual([3])
+  expect(factory.versions).toEqual([4])
   const handoff: ResponseHandoffWalRecord = {
     schemaVersion: 1, ownerRequestId: record.ownerRequestId, requestSessionKey: record.requestSessionKey,
     clientRequestId: record.ownerRequestId, clientMessageId: 'synthetic-message', composerText: 'synthetic text',

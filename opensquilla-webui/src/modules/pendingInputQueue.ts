@@ -1,10 +1,12 @@
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { ChatPageContext } from '@/types/pageContext'
+import type { ProjectInitTurnCommand } from '@/types/turnCommand'
 import type { InjectionKey } from 'vue'
 import type { Attachment, WorkspaceFileReference } from '@/types/chat'
 
 /** Domain-facing representation of a durable pending-input row. */
 export interface PendingInputServerItem {
+  readonly turnCommand?: ProjectInitTurnCommand
   readonly pendingInputId: string
   readonly clientRequestId: string
   readonly clientMessageId: string
@@ -30,6 +32,7 @@ export interface PendingInputServerAttachment {
 }
 
 export interface PendingInputEnqueueRequest {
+  turnCommand?: ProjectInitTurnCommand
   key: string
   pendingInputId: string
   clientRequestId?: string

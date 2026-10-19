@@ -96,6 +96,65 @@ function pendingUiId(
   return id!
 }
 
+describe('queued project initialization intent', () => {
+  const turnCommand = { name: 'project.init' as const, args: 'preserve existing notes' }
+
+  it('persists command intent through WAL, Gateway staging, and hydration', async () => {
+    const wal = memoryWal()
+    const call = vi.fn(async () => ({ requestFingerprint: 'init-fingerprint', revision: 1 }))
+    const h = makeQueue(undefined, () => true, {
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+      pendingInputWal: wal.wal, supportsTurnCommand: async () => true,
+    })
+    h.inputText.value = '/init preserve existing notes'
+    try {
+      expect(await h.queue.enqueuePendingInput(h.inputText.value, undefined, { turnCommand })).toBe(true)
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged'))
+      expect(call).toHaveBeenCalledWith('sessions.pending_inputs.enqueue', expect.objectContaining({ turnCommand }))
+      expect((await wal.wal.list(h.sessionKey.value))[0]?.turnCommand).toEqual(turnCommand)
+    } finally { h.queue.cleanup() }
+    const restored = makeQueue(undefined, () => true, { pendingInputWal: wal.wal })
+    try {
+      await restored.queue.hydratePendingQueue()
+      expect(restored.queue.pendingQueue.value[0]?.turnCommand).toEqual(turnCommand)
+    } finally { restored.queue.cleanup() }
+  })
+
+  it('keeps a saved command local when the current Gateway lacks its catalog capability', async () => {
+    const wal = memoryWal()
+    const call = vi.fn()
+    const h = makeQueue(undefined, () => true, {
+      rpc: { call }, hasRpcMethod: () => true, pendingInputWal: wal.wal,
+      supportsTurnCommand: async () => false,
+    })
+    try {
+      await h.queue.enqueuePendingInput('/init', undefined, { turnCommand })
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only'))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect((await wal.wal.list(h.sessionKey.value))[0]?.turnCommand).toEqual(turnCommand)
+    } finally { h.queue.cleanup() }
+  })
+
+  it('keeps a command locally owned if support is revoked during its admission WAL write', async () => {
+    const wal = memoryWal()
+    const call = vi.fn()
+    const supports = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false)
+    const h = makeQueue(undefined, () => true, {
+      rpc: { call }, hasRpcMethod: () => true, pendingInputWal: wal.wal,
+      supportsTurnCommand: supports,
+    })
+    try {
+      await h.queue.enqueuePendingInput('/init', undefined, { turnCommand })
+      await vi.waitFor(() => expect(supports).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only'))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect((await wal.wal.list(h.sessionKey.value))[0]).toMatchObject({
+        state: 'local_only', mayHaveServerCopy: false, turnCommand,
+      })
+    } finally { h.queue.cleanup() }
+  })
+})
+
 describe('manual compaction with the real pending composer queue', () => {
   it('persists explicit path metadata in the WAL and restores chips without duplicate paths', async () => {
     const path = 'C:\\资料\\book.pdf'

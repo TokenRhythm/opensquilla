@@ -290,9 +290,7 @@ async function save() {
     if (!isCurrentDialog(generation, savedSessionKey)) return
     status.value = next
     emit('saved', { sessionKey: savedSessionKey, status: next })
-    pushToast(t(next.enabled
-      ? 'chat.promptCacheKeepalive.enabledToast'
-      : 'chat.promptCacheKeepalive.disabledToast'), { tone: 'ok' })
+    if (next.enabled) pushToast(t('chat.promptCacheKeepalive.enabledToast'), { tone: 'ok' })
     emit('close')
   } catch (cause) {
     if (!isCurrentDialog(generation, savedSessionKey)) return

@@ -710,12 +710,21 @@ describe('rpc link-token bootstrap', () => {
     expect(store.isLocalOwner).toBe(true)
     expect(store.canManageProjectWorkspaces).toBe(true)
     expect(store.canChooseProject).toBe(true)
+    expect(store.canCreateProjectWorkspace).toBe(false)
+
+    clients[0].emit('_hello', {
+      auth: { principal: { isOwner: true } },
+      features: { methods: ['workspaces.list', 'workspaces.open', 'workspaces.create'] },
+    })
+    expect(store.canCreateProjectWorkspace).toBe(true)
 
     clients[0].emit('_state', 'connecting')
     expect(store.auth).toBeNull()
     expect(store.methods).toEqual([])
     expect(store.events).toEqual([])
     expect(store.canManageProjectWorkspaces).toBe(false)
+
+    expect(store.canCreateProjectWorkspace).toBe(false)
 
     clients[0].emit('_state', 'connected')
     clients[0].emit('_hello', {

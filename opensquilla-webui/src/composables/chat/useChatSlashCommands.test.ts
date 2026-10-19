@@ -1,5 +1,5 @@
 import i18n, { loadLocaleMessages } from '@/i18n'
-import { ref, watch } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
@@ -21,6 +21,95 @@ function deferred() {
   })
   return { promise, resolve }
 }
+
+const initCatalogCommand = {
+  name: '/init', aliases: [], category: 'turn', busy_policy: 'next_turn', presentation: 'turn',
+  execution: { kind: 'local', action: 'project.init' },
+}
+
+describe('project initialization command intent', () => {
+  it('requires catalog support and resolves only an explicitly typed init command', async () => {
+    const { api } = harness(false, [initCatalogCommand])
+    await expect(api.classifySlashCommand('/init keep existing sections')).resolves.toBe('registered')
+    expect(api.resolveTurnCommand('/init keep existing sections')).toEqual({ name: 'project.init', args: 'keep existing sections' })
+    expect(api.resolveTurnCommand('//init')).toBeNull()
+    expect(api.resolveTurnCommand('Please explain /init')).toBeNull()
+    expect(api.resolveTurnCommand('> /init')).toBeNull()
+  })
+
+  it('keeps init unavailable on an older Gateway instead of sending ordinary text', async () => {
+    const { api, inputText, notify } = harness(false)
+    inputText.value = '/init'
+    await expect(api.classifySlashCommand('/init')).resolves.toBe('unavailable')
+    await expect(api.executeSlashCommand('/init')).resolves.toBe(true)
+    expect(notify).toHaveBeenCalledWith(i18n.global.t('chat.slashCommands.initUnavailable'))
+    expect(inputText.value).toBe('/init')
+  })
+
+  it('does not treat an init action without ordinary-turn scheduling evidence as supported', async () => {
+    const { api } = harness(false, [{ ...initCatalogCommand, category: undefined }])
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('invalidates command support when the Gateway scope changes', async () => {
+    const scope = ref('profile-a')
+    const { api, rpc } = harness(false, [initCatalogCommand], Promise.resolve(), undefined, { catalogScope: () => scope.value })
+    await api.loadSlashCommands()
+    expect(api.resolveTurnCommand('/init')).not.toBeNull()
+    scope.value = 'profile-b'
+    await nextTick()
+    expect(api.resolveTurnCommand('/init')).toBeNull()
+    rpc.call.mockResolvedValue({ commands: [] })
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('reloads an invalidated catalog when the palette reopens and shares the pending request', async () => {
+    const scope = ref('epoch-1')
+    const { api, rpc, inputText } = harness(true, [initCatalogCommand, { name: '/compact', aliases: [] }],
+      Promise.resolve(), undefined, { catalogScope: () => scope.value })
+    await api.loadSlashCommands()
+    inputText.value = '/'
+    api.handleSlashInput()
+    expect(api.filteredSlashCmds.value.map(command => command.cmd)).toEqual(['/init', '/compact', '/plan'])
+    scope.value = 'epoch-2'
+    const ready = deferred()
+    rpc.call.mockImplementationOnce(async () => { await ready.promise; return { commands: [initCatalogCommand] } })
+    api.handleSlashInput()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    const supported = api.supportsTurnCommand({ name: 'project.init', args: '' })
+    inputText.value = '/in'
+    api.handleSlashInput()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    ready.resolve()
+    await expect(supported).resolves.toBe(true)
+    expect(inputText.value).toBe('/in')
+    expect(api.filteredSlashCmds.value.map(command => command.cmd)).toEqual(['/init'])
+  })
+
+  it('discards a late catalog from the previous scope', async () => {
+    const scope = ref('epoch-1')
+    const ready = deferred()
+    const { api, rpc } = harness(false, [initCatalogCommand], ready.promise, undefined, { catalogScope: () => scope.value })
+    const previous = api.loadSlashCommands()
+    scope.value = 'epoch-2'
+    rpc.call.mockResolvedValue({ commands: [] })
+    await api.loadSlashCommands()
+    ready.resolve()
+    await previous
+    expect(api.resolveTurnCommand('/init')).toBeNull()
+    await expect(api.supportsTurnCommand({ name: 'project.init', args: '' })).resolves.toBe(false)
+  })
+
+  it('retries a failed catalog when the palette is opened again', async () => {
+    const { api, rpc, inputText } = harness(false, [initCatalogCommand])
+    rpc.call.mockRejectedValueOnce(new Error('temporarily unavailable'))
+    await api.loadSlashCommands()
+    inputText.value = '/'
+    api.handleSlashInput()
+    await vi.waitFor(() => expect(api.filteredSlashCmds.value.some(command => command.cmd === '/init')).toBe(true))
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+  })
+})
 
 function harness(
   planModeAvailable: boolean,
@@ -173,7 +262,8 @@ describe('useChatSlashCommands compaction lifecycle', () => {
 describe('local side chat command palette', () => {
   it('has one primary entry searchable by its alias before the remote catalog loads', async () => {
     const run = vi.fn(async () => true)
-    const { api, inputText, rpc } = harness(false, [], Promise.resolve(), undefined, { sideChat: { run } })
+    const ready = deferred()
+    const { api, inputText, rpc } = harness(false, [], ready.promise, undefined, { sideChat: { run } })
     for (const query of ['/si', '/btw']) {
       inputText.value = query
       api.handleSlashInput()
@@ -183,7 +273,8 @@ describe('local side chat command palette', () => {
     await expect(api.classifySlashCommand('/btw question')).resolves.toBe('registered')
     await expect(api.executeSlashCommand('/btw question')).resolves.toBe(true)
     expect(run).toHaveBeenCalledWith('/btw question')
-    expect(rpc.call).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    ready.resolve()
   })
 
   it('completes only the leading token and preserves all prose after the caret', () => {
@@ -577,7 +668,7 @@ describe('useChatSlashCommands goal', () => {
     await api.executeSlashCommand(inputText.value)
 
     expect(goalClear).toHaveBeenCalledTimes(1)
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('cleared'))
+    expect(notify).not.toHaveBeenCalled()
   })
 
   it('pauses and resumes via /goal pause and /goal resume', async () => {
@@ -585,11 +676,12 @@ describe('useChatSlashCommands goal', () => {
     inputText.value = '/goal pause'
     await api.executeSlashCommand(inputText.value)
     expect(goalPause).toHaveBeenCalledTimes(1)
+    expect(notify).not.toHaveBeenCalled()
 
     inputText.value = '/goal resume'
     await api.executeSlashCommand(inputText.value)
     expect(goalResume).toHaveBeenCalledTimes(1)
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('resumed'))
+    expect(notify).not.toHaveBeenCalled()
   })
 
   it('edits the current Goal through the authoritative Goal composable', async () => {

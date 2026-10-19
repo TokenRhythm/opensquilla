@@ -56,6 +56,7 @@ export interface GatewayAccess {
   readonly deliveryIdentity: string | null
   readonly canManageProjectWorkspaces: boolean
   readonly canChooseProject: boolean
+  readonly canCreateProjectWorkspace?: boolean
   readonly runModePolicy: GatewayRunModePolicy | null
   readonly streamIdleTimeoutMs: number | null
   readonly concurrentHistoryReads: boolean

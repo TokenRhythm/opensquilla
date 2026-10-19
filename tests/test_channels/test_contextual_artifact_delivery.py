@@ -130,7 +130,8 @@ async def test_artifact_delivery_keeps_legacy_send_file_signature(tmp_path: Path
         expected_session_id="session-1",
     )
 
-    assert undelivered == []
+    assert len(undelivered) == 1
+    assert "awaiting confirmation" in undelivered[0]["channel_delivery_issue"]
     assert calls == [("chat-1", "legacy.txt", b"legacy")]
 
 

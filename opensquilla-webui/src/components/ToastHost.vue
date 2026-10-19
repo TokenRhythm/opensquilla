@@ -3,6 +3,7 @@
     name="toast-stack"
     tag="div"
     class="toast-host"
+    :class="{ 'toast-host--above-tabbar': mobileTabbarVisible }"
     aria-live="polite"
     data-testid="toast-host"
   >
@@ -47,6 +48,8 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useToasts, type ToastItem } from '@/composables/useToasts'
 
+defineProps<{ mobileTabbarVisible?: boolean }>()
+
 const { t } = useI18n()
 const { toasts, dismissToast, pauseToast, resumeToast, runToastAction } = useToasts()
 
@@ -73,22 +76,17 @@ watchPostEffect(() => {
 
 <style scoped>
 .toast-host {
-  /* One viewport-owned stack for every conversation. Keep the lower half
-     available to composers and Stop, including a resized workbench pane. */
   position: fixed;
-  top: calc(56px + env(safe-area-inset-top, 0px));
-  inset-inline: var(--sp-4);
-  width: min(392px, calc(100% - 2 * var(--sp-4)));
-  max-height: max(56px, calc(50dvh - 56px - env(safe-area-inset-top, 0px)));
-  margin-inline: auto;
-  padding: var(--sp-2);
-  box-sizing: border-box;
+  right: var(--sp-4);
+  bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px));
+  max-width: calc(100% - 2 * var(--sp-4));
+  max-height: 50dvh;
   overflow: auto;
   overscroll-behavior: contain;
   z-index: 1000;
   display: flex;
   flex-direction: column;
-  align-items: stretch;
+  align-items: flex-end;
   gap: var(--sp-2);
   pointer-events: none;
 }
@@ -99,6 +97,7 @@ watchPostEffect(() => {
   flex-shrink: 0;
   align-items: center;
   gap: var(--sp-2);
+  max-width: 360px;
   padding: 11px 12px 11px 14px;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -216,6 +215,21 @@ watchPostEffect(() => {
   .toast-stack-leave-active,
   .toast-stack-move {
     transition: none;
+  }
+}
+
+@media (max-width: 768px) {
+  .toast-host {
+    left: var(--sp-4);
+    align-items: stretch;
+  }
+
+  .toast-host--above-tabbar {
+    bottom: calc(var(--mobile-tabbar-h) + env(safe-area-inset-bottom, 0px) + var(--sp-4));
+  }
+
+  .toast {
+    max-width: none;
   }
 }
 
