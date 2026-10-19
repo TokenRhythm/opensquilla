@@ -429,11 +429,14 @@ try {
   assert.equal(deleteAllProcess.signalCode, null)
   desktopApp = null
   try {
-    await waitFor(async () => (
-      !await exists(primaryHome)
-      && !await exists(consolidationBackupRoot)
-      && !await exists(join(userData, 'logs'))
-    ), 'post-exit delete-all helper completion', deleteAllHelperTimeoutMs)
+    const helperReport = await waitFor(async () => {
+      const output = await readFile(join(helperDiagnostics, 'stdout.log'), 'utf8').catch(() => '')
+      try { return JSON.parse(output) } catch { return null }
+    }, 'post-exit delete-all helper completion', deleteAllHelperTimeoutMs)
+    assert.equal(helperReport.outcome, 'complete', helperReport.stable_code)
+    assert.equal(await exists(primaryHome), false)
+    assert.equal(await exists(consolidationBackupRoot), false)
+    assert.equal(await exists(join(userData, 'logs')), false)
   } catch (error) {
     const pendingTargets = await pendingDeleteAllTargets()
     throw new Error(

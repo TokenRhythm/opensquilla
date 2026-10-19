@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -673,22 +674,29 @@ def recovery_cleanup_apply(
             )
         # Electron writes the exact user-approved kind/path scope but keeps the
         # pipe open. Reading the complete bounded payload therefore blocks until
-        # parent exit has released Chromium/userData handles and delivered EOF.
+        # parent exit has delivered EOF; Chromium may still finish an exit write.
         approved_scope = _read_parent_cleanup_approval(
             user_data=user_data,
             expected_fingerprint=expected_scope_fingerprint,
         )
-        refreshed = cleanup_inspect(
-            user_data,
-            mode=mode,
-            profile_kind=profile_kind,
-            recovery_id=recovery_id,
-        )
-        if refreshed.outcome != "ready":
-            _cleanup_exit(refreshed, json_output=json_output)
-            return
-        refreshed_scope = frozenset(_cleanup_scope_pair(item) for item in refreshed.items)
-        if not refreshed_scope.issubset(approved_scope):
+        # Chromium can finish an atomic Preferences write just after parent EOF.
+        # Reinspect briefly without deleting anything or expanding the approval.
+        for attempt in range(5):
+            if attempt:
+                time.sleep(0.1)
+            refreshed = cleanup_inspect(
+                user_data,
+                mode=mode,
+                profile_kind=profile_kind,
+                recovery_id=recovery_id,
+            )
+            if refreshed.outcome != "ready":
+                _cleanup_exit(refreshed, json_output=json_output)
+                return
+            refreshed_scope = frozenset(_cleanup_scope_pair(item) for item in refreshed.items)
+            if refreshed_scope.issubset(approved_scope):
+                break
+        else:
             _cleanup_exit(
                 replace(
                     refreshed,
