@@ -577,9 +577,19 @@ def activate_desktop_gateway_ownership(
     try:
         owner.acquire()
     except BaseException:
-        from opensquilla.desktop_process_cleanup import release_desktop_process_cleanup
+        from opensquilla.desktop_process_cleanup import (
+            abort_desktop_process_cleanup,
+            release_desktop_process_cleanup,
+        )
 
-        release_desktop_process_cleanup(owner.instance_nonce)
+        try:
+            abort_desktop_process_cleanup(owner.state_dir, owner.instance_nonce)
+        except Exception:
+            # Preserve the ownership failure. A later independent cleanup can
+            # still close the launch fence if rollback itself is unavailable.
+            pass
+        finally:
+            release_desktop_process_cleanup(owner.instance_nonce)
         raise
     _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP = owner
     return owner

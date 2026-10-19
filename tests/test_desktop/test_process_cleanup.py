@@ -418,6 +418,9 @@ def test_desktop_ownership_acquire_failure_deactivates_process_scope(tmp_path, m
         )
     assert cleanup._active_scope is None
     assert desktop_ownership._ACTIVE_DESKTOP_GATEWAY_OWNERSHIP is None
+    assert not list((tmp_path / "control" / profile_lock_key(profile)).glob(
+        "process-launch-*.json",
+    ))
 
 
 def test_delayed_registration_retains_launch_fence_after_ownership_release(tmp_path):
