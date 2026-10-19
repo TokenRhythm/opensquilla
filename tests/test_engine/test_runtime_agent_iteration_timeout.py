@@ -56,6 +56,7 @@ async def test_run_accepts_legacy_tool_and_iteration_timeouts_without_enforcing_
     session_manager.update = AsyncMock(return_value=None)
     session_manager.get_compaction_summary = AsyncMock(return_value=None)
     session_manager.get_transcript = AsyncMock(return_value=[])
+    session_manager.resolve_compaction_context = AsyncMock(return_value=([], ""))
 
     runner = TurnRunner(
         provider_selector=selector,

@@ -92,10 +92,17 @@ class _ToolThenCompletedTextProvider(_ToolThenHangingTextProvider):
 
 
 class _HangingIntermediateTextProvider(_ToolThenHangingTextProvider):
-    """Start a tool and then stream work narration before cancellation."""
+    """Accept a tool/narration response, then wait for cancellation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.next_call_started = asyncio.Event()
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        del call_number
+        if call_number > 1:
+            self.next_call_started.set()
+            await asyncio.Event().wait()
+            return
         yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="lookup")
         yield ProviderToolUseEnd(
             tool_use_id="tool-1",
@@ -103,7 +110,9 @@ class _HangingIntermediateTextProvider(_ToolThenHangingTextProvider):
             arguments={},
         )
         yield ProviderText(text=PARTIAL_ACTIVITY)
-        await asyncio.Event().wait()
+        # A completed tool response is required before its narration may be
+        # published. Cancellation tests accepted text, not a provisional batch.
+        yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
 
 
 class _HangingReasoningProvider:
@@ -507,9 +516,15 @@ async def test_cancelled_turn_preserves_intermediate_text_presentation(tmp_path)
     manager = SessionManager(storage)
     session_key = "agent:main:webchat:cancel-intermediate-text"
     await manager.create(session_key)
+    provider = _HangingIntermediateTextProvider()
+    registry = _registry()
+    lookup_tool = registry.get("lookup")
+    assert lookup_tool is not None
+    lookup = AsyncMock(wraps=lookup_tool.handler)
+    registry.register(lookup_tool.spec, lookup)
     runner = TurnRunner(
-        provider_selector=_ProviderSelector(_HangingIntermediateTextProvider()),
-        tool_registry=_registry(),
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=registry,
         session_manager=manager,
         config=GatewayConfig(
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
@@ -538,11 +553,13 @@ async def test_cancelled_turn_preserves_intermediate_text_presentation(tmp_path)
     task = asyncio.create_task(_consume())
     try:
         await asyncio.wait_for(partial_seen.wait(), timeout=5.0)
-        await asyncio.sleep(0)
+        await asyncio.wait_for(provider.next_call_started.wait(), timeout=5.0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
+        lookup.assert_awaited_once()
+        assert provider.calls == 2
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
         text_segments = [
