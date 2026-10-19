@@ -115,8 +115,15 @@ class TerminalManager:
         self._lock = asyncio.Lock()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_connections: set[str] = set()
+        self._closing_connections: OrderedDict[str, None] = OrderedDict()
         self._creating: dict[str, int] = {}
         self._closing = False
+
+    def _remember_closing_connection(self, conn_id: str) -> None:
+        self._closing_connections[conn_id] = None
+        self._closing_connections.move_to_end(conn_id)
+        while len(self._closing_connections) > MAX_CLOSED_TERMINALS:
+            self._closing_connections.popitem(last=False)
 
     def _owned(self, terminal_id: str, conn_id: str) -> TerminalSession:
         session = self._sessions.get(terminal_id)
@@ -176,6 +183,7 @@ class TerminalManager:
         """Schedule one bounded close for every terminal owned by a socket."""
 
         self._cleanup_connections.discard(conn_id)
+        self._remember_closing_connection(conn_id)
         self.schedule_close_connection(conn_id)
 
     def _release_create_slot(self, conn_id: str) -> None:
@@ -199,7 +207,7 @@ class TerminalManager:
         output_flow_control: bool = False,
     ) -> dict[str, Any]:
         async with self._lock:
-            if self._closing:
+            if self._closing or conn_id in self._closing_connections:
                 raise TerminalSessionError(
                     "TERMINAL_CLOSED", "Gateway terminal sessions are shutting down"
                 )
@@ -318,7 +326,7 @@ class TerminalManager:
                 # Recheck after the potentially slow native spawn. A
                 # concurrent create cannot use the race to exceed the
                 # per-connection bound.
-                if self._closing:
+                if self._closing or conn_id in self._closing_connections:
                     raise TerminalSessionError(
                         "TERMINAL_CLOSED", "Gateway terminal sessions are shutting down"
                     )
@@ -608,6 +616,7 @@ class TerminalManager:
         task.add_done_callback(self._cleanup_tasks.discard)
 
     async def close_connection(self, conn_id: str) -> None:
+        self._remember_closing_connection(conn_id)
         sessions = [item for item in tuple(self._sessions.values()) if item.conn_id == conn_id]
         for session in sessions:
             await self._close_session(session, reason="connection_closed")

@@ -683,6 +683,44 @@ async def test_terminal_create_finishing_after_gateway_shutdown_is_rejected(
     assert manager._creating == {}
 
 
+@pytest.mark.asyncio
+async def test_terminal_create_finishing_after_connection_close_is_rejected(
+    tmp_path, monkeypatch
+):
+    handle = _FakeHandle()
+
+    def delayed_spawn(*args, **kwargs):
+        time.sleep(0.2)
+        return handle
+
+    async def terminate(value):
+        assert value is handle
+        handle.terminated = True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", delayed_spawn)
+    monkeypatch.setattr(
+        terminal_sessions,
+        "capture_process_tree_owner",
+        lambda *_args, **_kwargs: SimpleNamespace(start_completion_monitor=lambda: None),
+    )
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    manager = terminal_sessions.TerminalManager(send_event=lambda *_args: None)
+    creating = asyncio.create_task(manager.create(
+        conn_id="conn-close-race", session_key="agent:main:webchat:race",
+        workspace_service=_WorkspaceService(tmp_path), cwd="", command="sleep 30",
+        cols=80, rows=24,
+    ))
+    await asyncio.sleep(0.02)
+    manager.on_connection_cleanup("conn-close-race")
+    with pytest.raises(terminal_sessions.TerminalSessionError, match="shutting down"):
+        await creating
+    await asyncio.gather(*tuple(manager._cleanup_tasks))
+    await asyncio.sleep(0)
+    assert handle.terminated is True
+    assert manager._sessions == {}
+    assert manager._creating == {}
+
+
 
 @pytest.mark.asyncio
 async def test_terminal_reader_failure_terminates_live_shell_before_wait(
