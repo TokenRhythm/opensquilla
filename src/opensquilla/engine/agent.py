@@ -15353,7 +15353,7 @@ class Agent:
                 *(request_suffix_messages or []),
             ]
             active_config = consumer_chat_config or self._provider_admission_chat_config(
-                self._current_turn_message or "",
+                getattr(self, "_current_turn_message", "") or "",
                 context_window_tokens=self.config.context_window_tokens,
             )
 
@@ -15365,7 +15365,7 @@ class Agent:
                     runtime_context_insert_index=int(mapped_runtime_index or 0),
                 )
                 active_index = _active_user_message_index_for_request(
-                    assembled, current_user_text=self._current_turn_message or "",
+                    assembled, current_user_text=getattr(self, "_current_turn_message", "") or "",
                 )
                 return project_provider_final_request(
                     self.provider, assembled, (

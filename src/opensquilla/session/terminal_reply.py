@@ -39,9 +39,10 @@ IMAGE_INPUT_UNSUPPORTED_MESSAGE = (
     "The selected model cannot process image input. Choose an image-capable "
     "model or remove the image and try again."
 )
-_REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE = (
-    "the provider used the configured output budget for reasoning without returning a visible "
+_REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGES = frozenset(
+    f"the provider used the {budget} output budget for reasoning without returning a visible "
     "answer. increase llm.max_tokens or choose another model or provider."
+    for budget in ("configured", "available")
 )
 _REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE = (
     "The model used its output budget for reasoning without returning a visible answer. "
@@ -135,7 +136,7 @@ def safe_provider_failure_message(
     """
 
     if code == "empty_response" and isinstance(message, str) and message.lower() in {
-        _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE,
+        *_REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGES,
         _REASONING_ONLY_EMPTY_ERROR_MESSAGE,
     }:
         return message
@@ -231,7 +232,7 @@ def build_terminal_reply(
         ) + capacity_hint
     if (
         error_class == "empty_response"
-        and error_message == _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE
+        and error_message in _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGES
     ):
         return _REASONING_ONLY_OUTPUT_BUDGET_TERMINAL_MESSAGE
     if (

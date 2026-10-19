@@ -26,10 +26,8 @@ from opensquilla.provider.types import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
-from tests.test_engine import test_selector_provider_recovery as recovery_tests
 from tests.test_engine.test_selector_provider_recovery import _agent, _success, _wrapper
-
-clock = recovery_tests.clock
+from tests.test_engine.test_selector_provider_recovery import clock as clock
 
 
 def limited():

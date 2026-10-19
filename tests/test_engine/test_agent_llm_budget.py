@@ -67,7 +67,9 @@ RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
 def _inline_template_capacity(
     agent: Agent, provider: Any, *, window: int, output: int, char_cap: int,
 ) -> tuple[int, int]:
-    """Measure the inline replay envelope, whose summary is a message prefix."""
+    """Measure soft planning capacity; final candidates still need hard proof."""
+    from opensquilla.context_budget import soft_input_tokens
+
     messages = agent._provider_request_messages_for_count_projection(
         [Message(role="user", content="[Context summary]\n[candidate checkpoint]"),
          Message(role="assistant", content="Understood. Continuing from summary.")],
@@ -83,9 +85,13 @@ def _inline_template_capacity(
             provider_request_proof_max_chars=char_cap,
         ),
     )
+    soft_tokens = soft_input_tokens(window)
+    soft_chars = soft_tokens * 4
+    if char_cap > 0:
+        soft_chars = min(soft_chars, projection.proof["effective_proof_budget"])
     return (
-        projection.proof["effective_proof_token_budget"] - projection.proof["estimated_tokens"],
-        projection.proof["effective_proof_budget"] - projection.proof["estimated_chars"],
+        soft_tokens - projection.proof["estimated_tokens"],
+        soft_chars - projection.proof["estimated_chars"],
     )
 
 
@@ -544,9 +550,10 @@ def test_raw_attachment_capacity_reserves_actual_anthropic_generation_budget(
     assert len(observed) == 1
     # Anthropic raises the wire output cap to thinking + 4,096. Both input
     # dimensions must reserve that cap once, before proof headroom and fixed
-    # request content are subtracted.
+    # request content are subtracted. The soft planning reserve is not another
+    # deduction from this physical request proof.
     assert observed[0]["generation_budget"] == 14_096
-    assert observed[0]["token_budget"] == 128_000 - 14_096 - 20_000
+    assert observed[0]["token_budget"] == 128_000 - 14_096
     assert observed[0]["proof_budget"] == 4 * observed[0]["token_budget"]
     assert 0 < capacity < observed[0]["token_budget"] - 4_096
 
@@ -2437,9 +2444,16 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
         return await compact_core(request)
 
     monkeypatch.setattr("opensquilla.engine.agent.compact_context", capture_request)
+    # Token pressure must exceed the physical window even after the adapter
+    # fits the output cap. The old ASCII fixture fits under dynamic output.
+    background = (
+        "甲乙丙丁戊己庚辛壬癸" * 400
+        if pressure == "tokens"
+        else "Completed ordinary background. " * 150
+    )
     messages = [
         Message(role="user" if index % 2 == 0 else "assistant",
-                content="Completed ordinary background. " * 150)
+                content=background)
         for index in range(4)
     ]
     current = Message(role="user", content="Continue the active task exactly")
@@ -2467,6 +2481,7 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
         assert proof["estimated_tokens"] < proof["effective_proof_token_budget"] * 0.85
     else:
         assert proof["estimated_chars"] < proof["effective_proof_budget"] * 0.85
+        assert proof["estimated_tokens"] > agent.config.context_window_tokens
 
     outcome = await agent._check_context_overflow(
         messages,
@@ -2487,6 +2502,24 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
     assert outcome.removed_count == 4
     assert outcome.messages[-1] is current
     assert messages[-1] is current and len(messages) == 5
+    final_projection = provider.project_final_request(
+        agent._provider_request_messages_for_count_projection(
+            outcome.messages,
+            request_context_message=agent._request_context_message(
+                agent.config.request_context_prompt,
+            ),
+            request_context_insert_index=len(outcome.messages),
+            runtime_context_message=agent._freeze_preflight_runtime_context_message(),
+            runtime_context_insert_index=len(outcome.messages),
+        ),
+        agent.tool_definitions,
+        agent._provider_admission_chat_config(
+            "", context_window_tokens=agent.config.context_window_tokens,
+            max_output_tokens=8192,
+            provider_request_proof_max_chars=agent.config.provider_request_proof_max_chars,
+        ),
+    )
+    assert final_projection.fits
 
 
 @pytest.mark.asyncio
@@ -3024,6 +3057,8 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
         assert request.context_window_tokens == request.config.budget.history_capacity_tokens
         assert request.context_window_chars == request.config.budget.history_capacity_chars
         cut = int(request.forced_prefix_cut)
+        assert request.consumer_admission("first completed tool round", request.entries[cut:])
+        assert not request.consumer_admission("oversized checkpoint " * 1_000, [])
         return CompactionResult(
             summary="first completed tool round",
             kept_entries=request.entries[cut:],
@@ -3065,12 +3100,16 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
     assert len(provider.calls) == 5
     assert len(compact_requests) == 1
     assert all(request.config.budget is not None for request in compact_requests)
-    # All completed rounds are eligible at once. Only the active prompt and
-    # actual fixed envelope consume raw capacity; no implicit recent-pair
-    # retry is needed before admitting the compacted request.
-    assert all(request.context_window_tokens < 2_750 for request in compact_requests)
-    assert all(request.context_window_chars < 11_000 for request in compact_requests)
+    # Planning subtracts the actual fixed envelope from the soft input window.
+    # Its target is separate from the smaller consumer's final physical proof,
+    # which must reject oversized summaries and admit the eventual send.
+    assert all(0 < request.context_window_tokens < 8_750 for request in compact_requests)
+    assert all(0 < request.context_window_chars < 35_000 for request in compact_requests)
     assert all(request.forced_prefix_cut is not None for request in compact_requests)
+    final_projection = provider.project_final_request(provider.calls[-1])
+    assert final_projection.fits
+    assert final_projection.proof["estimated_tokens"] <= 2_750
+    assert final_projection.proof["estimated_chars"] <= 11_000
 
 
 @pytest.mark.asyncio

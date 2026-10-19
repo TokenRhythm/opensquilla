@@ -334,6 +334,49 @@ async def test_first_text_cannot_commit_while_any_tool_id_is_open() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_leg", ["primary", "secondary"])
+@pytest.mark.parametrize("tool_ended", [False, True])
+async def test_tool_stream_eof_uses_remaining_fallback_without_publishing(
+    monkeypatch: pytest.MonkeyPatch, failed_leg: str, tool_ended: bool,
+) -> None:
+    incomplete = [
+        ToolUseStartEvent(tool_use_id="pending", tool_name="echo"),
+        TextDeltaEvent(text="uncommitted explanation"),
+    ]
+    if tool_ended:
+        incomplete.append(ToolUseEndEvent(
+            tool_use_id="pending", tool_name="echo", arguments={},
+        ))
+    configs = [ProviderConfig("openrouter", model, api_key="offline-test")
+               for model in ("primary", "secondary", "third")]
+    providers = {
+        "primary": _SequenceProvider(incomplete if failed_leg == "primary" else [
+            ErrorEvent(code="503", message="busy"),
+        ]),
+        "secondary": _SequenceProvider(incomplete if failed_leg == "secondary" else [
+            TextDeltaEvent(text="recovered"), DoneEvent(stop_reason="stop"),
+        ]),
+        "third": _SequenceProvider([
+            TextDeltaEvent(text="recovered"), DoneEvent(stop_reason="stop"),
+        ]),
+    }
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider",
+                        lambda cfg: providers[cfg.model])
+    selector = ModelSelector(SelectorConfig(primary=configs[0], fallbacks=configs[1:]))
+    wrapper = _SelectorFallbackProvider(selector.resolve(), selector)
+
+    events = [event async for event in wrapper.chat([Message(role="user", content="go")])]
+
+    assert [providers[name].calls for name in providers] == (
+        [1, 1, 0] if failed_leg == "primary" else [1, 1, 1]
+    )
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == ["recovered"]
+    assert not any(isinstance(event, (ErrorEvent, ToolUseStartEvent, ToolUseEndEvent))
+                   for event in events)
+    assert sum(isinstance(event, DoneEvent) for event in events) == 1
+
+
+@pytest.mark.asyncio
 async def test_same_authority_fallback_waits_for_retry_after(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

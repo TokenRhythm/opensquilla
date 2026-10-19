@@ -2125,10 +2125,27 @@ async def _selector_safe_stream(
     """Convert provider-raised exceptions while preserving engine control flow."""
 
     stream: AsyncIterator[Any] | None = None
+    saw_tool_frame = False
+    saw_terminal = False
     try:
         stream = stream_factory()
         async for event in stream:
+            saw_tool_frame = saw_tool_frame or isinstance(
+                event,
+                (ProviderToolUseStartEvent, ProviderToolUseDeltaEvent, ProviderToolUseEndEvent),
+            )
+            saw_terminal = saw_terminal or isinstance(event, ProviderErrorEvent) or (
+                getattr(event, "kind", "") == "done"
+            )
             yield event
+        if saw_tool_frame and not saw_terminal and not content_started():
+            # Provisional tool frames require a terminal event before they can
+            # commit. EOF must enter recovery as an incomplete tool stream,
+            # rather than silently discard the leg without trying its fallback.
+            yield ProviderErrorEvent(
+                message="Provider stream ended before completing its tool response",
+                code="incomplete_tool_stream",
+            )
     except (asyncio.CancelledError, UsageAccountingUnavailableError, httpx.HTTPStatusError):
         # The shared provider recovery owner preserves structured HTTP facts
         # and Retry-After. Do not turn an HTTP response into a network error.

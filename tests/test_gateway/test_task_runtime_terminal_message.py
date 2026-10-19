@@ -887,12 +887,13 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", [None, "empty_response"])
+@pytest.mark.parametrize("budget", ["configured", "available"])
 async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_terminal_message(
-    failure_kind: str | None,
+    failure_kind: str | None, budget: str,
 ) -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     engine_message = (
-        "The provider used the configured output budget for reasoning without returning a "
+        f"The provider used the {budget} output budget for reasoning without returning a "
         "visible answer. Increase llm.max_tokens or choose another model or provider."
     )
 
