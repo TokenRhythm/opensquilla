@@ -252,26 +252,54 @@ async def test_cancellation_during_final_response_closes_provider_without_retry(
     assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
-async def test_total_timeout_during_final_response_preserves_timeout_outcome() -> None:
+async def test_total_timeout_during_final_response_preserves_timeout_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = _EdgeProvider([[('probe', {"target": "sample"})]] * 8, final_mode="block")
 
     async def handler(call: ToolCall) -> ToolResult:
         return _failed(call)
 
-    events = [
-        event async for event in _agent(provider, handler, timeout=0.15).run_turn("Inspect sample.")
-    ]
+    agent = _agent(provider, handler, timeout=30)
+    original_stream = agent._stream_provider_events_with_deadline
+    stream_calls = 0
+
+    async def final_response_deadline(
+        stream: AsyncIterator[Any], **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 4:
+            # Arm the real deadline after the three failed tool requests, so
+            # their setup time cannot consume the final-response test budget.
+            kwargs["total_deadline"] = kwargs["loop"].time() + 0.15
+        async for event in original_stream(stream, **kwargs):
+            yield event
+
+    monkeypatch.setattr(agent, "_stream_provider_events_with_deadline", final_response_deadline)
+    events: list[Any] = []
+
+    async def consume() -> None:
+        async for event in agent.run_turn("Inspect sample."):
+            events.append(event)
+
+    task = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(provider.final_started.wait(), timeout=5)
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
+
     assert provider.final_started.is_set()
     await asyncio.wait_for(provider.final_closed.wait(), timeout=1)
+    assert stream_calls == 4
     assert len(provider.requests) == 4
     assert provider.fallbacks == 0
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(errors) == 1
     assert errors[0].code == "agent_runtime_timeout"
-
-
-
-
 
 
 async def test_final_text_survives_spurious_tool_calls_without_dispatch() -> None:
