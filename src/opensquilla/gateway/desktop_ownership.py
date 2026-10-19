@@ -475,8 +475,22 @@ class DesktopGatewayOwnership:
         if self._active:
             return
         record = self.record
-        with _ownership_record_lock(self.state_dir):
-            _atomic_write_private_json(self.path, record)
+        try:
+            with _ownership_record_lock(self.state_dir):
+                _atomic_write_private_json(self.path, record)
+        except BaseException:
+            # The replacement can succeed before the final directory fsync
+            # reports an error. Remove only our exact record so a failed
+            # startup cannot masquerade as a live Desktop Gateway, while a
+            # successor that won the lock remains untouched.
+            with contextlib.suppress(BaseException):
+                with _ownership_record_lock(self.state_dir):
+                    if _read_record(self.path) == record:
+                        with contextlib.suppress(OSError):
+                            os.unlink(_native_io_path(self.path))
+                        with contextlib.suppress(OSError):
+                            _fsync_directory(self.path.parent)
+            raise
         self._written_record = record
         self._active = True
         atexit.register(self.release)
