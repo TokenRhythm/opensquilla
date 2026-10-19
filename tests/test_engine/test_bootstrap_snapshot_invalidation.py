@@ -192,7 +192,9 @@ def test_fresh_user_session_omits_live_daily_notes_from_dynamic_context(tmp_path
             tools=SimpleNamespace(profile=None),
         ),
     )
-    runner._load_daily_notes = lambda _workspace_dir: {"2026-05-31.md": "stale Labubu context"}
+    runner._load_daily_notes = lambda _workspace_dir, **_kwargs: {
+        "2026-05-31.md": "stale Labubu context",
+    }
     metadata: dict[str, object] = {}
 
     assembled = runner._assemble_prompt(
@@ -252,7 +254,7 @@ def test_non_fresh_user_session_omits_live_daily_notes_from_dynamic_context(tmp_
             tools=SimpleNamespace(profile=None),
         ),
     )
-    runner._load_daily_notes = lambda _workspace_dir: {"2026-05-31.md": "daily context"}
+    runner._load_daily_notes = lambda _workspace_dir, **_kwargs: {"2026-05-31.md": "daily context"}
     metadata: dict[str, object] = {}
 
     assembled = runner._assemble_prompt(
@@ -281,7 +283,7 @@ def test_daily_notes_auto_omit_preserves_memory_md(tmp_path) -> None:
             tools=SimpleNamespace(profile=None),
         ),
     )
-    runner._load_daily_notes = lambda _workspace_dir: {"2026-05-31.md": "daily context"}
+    runner._load_daily_notes = lambda _workspace_dir, **_kwargs: {"2026-05-31.md": "daily context"}
     metadata: dict[str, object] = {}
 
     assembled = runner._assemble_prompt(

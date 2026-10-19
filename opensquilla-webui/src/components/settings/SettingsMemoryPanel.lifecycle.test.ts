@@ -5,6 +5,7 @@ import { MEMORY_PROFILE_IMPORT_KEY } from '@/modules/memoryProfileImport'
 import { createV4MemoryProfileImport } from '@/adapters/gateway/memoryProfileImportV4'
 import SettingsMemoryPanel from './SettingsMemoryPanel.vue'
 import i18n from '@/i18n'
+import * as browser from '@/utils/browser'
 
 vi.mock('@/platform', () => ({ usePlatform: () => ({ capabilities: { isDesktop: true }, settings: {} }) }))
 vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast: vi.fn() }) }))
@@ -52,6 +53,20 @@ afterEach(() => {
 })
 
 describe('memory import observation lifecycle', () => {
+  it('does not schedule copy feedback when clipboard completion arrives after unmount', async () => {
+    vi.useFakeTimers()
+    const gate = deferred<void>()
+    vi.spyOn(browser, 'copyTextWithFallback').mockReturnValueOnce(gate.promise)
+    const { app, element } = await mountPanel(async () => ({ ...info, draftJob: null }))
+    const schedule = vi.spyOn(globalThis, 'setTimeout')
+    element.querySelector<HTMLButtonElement>('[data-testid="memory-import-copy-prompt"]')!.click()
+    unmount(app)
+    gate.resolve(undefined)
+    await settle()
+    expect(schedule.mock.calls.some(([, delay]) => delay === 1500)).toBe(false)
+    expect(element.childElementCount).toBe(0)
+  })
+
   it('clears settled polling on unmount without cancelling the backend job', async () => {
     vi.useFakeTimers()
     const request = vi.fn(async (method: string) => method === 'memory.import.info' ? info : activeJob)

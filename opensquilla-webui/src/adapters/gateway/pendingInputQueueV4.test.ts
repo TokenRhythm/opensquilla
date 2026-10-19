@@ -3,6 +3,27 @@ import { describe, expect, it, vi } from 'vitest'
 import { createV4PendingInputQueue } from './pendingInputQueueV4'
 
 describe('pending input queue v4 adapter', () => {
+  it('round trips explicit turn intent without inferring it from the message', async () => {
+    const turnCommand = { name: 'project.init' as const, args: '' }
+    const request = vi.fn(async (method: string) => method.endsWith('.list')
+      ? { items: [{ pendingInputId: 'p1', clientRequestId: 'r1', clientMessageId: 'm1', message: '/init', turnCommand }] }
+      : { requestFingerprint: 'fp-init', revision: 1 })
+    const adapter = createV4PendingInputQueue({
+      request: request as unknown as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>, supports: () => true,
+    })
+    await adapter.enqueue({ key: 's', pendingInputId: 'p1', message: '/init', turnCommand, attachments: [] })
+    expect(request).toHaveBeenCalledWith('sessions.pending_inputs.enqueue', expect.objectContaining({ turnCommand }))
+    expect((await adapter.list('s'))[0]?.turnCommand).toEqual(turnCommand)
+  })
+
+  it('rejects malformed command descriptors instead of dropping their intent', async () => {
+    const request = vi.fn(async () => ({ items: [{ pendingInputId: 'p1', clientRequestId: 'r1', clientMessageId: 'm1',
+      turnCommand: { name: 'project.init', args: 42 } }] }))
+    const adapter = createV4PendingInputQueue({
+      request: request as unknown as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>, supports: () => true,
+    })
+    await expect(adapter.list('s')).rejects.toMatchObject({ kind: 'invalid' })
+  })
   it('round trips explicit reference metadata through enqueue and listing', async () => {
     const path = 'C:\\book.pdf'
     const text = `Read\n${path}`

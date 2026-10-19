@@ -15,6 +15,7 @@ from opensquilla.application.turn_admission import (
     TurnAdmission,
 )
 from opensquilla.application.turn_input import complete_durable_ingress
+from opensquilla.contracts.turn_commands import normalize_turn_command
 from opensquilla.session_key import canonicalize_session_key
 
 
@@ -52,6 +53,7 @@ class PendingInputProjection(TypedDict, total=False):
     confirmedPlainText: bool
     pageContext: dict[str, Any]
     selectedSkills: list[dict[str, str]]
+    turnCommand: dict[str, str]
 
 
 class PendingInputEnqueueResult(PendingInputProjection, total=False):
@@ -466,6 +468,9 @@ class PendingInputQueue:
         if not isinstance(confirmed, bool):
             raise ValueError("params.confirmedPlainText must be a boolean")
         control = turn.message.strip()
+        has_turn_command = normalize_turn_command(
+            (turn.capture.input_provenance or {}).get("turn_command"),
+        ) is not None
         if confirmed and control.split(maxsplit=1)[0].casefold() in self._port.control_commands():
             raise PendingQueueRejectedError("registered-control-command")
         display = turn.display_text.strip() if turn.display_text is not None else ""
@@ -475,6 +480,7 @@ class PendingInputQueue:
             and not control.startswith("//")
             and not escaped
             and not confirmed
+            and not has_turn_command
         ):
             raise PendingQueueRejectedError("control-command")
         # 纯附件保留空正文；provider 补充提示不属于用户输入。其余不匹配仍拒绝。

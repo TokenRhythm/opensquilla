@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from opensquilla.tools.types import ToolError
+from opensquilla.tools.types import ToolError, WorkspaceAccessError
 
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _FOREIGN_POSIX_ROOTS = {
@@ -25,6 +25,35 @@ _FOREIGN_POSIX_ROOTS = {
     "usr",
     "var",
 }
+
+
+def resolve_bound_workspace(workspace: str | None) -> Path | None:
+    """Validate an existing tool-context root without creating or retargeting it.
+
+    Gateway bindings already name canonical paths. A missing or redirected
+    root must not turn a relative operation into work in another directory.
+    This checks the path's current meaning, not a permanent inode identity:
+    restoring an ordinary directory at the same path remains supported.
+    Unbound internal jobs retain their existing runtime/scratch fallback.
+    """
+    if not workspace:
+        return None
+    root = Path(workspace).expanduser().absolute()
+    try:
+        resolved = root.resolve(strict=True)
+        if resolved != root:
+            raise WorkspaceAccessError(
+                "workspace_binding_changed: The active workspace path now points to a "
+                "different location. Restore or reopen the project before using its files."
+            )
+        if not resolved.is_dir():
+            raise NotADirectoryError(str(root))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WorkspaceAccessError(
+            "workspace_unavailable: The active workspace is missing or inaccessible. "
+            "Restore or reopen the project before using its files."
+        ) from exc
+    return resolved
 
 
 def is_foreign_host_path(path: str, *, platform: str) -> bool:

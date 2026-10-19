@@ -487,8 +487,10 @@ describe('SkillsView catalog reload', () => {
     app.unmount()
   })
 
-  it('calls reload before listing the published catalog', async () => {
-    const { app, el, loadData, rpcCall, pushToast } = await mountSkillsView()
+  it.each([true, false])('calls reload before listing the published catalog without redundant feedback when changed=%s', async changed => {
+    const { app, el, loadData, rpcCall, pushToast } = await mountSkillsView({
+      success: true, changed, partial: false, generation: 2,
+    })
     loadData.mockClear()
 
     el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
@@ -500,9 +502,7 @@ describe('SkillsView catalog reload', () => {
     expect(rpcCall.mock.invocationCallOrder[0]).toBeLessThan(
       loadData.mock.invocationCallOrder[0],
     )
-    expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('generation 2'), {
-      tone: 'ok',
-    })
+    expect(pushToast).not.toHaveBeenCalled()
     app.unmount()
   })
 

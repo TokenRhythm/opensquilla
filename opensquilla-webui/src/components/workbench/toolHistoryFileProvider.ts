@@ -89,7 +89,7 @@ export function createToolHistoryFileDefinition(t: (key: string) => string, cont
         { kind: 'action', id: 'wrap', icon: 'fileText', pressed: wrapLines,
           label: t(wrapLines ? 'chat.toolModal.preserveLines' : 'chat.toolModal.wrapLines') },
         { kind: 'action', id: truncated ? 'download' : 'copy', icon: truncated ? (state.runtimeState.downloadError ? 'x' : 'download') : copyState === 'copied' ? 'check' : copyState === 'error' ? 'x' : 'copy',
-          label: t(truncated ? (state.runtimeState.downloadError ? 'shared.runTrace.downloadContentFailed' : toolHistoryFileFromItem(item)?.partial ? 'chat.download' : 'shared.runTrace.downloadFullContent') : copyState === 'copied' ? 'workspaceReference.copied' : copyState === 'error' ? 'workspaceReference.copyFailed' : 'chat.copy') },
+          label: t(truncated ? (state.runtimeState.downloadError ? 'shared.runTrace.downloadContentFailed' : toolHistoryFileFromItem(item)?.partial ? 'chat.download' : 'shared.runTrace.downloadFullContent') : copyState === 'error' ? 'workspaceReference.copyFailed' : 'chat.copy') },
       ]
     },
     createRuntime: (_item, context) => new ToolHistoryFileRuntime(context, contentAccess),

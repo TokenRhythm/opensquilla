@@ -13,7 +13,7 @@ import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvi
 import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import type { ArtifactPayload } from '@/types/artifacts'
-import type { WorkbenchResource, WorkbenchResourceOpenResponse } from '@/types/workbenchResources'
+import { createWorkbenchResourceRef, type WorkbenchResource, type WorkbenchResourceOpenResponse } from '@/types/workbenchResources'
 import AppWorkbench from './AppWorkbench.vue'
 
 const { pushToast, previewHarness } = vi.hoisted(() => ({ pushToast: vi.fn(), previewHarness: { enabled: false, runtime: false } }))
@@ -84,7 +84,7 @@ function opened(artifact = target): WorkbenchResourceOpenResponse {
   }
 }
 async function flush() { for (let i = 0; i < 8; i += 1) { await Promise.resolve(); await nextTick() } }
-function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done }); return { promise, resolve } }
+function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason?: unknown) => void; const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail }); return { promise, resolve, reject } }
 async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPayload; resourcesEnabled?: boolean; resourceSessionKey?: string } = {}) {
   const nextArtifact = options.target || target
   const resourceSessionKey = options.resourceSessionKey || 'session-a'
@@ -92,7 +92,8 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
   const store = useWorkbenchStore(pinia)
   store.setSessionScope('session-a')
   const item = { ...createArtifactPreviewWorkbenchItem({ artifact: current, nativeHtml: false, sessionKey: resourceSessionKey,
-    navigationArtifacts: [current, nextArtifact], ...(options.canonicalCurrent ? { resourceIdentity: 'document:current-doc' } : {}) }),
+    navigationArtifacts: [current, nextArtifact], resourceIdentity: options.canonicalCurrent
+      ? 'document:current-doc' : 'deliverable:current-html' }),
     scope: { type: 'session', id: 'session-a' } as const }
   store.openItem(item)
   const resources = useWorkbenchResourcesStore(pinia)
@@ -112,11 +113,15 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
   const select = () => host.querySelector<HTMLSelectElement>('[data-testid="workbench-artifact-switcher"]')
   const choose = async () => {
     const picker = select()!
-    picker.value = artifactWorkbenchItemId(resourceSessionKey, nextArtifact)
+    picker.value = artifactWorkbenchItemId(resourceSessionKey, nextArtifact, `deliverable:${nextArtifact.id}`)
     picker.dispatchEvent(new Event('change', { bubbles: true }))
     await flush()
   }
-  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose, fetchArtifact }
+  const continueEditing = async () => {
+    host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.artifactDocument.continueEditing}"]`)!.click()
+    await flush()
+  }
+  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose, continueEditing, fetchArtifact }
 }
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
@@ -155,6 +160,7 @@ describe('AppWorkbench artifact navigation', () => {
       await flush()
       const entry = h.host.querySelector<HTMLButtonElement>('.resource-collection__open')
       expect(entry?.textContent).toContain(artifact.name)
+      expect(entry?.textContent).toContain(en.workbench.resources.publishedVersion)
       expect(h.host.querySelector('.resource-collection')?.textContent).not.toContain('parent-only.html')
       await vi.waitFor(() => expect(load).toHaveBeenCalledWith(resourceSessionKey))
       expect(retain).toHaveBeenCalledWith(resourceSessionKey)
@@ -168,23 +174,50 @@ describe('AppWorkbench artifact navigation', () => {
       expect(h.resolve).toHaveBeenCalledWith(resourceSessionKey, listed.resource)
       expect(h.store.activeItemId).toBe(collection.id)
 
-      h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+      const imported = vi.spyOn(h.resources, 'importDocument')
       entry!.click()
       await flush()
-      expect(h.openCurrent).toHaveBeenCalledWith(resourceSessionKey, listed)
-      expect(h.host.querySelector('[role="alert"]')?.textContent).toContain(en.workbench.artifactErrors.permissionDenied)
-      expect(h.store.activeItemId).toBe(collection.id)
-      h.host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.resources.retry}"]`)!.click()
-      await flush()
-      expect(h.openCurrent).toHaveBeenCalledTimes(2)
+      expect(h.openCurrent).not.toHaveBeenCalled()
+      expect(imported).not.toHaveBeenCalled()
       expect(h.store.activeItem?.kind).toBe('artifact-preview')
       expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
       expect(h.store.activeItem?.payload.sessionKey).toBe(resourceSessionKey)
+      expect(h.store.activeItem?.payload.resourceIdentity).toBe(`deliverable:${artifact.id}`)
       expect(artifactFromWorkbenchItem(h.store.activeItem!)).toMatchObject({
-        id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head',
+        id: artifact.id, sha256: listed.sha256,
       })
     },
   )
+
+  it.each(['document', 'attachment'] as const)('keeps the existing current-open and retry behavior for a listed %s', async type => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
+    const h = await mount()
+    const listed: WorkbenchResource = { ...resource(), resource: createWorkbenchResourceRef(type, 'listed-current') }
+    h.resources.snapshots['session-a'] = {
+      sessionKey: 'session-a', available: true, loading: false, loaded: true,
+      error: null, resources: [listed], totalCount: 1,
+    }
+    const load = vi.spyOn(h.resources, 'load')
+    const collection = createResourceCollectionWorkbenchItem({ sessionKey: 'session-a', title: 'Files', resources: [listed] })
+    h.store.openItem(collection)
+    await flush()
+    await vi.waitFor(() => expect(load).toHaveBeenCalledWith('session-a'))
+    expect(h.host.querySelector('.resource-collection__open')?.textContent).toContain(type === 'document'
+      ? en.workbench.resources.currentWorkingFile : target.name)
+    h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+    h.host.querySelector<HTMLButtonElement>('.resource-collection__open')!.click()
+    await flush()
+    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledWith('session-a', listed))
+    expect(h.host.querySelector('[role="alert"]')?.textContent).toContain(en.workbench.artifactErrors.permissionDenied)
+    expect(h.store.activeItemId).toBe(collection.id)
+    h.host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.resources.retry}"]`)!.click()
+    await flush()
+    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledTimes(2))
+    expect(artifactFromWorkbenchItem(h.store.activeItem!)).toMatchObject({
+      id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head',
+    })
+  })
 
   it.each([target, { id: 'side-html', name: 'side.html', mime: 'text/html' }])(
     'navigates side $name using child authorization while retaining parent visibility', async artifact => {
@@ -192,11 +225,11 @@ describe('AppWorkbench artifact navigation', () => {
       const h = await mount({ target: artifact, resourceSessionKey: child })
       await h.choose()
       expect(h.resolve).toHaveBeenCalledWith(child, { type: 'deliverable', id: artifact.id, artifactId: artifact.id })
-      expect(h.openCurrent).toHaveBeenCalledWith(child, resource(artifact))
+      expect(h.openCurrent).not.toHaveBeenCalled()
       const active = h.store.activeItem!
       expect(active.scope).toEqual({ type: 'session', id: 'session-a' })
       expect(active.payload.sessionKey).toBe(child)
-      expect(artifactFromWorkbenchItem(active)).toMatchObject({ id: 'canonical-head', documentId: 'canonical-doc' })
+      expect(artifactFromWorkbenchItem(active)).toMatchObject({ id: artifact.id })
       expect(h.store.visibleItems).toContainEqual(active)
       expect(h.store.activeSessionId).toBe('session-a')
     },
@@ -207,12 +240,14 @@ describe('AppWorkbench artifact navigation', () => {
     const h = await mount({ resourceSessionKey: child })
     h.resolve.mockResolvedValueOnce(null)
     await h.choose()
-    expect(h.store.activeItemId).toBe(artifactWorkbenchItemId(child, target))
+    expect(h.store.activeItemId).toBe(artifactWorkbenchItemId(child, target, `deliverable:${target.id}`))
     expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
     expect(h.store.activeItem?.payload.sessionKey).toBe(child)
   })
 
   it('keeps side preview scope after importing an editable delivery', async () => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
     const child = 'agent:main:sidechat:child'
     const h = await mount({ resourceSessionKey: child })
     const result = opened()
@@ -222,7 +257,10 @@ describe('AppWorkbench artifact navigation', () => {
       document: result.document, revision: result.revision,
     } as Awaited<ReturnType<typeof h.resources.importDocument>>)
     await h.choose()
-    expect(imported).toHaveBeenCalledWith(child, resource())
+    expect(imported).not.toHaveBeenCalled()
+    expect(h.openCurrent).not.toHaveBeenCalled()
+    await h.continueEditing()
+    await vi.waitFor(() => expect(imported).toHaveBeenCalledWith(child, resource()))
     expect(h.store.activeItem?.payload.sessionKey).toBe(child)
     expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
   })
@@ -249,7 +287,8 @@ describe('AppWorkbench artifact navigation', () => {
     vi.spyOn(URL, 'createObjectURL').mockReturnValueOnce('blob:old-office').mockReturnValueOnce('blob:new-office')
     const h = await mount()
     const artifact = { ...target, documentId: 'office-doc', revisionId: 'revision-1', sha256: 'a'.repeat(64) }
-    const item = createArtifactPreviewWorkbenchItem({ artifact, nativeHtml: false, sessionKey: 'session-a' })
+    const item = createArtifactPreviewWorkbenchItem({ artifact, nativeHtml: false, sessionKey: 'session-a',
+      resourceIdentity: 'document:office-doc' })
     h.store.openItem(item)
     const key = artifactDocumentWorkspaceKey(artifact, 'session-a')
     const workspace = createLegacyArtifactWorkspace(artifact, 'session-a')
@@ -321,21 +360,18 @@ describe('AppWorkbench artifact navigation', () => {
   it.each([
     target,
     { id: 'raw-html', name: 'other.html', mime: 'text/html', documentId: 'known-doc' },
-  ])('opens $name through canonical resource resolution', async artifact => {
+  ])('opens the fixed $name snapshot through canonical resource resolution', async artifact => {
     const h = await mount({ target: artifact })
     await h.choose()
-    expect(h.resolve).toHaveBeenCalledWith('session-a', artifact.documentId
-      ? { type: 'document', id: artifact.documentId, documentId: artifact.documentId }
-      : { type: 'deliverable', id: artifact.id, artifactId: artifact.id })
-    expect(h.openCurrent).toHaveBeenCalledWith('session-a', resource(artifact))
+    expect(h.resolve).toHaveBeenCalledWith('session-a', { type: 'deliverable', id: artifact.id, artifactId: artifact.id })
+    expect(h.openCurrent).not.toHaveBeenCalled()
     const active = h.store.items.find(item => item.id === h.store.activeItemId)!
-    expect(artifactFromWorkbenchItem(active)).toMatchObject({ id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head' })
-    expect(h.store.items.some(item => item.id === artifactWorkbenchItemId('session-a', artifact))).toBe(false)
+    expect(artifactFromWorkbenchItem(active)).toMatchObject({ id: artifact.id })
   })
 
-  it.each(['resolve', 'openCurrent'] as const)('shows %s failure without opening a raw fallback', async phase => {
+  it('shows a resolve failure without opening a raw fallback', async () => {
     const h = await mount()
-    h[phase].mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+    h.resolve.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
     await h.choose()
     expect(h.store.items).toHaveLength(1)
     expect(h.store.activeItemId).toBe(h.item.id)
@@ -343,12 +379,26 @@ describe('AppWorkbench artifact navigation', () => {
     expect(pushToast).toHaveBeenCalledWith(en.workbench.artifactErrors.permissionDenied, expect.objectContaining({ tone: 'danger' }))
   })
 
+  it('keeps the fixed snapshot visible when Continue editing is denied', async () => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
+    const h = await mount()
+    await h.choose()
+    const snapshotId = h.store.activeItemId
+    h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+    await h.continueEditing()
+    await vi.waitFor(() => expect(pushToast).toHaveBeenCalledWith(en.workbench.artifactErrors.permissionDenied,
+      expect.objectContaining({ tone: 'danger' })))
+    expect(h.store.activeItemId).toBe(snapshotId)
+    expect(artifactFromWorkbenchItem(h.store.activeItem!)).toMatchObject({ id: target.id })
+  })
+
   it('retains the legacy path when resource resolution reports an older Gateway', async () => {
     const h = await mount()
     h.resolve.mockResolvedValueOnce(null)
     await h.choose()
     expect(h.openCurrent).not.toHaveBeenCalled()
-    expect(h.store.activeItemId).toBe(artifactWorkbenchItemId('session-a', target))
+    expect(h.store.activeItemId).toBe(artifactWorkbenchItemId('session-a', target, `deliverable:${target.id}`))
   })
 
   it.each(['close origin', 'change session'] as const)('does not reopen after %s during resolution', async invalidation => {
@@ -366,13 +416,77 @@ describe('AppWorkbench artifact navigation', () => {
   })
 
   it('does not reopen after the origin closes during canonical open', async () => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
     const h = await mount()
+    await h.choose()
+    const originId = h.store.activeItemId!
     const pending = deferred<WorkbenchResourceOpenResponse | null>()
     h.openCurrent.mockReturnValueOnce(pending.promise)
-    await h.choose()
-    expect(h.openCurrent).toHaveBeenCalledTimes(1)
-    h.store.closeItem(h.item.id)
+    await h.continueEditing()
+    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledTimes(1))
+    h.store.closeItem(originId)
     pending.resolve(opened()); await flush()
-    expect(h.store.items).toHaveLength(0)
+    expect(h.store.items.map(item => item.id)).toEqual([h.item.id])
   })
+
+  it.each([false, true])('does not take focus after switching tabs during Continue editing (return=%s)', async returns => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
+    const h = await mount()
+    await h.choose()
+    const originId = h.store.activeItemId!
+    const pending = deferred<WorkbenchResourceOpenResponse | null>()
+    h.openCurrent.mockReturnValueOnce(pending.promise)
+    await h.continueEditing()
+    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledOnce())
+    h.store.activateItem(h.item.id)
+    if (returns) h.store.activateItem(originId)
+    pending.resolve(opened()); await flush()
+    expect(h.store.items.map(item => item.id)).toEqual([h.item.id, originId])
+    expect(h.store.activeItemId).toBe(returns ? originId : h.item.id)
+  })
+
+  it.each(['resolve', 'open'] as const)(
+    'reports a delayed Continue editing %s error while the originating tab stays active', async stage => {
+      previewHarness.enabled = true
+      previewHarness.runtime = true
+      const h = await mount()
+      await h.choose()
+      const originId = h.store.activeItemId!
+      const pending = deferred<never>()
+      const operation = stage === 'resolve' ? h.resolve : h.openCurrent
+      operation.mockReturnValueOnce(pending.promise)
+      const priorCalls = operation.mock.calls.length
+      await h.continueEditing()
+      await vi.waitFor(() => expect(operation).toHaveBeenCalledTimes(priorCalls + 1))
+      pending.reject(artifactProductClientError('PERMISSION_DENIED'))
+      await flush()
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(en.workbench.artifactErrors.permissionDenied,
+        expect.objectContaining({ tone: 'danger' }))
+      expect(h.store.activeItemId).toBe(originId)
+    },
+  )
+
+  it.each((['resolve', 'open'] as const).flatMap(stage => [false, true].map(returns => ({ stage, returns }))))(
+    'ignores a delayed Continue editing $stage error after a tab switch (return=$returns)', async ({ stage, returns }) => {
+      previewHarness.enabled = true
+      previewHarness.runtime = true
+      const h = await mount()
+      await h.choose()
+      const originId = h.store.activeItemId!
+      const pending = deferred<never>()
+      const operation = stage === 'resolve' ? h.resolve : h.openCurrent
+      operation.mockReturnValueOnce(pending.promise)
+      const priorCalls = operation.mock.calls.length
+      await h.continueEditing()
+      await vi.waitFor(() => expect(operation).toHaveBeenCalledTimes(priorCalls + 1))
+      h.store.activateItem(h.item.id)
+      if (returns) h.store.activateItem(originId)
+      pending.reject(artifactProductClientError('PERMISSION_DENIED'))
+      await flush()
+      expect(pushToast).not.toHaveBeenCalled()
+      expect(h.store.activeItemId).toBe(returns ? originId : h.item.id)
+    },
+  )
 })

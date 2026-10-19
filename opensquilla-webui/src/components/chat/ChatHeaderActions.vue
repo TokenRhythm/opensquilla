@@ -8,7 +8,7 @@
   >
     <div class="chat-header__identity">
       <h1 class="chat-header__title chat-label" :title="title">{{ title }}</h1>
-      <span class="chat-header__copy-live" aria-live="polite">{{ copyLiveText }}</span>
+      <span v-if="copyState === 'err'" class="chat-header__copy-live" aria-live="polite">{{ copyLiveText }}</span>
     </div>
 
     <span class="chat-header__spacer" aria-hidden="true"></span>
@@ -235,7 +235,7 @@ let coarsePointerMedia: MediaQueryList | null = null
 let layoutFrame: number | null = null
 let hasMeasuredLayout = false
 
-const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionLink'))
+const copyLabel = computed(() => t('chat.copySessionLink'))
 const deliverablesLabel = computed(() => {
   const label = t('chat.deliverablesCount', { count: props.deliverableCount })
   return props.hasNewDeliverable ? `${label}, New` : label

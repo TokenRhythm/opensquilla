@@ -1045,7 +1045,21 @@ class WeComChannel:
                 raise ValueError("WeCom artifact size changed before upload")
             return content
 
-        material = await asyncio.to_thread(read_bounded)
+        reader = asyncio.create_task(asyncio.to_thread(read_bounded))
+        try:
+            material = await asyncio.shield(reader)
+        except asyncio.CancelledError:
+            # The artifact caller owns a temporary file until this adapter
+            # returns. A cancelled coroutine must join the filesystem reader
+            # before allowing that caller to remove its material.
+            while not reader.done():
+                try:
+                    await asyncio.shield(reader)
+                except (asyncio.CancelledError, Exception):
+                    continue
+            if not reader.cancelled():
+                reader.exception()
+            raise
         media_type = self._wecom_media_type(path)
         uploaded = await client.upload_media(material, type=media_type, filename=path.name)
         media_id = str(uploaded.get("media_id") or "")

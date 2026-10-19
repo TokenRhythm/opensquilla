@@ -5,6 +5,7 @@ import { createI18n } from 'vue-i18n'
 
 import ChatHeaderActions from './ChatHeaderActions.vue'
 import type { ChatRouteHeaderFindState } from '@/composables/chat/useChatRouteHeaderBridge'
+import type { IconName } from '@/utils/icons'
 
 type LayoutName = 'wide' | 'compact' | 'tight'
 type Action = 'deliverables' | 'share' | 'copy-session-link' | 'find'
@@ -15,8 +16,8 @@ type HeaderInstance = ComponentPublicInstance & {
 
 const BASE_PROPS = {
   title: 'Responsive header test',
-  copyState: null,
-  copyIcon: 'copy' as const,
+  copyState: null as string | null,
+  copyIcon: 'copy' as IconName,
   copyLiveText: '',
   deliverableCount: 2,
   hasNewDeliverable: false,
@@ -276,6 +277,14 @@ afterEach(() => {
 })
 
 describe('ChatHeaderActions', () => {
+  it('shows the copy check while retaining the action text and no success announcement', async () => {
+    const { el } = await mountHeader(800, { copyState: 'ok', copyIcon: 'check', copyLiveText: 'Copied' })
+    await openMenu(el)
+    const copy = el.querySelector('[data-testid="chat-session-action-copy"]')!
+    expect(copy.textContent?.trim()).toBe('Copy session link')
+    expect(copy.querySelector('polyline')?.getAttribute('points')).toBe('20 6 9 17 4 12')
+    expect(el.textContent).not.toContain('Copied')
+  })
   it('exposes the full title and provides the same session menu in wide layouts', async () => {
     const fullTitle = 'A complete session title that may be visually truncated'
     const { el } = await mountHeader(800, { title: fullTitle })

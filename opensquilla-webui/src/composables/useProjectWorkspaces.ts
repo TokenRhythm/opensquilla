@@ -1,5 +1,5 @@
 import { computed, hasInjectionContext, inject, ref, watch } from 'vue'
-import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog, type WorkspaceHistoryDeletion, type WorkspaceItem } from '@/modules/workspaceCatalog'
+import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog, type WorkspaceCreationDefaults, type WorkspaceHistoryDeletion, type WorkspaceItem } from '@/modules/workspaceCatalog'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 
 type ProjectWorkspaceItem = WorkspaceItem
@@ -13,6 +13,7 @@ const workspaces = ref<ProjectWorkspaceItem[]>([])
 const isLoading = ref(false)
 const error = ref<string | null>(null)
 const hasLoaded = ref(false)
+const creationDefaults = ref<WorkspaceCreationDefaults | null>(null)
 let loadSequence = 0
 
 export function useProjectWorkspaces(
@@ -33,12 +34,20 @@ export function useProjectWorkspaces(
   const gatewayAccess = access
   const workspaceCatalog: WorkspaceCatalog = catalog
 
+  function catalogScope() {
+    return JSON.stringify([
+      gatewayAccess.deliveryIdentity, gatewayAccess.loadConnectionEndpoint(),
+      gatewayAccess.subscriptionEpoch,
+    ])
+  }
+
   function resetWorkspaces() {
     loadSequence += 1
     workspaces.value = []
     isLoading.value = false
     error.value = null
     hasLoaded.value = false
+    creationDefaults.value = null
   }
 
   function requireOwner() {
@@ -55,12 +64,14 @@ export function useProjectWorkspaces(
       return []
     }
     const requestSequence = ++loadSequence
+    const scope = catalogScope()
     isLoading.value = true
     error.value = null
     try {
       const loadedWorkspaces = [...await workspaceCatalog.list(requestOptions)]
-      if (requestSequence === loadSequence) {
+      if (requestSequence === loadSequence && scope === catalogScope()) {
         workspaces.value = loadedWorkspaces
+        creationDefaults.value = workspaceCatalog.creationDefaults ?? null
         hasLoaded.value = true
       }
       return loadedWorkspaces
@@ -89,6 +100,32 @@ export function useProjectWorkspaces(
     const workspace = await workspaceCatalog.open(path)
     await loadWorkspaces()
     return workspace
+  }
+
+  async function createWorkspace(parentPath: string, name: string): Promise<ProjectWorkspaceItem | null> {
+    requireOwner()
+    if (!gatewayAccess.canCreateProjectWorkspace || !workspaceCatalog.create) {
+      throw new Error('This Gateway does not support creating project directories.')
+    }
+    const scope = catalogScope()
+    try {
+      const workspace = await workspaceCatalog.create(parentPath, name)
+      if (scope === catalogScope()) {
+        // A returned registration is authoritative even if refreshing fails.
+        if (workspace) workspaces.value = [
+          ...workspaces.value.filter(item => item.id !== workspace.id), workspace,
+        ]
+        try { await loadWorkspaces() } catch { /* The known creation result remains valid. */ }
+      }
+      return workspace
+    } catch (cause) {
+      if (scope === catalogScope()) {
+        // A lost reply may follow registration. Refresh for review, but never
+        // adopt a directory or replay creation based on path/name equality.
+        try { await loadWorkspaces() } catch { /* Preserve the original outcome. */ }
+      }
+      throw cause
+    }
   }
 
   async function deleteWorkspaceHistory(
@@ -133,6 +170,8 @@ export function useProjectWorkspaces(
 
   const byId = computed(() => new Map(workspaces.value.map(item => [item.id, item])))
 
+  watch(catalogScope, resetWorkspaces)
+
   watch(
     () => gatewayAccess.canManageProjectWorkspaces,
     allowed => {
@@ -147,9 +186,11 @@ export function useProjectWorkspaces(
     isLoading,
     error,
     hasLoaded,
+    creationDefaults,
     resetWorkspaces,
     loadWorkspaces,
     openWorkspace,
+    createWorkspace,
     renameWorkspace: async (workspaceId: string, name: string) => {
       requireOwner()
       await workspaceCatalog.rename(workspaceId, name)

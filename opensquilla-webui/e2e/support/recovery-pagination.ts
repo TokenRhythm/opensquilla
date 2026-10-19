@@ -21,7 +21,8 @@ export async function seedRecoveryRows(
 ): Promise<void> {
   await wal.listRecoveryDeliveries!()
   const database = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(DATABASE, 3)
+    // The production WAL above owns creation and schema upgrades.
+    const request = indexedDB.open(DATABASE)
     request.onsuccess = () => resolve(request.result)
     request.onerror = () => reject(request.error)
   })

@@ -398,7 +398,7 @@ describe('paged source operations', () => {
     expect(search).toHaveBeenCalledWith('task', file, 'needle', expect.any(AbortSignal))
     expect(f.readPage).toHaveBeenLastCalledWith('task', file, 401, 600, expect.any(AbortSignal))
     f.event('workspace-file-copy')
-    await vi.waitFor(() => expect(f.state.copied).toBe(true))
+    await vi.waitFor(() => expect(f.state).toMatchObject({ copied: true, copying: false }))
     expect(f.read).toHaveBeenCalledWith('task', file, expect.any(AbortSignal))
     f.runtime.dispose!('closed')
   })
@@ -473,7 +473,7 @@ describe('paged source operations', () => {
     await event('workspace-file-copy')
     expect(read).toHaveBeenCalledWith('task', file, expect.any(AbortSignal))
     await vi.waitFor(() => expect(copyTextWithFallback).toHaveBeenCalledWith('entire file\nincluding other pages\n'))
-    await vi.waitFor(() => expect(state).toMatchObject({ copied: true, copying: false }))
+    await vi.waitFor(() => expect(state).toMatchObject({ copied: true, copying: false, copyErrorKey: '' }))
   })
 
   it.each(['dispose', 'switch'] as const)('cancels full-copy reads on %s and never copies stale content', async action => {
@@ -488,7 +488,7 @@ describe('paged source operations', () => {
     pending.resolve(new Blob(['old file']))
     await copying
     expect(copyTextWithFallback).not.toHaveBeenCalled()
-    expect(state).toMatchObject({ copied: false, copying: false })
+    expect(state).toMatchObject({ copied: false, copying: false, copyErrorKey: '' })
   })
 
   it('does not report late clipboard success after the panel is disposed', async () => {
@@ -501,7 +501,7 @@ describe('paged source operations', () => {
     runtime.dispose!('closed')
     pending.resolve()
     await copying
-    expect(state).toMatchObject({ copied: false, copying: false })
+    expect(state).toMatchObject({ copied: false, copying: false, copyErrorKey: '' })
   })
 
   it.each([new Uint8Array([0x61, 0, 0x62]), new Uint8Array([0xff, 0xfe])])('rejects binary/invalid UTF-8 fallback and full-copy contents', async bytes => {

@@ -225,7 +225,6 @@ async function perform(action: 'preview' | 'save' | 'export-zip' | 'path' | 'con
       assertCurrent()
       if (!info) throw new Error(t('resourceActions.unavailable'))
       await copyTextWithFallback(info.sourcePath)
-      pushToast(t('chat.copied'), { tone: 'ok' })
       return
     }
     let blob: Blob
@@ -251,7 +250,6 @@ async function perform(action: 'preview' | 'save' | 'export-zip' | 'path' | 'con
       catch { throw new Error(t('resourceActions.textOnly')) }
       if (text.includes('\0')) throw new Error(t('resourceActions.textOnly'))
       await copyTextWithFallback(text)
-      pushToast(t('chat.copied'), { tone: 'ok' })
       return
     }
     const name = metadata.value?.name || String(artifact.name || 'file')

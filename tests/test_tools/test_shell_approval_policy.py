@@ -235,6 +235,7 @@ async def test_full_host_write_file_skips_safety_guards(
     assert ctx is not None
     ctx.run_mode = "full"
     ctx.workspace_dir = str(tmp_path / "workspace")
+    Path(ctx.workspace_dir).mkdir()
     ctx.file_edit_requires_fresh_read = True
     ctx.workspace_write_deny_globs = ["**"]
     target = tmp_path / "outside" / "large.txt"

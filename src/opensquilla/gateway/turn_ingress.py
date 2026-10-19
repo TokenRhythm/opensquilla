@@ -18,6 +18,7 @@ from opensquilla.session.storage import TurnAcceptanceResult
 
 _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("message", ("message",)),
+    ("turn_command", ("turnCommand",)),
     ("display_text", ("displayText", "display_text")),
     ("attachments", ("attachments",)),
     ("workspace_files", ("workspaceFiles",)),

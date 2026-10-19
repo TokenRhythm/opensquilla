@@ -214,15 +214,6 @@ async function manualReload() {
         summary: reloadSummary(result),
         errors: result.errors?.length || 0,
       }), { tone: 'warn' })
-    } else if (!result.changed) {
-      pushToast(t('cronSkills.skillsView.reloadNoChanges', {
-        generation: result.generation,
-      }))
-    } else {
-      pushToast(t('cronSkills.skillsView.reloadSuccess', {
-        generation: result.generation,
-        summary: reloadSummary(result),
-      }), { tone: 'ok' })
     }
   } catch (err) {
     pushToast(t('cronSkills.skillsView.reloadFailed', {
@@ -319,9 +310,7 @@ async function setSkillEnabled(name: string, enabled: boolean) {
   try {
     const result = await skillCatalog.setEnabled({ name, enabled })
     if (result.persisted) {
-      pushToast(t(result.refreshed
-        ? enabled ? 'cronSkills.skillDetail.enabledSaved' : 'cronSkills.skillDetail.disabledSaved'
-        : 'cronSkills.skillDetail.refreshPending'), { tone: result.refreshed ? 'ok' : 'warn' })
+      if (!result.refreshed) pushToast(t('cronSkills.skillDetail.refreshPending'), { tone: 'warn' })
       await loadData()
       if (selectedSkill.value === original) await openSkill({ ...original, disabled: !enabled })
     }

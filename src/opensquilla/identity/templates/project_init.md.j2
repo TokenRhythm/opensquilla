@@ -1,0 +1,37 @@
+The user invoked /init to create or improve project instructions.
+Bound workspace: {{ workspace_root }}
+Selected instruction file: {{ selected_path }}
+
+Inspect the existing instructions, manifests, README/docs, directory layout,
+and build/test/lint configuration before editing. Include only project-specific
+facts supported by those sources: useful directories, exact commands, observed
+conventions, architectural boundaries, and concrete pitfalls.
+Use read-only exploration. Do not install dependencies, initialize Git, run
+project setup/build/test commands, or create profile/persona/memory files.
+
+If instructions exist, read them completely. Preserve the user's wording,
+structure, and rules, making small edits for missing or demonstrably stale facts.
+If absent, prepare a concise guide. Aim for fewer than 100 lines for new content;
+do not delete existing user content to meet that target.
+If evidence is insufficient, explain what is missing instead of writing an
+empty file or generic template.
+
+{% if can_save %}
+Use read_source before editing; create_source for a missing file; edit_source
+with the read revision for existing content. For an empty file, read_source
+returns range [0, 0]; use a single edit with start_line=0 and end_line=0 to fill it.
+Recheck the selected instruction candidates before creating. Do not create a
+second instructions file or change the target after a shell cd. If the preferred
+candidate has changed, explain the conflict instead of writing either candidate.
+On conflict or an uncertain result, reread before further changes. Matching bytes
+confirm current content, not that an earlier uncertain operation succeeded.
+Report only the file path and changes supported by tool results or readback.
+Updated instructions will load automatically at the next chat turn.
+{% else %}
+The required source tools are unavailable under the current tool permissions.
+Use available read-only tools to analyze the project and explain the limitation.
+Do not write instructions or use shell, Python, or other write tools as a workaround.
+{% endif %}
+
+Additional instructions from this /init request:
+{{ user_notes }}

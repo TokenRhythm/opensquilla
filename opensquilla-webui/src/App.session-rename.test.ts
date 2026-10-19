@@ -73,7 +73,7 @@ describe('App session rename through title-read contention', () => {
     expect(app.local.value[key]?.title).toBe('My confirmed name')
     expect(app.overrides.value).toEqual({})
     expect(app.sessions.sessionListError.value).toBe(true)
-    expect(app.toast).toHaveBeenCalledExactlyOnceWith('Session renamed', { tone: 'ok' })
+    expect(app.toast).not.toHaveBeenCalled()
 
     await vi.advanceTimersByTimeAsync(500)
     expect(app.sessions.sessionsList.value[0]?.title).toBe('Renamed elsewhere')
@@ -133,7 +133,7 @@ describe('App session rename through title-read contention', () => {
     expect(app.sessions.sessionsList.value[0]?.title).toBe('Newer confirmed name')
     expect(app.local.value[key]?.title).toBe('Newer confirmed name')
     expect(app.overrides.value).toEqual({})
-    expect(app.toast).toHaveBeenCalledExactlyOnceWith('Session renamed', { tone: 'ok' })
+    expect(app.toast).not.toHaveBeenCalled()
     app.automatic.dispose()
   })
 

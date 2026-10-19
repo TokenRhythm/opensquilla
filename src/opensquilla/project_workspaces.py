@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -102,6 +103,60 @@ def workspace_is_available(workspace: ProjectWorkspace) -> bool:
     except ProjectWorkspaceStateError:
         return False
     return True
+
+
+def protected_session_workspace_path(
+    *, agent_id: str | None, execution_workspace: Any, origin: Any,
+) -> str | None:
+    """Extract a maintenance-protected user root without granting execution access."""
+    from opensquilla.execution_workspaces import normalize_execution_workspace
+
+    if isinstance(execution_workspace, str):
+        try:
+            execution_workspace = json.loads(execution_workspace)
+        except (TypeError, ValueError):
+            return None
+    if execution_workspace is not None:
+        try:
+            binding = normalize_execution_workspace(execution_workspace)
+        except ProjectWorkspaceStateError:
+            # Recover only an explicit configured absolute root from damaged
+            # metadata. This suppresses maintenance; it grants no new access.
+            if not isinstance(execution_workspace, dict):
+                return None
+            binding = execution_workspace
+        if binding.get("kind") != "configured":
+            return None
+        root = binding.get("root")
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            return None
+        try:
+            path = _legacy_project_path(root)
+        except ValueError:
+            return None
+        return path.path if path is not None else None
+    if isinstance(origin, str):
+        try:
+            origin = json.loads(origin)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(origin, dict):
+        return None
+    run_context = origin.get(RUN_CONTEXT_ORIGIN_KEY)
+    if not isinstance(run_context, dict):
+        return None
+    root = run_context.get("workspace")
+    if not isinstance(root, str) or not root.strip():
+        return None
+    try:
+        path = _legacy_project_path(root)
+    except ValueError:
+        return None
+    if path is not None and path.path_key != project_path_key(
+        resolve_agent_workspace_dir(agent_id or "main"),
+    ):
+        return path.path
+    return None
 
 
 def _validate_stored_project_path(workspace: ProjectWorkspace) -> str:

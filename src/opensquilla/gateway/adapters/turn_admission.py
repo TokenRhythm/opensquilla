@@ -154,6 +154,7 @@ class GatewayTurnAdmissionAdapter:
         extra: dict[str, Any] = {}
         for name in (
             "noMemoryCapture",
+            "turnCommand",
             "no_memory_capture",
             "inputProvenance",
             "input_provenance",

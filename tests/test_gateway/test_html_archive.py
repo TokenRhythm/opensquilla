@@ -12,11 +12,11 @@ from test_artifacts_download import _app, _publish
 from test_working_file_actions import counts
 from test_working_file_actions import files as files
 
+from opensquilla import artifact_archives as html_archive
 from opensquilla.application.artifact_workbench import ContentExportError
 from opensquilla.artifact_session.models import Actor, ActorKind, ArtifactBlobRef
 from opensquilla.artifact_session.working_files import WorkingFiles
 from opensquilla.artifacts import ArtifactBundle, ArtifactBundleSourceFile, ArtifactStore
-from opensquilla.gateway import html_archive
 from opensquilla.gateway.html_archive import HtmlZipExporter, TemporaryArchiveResponse
 
 

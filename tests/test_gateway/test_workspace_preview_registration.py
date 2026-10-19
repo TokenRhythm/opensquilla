@@ -227,6 +227,16 @@ async def test_entry_mime_survives_registration_reopen_and_publication(preview, 
         b'<link rel="stylesheet" href="../style.css" /></head>'
         b'<body><h1>Live</h1></body></html>'
     )
+    if mode == "none":
+        # MIME continuity requires a valid single-file delivery fixture.
+        payload = payload.replace(
+            b'<link rel="stylesheet" href="../style.css" />',
+            b'<style>h1 { color: navy }</style>',
+        )
+    elif mode == "auto":
+        # Automatic collection is rooted at the entrypoint's directory.
+        payload = payload.replace(b'../style.css', b'style.css')
+        (workspace / "site/pages/style.css").write_text("h1 { color: navy }")
     (workspace / path).write_bytes(payload)
     collection = {"bundle": mode, **({"bundle_root": "site"} if mode == "directory" else {})}
     opened = await _open(context, path=path, **collection)

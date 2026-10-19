@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
 import type { ToolResultContext } from '@/types/chat'
@@ -59,6 +59,7 @@ beforeEach(() => {
   document.body.innerHTML = ''
   vi.mocked(copyTextWithFallback).mockClear()
 })
+afterEach(() => vi.useRealTimers())
 
 describe('ToolResultModal', () => {
   it('uses context to show a PTY result even when content is a combined detail transcript', async () => {
@@ -191,7 +192,8 @@ describe('ToolResultModal', () => {
     app.unmount()
   })
 
-  it('copies the complete raw content and updates the button state', async () => {
+  it('briefly checks the copy icon without changing its action label', async () => {
+    vi.useFakeTimers()
     const content = 'first\nsecond'
     const { app, el } = await mountToolResultModal({ content })
     const copyButton = el.querySelector<HTMLButtonElement>('button[title="Copy"]')
@@ -202,7 +204,28 @@ describe('ToolResultModal', () => {
     await nextTick()
 
     expect(copyTextWithFallback).toHaveBeenCalledWith(content)
-    expect(copyButton?.title).toBe('Copied')
+    expect(copyButton?.title).toBe('Copy')
+    expect(copyButton?.getAttribute('aria-label')).toBe('Copy')
+    expect(copyButton?.classList.contains('is-copied')).toBe(false)
+    expect(copyButton?.querySelector('polyline')?.getAttribute('points')).toBe('20 6 9 17 4 12')
+    expect(el.textContent).not.toContain('Copied')
+    await vi.advanceTimersByTimeAsync(1600)
+    await nextTick()
+    expect(copyButton?.querySelector('polyline')).toBeNull()
+    app.unmount()
+  })
+
+  it('does not show a delayed copy check in another session', async () => {
+    let completeCopy!: () => void
+    vi.mocked(copyTextWithFallback).mockImplementationOnce(() => new Promise<void>(resolve => { completeCopy = resolve }))
+    const { app, el, sessionKey } = await mountToolResultModal({ sessionKey: 'first' })
+    el.querySelector<HTMLButtonElement>('button[title="Copy"]')!.click()
+    sessionKey.value = 'second'
+    await nextTick()
+    completeCopy()
+    await Promise.resolve()
+    await nextTick()
+    expect(el.querySelector('button[title="Copy"] polyline')).toBeNull()
     app.unmount()
   })
 

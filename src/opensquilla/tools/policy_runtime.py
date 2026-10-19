@@ -225,7 +225,9 @@ def resolve_runtime_tool_surface(
         denied_tools |= set(_PRIVATE_MEMORY_READ_TOOL_NAMES)
 
     allowed_tools = _remove_denied_from_allowed(allowed_tools, denied_tools)
-    return replace(ctx, allowed_tools=allowed_tools, denied_tools=denied_tools)
+    return replace(
+        ctx, allowed_tools=allowed_tools, denied_tools=denied_tools,
+    )
 
 
 def detect_runtime_tool_surface_capabilities(

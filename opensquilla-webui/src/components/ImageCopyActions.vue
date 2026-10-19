@@ -68,12 +68,15 @@ async function perform(mode: 'image' | 'svg-source') {
   // Calling copy before awaiting preserves the click's clipboard activation.
   const ok = await copy(mode)
   if (attempt !== generation) return
-  result.value = ok ? 'ok' : 'error'
-  feedback.value = t(ok
-    ? mode === 'image' ? 'imageClipboard.copiedImage' : 'imageClipboard.copiedSource'
-    : 'imageClipboard.failed')
   clearTimeout(feedbackTimer)
-  feedbackTimer = setTimeout(() => { feedback.value = ''; result.value = 'idle' }, 1200)
+  if (ok && mode === 'image') {
+    result.value = 'ok'
+    feedbackTimer = setTimeout(() => { result.value = 'idle' }, 1200)
+  } else if (!ok) {
+    result.value = 'error'
+    feedback.value = t('imageClipboard.failed')
+    feedbackTimer = setTimeout(() => { feedback.value = ''; result.value = 'idle' }, 1200)
+  }
 }
 
 function reset() {

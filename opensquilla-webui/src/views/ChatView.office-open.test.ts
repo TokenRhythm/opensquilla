@@ -146,19 +146,22 @@ describe('chat Office card document opening', () => {
     expect(h.legacy).not.toHaveBeenCalled()
   })
 
-  it.each(['docx', 'pptx', 'xlsx', 'html'])('opens %s through the canonical document and retains revision/hash', async extension => {
+  it.each(['docx', 'pptx', 'xlsx', 'html'])('opens historical %s with its original deliverable identity and hash', async extension => {
     const h = harness(), artifact = { ...h.artifact, name: `计划.${extension}` }
     expect(h.api.openArtifact(artifact)).toBe(true)
     await vi.waitFor(() => expect(h.openItem).toHaveBeenCalledTimes(1))
     expect(h.services.resolve).toHaveBeenCalledWith('session-a', createWorkbenchResourceRef('deliverable', artifact.id))
-    expect(h.services.openCurrent).toHaveBeenCalledWith('session-a', h.resource)
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
     expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({
-      sessionKey: 'session-a', resourceIdentity: 'document:doc-current', initialSection: 'preview',
-      artifact: expect.objectContaining({ documentId: 'doc-current', revisionId: 'rev-current', sha256: 'b'.repeat(64),
-        revision_download_url: h.revision.downloadUrl }),
+      sessionKey: 'session-a', resourceIdentity: `deliverable:${artifact.id}`,
+      artifact: expect.objectContaining({ id: artifact.id, sha256: 'a'.repeat(64) }),
     }))
+    const opened = h.openItem.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(opened).not.toHaveProperty('preparedPreview')
+    expect(opened.artifact).not.toHaveProperty('documentId')
     expect(h.legacy).not.toHaveBeenCalled()
     expect(h.services.importDocument).not.toHaveBeenCalled()
+    expect(h.services.preview).not.toHaveBeenCalled()
   })
 
   it.each(['pdf', 'doc', 'ppt', 'xls'])('leaves %s on its existing preview route', extension => {
@@ -179,39 +182,43 @@ describe('chat Office card document opening', () => {
     expect(h.services.resolve).not.toHaveBeenCalled()
   })
 
-  it('preserves explicit document identity and the old API import fallback', async () => {
+  it('keeps a related document from replacing a historical card and preserves the old API preview fallback', async () => {
     const h = harness()
     await h.api.openDeliverableWorkbenchResource({ ...h.artifact, documentId: 'doc-current' })
-    expect(h.services.resolve).toHaveBeenCalledWith('session-a', createWorkbenchResourceRef('document', 'doc-current'))
-    h.services.openCurrent.mockResolvedValue(null); h.openItem.mockClear()
-    await h.api.openDeliverableWorkbenchResource(h.artifact)
-    expect(h.services.importDocument).toHaveBeenCalledWith('session-a', h.resource)
-    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ artifact: expect.objectContaining({ documentId: 'doc-current' }) }))
-  })
-
-  it('keeps an authoritative readonly response as preview and never imports it', async () => {
-    const h = harness()
-    h.services.openCurrent.mockResolvedValue({ disposition: 'readonly', resource: h.resource })
+    expect(h.services.resolve).toHaveBeenCalledWith('session-a', createWorkbenchResourceRef('deliverable', h.artifact.id))
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
+    h.services.resolve.mockResolvedValueOnce(null); h.openItem.mockClear()
     await h.api.openDeliverableWorkbenchResource(h.artifact)
     expect(h.services.importDocument).not.toHaveBeenCalled()
-    expect(h.services.preview).toHaveBeenCalledWith('session-a', h.resource.resource)
-    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ preparedPreview: expect.any(Object), previewLeaseEligible: false }))
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.legacy).toHaveBeenCalledWith(h.artifact)
+  })
+
+  it('does not open or import a historical resource whose preview capability is unavailable', async () => {
+    const h = harness()
+    h.services.resolve.mockResolvedValueOnce({ ...h.resource, capabilities: { preview: false, edit: false } })
+    await h.api.openDeliverableWorkbenchResource(h.artifact)
+    expect(h.services.importDocument).not.toHaveBeenCalled()
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
+    expect(h.services.preview).not.toHaveBeenCalled()
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.pushToast).toHaveBeenCalledOnce()
   })
 
   it.each(['session', 'epoch', 'gateway identity', 'connection epoch', 'disposed', 'inactive'] as const)(
     'discards a completed open after the %s changes', async change => {
       const h = harness()
       let resolve!: (value: unknown) => void
-      h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+      h.services.resolve.mockImplementationOnce(() => new Promise(done => { resolve = done }))
       const pending = h.api.openDeliverableWorkbenchResource(h.artifact)
-      await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalled())
+      expect(h.services.resolve).toHaveBeenCalledOnce()
       if (change === 'session') h.sessionKey.value = 'session-b'
       else if (change === 'epoch') h.currentEpoch.value += 1
       else if (change === 'gateway identity') h.deliveryIdentity.value = 'gateway-b'
       else if (change === 'connection epoch') h.gatewayAccess.subscriptionEpoch += 1
       else if (change === 'disposed') h.api.dispose()
       else h.api.deactivate()
-      resolve(h.current); await pending
+      resolve(h.resource); await pending
       expect(h.openItem).not.toHaveBeenCalled()
       expect(h.legacy).not.toHaveBeenCalled()
       expect(h.pushToast).not.toHaveBeenCalled()
@@ -232,9 +239,9 @@ describe('chat Office card document opening', () => {
     'retires an older open when the %s changes and returns before resolution', async change => {
       const h = harness()
       let resolve!: (value: unknown) => void
-      h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+      h.services.resolve.mockImplementationOnce(() => new Promise(done => { resolve = done }))
       const pending = h.api.openDeliverableWorkbenchResource(h.artifact)
-      await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalledOnce())
+      expect(h.services.resolve).toHaveBeenCalledOnce()
       if (change === 'session') {
         h.sessionKey.value = 'session-b'; h.sessionKey.value = 'session-a'
       } else if (change === 'epoch') {
@@ -244,40 +251,39 @@ describe('chat Office card document opening', () => {
       } else {
         h.gatewayAccess.subscriptionEpoch = 2; h.gatewayAccess.subscriptionEpoch = 1
       }
-      resolve(h.current); await pending
+      resolve(h.resource); await pending
       expect(h.openItem).not.toHaveBeenCalled()
       expect(h.legacy).not.toHaveBeenCalled()
       expect(h.pushToast).not.toHaveBeenCalled()
     },
   )
 
-  it('does not reopen an older document when a later click finishes first', async () => {
+  it('does not reopen an older historical delivery when a later click finishes first', async () => {
     const h = harness()
     let resolve!: (value: unknown) => void
-    h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    h.services.resolve.mockImplementationOnce(() => new Promise(done => { resolve = done }))
     const first = h.api.openDeliverableWorkbenchResource(h.artifact)
-    await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalledOnce())
-    const secondRevision = { ...h.revision, documentId: 'doc-second', revisionId: 'rev-second' }
-    const second = { ...h.current, revision: secondRevision, document: { documentId: 'doc-second' },
-      resource: { ...h.resource, resource: createWorkbenchResourceRef('document', 'doc-second') } }
-    h.services.openCurrent.mockResolvedValueOnce(second)
+    expect(h.services.resolve).toHaveBeenCalledOnce()
+    const second = { ...h.resource, resource: createWorkbenchResourceRef('deliverable', 'second-ppt') }
+    h.services.resolve.mockResolvedValueOnce(second)
     await h.api.openDeliverableWorkbenchResource({ ...h.artifact, id: 'second-ppt' })
-    resolve(h.current); await first
+    resolve(h.resource); await first
     expect(h.openItem).toHaveBeenCalledOnce()
-    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ resourceIdentity: 'document:doc-second' }))
+    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ resourceIdentity: 'deliverable:second-ppt' }))
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
     expect(h.legacy).not.toHaveBeenCalled()
   })
 
   it('keeps a newer workspace preview when an earlier public deliverable resolves late', async () => {
     const h = harness()
     let resolve!: (value: unknown) => void
-    h.services.openCurrent.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    h.services.resolve.mockImplementationOnce(() => new Promise(done => { resolve = done }))
     const pending = h.api.openDeliverableWorkbenchResource(h.artifact)
-    await vi.waitFor(() => expect(h.services.openCurrent).toHaveBeenCalledOnce())
+    expect(h.services.resolve).toHaveBeenCalledOnce()
     h.workspacePreviewOpening.open.mockImplementationOnce(() => h.openItem({ resourceIdentity: 'document:doc_new_site' }))
     expect(h.api.openArtifact({ source: 'workspace-preview', documentId: 'doc_new_site',
       session_key: 'session-a', name: 'new-site.html', mime: 'text/html' })).toBe(true)
-    resolve(h.current); await pending
+    resolve(h.resource); await pending
     expect(h.openItem).toHaveBeenCalledOnce()
     expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ resourceIdentity: 'document:doc_new_site' }))
   })

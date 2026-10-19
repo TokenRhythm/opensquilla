@@ -3,6 +3,7 @@ import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
 import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
 import { normalizePageContext } from '@/types/pageContext'
+import { copyTurnCommand, isProjectInitTurnCommand } from '@/types/turnCommand'
 import {
   readTransportFailure,
 } from './transportTypes'
@@ -99,6 +100,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
   if (!pendingInputId || !clientRequestId || !clientMessageId) return null
 
   if (value.selectedSkills !== undefined && !isSelectedSkills(value.selectedSkills)) return null
+  if (value.turnCommand !== undefined && !isProjectInitTurnCommand(value.turnCommand)) return null
   const attachments = Array.isArray(value.attachments)
     ? value.attachments.flatMap(attachment => {
         const projected = projectServerAttachment(attachment)
@@ -122,6 +124,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
 
   return {
     pendingInputId,
+    ...(isProjectInitTurnCommand(value.turnCommand) ? { turnCommand: copyTurnCommand(value.turnCommand) } : {}),
     clientRequestId,
     clientMessageId,
     ...(message !== undefined ? { message } : {}),
@@ -217,11 +220,15 @@ function createRawPendingInputQueuePort(
     supportsQueue: () => supports(methods.enqueue),
     supportsReorder: () => supports(methods.reorder),
     enqueue: request => {
+      if (request.turnCommand !== undefined && !isProjectInitTurnCommand(request.turnCommand)) {
+        return Promise.reject(new PendingInputQueueError('invalid', 'Invalid turn command.', false))
+      }
       if (request.selectedSkills?.length && !supports(SKILLS_CANDIDATES_METHOD)) {
         return Promise.reject(new PendingInputQueueError('unsupported', 'Update the Gateway to use selected skills.', false))
       }
       return requestPending(source, methods.enqueue, {
         ...request,
+        ...(request.turnCommand ? { turnCommand: copyTurnCommand(request.turnCommand) } : {}),
         ...(request.selectedSkills?.length ? { selectedSkills: copySelectedSkills(request.selectedSkills) } : {}),
         ...(request.localPathReferences?.length
           ? { localPathReferences: copyLocalPathReferences(request.localPathReferences, request.displayText ?? request.message) } : {}),

@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from opensquilla.artifact_archives import validate_html_archive
 from opensquilla.artifact_validation import (
     ArtifactValidationError,
     is_pptx_candidate,
@@ -28,6 +30,7 @@ from opensquilla.artifacts import (
     artifact_publish_max_bytes_for_name,
     collect_artifact_bundle,
 )
+from opensquilla.contracts.content_material import ContentExportError
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.types import CallerKind, ToolContext
 
@@ -346,16 +349,29 @@ def auto_publish_omitted_workspace_artifacts(
                     )
                     continue
 
-            target_sha256 = hashlib.sha256(
-                pptx_payload if pptx_payload is not None else target.read_bytes()
-            ).hexdigest()
+            bundle_snapshot = (
+                collect_artifact_bundle(target, workspace_root=workspace, mode="auto")
+                if suffix in _HTML_SUFFIXES else None
+            )
+            bundle_manifest = None
+            if bundle_snapshot is not None:
+                validate_html_archive(bundle_snapshot)
+                bundle_manifest = artifact_bundle_manifest(bundle_snapshot)
+                target_sha256 = next(
+                    item.sha256 for item in bundle_manifest.files
+                    if item.path == bundle_manifest.entrypoint
+                )
+            else:
+                target_sha256 = hashlib.sha256(
+                    pptx_payload if pptx_payload is not None else target.read_bytes()
+                ).hexdigest()
             artifact_key = (target_sha256, _safe_filename(target.name))
             target_key = artifact_delivery_publish_target_key(
                 str(target),
                 workspace_dir=workspace,
             )
             name_key = artifact_delivery_name_target_key(target.name)
-            if artifact_key in known_artifact_keys or any(
+            if (bundle_manifest is None and artifact_key in known_artifact_keys) or any(
                 _published_source_version_matches(
                     target, target_sha256, source, artifact,
                     store=store, workspace=workspace, session_id=ctx.artifact_session_id,
@@ -375,6 +391,8 @@ def auto_publish_omitted_workspace_artifacts(
                 sha256=target_sha256,
                 name=target.name,
                 mime=artifact_mime,
+                bundle_digest=bundle_manifest.bundle_digest if bundle_manifest else None,
+                require_single_file=bundle_manifest is None,
             )
             if existing is not None and existing.id in source_artifact_ids:
                 # Its source/version already failed the check above. A matching
@@ -396,7 +414,18 @@ def auto_publish_omitted_workspace_artifacts(
                     if ctx.artifact_disk_budget_bytes is not None
                     else DEFAULT_ARTIFACT_DISK_BUDGET_BYTES
                 )
-                if pptx_payload is not None:
+                if bundle_snapshot is not None:
+                    ref = store.publish_bundle(
+                        bundle_snapshot,
+                        session_id=ctx.artifact_session_id,
+                        session_key=ctx.session_key,
+                        name=target.name,
+                        mime=artifact_mime,
+                        source="auto_publish_omitted",
+                        max_bytes=publish_max_bytes,
+                        disk_budget_bytes=disk_budget_bytes,
+                    )
+                elif pptx_payload is not None:
                     ref = store.publish_bytes(
                         pptx_payload,
                         session_id=ctx.artifact_session_id,
@@ -421,16 +450,21 @@ def auto_publish_omitted_workspace_artifacts(
             else:
                 ref = existing
             payload = artifact_payload(ref)
+            publication_id = secrets.token_hex(24)
+            source = ArtifactSource(
+                str(target), bundle_mode="auto" if bundle_snapshot is not None else "none",
+                artifact_id=ref.id,
+            )
+            ctx.artifact_source_paths[publication_id] = source
+            payload = {**payload, "publication_id": publication_id}
             ctx.published_artifacts.append(payload)
             published.append(payload)
-            published_sources.append(
-                (ArtifactSource(str(target), bundle_mode="none", artifact_id=ref.id), payload)
-            )
+            published_sources.append((source, payload))
             source_artifact_ids.add(ref.id)
             for resolved_key in (target_key, name_key):
                 if resolved_key is not None and resolved_key not in resolved_target_keys:
                     resolved_target_keys.append(resolved_key)
-        except (ArtifactBudgetError, OSError, ValueError) as exc:
+        except (ArtifactBudgetError, ContentExportError, OSError, ValueError) as exc:
             failure_summaries.append(f"auto-publish failed for {target.name}: {exc}")
             log.warning(
                 "artifact_delivery.auto_publish_failed path=%s error=%s",

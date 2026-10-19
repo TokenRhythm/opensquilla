@@ -192,6 +192,15 @@ describe('v4 TurnCommands Adapter', () => {
     expect(request).toHaveBeenCalledWith(CHAT_SEND_METHOD, params)
   })
 
+  it('preserves a narrow ordinary-turn command and rejects malformed descriptors', () => {
+    const turnCommand = { name: 'project.init' as const, args: 'retain existing rules' }
+    expect(toWireSendParams({ message: '/init retain existing rules', sessionKey: 's', turnCommand }))
+      .toMatchObject({ turnCommand })
+    expect(() => toWireSendParams({ message: '/init', sessionKey: 's',
+      turnCommand: { name: 'anything', args: '' } as never }))
+      .toThrow(expect.objectContaining({ failureCode: 'INVALID_REQUEST', accepted: false }))
+  })
+
   it('validates a pinned first turn with selected skills, workspace references and imported files', async () => {
     const request = vi.fn(async <T>() => ({ sessionKey: 'agent:main:test' } as T)) as TurnCommandsTransport['request']
     const commands = createV4TurnCommands({ request, supports: () => true })

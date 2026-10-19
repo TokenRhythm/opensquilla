@@ -57,7 +57,7 @@ describe('ActivityNarration visible commentary', () => {
     i18n.global.locale.value = 'zh-Hans'
     await nextTick()
     expect(host.querySelectorAll('.code-copy-btn')).toHaveLength(1)
-    expect(host.querySelector<HTMLButtonElement>('.code-copy-btn')!.title).toBe(i18n.global.t('chat.copied'))
+    expect(host.querySelector<HTMLButtonElement>('.code-copy-btn')!.title).toBe(i18n.global.t('chat.copy'))
   })
 
   it('keeps a short readable update directly visible', () => {

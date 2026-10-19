@@ -190,6 +190,9 @@
           "items": {
             "$ref": "#/$defs/WorkspaceFileReference"
           }
+        },
+        "turnCommand": {
+          "$ref": "#/$defs/TurnCommand"
         }
       }
     },
@@ -751,6 +754,22 @@
           }
         }
       ]
+    },
+    "TurnCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "args"
+      ],
+      "properties": {
+        "name": {
+          "const": "project.init"
+        },
+        "args": {
+          "type": "string"
+        }
+      }
     }
   }
 }

@@ -154,7 +154,7 @@ describe('ActivityToolDetails adaptive detail window', () => {
       `$ ${command}\n\n${result}`,
     ))
     await vi.waitFor(() => {
-      expect(copy?.getAttribute('aria-label')).toBe('Copied')
+      expect(copy?.getAttribute('aria-label')).toBe('Copy')
     })
 
     expect(onShowResult).not.toHaveBeenCalled()

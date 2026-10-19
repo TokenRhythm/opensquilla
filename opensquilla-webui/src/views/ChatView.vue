@@ -829,6 +829,7 @@ import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverable
 import { useChatRouteHeaderBridge, type ChatRouteHeaderAction } from '@/composables/chat/useChatRouteHeaderBridge'
 import { configureWorkbenchSessionCollaboration, configureWorkbenchSessionRouting, useWorkbenchSessionPreparation } from '@/composables/chat/useWorkbenchSessionPreparation'
 import { useChatFind } from '@/composables/chat/useChatFind'
+import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useChatFindPresentation } from '@/composables/chat/useChatFindPresentation'
 import { isChatFindShortcut } from '@/utils/chat/chatFindShortcut'
 import { SESSION_MESSAGE_SEARCH_KEY } from '@/modules/sessionMessageSearch'
@@ -1037,6 +1038,7 @@ import {
 } from '@/utils/chat/artifacts'
 import {
   artifactFromWorkbenchItem,
+  fixedArtifactTarget,
   createArtifactPreviewWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
 } from '@/workbench/artifactItems'
@@ -1084,7 +1086,6 @@ import {
   STOPPED_STREAM_TASK_ID,
 } from '@/utils/chat/streamEvents'
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
-import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import { currentSessionLink } from '@/utils/chat/sessionLinks'
 import {
@@ -2102,6 +2103,7 @@ const chatPendingQueue = useChatPendingQueue({
   pendingQueuePolicy: props.pendingQueuePolicy,
   pendingInputQueue,
   connectionState: gatewayConnectionState,
+  supportsTurnCommand: command => chatSlashCommands.supportsTurnCommand(command),
   deliveryIdentity,
   composerRevision,
   prepareAttachmentsForSend,
@@ -3638,6 +3640,7 @@ const sideChatCommand = useSideChatCommand({
   notify: message => pushToast(message, { duration: 6000 }), translate: key => t(key), resized: autoResizeTextarea,
 })
 const chatSlashCommands = useChatSlashCommands({
+  catalogScope: () => JSON.stringify([gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch]),
   sideChat: sideChatCommand,
   commandAllowed: command => conversationSlashActionAllowed(conversationPolicy.value, command.execution?.action || command.cmd),
   skillCatalog,
@@ -3844,6 +3847,7 @@ const chatSend = useChatSend({
   },
   activeSteerCapability,
   inputText,
+  commandText: composerText,
   messages,
   sessionKey,
   pendingQueueOwnerContext,
@@ -3970,6 +3974,8 @@ const chatSend = useChatSend({
   classifySlashCommand,
   executeSlashCommand,
   isPlanModeCommand,
+  resolveTurnCommand: chatSlashCommands.resolveTurnCommand,
+  supportsTurnCommand: chatSlashCommands.supportsTurnCommand,
   closeSlashMenu,
   autoResizeTextarea,
   scrollToBottom,
@@ -5699,7 +5705,8 @@ async function downloadArtifact(artifact: ArtifactPayload) {
   // are separate workbench actions and must not change what this chat card
   // resolves to after later edits.
   try {
-    const result = await artifactWorkbench.content.fetchArtifact(artifact, {
+    const target = artifact.source === 'workspace-preview' ? artifact : fixedArtifactTarget(artifact)
+    const result = await artifactWorkbench.content.fetchArtifact(target, {
       sessionKey: sessionKey.value,
     })
     if (!result.ok) {
@@ -5872,6 +5879,7 @@ function openLegacyArtifactWorkbench(
       && platform.workbench.native,
     ),
     sessionKey: sessionKey.value,
+    ...(artifact.id ? { resourceIdentity: `deliverable:${artifact.id}` } : {}),
   }))
 }
 
@@ -5883,13 +5891,9 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
   const documentId = typeof artifact.documentId === 'string'
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
-  if ((!artifactId && !documentId) || !key) {
-    openLegacyArtifactWorkbench(artifact)
-    return
-  }
   try {
-    // Persisted workspace cards can reference an internal historical revision.
-    // Resolve its owning document instead of treating it as a public delivery.
+    // Working-file cards deliberately follow their Document. Published chat
+    // cards instead retain the original ArtifactStore identity below.
     if (artifact.source === 'workspace-preview') {
       await openWorkspacePreviewExplicit(
         documentId || { artifactId }, key,
@@ -5897,111 +5901,38 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       )
       return
     }
-    const ref = documentId
-      ? createWorkbenchResourceRef('document', documentId)
-      : createWorkbenchResourceRef('deliverable', artifactId)
+    if (!artifactId || !key) {
+      openLegacyArtifactWorkbench(artifact)
+      return
+    }
+    const ref = createWorkbenchResourceRef('deliverable', artifactId)
     const resource = await workbenchResourcesStore.resolve(key, ref)
     if (!isCurrent()) return
     if (!resource) {
       openLegacyArtifactWorkbench(artifact)
       return
     }
-    const current = await workbenchResourcesStore.openCurrent(key, resource)
-    if (!isCurrent()) return
-    if (current?.disposition === 'document') {
-      const currentArtifact = artifactPayloadFromRevision(current.revision)
-      currentArtifact.documentId = current.document.documentId
-      currentArtifact.revisionId = current.revision.revisionId
-      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-        artifact: currentArtifact,
-        initialSection: 'preview',
-        navigationArtifacts: sessionArtifacts.value,
-        nativeHtml: Boolean(
-          platform.capabilities.hasNativeWorkbenchSurfaces
-          && platform.workbench.native,
-        ),
-        previewLeaseEligible: true,
-        resourceIdentity: workbenchResourceKey(current.resource.resource),
-        sessionKey: key,
-      }))
-      return
-    }
-    if (!current && resource.resource.type === 'document') {
-      openLegacyArtifactWorkbench(
-        artifactPayloadFromWorkbenchResource(resource),
-        'preview',
-      )
-      return
-    }
-    if (
-      !current
-      && resource.resource.type !== 'document'
-      && resource.capabilities.edit
-      && resource.sha256
-    ) {
-      const imported = await workbenchResourcesStore.importDocument(
-        key,
-        resource,
-      )
-      if (!isCurrent()) return
-      const importedArtifact = artifactPayloadFromRevision(imported.revision)
-      importedArtifact.documentId = imported.document.documentId
-      importedArtifact.revisionId = imported.revision.revisionId
-      openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-        artifact: importedArtifact,
-        initialSection: 'preview',
-        navigationArtifacts: sessionArtifacts.value,
-        nativeHtml: Boolean(
-          platform.capabilities.hasNativeWorkbenchSurfaces
-          && platform.workbench.native,
-        ),
-        previewLeaseEligible: true,
-        resourceIdentity: `document:${imported.document.documentId}`,
-        sessionKey: key,
-      }))
-      return
-    }
-    const readonlyResource = current?.resource || resource
-    if (!readonlyResource.capabilities.preview) {
+    if (!resource.capabilities.preview) {
       pushToast(t(workbenchResourceUnavailableReasonKey(
-        current?.reasonCode || workbenchResourceActionReasonCode(
-          readonlyResource.capabilities,
-          'preview',
-        ),
+        workbenchResourceActionReasonCode(resource.capabilities, 'preview'),
       )), { tone: 'warn' })
       return
     }
-    const preview = await workbenchResourcesStore.preview(
-      key,
-      readonlyResource.resource,
-    )
-    if (!isCurrent()) return
-    if (!preview) {
-      openLegacyArtifactWorkbench(artifact)
-      return
-    }
-    const preparedResource = resourceFromPreparedPreview(preview)
+    // Viewing a delivery must neither open the current head nor import a
+    // working copy. HTML uses its existing lease; Office uses previews.create.
     openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-      artifact: artifactPayloadFromWorkbenchResource(preparedResource),
+      artifact: artifactPayloadFromWorkbenchResource(resource),
       navigationArtifacts: sessionArtifacts.value,
-      nativeHtml: false,
-      preparedPreview: preview.preview,
-      previewLeaseEligible: false,
-      resourceIdentity: workbenchResourceKey(readonlyResource.resource),
+      nativeHtml: Boolean(platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native),
+      resourceIdentity: workbenchResourceKey(ref),
       sessionKey: key,
     }))
   } catch (error) {
     if (!isCurrent()) return
-    // METHOD_NOT_FOUND is normalized to a null open result by the provider and
-    // follows the compatibility path above. Any other failure must remain
-    // visible: silently opening the immutable chat artifact would disguise a
-    // failed current-head resolution as a successful edit action.
     const classified = classifyArtifactProductError(error)
     const translated = t(classified.messageKey)
-    pushToast(
-      translated === classified.messageKey ? classified.fallbackMessage : translated,
-      { tone: 'danger', duration: 9000 },
-    )
+    pushToast(translated === classified.messageKey ? classified.fallbackMessage : translated,
+      { tone: 'danger', duration: 9000 })
   }
 }
 
@@ -6359,6 +6290,7 @@ const {
   copyIconName: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
   onCopyClick: copySessionLink,
+  resetCopyFeedback: resetSessionCopyFeedback,
 } = useCopyFeedback(async () => {
   const key = sessionKey.value
   const epoch = gatewayAccess.subscriptionEpoch
@@ -6376,6 +6308,7 @@ const {
     return false
   }
 })
+watch([sessionKey, () => gatewayAccess.subscriptionEpoch], resetSessionCopyFeedback, { flush: 'sync' })
 
 // App owns the header component. This view registers one stable set of refs and
 // commands; draft materialization only changes those refs and never rebuilds
@@ -6566,9 +6499,7 @@ async function onShareCopy() {
   const ok = await copyImageToClipboard(preview.blob)
   // Approved decision: the modal stays open after a copy so the user can copy
   // again or then download; only Download / Cancel / Escape closes it.
-  pushToast(ok ? t('chat.toast.copiedToClipboard') : t('chat.toast.copyNotSupported'), {
-    tone: ok ? undefined : 'danger',
-  })
+  if (!ok) pushToast(t('chat.toast.copyNotSupported'), { tone: 'danger' })
 }
 
 // Re-render the image in the chosen theme, swapping the object URL in place so
@@ -8055,6 +7986,9 @@ watch(
 
 watch(projectWorkspaces.workspaces, workspaces => {
   if (!gatewayAccess.canManageProjectWorkspaces) return
+  // A reconnect clears the catalog before its next successful load. That
+  // temporary empty value is not evidence that the bound project was removed.
+  if (!projectWorkspaces.hasLoaded.value) return
   const workspaceId = boundWorkspaceId.value
   if (!workspaceId) return
   const workspace = workspaces.find(item => item.id === workspaceId) || null

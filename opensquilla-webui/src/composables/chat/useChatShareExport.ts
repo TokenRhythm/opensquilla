@@ -103,7 +103,6 @@ export function useChatShareExport(options: ChatShareExportOptions) {
         zoomOut: i18n.global.t('chat.mermaid.zoomOut'),
         reset: i18n.global.t('chat.mermaid.reset'),
         copyCode: i18n.global.t('chat.mermaid.copyCode'),
-        copied: i18n.global.t('chat.copied'),
         copyFailed: i18n.global.t('chat.toast.copyFailed'),
         exportPng: i18n.global.t('chat.mermaid.exportPng'),
         exportFailed: i18n.global.t('chat.mermaid.exportFailed'),

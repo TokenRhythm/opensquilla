@@ -554,6 +554,7 @@ describe('useSkillRegistry install state', () => {
     expect(call.mock.calls.map(([method]) => method)).toEqual(['skills.deps.install'])
     pending.get('skills.deps.install')?.({ success: true })
     await dependency
+    expect(pushToast).not.toHaveBeenCalled()
 
     const uninstall = registry.uninstallSkill('demo')
     expect(gate.owner.value).toBe('uninstall')
@@ -1050,6 +1051,7 @@ describe('useSkillRegistry install state', () => {
     expect(outcome.missingStill.env_any).toEqual([
       ['OPENROUTER_API_KEY', 'ARK_API_KEY'],
     ])
+    expect(pushToast).toHaveBeenCalledExactlyOnceWith('binary installed', { tone: 'warn' })
   })
 })
 

@@ -44,7 +44,7 @@ afterEach(() => {
 })
 
 describe('ImageCopyActions', () => {
-  it('shows the check only after clipboard success and restores copy after 1.2 seconds', async () => {
+  it('shows a temporary check after success without changing action labels or announcing success', async () => {
     vi.useFakeTimers()
     let finishWrite!: () => void
     vi.spyOn(imageClipboard, 'writePreparedClipboard').mockImplementation(() => new Promise<void>(resolve => {
@@ -52,6 +52,8 @@ describe('ImageCopyActions', () => {
     }))
     const { host } = await mount()
     const button = host.querySelector<HTMLButtonElement>('[data-testid="copy-image"]')!
+    const title = button.title
+    const label = button.getAttribute('aria-label')
     expect(button.querySelector('.icon')?.innerHTML).toBe(iconMarkup('copy'))
     button.click()
     await nextTick()
@@ -63,7 +65,10 @@ describe('ImageCopyActions', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(button.disabled).toBe(false)
     expect(button.querySelector('.icon')?.innerHTML).toBe(iconMarkup('check'))
-    expect(host.querySelector('[role="status"]')?.textContent).toBe(i18n.global.t('imageClipboard.copiedImage'))
+    expect(host.querySelector('[role="status"]')?.textContent).toBe('')
+    expect(host.querySelector('.image-copy-actions')?.getAttribute('data-state')).toBe('ok')
+    expect(button.title).toBe(title)
+    expect(button.getAttribute('aria-label')).toBe(label)
     await vi.advanceTimersByTimeAsync(1199)
     expect(button.querySelector('.icon')?.innerHTML).toBe(iconMarkup('check'))
     await vi.advanceTimersByTimeAsync(1)
@@ -72,6 +77,7 @@ describe('ImageCopyActions', () => {
   })
 
   it('supports the SVG menu keyboard lifecycle across unrelated parent renders', async () => {
+    vi.spyOn(imageClipboard, 'writePreparedClipboard').mockResolvedValue(undefined)
     const { host, unrelated } = await mount()
     const more = host.querySelector<HTMLButtonElement>('[data-testid="image-copy-more"]')!
     more.focus()
@@ -88,6 +94,17 @@ describe('ImageCopyActions', () => {
     expect(document.querySelector('[role="menu"]')).toBeNull()
     expect(document.activeElement).toBe(more)
     expect(useNativeSurfaceOcclusionState().value).toBe(false)
+    more.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('[data-testid="copy-svg-source"]')!.click()
+    await nextTick()
+    await vi.waitFor(() => {
+      expect(host.querySelector('[data-testid="copy-image"]')?.getAttribute('aria-busy')).toBe('false')
+      expect(host.querySelector('[data-testid="copy-image"] .icon')?.innerHTML).toBe(iconMarkup('copy'))
+    })
+    expect(imageClipboard.writePreparedClipboard).toHaveBeenCalledWith('svg-source', expect.any(Function))
+    expect(document.querySelector('[role="menu"]')).toBeNull()
+    expect(host.querySelector('[role="status"]')?.textContent).toBe('')
   })
 
   it('announces an unsupported clipboard without fetching or downloading', async () => {

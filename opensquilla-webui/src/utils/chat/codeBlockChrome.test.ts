@@ -7,7 +7,7 @@ import { copyTextWithFallback } from '@/utils/browser'
 
 vi.mock('@/utils/browser', () => ({ copyTextWithFallback: vi.fn() }))
 
-const labels = { copy: 'Copy', copied: 'Copied', copyFailed: 'Copy failed' }
+const labels = { copy: 'Copy', copyFailed: 'Copy failed' }
 const owners: ReturnType<typeof createCodeBlockChrome>[] = []
 
 beforeEach(() => { vi.mocked(copyTextWithFallback).mockReset().mockResolvedValue(undefined) })
@@ -47,7 +47,7 @@ describe('decorateCodeBlocks', () => {
     button.click()
     await vi.waitFor(() => {
       expect(copyTextWithFallback).toHaveBeenCalledWith('print(1)')
-      expect(button.getAttribute('aria-label')).toBe('Copied')
+      expect(button.getAttribute('aria-label')).toBe('Copy')
     })
   })
 })
@@ -72,7 +72,7 @@ describe('owned code-block copy lifecycle', () => {
     expect(button.dataset.shareControl).toBe('true')
   })
 
-  it('clears failed feedback on retry and keeps one restarted timer', async () => {
+  it('clears failed feedback on retry and briefly shows a check with the original action name', async () => {
     vi.useFakeTimers()
     const { button } = owned('<pre><code>source</code></pre>')
     vi.mocked(copyTextWithFallback).mockRejectedValueOnce(new Error('denied'))
@@ -84,11 +84,17 @@ describe('owned code-block copy lifecycle', () => {
     await Promise.resolve()
     expect(button.classList.contains('is-error')).toBe(false)
     expect(button.classList.contains('is-copied')).toBe(true)
+    expect(button.querySelector('polyline')).not.toBeNull()
+    expect(button.getAttribute('aria-label')).toBe('Copy')
+    expect(button.textContent).toBe('')
     expect(vi.getTimerCount()).toBe(1)
     vi.advanceTimersByTime(200)
-    expect(button.title).toBe('Copied')
+    expect(button.title).toBe('Copy')
+    expect(button.classList.contains('is-copied')).toBe(true)
     vi.advanceTimersByTime(1400)
     expect(button.title).toBe('Copy')
+    expect(button.classList.contains('is-copied')).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('updates locale in place while retaining keyboard focus and current feedback', async () => {
@@ -96,10 +102,12 @@ describe('owned code-block copy lifecycle', () => {
     button.focus()
     button.click()
     await Promise.resolve()
-    owner.updateLabels({ copy: '复制', copied: '已复制', copyFailed: '复制失败' })
+    owner.updateLabels({ copy: '复制', copyFailed: '复制失败' })
     expect(root.querySelectorAll('button')).toHaveLength(1)
     expect(document.activeElement).toBe(button)
-    expect(button.title).toBe('已复制')
+    expect(button.title).toBe('复制')
+    expect(button.getAttribute('aria-label')).toBe('复制')
+    expect(button.classList.contains('is-copied')).toBe(true)
   })
 
   it('ignores an older copy completion after a newer attempt', async () => {
@@ -111,7 +119,7 @@ describe('owned code-block copy lifecycle', () => {
     await Promise.resolve()
     rejectFirst(new Error('late failure'))
     await Promise.resolve()
-    expect(button.title).toBe('Copied')
+    expect(button.title).toBe('Copy')
     expect(button.classList.contains('is-error')).toBe(false)
   })
 
@@ -128,6 +136,7 @@ describe('owned code-block copy lifecycle', () => {
     button.click()
     expect(copyTextWithFallback).toHaveBeenCalledOnce()
     owner.decorate(root, labels)
+    vi.mocked(copyTextWithFallback).mockRejectedValueOnce(new Error('denied'))
     root.querySelector<HTMLButtonElement>('button')!.click()
     await Promise.resolve()
     expect(vi.getTimerCount()).toBe(1)

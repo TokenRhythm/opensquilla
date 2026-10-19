@@ -205,6 +205,9 @@ export function createWorkbenchResourceCollectionDefinition(
         { name: resource.name },
       ),
       preparingLabel: options.t('workbench.resources.preparing'),
+      versionLabel: (resource: WorkbenchResource) => resource.resource.type === 'document'
+        ? options.t('workbench.resources.currentWorkingFile')
+        : resource.resource.type === 'deliverable' ? options.t('workbench.resources.publishedVersion') : '',
       retryLabel: options.t('workbench.resources.retry'),
       resources: options.resources?.(item) ?? resourcesFromWorkbenchItem(item),
       unavailableReason: (resource: WorkbenchResource) => options.t(

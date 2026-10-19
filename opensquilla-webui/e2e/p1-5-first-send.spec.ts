@@ -695,7 +695,7 @@ async function seedDurableHandoff(
       principal.authenticated, principal.isOwner, [...principal.scopes].sort(),
       [...principal.capabilities].sort(), principal.tokenPublicId, principal.guestOwnerId,
     ])
-    const open = indexedDB.open('opensquilla-chat-pending-inputs', 3)
+    const open = indexedDB.open('opensquilla-chat-pending-inputs')
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       open.onupgradeneeded = () => {
         const db = open.result
@@ -913,7 +913,7 @@ test.describe('durable handoff and pending order release gate', () => {
     // a delivery owner nor rewrites its phase, identity, Stop, lease, or clock.
     const readDelivery = () => page.evaluate(async id => {
       const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open('opensquilla-chat-pending-inputs', 3)
+        const request = indexedDB.open('opensquilla-chat-pending-inputs')
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
       })
@@ -962,14 +962,18 @@ test.describe('durable handoff and pending order release gate', () => {
     await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     await expect.poll(async () => (await readDelivery()).record.phase).toBe('unknown')
     expect((await readDelivery()).record.response).toBeUndefined()
-    // A transient transport toast must leave Stop directly clickable. Do not
-    // dismiss it or wait for its lifetime to expire before requesting Stop.
+    // Unknown acceptance belongs to request-scoped recovery, not a failed-turn
+    // toast. Keep its status visible while Stop remains directly clickable.
+    const unknownDeliveryNotice = page.getByTestId('chat-delivery-recovery')
+    await expect(unknownDeliveryNotice).toContainText('Message status needs confirmation')
+    await expect(unknownDeliveryNotice).toContainText('Reconnect to check the original delivery.')
     const lostAckToast = page.getByTestId('toast').filter({ hasText: 'This request did not finish.' })
-    await expect(lostAckToast).toBeVisible()
+    await expect(lostAckToast).toHaveCount(0)
     const stopButton = page.getByRole('button', { name: 'Stop current response', exact: true })
     await expect(stopButton).toBeVisible()
     await stopButton.click()
-    await expect(lostAckToast).toBeVisible()
+    await expect(unknownDeliveryNotice).toBeVisible()
+    await expect(lostAckToast).toHaveCount(0)
     await expect.poll(async () => (await readDelivery()).record.stop).toMatchObject({ requested: true })
     const originalRecord = (await readDelivery()).record
     expect(originalRecord.stop?.completed).not.toBe(true)
@@ -1005,7 +1009,8 @@ test.describe('durable handoff and pending order release gate', () => {
     await expectSingletonChat(page)
     const notice = page.getByTestId('chat-delivery-recovery')
     await expect(notice).toContainText('Message status needs confirmation')
-    await expect(notice).toContainText(text)
+    await expect(notice.getByRole('listitem')).toHaveCount(1)
+    await expect(page.locator('.msg-user').filter({ hasText: text })).toBeVisible()
     await expect(notice).toContainText('Automatic checks have paused.')
     // The existing session card is the discoverable manual recovery entry.
     // Exercise its real narrow-screen hit target without issuing another read.
@@ -1059,7 +1064,8 @@ test.describe('durable handoff and pending order release gate', () => {
     await expect(page).toHaveURL(url => url.pathname.endsWith('/chat') && url.searchParams.get('session') === sessionKey)
     await expectSingletonChat(page)
     const replacementNotice = page.getByTestId('chat-delivery-recovery')
-    await expect(replacementNotice).toContainText(text)
+    await expect(replacementNotice.getByRole('listitem')).toHaveCount(1)
+    await expect(page.locator('.msg-user').filter({ hasText: text })).toBeVisible()
     await replacementNotice.getByRole('button', { name: 'Check delivery status', exact: true }).click()
     await expect.poll(async () => (await readDelivery()).record.revision).toBeGreaterThan(replacementRecord.revision)
     await expect(replacementNotice.getByRole('button', { name: 'Check delivery status', exact: true })).toBeEnabled()

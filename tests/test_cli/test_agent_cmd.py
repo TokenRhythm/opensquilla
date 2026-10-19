@@ -74,17 +74,20 @@ class _FakeServices:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit_workspace", [False, True])
+@pytest.mark.parametrize("precreated", [False, True])
+@pytest.mark.parametrize("agent_id", ["main", "ops"])
 async def test_cli_new_sessions_keep_the_effective_startup_workspace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool, precreated: bool,
+    agent_id: str,
 ) -> None:
     from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
 
-    monkeypatch.setattr(
-        "opensquilla.gateway.config.default_opensquilla_home", lambda: tmp_path / "profile"
-    )
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "profile"))
     config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
     selected = tmp_path / "selected" if explicit_workspace else Path(config.workspace_dir)
-    selected.mkdir(parents=True)
+    expected = selected if agent_id == "main" else selected / "agents" / agent_id
+    if precreated or explicit_workspace:
+        expected.mkdir(parents=True)
     storage = await SessionStorage.open(str(tmp_path / "cli-workspace.db"))
     contexts: list[Any] = []
 
@@ -114,19 +117,61 @@ async def test_cli_new_sessions_keep_the_effective_startup_workspace(
     monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
     try:
         for suffix in ("first", "second"):
-            key = f"agent:main:cli-workspace:{suffix}"
+            key = f"agent:{agent_id}:cli-workspace:{suffix}"
             await run_agent_once(
-                message="pwd", session_id=key, config=config,
+                message="pwd", session_id=key, config=config, agent_id=agent_id,
                 workspace=str(selected) if explicit_workspace else None,
             )
             session = await storage.get_session(key)
             assert session.execution_workspace["kind"] == "configured"
-            assert session.execution_workspace["root"] == str(selected.resolve())
+            assert session.execution_workspace["root"] == str(expected.resolve())
     finally:
         await storage.close()
 
-    assert [ctx.workspace_dir for ctx in contexts] == [str(selected.resolve())] * 2
+    assert [ctx.workspace_dir for ctx in contexts] == [str(expected.resolve())] * 2
     assert config.workspace_dir_source == "default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_id", ["main", "ops"])
+@pytest.mark.parametrize("source", ["argument", "config", "agent"])
+async def test_cli_does_not_initialize_missing_user_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_id: str, source: str,
+) -> None:
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "profile"))
+    selected = tmp_path / "existing-project"
+    selected.mkdir()
+    (selected / "AGENTS.md").write_text("Keep this guide.\n", encoding="utf-8")
+    missing = selected / "missing"
+    config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
+    if source == "config":
+        config = GatewayConfig(workspace_dir=str(missing))
+    elif source == "agent":
+        # Agent-specific overrides apply to non-main agents.
+        agent_id = "ops"
+        config.agents = [AgentEntryConfig(id=agent_id, workspace=str(missing))]
+    storage = await SessionStorage.open(str(tmp_path / "cli-workspace.db"))
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config, SessionManager(
+            storage, execution_workspace_factory=build_execution_workspace_factory(
+                config, profile_home=tmp_path,
+            ),
+        ))
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        with pytest.raises(ProjectWorkspaceStateError):
+            await run_agent_once(
+                message="pwd", config=config, agent_id=agent_id,
+                workspace=str(missing) if source == "argument" else None,
+            )
+    finally:
+        await storage.close()
+    assert sorted(path.name for path in selected.iterdir()) == ["AGENTS.md"]
+    assert (selected / "AGENTS.md").read_text(encoding="utf-8") == "Keep this guide.\n"
 
 
 def test_benchmark_transcript_preserves_tool_result_execution_status() -> None:

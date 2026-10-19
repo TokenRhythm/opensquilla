@@ -263,6 +263,7 @@ async function loadInfo() {
 async function copyPrompt() {
   try {
     await copyTextWithFallback(exportPrompt.value)
+    if (disposed) return
     promptCopied.value = true
     if (copyResetTimer) clearTimeout(copyResetTimer)
     copyResetTimer = setTimeout(() => {
@@ -270,6 +271,7 @@ async function copyPrompt() {
       copyResetTimer = null
     }, 1500)
   } catch {
+    if (disposed) return
     errorCode.value = ''
     lastOperation.value = 'copy'
     state.value = 'error'
@@ -712,7 +714,7 @@ onUnmounted(() => {
                   @click="copyPrompt"
                 >
                   <Icon :name="promptCopied ? 'check' : 'copy'" :size="15" aria-hidden="true" />
-                  <span>{{ promptCopied ? t('settings.memoryImport.copiedPrompt') : t('settings.memoryImport.copyPrompt') }}</span>
+                  <span>{{ t('settings.memoryImport.copyPrompt') }}</span>
                 </button>
               </div>
 

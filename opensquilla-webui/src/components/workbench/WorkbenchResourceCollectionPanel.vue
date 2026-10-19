@@ -28,6 +28,7 @@
               </span>
               <span class="resource-collection__copy">
                 <strong>{{ resource.name }}</strong>
+                <small v-if="versionLabel?.(resource)">{{ versionLabel?.(resource) }}</small>
                 <small>{{ resourceMeta(resource) }}</small>
                 <small v-if="isBusy(resource)" role="status">
                   {{ preparingLabel }}
@@ -102,6 +103,7 @@ const props = defineProps<{
   preparingLabel: string
   retryLabel: string
   resources: readonly WorkbenchResource[]
+  versionLabel?: (resource: WorkbenchResource) => string
   unavailableReason: (resource: WorkbenchResource) => string
 }>()
 

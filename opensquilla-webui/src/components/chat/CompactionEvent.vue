@@ -33,7 +33,7 @@
         class="chat-compaction-event__diagnostic"
         :title="maintenance.compactionId"
         @click="copyDiagnosticId"
-      >{{ copied ? t('chat.copiedDiagnosticId') : t('chat.copyDiagnosticId') }}</button>
+      >{{ t('chat.copyDiagnosticId') }}</button>
       <span v-if="copyFailed" class="chat-compaction-event__detail" role="status">
         {{ t('chat.copyDiagnosticFailed') }} {{ maintenance?.compactionId }}
       </span>
@@ -73,14 +73,12 @@ function recoveryText(announce = false): string {
 }
 const recoveryLabel = computed(() => recoveryText())
 const recoveryAnnouncement = computed(() => maintenance.value?.providerRecovery?.phase === 'retry_wait' ? recoveryText(true) : '')
-const copied = ref(false)
 const copyFailed = ref(false)
 const failure = computed(() => compactionFailurePresentation(maintenance.value?.reason))
 async function copyDiagnosticId() {
   if (!maintenance.value?.compactionId) return
   try {
     await copyTextWithFallback(maintenance.value.compactionId)
-    copied.value = true
     copyFailed.value = false
   } catch {
     copyFailed.value = true

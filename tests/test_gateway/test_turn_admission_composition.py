@@ -152,8 +152,14 @@ registry = get_dispatcher()
 # Bounded in-conversation search adds sessions.messages.search.
 # Interactive terminals add create, write, resize, close, and consume methods.
 # Temporary side conversations add their create and close Contracts.
+# Workspace creation adds its own write Contract.
 # Keep the exact count so an unrelated RPC cannot slip into the registry.
-assert len(registry.list_methods()) == 284
+assert len(registry.list_methods()) == 285
+workspace_entry = registry.get_entry("workspaces.create")
+assert workspace_entry is not None
+assert workspace_entry.required_scope == "operator.write"
+assert workspace_entry.generated_contract_name == "workspaces.create"
+assert workspace_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
 for method in (
     "terminal.create", "terminal.write", "terminal.resize", "terminal.close",
     "terminal.consume",

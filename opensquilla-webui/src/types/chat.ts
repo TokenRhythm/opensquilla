@@ -162,6 +162,7 @@ export interface PendingSteerAttempt {
 }
 
 export interface ChatPendingItem {
+  turnCommand?: import('./turnCommand').ProjectInitTurnCommand
   /** Stable local identity for keyed rendering and UI actions across peer edits. */
   pendingUiId: string
   text: string

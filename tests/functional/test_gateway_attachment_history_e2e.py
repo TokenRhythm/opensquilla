@@ -221,6 +221,7 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
     config = GatewayConfig()
     config.state_dir = str(tmp_path / "state")
     config.workspace_dir = str(tmp_path / "workspace")
+    Path(config.workspace_dir).mkdir()
     config.attachments.media_root = str(tmp_path / "media")
     config.squilla_router.enabled = True
     config.squilla_router.rollout_phase = "full"

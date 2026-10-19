@@ -29,6 +29,7 @@ interface GatewayAccessSource {
   getConnectionEndpoint(): string | null
   readonly canManageProjectWorkspaces: boolean
   readonly canChooseProject: boolean
+  readonly canCreateProjectWorkspace?: boolean
   readonly auth: Record<string, unknown> | null
   readonly policy: Record<string, unknown> | null
   readonly connectionGeneration: number
@@ -271,6 +272,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     },
     get canChooseProject() {
       return source.canChooseProject
+    },
+    get canCreateProjectWorkspace() {
+      return source.canCreateProjectWorkspace === true
     },
     get runModePolicy() {
       return runModePolicy(source.auth)

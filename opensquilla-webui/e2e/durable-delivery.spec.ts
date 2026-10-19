@@ -7,6 +7,8 @@ import { resolve } from 'node:path'
 // production modules and serve them entirely through Playwright interception.
 const ORIGIN = 'http://127.0.0.1:44177'
 const DATABASE = 'opensquilla-chat-pending-inputs'
+// Explicit migration contract; historical seed versions below stay unchanged.
+const CURRENT_DATABASE_VERSION = 4
 let fixtureModule: string
 
 test.beforeAll(async () => {
@@ -244,9 +246,9 @@ async function installOwner(page: Page, identity = 'synthetic-identity', holdLoo
   }, { identity, holdLookup })
 }
 
-test('v3 preserves v2 handoffs in quarantine and old clients fail without resetting data', async ({ context }) => {
+for (const legacyVersion of [2, 3]) test(`v4 preserves v${legacyVersion} quarantined handoffs and old clients fail without resetting data`, async ({ context }) => {
   const page = await fixturePage(context)
-  const result = await page.evaluate(async databaseName => {
+  const result = await page.evaluate(async ({ databaseName, legacyVersion }) => {
     const fixture = (window as any).deliveryFixture
     const legacy = { schemaVersion: 1, ownerRequestId: 'synthetic-v2-handoff',
       requestSessionKey: 'synthetic-session', clientRequestId: 'synthetic-v2-handoff',
@@ -254,11 +256,17 @@ test('v3 preserves v2 handoffs in quarantine and old clients fail without resett
       composerText: 'Synthetic legacy draft', recoveryAttachments: [], state: 'submitting',
       createdAt: 1, updatedAt: 1 }
     await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.open(databaseName, 2)
+      const request = indexedDB.open(databaseName, legacyVersion)
       request.onupgradeneeded = () => {
         request.result.createObjectStore('pending_chat_inputs', { keyPath: 'pendingInputId' })
           .createIndex('session_created', ['sessionKey', 'createdAt'])
         const store = request.result.createObjectStore('response_handoffs', { keyPath: 'ownerRequestId' })
+        if (legacyVersion === 3) {
+          store.createIndex('recovery_state', 'recoveryState')
+          store.createIndex('task_scope', 'taskScope')
+          store.createIndex('handoff_session', 'handoff.requestSessionKey')
+          store.createIndex('steer_scope', 'steerScope')
+        }
         store.put(legacy)
         store.put({ schemaVersion: 77, ownerRequestId: 'synthetic-future-record', payload: 'Synthetic future material' })
       }
@@ -267,28 +275,29 @@ test('v3 preserves v2 handoffs in quarantine and old clients fail without resett
     })
     const quarantined = await fixture.wal.countQuarantinedDeliveries()
     const recovery = await fixture.wal.listRecoveryDeliveries()
-    const oldClientError = await new Promise<string>((resolve, reject) => {
-      const request = indexedDB.open(databaseName, 2)
+    const oldClientErrors = await Promise.all([2, 3].map(version => new Promise<string>((resolve, reject) => {
+      const request = indexedDB.open(databaseName, version)
       request.onerror = () => resolve(request.error!.name)
-      request.onsuccess = () => { request.result.close(); reject(new Error('Old client unexpectedly opened v3')) }
-    })
-    const stored = await new Promise<unknown[]>((resolve, reject) => {
-      const request = indexedDB.open(databaseName, 3)
+      request.onsuccess = () => { request.result.close(); reject(new Error(`Old v${version} client unexpectedly opened the current WAL`)) }
+    })))
+    const stored = await new Promise<{ version: number; records: unknown[] }>((resolve, reject) => {
+      const request = indexedDB.open(databaseName)
       request.onerror = () => reject(request.error)
       request.onsuccess = () => {
         const database = request.result
         const read = database.transaction('response_handoffs').objectStore('response_handoffs').getAll()
-        read.onsuccess = () => { database.close(); resolve(read.result) }
+        read.onsuccess = () => { database.close(); resolve({ version: database.version, records: read.result }) }
         read.onerror = () => reject(read.error)
       }
     })
-    return { quarantined, recovery, oldClientError, stored, legacy }
-  }, DATABASE)
+    return { quarantined, recovery, oldClientErrors, stored, legacy }
+  }, { databaseName: DATABASE, legacyVersion })
   expect(result.quarantined).toBe(2)
   expect(result.recovery.records).toEqual([])
-  expect(result.oldClientError).toBe('VersionError')
-  expect(result.stored).toContainEqual(result.legacy)
-  expect(result.stored).toContainEqual({ schemaVersion: 77, ownerRequestId: 'synthetic-future-record', payload: 'Synthetic future material' })
+  expect(result.oldClientErrors).toEqual(['VersionError', 'VersionError'])
+  expect(result.stored.version).toBe(CURRENT_DATABASE_VERSION)
+  expect(result.stored.records).toContainEqual(result.legacy)
+  expect(result.stored.records).toContainEqual({ schemaVersion: 77, ownerRequestId: 'synthetic-future-record', payload: 'Synthetic future material' })
 })
 
 test('a blocked open closes its late connection without replacing a newer open', async ({ context }) => {
@@ -326,7 +335,7 @@ test('a blocked open closes its late connection without replacing a newer open',
   })
   await blocker.evaluate(() => (window as any).deliveryFixture.blocker.close())
   await expect.poll(() => page.evaluate(() => (window as any).deliveryFixture.reopenedCount)).toBe(0)
-  expect(await page.evaluate(() => (window as any).deliveryFixture.closedVersions)).toContain(3)
+  expect(await page.evaluate(() => (window as any).deliveryFixture.closedVersions)).toContain(CURRENT_DATABASE_VERSION)
   expect(await page.evaluate(() => (window as any).deliveryFixture.wal.listRecoveryDeliveries())).toEqual({ records: [] })
 })
 
@@ -433,13 +442,13 @@ test('a later database upgrade invalidates the existing WAL and application owne
   const page = await fixturePage(context)
   await installOwner(page)
   await page.evaluate(() => (window as any).deliveryFixture.wal.countQuarantinedDeliveries())
-  await page.evaluate(async databaseName => {
+  await page.evaluate(async ({ databaseName, nextVersion }) => {
     await new Promise<void>((resolve, reject) => {
-      const upgrade = indexedDB.open(databaseName, 4)
+      const upgrade = indexedDB.open(databaseName, nextVersion)
       upgrade.onerror = () => reject(upgrade.error)
       upgrade.onsuccess = () => { upgrade.result.close(); resolve() }
     })
-  }, DATABASE)
+  }, { databaseName: DATABASE, nextVersion: CURRENT_DATABASE_VERSION + 1 })
   const outcome = await page.evaluate(async () => {
     const fixture = (window as any).deliveryFixture
     let error = ''
@@ -452,9 +461,9 @@ test('a later database upgrade invalidates the existing WAL and application owne
   expect(outcome.calls).toEqual({ sends: 0, lookups: 0, cancels: [] })
 })
 
-test('an aborted native v2 to v3 upgrade preserves both stores and can retry without resetting the database', async ({ context }) => {
+test('an aborted native v2 to v4 upgrade preserves both stores and can retry without resetting the database', async ({ context }) => {
   const page = await fixturePage(context)
-  const result = await page.evaluate(async databaseName => {
+  const result = await page.evaluate(async ({ databaseName, currentVersion }) => {
     const fixture = (window as any).deliveryFixture
     const pending = { schemaVersion: 1, pendingInputId: 'synthetic-v2-draft', sessionKey: 'synthetic-session',
       clientRequestId: 'synthetic-v2-request', clientMessageId: 'synthetic-v2-message', text: 'Synthetic retained draft',
@@ -484,7 +493,7 @@ test('an aborted native v2 to v3 upgrade preserves both stores and can retry wit
     }
     IDBFactory.prototype.open = function (name: string, version?: number) {
       const request = version === undefined ? originalOpen.call(this, name) : originalOpen.call(this, name, version)
-      if (name === databaseName && version === 3) {
+      if (name === databaseName && version === currentVersion) {
         // Let the WAL register its migration callback first, then append an
         // observer before the browser dispatches the native upgrade event.
         queueMicrotask(() => {
@@ -524,19 +533,19 @@ test('an aborted native v2 to v3 upgrade preserves both stores and can retry wit
       const afterAbort = await snapshot(2)
       IDBFactory.prototype.open = originalOpen
       const quarantined = await fixture.wal.countQuarantinedDeliveries()
-      const afterRetry = await snapshot(3)
+      const afterRetry = await snapshot(currentVersion)
       return { interrupted, attemptedIndexes, failure, afterAbort, afterRetry, quarantined, deleteCalls, pending, handoff }
     } finally {
       IDBFactory.prototype.open = originalOpen
       IDBFactory.prototype.deleteDatabase = originalDelete
       fixture.wal.close()
     }
-  }, DATABASE)
+  }, { databaseName: DATABASE, currentVersion: CURRENT_DATABASE_VERSION })
   expect(result.interrupted).toBe(true)
   expect(result.attemptedIndexes).toContain('recovery_state')
   expect(result.failure).toBe('AbortError')
   expect(result.afterAbort).toMatchObject({ version: 2, drafts: [result.pending], handoffs: [result.handoff], indexes: [] })
-  expect(result.afterRetry).toMatchObject({ version: 3, drafts: [result.pending], handoffs: [result.handoff] })
+  expect(result.afterRetry).toMatchObject({ version: CURRENT_DATABASE_VERSION, drafts: [result.pending], handoffs: [result.handoff] })
   expect(result.afterRetry.indexes).toContain('recovery_state')
   expect(result.quarantined).toBe(1)
   expect(result.deleteCalls).toBe(0)
@@ -670,7 +679,7 @@ test('500 real pending queues obey retention budgets and recover evicted attachm
       }
       const usage = harness.queue.getParkedQueueUsage()
       const persistedCount = await new Promise<number>((resolve, reject) => {
-        const opening = indexedDB.open(databaseName, 3)
+        const opening = indexedDB.open(databaseName)
         opening.onerror = () => reject(opening.error)
         opening.onsuccess = () => {
           const database = opening.result
