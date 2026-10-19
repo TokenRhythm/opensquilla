@@ -423,6 +423,29 @@ def test_desktop_ownership_acquire_failure_deactivates_process_scope(tmp_path, m
     ))
 
 
+def test_registry_initialization_failure_rolls_back_manifest(tmp_path, monkeypatch):
+    control = tmp_path / "control"
+    state = tmp_path / "state"
+    original = process_tree._connect_owner_database
+
+    def fail_registry(*_args, **_kwargs):
+        raise OSError("synthetic registry failure")
+
+    monkeypatch.setattr(process_tree, "_connect_owner_database", fail_registry)
+    with pytest.raises(OSError, match="synthetic registry failure"):
+        cleanup.configure_desktop_process_cleanup(
+            ownership_dir=control, instance_nonce=_NONCE, state_dir=state,
+        )
+    monkeypatch.setattr(process_tree, "_connect_owner_database", original)
+    assert cleanup._active_scope is None
+    assert not list(control.glob("process-launch-*.json"))
+    cleanup.configure_desktop_process_cleanup(
+        ownership_dir=control, instance_nonce=_NONCE, state_dir=state,
+    )
+    cleanup.release_desktop_process_cleanup(_NONCE)
+    assert _cleanup(control)
+
+
 def test_delayed_registration_retains_launch_fence_after_ownership_release(tmp_path):
     control, state = _configure(tmp_path)
     scope = process_tree._current_task_process_scope()

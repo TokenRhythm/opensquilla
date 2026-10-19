@@ -173,17 +173,26 @@ def configure_desktop_process_cleanup(
             "protocol": PROTOCOL, "launch_digest": digest,
             "state_dir": str(root), "closed": False,
         }, instance_nonce, initial=True)
-        with _connect_owner_database(_owner_database_path(root)) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "INSERT OR IGNORE INTO desktop_process_launches VALUES (?, 0)", (digest,),
-            )
-            row = connection.execute(
-                "SELECT closed FROM desktop_process_launches WHERE launch_digest = ?", (digest,),
-            ).fetchone()
-            if row is None or row["closed"] != 0:
-                raise RuntimeError("Desktop process launch is closing")
-            connection.execute("COMMIT")
+        try:
+            with _connect_owner_database(_owner_database_path(root)) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "INSERT OR IGNORE INTO desktop_process_launches VALUES (?, 0)", (digest,),
+                )
+                row = connection.execute(
+                    "SELECT closed FROM desktop_process_launches WHERE launch_digest = ?",
+                    (digest,),
+                ).fetchone()
+                if row is None or row["closed"] != 0:
+                    raise RuntimeError("Desktop process launch is closing")
+                connection.execute("COMMIT")
+        except BaseException:
+            # The manifest is only useful once the durable admission row exists.
+            # Remove it when registry initialization fails so a retry with the
+            # same launch authority is not mistaken for an active instance.
+            with contextlib.suppress(OSError):
+                path.unlink()
+            raise
         _active_scope = scope
 
 
