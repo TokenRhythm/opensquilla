@@ -8,11 +8,17 @@ import json
 import httpx
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.attachment_workspace import AttachmentWorkspaceMaterializer
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.types import DoneEvent, ErrorEvent
 from opensquilla.provider.openai import OpenAIProvider
-from opensquilla.session.compaction import CompactionRequest, CompactionResult, compact_context
+from opensquilla.session.compaction import (
+    CompactionRequest,
+    CompactionResult,
+    compact_context,
+    estimate_entry_model_replay_tokens,
+)
 from opensquilla.session.compaction_state import (
     CompactionObligation,
     build_structured_summary_from_text,
@@ -87,9 +93,14 @@ async def test_unmaterialized_or_forged_attachment_paths_are_not_adopted(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "force_tokenizer_fallback", [False, True], ids=["default-tokenizer", "fallback"],
+)
 async def test_two_durable_generations_and_restart_keep_verified_reference(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, force_tokenizer_fallback,
 ):
+    if force_tokenizer_fallback:
+        monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
     workspace, resolver = _resolver(tmp_path)
     db = tmp_path / "session.db"
     storage = SessionStorage(db)
@@ -109,15 +120,17 @@ async def test_two_durable_generations_and_restart_keep_verified_reference(
     assert materialized_path and (workspace / materialized_path).read_bytes() == body
     try:
         for generation in (1, 2):
-            for index in range(4):
+            for index in range(5):
                 await manager.append_message(
                     node.session_key, "user", f"Generation {generation} round {index}. "
-                    + "Continue the document review. " * 200,
+                    + "Continue the document review. " * 100,
                 )
                 await manager.append_message(
-                    node.session_key, "assistant", "Completed ordinary review. " * 200,
+                    node.session_key, "assistant", "Completed ordinary review. " * 100,
                 )
             canonical = await manager.get_canonical_transcript(node.session_key)
+            assert sum(estimate_entry_model_replay_tokens(row) for row in canonical) > 4000
+            assert sum(estimate_entry_model_replay_tokens(row) for row in canonical[-2:]) < 4000
             config = synthetic_compaction_config(
                 summary=f"Generation {generation}: continue reviewing the original document.",
                 attachment_path_resolver=resolver,

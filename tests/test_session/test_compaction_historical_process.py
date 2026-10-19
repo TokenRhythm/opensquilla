@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.engine.history import reconstruct_messages_from_entry
 from opensquilla.execution_status import execution_status_for_tool_result
 from opensquilla.provider.types import ChatConfig, Message, ToolDefinition
@@ -24,6 +25,12 @@ from opensquilla.session.compaction_deployment import (
 )
 from opensquilla.session.context_view import format_compaction_summary_context
 from tests.test_session.test_compaction_bounded_input import CapturingProvider
+
+
+@pytest.fixture(params=["default-tokenizer", "fallback"], autouse=True)
+def tokenizer_mode(request, monkeypatch):
+    if request.param == "fallback":
+        monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
 
 
 def _process_round(call_id, action, status):
@@ -55,10 +62,12 @@ def _process_round(call_id, action, status):
 def _history():
     entries = _process_round("old-poll", "poll", "running")
     entries += _process_round("later-wait", "wait", "done")
-    for index in range(24):
+    # Keep each round below 32K's planning guard in both tokenizer modes,
+    # while the full real source remains larger than the 200K model window.
+    for index in range(48):
         entries.extend([
             {"role": "user", "content": f"Earlier request {index}. "
-             + "Background facts were collected and verified carefully. " * 1000},
+             + "Background facts were collected and verified carefully. " * 600},
             {"role": "assistant", "content": f"Batch {index} completed."},
         ])
     return entries
@@ -124,6 +133,9 @@ async def test_old_running_then_completed_process_uses_bounded_summary(window):
     original = deepcopy(entries)
     assert entries[1]["tool_calls"][1]["execution_status"]["reason"] == "background_running"
     assert entries[3]["tool_calls"][1]["execution_status"]["status"] == "success"
+    assert _compaction_source_size(entries)[0] > 200_000
+    assert _compaction_source_size(entries[-3:-1])[0] < cfg.budget.auto_trigger_tokens
+    assert project("Tiny checkpoint.", entries[-3:]).fits
 
     result = await _compact(entries, cfg)
 

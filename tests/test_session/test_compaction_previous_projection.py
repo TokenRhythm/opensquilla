@@ -9,6 +9,7 @@ from copy import deepcopy
 import httpx
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.request_proof import projected_generation_budget
 from opensquilla.provider.types import ChatConfig
@@ -41,8 +42,9 @@ def deployment(window: int):
 def huge_previous(window: int, *, paragraph: bool = False) -> str:
     # Both character and token proofs must bound this input. One variant has no
     # message, line or section boundary on which a splitter could make progress.
+    # Sentence punctuation avoids a separate pathological BPE timing benchmark.
     filler = (
-        "旧值甲乙丙丁戊己庚辛壬癸" if paragraph
+        "旧值甲乙丙丁戊己庚辛壬癸。" if paragraph
         else "\n## Earlier record\n旧值甲乙丙丁戊己庚辛壬癸\n"
     )
     return "CURRENT_TASK_START: preserve the latest request.\n" + filler * (window // 6) + (
@@ -90,6 +92,8 @@ async def test_oversized_previous_fit_and_physical_send_share_bounded_data(
 
     provider, target, context = deployment(window)
     previous = huge_previous(window, paragraph=paragraph)
+    assert len(previous.encode("utf-8")) > window * 4
+    assert token_estimation.estimate_tokens(previous) > window
     source = raw_source() if with_raw else []
     frozen = deepcopy(source)
     with monkeypatch.context() as baseline:
@@ -272,7 +276,7 @@ async def test_oversized_raw_envelope_is_explicitly_sampled_without_changing_sou
     window = 32_768
     provider, target, context = deployment(window)
     previous = huge_previous(window, paragraph=True)
-    source = [{"role": "user", "content": "PROTECTED_SOURCE:" + "甲乙丙丁" * window}]
+    source = [{"role": "user", "content": "PROTECTED_SOURCE:" + "甲乙丙丁。" * window}]
     frozen = deepcopy(source)
     payloads = install_stream(monkeypatch, text="Continue from the bounded source excerpts.")
     failures = []
