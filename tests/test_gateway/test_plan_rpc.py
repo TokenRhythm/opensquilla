@@ -301,6 +301,7 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
     monkeypatch: pytest.MonkeyPatch,
     interruption: str,
 ) -> None:
+    from opensquilla.artifacts import ArtifactStore
     from opensquilla.tools.builtin.artifacts import publish_artifact
     from opensquilla.tools.types import ToolContext, current_tool_context
 
@@ -310,6 +311,8 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
     report.write_text("Synthetic verified report.\n", encoding="utf-8")
     entered = asyncio.Event()
     wait_for_cancel = asyncio.Event()
+    delivery_entered = asyncio.Event()
+    publication_complete = asyncio.Event()
     contexts: list[ToolContext] = []
     published: list[dict[str, Any]] = []
 
@@ -339,6 +342,7 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
             if interruption == "paused":
                 raise RuntimeError("Synthetic provider failure")
             return
+        delivery_entered.set()
         if interruption != "cancelled":
             resumed = await stack.storage.get_plan_run(str(context.plan_run_id))
             assert resumed is not None
@@ -348,6 +352,7 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
         # operation; publication must not stand in for unfinished work.
         assert report.read_text(encoding="utf-8") == "Synthetic verified report.\n"
         published.append(await publish(context))
+        publication_complete.set()
 
     monkeypatch.setattr(
         "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
@@ -399,6 +404,13 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
             )
             assert second["planRun"]["runId"] == run_id
 
+        # Activation, real artifact publication, and durable terminal settlement
+        # each perform filesystem/SQLite work. Bound the actual phases separately:
+        # a shared two-second deadline can report a false timeout while a turn
+        # still makes progress on Windows. These three waits remain bounded to six
+        # seconds in total; publication alone is not proof of terminal success.
+        await asyncio.wait_for(delivery_entered.wait(), timeout=2.0)
+        await asyncio.wait_for(publication_complete.wait(), timeout=2.0)
         terminal = await stack.runtime.wait(second["turn_id"], timeout=2.0)
         assert terminal.status == AgentTaskStatus.SUCCEEDED
         assert len(contexts) == 2
@@ -406,6 +418,10 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
         assert len(published) == 1
         assert published[0]["status"] == "published"
         assert published[0]["artifact"]["name"] == "report.txt"
+        _, delivered_bytes, _ = ArtifactStore(tmp_path / "media").read_verified_material(
+            published[0]["artifact"]["id"], session_id="plan-recovery-artifact",
+        )
+        assert delivered_bytes == report.read_bytes()
         final = await stack.storage.get_plan_run(run_id)
         assert final is not None
         if interruption == "cancelled":

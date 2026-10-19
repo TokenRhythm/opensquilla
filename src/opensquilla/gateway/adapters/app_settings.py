@@ -168,6 +168,8 @@ async def _reconcile_tokenrhythm_profile_after_config_change(
 class GatewayAppSettingsPort:
     """Bind the settings owner's model/storage operations to the running Gateway."""
 
+    _explicit_image_route_paths: set[str]
+
     profile_ids = legacy_profile_ids()
     replace = staticmethod(_update_config_in_place)
     reconcile_routing = staticmethod(reconcile_model_routing_write)
@@ -233,7 +235,7 @@ class GatewayAppSettingsPort:
         self.provider_selector = provider_selector
         self.subscription_manager = subscription_manager
         self.source = source
-        self._explicit_image_route_paths: set[str] = set()
+        self._explicit_image_route_paths = set()
 
     def read_public_settings(self) -> SettingsObject:
         config = self.config

@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from opensquilla import token_estimation
 from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.provider.types import (
     ChatConfig,
@@ -62,6 +63,16 @@ def no_network(monkeypatch):
     monkeypatch.setattr("httpx.AsyncClient.send", reject_network)
     yield
     assert not attempts, "an integrity test attempted an external request"
+
+
+@pytest.fixture(params=["default", "unavailable"])
+def tokenizer_mode(request, monkeypatch):
+    # A runner without a cached encoding can retain this fallback for its whole
+    # lifetime. Budget fixtures must keep their intended bounds in either mode.
+    if request.param == "unavailable":
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
 
 
 def source_entries():
@@ -231,15 +242,16 @@ def test_final_fit_cannot_hide_previously_covered_goals():
     assert coverage.status == "pass"
 
 
+@pytest.mark.usefixtures("tokenizer_mode")
 async def test_fitting_refuses_to_delete_unextracted_fact_from_nonempty_summary():
     fact = "The retired route uses copper while the current route uses silver."
     text = (
         "Keep src/synthetic/main.py. "
-        + "Earlier ordinary context remains useful. " * 25
+        + "Earlier ordinary context remains useful. " * 20
         + fact
-        + " Recent ordinary context remains useful." * 25
+        + " Recent ordinary context remains useful." * 20
     )
-    assert estimate_tokens(text) < 1024
+    assert 200 < estimate_tokens(text) < 1024
     entries = source_entries()
     entries[0]["content"] += "\nFile src/synthetic/main.py.\n" + fact
     original = deepcopy(entries)
@@ -527,6 +539,7 @@ async def test_nonshrinking_candidate_does_not_report_pressure_released(manual, 
 
 @pytest.mark.parametrize("reasoning_control", [True, False])
 @pytest.mark.parametrize("output_case", ["short_body", "long_body", "input_reserve"])
+@pytest.mark.usefixtures("tokenizer_mode")
 async def test_reasoning_and_body_use_current_generation_budget_without_a_body_cap(
     monkeypatch, reasoning_control, output_case,
 ):
@@ -534,6 +547,10 @@ async def test_reasoning_and_body_use_current_generation_budget_without_a_body_c
     from opensquilla.session.tokenizer import estimate_tokens
 
     provider = SyntheticCompactionProvider("short body")
+    # Stay above the obsolete 1024 cap and below the generation allowance with
+    # both cl100k and the conservative UTF-8 fallback estimator.
+    reasoning = "reason " * 1100
+    assert 1024 < estimate_tokens(reasoning) < 4096
 
     def project(messages, tools=None, config=None, *, message_limit=None):
         return ProviderFinalRequestProjection(
@@ -547,8 +564,6 @@ async def test_reasoning_and_body_use_current_generation_budget_without_a_body_c
 
     async def chat(messages, tools=None, config=None):
         provider.calls.append((messages, tools, config))
-        reasoning = "synthetic reasoning " * 600
-        assert 1024 < estimate_tokens(reasoning) < 4096
         yield ReasoningDeltaEvent(text=reasoning)
         yield TextDeltaEvent(text="body " * 2000 if output_case == "long_body" else "short body")
         yield DoneEvent(output_tokens=3000, reasoning_tokens=2995)
