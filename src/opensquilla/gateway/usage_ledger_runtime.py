@@ -382,7 +382,7 @@ class SessionUsageEventSink:
         price_snapshot: UsagePriceSnapshot | None = None,
     ) -> dict[str, Any]:
         """Replace the valuation of the original physical item, never its identity."""
-        result = await self._storage.append_usage_settlement(
+        result: dict[str, Any] = await self._storage.append_usage_settlement(
             call.event_id, ordinal, revision, meters=meters, price_snapshot=price_snapshot
         )
         from types import SimpleNamespace

@@ -713,6 +713,7 @@ def _item_from_row(
     default_provider: str,
     default_model: str,
     resolve_estimates: bool,
+    allow_heuristic_estimates: bool,
 ) -> UsageCallItem:
     provider = str(row.get("provider") or default_provider or "")
     model = str(row.get("model") or default_model or "")
@@ -772,7 +773,7 @@ def _item_from_row(
         price_source = resolved.source
         # Routing heuristics retain their legacy fallback, but a default rate
         # and an unpriced custom endpoint are not accounting price evidence.
-        if resolved.has_accounting_price:
+        if resolved.has_accounting_price or allow_heuristic_estimates:
             estimate = estimate_cost(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
@@ -911,6 +912,7 @@ def normalize_provider_usage(
     default_model: str,
     completed_at_ms: int,
     resolve_estimates: bool = True,
+    allow_heuristic_estimates: bool = False,
 ) -> UsageCallResult:
     """Normalize a provider ``DoneEvent`` without depending on persistence.
 
@@ -921,6 +923,8 @@ def normalize_provider_usage(
     exactly without a second rounding path.  ``resolve_estimates=False`` keeps
     normalization receipt-only so turn budget accounting never performs price
     resolution on the provider stream's synchronous error path.
+    ``allow_heuristic_estimates`` is only for the transient turn budget gate;
+    persisted usage and user-visible cost reports must retain its default.
     """
 
     raw_breakdown = getattr(event, "model_usage_breakdown", None)
@@ -961,6 +965,7 @@ def normalize_provider_usage(
             default_provider=provider,
             default_model=model,
             resolve_estimates=resolve_estimates,
+            allow_heuristic_estimates=allow_heuristic_estimates,
         )
         for ordinal, row in enumerate(rows)
     )

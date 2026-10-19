@@ -109,7 +109,7 @@ async def ensure_usage_owner_on_conn(
         )
         if not isinstance(parent_id, str) or not isinstance(parent_epoch, int):
             task = await _one(
-                conn, "SELECT details FROM agent_tasks WHERE task_id=?", (origin.get("task_id"),)
+                conn, "SELECT * FROM agent_tasks WHERE task_id=?", (origin.get("task_id"),)
             )
             details = _object(_value(task, "details"))
             metadata = _object(details.get("metadata"))
@@ -181,7 +181,7 @@ async def ensure_usage_attribution_on_conn(conn: Any, event: Any) -> None:
     parent_run_id = _value(event, "parent_turn_id")
     parent_owner = None
     task = await _one(
-        conn, "SELECT details FROM agent_tasks WHERE task_id=?", (_value(event, "turn_id"),)
+        conn, "SELECT * FROM agent_tasks WHERE task_id=?", (_value(event, "turn_id"),)
     )
     details = _object(_value(task, "details"))
     metadata = (
@@ -208,7 +208,7 @@ async def ensure_usage_attribution_on_conn(conn: Any, event: Any) -> None:
         # A durable parent can delegate before making its own provider call.
         # Verify the captured generation instead of requiring a parent bill.
         parent_task = await _one(
-            conn, "SELECT session_key,details FROM agent_tasks WHERE task_id=?", (parent_run_id,)
+            conn, "SELECT * FROM agent_tasks WHERE task_id=?", (parent_run_id,)
         )
         parent_details = _object(_value(parent_task, "details"))
         durable_inline_parent = (

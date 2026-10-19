@@ -13,7 +13,9 @@ from opensquilla.session.cost_rollup import rollup_cost_source
 def _mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
-    return asdict(value) if is_dataclass(value) else vars(value).copy()
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    return dict(vars(value))
 
 
 def _nanos(amount: Any) -> int | None:

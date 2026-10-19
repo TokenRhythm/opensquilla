@@ -20,7 +20,7 @@ from typing import Any
 
 from opensquilla.endpoint_identity import base_url_matches_official_api
 from opensquilla.provider.fx import settlement_fx_evidence
-from opensquilla.usage_metering import UsageMeter, UsageSettlementRevision
+from opensquilla.usage_metering import AmountAuthority, UsageMeter, UsageSettlementRevision
 
 
 def decimal_quantity(value: Any) -> str:
@@ -34,7 +34,7 @@ def decimal_quantity(value: Any) -> str:
         not amount.is_finite()
         or amount < 0
         or amount > Decimal(2**63 - 1)
-        or amount.as_tuple().exponent < -30
+        or int(amount.as_tuple().exponent) < -30
     ):
         raise ValueError("invalid meter quantity")
     return format(amount, "f")
@@ -92,7 +92,7 @@ def response_measurement(
         metadata["provider_request_id"] = request_id
     meters = [replace(m, dimensions={**m.dimensions, **metadata}) for m in requested_meters]
     settlement = None
-    monetary: tuple[str, str, str, str] | None = None
+    monetary: tuple[AmountAuthority, str, str, str] | None = None
     if provider == "openrouter" and _official(provider, base_url):
         if "cost" in usage:
             amount = decimal_quantity(usage["cost"])
@@ -418,7 +418,9 @@ def audio_duration_seconds(payload: bytes) -> str | None:
             stderr=subprocess.DEVNULL,
             timeout=5,
             check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+            ),
         )
         if result.returncode == 0:
             return decimal_quantity(result.stdout.decode("ascii").strip())

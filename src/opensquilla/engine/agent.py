@@ -6318,6 +6318,7 @@ class Agent:
                 default_provider=default_provider,
                 default_model=default_model,
                 completed_at_ms=0,
+                allow_heuristic_estimates=True,
             )
             total_cost_usd_accum += (
                 budget_usage.billed_cost_nanos + budget_usage.estimated_cost_nanos
@@ -13224,14 +13225,19 @@ class Agent:
             estimate_basis = "free" if turn_estimate_basis == "free" and has_turn_tokens else None
 
         if turn_model_usage_breakdown:
-            previous_missing = sum(
-                _usage_int(row.get("missing_cost_entries")) for row in turn_model_usage_breakdown
-            )
+            # Ensemble already includes missing physical receipts in the
+            # event's usage_missing_count. Only newly unpriced calls add gaps.
             priced_rows = _with_model_usage_cost_fields(turn_model_usage_breakdown)
-            total_missing_cost_entries += max(
-                0,
-                sum(_usage_int(row.get("missing_cost_entries")) for row in priced_rows)
-                - previous_missing,
+            total_missing_cost_entries += sum(
+                max(
+                    0,
+                    _usage_int(priced.get("missing_cost_entries"))
+                    - max(
+                        _usage_int(row.get("missing_cost_entries")),
+                        int(bool(row.get("usage_receipt_missing"))),
+                    ),
+                )
+                for row, priced in zip(turn_model_usage_breakdown, priced_rows, strict=True)
             )
             # Preserve each physical call's price evidence for the final model
             # rollup; a billed sibling cannot hide an unpriced request.

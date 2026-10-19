@@ -12,7 +12,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 AmountAuthority = Literal["provider_confirmed", "provider_estimate", "local_estimate", "unknown"]
 
@@ -20,7 +20,7 @@ AmountAuthority = Literal["provider_confirmed", "provider_estimate", "local_esti
 class _FrozenDimensions(dict):
     """A JSON/dataclasses-compatible immutable copy of small dimensions."""
 
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+    def _immutable(self, *args: Any, **kwargs: Any) -> NoReturn:
         raise TypeError("usage dimensions are immutable")
 
     __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
@@ -36,7 +36,7 @@ def exact_decimal(value: Any, *, label: str = "quantity") -> str:
     if not number.is_finite() or number < 0:
         raise ValueError(f"{label} must be finite and non-negative")
     # Bound untrusted exponents before materializing a decimal string.
-    if number.adjusted() > 24 or number.as_tuple().exponent < -30:
+    if number.adjusted() > 24 or int(number.as_tuple().exponent) < -30:
         raise ValueError(f"{label} exceeds supported precision/range")
     return format(number, "f")
 

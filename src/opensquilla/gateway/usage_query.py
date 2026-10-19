@@ -1349,7 +1349,7 @@ async def _query_usage_ledger_once(
         if (event_id := _text(_first(event, "event_id", "eventId")))
     ]
     items = await storage.query_usage_event_items(event_ids) if event_ids else []
-    items_by_event = _index_items_by_event(attributed_events, items)
+    items_by_event: Mapping[str, Sequence[Any]] = _index_items_by_event(attributed_events, items)
     query_receipts = getattr(storage, "query_usage_item_billing_receipts", None)
     receipts = await query_receipts(event_ids) if event_ids and callable(query_receipts) else []
     query_settlements = getattr(storage, "query_usage_settlements", None)

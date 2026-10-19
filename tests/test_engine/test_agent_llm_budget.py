@@ -1451,6 +1451,48 @@ async def test_agent_stops_when_turn_estimated_cost_budget_is_exceeded() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("budget, expected_exceeded", [(0.001, True), (1.0, False)])
+async def test_turn_budget_uses_default_heuristic_without_reporting_a_quoted_cost(
+    monkeypatch: pytest.MonkeyPatch, budget: float, expected_exceeded: bool,
+) -> None:
+    from opensquilla.engine.pricing import resolve_model_price
+    from opensquilla.engine.usage_accounting import normalize_provider_usage
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog", lambda: ModelCatalog(),
+    )
+    model = "unquoted-budget-test"
+    assert resolve_model_price(model, "fake").source == "default"
+    provider = _NoBilledCostUsageProvider(input_tokens=1000, output_tokens=1000)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(provider_id="fake", model_id=model, max_turn_cost_usd=budget),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    errors = [
+        event for event in events
+        if event.kind == "error" and event.code == "turn_cost_budget_exceeded"
+    ]
+    assert bool(errors) is expected_exceeded
+    if errors:
+        assert "estimated cost basis" in errors[0].message
+    assert len(provider.calls) == 1
+    done = next(event for event in events if event.kind == "done")
+    assert done.cost_usd == 0.0
+    assert done.cost_source == "unavailable"
+    assert done.missing_cost_entries == 1
+    usage = normalize_provider_usage(
+        ProviderDone(input_tokens=1000, output_tokens=1000),
+        default_provider="fake", default_model=model, completed_at_ms=0,
+    )
+    assert usage.cost_source == "unavailable"
+    assert usage.estimated_cost_nanos == 0
+
+
+@pytest.mark.asyncio
 async def test_agent_labels_turn_cost_budget_error_as_mixed_when_billed_and_estimated() -> None:
     # Turn mixes a real billed cost (call 1) with an estimated cost (call 2,
     # cost-blind) — the gate's basis label must reflect both contributions.
@@ -1483,16 +1525,16 @@ async def test_agent_labels_turn_cost_budget_error_as_mixed_when_billed_and_esti
 async def test_agent_turn_cost_budget_prices_each_unbilled_ensemble_member(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.engine.pricing import PriceEntry
+    from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 
     calls: list[tuple[str, str]] = []
 
-    def resolve(model_id: str, provider: str = "") -> Any:
+    def resolve(model_id: str, provider: str = "") -> ResolvedModelPrice:
         calls.append((model_id, provider))
         input_per_m = {("m1", "p1"): 100.0, ("m2", "p2"): 200.0}[
             (model_id, provider)
         ]
-        return SimpleNamespace(
+        return ResolvedModelPrice(
             entry=PriceEntry(input_per_m=input_per_m, output_per_m=0.0),
             source="test",
         )
@@ -1545,14 +1587,14 @@ async def test_agent_turn_cost_budget_prices_each_unbilled_ensemble_member(
 async def test_agent_turn_cost_budget_combines_billed_and_unbilled_ensemble_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.engine.pricing import PriceEntry
+    from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 
     calls: list[tuple[str, str]] = []
 
-    def resolve(model_id: str, provider: str = "") -> Any:
+    def resolve(model_id: str, provider: str = "") -> ResolvedModelPrice:
         calls.append((model_id, provider))
         assert (model_id, provider) == ("m2", "p2")
-        return SimpleNamespace(
+        return ResolvedModelPrice(
             entry=PriceEntry(input_per_m=400.0, output_per_m=0.0),
             source="test",
         )
@@ -1605,14 +1647,14 @@ async def test_agent_turn_cost_budget_combines_billed_and_unbilled_ensemble_memb
 async def test_agent_turn_cost_budget_stops_retry_after_ensemble_error_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.engine.pricing import PriceEntry
+    from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 
     calls: list[tuple[str, str]] = []
 
-    def resolve(model_id: str, provider: str = "") -> Any:
+    def resolve(model_id: str, provider: str = "") -> ResolvedModelPrice:
         calls.append((model_id, provider))
         assert (model_id, provider) == ("m1", "p1")
-        return SimpleNamespace(
+        return ResolvedModelPrice(
             entry=PriceEntry(input_per_m=300.0, output_per_m=0.0),
             source="test",
         )

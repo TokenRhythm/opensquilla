@@ -175,5 +175,8 @@ async def test_agent_ensemble_continuation_counts_each_physical_receipt_once(mon
     assert done.output_tokens == expected_output
     assert done.billed_cost == pytest.approx(expected_input / 100)
     assert done.missing_cost_entries == expected_missing
+    assert sum(row["missing_cost_entries"] for row in done.model_usage_breakdown) == (
+        expected_missing
+    )
     assert sum(row["input_tokens"] for row in done.model_usage_breakdown) == expected_input
     assert sum(row["output_tokens"] for row in done.model_usage_breakdown) == expected_output

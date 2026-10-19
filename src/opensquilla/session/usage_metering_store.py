@@ -160,8 +160,10 @@ async def append_settlement_on_conn(
                 raise UsageLedgerConflictError("settlement references an unknown price snapshot")
     if meters:
         rows = await read_metering_on_conn(conn, [event_id])
-        original = next((r["meters"] for r in rows if r["ordinal"] == ordinal), [])
-        _merge_meters([*original, *[asdict(m) for m in meters]])
+        original_meters: list[dict[str, Any]] = next(
+            (r["meters"] for r in rows if r["ordinal"] == ordinal), []
+        )
+        _merge_meters([*original_meters, *[asdict(m) for m in meters]])
     await conn.execute(
         "INSERT INTO usage_settlement_revisions"
         "(event_id,ordinal,revision_id,revision_no,payload_json) VALUES(?,?,?,?,?)",

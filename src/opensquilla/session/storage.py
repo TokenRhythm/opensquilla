@@ -2860,7 +2860,6 @@ class SessionStorage:
         await self._conn.execute(_CREATE_USAGE_LEGACY_BASELINES)
         for statement in (*USAGE_METERING_SCHEMA, *USAGE_ATTRIBUTION_SCHEMA):
             await self._conn.execute(statement)
-        await backfill_usage_attribution_on_conn(self._conn)
         await self._conn.execute(_CREATE_IDX_USAGE_EVENTS_COMPLETED)
         await self._conn.execute(_CREATE_IDX_USAGE_EVENTS_SESSION_COMPLETED)
         await self._conn.execute(_CREATE_IDX_USAGE_EVENTS_AGENT_COMPLETED)
@@ -2885,6 +2884,7 @@ class SessionStorage:
         await self._migrate_collaboration_columns()
         await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
+        await backfill_usage_attribution_on_conn(self._conn)
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_assistant_replay_column()
         await self._migrate_transcript_content_byte_length_column()

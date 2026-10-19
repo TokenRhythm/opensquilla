@@ -289,6 +289,33 @@ def _add_session(
     connection.commit()
 
 
+def test_legacy_schema_usage_attribution_backfill_is_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    connection = _database(path)
+    _add_session(
+        connection, key="agent:main:legacy", session_id="legacy-session",
+        content="legacy", suffix="legacy",
+    )
+    connection.close()
+
+    prepare_session_schema(path)
+    with sqlite3.connect(path) as upgraded:
+        owner = upgraded.execute(
+            "SELECT session_id, session_epoch, root_session_id, attribution_status "
+            "FROM usage_attribution_owners"
+        ).fetchall()
+        revision = upgraded.execute("SELECT revision FROM usage_accounting_state").fetchone()
+        assert owner == [("legacy-session", 0, "legacy-session", "complete")]
+
+    prepare_session_schema(path)
+    with sqlite3.connect(path) as replayed:
+        assert replayed.execute(
+            "SELECT revision FROM usage_accounting_state"
+        ).fetchone() == revision
+        assert replayed.execute("SELECT COUNT(*) FROM usage_attribution_runs").fetchone() == (1,)
+        assert replayed.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (1,)
+
+
 def test_merge_session_database_imports_complete_supported_session_graph(
     tmp_path: Path,
 ) -> None:
