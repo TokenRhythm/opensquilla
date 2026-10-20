@@ -110,6 +110,7 @@ function normalizeReason(reason: string): SessionDirectoryChangeReason {
     case 'cancellation_completed':
     case 'cron_result':
     case 'cron_system_event':
+    case 'metadata_backfilled':
     case 'updated':
       // These reasons invalidate the directory but do not carry a task
       // lifecycle transition that the domain needs to interpret.

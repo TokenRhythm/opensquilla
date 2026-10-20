@@ -6123,8 +6123,22 @@ async def start_gateway_server(
         from opensquilla.gateway.content_length_backfill import (
             run_content_length_backfill,
         )
+        from opensquilla.gateway.session_events import (
+            SESSION_DIRECTORY_KEY,
+            build_session_directory_metadata_changed_payload,
+        )
+
+        async def _notify_directory_metadata_changed() -> None:
+            await runtime_event_bridge.emit(
+                SESSION_DIRECTORY_KEY,
+                SESSIONS_CHANGED_EVENT,
+                build_session_directory_metadata_changed_payload(),
+            )
 
         svc.content_length_backfill_task = create_background_task(
-            run_content_length_backfill(usage_storage)
+            run_content_length_backfill(
+                usage_storage,
+                notify_directory_changed=_notify_directory_metadata_changed,
+            )
         )
     return server_handle

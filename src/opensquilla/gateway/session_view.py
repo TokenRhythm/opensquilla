@@ -199,12 +199,18 @@ def _title(
 ) -> str:
     stored = _metadata_title(
         session, effective_agent_id, session_kind, surface,
-        include_generic=not bool(transcript_title),
     )
     if stored:
         return stored
     if transcript_title:
         return transcript_title
+    # Placeholders remain a fallback for genuinely unnamed sessions. A stored
+    # meaningful title must not depend on transcript availability or indexing.
+    placeholder = _metadata_title(
+        session, effective_agent_id, session_kind, surface, include_generic=True,
+    )
+    if placeholder:
+        return placeholder
     if session_kind == "chat" and surface == "webchat":
         if effective_agent_id != "main":
             return _humanize(effective_agent_id)
@@ -246,18 +252,9 @@ def session_title_from_metadata(
     surface = _surface(session, key, origin_map, channel_types)
     effective_agent_id = _effective_agent_id(session, key)
     session_kind = _session_kind(session, key, surface, origin_map)
-    title = _metadata_title(
-        session, effective_agent_id, session_kind, surface, include_generic=True,
+    return _metadata_title(
+        session, effective_agent_id, session_kind, surface,
     )
-    if (
-        session_kind == "chat" and surface == "webchat"
-        and _is_generic_webchat_title(title, effective_agent_id)
-    ):
-        # A leading placeholder is conditional on whether transcript text is
-        # available. Preserve that existing fallback rather than skipping its
-        # read merely because a later stored candidate would be meaningful.
-        return ""
-    return title
 
 
 def _metadata_title(

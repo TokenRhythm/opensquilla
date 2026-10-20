@@ -2,6 +2,16 @@
   "format": 1,
   "cases": [
     {
+      "id": "canonical-directory-metadata-backfilled",
+      "coverage": "reserved-directory-invalidation-without-task-state",
+      "expectation": "exact",
+      "wire": {
+        "schema_version": 1,
+        "key": "*",
+        "reason": "metadata_backfilled"
+      }
+    },
+    {
       "id": "canonical-turn-complete",
       "coverage": "canonical-schema-version",
       "expectation": "exact",

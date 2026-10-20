@@ -124,6 +124,19 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
       .toEqual({ key: 'k', reason: 'unknown' })
   })
 
+  it('projects reserved directory metadata invalidation without inventing task state', () => {
+    expect(decodeSessionDirectoryChange({
+      schema_version: 1,
+      key: '*',
+      reason: 'metadata_backfilled',
+    })).toEqual({ key: '*', reason: 'updated' })
+    expect(decodeSessionDirectoryChange({
+      schema_version: 1,
+      key: '',
+      reason: 'metadata_backfilled',
+    })).toBeNull()
+  })
+
   it('retains a legacy top-level terminal status beside a task projection', () => {
     expect(decodeSessionDirectoryChange({
       key: 'agent:main:legacy-status',
