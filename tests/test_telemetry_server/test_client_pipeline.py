@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -100,6 +101,20 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
                 sink = GrowthEventSink(runtime, config=config, clock=lambda: occurred)
                 return runtime, sink
 
+            async def start_and_wait_for_recovery(sink):
+                recovered = asyncio.Event()
+                recover = sink._recover_rejected_once
+
+                async def tracked_recovery():
+                    await recover()
+                    recovered.set()
+
+                monkeypatch.setattr(sink, "_recover_rejected_once", tracked_recovery)
+                # Startup only schedules recovery. Upload after the real background
+                # recovery completes so this checks the entire retained batch.
+                await sink.start()
+                await asyncio.wait_for(recovered.wait(), 5)
+
             runtime, sink = make_runtime()
             try:
                 assert await sink.record_product_active(surface=ClientSurface.CLI)
@@ -141,7 +156,7 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
             runtime, sink = make_runtime()
             try:
                 if entrypoint in {"startup", "rejected_again"}:
-                    await sink.start()
+                    await start_and_wait_for_recovery(sink)
                 elif entrypoint == "activity":
                     assert not await sink.record_product_active(surface=ClientSurface.CLI)
                 elif entrypoint == "launch":
@@ -182,7 +197,7 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
             count = len(requests)
             runtime, sink = make_runtime()
             try:
-                await sink.start()
+                await start_and_wait_for_recovery(sink)
                 await runtime.upload_once(TelemetryScope.GROWTH)
                 assert len(requests) == count
             finally:

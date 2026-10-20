@@ -426,9 +426,9 @@ class _HistoryWebSocket:
             if frame.get("type") == "hello-ok"
         )
 
-    async def wait_for_response(self, req_id: str) -> None:
+    async def wait_for_response(self, req_id: str, *, timeout: float | None = 1) -> None:
         event = self._response_events.setdefault(req_id, asyncio.Event())
-        await asyncio.wait_for(event.wait(), timeout=1)
+        await asyncio.wait_for(event.wait(), timeout=timeout)
 
     def has_response(self, req_id: str) -> bool:
         event = self._response_events.get(req_id)
@@ -440,6 +440,8 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
     monkeypatch: Any,
     writer_queue_enabled: bool,
 ) -> None:
+    from opensquilla.onboarding import probe as probe_module
+
     probe_started = asyncio.Event()
     stream_close_started = asyncio.Event()
     release_stream_close = asyncio.Event()
@@ -475,19 +477,23 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         "opensquilla.onboarding.probe.build_provider",
         lambda *args, **kwargs: _BlockingProvider(),
     )
+    # This test checks save/cleanup ordering. Keep cleanup pending until its
+    # explicit release, even when a loaded runner takes more than one second.
+    # The connection watchdog below still bounds a stalled cancellation/save.
+    monkeypatch.setattr(probe_module, "_PROBE_STREAM_CLOSE_TIMEOUT_SECONDS", 30.0)
     dispatcher = _CancellableProviderProbeDispatcher()
 
     async def wait_for_probe_before_cancel(frame: str) -> None:
         decoded = json.loads(frame)
         if decoded.get("type") == "cancel":
-            await asyncio.wait_for(probe_started.wait(), timeout=1)
+            await probe_started.wait()
 
     async def finish_after_save(socket: _HistoryWebSocket) -> None:
-        await asyncio.wait_for(stream_close_started.wait(), timeout=1)
-        await socket.wait_for_response("save")
+        await stream_close_started.wait()
+        await socket.wait_for_response("save", timeout=None)
         observed["save_finished_during_cleanup"] = not stream_closed.is_set()
         release_stream_close.set()
-        await asyncio.wait_for(stream_closed.wait(), timeout=1)
+        await stream_closed.wait()
 
     ws = _HistoryWebSocket(
         [
@@ -515,16 +521,19 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         after_frames=finish_after_save,
     )
 
-    # Allow handshake/setup scheduling overhead in this integration watchdog;
-    # probe cancellation, stream cleanup, and save progress keep their 1s waits.
-    await asyncio.wait_for(
-        handle_ws_connection(
-            ws,
-            GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
-            dispatcher=dispatcher,
-        ),
-        timeout=10,
-    )
+    # Put the watchdog outside the simulated receive path so a fixture timeout
+    # cannot be mistaken for a client keepalive timeout by the Gateway.
+    try:
+        await asyncio.wait_for(
+            handle_ws_connection(
+                ws,
+                GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+                dispatcher=dispatcher,
+            ),
+            timeout=10,
+        )
+    finally:
+        release_stream_close.set()
 
     responses = {frame["id"]: frame for frame in ws.responses()}
     assert "probe" not in responses

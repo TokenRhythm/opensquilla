@@ -839,8 +839,20 @@ async def test_stalled_counter_flush_does_not_delay_legacy_uploads(
     entered = asyncio.Event()
     release = asyncio.Event()
     uploaded = asyncio.Event()
+    mark_entered = asyncio.Event()
+    allow_mark = asyncio.Event()
+    marked = asyncio.Event()
     saved = []
     real_wait = asyncio.wait
+    real_mark_uploaded = legacy.mark_daily_usage_uploaded
+
+    async def mark_uploaded(**kwargs):
+        mark_entered.set()
+        await allow_mark.wait()
+        updated = await real_mark_uploaded(**kwargs)
+        assert updated
+        marked.set()
+        return updated
 
     class StalledStore:
         @classmethod
@@ -866,10 +878,18 @@ async def test_stalled_counter_flush_does_not_delay_legacy_uploads(
 
     async def wait_after_legacy_upload(tasks, *, timeout):
         await asyncio.wait_for(uploaded.wait(), timeout=2)
+        await asyncio.wait_for(mark_entered.wait(), timeout=2)
+        assert not release.is_set()
+        assert not marked.is_set()
+        allow_mark.set()
+        # The synthetic short deadline measures the stalled counter writer;
+        # a real SQLite acknowledgement is allowed to finish on slow disks.
+        await asyncio.wait_for(marked.wait(), timeout=2)
         return await real_wait(tasks, timeout=timeout)
 
     monkeypatch.setattr(usage_telemetry, "DailyUsageStore", StalledStore)
     monkeypatch.setattr(usage_telemetry, "_post_payload", post)
+    monkeypatch.setattr(legacy, "mark_daily_usage_uploaded", mark_uploaded)
     monkeypatch.setattr(
         install_telemetry, "ensure_install_telemetry_id", lambda **_kw: "synthetic-install",
     )
@@ -889,6 +909,7 @@ async def test_stalled_counter_flush_does_not_delay_legacy_uploads(
             )
             await asyncio.wait_for(runtime.close(), timeout=2)
         else:
+            allow_mark.set()
             monkeypatch.setattr(
                 usage_telemetry, "asyncio",
                 SimpleNamespace(**(vars(asyncio) | {"sleep": stop_after_cycle})),
@@ -899,6 +920,7 @@ async def test_stalled_counter_flush_does_not_delay_legacy_uploads(
         assert not flush.done()
         assert await legacy.list_pending_daily_usage(before_day="9999-12-31") == []
     finally:
+        allow_mark.set()
         release.set()
         await flush
         await runtime.close()
