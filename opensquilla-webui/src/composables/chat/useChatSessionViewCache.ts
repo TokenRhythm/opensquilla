@@ -56,9 +56,13 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     snapshots.delete(key)
   }
 
-  function capture(key: string) {
-    if (!installed || !options.deliveryIdentity.value || !key) return
-    remove(key)
+  function capture(key: string, retainReadable = false) {
+    if (!options.deliveryIdentity.value || !key) return
+    // A degraded history can already be displayed beside confirmed live work.
+    // Freeze that readable view only for same-session recovery; it must never
+    // replace the authoritative snapshot used when navigating between sessions.
+    if (!installed && !(retainReadable && historyReady.value && liveReady.value && liveConfirmed)) return
+    if (installed) remove(key)
     if (maxSessions <= 0) return
     // Clone once on departure: mutable live/history objects cannot change a
     // detached view, and serialization accounts for nested tool/reasoning data.
@@ -71,11 +75,14 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     if (!budget.include('viewport', viewport)) return
     const serialized = JSON.stringify({ messages: retainedMessages, presentation, viewport })
     const bytes = budget.bytes
-    snapshots.set(key, { ...JSON.parse(serialized), bytes, epoch })
+    const snapshot: ViewSnapshot<Presentation, Viewport> = { ...JSON.parse(serialized), bytes, epoch }
+    if (!installed) return snapshot
+    snapshots.set(key, snapshot)
     totalBytes += bytes
     while (snapshots.size > maxSessions || totalBytes > maxBytes) {
       remove(snapshots.keys().next().value!)
     }
+    return snapshot
   }
 
   function invalidate(key?: string) {
@@ -110,12 +117,15 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     // reopen the barrier. Adopt only receipts from the exact still-current
     // lease. A replacement/revoked identity always needs fresh installations.
     const adopt = firstProof && authority !== null
-    const keepHistory = adopt && historyReady.value && historyConfirmed && historyAuthority === authority
+    // A same-lease fallback is readable, but remains unconfirmed and therefore
+    // cannot become an authoritative navigation snapshot on identity arrival.
+    const keepHistory = adopt && historyReady.value && historyAuthority === authority
+    const keepHistoryConfirmed = historyConfirmed
     const keepLive = adopt && liveReady.value && liveConfirmed && liveAuthority === authority
     const keepEpoch = adopt && epochAuthority === authority ? epoch : null
     invalidate()
     if (keepEpoch !== null) observeEpoch(options.sessionKey.value, keepEpoch)
-    if (keepHistory) historyInstalled(options.sessionKey.value)
+    if (keepHistory) historyInstalled(options.sessionKey.value, keepHistoryConfirmed)
     if (keepLive) liveInstalled(options.sessionKey.value)
   }, { flush: 'sync' })
   watch(options.sessionKey, (key, previous) => {
@@ -143,7 +153,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     if (key !== options.sessionKey.value) return
     historyReady.value = true
     historyConfirmed = authoritative
-    historyAuthority = authoritative ? currentAuthority() : null
+    historyAuthority = currentAuthority()
     releasePreview()
   }
 
@@ -151,9 +161,9 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     if (key !== options.sessionKey.value) return
     // Freeze the last complete view before the subscription clears live state.
     // Repeated recovery attempts must not recapture their partial replacement.
-    capture(key)
+    const readable = capture(key, true)
     if (!preview.value && options.deliveryIdentity.value) {
-      preview.value = snapshots.get(key) ?? null
+      preview.value = readable ?? snapshots.get(key) ?? null
     }
     installed = false
     liveReady.value = false
