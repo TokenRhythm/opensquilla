@@ -610,7 +610,11 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(tmp_path
     exported = await harness.run_case(
         source, provider="tokenrhythm", model="deepseek-v4-flash", api_key="synthetic-key",
         observer=observer, scenario="compaction", thinking="off",
-        compaction_options=harness.CompactionCaseOptions(task_profile="coding"),
+        # Leave output headroom so admission preserves the same controls with
+        # conservative token estimates as well as a cached tokenizer.
+        compaction_options=harness.CompactionCaseOptions(
+            task_profile="coding", max_output_tokens=2048,
+        ),
         comparison_snapshot_out=snapshot,
     )
     assert exported["status"] == "comparison_snapshot_exported"
