@@ -8428,8 +8428,10 @@ class TaskRuntime:
                             session_id=retry.session_id,
                             session_epoch=retry.session_epoch,
                         ):
-                            # Do not replay lifecycle/Goal settlement or write
-                            # an old task status over a successor's session.
+                            # Wake the existing coordinator to reread durable
+                            # owners after persistence recovers. Do not replay
+                            # an old lifecycle event over a successor's state.
+                            await self._notify_runtime_idle(retry.session_key)
                             await self._emit(
                                 retry.session_key, "sessions.changed",
                                 build_sessions_changed_payload(

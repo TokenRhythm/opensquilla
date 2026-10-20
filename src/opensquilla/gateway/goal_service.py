@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import secrets
 import time
 import uuid
@@ -46,6 +47,7 @@ from opensquilla.session.goals import (
 )
 from opensquilla.session.keys import canonicalize_session_key, parse_agent_id
 from opensquilla.session.models import AgentTaskStatus
+from opensquilla.session.storage import StorageBusyError
 
 if TYPE_CHECKING:
     from opensquilla.gateway.rpc import RpcContext
@@ -53,6 +55,10 @@ if TYPE_CHECKING:
     from opensquilla.session.models import GoalRecord
 
 log = structlog.get_logger(__name__)
+
+_IDLE_RETRY_LIMIT = 4
+_IDLE_RETRY_WINDOW_SECONDS = 120.0
+_IDLE_RETRY_BASE_SECONDS = 0.5
 
 _AUTOMATIC_GOAL_MESSAGE = (
     "This is a new automatic continuation turn. The previous turn has ended. "
@@ -97,6 +103,37 @@ class GoalExecutionLease:
 class _GoalTransitionLockState:
     lock: asyncio.Lock
     borrowers: int = 0
+
+
+@dataclass(slots=True)
+class _GoalIdleRetry:
+    deadline: float
+    failures: int = 0
+    not_before: float = 0.0
+    exhausted: bool = False
+    terminal_task_id: str | None = None
+    continuation_retry: _GoalIdleRetry | None = None
+    pending_settlement: _GoalIdleRetry | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _GoalGuardrailDecision:
+    pause_reason: str | None = None
+    empty_streak: tuple[str, int, int] | None = None
+    progress_streak: tuple[int, str, int] | None = None
+
+
+def _retryable_idle_error(error: Exception) -> bool:
+    from opensquilla.gateway.task_runtime import (
+        TaskDependencyError,
+        TaskQueueFullError,
+        TaskResidentBusyError,
+    )
+
+    return isinstance(error, StorageBusyError | TaskDependencyError | TaskQueueFullError
+                      | TaskResidentBusyError) or (
+        isinstance(error, GoalConflictError) and error.retryable is True
+    )
 
 
 def _principal_identity(principal: Any) -> str:
@@ -181,6 +218,11 @@ class GoalService:
         self._transition_registry_lock = asyncio.Lock()
         self._kick_tasks: dict[str, asyncio.Task[None]] = {}
         self._kick_dirty: set[str] = set()
+        # One retry budget belongs to the existing session idle runner. Keep
+        # exhausted episodes so reattach/duplicate wakeups cannot replenish it.
+        # A successful new Goal/resume is the only explicit reset; lease and
+        # state revisions alone never reset attempts or the server wait floor.
+        self._idle_retries: dict[str, _GoalIdleRetry] = {}
         self._closed = False
         # Process-local: a restart pauses Goals instead of inferring prior empty work.
         self._empty_automatic_turns: dict[str, tuple[str, int, int]] = {}
@@ -295,6 +337,7 @@ class GoalService:
                     "GOAL_AUTHORITY_UNAVAILABLE",
                     "Current Goal authority could not be read; "
                     "retry without revoking the existing lease",
+                    retryable=True,
                 )
             if not authority_state:
                 self._revoke_authority(goal.session_key)
@@ -568,6 +611,7 @@ class GoalService:
                 "GOAL_AUTHORITY_UNAVAILABLE",
                 "Current Goal authority could not be read; "
                 "retry without revoking the existing lease",
+                retryable=True,
             )
         if authority_state != "allow":
             self._revoke_authority(goal.session_key)
@@ -824,6 +868,7 @@ class GoalService:
                 "Current Goal authority could not be read; "
                 "retry without revoking the existing lease",
                 current=goal,
+                retryable=True,
             )
         if authority_state != "allow":
             self._revoke_authority(goal.session_key)
@@ -979,6 +1024,7 @@ class GoalService:
             raise GoalConflictError(
                 "GOAL_AUTHORITY_UNAVAILABLE",
                 "Current Goal authority could not be read; retry without accepting the turn",
+                retryable=True,
             )
         if status != "allow" or not self._decision_matches(principal, decision):
             raise GoalConflictError(
@@ -1334,6 +1380,7 @@ class GoalService:
                         return acceptance
                     assert acceptance.goal is not None
                     assert acceptance.goal_context is not None
+                    self._reset_idle_retry(key)
                     notify = getattr(self._session_manager, "notify_message_appended", None)
                     if callable(notify):
                         try:
@@ -1898,6 +1945,7 @@ class GoalService:
 
         result = await complete_durable_ingress(_resume_locked())
         if not result.replayed and result.goal is not None:
+            self._reset_idle_retry(key)
             self.schedule_idle_evaluation(key)
         _emit_goal_metric(
             "goal_commands_total",
@@ -2227,14 +2275,23 @@ class GoalService:
         context = GoalTurnContext.from_task_detail(context_value)
         if context is None:
             return None
-        goal = await self._storage.get_goal_by_id(context.goal_id)
-        if goal is None:
+        task = await self._storage.get_agent_task(context.task_id)
+        if task is None or effective_goal_turn_context(task.details or {}) != context:
             return None
-        async with self._lock(goal.session_key):
+        # Task ownership must be released even if its Goal was cleared. The
+        # storage transaction fences started work and the current Goal owner.
+        key = canonicalize_session_key(task.session_key)
+        async with self._lock(key):
             updated = await self._storage.compensate_goal_activation_failure(context)
             if updated is None:
                 return None
-            self._revoke_authority(goal.session_key)
+            authority = self._leases.get(key) or self._continuity_grants.get(key)
+            if authority is not None and (
+                authority.goal_id == context.goal_id
+                and authority.session_id == context.session_id
+                and authority.epoch == context.epoch
+            ):
+                self._revoke_authority(key)
             await self._emit_goal(
                 updated,
                 event_type="updated",
@@ -2479,73 +2536,130 @@ class GoalService:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    async def _guard_no_progress_continuations(
+    def _continuation_guardrail_decision(
         self,
-        goal: GoalRecord,
+        goal: GoalRecord | None,
         task: Any,
         context: GoalTurnContext,
-    ) -> GoalRecord:
-        if goal.status != GoalStatus.ACTIVE.value:
-            self._no_progress_automatic_turns.pop(goal.goal_id, None)
-            return goal
+    ) -> _GoalGuardrailDecision:
+        if (
+            goal is None or goal.status != GoalStatus.ACTIVE.value
+            or goal.active_task_id != context.task_id
+            or goal.objective_revision != context.objective_revision
+            or not context.automatic
+        ):
+            return _GoalGuardrailDecision()
+        empty_streak = None
+        if self._empty_automatic_turn(task, context):
+            previous_empty = self._empty_automatic_turns.get(goal.goal_id)
+            count = (
+                previous_empty[2] + 1
+                if previous_empty and previous_empty[1] == context.objective_revision
+                else 1
+            )
+            empty_streak = (context.task_id, context.objective_revision, count)
+        progress_streak = None
         signature = self._goal_turn_progress_signature(task, goal, context)
-        if signature is None:
-            self._no_progress_automatic_turns.pop(goal.goal_id, None)
-            return goal
-        previous = self._no_progress_automatic_turns.get(goal.goal_id)
-        count = (
-            previous[2] + 1
-            if previous is not None
-            and previous[0] == context.objective_revision
-            and previous[1] == signature
-            else 1
+        if signature is not None:
+            previous = self._no_progress_automatic_turns.get(goal.goal_id)
+            count = (
+                previous[2] + 1
+                if previous is not None
+                and previous[0] == context.objective_revision and previous[1] == signature
+                else 1
+            )
+            progress_streak = (context.objective_revision, signature, count)
+        return _GoalGuardrailDecision(
+            pause_reason=(
+                "empty_continuations" if empty_streak and empty_streak[2] >= 3
+                else "no_progress" if progress_streak and progress_streak[2] >= 3
+                else None
+            ),
+            empty_streak=empty_streak, progress_streak=progress_streak,
         )
-        self._no_progress_automatic_turns[goal.goal_id] = (
-            context.objective_revision,
-            signature,
-            count,
-        )
-        if count < 3:
-            return goal
-        paused = await self._storage.pause_goal_for_system(
-            session_key=goal.session_key,
-            goal_id=goal.goal_id,
-            expected_state_revision=goal.state_revision,
-            reason="no_progress",
-        )
-        self._no_progress_automatic_turns.pop(goal.goal_id, None)
-        return paused or goal
-
-    async def _guard_empty_continuations(
-        self,
-        goal: GoalRecord,
-        task: Any,
-        context: GoalTurnContext,
-    ) -> GoalRecord:
-        if goal.status != GoalStatus.ACTIVE.value or not self._empty_automatic_turn(task, context):
-            self._empty_automatic_turns.pop(goal.goal_id, None)
-            return goal
-        previous = self._empty_automatic_turns.get(goal.goal_id)
-        if previous is not None and previous[0] == context.task_id:
-            return goal
-        count = previous[2] + 1 if previous and previous[1] == context.objective_revision else 1
-        self._empty_automatic_turns[goal.goal_id] = (
-            context.task_id,
-            context.objective_revision,
-            count,
-        )
-        if count < 3:
-            return goal
-        paused = await self._storage.pause_goal_for_system(
-            session_key=goal.session_key,
-            goal_id=goal.goal_id,
-            expected_state_revision=goal.state_revision,
-            reason="empty_continuations",
-        )
-        self._empty_automatic_turns.pop(goal.goal_id, None)
-        return paused or goal
 
     async def on_task_lifecycle(self, event: TaskLifecycleEvent) -> None:
+        key = canonicalize_session_key(event.session_key)
+        applying = False
+        try:
+            if event.phase == "terminal" and event.terminal_persisted and key in self._idle_retries:
+                await self._queue_new_terminal_settlement(key, event.task_id)
+                # Same-task observer delivery only wakes its existing episode.
+                self.schedule_idle_evaluation(key)
+                return
+            applying = True
+            await self._apply_task_lifecycle(event)
+        except Exception as error:
+            if applying and event.phase == "terminal" and self._defer_idle_retry(
+                key, error, terminal_task_id=event.task_id if applying else None,
+            ):
+                self.schedule_idle_evaluation(key)
+            raise
+
+    async def _queue_new_terminal_settlement(self, key: str, task_id: str) -> None:
+        async with self._lock(key):
+            retry = self._idle_retries.get(key)
+            if retry is None or retry.terminal_task_id == task_id:
+                return
+            pending = retry.pending_settlement
+            if pending is not None and (
+                pending.terminal_task_id == task_id or not pending.exhausted
+            ):
+                return
+            continuation = retry.continuation_retry or retry
+            floor = max(
+                retry.not_before, continuation.not_before,
+                pending.not_before if pending is not None else 0.0,
+            )
+            # Keep one bounded candidate before any storage read. A failed
+            # qualification must not lose a new terminal obligation, or replace
+            # an existing task's exhausted settlement budget without proof.
+            pending = _GoalIdleRetry(
+                deadline=max(time.monotonic(), floor) + _IDLE_RETRY_WINDOW_SECONDS,
+                not_before=floor, terminal_task_id=task_id,
+            )
+            retry.pending_settlement = pending
+            try:
+                await self._qualify_terminal_settlement(key, retry, pending)
+            except Exception as error:
+                if self._defer_idle_retry(key, error, retry=pending):
+                    self.schedule_idle_evaluation(key)
+                elif retry.pending_settlement is pending:
+                    retry.pending_settlement = None
+                raise
+
+    async def _qualify_terminal_settlement(
+        self, key: str, retry: _GoalIdleRetry, pending: _GoalIdleRetry,
+    ) -> None:
+        goal = await self._storage.get_goal(key)
+        task = (
+            await self._storage.get_agent_task(goal.active_task_id)
+            if goal is not None and goal.active_task_id is not None else None
+        )
+        context = effective_goal_turn_context(task.details or {}) if task else None
+        if self._idle_retries.get(key) is not retry or retry.pending_settlement is not pending:
+            return
+        retry.pending_settlement = None
+        pending.not_before = max(pending.not_before, retry.not_before)
+        if retry.continuation_retry is not None:
+            pending.not_before = max(pending.not_before, retry.continuation_retry.not_before)
+        retry.not_before = pending.not_before
+        if (
+            goal is None or task is None or goal.active_task_id == retry.terminal_task_id
+            or task.status in {AgentTaskStatus.QUEUED, AgentTaskStatus.RUNNING}
+            or task.session_key != key or context is None or context.task_id != task.task_id
+            or context.goal_id != goal.goal_id or context.session_id != goal.session_id
+            or context.epoch != goal.session_epoch
+        ):
+            return
+        # Promote only the current durable terminal owner. The fixed candidate
+        # slot never nests, and the saved continuation is always the original
+        # budget, not a chain of preceding settlement attempts.
+        pending.terminal_task_id = task.task_id
+        pending.continuation_retry = retry.continuation_retry or retry
+        self._idle_retries[key] = pending
+
+    async def _apply_task_lifecycle(self, event: TaskLifecycleEvent) -> None:
         if event.phase in {"queued", "running"}:
             task = await self._storage.get_agent_task(event.task_id)
             details = (
@@ -2580,6 +2694,8 @@ class GoalService:
             return
         key = canonicalize_session_key(event.session_key)
         async with self._lock(key):
+            guard_goal = await self._storage.get_goal_by_id(context.goal_id)
+            guard = self._continuation_guardrail_decision(guard_goal, task, context)
             if not event.terminal_persisted:
                 updated = await self._storage.compensate_terminal_persistence_failure(
                     context
@@ -2625,10 +2741,19 @@ class GoalService:
                         ),
                         successor_expected=successor_expected,
                         process_restart=cancellation_source == "gateway_shutdown",
+                        guardrail_pause_reason=guard.pause_reason,
+                        guardrail_progress_revision=(
+                            guard_goal.progress_revision if guard_goal is not None else None
+                        ),
                     )
                 except GoalConflictError:
                     raise
-                except Exception:
+                except Exception as error:
+                    if _retryable_idle_error(error):
+                        # The terminal task is durable. Wait before another
+                        # writer attempt; immediate compensation would bypass
+                        # its Retry-After and turn a short outage into a pause.
+                        raise
                     # The terminal AgentTask is already durable, but Goal
                     # settlement could not be committed.  Fail closed in a
                     # second transaction instead of allowing the idle hook to
@@ -2644,15 +2769,23 @@ class GoalService:
                         )
                     )
             if updated is not None:
-                updated = await self._guard_empty_continuations(updated, task, context)
-                if not context.automatic:
-                    # A human-authored turn is a new opportunity for progress;
-                    # never carry an automatic no-progress streak across it.
+                # Owner release and any guard pause committed together. Only
+                # now advance process-local streaks; retrying a failed writer
+                # cannot count a turn twice or lose a required pause.
+                keep_streak = (
+                    updated.status == GoalStatus.ACTIVE.value
+                    and guard_goal is not None
+                    and updated.objective_revision == context.objective_revision
+                    and updated.progress_revision == guard_goal.progress_revision
+                )
+                if keep_streak and guard.empty_streak:
+                    self._empty_automatic_turns[context.goal_id] = guard.empty_streak
+                else:
+                    self._empty_automatic_turns.pop(context.goal_id, None)
+                if keep_streak and guard.progress_streak:
+                    self._no_progress_automatic_turns[context.goal_id] = guard.progress_streak
+                else:
                     self._no_progress_automatic_turns.pop(context.goal_id, None)
-                elif updated.status == GoalStatus.ACTIVE.value:
-                    updated = await self._guard_no_progress_continuations(
-                        updated, task, context
-                    )
                 if updated.status != GoalStatus.ACTIVE.value:
                     self._revoke_authority(key)
                 classification = "active"
@@ -2755,18 +2888,154 @@ class GoalService:
         )
         self._kick_tasks[key] = task
 
+    def _reset_idle_retry(self, session_key: str) -> None:
+        retry = self._idle_retries.get(session_key)
+        if retry is not None:
+            self._idle_retries[session_key] = _GoalIdleRetry(
+                deadline=time.monotonic() + _IDLE_RETRY_WINDOW_SECONDS,
+                not_before=max(
+                    retry.not_before,
+                    retry.pending_settlement.not_before if retry.pending_settlement else 0.0,
+                    retry.continuation_retry.not_before if retry.continuation_retry else 0.0,
+                ),
+            )
+
+    def _defer_idle_retry(
+        self, session_key: str, error: Exception, *, terminal_task_id: str | None = None,
+        retry: _GoalIdleRetry | None = None,
+    ) -> bool:
+        if not _retryable_idle_error(error):
+            return False
+        now = time.monotonic()
+        if retry is None:
+            retry = self._idle_retries.setdefault(
+                session_key, _GoalIdleRetry(deadline=now + _IDLE_RETRY_WINDOW_SECONDS),
+            )
+        if retry.terminal_task_id is None:
+            retry.terminal_task_id = terminal_task_id
+        retry.failures += 1
+        delay = _IDLE_RETRY_BASE_SECONDS * 2 ** min(retry.failures - 1, 4)
+        retry_after = getattr(error, "retry_after_ms", None)
+        if (
+            isinstance(retry_after, int | float)
+            and not isinstance(retry_after, bool)
+            and math.isfinite(retry_after)
+            and retry_after > 0
+        ):
+            delay = max(delay, retry_after / 1000)
+        retry.not_before = max(retry.not_before, now + delay)
+        retry.exhausted = (
+            retry.exhausted or retry.failures >= _IDLE_RETRY_LIMIT or now >= retry.deadline
+        )
+        return True
+
     async def _run_scheduled_kick(self, session_key: str) -> None:
         try:
             while True:
+                retry = self._idle_retries.get(session_key)
+                pending = retry.pending_settlement if retry is not None else None
+                if retry is not None and pending is not None:
+                    # The observer qualifies a freshly registered candidate
+                    # under this lock. Do not sleep against that provisional
+                    # candidate if the in-flight read is about to reject it.
+                    async with self._lock(session_key):
+                        if (
+                            self._idle_retries.get(session_key) is not retry
+                            or retry.pending_settlement is not pending
+                        ):
+                            continue
+                    pending.not_before = max(pending.not_before, retry.not_before)
+                    if retry.continuation_retry is not None:
+                        pending.not_before = max(
+                            pending.not_before, retry.continuation_retry.not_before,
+                        )
+                    now = time.monotonic()
+                    if pending.exhausted or now >= pending.deadline:
+                        pending.exhausted = True
+                        # An unverified stale event cannot consume the current
+                        # owner's remaining budget. Keep its deduplication
+                        # marker while letting that owner's episode proceed.
+                        retry.not_before = max(retry.not_before, pending.not_before)
+                    else:
+                        if now < pending.not_before:
+                            await asyncio.sleep(min(pending.not_before, pending.deadline) - now)
+                            continue
+                        try:
+                            async with self._lock(session_key):
+                                if (
+                                    self._idle_retries.get(session_key) is retry
+                                    and retry.pending_settlement is pending
+                                ):
+                                    await self._qualify_terminal_settlement(
+                                        session_key, retry, pending,
+                                    )
+                        except Exception as error:
+                            if self._defer_idle_retry(session_key, error, retry=pending):
+                                continue
+                            if retry.pending_settlement is pending:
+                                retry.pending_settlement = None
+                            log.warning("goal.terminal_qualification_failed", exc_info=True)
+                            break
+                        continue
+                failures = retry.failures if retry is not None else 0
+                if retry is not None:
+                    if retry.continuation_retry is not None:
+                        retry.not_before = max(
+                            retry.not_before, retry.continuation_retry.not_before,
+                        )
+                    now = time.monotonic()
+                    if retry.exhausted or now >= retry.deadline:
+                        retry.exhausted = True
+                        return
+                    if now < retry.not_before:
+                        # Reaching the deadline ends the episode; it never
+                        # permits an early attempt before a longer wait floor.
+                        await asyncio.sleep(min(retry.not_before, retry.deadline) - now)
+                        continue
                 self._kick_dirty.discard(session_key)
+                # Record the owner before attempting settlement so a duplicate
+                # terminal event cannot mistake a failed first attempt for a
+                # new task and replenish its budget.
+                created_retry = retry is None
+                if retry is None:
+                    retry = _GoalIdleRetry(deadline=time.monotonic() + _IDLE_RETRY_WINDOW_SECONDS)
+                    self._idle_retries[session_key] = retry
                 try:
-                    await self._kick_if_idle(session_key)
-                except Exception:
+                    if retry.continuation_retry is not None:
+                        await self._kick_if_idle(
+                            session_key, settlement_task_id=retry.terminal_task_id,
+                        )
+                    else:
+                        await self._kick_if_idle(session_key)
+                except Exception as error:
                     log.warning(
                         "goal.idle_evaluation_failed",
                         session_key=session_key,
                         exc_info=True,
                     )
+                    if self._defer_idle_retry(session_key, error, retry=retry):
+                        continue
+                    if created_retry and self._idle_retries.get(session_key) is retry:
+                        self._idle_retries.pop(session_key, None)
+                    break
+                # A concurrent terminal observer may have recorded a new
+                # failure while this evaluation awaited storage. Do not erase
+                # that retry or its server floor on an unrelated success.
+                if self._idle_retries.get(session_key) is retry:
+                    if (
+                        retry.pending_settlement is not None
+                        and not retry.pending_settlement.exhausted
+                    ):
+                        continue
+                    if retry is not None and retry.failures == failures:
+                        if retry.continuation_retry is not None:
+                            continuation = retry.continuation_retry
+                            continuation.not_before = max(continuation.not_before, retry.not_before)
+                            self._idle_retries[session_key] = continuation
+                            continue
+                        self._idle_retries.pop(session_key, None)
+                elif session_key in self._idle_retries:
+                    continue
                 if session_key not in self._kick_dirty:
                     break
         finally:
@@ -2774,11 +3043,44 @@ class GoalService:
             if current is asyncio.current_task():
                 self._kick_tasks.pop(session_key, None)
 
-    async def _kick_if_idle(self, session_key: str) -> None:
+    async def _kick_if_idle(
+        self, session_key: str, *, settlement_task_id: str | None = None,
+    ) -> None:
         if self._closed:
             return
         session_key = canonicalize_session_key(session_key)
+        retry = self._idle_retries.get(session_key)
         goal = await self._storage.get_goal(session_key)
+        if settlement_task_id is not None and (
+            goal is None or goal.active_task_id != settlement_task_id
+        ):
+            return
+        if goal is not None and goal.active_task_id is not None:
+            task = await self._storage.get_agent_task(goal.active_task_id)
+            context = effective_goal_turn_context(task.details or {}) if task else None
+            if (
+                task is not None
+                and task.status not in {AgentTaskStatus.QUEUED, AgentTaskStatus.RUNNING}
+                and task.session_key == session_key
+                and context is not None
+                and context.task_id == goal.active_task_id
+                and context.goal_id == goal.goal_id
+                and context.session_id == goal.session_id
+                and context.epoch == goal.session_epoch
+            ):
+                if retry is not None and self._idle_retries.get(session_key) is retry:
+                    retry.terminal_task_id = task.task_id
+                # Durable owner/task facts are the recovery source. Call before
+                # acquiring the transition lock: settlement acquires it itself.
+                await self._apply_task_lifecycle(TaskLifecycleEvent(
+                    phase="terminal", session_key=session_key, task_id=task.task_id,
+                    task_status=task.status, run_kind=task.run_kind,
+                    terminal_reason=task.terminal_reason,
+                ))
+                if settlement_task_id is None:
+                    goal = await self._storage.get_goal(session_key)
+        if settlement_task_id is not None:
+            return
         if goal is None or goal.status != GoalStatus.ACTIVE.value or goal.active_task_id:
             if goal is not None and goal.active_task_id:
                 _emit_goal_metric(
@@ -2854,7 +3156,7 @@ class GoalService:
                     "goal_continuation_deferred_total",
                     reason="authority_unavailable",
                 )
-                return
+                raise
             raise
         if lease is None:
             _emit_goal_metric("goal_active_without_owner_total")
@@ -2917,7 +3219,9 @@ class GoalService:
             await self._stamp_activation_authority(
                 envelope, principal, owner_connection_id=lease.owner_connection_id,
             )
-        except Exception:
+        except Exception as error:
+            if _retryable_idle_error(error):
+                raise
             log.warning(
                 "goal.continuation_execution_preflight_failed",
                 session_key=session_key,
@@ -3318,6 +3622,7 @@ class GoalService:
         tasks = list(self._kick_tasks.values())
         self._kick_tasks.clear()
         self._kick_dirty.clear()
+        self._idle_retries.clear()
         for task in tasks:
             task.cancel()
         if tasks:

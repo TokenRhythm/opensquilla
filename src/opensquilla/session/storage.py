@@ -10003,6 +10003,8 @@ class SessionStorage:
         usage_limited: bool = False,
         successor_expected: bool = False,
         process_restart: bool = False,
+        guardrail_pause_reason: str | None = None,
+        guardrail_progress_revision: int | None = None,
         now_ms: int | None = None,
     ) -> GoalRecord | None:
         """Settle one authoritative terminal task exactly once by owner CAS."""
@@ -10016,6 +10018,10 @@ class SessionStorage:
             raise GoalValidationError(
                 "runtime_budget_seconds must be between 60 and 86400",
                 code="INVALID_GOAL_GUARDRAIL",
+            )
+        if guardrail_pause_reason not in {None, "empty_continuations", "no_progress"}:
+            raise GoalValidationError(
+                "Invalid Goal continuation guardrail", code="INVALID_GOAL_GUARDRAIL",
             )
         timestamp = _now_ms() if now_ms is None else now_ms
         async with self._write_transaction("settle_goal_task") as conn:
@@ -10136,6 +10142,13 @@ class SessionStorage:
                         status = GoalStatus.PAUSED.value
                         pause_reason = "runtime_limit"
                         terminal_reason = "runtime_limit"
+                    elif (
+                        context.automatic and guardrail_pause_reason is not None
+                        and goal.progress_revision == guardrail_progress_revision
+                    ):
+                        status = GoalStatus.PAUSED.value
+                        pause_reason = guardrail_pause_reason
+                        terminal_reason = guardrail_pause_reason
                 elif task.status in {AgentTaskStatus.FAILED, AgentTaskStatus.TIMEOUT}:
                     if task.error_class == "goal_checkpoint_required":
                         # Artifact delivery already succeeded, so a missing
@@ -10222,6 +10235,7 @@ class SessionStorage:
         reason: str,
         now_ms: int | None,
         preserve_unstarted_continuation: bool = False,
+        require_unstarted: bool = False,
     ) -> GoalRecord | None:
         timestamp = _now_ms() if now_ms is None else now_ms
         async with self._write_transaction(f"compensate_goal_{reason}") as conn:
@@ -10239,6 +10253,13 @@ class SessionStorage:
                     "STALE_GOAL",
                     "The compensated task does not carry this Goal generation",
                 )
+            if require_unstarted and (
+                task.status == AgentTaskStatus.RUNNING or task.started_at is not None
+            ):
+                # A late activation observer cannot reclaim work that crossed
+                # the runtime-owned boundary, including a terminal task whose
+                # Goal has not yet been settled.
+                return None
             if preserve_unstarted_continuation:
                 if not context.automatic:
                     raise GoalConflictError(
@@ -10409,6 +10430,7 @@ class SessionStorage:
             context,
             reason=reason,
             now_ms=now_ms,
+            require_unstarted=True,
         )
 
     async def compensate_terminal_persistence_failure(

@@ -65,10 +65,12 @@ class GoalConflictError(RuntimeError):
         message: str,
         *,
         current: GoalRecord | None = None,
+        retryable: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.current = current
+        self.retryable = retryable
 
 
 @dataclass(frozen=True, slots=True)

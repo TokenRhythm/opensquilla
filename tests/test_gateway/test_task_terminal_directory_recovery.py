@@ -150,14 +150,22 @@ async def test_terminal_retry_invalidates_without_replaying_old_session_status(
                 return await is_current(*args, **kwargs)
             monkeypatch.setattr(task_runtime_module, "task_session_is_current", fail_first_notice)
         before = len(events)
+        idle_wakes = []
+
+        async def observe_idle(key):
+            idle_wakes.append(key)
+
+        runtime.set_idle_listener(observe_idle)
         allow_retry.set()
         await asyncio.wait_for(asyncio.shield(runtime._terminal_retry_task), 3)
         notices = [payload for _, name, payload in events[before:] if name == "sessions.changed"]
         if replacement in {"recreated", "deleted"}:
             assert notices == []
+            assert idle_wakes == []
         else:
             assert notices == [{"schema_version": 1, "key": node.session_key, "reason": "updated",
                                 "session_id": node.session_id, "epoch": node.epoch}]
+            assert idle_wakes == [node.session_key]
         latest = await storage.get_session(node.session_key)
         if replacement == "deleted":
             assert latest is None

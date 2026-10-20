@@ -6,6 +6,8 @@ import uuid
 from collections.abc import Awaitable
 from typing import Any, cast
 
+import structlog
+
 from opensquilla.gateway.adapters.goals_contract import (
     register_goals_capabilities_contract,
     register_goals_clear_contract,
@@ -30,6 +32,7 @@ from opensquilla.session.goals import (
 )
 
 _d = get_dispatcher()
+log = structlog.get_logger(__name__)
 
 
 def _require_params(params: dict | None) -> dict[str, Any]:
@@ -164,17 +167,30 @@ async def _translate_goal_errors(
             "GOAL_ACTIVE",
             "GOAL_BUSY",
         }:
-            snapshot = (
-                await service.snapshot(exc.current)
-                if service is not None and callable(getattr(service, "snapshot", None))
-                else None
-            )
-            details = {"goal": snapshot}
+            try:
+                snapshot = (
+                    await service.snapshot(exc.current)
+                    if service is not None and callable(getattr(service, "snapshot", None))
+                    else None
+                )
+            except Exception as snapshot_error:
+                # Enrichment cannot erase an already-known rejection or make
+                # its acceptance ambiguous when an independent read fails.
+                log.warning(
+                    "goal.conflict_snapshot_unavailable",
+                    code=exc.code,
+                    error_class=type(snapshot_error).__name__,
+                )
+            else:
+                details = {"goal": snapshot}
         raise RpcHandlerError(
             exc.code,
             str(exc),
             details=details,
-            retryable=exc.code in {"STALE_GOAL", "SESSION_GENERATION_CHANGED"},
+            retryable=(
+                exc.retryable if exc.retryable is not None
+                else exc.code in {"STALE_GOAL", "SESSION_GENERATION_CHANGED"}
+            ),
             accepted=False,
         ) from exc
 
