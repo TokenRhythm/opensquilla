@@ -21,6 +21,7 @@ from opensquilla.cli.chat.session_context import GatewayRuntimeScope, GatewaySes
 from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
 from opensquilla.cli.chat.user_input import GatewayUserInput
+from opensquilla.cli.tui.backend.runtime import TuiTelemetryDelivery
 from opensquilla.cli.tui.opentui.context import (
     send_context_patch,
     send_context_update,
@@ -1119,6 +1120,7 @@ async def run_gateway_chat(
 
         from opensquilla.cli.tui.opentui.host_runtime import HostRuntimeError
 
+        surface_telemetry: TuiTelemetryDelivery | None = None
         try:
 
             async def _record_user_activity() -> None:
@@ -1130,10 +1132,16 @@ async def run_gateway_chat(
                         timeout=1.0,
                     )
 
-            async def _record_surface_ready() -> None:
-                await pending_questions.present()
+            async def _record_surface_telemetry() -> None:
                 await _record_user_activity()
                 await client.call("telemetry.client_launch.record", {})
+
+            surface_telemetry = TuiTelemetryDelivery(_record_surface_telemetry)
+
+            async def _record_surface_ready() -> None:
+                await pending_questions.present()
+                assert surface_telemetry is not None
+                surface_telemetry.observe()
 
             input_loop_kwargs: dict[str, Any] = {
                 "scope": session_context.scope,
@@ -1170,6 +1178,9 @@ async def run_gateway_chat(
             exit_reason = "host_crash"
         except Exception:  # noqa: BLE001 - return one receipt after surface teardown
             exit_reason = "runtime_error"
+        finally:
+            if surface_telemetry is not None:
+                await surface_telemetry.close()
         final_session_key = session_context.session_key
         final_model = session_context.model
         try:

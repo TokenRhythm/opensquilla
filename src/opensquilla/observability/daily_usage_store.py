@@ -1,4 +1,4 @@
-"""Durable daily counters for clients whose conversation storage is temporary.
+"""Durable daily counters isolated from conversation storage.
 
 This database has no sessions or transcripts and performs no runtime recovery.
 Its identity and acknowledgement semantics match the Gateway's daily counters.
@@ -7,11 +7,14 @@ Its identity and acknowledgement semantics match the Gateway's daily counters.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import secrets
 import sqlite3
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -20,6 +23,30 @@ from opensquilla.paths import native_io_path
 _T = TypeVar("_T")
 _IDENTITY_KEY = "telemetry.daily_usage_store_id"
 _SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
+DAILY_USAGE_FINALIZATION_GRACE_SECONDS = 60.0
+log = logging.getLogger(__name__)
+
+
+def daily_usage_finalizes_at(day: str) -> float:
+    midnight = datetime.fromisoformat(day).replace(tzinfo=UTC) + timedelta(days=1)
+    return midnight.timestamp() + DAILY_USAGE_FINALIZATION_GRACE_SECONDS
+
+
+def _utc_timestamp() -> float:
+    return time.time()
+
+
+@dataclass(frozen=True, slots=True)
+class DailyUsageDelta:
+    """Content-free additions to one UTC day's existing counters."""
+
+    day: str
+    conversation_turns: int
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+    cache_write_tokens: int
+    updated_at: int
 
 
 class DailyUsageStore:
@@ -33,10 +60,13 @@ class DailyUsageStore:
     @classmethod
     async def open(cls, path: str | Path) -> DailyUsageStore:
         store = cls(native_io_path(path))
-        store._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        store._path.touch(mode=0o600, exist_ok=True)
+        await asyncio.to_thread(store._prepare_path)
         await store._run(store._initialize)
         return store
+
+    def _prepare_path(self) -> None:
+        self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._path.touch(mode=0o600, exist_ok=True)
 
     async def close(self) -> None:
         # Every operation owns and closes its SQLite connection. Waiting for
@@ -136,15 +166,42 @@ class DailyUsageStore:
         cache_write_tokens: int,
         updated_at: int,
     ) -> None:
+        await self.record_daily_usage_batch((DailyUsageDelta(
+            day=day,
+            conversation_turns=1,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            updated_at=updated_at,
+        ),))
+
+    async def record_daily_usage_batch(
+        self, rows: tuple[DailyUsageDelta, ...], *, discard_expired: bool = False,
+    ) -> None:
+        """Add several day aggregates with one connection and transaction."""
+        if not rows:
+            return
+
         def record(connection: sqlite3.Connection) -> None:
-            connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            # Decide only after obtaining the same writer lock used by upload
+            # snapshots. A suspended or blocked buffer cannot mutate a day
+            # whose retry-stable upload may already have been accepted.
+            admitted = rows
+            if discard_expired:
+                now = _utc_timestamp()
+                admitted = tuple(row for row in rows if now < daily_usage_finalizes_at(row.day))
+                if len(admitted) != len(rows):
+                    log.debug("Uncommitted daily usage expired before persistence")
+            connection.executemany(
                 """
                 INSERT INTO telemetry_daily_usage (
                     day, conversation_turns, input_tokens, output_tokens,
                     cached_tokens, cache_write_tokens, updated_at, uploaded_at
-                ) VALUES (?, 1, ?, ?, ?, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(day) DO UPDATE SET
-                    conversation_turns = conversation_turns + 1,
+                    conversation_turns = conversation_turns + excluded.conversation_turns,
                     input_tokens = input_tokens + excluded.input_tokens,
                     output_tokens = output_tokens + excluded.output_tokens,
                     cached_tokens = cached_tokens + excluded.cached_tokens,
@@ -152,13 +209,22 @@ class DailyUsageStore:
                     updated_at = excluded.updated_at,
                     uploaded_at = NULL
                 """,
-                (day, input_tokens, output_tokens, cached_tokens, cache_write_tokens, updated_at),
+                [
+                    (
+                        row.day, row.conversation_turns, row.input_tokens, row.output_tokens,
+                        row.cached_tokens, row.cache_write_tokens, row.updated_at,
+                    )
+                    for row in admitted
+                ],
             )
 
         await self._run(record)
 
     async def list_pending_daily_usage(self, *, before_day: str) -> list[dict[str, Any]]:
         def read(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+            # Serialize the hourly upload snapshot behind admitted counter
+            # writes, including a transaction still committing at finalization.
+            connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
                 SELECT day, conversation_turns, input_tokens, output_tokens,

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
+from datetime import UTC, date, datetime
 from typing import Any
 
 from rich.markup import escape as _escape
@@ -25,6 +26,78 @@ from opensquilla.cli.tui.backend.state import TuiRuntimeState
 # Ceiling on the shutdown drain of in-flight abort RPCs: a wedged gateway
 # that never answers the abort must not hang TUI exit indefinitely.
 _ABORT_DRAIN_TIMEOUT_S = 5.0
+_ACTIVITY_DELIVERY_TIMEOUT_S = 2.0
+_ACTIVITY_RETRY_INTERVAL_S = 60.0
+_ACTIVITY_CLOSE_TIMEOUT_S = 0.05
+
+
+def _activity_day() -> date:
+    return datetime.now(UTC).date()
+
+
+class TuiTelemetryDelivery:
+    """Own one background observation without delaying terminal input or exit."""
+
+    def __init__(self, observe: Callable[[], Awaitable[None]]) -> None:
+        self._observe = observe
+        self._task: asyncio.Task[None] | None = None
+        self._attempted_day: date | None = None
+        self._retry_after = 0.0
+        self._pending_next_day = False
+        self._closed = False
+
+    def observe(self) -> None:
+        if self._closed:
+            return
+        day = _activity_day()
+        loop = asyncio.get_running_loop()
+        if self._task is not None and not self._task.done():
+            if day != self._attempted_day:
+                self._pending_next_day = True
+            return
+        if day == self._attempted_day and loop.time() < self._retry_after:
+            return
+        self._attempted_day = day
+        self._retry_after = loop.time() + _ACTIVITY_RETRY_INTERVAL_S
+        operation = self._deliver()
+        try:
+            self._task = loop.create_task(operation, name="tui-activity-telemetry")
+        except Exception:
+            operation.close()
+            return
+        self._task.add_done_callback(self._consume_result)
+
+    async def _deliver(self) -> None:
+        while True:
+            try:
+                async with asyncio.timeout(_ACTIVITY_DELIVERY_TIMEOUT_S):
+                    await self._observe()
+            except asyncio.CancelledError:
+                raise
+            except BaseException:  # telemetry cannot change terminal control flow
+                pass
+            if self._closed or not self._pending_next_day:
+                return
+            self._pending_next_day = False
+            day = _activity_day()
+            if day == self._attempted_day:
+                return
+            self._attempted_day = day
+            self._retry_after = asyncio.get_running_loop().time() + _ACTIVITY_RETRY_INTERVAL_S
+
+    @staticmethod
+    def _consume_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def close(self) -> None:
+        self._closed = True
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+            # A cancellation-resistant observer must not turn telemetry into
+            # a terminal shutdown dependency.
+            await asyncio.wait({task}, timeout=_ACTIVITY_CLOSE_TIMEOUT_S)
 
 
 def _emit(event_sink: TuiEventSink | None, event: TuiEvent) -> None:
@@ -58,6 +131,7 @@ async def run_tui_runtime(
             hooks.expose_surface(tui_surface)
         with contextlib.suppress(Exception):
             await hooks.on_surface_ready()
+        activity_delivery = TuiTelemetryDelivery(hooks.on_user_activity)
         turn_task: asyncio.Task[bool] | None = None
         # Abort tasks are held (and drained on shutdown) so a fire-and-forget
         # cancel RPC is never garbage-collected mid-flight or abandoned while
@@ -393,8 +467,7 @@ async def run_tui_runtime(
 
                 # Observe at submission, including slash commands and busy-turn
                 # steering, without handing input content to the activity hook.
-                with contextlib.suppress(Exception):
-                    await hooks.on_user_activity()
+                activity_delivery.observe()
 
                 category = config.classify_input(user_input)
 
@@ -666,6 +739,7 @@ async def run_tui_runtime(
                     name=task_name,
                 )
         finally:
+            await activity_delivery.close()
             if hooks.clear_exposed_surface is not None:
                 hooks.clear_exposed_surface()
             tui_surface.set_cancel_callback(None)

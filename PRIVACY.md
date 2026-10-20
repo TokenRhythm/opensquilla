@@ -149,6 +149,13 @@ to separate bounded local SQLite queues and upload batches to separate routes:
 local collection and again immediately before network upload. Offline retries
 reuse `event_id` for deduplication. Growth events are not sampled.
 
+Runtime observations first use a bounded in-memory buffer before background
+batch persistence. Daily counters are combined in memory and periodically
+written to a counts-only database. Buffer saturation or abrupt termination can
+lose observations that have not yet been persisted; reporting does not make
+Agent execution wait for delivery. Uncommitted daily additions expire 60 seconds
+after their UTC day ends, so delayed clients cannot change a finalized upload.
+
 V2 statistics payloads never include prompts, responses, provider configuration,
 agent configuration, tool arguments, task parameters, file names, file paths,
 file contents, raw exception messages, complete stacks, usernames, hostnames,

@@ -13,6 +13,11 @@ from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import DoneEvent, ErrorEvent
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.observability import install_telemetry, network_policy
+from opensquilla.observability.daily_usage_store import DailyUsageStore
+from opensquilla.observability.usage_telemetry import (
+    StandaloneUsageTelemetry,
+    standalone_daily_usage_path,
+)
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -73,6 +78,10 @@ def _enable_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
         "CI",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        install_telemetry, "_collect_mac_address_candidates", lambda: ["02:00:00:00:00:32"]
+    )
+    monkeypatch.setattr(install_telemetry, "_collect_ip_address_candidates", lambda: [])
 
 
 @pytest.mark.parametrize("run_kind", ["default", "web_turn", "channel_turn"])
@@ -85,14 +94,16 @@ async def test_completed_turn_records_daily_usage_and_v2_result(
     session_key = "agent:main:telemetry-test"
     await manager.create(session_key)
     facts: list[TurnReliabilityFacts] = []
+    config = GatewayConfig(
+        workspace_dir=str(tmp_path), state_dir=str(tmp_path / "state"),
+        squilla_router={"enabled": False},
+    )
+    usage = StandaloneUsageTelemetry(config=config, legacy_storage=storage)
     runner = TurnRunner(
         provider_selector=_SingleProviderSelector(),
         session_manager=manager,
-        config=GatewayConfig(
-            workspace_dir=str(tmp_path),
-            state_dir=str(tmp_path / "state"),
-            squilla_router={"enabled": False},
-        ),
+        config=config,
+        usage_telemetry=usage,
         turn_reliability_sink=facts.append,
     )
     try:
@@ -111,7 +122,13 @@ async def test_completed_turn_records_daily_usage_and_v2_result(
 
             assert not [event for event in events if isinstance(event, ErrorEvent)]
             assert len([event for event in events if isinstance(event, DoneEvent)]) == 1
-            rows = await storage.list_pending_daily_usage(before_day="9999-12-31")
+            assert await storage.list_pending_daily_usage(before_day="9999-12-31") == []
+            await usage.flush()
+            counters = await DailyUsageStore.open(standalone_daily_usage_path(config))
+            try:
+                rows = await counters.list_pending_daily_usage(before_day="9999-12-31")
+            finally:
+                await counters.close()
             assert len(rows) == 1
             assert rows[0]["conversation_turns"] == turn_number
             assert rows[0]["input_tokens"] == 120 * turn_number
@@ -121,11 +138,15 @@ async def test_completed_turn_records_daily_usage_and_v2_result(
             assert rows[0]["uploaded_at"] is None
             assert len(facts) == turn_number
             assert all(fact.outcome is ResultOutcome.SUCCESS for fact in facts)
+            session = await manager.get_session(session_key)
+            assert session.input_tokens == 120 * turn_number
+            assert session.output_tokens == 24 * turn_number
     finally:
+        await usage.close()
         await storage.close()
 
 
-async def test_daily_usage_storage_failure_preserves_turn_and_v2_result(
+async def test_direct_runner_has_no_implicit_telemetry_database_writes(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _enable_telemetry(monkeypatch)
@@ -164,7 +185,7 @@ async def test_daily_usage_storage_failure_preserves_turn_and_v2_result(
             )
         ]
 
-        assert record_attempts == 1
+        assert record_attempts == 0
         assert not [event for event in events if isinstance(event, ErrorEvent)]
         done = [event for event in events if isinstance(event, DoneEvent)]
         assert len(done) == 1
@@ -180,12 +201,6 @@ async def test_daily_usage_storage_failure_preserves_turn_and_v2_result(
 
 
 async def test_ephemeral_turn_keeps_only_daily_counters_across_restart(tmp_path, monkeypatch):
-    from opensquilla.observability.daily_usage_store import DailyUsageStore
-    from opensquilla.observability.usage_telemetry import (
-        StandaloneUsageTelemetry,
-        standalone_daily_usage_path,
-    )
-
     _enable_telemetry(monkeypatch)
     storage = await SessionStorage.open(":memory:")
     manager = SessionManager(storage)

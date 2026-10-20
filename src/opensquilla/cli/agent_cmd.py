@@ -475,18 +475,19 @@ async def run_agent_once(
         )
 
         growth_sink = getattr(svc, "growth_event_sink", None)
-        record_launch = getattr(growth_sink, "record_client_launch", None)
+        observe_launch = getattr(growth_sink, "observe_client_launch", None)
         # Stateless CLI runs still count as client launches.
-        if callable(record_launch):
-            await record_launch(
-                surface=ClientSurface.CLI,
-                entrypoint=ClientEntrypoint.AGENT,
-                execution_mode=ExecutionMode.ONE_SHOT,
-            )
-        record_active = getattr(growth_sink, "record_product_active", None)
-        if callable(record_active):
+        if callable(observe_launch):
             with contextlib.suppress(Exception):
-                await record_active(surface=ClientSurface.CLI)
+                observe_launch(
+                    surface=ClientSurface.CLI,
+                    entrypoint=ClientEntrypoint.AGENT,
+                    execution_mode=ExecutionMode.ONE_SHOT,
+                )
+        observe_active = getattr(growth_sink, "observe_product_active", None)
+        if callable(observe_active):
+            with contextlib.suppress(Exception):
+                observe_active(surface=ClientSurface.CLI)
 
         async for event in runner.run(
             message,

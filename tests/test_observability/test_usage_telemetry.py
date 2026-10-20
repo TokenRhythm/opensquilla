@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
@@ -49,6 +50,10 @@ def _enable_telemetry_for_test(monkeypatch) -> None:
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv(network_policy.DO_NOT_TRACK_ENV, raising=False)
     monkeypatch.delenv(network_policy.PRODUCT_ANALYTICS_DISABLED_ENV, raising=False)
+    monkeypatch.setattr(
+        install_telemetry, "_collect_mac_address_candidates", lambda: ["02:00:00:00:00:31"]
+    )
+    monkeypatch.setattr(install_telemetry, "_collect_ip_address_candidates", lambda: [])
 
 
 async def test_records_only_completed_interactive_turns(tmp_path, monkeypatch):
@@ -748,6 +753,162 @@ async def test_gateway_loop_drains_standalone_rows_despite_failed_legacy_store(
         await restored.close()
 
 
+@pytest.mark.parametrize("failure", ["corrupt", "blocked_directory"])
+@pytest.mark.parametrize("close_only", [False, True])
+async def test_unavailable_counter_store_does_not_starve_legacy_uploads(
+    tmp_path, monkeypatch, failure, close_only,
+):
+    _enable_telemetry_for_test(monkeypatch)
+    config = _config(tmp_path)
+    path = usage_telemetry.standalone_daily_usage_path(config)
+    if failure == "corrupt":
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"synthetic invalid sqlite database")
+    else:
+        # A file where the directory belongs fails consistently on every
+        # supported platform, without relying on permission bits or user IDs.
+        path.parent.parent.mkdir(parents=True)
+        path.parent.write_bytes(b"synthetic directory obstruction")
+    legacy = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    sent = []
+    cycles = 0
+    runtime = usage_telemetry.StandaloneUsageTelemetry(
+        config=config, legacy_storage=legacy, flush_interval_seconds=86400,
+    )
+
+    async def record_legacy(day):
+        await usage_telemetry.record_completed_turn(
+            legacy, config=config, run_kind="default", done_event=_done(),
+            now=datetime(2020, 1, day, tzinfo=UTC),
+        )
+
+    async def post(_endpoint, payload):
+        sent.append(payload)
+        return True, None
+
+    async def next_cycle(delay):
+        nonlocal cycles
+        if delay != usage_telemetry.DAILY_USAGE_UPLOAD_INTERVAL_SECONDS:
+            await asyncio.sleep(delay)
+            return
+        cycles += 1
+        # The same local failure remains present across upload cycles.
+        with pytest.raises((sqlite3.DatabaseError, OSError)):
+            await runtime.flush()
+        if cycles == 2:
+            raise asyncio.CancelledError
+        await record_legacy(2)
+
+    monkeypatch.setattr(usage_telemetry, "_post_payload", post)
+    monkeypatch.setattr(
+        install_telemetry, "ensure_install_telemetry_id", lambda **_kw: "synthetic-install",
+    )
+    monkeypatch.setattr(
+        usage_telemetry, "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"sleep": next_cycle})),
+    )
+    try:
+        await record_legacy(1)
+        await runtime.record_turn(run_kind="default", done_event=_done())
+        if close_only:
+            await runtime.close()
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await runtime._run_upload_loop()
+        assert [payload["day"] for payload in sent] == (
+            ["2020-01-01"] if close_only else ["2020-01-01", "2020-01-02"]
+        )
+        assert {payload["conversation_turns"] for payload in sent} == {1}
+        assert await legacy.list_pending_daily_usage(before_day="9999-12-31") == []
+        assert sum(row.conversation_turns for row in runtime._pending.values()) == 1
+    finally:
+        await runtime.close()
+        await legacy.close()
+
+
+@pytest.mark.parametrize("close_only", [False, True])
+async def test_stalled_counter_flush_does_not_delay_legacy_uploads(
+    tmp_path, monkeypatch, close_only,
+):
+    _enable_telemetry_for_test(monkeypatch)
+    config = _config(tmp_path)
+    legacy = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    runtime = usage_telemetry.StandaloneUsageTelemetry(
+        config=config, legacy_storage=legacy, flush_interval_seconds=86400,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    uploaded = asyncio.Event()
+    saved = []
+    real_wait = asyncio.wait
+
+    class StalledStore:
+        @classmethod
+        async def open(cls, _path):
+            return cls()
+
+        async def record_daily_usage_batch(self, rows, **_kwargs):
+            entered.set()
+            await release.wait()
+            saved.extend(rows)
+
+        async def close(self):
+            pass
+
+    async def post(_endpoint, payload):
+        assert payload["day"] == "2020-01-01"
+        assert not release.is_set()
+        uploaded.set()
+        return True, None
+
+    async def stop_after_cycle(_delay):
+        raise asyncio.CancelledError
+
+    async def wait_after_legacy_upload(tasks, *, timeout):
+        await asyncio.wait_for(uploaded.wait(), timeout=2)
+        return await real_wait(tasks, timeout=timeout)
+
+    monkeypatch.setattr(usage_telemetry, "DailyUsageStore", StalledStore)
+    monkeypatch.setattr(usage_telemetry, "_post_payload", post)
+    monkeypatch.setattr(
+        install_telemetry, "ensure_install_telemetry_id", lambda **_kw: "synthetic-install",
+    )
+    await usage_telemetry.record_completed_turn(
+        legacy, config=config, run_kind="default", done_event=_done(),
+        now=datetime(2020, 1, 1, tzinfo=UTC),
+    )
+    await runtime.record_turn(run_kind="default", done_event=_done())
+    flush = asyncio.create_task(runtime.flush())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        if close_only:
+            monkeypatch.setattr(usage_telemetry, "STANDALONE_CLOSE_TIMEOUT_SECONDS", 0.01)
+            monkeypatch.setattr(
+                usage_telemetry, "asyncio",
+                SimpleNamespace(**(vars(asyncio) | {"wait": wait_after_legacy_upload})),
+            )
+            await asyncio.wait_for(runtime.close(), timeout=2)
+        else:
+            monkeypatch.setattr(
+                usage_telemetry, "asyncio",
+                SimpleNamespace(**(vars(asyncio) | {"sleep": stop_after_cycle})),
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(runtime._run_upload_loop(), timeout=2)
+        assert uploaded.is_set()
+        assert not flush.done()
+        assert await legacy.list_pending_daily_usage(before_day="9999-12-31") == []
+    finally:
+        release.set()
+        await flush
+        await runtime.close()
+        if runtime._close_task is not None:
+            await asyncio.gather(runtime._close_task, return_exceptions=True)
+        await legacy.close()
+    assert len(saved) == 1
+    assert saved[0].conversation_turns == 1
+
+
 async def test_standalone_close_preserves_usage_after_upload_timeout(tmp_path, monkeypatch):
     from opensquilla.observability.daily_usage_store import DailyUsageStore
 
@@ -762,17 +923,17 @@ async def test_standalone_close_preserves_usage_after_upload_timeout(tmp_path, m
     await storage.close()
     entered = asyncio.Event()
     cancelled = asyncio.Event()
-    close_timeout = asyncio.timeout(None)
+    real_wait = asyncio.wait
 
-    def timeout_after_upload_started(delay):
-        assert delay == 0.05
-        return close_timeout
+    async def wait_after_upload_started(tasks, *, timeout):
+        assert timeout == 0.05
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        return await real_wait(tasks, timeout=timeout)
 
     async def blocked_post(endpoint, payload):
         entered.set()
         # Exercise cancellation of an active request without charging cold
         # SQLite and identity initialization to this synthetic short deadline.
-        close_timeout.reschedule(asyncio.get_running_loop().time() + 0.05)
         try:
             await asyncio.Event().wait()
         finally:
@@ -782,11 +943,12 @@ async def test_standalone_close_preserves_usage_after_upload_timeout(tmp_path, m
     monkeypatch.setattr(usage_telemetry, "STANDALONE_CLOSE_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(
         usage_telemetry, "asyncio",
-        SimpleNamespace(**(vars(asyncio) | {"timeout": timeout_after_upload_started})),
+        SimpleNamespace(**(vars(asyncio) | {"wait": wait_after_upload_started})),
     )
     runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=None)
     await asyncio.wait_for(runtime.close(), timeout=5)
     assert entered.is_set()
+    await asyncio.sleep(0)
     assert cancelled.is_set()
     restored = await DailyUsageStore.open(path)
     try:

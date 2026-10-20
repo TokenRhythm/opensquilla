@@ -389,7 +389,7 @@ async def test_standalone_counter_store_waits_for_another_connection_writer(
         connection = connect(*args, **kwargs)
 
         def trace(statement):
-            if statement.lstrip().startswith("INSERT INTO telemetry_daily_usage"):
+            if statement.lstrip().startswith("BEGIN IMMEDIATE"):
                 write_started.set()
 
         connection.set_trace_callback(trace)
