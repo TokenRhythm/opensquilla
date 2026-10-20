@@ -45,6 +45,17 @@ mixing Windows path-length failures into the benchmark. The script never removes
 previous evidence. Each pair alternates A/B and B/A ordering, and each variant
 gets its own identical database copy.
 
+If a long uninterrupted window is unavailable, declare the number of pairs
+before collecting new evidence, then use `--pairs 1 --pair-offset 0`, followed
+by offsets 1 through 5 for six separately recorded blocks. This preserves the
+alternating order. Aggregate all complete blocks, including any that fail their
+individual timing budget; never retry or exclude a block because it was slow.
+Retain every failed attempt. External build interference invalidates the entire
+four-launch block, which may be retried at the same offset; functional failures
+require investigation before continuing. Combine the raw timings from the first
+valid block at each declared offset using the same percentile rule and original
+thresholds. Report the block boundaries, pauses and failed attempts.
+
 ## Fixture and measurement scope
 
 The default fixture has 50 sessions, each with `display_name = WebChat`, a valid

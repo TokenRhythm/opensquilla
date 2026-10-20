@@ -5,6 +5,7 @@
 //   [--pairs 6] [--verify-backfill] [--max-regression-ms 250] [--max-regression-ratio .05]
 //   [--read-diagnostics --named 45 --unnamed 5] (separate work-count evidence, not timing)
 //   [--wait-for-builds] (wait outside timing when preflight detects a build)
+//   [--pair-offset 0] (preserve alternating order across separately recorded blocks)
 // These are fresh-process launches with uncontrolled/warm OS caches, never a
 // claim about machine-cold cache. Run without concurrent builds or benchmarks.
 import assert from 'node:assert/strict'
@@ -38,6 +39,7 @@ const workdir = resolve(requiredOption('--workdir'))
 const output = resolve(requiredOption('--output'))
 const option = (name, fallback) => process.argv.includes(name) ? requiredOption(name) : fallback
 const pairs = Number(option('--pairs', '6'))
+const pairOffset = Number(option('--pair-offset', '0'))
 const verifyBackfill = process.argv.includes('--verify-backfill')
 const readDiagnostics = process.argv.includes('--read-diagnostics')
 const waitForBuilds = process.argv.includes('--wait-for-builds')
@@ -48,6 +50,8 @@ const maxRegressionRatio = Number(option('--max-regression-ratio', '.05'))
 const timeout = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + 30_000
 assert.equal(process.platform, 'win32', 'This probe requires native Windows')
 assert.ok(Number.isInteger(pairs) && pairs >= 0 && (pairs > 0 || verifyBackfill))
+assert.ok(Number.isSafeInteger(pairOffset) && pairOffset >= 0
+  && Number.isSafeInteger(pairOffset + pairs))
 assert.ok(Number.isInteger(named) && Number.isInteger(unnamed)
   && Math.min(named, unnamed) >= 0 && named + unnamed > 0 && named + unnamed <= 50)
 assert.ok(Number.isFinite(maxRegressionMs) && maxRegressionMs >= 0)
@@ -77,6 +81,7 @@ const report = {
   thresholds: { maxRegressionMs, maxRegressionRatio },
   executables: {},
   pairs,
+  pairOffset,
   boots: [],
 }
 for (const [label, executable] of Object.entries(executables)) {
@@ -491,7 +496,7 @@ try {
   protocolCaptured = true
   const seedPath = join(workdir, 'seed.db')
   report.fixture = runSeed(['--database', seedPath, '--source', source, '--named', String(named), '--unnamed', String(unnamed)])
-  for (let pair = 0; pair < pairs; pair++) {
+  for (let pair = pairOffset; pair < pairOffset + pairs; pair++) {
     const order = pair % 2 ? ['candidate', 'baseline'] : ['baseline', 'candidate']
     for (const label of order) {
       const profile = await prepareProfile(join(workdir, `p${pair}-${label[0]}`), seedPath)
