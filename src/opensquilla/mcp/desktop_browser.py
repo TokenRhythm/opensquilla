@@ -190,6 +190,9 @@ def _argument_validation_result(
         description = f"{field}: {rule}; expected {expected}"
         # Reuse the advertised contract, never submitted arguments or server error text.
         guidance = field_schema.get("description") if field_schema and field != "$" else None
+        # The action field's recovery description explains batch order only.
+        if field.rsplit(".", 1)[-1] == "action" and rule != "order":
+            guidance = None
         if rule != "unrecognized" and isinstance(guidance, str) and 0 < len(guidance) <= 512:
             description += f". {guidance}"
         descriptions.append(description)

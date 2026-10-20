@@ -841,6 +841,25 @@ def test_argument_guidance_remains_bounded(description):
 
 
 @pytest.mark.parametrize(
+    ("rule", "expected"), [("enum", "supported_value"), ("dependency", "related_fields")],
+)
+def test_action_order_guidance_is_not_used_for_other_action_errors(rule, expected):
+    from opensquilla.mcp.desktop_browser import _argument_validation_result
+
+    schema = diagnostic_input_schema()
+    guidance = "Only fill/select may precede the final action."
+    schema["properties"]["actions"]["items"]["properties"]["action"] = {
+        "type": "string", "description": guidance,
+    }
+    error = argument_validation_error()
+    issue = {"field": "actions.0.action", "rule": rule, "expected": expected}
+    error["data"]["issues"] = [issue]
+    result = _argument_validation_result(error, schema)
+    assert result["structuredContent"]["issues"] == [issue]
+    assert guidance not in result["structuredContent"]["message"]
+
+
+@pytest.mark.parametrize(
     ("location", "changes"),
     [
         ("error", {"code": -32603}),

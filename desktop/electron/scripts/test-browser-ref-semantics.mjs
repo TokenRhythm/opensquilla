@@ -100,6 +100,37 @@ try {
   driver.invalidate()
   console.log('Browser ref semantics passed: native input buttons, accessible names, field state, editability, secret omission and executable refs.')
 
+  for (const [html, change, action] of [
+    ['<button>First target</button>', node => { node.textContent = 'Second target' }, 'click'],
+    ['<button aria-label="First target">Caption</button>', node => { node.setAttribute('aria-label', 'Second target') }, 'click'],
+    ['<button>First target</button>', node => { node.setAttribute('role', 'link') }, 'click'],
+    ['<input aria-label="First target">', node => { node.type = 'password' }, 'fill'],
+    ['<a href="/first">First target</a>', node => { node.setAttribute('href', '/second') }, 'click'],
+    ['<input type="button" value="First target">', node => { node.value = 'Second target' }, 'click'],
+    ['<label for="field">First target</label><input id="field">', node => { node.labels[0].textContent = 'Second target' }, 'fill'],
+  ]) {
+    await page.setContent(html)
+    const observed = await driver.snapshot(1, guard, signal)
+    const control = observed.refs.find(value => value.name === 'First target' && ['button', 'input', 'a'].includes(value.tagName))
+    assert.ok(control)
+    await page.locator('button,input,a').evaluate(change)
+    await assert.rejects(driver.act({ action, ref: control.ref, text: 'synthetic-entry' }, 1, guard, signal),
+      error => error.code === 'STALE_ELEMENT' && error.details.outcome === 'not_started')
+  }
+  await page.setContent('<input aria-label="Entry"><div contenteditable="true">Draft</div><p id="status">Idle</p>')
+  const editable = await driver.snapshot(1, guard, signal)
+  const status = editable.refs.find(value => value.name === 'Idle')
+  assert.ok(editable.refs.every(value => !Object.hasOwn(value, 'identity')))
+  for (const control of editable.refs.filter(value => value.editable)) {
+    await driver.act({ action: 'fill', ref: control.ref, text: 'First edit' }, 1, guard, signal)
+    await page.locator('#status').evaluate(node => { node.textContent = 'Unrelated update' })
+    await driver.act({ action: 'fill', ref: control.ref, text: 'Second edit' }, 1, guard, signal)
+  }
+  assert.equal(await page.locator('input').inputValue(), 'Second edit')
+  assert.equal(await page.locator('[contenteditable]').innerText(), 'Second edit')
+  assert.equal((await driver.readText({ ref: status.ref }, 1, guard, signal)).text, 'Unrelated update')
+  console.log('Browser ref identity rejects changed target semantics while preserving field edits and unrelated updates.')
+
   await page.setContent(`<!doctype html><body>
     <p>Outside marker</p><button onclick="document.body.dataset.clicked='outside'">Same control</button>
     ${Array.from({ length: 197 }, (_, index) => `<button>Head button ${index}</button>`).join('')}
