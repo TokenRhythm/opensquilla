@@ -51,6 +51,12 @@ vi.mock('./assistantChatWorkbenchProvider', () => ({ createAssistantChatWorkbenc
 vi.mock('./toolHistoryFileProvider', () => ({ createToolHistoryFileDefinition: () => ({ kind: 'tool-file-history' }) }))
 
 const apps: App[] = []
+function browserItem(options: Parameters<typeof createBrowserWorkbenchItem>[0]) {
+  const item = createBrowserWorkbenchItem(options)
+  if (!item) throw new Error('Expected a browser item for this valid fixture URL')
+  return item
+}
+
 const key = (suffix: string) => `workbench.newPanel.${suffix}`
 type PanelKind = 'browser' | 'workspace-files' | 'terminal' | 'assistant-chat'
 type GatewayMenuFixture = { -readonly [K in keyof Pick<GatewayAccess,
@@ -346,7 +352,7 @@ describe('AppWorkbench new panel menu interaction', () => {
 
   it('reopens the eighth browser directly from the menu without consuming a slot for a blank tab', async () => {
     const harness = await mount()
-    const browsers = Array.from({ length: 8 }, (_, index) => createBrowserWorkbenchItem({
+    const browsers = Array.from({ length: 8 }, (_, index) => browserItem({
       scopeId: 'session-a', url: `https://example.test/page-${index}`,
     }))
     for (const item of browsers) expect(harness.store.openItem(item, { activate: false })).toBe(true)
@@ -365,8 +371,8 @@ describe('AppWorkbench new panel menu interaction', () => {
 
   it('only reopens closed browsers for the current session and ignores a dismissed menu action', async () => {
     const harness = await mount()
-    const closedA = createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'https://example.test/a' })
-    const closedB = createBrowserWorkbenchItem({ scopeId: 'session-b', url: 'https://example.test/b' })
+    const closedA = browserItem({ scopeId: 'session-a', url: 'https://example.test/a' })
+    const closedB = browserItem({ scopeId: 'session-b', url: 'https://example.test/b' })
     for (const item of [closedA, closedB]) {
       harness.store.openItem(item, { activate: false })
       harness.store.closeItem(item.id)
@@ -400,11 +406,11 @@ describe('AppWorkbench new panel menu interaction', () => {
 
   it('keeps the closed browser recoverable when the menu reopen reaches browser capacity', async () => {
     const harness = await mount()
-    const closed = createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'https://example.test/closed' })
+    const closed = browserItem({ scopeId: 'session-a', url: 'https://example.test/closed' })
     harness.store.openItem(closed, { activate: false })
     harness.store.closeItem(closed.id)
     for (let index = 0; index < 8; index += 1) {
-      harness.store.openItem(createBrowserWorkbenchItem({
+      harness.store.openItem(browserItem({
         scopeId: 'session-a', url: `https://example.test/open-${index}`,
       }), { activate: false })
     }
