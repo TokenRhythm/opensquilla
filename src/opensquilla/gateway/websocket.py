@@ -52,6 +52,10 @@ from opensquilla.gateway.rpc.ingress import (
     is_utf8_encodable,
     validate_rpc_ingress,
 )
+from opensquilla.gateway.telemetry_connections import (
+    register_tui_handshake,
+    unregister_tui_connection,
+)
 from opensquilla.gateway.transport_flow import (
     CONNECTION_BUFFER_BYTES,
     CONTROL_BUFFER_BYTES,
@@ -330,6 +334,15 @@ _MAX_DETACHED_REQUESTS_PER_CONNECTION = len(
 )
 _MAX_CANCELLABLE_REQUESTS_PER_CONNECTION = len(_PROVIDER_PROBE_METHODS)
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
+_TELEMETRY_RECORD_METHODS = frozenset({
+    "telemetry.product_active.record", "telemetry.client_launch.record",
+})
+_TELEMETRY_REQUEST_METHODS = _TELEMETRY_RECORD_METHODS | {"telemetry.consent.set"}
+# Recording and explicit preferences share wire order, but neither occupies the
+# ordinary request worker. Reserve consent admission even when both recording
+# slots are busy; the complete telemetry lane owns at most three tasks.
+_MAX_TELEMETRY_RECORD_REQUESTS_PER_CONNECTION = 2
+_MAX_TELEMETRY_CONSENT_REQUESTS_PER_CONNECTION = 1
 
 
 def _should_detach_rpc_request(method: str, params: Any) -> bool:
@@ -481,6 +494,15 @@ class WsConnection:
         default_factory=set,
         init=False,
         repr=False,
+    )
+    _telemetry_request_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set, init=False, repr=False,
+    )
+    _telemetry_consent_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set, init=False, repr=False,
+    )
+    _telemetry_request_tail: asyncio.Future[None] | None = field(
+        default=None, init=False, repr=False,
     )
     _cancellable_request_tasks: dict[str, asyncio.Task[None]] = field(
         default_factory=dict,
@@ -2104,13 +2126,23 @@ class WsConnection:
         *,
         request_id: str | None = None,
         provider_probe_lease: object | None = None,
+        telemetry_completion: asyncio.Future[None] | None = None,
+        telemetry_consent: bool = False,
     ) -> None:
         self._detached_request_tasks.add(task)
+        if telemetry_completion is not None:
+            self._telemetry_request_tasks.add(task)
+            if telemetry_consent:
+                self._telemetry_consent_tasks.add(task)
         if request_id is not None:
             self._cancellable_request_tasks[request_id] = task
 
         def finished(completed: asyncio.Task[None]) -> None:
             self._detached_request_tasks.discard(completed)
+            self._telemetry_request_tasks.discard(completed)
+            self._telemetry_consent_tasks.discard(completed)
+            if telemetry_completion is not None and not telemetry_completion.done():
+                telemetry_completion.set_result(None)
             if provider_probe_lease is not None:
                 _release_provider_probe_lease(provider_probe_lease)
             self._cancelled_request_tasks.discard(completed)
@@ -2133,6 +2165,14 @@ class WsConnection:
                 )
 
         task.add_done_callback(finished)
+
+    def _admit_telemetry_request(
+        self,
+    ) -> tuple[tuple[asyncio.Future[None], ...], asyncio.Future[None]]:
+        predecessor = self._telemetry_request_tail
+        completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._telemetry_request_tail = completion
+        return (() if predecessor is None else (predecessor,)), completion
 
     def _cancel_detached_request(self, request_id: str) -> None:
         """Cancel a cancellable request owned by this connection, if still active."""
@@ -2157,6 +2197,8 @@ class WsConnection:
         self._accept_detached_responses = False
         tasks = tuple(self._detached_request_tasks)
         self._detached_request_tasks.clear()
+        self._telemetry_request_tasks.clear()
+        self._telemetry_consent_tasks.clear()
         self._cancellable_request_tasks.clear()
         self._cancelled_request_tasks.update(tasks)
         for task in tasks:
@@ -3479,6 +3521,7 @@ async def handle_ws_connection(
         ),
         auth=_websocket_hello_auth_payload(principal),
     )
+    register_tui_handshake(conn_id, params_raw.get("client"), principal)
     try:
         await conn.send_raw_text(
             hello.model_dump_json(
@@ -3486,7 +3529,11 @@ async def handle_ws_connection(
             )
         )
     except (WebSocketDisconnect, TimeoutError):
+        unregister_tui_connection(conn_id)
         return
+    except BaseException:
+        unregister_tui_connection(conn_id)
+        raise
 
     registry.register(conn)
     # Boundary: pre-auth direct-send ends here. After registry.register(conn),
@@ -3562,6 +3609,7 @@ async def handle_ws_connection(
         except asyncio.CancelledError:
             pass
         registry.unregister(conn_id)
+        unregister_tui_connection(conn_id)
         conn._cleanup_transport()
         if subscription_manager is not None:
             subscription_manager.remove_connection(conn_id)
@@ -3617,6 +3665,8 @@ async def _dispatch_request(
     method: str,
     params: Any,
     ctx: RpcContext,
+    *,
+    detached: bool = False,
 ) -> None:
     worker = asyncio.current_task()
     if method == "cron.run" and worker is not None and conn._ordinary_worker is worker:
@@ -3640,7 +3690,7 @@ async def _dispatch_request(
             (operation.current() or (not res.ok and not operation.closed))
             and operation.claim_response()
         )
-    if should_send:
+    if should_send and (not detached or conn._accept_detached_responses):
         await conn.send_res(res, transport_control=(
             method in _CONTROL_RPC_METHODS or method in _RECOVERY_CONTROL_METHODS
             or method == "sessions.messages.resume"
@@ -4008,6 +4058,33 @@ async def _message_loop(
                     )
                 await asyncio.sleep(0)
                 continue
+            if method in _TELEMETRY_REQUEST_METHODS:
+                telemetry_consent = method == "telemetry.consent.set"
+                consent_count = len(conn._telemetry_consent_tasks)
+                at_limit = (
+                    consent_count >= _MAX_TELEMETRY_CONSENT_REQUESTS_PER_CONNECTION
+                    if telemetry_consent else
+                    len(conn._telemetry_request_tasks) - consent_count
+                    >= _MAX_TELEMETRY_RECORD_REQUESTS_PER_CONNECTION
+                )
+                if at_limit:
+                    await conn.send_res(make_error_res(
+                        req_id, ERROR_UNAVAILABLE,
+                        "Too many telemetry requests are already running",
+                        retryable=True, retry_after_ms=100, accepted=False,
+                    ))
+                    continue
+                predecessor, completion = conn._admit_telemetry_request()
+                task = asyncio.create_task(
+                    _dispatch_telemetry_request(
+                        predecessor, completion, conn, dispatcher, req_id, method, params, ctx,
+                    ),
+                    name=f"ws-telemetry-request-{conn.conn_id}",
+                )
+                conn._track_detached_request(
+                    task, telemetry_completion=completion, telemetry_consent=telemetry_consent,
+                )
+                continue
             if _should_detach_rpc_request(method, params):
                 cancellable = _is_cancellable_request(method, params)
                 if cancellable and req_id in conn._cancellable_request_tasks:
@@ -4022,6 +4099,7 @@ async def _message_loop(
                 ordinary_detached_count = (
                     len(conn._detached_request_tasks)
                     - len(conn._cancellable_request_tasks)
+                    - len(conn._telemetry_request_tasks)
                 )
                 at_limit = (
                     len(conn._cancellable_request_tasks)
@@ -4172,6 +4250,27 @@ async def _dispatch_and_send(
     if cancellable and not conn._detached_response_allowed(asyncio.current_task()):
         return
     await conn.send_res(response)
+
+
+async def _dispatch_telemetry_request(
+    predecessors: tuple[asyncio.Future[None], ...],
+    completion: asyncio.Future[None],
+    conn: WsConnection,
+    dispatcher: RpcDispatcher,
+    req_id: str,
+    method: str,
+    params: Any,
+    ctx: RpcContext,
+) -> None:
+    try:
+        for predecessor in predecessors:
+            await asyncio.shield(predecessor)
+        if conn._closing:
+            return
+        await _dispatch_request(conn, dispatcher, req_id, method, params, ctx, detached=True)
+    finally:
+        if not completion.done():
+            completion.set_result(None)
 
 
 def _build_features(dispatcher: RpcDispatcher, *, principal: Principal | None = None) -> Any:

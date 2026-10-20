@@ -596,9 +596,7 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(
     )
 
     if tokenizer_mode == "unavailable":
-        monkeypatch.setattr(
-            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
-        )
+        monkeypatch.setattr(token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE)
     monkeypatch.setenv("OPENSQUILLA_LIVE_DISABLE_DOTENV", "1")
     snapshot = tmp_path / "frozen"
     source = tmp_path / "source"
@@ -617,11 +615,10 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(
     exported = await harness.run_case(
         source, provider="tokenrhythm", model="deepseek-v4-flash", api_key="synthetic-key",
         observer=observer, scenario="compaction", thinking="off",
-        # Keep final-admission headroom for the conservative tokenizer too:
-        # at 20k the natural arm legitimately clamps output to 4075 tokens,
-        # while the compacted arm retains 4096, changing the locked controls.
+        # Leave output headroom so admission preserves the same controls with
+        # conservative token estimates as well as a cached tokenizer.
         compaction_options=harness.CompactionCaseOptions(
-            task_profile="coding", context_window_tokens=24_000,
+            task_profile="coding", max_output_tokens=2048,
         ),
         comparison_snapshot_out=snapshot,
     )
@@ -651,10 +648,10 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(
                                       observer=observed, history_tokens=tokens, history_chars=chars)
         assert result["ok"] is True
         proof = result["comparison"]
-        assert proof["final_request"]["generation_budget"] == 4096
-        assert proof["compaction_applied"] is (tokens is not None)
+        assert proof["final_request"]["generation_budget"] == 2048
         assert proof["summary_calls"] == (1 if tokens is not None else 0)
         assert proof["archive_preserved"] is True
+        assert proof["compaction_applied"] is (tokens is not None)
         assert all(proof["answer_fact_checks"].values())
         assert proof["source_sha256"] == manifest["source_sha256"]
         assert proof["capacity_samples"]

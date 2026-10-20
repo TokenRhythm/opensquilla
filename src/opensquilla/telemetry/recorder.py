@@ -9,6 +9,7 @@ consent checkpoint and notice-version boundary.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -127,6 +128,40 @@ class TelemetryRecorder:
                 return RecordResult(RecordStatus.CONSENT_BLOCKED)
             result = await self._outbox.enqueue(event, priority=priority)
             return RecordResult(_RECORD_STATUS_BY_ENQUEUE_RESULT[result])
+
+    async def record_many(
+        self,
+        events: Sequence[tuple[StrictTelemetryModel, OutboxPriority | int | None]],
+        *,
+        expected_consent_revision: int,
+    ) -> tuple[RecordResult, ...]:
+        """Persist background observations together under one current permit."""
+
+        notice = CURRENT_NOTICE_VERSION_BY_SCOPE[self.scope.value]
+        eligible = []
+        results = []
+        for index, (event, priority) in enumerate(events):
+            if str(getattr(event, "consent_scope", None)) != self.scope.value:
+                raise ValueError("event consent scope does not match recorder scope")
+            if getattr(event, "notice_version", None) != notice:
+                results.append(RecordResult(RecordStatus.NOTICE_MISMATCH))
+            else:
+                eligible.append((index, event, priority))
+                results.append(RecordResult(RecordStatus.CONSENT_BLOCKED))
+        if not eligible:
+            return tuple(results)
+
+        async with self._coordinator.authorized(
+            self.scope, checkpoint=ConsentCheckpoint.ENQUEUE, notice_version=notice,
+        ) as permit:
+            if permit is None or permit.revision != expected_consent_revision:
+                return tuple(results)
+            recorded = await self._outbox.enqueue_many(
+                [(event, priority) for _index, event, priority in eligible],
+            )
+            for (index, _event, _priority), result in zip(eligible, recorded, strict=True):
+                results[index] = RecordResult(_RECORD_STATUS_BY_ENQUEUE_RESULT[result])
+        return tuple(results)
 
 
 _RECORD_STATUS_BY_ENQUEUE_RESULT = {

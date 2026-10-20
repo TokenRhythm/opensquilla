@@ -13,7 +13,7 @@ import pytest
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 import opensquilla.gateway.websocket as websocket_module
-from opensquilla.gateway import rpc_sessions
+from opensquilla.gateway import rpc_sessions, rpc_telemetry
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.event_bridge import EventBridge
 from opensquilla.gateway.protocol import make_ok_res
@@ -426,9 +426,9 @@ class _HistoryWebSocket:
             if frame.get("type") == "hello-ok"
         )
 
-    async def wait_for_response(self, req_id: str) -> None:
+    async def wait_for_response(self, req_id: str, *, timeout: float | None = 1) -> None:
         event = self._response_events.setdefault(req_id, asyncio.Event())
-        await asyncio.wait_for(event.wait(), timeout=1)
+        await asyncio.wait_for(event.wait(), timeout=timeout)
 
     def has_response(self, req_id: str) -> bool:
         event = self._response_events.get(req_id)
@@ -440,6 +440,8 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
     monkeypatch: Any,
     writer_queue_enabled: bool,
 ) -> None:
+    from opensquilla.onboarding import probe as probe_module
+
     probe_started = asyncio.Event()
     stream_close_started = asyncio.Event()
     release_stream_close = asyncio.Event()
@@ -475,19 +477,23 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         "opensquilla.onboarding.probe.build_provider",
         lambda *args, **kwargs: _BlockingProvider(),
     )
+    # This test checks save/cleanup ordering. Keep cleanup pending until its
+    # explicit release, even when a loaded runner takes more than one second.
+    # The connection watchdog below still bounds a stalled cancellation/save.
+    monkeypatch.setattr(probe_module, "_PROBE_STREAM_CLOSE_TIMEOUT_SECONDS", 30.0)
     dispatcher = _CancellableProviderProbeDispatcher()
 
     async def wait_for_probe_before_cancel(frame: str) -> None:
         decoded = json.loads(frame)
         if decoded.get("type") == "cancel":
-            await asyncio.wait_for(probe_started.wait(), timeout=1)
+            await probe_started.wait()
 
     async def finish_after_save(socket: _HistoryWebSocket) -> None:
-        await asyncio.wait_for(stream_close_started.wait(), timeout=1)
-        await socket.wait_for_response("save")
+        await stream_close_started.wait()
+        await socket.wait_for_response("save", timeout=None)
         observed["save_finished_during_cleanup"] = not stream_closed.is_set()
         release_stream_close.set()
-        await asyncio.wait_for(stream_closed.wait(), timeout=1)
+        await stream_closed.wait()
 
     ws = _HistoryWebSocket(
         [
@@ -515,16 +521,19 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         after_frames=finish_after_save,
     )
 
-    # Allow handshake/setup scheduling overhead in this integration watchdog;
-    # probe cancellation, stream cleanup, and save progress keep their 1s waits.
-    await asyncio.wait_for(
-        handle_ws_connection(
-            ws,
-            GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
-            dispatcher=dispatcher,
-        ),
-        timeout=10,
-    )
+    # Put the watchdog outside the simulated receive path so a fixture timeout
+    # cannot be mistaken for a client keepalive timeout by the Gateway.
+    try:
+        await asyncio.wait_for(
+            handle_ws_connection(
+                ws,
+                GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+                dispatcher=dispatcher,
+            ),
+            timeout=10,
+        )
+    finally:
+        release_stream_close.set()
 
     responses = {frame["id"]: frame for frame in ws.responses()}
     assert "probe" not in responses
@@ -1863,3 +1872,280 @@ async def test_detached_history_send_failure_closes_connection(
 
     assert ws.close_codes == [1011]
     assert all(frame["id"] != "history-fail" for frame in ws.responses())
+
+
+class _TelemetryDispatcher:
+    def __init__(self) -> None:
+        self.search_started = asyncio.Event()
+        self.search_cancelled = asyncio.Event()
+        self.connection: Any = None
+
+    def list_methods(self) -> list[str]:
+        return ["sessions.send", "sessions.search", "usage.status"] + sorted(
+            websocket_module._TELEMETRY_RECORD_METHODS | {"telemetry.consent.set"}
+        )
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        self.connection = get_registry().get(ctx.conn_id)
+        if method.startswith("telemetry."):
+            return await rpc_telemetry.get_dispatcher().dispatch(req_id, method, params, ctx)
+        if method == "sessions.search":
+            self.search_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.search_cancelled.set()
+                raise
+        return make_ok_res(req_id, {"method": method})
+
+
+def _telemetry_frame(ident: str, method: str) -> str:
+    return json.dumps({
+        "type": "req", "id": ident, "method": method,
+        "params": {"surface": "tui"} if method == "telemetry.product_active.record" else {},
+    })
+
+
+def _consent_frame(ident: str, *, enabled: bool) -> str:
+    return json.dumps({
+        "type": "req", "id": ident, "method": "telemetry.consent.set",
+        "params": {"scope": "growth", "enabled": enabled},
+    })
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
+@pytest.mark.parametrize("method", sorted(websocket_module._TELEMETRY_RECORD_METHODS))
+@pytest.mark.parametrize("recorded", [False, True])
+async def test_slow_telemetry_record_allows_same_socket_send_ping_and_cancel(
+    method: str, recorded: bool, writer_queue_enabled: bool,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    dispatcher = _TelemetryDispatcher()
+
+    async def record(**kwargs: Any) -> bool:
+        started.set()
+        await release.wait()
+        return recorded
+
+    async def before_frame(frame: str) -> None:
+        data = json.loads(frame)
+        if data.get("id") == "send":
+            await asyncio.wait_for(started.wait(), 1)
+        if data.get("type") == "cancel":
+            await asyncio.wait_for(dispatcher.search_started.wait(), 1)
+
+    async def finish(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("send")
+        await asyncio.wait_for(dispatcher.search_cancelled.wait(), 1)
+        assert not socket.has_response("record")
+        assert any(json.loads(frame).get("type") == "pong" for frame in socket.sent)
+        release.set()
+        await socket.wait_for_response("record")
+
+    frames = [
+        _CONNECT_FRAME,
+        _telemetry_frame("record", method),
+        _telemetry_frame("send", "sessions.send"),
+        _telemetry_frame("search", "sessions.search"),
+        json.dumps({"type": "ping"}),
+        json.dumps({"type": "cancel", "id": "search"}),
+    ]
+    ws = _HistoryWebSocket(frames, dispatcher, before_frame=before_frame, after_frames=finish)
+    await asyncio.wait_for(handle_ws_connection(
+        ws, GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled), dispatcher=dispatcher,
+        turn_runner=SimpleNamespace(growth_event_sink=SimpleNamespace(
+            record_product_active=record, record_client_launch=record,
+        )),
+    ), 5)
+    responses = {response["id"]: response for response in ws.responses()}
+    assert responses["record"]["payload"] == {"recorded": recorded}
+    assert responses["send"]["ok"] is True
+    assert "search" not in responses
+
+
+async def test_telemetry_cap_is_separate_and_disconnect_cleans_running_and_waiting_records(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(websocket_module, "_MAX_DETACHED_REQUESTS_PER_CONNECTION", 1)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
+    dispatcher = _TelemetryDispatcher()
+
+    async def record(**kwargs: Any) -> bool:
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def finish(socket: _HistoryWebSocket) -> None:
+        await asyncio.wait_for(started.wait(), 1)
+        await socket.wait_for_response("overflow")
+        await socket.wait_for_response("consent-overflow")
+        await socket.wait_for_response("send")
+        await socket.wait_for_response("optional")
+        assert dispatcher.connection is not None
+        assert len(dispatcher.connection._telemetry_request_tasks) == 3
+        assert len(dispatcher.connection._telemetry_consent_tasks) == 1
+        assert not socket.has_response("record-a")
+        assert not socket.has_response("record-b")
+
+    frames = [
+        _CONNECT_FRAME,
+        _telemetry_frame("record-a", "telemetry.product_active.record"),
+        _telemetry_frame("record-b", "telemetry.client_launch.record"),
+        _consent_frame("consent", enabled=False),
+        _telemetry_frame("overflow", "telemetry.client_launch.record"),
+        _consent_frame("consent-overflow", enabled=True),
+        _telemetry_frame("optional", "usage.status"),
+        _telemetry_frame("send", "sessions.send"),
+    ]
+    ws = _HistoryWebSocket(frames, dispatcher, after_frames=finish)
+    await asyncio.wait_for(handle_ws_connection(
+        ws, GatewayConfig(), dispatcher=dispatcher,
+        turn_runner=SimpleNamespace(growth_event_sink=SimpleNamespace(
+            record_product_active=record, record_client_launch=record,
+        )),
+    ), 5)
+    for request_id in ("overflow", "consent-overflow"):
+        response = next(r for r in ws.responses() if r["id"] == request_id)
+        assert response["ok"] is False
+        assert response["error"]["code"] == "UNAVAILABLE"
+        assert response["error"]["retryable"] is True
+        assert response["error"]["accepted"] is False
+    assert calls == 1
+    assert cancelled.is_set()
+    assert not dispatcher.connection._telemetry_request_tasks
+    assert not dispatcher.connection._telemetry_consent_tasks
+    assert not dispatcher.connection._detached_request_tasks
+    assert dispatcher.connection._telemetry_request_tail.done()
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
+async def test_telemetry_consent_preserves_record_order_without_blocking_send(
+    tmp_path: Any, writer_queue_enabled: bool,
+) -> None:
+    config = GatewayConfig(
+        config_path=str(tmp_path / "config.toml"), state_dir=str(tmp_path / "state"),
+        ws_writer_queue_enabled=writer_queue_enabled,
+    )
+    dispatcher = _TelemetryDispatcher()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls: list[bool] = []
+
+    async def record(**kwargs: Any) -> bool:
+        calls.append(config.privacy.disable_network_observability)
+        if len(calls) == 1:
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    async def finish(socket: _HistoryWebSocket) -> None:
+        await asyncio.wait_for(first_started.wait(), 1)
+        await socket.wait_for_response("send")
+        assert not socket.has_response("record-a")
+        assert not socket.has_response("consent")
+        assert len(calls) == 1
+        assert config.privacy.disable_network_observability is False
+        release_first.set()
+        await socket.wait_for_response("record-b")
+        await socket.wait_for_response("consent")
+
+    frames = [
+        _CONNECT_FRAME,
+        _telemetry_frame("record-a", "telemetry.product_active.record"),
+        _consent_frame("consent", enabled=False),
+        _telemetry_frame("send", "sessions.send"),
+        _telemetry_frame("record-b", "telemetry.client_launch.record"),
+    ]
+    ws = _HistoryWebSocket(frames, dispatcher, after_frames=finish)
+    await asyncio.wait_for(handle_ws_connection(
+        ws, config, dispatcher=dispatcher,
+        turn_runner=SimpleNamespace(growth_event_sink=SimpleNamespace(
+            record_product_active=record, record_client_launch=record,
+        )),
+    ), 5)
+    assert calls == [False, True]
+    assert next(r for r in ws.responses() if r["id"] == "consent")["ok"] is True
+    assert [r["id"] for r in ws.responses()] == ["send", "record-a", "consent", "record-b"]
+
+
+@pytest.mark.parametrize("client_info,owner,expected", [
+    ({"id": "opensquilla-cli", "mode": "tui", "version": "test", "platform": "test"}, True, True),
+    ({"id": "opensquilla-cli", "mode": "tui", "version": "test", "platform": "test"}, False, False),
+    (None, True, False),
+    ({"id": "opensquilla-cli", "mode": "tui"}, True, False),
+    ({"id": "opensquilla-cli", "mode": "tui", "version": 1, "platform": "test"}, True, False),
+    ({"id": "other", "mode": "tui", "version": "test", "platform": "test"}, True, False),
+    ({"id": "opensquilla-cli", "mode": "cli", "version": "test", "platform": "test"}, True, False),
+    ([], True, False),
+])
+async def test_tui_handshake_classifies_first_send_with_reporting_disabled(
+    client_info: Any, owner: bool, expected: bool,
+) -> None:
+    from opensquilla.gateway.telemetry_connections import is_registered_tui_connection
+
+    observed: list[bool] = []
+    conn_id = ""
+
+    class Dispatcher:
+        def list_methods(self) -> list[str]:
+            return ["sessions.send"]
+
+        async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+            nonlocal conn_id
+            conn_id = ctx.conn_id
+            observed.append(is_registered_tui_connection(ctx.conn_id))
+            return make_ok_res(req_id, {"tui": observed[-1]})
+
+    class Socket(_HistoryWebSocket):
+        async def send_text(self, text: str) -> None:
+            frame = json.loads(text)
+            if frame.get("type") == "hello-ok":
+                assert is_registered_tui_connection(frame["server"]["conn_id"]) is expected
+            await super().send_text(text)
+
+    async def finish(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("send")
+
+    handshake = json.loads(_CONNECT_FRAME)
+    if client_info is not None:
+        handshake["params"]["client"] = client_info
+    dispatcher = Dispatcher()
+    ws = Socket([json.dumps(handshake), _telemetry_frame("send", "sessions.send")],
+                dispatcher, after_frames=finish)
+    if not owner:
+        ws.client = SimpleNamespace(host="192.168.1.2", port=12345)
+    await asyncio.wait_for(handle_ws_connection(
+        ws, GatewayConfig(privacy={"disable_network_observability": True}), dispatcher=dispatcher,
+    ), 5)
+    assert observed == [expected]
+    assert not is_registered_tui_connection(conn_id)
+
+
+async def test_disconnect_does_not_start_telemetry_waiting_for_queued_consent() -> None:
+    from opensquilla.gateway.websocket import WsConnection, _dispatch_telemetry_request
+
+    dispatcher = _TelemetryDispatcher()
+    ws = _HistoryWebSocket([], dispatcher)
+    conn = WsConnection(conn_id="telemetry-disconnected", ws=ws)
+    predecessor = asyncio.get_running_loop().create_future()
+    completion = asyncio.get_running_loop().create_future()
+    task = asyncio.create_task(_dispatch_telemetry_request(
+        (predecessor,), completion, conn, dispatcher, "record",
+        "telemetry.product_active.record", {"surface": "tui"}, None,
+    ))
+    await asyncio.sleep(0)
+    conn._closing = True
+    # Disconnect prevents a retired preference barrier from starting waiting work.
+    predecessor.set_result(None)
+    await asyncio.wait_for(task, 1)
+    assert completion.done()
+    assert dispatcher.connection is None
+    assert not ws.sent

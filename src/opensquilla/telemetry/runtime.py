@@ -11,9 +11,10 @@ import asyncio
 import logging
 import os
 import stat
+import threading
+from collections import deque
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from opensquilla.telemetry.desktop_turn_counts import record_desktop_turn
 from opensquilla.telemetry.device_identity import get_device_id
 from opensquilla.telemetry.outbox import OutboxPriority, TelemetryOutbox
 from opensquilla.telemetry.recorder import RecordResult, RecordStatus, TelemetryRecorder
+from opensquilla.telemetry.state_io import run_state_io
 from opensquilla.telemetry.uploader import TelemetryUploader
 
 log = logging.getLogger(__name__)
@@ -39,6 +41,17 @@ log = logging.getLogger(__name__)
 DEFAULT_TELEMETRY_V2_BASE_URL = "https://telemetry.opensquilla.ai"
 DEFAULT_UPLOAD_INTERVAL_SECONDS = 30.0
 SHUTDOWN_UPLOAD_TIMEOUT_SECONDS = 2.0
+BACKGROUND_RECORD_QUEUE_LIMIT = 256
+BACKGROUND_RECORD_BATCH_SIZE = 32
+BACKGROUND_RECORD_INTERVAL_SECONDS = 0.05
+
+
+@dataclass(frozen=True)
+class _PendingRecord:
+    event: StrictTelemetryModel
+    scope: TelemetryScope
+    priority: OutboxPriority
+    consent_revision: int
 
 
 @dataclass
@@ -85,6 +98,13 @@ class ScopedTelemetryRuntime:
         self._scopes: dict[TelemetryScope, _ScopeRuntime] = {}
         self._scope_locks = {scope: asyncio.Lock() for scope in TelemetryScope}
         self._record_tasks: set[asyncio.Task[object]] = set()
+        self._record_queue: deque[_PendingRecord] = deque()
+        self._record_queue_lock = threading.Lock()
+        self._record_drain_scheduled = False
+        self._record_drain_task: asyncio.Task[object] | None = None
+        self._record_flush = asyncio.Event()
+        self._device_id: str | None = None
+        self._device_identity_resolved = False
         self._upload_task: asyncio.Task[None] | None = None
         self._upload_stop = asyncio.Event()
         self._shutdown_deadline: float | None = None
@@ -102,13 +122,34 @@ class ScopedTelemetryRuntime:
         return frozenset(self._scopes)
 
     def device_id_for(self, scope: TelemetryScope) -> str | None:
-        """Read device identity only for a locally produced, allowed event."""
+        """Return cached identity without OS or filesystem work in observers."""
 
         if self._closed or not resolve_scope_consent(
             scope, config=self._config, env=self._env
         ).enqueue_allowed:
             return None
-        return get_device_id()
+        return self._device_id
+
+    async def prepare_device_identity(self, scope: TelemetryScope) -> str | None:
+        """Resolve an explicitly awaited startup observation outside the loop."""
+
+        if self._closed or not resolve_scope_consent(
+            scope, config=self._config, env=self._env,
+        ).enqueue_allowed:
+            return None
+        async with self._coordinator.authorized(
+            scope, checkpoint=ConsentCheckpoint.ENQUEUE,
+            notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE[scope.value],
+        ) as permit:
+            if permit is None:
+                return None
+            return await self._resolve_device_identity()
+
+    async def _resolve_device_identity(self) -> str | None:
+        if not self._device_identity_resolved:
+            self._device_id = await run_state_io(get_device_id)
+            self._device_identity_resolved = True
+        return self._device_id
 
     async def start(self) -> None:
         """Start the wake-up loop without creating files or making requests."""
@@ -117,9 +158,6 @@ class ScopedTelemetryRuntime:
         if self._closing or self._upload_stop.is_set():
             return
         self._bind_owner_loop()
-        await self._drain_desktop_spool()
-        if self._closing or self._closed or self._upload_stop.is_set():
-            return
         if self._upload_task is None or self._upload_task.done():
             if self._upload_task is not None and not self._upload_task.cancelled():
                 self._upload_task.exception()
@@ -151,20 +189,7 @@ class ScopedTelemetryRuntime:
             priority=priority,
             expected_consent_revision=expected_consent_revision,
         )
-        if (
-            result.status is RecordStatus.RECORDED
-            and getattr(event, "event_name", "") == "turn_result"
-        ):
-            try:
-                async with self._coordinator.authorized(
-                    scope,
-                    checkpoint=ConsentCheckpoint.ENQUEUE,
-                    notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE[scope.value],
-                ) as permit:
-                    if permit is not None:
-                        record_desktop_turn(self._state_dir, event)
-            except Exception:
-                log.debug("desktop turn counter checkpoint failed", exc_info=True)
+        await self._checkpoint_desktop_turns(scope, ((event, result),))
         return result
 
     def record_background(
@@ -173,35 +198,183 @@ class ScopedTelemetryRuntime:
         *,
         priority: OutboxPriority | int | None = None,
     ) -> None:
-        """Schedule a best-effort record without exposing failures to callers."""
+        """Admit optional work without creating one task or transaction per event.
+
+        Saturation drops observations before durable acceptance. Higher priority
+        observations may replace a lower priority queued observation; persisted
+        outbox records and direct ``record`` calls are unaffected.
+        """
 
         if self._closed or self._closing:
             return
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
-            owner_loop = self._owner_loop
-            if owner_loop is not None and owner_loop.is_running():
-                owner_loop.call_soon_threadsafe(
-                    partial(self.record_background, event, priority=priority),
-                )
+            running_loop = None
+        owner_loop = self._owner_loop or running_loop
+        if owner_loop is None or not owner_loop.is_running():
             return
-        if self._owner_loop is not None and running_loop is not self._owner_loop:
-            if self._owner_loop.is_running():
-                self._owner_loop.call_soon_threadsafe(
-                    partial(self.record_background, event, priority=priority),
-                )
-            return
-        self._owner_loop = running_loop
         try:
-            task = running_loop.create_task(
-                self._record_safely(event, priority=priority),
-                name=f"telemetry-record-{getattr(event, 'event_name', 'event')}",
+            scope = TelemetryScope(str(getattr(event, "consent_scope", "")))
+            pending = _PendingRecord(
+                event, scope, _background_priority(event, priority),
+                self._coordinator.revision(scope),
             )
-        except RuntimeError:
+        except (TypeError, ValueError):
             return
+        self._owner_loop = owner_loop
+        with self._record_queue_lock:
+            if self._closed or self._closing:
+                return
+            if len(self._record_queue) >= BACKGROUND_RECORD_QUEUE_LIMIT:
+                lowest = min(self._record_queue, key=lambda item: item.priority)
+                if pending.priority <= lowest.priority:
+                    return
+                self._record_queue.remove(lowest)
+            self._record_queue.append(pending)
+            if self._record_drain_scheduled:
+                if (
+                    running_loop is owner_loop
+                    and len(self._record_queue) >= BACKGROUND_RECORD_BATCH_SIZE
+                ):
+                    self._record_flush.set()
+                return
+            self._record_drain_scheduled = True
+        if running_loop is owner_loop:
+            self._ensure_record_drain()
+        else:
+            try:
+                owner_loop.call_soon_threadsafe(self._ensure_record_drain)
+            except RuntimeError:
+                with self._record_queue_lock:
+                    self._record_queue.clear()
+                    self._record_drain_scheduled = False
+
+    def _ensure_record_drain(self) -> None:
+        if self._closed:
+            return
+        if self._record_drain_task is not None and not self._record_drain_task.done():
+            return
+        task = asyncio.create_task(
+            self._drain_background_records(), name="telemetry-record-drain",
+        )
+        self._record_drain_task = task
         self._record_tasks.add(task)
         task.add_done_callback(self._record_tasks.discard)
+
+    async def _drain_background_records(self) -> None:
+        while True:
+            with self._record_queue_lock:
+                queue_size = len(self._record_queue)
+            if 0 < queue_size < BACKGROUND_RECORD_BATCH_SIZE and not self._closing:
+                try:
+                    await asyncio.wait_for(
+                        self._record_flush.wait(), timeout=BACKGROUND_RECORD_INTERVAL_SECONDS,
+                    )
+                except TimeoutError:
+                    pass
+            self._record_flush.clear()
+            with self._record_queue_lock:
+                batch = tuple(
+                    self._record_queue.popleft()
+                    for _ in range(min(len(self._record_queue), BACKGROUND_RECORD_BATCH_SIZE))
+                )
+                if not batch:
+                    self._record_drain_scheduled = False
+                    return
+            groups: dict[tuple[TelemetryScope, int], list[_PendingRecord]] = {}
+            for pending in batch:
+                groups.setdefault((pending.scope, pending.consent_revision), []).append(pending)
+            recorded = False
+            for group in groups.values():
+                recorded = await self._record_batch_safely(group) or recorded
+            if (
+                recorded and not self._closing
+                and (self._upload_task is None or self._upload_task.done())
+            ):
+                try:
+                    await self.start()
+                except Exception:
+                    log.debug("statistics upload loop start failed", exc_info=True)
+            # Let application callbacks run between bounded persistence groups.
+            await asyncio.sleep(0)
+
+    async def _record_batch_safely(self, batch: list[_PendingRecord]) -> bool:
+        scope = batch[0].scope
+        try:
+            batch = await self._prepare_background_identity(batch)
+            if len(batch) == 1:
+                return await self._record_safely(batch[0])
+            scoped = await self._scope_runtime(scope)
+            if scoped is None:
+                return False
+            results = await scoped.recorder.record_many(
+                [(pending.event, pending.priority) for pending in batch],
+                expected_consent_revision=batch[0].consent_revision,
+            )
+            await self._checkpoint_desktop_turns(
+                scope, tuple((pending.event, result) for pending, result in zip(batch, results)),
+            )
+            return any(_record_was_accepted(result) for result in results)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A malformed or conflicting optional event must not lose its peers.
+            log.debug("statistics batch record failed", exc_info=True)
+            recorded = False
+            for pending in batch:
+                recorded = await self._record_safely(pending) or recorded
+            return recorded
+
+    async def _prepare_background_identity(
+        self, batch: list[_PendingRecord],
+    ) -> list[_PendingRecord]:
+        async with self._coordinator.authorized(
+            batch[0].scope,
+            checkpoint=ConsentCheckpoint.ENQUEUE,
+            notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE[batch[0].scope.value],
+        ) as permit:
+            if permit is None or permit.revision != batch[0].consent_revision:
+                return batch
+            await self._resolve_device_identity()
+            if self._device_id is None:
+                return batch
+            return [
+                _PendingRecord(
+                    pending.event.model_copy(update={"device_id": self._device_id}),
+                    pending.scope, pending.priority, pending.consent_revision,
+                ) if getattr(pending.event, "device_id", None) is None else pending
+                for pending in batch
+            ]
+
+    async def _checkpoint_desktop_turns(
+        self,
+        scope: TelemetryScope,
+        records: tuple[tuple[StrictTelemetryModel, RecordResult], ...],
+    ) -> None:
+        turns = tuple(event for event, result in records if (
+            result.status is RecordStatus.RECORDED
+            and getattr(event, "event_name", "") == "turn_result"
+        ))
+        if not turns:
+            return
+        try:
+            async with self._coordinator.authorized(
+                scope,
+                checkpoint=ConsentCheckpoint.ENQUEUE,
+                notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE[scope.value],
+            ) as permit:
+                if permit is not None:
+                    def checkpoint() -> None:
+                        for event in turns:
+                            try:
+                                record_desktop_turn(self._state_dir, event)
+                            except Exception:
+                                log.debug("desktop turn counter checkpoint failed", exc_info=True)
+
+                    await run_state_io(checkpoint)
+        except Exception:
+            log.debug("desktop turn counter checkpoint failed", exc_info=True)
 
     async def recover_contract_rejection_once(
         self,
@@ -257,6 +430,7 @@ class ScopedTelemetryRuntime:
         if self._closed or self._closing:
             return
         self._closing = True
+        self._record_flush.set()
         self.prepare_shutdown()
         upload_task = self._upload_task
         self._upload_task = None
@@ -271,6 +445,11 @@ class ScopedTelemetryRuntime:
                 upload_task.cancel()
             if upload_guard is not None:
                 upload_guard.cancel()
+        # A worker may have admitted records before its wake-up callback runs.
+        with self._record_queue_lock:
+            queued = bool(self._record_queue)
+        if queued:
+            self._ensure_record_drain()
         pending = asyncio.gather(*tuple(self._record_tasks), return_exceptions=True)
         try:
             # A send holds the scope's consent lock, which pending records also
@@ -373,24 +552,18 @@ class ScopedTelemetryRuntime:
                         await _ignore_close(outbox.close())
                     return None
 
-    async def _record_safely(
-        self,
-        event: StrictTelemetryModel,
-        *,
-        priority: OutboxPriority | int | None,
-    ) -> None:
+    async def _record_safely(self, pending: _PendingRecord) -> bool:
         try:
-            result = await self.record(event, priority=priority)
-            if not self._closing and result.status in {
-                RecordStatus.RECORDED,
-                RecordStatus.DUPLICATE,
-                RecordStatus.EVICTED,
-            }:
-                await self.start()
+            result = await self.record(
+                pending.event, priority=pending.priority,
+                expected_consent_revision=pending.consent_revision,
+            )
+            return _record_was_accepted(result)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.debug("statistics event record failed", exc_info=True)
+            return False
 
     async def _run_upload_cycle(self) -> None:
         await self._drain_desktop_spool()
@@ -414,22 +587,28 @@ class ScopedTelemetryRuntime:
         """Import Electron events without opening an unconsented scope."""
 
         root = desktop_early_spool_root(self._state_dir)
-        try:
-            root_metadata = root.lstat()
-        except OSError:
-            return
-        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
-            return
+
+        def existing_spool_scopes() -> list[TelemetryScope]:
+            try:
+                root_metadata = root.lstat()
+            except OSError:
+                return []
+            if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+                return []
+            scopes = []
+            for scope in TelemetryScope:
+                try:
+                    scope_metadata = (root / scope.value).lstat()
+                except OSError:
+                    continue
+                if stat.S_ISDIR(scope_metadata.st_mode) and not stat.S_ISLNK(
+                    scope_metadata.st_mode
+                ):
+                    scopes.append(scope)
+            return scopes
 
         recorders: dict[TelemetryScope, TelemetryRecorder] = {}
-        for scope in TelemetryScope:
-            scope_directory = root / scope.value
-            try:
-                scope_metadata = scope_directory.lstat()
-            except OSError:
-                continue
-            if stat.S_ISLNK(scope_metadata.st_mode) or not stat.S_ISDIR(scope_metadata.st_mode):
-                continue
+        for scope in await run_state_io(existing_spool_scopes):
             try:
                 if not resolve_scope_consent(
                     scope,
@@ -476,6 +655,24 @@ async def _ignore_close(operation: Coroutine[Any, Any, object]) -> None:
         await operation
     except Exception:
         pass
+
+
+def _record_was_accepted(result: RecordResult) -> bool:
+    return result.status in {RecordStatus.RECORDED, RecordStatus.DUPLICATE, RecordStatus.EVICTED}
+
+
+def _background_priority(
+    event: StrictTelemetryModel, priority: OutboxPriority | int | None,
+) -> OutboxPriority:
+    if priority is not None:
+        return OutboxPriority(priority)
+    if getattr(event, "event_name", None) == "app_crash_detected":
+        return OutboxPriority.CRITICAL
+    if getattr(event, "outcome", None) in {"fail", "timeout"}:
+        return OutboxPriority.HIGH
+    if getattr(event, "event_name", None) == "performance_summary":
+        return OutboxPriority.LOW
+    return OutboxPriority.NORMAL
 
 
 __all__ = [

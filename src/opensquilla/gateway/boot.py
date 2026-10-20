@@ -769,9 +769,20 @@ class ServiceContainer:
         daily_usage_task = self.daily_usage_telemetry_task
         self.daily_usage_telemetry_task = None
         if daily_usage_task is not None:
+            from opensquilla.observability.usage_telemetry import STANDALONE_CLOSE_TIMEOUT_SECONDS
+
             daily_usage_task.cancel()
+            daily_usage_task.add_done_callback(
+                lambda task: None if task.cancelled() else task.exception()
+            )
             try:
-                await daily_usage_task
+                done, _ = await asyncio.wait(
+                    {daily_usage_task}, timeout=STANDALONE_CLOSE_TIMEOUT_SECONDS,
+                )
+                if done:
+                    daily_usage_task.result()
+                else:
+                    log.debug("gateway.usage_telemetry_close_incomplete")
             except asyncio.CancelledError:
                 pass
             except Exception:
@@ -4428,16 +4439,19 @@ async def build_services(
         sandbox_setup_task=sandbox_setup_task,
         sandbox_upgrade_report=sandbox_upgrade_report,
     )
-    if start_standalone_telemetry:
-        try:
-            from opensquilla.observability.usage_telemetry import StandaloneUsageTelemetry
+    try:
+        from opensquilla.observability.usage_telemetry import StandaloneUsageTelemetry
 
-            svc.standalone_usage_telemetry = StandaloneUsageTelemetry(
-                config=config, legacy_storage=get_session_storage(session_manager),
-            )
+        # Every runtime owns a local counter buffer. Network workers still
+        # follow the standalone opt-in or listening Gateway readiness edge.
+        svc.standalone_usage_telemetry = StandaloneUsageTelemetry(
+            config=config, legacy_storage=get_session_storage(session_manager),
+            upload_on_close=start_standalone_telemetry,
+        )
+        if start_standalone_telemetry:
             svc.standalone_usage_telemetry.start()
-        except Exception:
-            log.debug("build_services.standalone_usage_telemetry_unavailable", exc_info=True)
+    except Exception:
+        log.debug("build_services.standalone_usage_telemetry_unavailable", exc_info=True)
     if skill_loader is not None:
         try:
             from opensquilla.skills.watcher import SkillCatalogWatcher
@@ -5749,7 +5763,10 @@ async def start_gateway_server(
             )
 
             daily_usage_storage = get_session_storage(svc.session_manager)
-            if daily_usage_storage is not None:
+            daily_usage_sink = svc.standalone_usage_telemetry
+            if daily_usage_sink is not None:
+                daily_usage_sink.enable_uploads()
+            if daily_usage_storage is not None or daily_usage_sink is not None:
                 svc.daily_usage_telemetry_task = create_background_task(
                     run_daily_usage_upload_loop(daily_usage_storage, config=config)
                 )

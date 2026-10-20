@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import sys
@@ -76,15 +77,25 @@ def test_standalone_session_context_mirrors_state_to_legacy_scope() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("activity_blocks", [False, True])
 async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
     monkeypatch: pytest.MonkeyPatch,
+    activity_blocks: bool,
 ) -> None:
     from opensquilla.cli.repl import standalone_runtime
 
     activity: list[dict[str, Any]] = []
+    activity_entered = asyncio.Event()
+    activity_cancelled = asyncio.Event()
 
     async def record_active(**kwargs: Any) -> bool:
         activity.append(kwargs)
+        if activity_blocks:
+            activity_entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                activity_cancelled.set()
         return True
 
     class _FakeSessionManager:
@@ -155,7 +166,11 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
         scope["pending_input_provider"] = pending_provider
 
         await on_surface_ready()
-        await on_user_activity()
+        if activity_blocks:
+            await asyncio.wait_for(activity_entered.wait(), timeout=2)
+        else:
+            await asyncio.sleep(0)
+            await on_user_activity()
         assert await dispatch("hello") is True
 
         captured["scope_after_message"] = dict(scope)
@@ -176,12 +191,12 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
         get_tui_output=lambda _scope: output,
     )
 
-    await standalone_runtime.run_standalone_chat(
+    await asyncio.wait_for(standalone_runtime.run_standalone_chat(
         model="openrouter/test",
         session_id="agent:main:standalone:test",
         deps=deps,
         timeout=7.25,
-    )
+    ), timeout=2)
 
     assert captured["surface"] is Surface.CLI_STANDALONE
     assert captured["initial_scope"]["session_key"] == "agent:main:standalone:test"
@@ -198,7 +213,8 @@ async def test_standalone_runtime_mirrors_turn_model_update_to_legacy_scope(
     assert captured["state_after_message"].model == "standalone/after"
     assert captured["state_after_message"].usage.input_tokens == 5
     assert captured["state_after_message"].usage.output_tokens == 8
-    assert activity == [{"surface": "tui"}, {"surface": "tui"}]
+    assert activity == [{"surface": "tui"}] * (1 if activity_blocks else 2)
+    assert activity_cancelled.is_set() is activity_blocks
 
 
 @pytest.mark.asyncio

@@ -90,6 +90,47 @@ The local daily ledger is persisted before enqueue; retries retain `event_id`
 and occurrence time. It uses the existing unified reporting control and CI /
 `DO_NOT_TRACK` vetoes, with no new prompt or statistics preference.
 
+## Client execution and storage
+
+Agent and TUI input processing do not wait for telemetry delivery. Runtime
+observations enter a bounded memory queue with one background consumer. The
+queue holds at most 256 observations and commits up to 32 events in one SQLite
+transaction, coalescing small bursts for up to 50 milliseconds. Saturation may
+discard observations before durable acceptance, preferring higher-priority
+events. Existing durable records and explicit awaited recording retain their
+receipt and retry semantics.
+
+Gateway recording requests and reporting preference changes use a separate,
+bounded telemetry lane. Their responses still reflect completed operations,
+and their connection-local ordering is preserved without holding up Agent
+requests. TUI connections identify their surface in the existing authenticated
+handshake, so the first turn does not depend on a launch observation finishing.
+Older clients retain launch-based registration.
+
+Growth state transactions run outside the application event loop. Busy state
+locks are skipped rather than waited on, and later activity or retained pending
+records can retry. A successful activity observation is cached for its surface
+and UTC day; repeated observations do not reopen its state or enqueue another
+database record. Reporting preference revisions invalidate that cache.
+CLI launch and activity observations, pending Growth recovery, and Desktop spool
+recovery run in background tasks rather than delaying Agent startup.
+Desktop spool discovery, file reads, and claim cleanup also run outside the
+application event loop, while consent checks and recording retain their owners.
+
+Daily turn and token counters accumulate in memory and flush together to the
+counts-only sidecar every five seconds. They do not add a telemetry write to the
+conversation database for each turn. Shutdown flushes admitted counters; an
+abrupt process termination can lose counters and observations still in memory.
+Each UTC day is finalized 60 seconds after midnight. Upload snapshots wait for
+earlier counter transactions, and buffered additions still uncommitted after
+that boundary expire. This keeps a shared database's retry-stable daily payload
+unchanged when several clients run together. A suspended process or persistently
+unavailable database can therefore lose expired, uncommitted counters.
+Uploads of durable daily counters run independently of buffered counter flushes;
+an unavailable sidecar does not prevent healthy legacy counters from uploading.
+The memory bounds and batching do not change existing database schemas, event
+schemas, legacy upload identities, or network reporting controls.
+
 ## Source CLI reporting lifecycle
 
 Local owner connections to a loopback Gateway can record content-free TUI
@@ -104,7 +145,8 @@ this event to the Desktop lifecycle observer, avoiding duplicate startup counts.
 
 Short CLI processes make a bounded final v2 upload attempt after event producers
 finish. Unacknowledged events remain in the persistent queue for a later run.
-Offline shutdown therefore does not discard accepted events or wait indefinitely.
+Offline shutdown retains durable, unacknowledged events. Its network deadline
+does not include the time needed to finish local writes already in progress.
 
 V1 installation/version and daily usage reporting also run for user-invoked
 `agent` and `chat --standalone` processes. Standalone daily counters live in a
@@ -112,11 +154,13 @@ dedicated counts-only database, independently of `--session-db-path` and
 temporary conversations. A later standalone process or listening Gateway can
 upload these counters. Existing Gateway and explicitly persisted CLI usage
 buckets retain their identities and acknowledgement state; new standalone turns
-are recorded only in the dedicated store. Counts lost by older in-memory clients
+are recorded only in the dedicated store. New Gateway counters use that store
+as well, while old conversation-database counters remain eligible for upload.
+Counts lost by older in-memory clients
 cannot be reconstructed.
 
 Daily usage uploads include only completed UTC days. The current day's counters
-are durable locally and become eligible after midnight UTC.
+are periodically persisted locally and become eligible after midnight UTC.
 The existing reporting preference and environment vetoes apply at collection
 and upload boundaries for both versions.
 

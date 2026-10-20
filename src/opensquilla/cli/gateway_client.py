@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import json
 import math
+import sys
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla import __version__
 from opensquilla.compaction_timing import DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
 from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
 from opensquilla.contracts.adapters.sessions_resolve_contract import call_sessions_resolve
@@ -479,6 +481,12 @@ class GatewayClient:
         }
         if self.structured_user_input:
             params["caps"].append(STRUCTURED_USER_INPUT_CAPABILITY)
+            params["client"] = {
+                "id": "opensquilla-cli",
+                "version": __version__,
+                "platform": sys.platform,
+                "mode": "tui",
+            }
         if token:
             params["auth"] = {"token": token}
         await self._ws.send(

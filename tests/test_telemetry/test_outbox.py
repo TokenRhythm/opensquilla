@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,6 +121,27 @@ async def test_scopes_use_distinct_wal_databases_and_busy_timeout(tmp_path: Path
         await growth.close()
 
 
+async def test_outbox_filesystem_preparation_runs_outside_application_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.telemetry import outbox as outbox_module
+
+    threads = []
+    restrict = outbox_module._restrict_permissions
+
+    def capture_permissions(path, mode):
+        threads.append(threading.get_ident())
+        restrict(path, mode)
+
+    monkeypatch.setattr(outbox_module, "_restrict_permissions", capture_permissions)
+    outbox = await _open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        assert len(threads) == 2
+        assert threading.get_ident() not in threads
+    finally:
+        await outbox.close()
+
+
 async def test_enqueue_persists_only_revalidated_canonical_scope_payload(tmp_path: Path) -> None:
     outbox = await _open(tmp_path, TelemetryScope.RELIABILITY)
     event = _turn_event()
@@ -158,6 +180,54 @@ async def test_duplicate_is_idempotent_but_changed_payload_conflicts(tmp_path: P
 
         with pytest.raises(OutboxEventConflictError):
             await outbox.enqueue(_turn_event(1, duration_ms=121))
+    finally:
+        await outbox.close()
+
+
+async def test_enqueue_many_commits_once_and_applies_priority_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outbox = await _open(
+        tmp_path, TelemetryScope.RELIABILITY, limits=OutboxLimits(max_events=2),
+    )
+    commits = 0
+    commit = outbox._connection.commit
+
+    async def counted_commit():
+        nonlocal commits
+        commits += 1
+        await commit()
+
+    monkeypatch.setattr(outbox._connection, "commit", counted_commit)
+    try:
+        assert await outbox.enqueue_many([
+            (_turn_event(1), OutboxPriority.NORMAL),
+            (_turn_event(2), OutboxPriority.LOW),
+            (_turn_event(3), OutboxPriority.HIGH),
+        ]) == (EnqueueResult.ENQUEUED, EnqueueResult.EVICTED, EnqueueResult.ENQUEUED)
+        assert commits == 1
+        batch = await outbox.claim_batch()
+        assert batch is not None
+        assert {event.event_id for event in batch.events} == {_uuid(1), _uuid(3)}
+    finally:
+        await outbox.close()
+
+
+async def test_enqueue_many_conflict_rolls_back_peers_and_duplicates_remain_idempotent(
+    tmp_path: Path,
+) -> None:
+    outbox = await _open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        await outbox.enqueue(_turn_event(1))
+        with pytest.raises(OutboxEventConflictError):
+            await outbox.enqueue_many([
+                (_turn_event(2), None), (_turn_event(1, duration_ms=121), None),
+            ])
+        assert (await outbox.stats()).pending_events == 1
+        assert await outbox.enqueue_many([
+            (_turn_event(1), None), (_turn_event(2), None), (_turn_event(2), None),
+        ]) == (EnqueueResult.DUPLICATE, EnqueueResult.ENQUEUED, EnqueueResult.DUPLICATE)
+        assert (await outbox.stats()).pending_events == 2
     finally:
         await outbox.close()
 
