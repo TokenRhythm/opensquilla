@@ -559,29 +559,63 @@ test('finishes a progressing 48 second transfer with its original sync revision'
 
 test('reconnects through modern resume while preserving the draft and sends it exactly once', async ({ page }) => {
   const gateway = await prepare(page, 'healthy')
-  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
-  await expect.poll(() => calls(gateway.requests, RESUME, 1).length).toBe(1)
-  const input = page.locator('.chat-textarea')
-  await input.fill(DRAFT)
-  const send = page.locator('.chat-send-btn[aria-label="Send"]')
-  await expect(send).toBeEnabled()
-  const originalUrl = page.url()
-  const firstRevision = calls(gateway.requests, READ, 1)[0]!.params.sync_revision
-  expect(JSON.stringify(calls(gateway.requests, 'connect')[0]!.params)).toContain('transport.recovery.v1')
-  gateway.sockets[0]!.close({ code: 1012, reason: 'synthetic restart' })
-  await advance(page, 2_000)
-  await expect.poll(() => calls(gateway.requests, RESUME, 2).length).toBe(1)
-  await expect(send).toBeEnabled()
-  await expectComposerValue(input, DRAFT)
-  expect(page.url()).toBe(originalUrl)
-  expect(calls(gateway.requests, READ, 2)[0]!.params.sync_revision).not.toBe(firstRevision)
-  expect(calls(gateway.requests, RELEASE, 2).some(item => item.params.sync_revision === firstRevision)).toBe(false)
-  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
-  await input.press('Enter')
-  await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
-  expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
-  await expectComposerValue(input, '')
-  await advance(page, 10_000)
-  expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
-  expect(gateway.sockets).toHaveLength(2)
+  // Delivery identity is initialized beside transport startup. Hold its real
+  // origin lock so the first identity deterministically binds after live
+  // readiness, which must retire the provisional lease and install a new one.
+  await page.addInitScript(() => {
+    const ready = new Promise<void>(resolve => {
+      Object.assign(window, { releaseModernRecoveryIdentity: resolve })
+    })
+    void navigator.locks.request('opensquilla.deliverySalt.v1', () => ready)
+  })
+  const releaseIdentity = () => page.evaluate(() => {
+    (window as unknown as { releaseModernRecoveryIdentity?: () => void })
+      .releaseModernRecoveryIdentity?.()
+  })
+  try {
+    await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+    await expect.poll(() => calls(gateway.requests, RESUME, 1).length).toBe(1)
+    const input = page.locator('.chat-textarea')
+    await input.fill(DRAFT)
+    const send = page.locator('.chat-send-btn[aria-label="Send"]')
+    await expect(send).toBeEnabled()
+    const provisionalRevision = calls(gateway.requests, READ, 1)[0]!.params.sync_revision
+    await releaseIdentity()
+    await expect.poll(() => calls(gateway.requests, RESUME, 1).length).toBe(2)
+    const initialReads = calls(gateway.requests, READ, 1)
+    expect(initialReads).toHaveLength(2)
+    const firstRevision = initialReads[1]!.params.sync_revision
+    expect(firstRevision).not.toBe(provisionalRevision)
+    expect(calls(gateway.requests, RESUME, 1).map(item => item.params.sync_revision))
+      .toEqual([provisionalRevision, firstRevision])
+    expect(calls(gateway.requests, RELEASE, 1).map(item => item.params.sync_revision))
+      .toEqual([provisionalRevision])
+    await expect(send).toBeEnabled()
+    const originalUrl = page.url()
+    expect(JSON.stringify(calls(gateway.requests, 'connect')[0]!.params)).toContain('transport.recovery.v1')
+    gateway.sockets[0]!.close({ code: 1012, reason: 'synthetic restart' })
+    await advance(page, 2_000)
+    await expect.poll(() => calls(gateway.requests, RESUME, 2).length).toBe(1)
+    await expect(send).toBeEnabled()
+    await expectComposerValue(input, DRAFT)
+    expect(page.url()).toBe(originalUrl)
+    const reconnectedReads = calls(gateway.requests, READ, 2)
+    expect(reconnectedReads).toHaveLength(1)
+    const reconnectedRevision = reconnectedReads[0]!.params.sync_revision
+    expect(reconnectedRevision).not.toBe(firstRevision)
+    expect(calls(gateway.requests, RESUME, 2)[0]!.params).toMatchObject({
+      key: SESSION, sync_revision: reconnectedRevision, stream_generation: GENERATION, stream_seq: 0,
+    })
+    expect(calls(gateway.requests, RELEASE, 2).some(item => item.params.sync_revision === firstRevision)).toBe(false)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+    await input.press('Enter')
+    await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+    expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
+    await expectComposerValue(input, '')
+    await advance(page, 10_000)
+    expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+    expect(gateway.sockets).toHaveLength(2)
+  } finally {
+    if (!page.isClosed()) await releaseIdentity()
+  }
 })
