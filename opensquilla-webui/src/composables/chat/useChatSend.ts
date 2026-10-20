@@ -273,7 +273,7 @@ interface DispatchSendOptions {
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
   preDispatchGuard?: (stage: 'preflight' | 'before_rpc') => boolean
   /** Queue permission remains revocable while the durable owner prepares admission. */
-  beforeDispatch?: () => boolean
+  beforeDispatch?: (clientRequestId: string) => boolean
   onAccepted?: () => void
   onDeliveryAccepted?: () => void
   /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
@@ -786,7 +786,9 @@ export function useChatSend(options: UseChatSendOptions) {
     if (options.durableStopPending) options.durableStopPending.value = pending
   }, { immediate: true })
 
-  const acceptanceRecoveryPendingForCurrentSession: ComputedRef<boolean> = computed(() => {
+  function hasAcceptanceRecoveryPending(ownSubmittingRequestId?: string): boolean {
+    // First admission publishes submitting before its final guard. Exclude only
+    // that caller's request; its Stop and every unknown remain blocking.
     // Depend on an explicit version because the attempt registry is purposely
     // non-reactive and must remain request-owned across route switches.
     acceptanceRecoveryVersion.value
@@ -794,13 +796,15 @@ export function useChatSend(options: UseChatSendOptions) {
     const key = options.sessionKey.value
     if (!identity || !key) return false
     if (currentSessionDeliveries.value.some(item => (
-      item.phase === 'unknown' || item.phase === 'submitting' || item.stopPending
+      item.phase === 'unknown' || item.stopPending
+      || (item.phase === 'submitting' && item.id !== ownSubmittingRequestId)
     ))) return true
     for (const attempt of stoppedAcceptanceAttempts.values()) {
       if (attempt.deliveryIdentity === identity && attempt.requestSessionKey === key && attempt.stopRequested) return true
     }
     return false
-  })
+  }
+  const acceptanceRecoveryPendingForCurrentSession: ComputedRef<boolean> = computed(() => hasAcceptanceRecoveryPending())
   watch(acceptanceRecoveryPendingForCurrentSession, (pending) => {
     if (options.acceptanceRecoveryPending) {
       options.acceptanceRecoveryPending.value = pending
@@ -2519,7 +2523,7 @@ export function useChatSend(options: UseChatSendOptions) {
     onDeliveryAccepted?: () => void
     preflightGuard?: () => boolean
     /** Additional scope check that remains valid after the sender consumes the composer. */
-    preDispatchGuard?: () => boolean
+    preDispatchGuard?: (ownSubmittingRequestId?: string) => boolean
   }
 
   function currentExactReplayAttempt(): SendAttempt | null {
@@ -2968,7 +2972,7 @@ export function useChatSend(options: UseChatSendOptions) {
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
       preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
-      beforeDispatch: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false
+      beforeDispatch: ownSubmittingRequestId => deliveryStillMatches() && invocation.preDispatchGuard?.(ownSubmittingRequestId) !== false
         && closedAdmissionsStillAllowSend(),
       onAccepted,
       onDeliveryAccepted: invocation.onDeliveryAccepted,
@@ -3717,9 +3721,9 @@ export function useChatSend(options: UseChatSendOptions) {
         res = receipt.response
       } else res = await options.turnCommands.send(acceptanceRequest, {
         beforeDispatch: attempt.params.turnCommand
-          ? () => sendOpts.beforeDispatch?.() !== false
+          ? () => sendOpts.beforeDispatch?.(attempt.clientRequestId) !== false
             && options.resolveTurnCommand?.('/init')?.name === attempt.params.turnCommand?.name
-          : sendOpts.beforeDispatch,
+          : sendOpts.beforeDispatch ? () => sendOpts.beforeDispatch!(attempt.clientRequestId) : undefined,
       })
       if (disposed) return 'accepted'
       if (attempt.detachedFromComposer) {
@@ -4543,6 +4547,7 @@ export function useChatSend(options: UseChatSendOptions) {
     recoverResponseHandoffs,
     sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,
+    hasAcceptanceRecoveryPending,
     acceptanceStopAvailableForCurrentSession,
     durableStopPendingForCurrentSession,
   }

@@ -72,6 +72,72 @@ const closureAnnotation: PromptAnnotationSnapshot = {
   tagName: 'h1', quote: 'Heading', sentOrder: 0,
 }
 
+describe('automatic prefill admission through the real durable owner', () => {
+  it('ignores only its own published submitting row at the final guard', async () => {
+    const h = queuedSendHarness()
+    const checkedIds: Array<string | undefined> = []
+    const current = (id?: string) => {
+      checkedIds.push(id)
+      if (id) {
+        expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+        expect(h.options.durableDelivery.snapshots()).toContainEqual(expect.objectContaining({
+          id, phase: 'submitting', stopPending: false,
+        }))
+      }
+      return !h.api.hasAcceptanceRecoveryPending(id)
+    }
+    await h.api.onSend({
+      cancelIfComposerChanged: true, preflightGuard: () => current(), preDispatchGuard: current,
+    })
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    const request = h.commands.send.mock.calls[0]![0]
+    expect(checkedIds).toContain(request.params.clientRequestId)
+    expect((await h.options.durableDelivery.get(request.params.clientRequestId!))?.phase).toBe('accepted')
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+  })
+
+  it.each(['unknown', 'submitting', 'stop', 'identity'] as const)(
+    'revokes prefill when another %s appears during WAL preparation', async kind => {
+      const wal = memoryDeliveryWal()
+      const prepare = wal.prepareDelivery!
+      let reached = false
+      let release!: () => void
+      const barrier = new Promise<void>(resolve => { release = resolve })
+      wal.prepareDelivery = async (record, owner) => {
+        if (record.ownerRequestId !== 'other-request') { reached = true; await barrier }
+        return prepare(record, owner)
+      }
+      const deliveryIdentity = ref('synthetic-identity')
+      const h = queuedSendHarness({ pendingInputWal: wal, deliveryIdentity })
+      const identity = h.options.deliveryIdentity.value
+      const current = (id?: string) => h.options.deliveryIdentity.value === identity
+        && !h.api.hasAcceptanceRecoveryPending(id)
+      const sending = h.api.onSend({ preflightGuard: () => current(), preDispatchGuard: current })
+      await vi.waitFor(() => expect(reached).toBe(true))
+      if (kind === 'identity') deliveryIdentity.value = 'replacement-identity'
+      else {
+        const now = Date.now()
+        await prepare({
+          schemaVersion: 2, ownerRequestId: 'other-request', deliveryIdentity: identity!,
+          requestSessionKey: h.scope.sessionKey,
+          request: { kind: 'send', request: { kind: 'new-turn', params: {
+            sessionKey: h.scope.sessionKey, message: 'Another request', clientRequestId: 'other-request',
+          } } },
+          phase: kind === 'stop' ? 'accepted' : kind,
+          ...(kind === 'stop' ? { stop: { requested: true as const } } : {}),
+          revision: 1, createdAt: now, updatedAt: now,
+          lease: { owner: 'other-tab', epoch: 1, expiresAt: now + 60_000 },
+        })
+        await h.options.durableDelivery.wake()
+        expect(h.api.hasAcceptanceRecoveryPending('other-request')).toBe(kind !== 'submitting')
+      }
+      release()
+      await sending
+      expect(h.commands.send).not.toHaveBeenCalled()
+    },
+  )
+})
+
 describe('fenced delivery draft recovery', () => {
   it.each(['retired', 'accepted-unavailable', 'text', 'provider activity', 'bound history', 'later content'] as const)(
     'cleans only its retired local admission placeholder: %s', async (scenario) => {
