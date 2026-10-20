@@ -24,6 +24,7 @@ from opensquilla.artifacts import (
 )
 from opensquilla.gateway.artifacts import register_artifact_routes
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 
@@ -53,6 +54,7 @@ async def artifact_editing_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         state_dir=str(tmp_path / "state"),
         workspace_dir=str(tmp_path / "workspace"),
         config_path=None,
+        sandbox=SandboxSettings(),
     )
     ctx = RpcContext(
         conn_id="artifact-editing-test",

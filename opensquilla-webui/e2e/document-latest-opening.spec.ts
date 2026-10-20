@@ -19,6 +19,9 @@ const mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.doc
 const titles = new WeakMap<Page, { original: string; edited: string }>()
 
 function firstParagraph(bytes: Buffer): string {
+  const entities: Record<string, string> = {
+    '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'",
+  }
   // Read the frozen file independently of the production Office parser. The
   // live fixture may be edited while a developer runs these acceptance tests.
   const end = bytes.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]))
@@ -34,8 +37,7 @@ function firstParagraph(bytes: Buffer): string {
       const xml = (bytes.readUInt16LE(offset + 10) === 8 ? inflateRawSync(payload) : payload).toString()
       for (const match of xml.matchAll(/<w:p(?:\s[^>]*|)>([\s\S]*?)<\/w:p>/g)) {
         const text = [...match[1]!.matchAll(/<w:t(?:\s[^>]*|)>([\s\S]*?)<\/w:t>/g)].map(item => item[1]).join('')
-        if (text) return text.replaceAll('&amp;', '&').replaceAll('&lt;', '<').replaceAll('&gt;', '>')
-          .replaceAll('&quot;', '"').replaceAll('&apos;', "'")
+        if (text) return text.replace(/&(?:amp|lt|gt|quot|apos);/g, entity => entities[entity]!)
       }
     }
     offset += 46 + nameLength + extraLength + commentLength

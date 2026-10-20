@@ -80,13 +80,19 @@ try {
         check(shown.ok, shown.message || 'show failed')
         const overlay = manager.annotationOverlays.get(owner)
         await wait(() => overlay.view.getVisible(), 'editor visible')
-        await wait(async () => await overlay.view.webContents.executeJavaScript(
-          `document.querySelector('#annotation-body').value===${JSON.stringify(initialBody)} && document.documentElement.dataset.editorVersion==='${modern ? 2 : 1}'`), 'editor initialized')
+        await wait(async () => {
+          const current = await overlay.view.webContents.executeJavaScript(
+            "({body:document.querySelector('#annotation-body').value,version:document.documentElement.dataset.editorVersion})")
+          return current.body === initialBody && current.version === String(modern ? 2 : 1)
+        }, 'editor initialized')
         return overlay
       }
       const evaluate = (overlay, script) => overlay.view.webContents.executeJavaScript(script)
-      const input = (overlay, body) => evaluate(overlay,
-        `(()=>{const t=document.querySelector('#annotation-body');t.value=${JSON.stringify(body)};t.dispatchEvent(new Event('input',{bubbles:true}));})()`)
+      const input = async (overlay, body) => {
+        await evaluate(overlay,
+          "(()=>{const t=document.querySelector('#annotation-body');t.focus();t.value='';t.dispatchEvent(new Event('input',{bubbles:true}));})()")
+        if (body) await overlay.view.webContents.insertText(body)
+      }
       const update = (annotationId, changes = {}) => manager.updateArtifactAnnotationOverlay({
         version: 3, surfaceId, annotationId, editorState: { ...state, ...changes },
       })
