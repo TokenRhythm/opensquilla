@@ -475,8 +475,22 @@ class DesktopGatewayOwnership:
         if self._active:
             return
         record = self.record
-        with _ownership_record_lock(self.state_dir):
-            _atomic_write_private_json(self.path, record)
+        try:
+            with _ownership_record_lock(self.state_dir):
+                _atomic_write_private_json(self.path, record)
+        except BaseException:
+            # The replacement can succeed before the final directory fsync
+            # reports an error. Remove only our exact record so a failed
+            # startup cannot masquerade as a live Desktop Gateway, while a
+            # successor that won the lock remains untouched.
+            with contextlib.suppress(BaseException):
+                with _ownership_record_lock(self.state_dir):
+                    if _read_record(self.path) == record:
+                        with contextlib.suppress(OSError):
+                            os.unlink(_native_io_path(self.path))
+                        with contextlib.suppress(OSError):
+                            _fsync_directory(self.path.parent)
+            raise
         self._written_record = record
         self._active = True
         atexit.register(self.release)
@@ -577,9 +591,19 @@ def activate_desktop_gateway_ownership(
     try:
         owner.acquire()
     except BaseException:
-        from opensquilla.desktop_process_cleanup import release_desktop_process_cleanup
+        from opensquilla.desktop_process_cleanup import (
+            abort_desktop_process_cleanup,
+            release_desktop_process_cleanup,
+        )
 
-        release_desktop_process_cleanup(owner.instance_nonce)
+        try:
+            abort_desktop_process_cleanup(owner.state_dir, owner.instance_nonce)
+        except Exception:
+            # Preserve the ownership failure. A later independent cleanup can
+            # still close the launch fence if rollback itself is unavailable.
+            pass
+        finally:
+            release_desktop_process_cleanup(owner.instance_nonce)
         raise
     _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP = owner
     return owner

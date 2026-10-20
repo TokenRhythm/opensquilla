@@ -1,15 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, type App } from 'vue'
+import { createApp, type App } from 'vue'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import CompactionEvent from '@/components/chat/CompactionEvent.vue'
 import type { ChatRenderedMessage } from '@/types/chat'
 import compactionEventSource from '../components/chat/CompactionEvent.vue?raw'
 import chatViewSource from './ChatView.vue?raw'
 import chatViewStyles from '../styles/chat-view.css?raw'
-import { copyTextWithFallback } from '@/utils/browser'
-
-vi.mock('@/utils/browser', () => ({ copyTextWithFallback: vi.fn().mockResolvedValue(undefined) }))
 
 const apps: App[] = []
 
@@ -84,14 +81,14 @@ describe('compaction maintenance presentation', () => {
   })
 
   it.each([
-    ['en', 'The summary did not pass the completeness check', 'your original context is preserved'],
-    ['zh-Hans', '摘要未通过完整性校验', '原上下文已保留'],
-  ] as const)('explains a rejected manual summary and copies its diagnostic ID in %s', async (locale, title, preservation) => {
+    ['en', 'The summary did not pass the completeness check'],
+    ['zh-Hans', '摘要未通过完整性校验'],
+  ] as const)('explains a rejected manual summary without asking the user to interpret an ID in %s', async (locale, title) => {
     await loadLocaleMessages(locale)
     i18n.global.locale.value = locale
     const message: ChatRenderedMessage = {
       id: 'failed-compact', role: 'maintenance', displayRole: 'maintenance', roleLabel: '',
-      text: '', timeStr: '', showHeader: false,
+      text: '', timeStr: '刚刚', showHeader: false,
       maintenance: {
         kind: 'context_compaction', compactionId: 'cmp-failed-123', source: 'manual',
         state: 'failed', durability: 'none', reason: 'summary_replay_incomplete',
@@ -105,14 +102,39 @@ describe('compaction maintenance presentation', () => {
     app.mount(host)
 
     expect(host.querySelector('.chat-compaction-event__title')?.textContent).toBe(title)
-    expect(host.textContent).toContain(preservation)
+    expect(host.textContent).toContain(i18n.global.t('chat.compact.failureRejectedDetail'))
     expect(host.textContent).not.toContain('summary_replay_incomplete')
-    const copy = host.querySelector<HTMLButtonElement>('.chat-compaction-event__diagnostic')!
-    copy.click()
-    await nextTick()
-    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith('cmp-failed-123')
-    expect(copy.textContent).toBe(i18n.global.t('chat.copyDiagnosticId'))
-    expect(host.querySelector('.chat-compaction-event__body [role="status"]')).toBeNull()
+    expect(host.textContent).not.toContain('cmp-failed-123')
+    expect(host.textContent).not.toContain('刚刚')
+    expect(host.querySelector('button')).toBeNull()
+    expect(host.querySelector('time')).toBeNull()
+    expect(host.querySelector('[data-compaction-id="cmp-failed-123"]')).not.toBeNull()
+  })
+
+  it.each([false, true])('keeps an automatic failed attempt informational without inventing ongoing recovery (restored=%s)', restoredFromHistory => {
+    const message: ChatRenderedMessage = {
+      id: 'automatic-failed', role: 'maintenance', displayRole: 'maintenance', roleLabel: '',
+      text: '', timeStr: 'just now', showHeader: false, restoredFromHistory,
+      maintenance: {
+        kind: 'context_compaction', compactionId: 'cmp-auto', source: 'automatic',
+        state: 'failed', durability: 'none', reason: 'summary_failed', failureKind: 'rate_limited', httpStatus: 429,
+        detail: 'Private upstream diagnostic data',
+      },
+    }
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(CompactionEvent, { message })
+    apps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    const event = host.querySelector<HTMLElement>('[data-testid="compaction-event"]')!
+    expect(event.dataset.status).toBe('failed')
+    expect(event.textContent?.trim()).toBe(i18n.global.t('chat.compact.incomplete'))
+    expect(event.classList.contains('chat-compaction-event--failed')).toBe(false)
+    expect(event.classList.contains('chat-compaction-event--running')).toBe(false)
+    expect(event.getAttribute('role')).toBe(restoredFromHistory ? null : 'status')
+    expect(event.getAttribute('aria-live')).toBe(restoredFromHistory ? null : 'polite')
+    expect(event.querySelector('time, button')).toBeNull()
   })
 
   it.each([
@@ -126,7 +148,7 @@ describe('compaction maintenance presentation', () => {
         const message: ChatRenderedMessage = {
           id: `cmp-${durability}-${restoredFromHistory}`,
           role: 'maintenance', displayRole: 'maintenance', roleLabel: '',
-          text: '', timeStr: '', showHeader: false, restoredFromHistory,
+          text: '', timeStr: 'just now', showHeader: false, restoredFromHistory,
           maintenance: {
             kind: 'context_compaction', compactionId: 'cmp-transcript',
             source: 'automatic', state: 'completed', durability,
@@ -145,11 +167,18 @@ describe('compaction maintenance presentation', () => {
         expect(event.dataset.status).toBe('completed')
         expect(event.dataset.durability).toBe(durability)
         expect(event.querySelector('.chat-compaction-event__title')?.textContent)
-          .toBe(durability === 'request_scoped' ? temporary : saved)
+          .toBe(saved)
+        if (durability === 'request_scoped') {
+          expect(event.querySelector('.compaction-recovery-marker__button')?.getAttribute('aria-label')).toBe(temporary)
+          expect(event.textContent).not.toContain(temporary)
+        }
         expect(event.classList.contains('chat-compaction-event--running')).toBe(false)
+        expect(event.classList.contains('chat-compaction-event--failed')).toBe(false)
+        expect(event.querySelector('.chat-compaction-event__marker, .compaction-recovery-marker__ring')).not.toBeNull()
+        expect(event.querySelector('time')).toBeNull()
+        expect(event.textContent).not.toContain('just now')
         expect(event.querySelector('.chat-compaction-event__body .chat-compaction-event__detail')).toBeNull()
         expect(event.getAttribute('aria-live')).toBe(restoredFromHistory ? null : 'polite')
-        if (durability === 'request_scoped') expect(event.textContent).not.toContain(saved)
       }
     }
   })

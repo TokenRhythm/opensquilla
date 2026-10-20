@@ -195,6 +195,29 @@ def test_desktop_ownership_windows_long_path_failed_replace_cleanup(
     assert not os.path.exists(_native_io_path(owner.path))
 
 
+def test_desktop_ownership_failed_directory_sync_rolls_back_record(tmp_path, monkeypatch):
+    from opensquilla.gateway import desktop_ownership
+
+    owner = _owner(tmp_path, monkeypatch)
+    original_directory_sync = desktop_ownership._fsync_directory
+    calls = 0
+
+    def fail_directory_sync(_path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected directory sync failure")
+        original_directory_sync(_path)
+
+    monkeypatch.setattr(desktop_ownership, "_fsync_directory", fail_directory_sync)
+    with pytest.raises(OSError, match="injected directory sync failure"):
+        owner.acquire()
+
+    assert not owner.path.exists()
+    owner.acquire()
+    owner.release()
+
+
 def test_desktop_ownership_release_does_not_remove_a_successor_record(
     tmp_path: Path,
     monkeypatch,

@@ -492,6 +492,28 @@ describe('Escape and message edits', () => {
     expect(down.preventDefault).not.toHaveBeenCalled()
   })
 
+  it('keeps an edited history entry when ArrowUp or ArrowDown follows (#1954)', () => {
+    const { api, inputText } = harness({
+      messages: [
+        { role: 'user', text: 'first request', ts: null },
+        { role: 'user', text: 'second request', ts: null },
+      ],
+    })
+    api.onTextareaKeydown(keydown({ key: 'ArrowUp', target: field('', 'start') }))
+    expect(inputText.value).toBe('second request')
+    inputText.value = 'second request, edited'
+    api.onTextareaInput(inputEvent('insertText', field('second request, edited', 'end')))
+
+    const up = keydown({ key: 'ArrowUp', target: field('second request, edited', 'end') })
+    api.onTextareaKeydown(up)
+    const down = keydown({ key: 'ArrowDown', target: field('second request, edited', 'end') })
+    api.onTextareaKeydown(down)
+
+    expect(inputText.value).toBe('second request, edited')
+    expect(up.preventDefault).not.toHaveBeenCalled()
+    expect(down.preventDefault).not.toHaveBeenCalled()
+  })
+
   it('cancels an uncommitted edit instead of clearing the composer', () => {
     // #1372: edit mode empties the transcript on the first click, and Escape
     // used to clear the draft and leave that empty state on screen. Cancelling

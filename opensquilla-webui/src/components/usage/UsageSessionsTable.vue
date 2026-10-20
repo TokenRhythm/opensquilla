@@ -37,7 +37,7 @@
               </td>
             </tr>
           </template>
-          <template v-for="row in sortedRows" :key="rowKey(row.raw)">
+          <template v-for="row in sortedRows" :key="row.rowIdentity">
             <tr>
               <td :data-label="t('usageLogs.columns.session')">
                 <a
@@ -56,13 +56,6 @@
               <td data-label="Cache R" class="usage-mono usage-dim">{{ row.cacheReadTokens != null ? row.cacheReadTokens.toLocaleString() : '-' }}</td>
               <td data-label="Cache W" class="usage-mono usage-dim">{{ row.cacheWriteTokens != null ? row.cacheWriteTokens.toLocaleString() : '-' }}</td>
               <td data-label="Cost" class="usage-mono usage-cost">{{ fmtCost(row.cost, { source: row.raw }) }}</td>
-              <td data-label="Source">
-                <span
-                  class="usage-source"
-                  :class="costSourceClasses(row.raw)"
-                  :title="costSourceTooltip(row.raw)"
-                >{{ costSourceLabel(row.raw) }}</span>
-              </td>
               <td data-label="Model">
                 <button
                   v-if="row.hasModelBreakdown"
@@ -118,14 +111,10 @@ defineProps<{
     cost: number | null | undefined,
     opts?: { decimals?: number; source?: object },
   ) => string
-  costSourceLabel: (row: UsageSession) => string
-  costSourceTooltip: (row: UsageSession) => string
-  costSourceClasses: (row: UsageSession) => Record<string, boolean>
   costSourceClassesForBreakdown: (row: BreakdownRow) => Record<string, boolean>
   costSourceLabelForBreakdown: (row: BreakdownRow) => string
   costSourceTooltipForBreakdown: (row: BreakdownRow) => string
   modelDisplayLabel: (row: UsageSession) => string
-  rowKey: (row: UsageSession) => string
   rowBreakdown: (row: UsageSession) => BreakdownRow[]
   rowBreakdownTotalTokens: (row: UsageSession) => number
   rowBreakdownTotalCost: (row: UsageSession) => number

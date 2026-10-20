@@ -14,10 +14,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as datetime_time
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from opensquilla.gateway.usage_settlement_projection import (
+    apply_current_settlements,
+    summarize_metering,
+)
 from opensquilla.provider.fx import canonical_native_per_usd_rates
 from opensquilla.session.cost_rollup import rollup_cost_source
 
@@ -39,6 +43,10 @@ _NATIVE_RECEIPT_PROVIDER_IDS = frozenset({"openrouter", "tokenrhythm"})
 
 class UsageQueryValidationError(ValueError):
     """Raised when a range or timezone cannot be interpreted safely."""
+
+
+class UsageQuerySnapshotBusyError(RuntimeError):
+    """No consistent snapshot was available within the bounded retry budget."""
 
 
 def _field(source: Any, name: str, default: Any = None) -> Any:
@@ -265,16 +273,35 @@ def _add_billing_receipt(totals: dict[str, Any], receipt: Any) -> None:
             "normalizationRatesNativePerUsd": [],
         },
     )
+    for exact_key, nanos_key, receipt_key, delta in (
+        ("amount", "amountNanos", "amount_exact", amount_nanos),
+        ("usdEquivalentExact", "usdEquivalentNanos", "usd_equivalent_exact", usd_nanos),
+    ):
+        prior = Decimal(
+            str(native.get(exact_key, Decimal(_integer(native.get(nanos_key))) / 1_000_000_000))
+        )
+        amount = _field(receipt, receipt_key)
+        value = Decimal(str(amount)) if amount is not None else Decimal(delta) / 1_000_000_000
+        native[exact_key] = format(prior + value, "f")
     native["amountNanos"] = _integer(native.get("amountNanos")) + amount_nanos
-    native["usdEquivalentNanos"] = (
-        _integer(native.get("usdEquivalentNanos")) + usd_nanos
-    )
+    native["usdEquivalentNanos"] = _integer(native.get("usdEquivalentNanos")) + usd_nanos
     native["receiptCount"] = _integer(native.get("receiptCount")) + 1
-    if fx_nanos:
-        fx = _nanos_decimal(fx_nanos)
+    exact_fx = _field(receipt, "fx_native_per_usd")
+    if fx_nanos or exact_fx:
+        fx = str(exact_fx) if exact_fx else _nanos_decimal(fx_nanos)
         rates = native["normalizationRatesNativePerUsd"]
         if fx not in rates:
             rates.append(fx)
+        source = _text(_field(receipt, "fx_source"))
+        if source:
+            evidence = {
+                "source": source,
+                "revision": _text(_field(receipt, "fx_source_revision")),
+                "rate": fx,
+            }
+            sources = native.setdefault("normalizationSources", [])
+            if evidence not in sources:
+                sources.append(evidence)
 
 
 def _add_native_receipt_expectation(
@@ -284,10 +311,14 @@ def _add_native_receipt_expectation(
 ) -> None:
     """Track physical native-receipt coverage for one usage item."""
 
-    provider = _text(
-        _first(source, "provider", "provider_id", "providerId"),
-        "",
-    ).strip().lower()
+    provider = (
+        _text(
+            _first(source, "provider", "provider_id", "providerId"),
+            "",
+        )
+        .strip()
+        .lower()
+    )
     cost_source = _text(_first(source, "cost_source", "costSource"), "none")
     expects_receipt = provider == "tokenrhythm" or (
         provider == "openrouter" and cost_source == "provider_billed"
@@ -321,6 +352,26 @@ def _merge_native_billing(
                     "normalizationRatesNativePerUsd": [],
                 },
             )
+            for exact_key, nanos_key in (
+                ("amount", "amountNanos"),
+                ("usdEquivalentExact", "usdEquivalentNanos"),
+            ):
+                prior = Decimal(
+                    str(
+                        entry.get(
+                            exact_key, Decimal(_integer(entry.get(nanos_key))) / 1_000_000_000
+                        )
+                    )
+                )
+                delta = Decimal(
+                    str(raw.get(exact_key, Decimal(_integer(raw.get(nanos_key))) / 1_000_000_000))
+                )
+                entry[exact_key] = format(max(Decimal(0), prior + direction * delta), "f")
+            if not subtract:
+                for evidence in raw.get("normalizationSources", []):
+                    sources = entry.setdefault("normalizationSources", [])
+                    if evidence not in sources:
+                        sources.append(evidence)
             for key in ("amountNanos", "usdEquivalentNanos", "receiptCount"):
                 entry[key] = max(
                     0,
@@ -366,9 +417,19 @@ def _add_record(
 ) -> None:
     for wire_name, source_names in _TOKEN_FIELDS:
         totals[wire_name] += max(0, _integer(_first(source, *source_names, default=0)))
-    totals["costNanos"] += _cost_nanos(source)
-    totals["billedCostNanos"] += _cost_nanos(source, "billed")
-    totals["estimatedCostNanos"] += _cost_nanos(source, "estimated")
+    for prefix in ("", "billed", "estimated"):
+        nanos_key = f"{prefix}CostNanos" if prefix else "costNanos"
+        exact_key = f"{prefix}CostUsdExact" if prefix else "costUsdExact"
+        source_key = f"{prefix}_cost_usd_exact" if prefix else "cost_usd_exact"
+        prior = Decimal(str(totals.get(exact_key, Decimal(totals[nanos_key]) / 1_000_000_000)))
+        exact = _first(source, source_key, exact_key)
+        amount = (
+            Decimal(str(exact))
+            if exact is not None
+            else Decimal(_cost_nanos(source, prefix)) / 1_000_000_000
+        )
+        totals[exact_key] = format(prior + amount, "f")
+        totals[nanos_key] += _cost_nanos(source, prefix)
     cost_source = _text(_first(source, "cost_source", "costSource"), "none")
     missing = max(
         0,
@@ -405,26 +466,62 @@ def _finish_totals(totals: dict[str, Any], sessions: set[str] | None = None) -> 
     totals["costUsd"] = _nanos_to_usd(totals["costNanos"])
     totals["billedCostUsd"] = _nanos_to_usd(totals["billedCostNanos"])
     totals["estimatedCostUsd"] = _nanos_to_usd(totals["estimatedCostNanos"])
+    # Settlement precision may exceed one nano-USD. Sum exact decimals before
+    # deriving the compatibility integers; never round each physical call.
+    for prefix in ("", "billed", "estimated"):
+        base = f"{prefix}Cost" if prefix else "cost"
+        exact = Decimal(
+            str(totals.get(f"{base}UsdExact", Decimal(totals[f"{base}Nanos"]) / 1_000_000_000))
+        )
+        totals[f"{base}UsdExact"] = format(exact, "f")
+        totals[f"{base}Usd"] = float(exact)
+        totals[f"{base}Nanos"] = int(
+            (exact * 1_000_000_000).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+        )
+    # Preserve the legacy integer component invariant. The exact decimal
+    # fields above remain authoritative at sub-nano precision.
+    totals["costNanos"] = totals["billedCostNanos"] + totals["estimatedCostNanos"]
     native_payload: dict[str, Any] = {}
     native_source = totals.get("nativeBilledByCurrency", {})
     if isinstance(native_source, Mapping):
         for currency, raw in native_source.items():
             if not isinstance(raw, Mapping):
                 continue
-            amount_nanos = max(0, _integer(raw.get("amountNanos")))
-            usd_nanos = max(0, _integer(raw.get("usdEquivalentNanos")))
+            amount_exact = Decimal(
+                str(
+                    raw.get(
+                        "amount", Decimal(max(0, _integer(raw.get("amountNanos")))) / 1_000_000_000
+                    )
+                )
+            )
+            usd_exact = Decimal(
+                str(
+                    raw.get(
+                        "usdEquivalentExact",
+                        Decimal(max(0, _integer(raw.get("usdEquivalentNanos")))) / 1_000_000_000,
+                    )
+                )
+            )
+            amount_nanos = int(
+                (amount_exact * 1_000_000_000).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+            )
+            usd_nanos = int(
+                (usd_exact * 1_000_000_000).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+            )
             rates = raw.get("normalizationRatesNativePerUsd", [])
             native_payload[str(currency)] = {
                 "amountNanos": str(amount_nanos),
-                "amount": _nanos_decimal(amount_nanos),
+                "amount": format(amount_exact, "f"),
                 "usdEquivalentNanos": str(usd_nanos),
+                "usdEquivalentExact": format(usd_exact, "f"),
+                **(
+                    {"normalizationSources": raw["normalizationSources"]}
+                    if raw.get("normalizationSources")
+                    else {}
+                ),
                 "receiptCount": max(0, _integer(raw.get("receiptCount"))),
                 "normalizationRatesNativePerUsd": sorted(
-                    {
-                        _text(rate)
-                        for rate in rates
-                        if _text(rate)
-                    }
+                    {_text(rate) for rate in rates if _text(rate)}
                 )
                 if isinstance(rates, Sequence) and not isinstance(rates, str)
                 else [],
@@ -445,9 +542,7 @@ def _finish_totals(totals: dict[str, Any], sessions: set[str] | None = None) -> 
         billed_cost_usd=totals["billedCostUsd"],
         estimated_cost_component_usd=totals["estimatedCostUsd"],
         missing_cost_entries=totals["missingCostEntries"],
-        provider_billed_entries=_integer(
-            totals["costSourceCounts"].get("provider_billed")
-        )
+        provider_billed_entries=_integer(totals["costSourceCounts"].get("provider_billed"))
         + _integer(totals["costSourceCounts"].get("mixed")),
         estimated_cost_entries=(
             _integer(totals["costSourceCounts"].get("opensquilla_estimate"))
@@ -555,14 +650,16 @@ def _group_sessions(
     items_by_event: Mapping[str, Sequence[Any]],
     receipts_by_event: Mapping[str, Sequence[Any]],
     receipts_by_item: Mapping[tuple[str, int], Any],
-    session_keys: Mapping[str, str],
+    session_keys: Mapping[tuple[str, int], str],
+    attributions: Mapping[str, Mapping[str, Any]] | None = None,
+    metering_by_item: Mapping[tuple[str, int], Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    grouped: dict[str, list[Any]] = defaultdict(list)
+    grouped: dict[tuple[str, int], list[Any]] = defaultdict(list)
     for event in events:
-        session_id = _text(_first(event, "session_id", "sessionId"), "unknown")
-        grouped[session_id].append(event)
+        session_id, epoch = _session_epoch_key(event)
+        grouped[(session_id or "unknown", epoch)].append(event)
     rows: list[dict[str, Any]] = []
-    for session_id, session_events in grouped.items():
+    for (session_id, epoch), session_events in grouped.items():
         totals, _ = _sum_records(session_events)
         for event in session_events:
             event_id = _text(_first(event, "event_id", "eventId"))
@@ -578,7 +675,8 @@ def _group_sessions(
         rows.append(
             {
                 "sessionId": session_id,
-                "sessionKey": session_keys.get(session_id),
+                "sessionEpoch": epoch,
+                "sessionKey": session_keys.get((session_id, epoch)),
                 "firstUsageAtMs": min(timestamps) if timestamps else None,
                 "lastUsageAtMs": max(timestamps) if timestamps else None,
                 "totals": totals,
@@ -586,10 +684,205 @@ def _group_sessions(
                     session_events,
                     items_by_event,
                     receipts_by_item,
+                    metering_by_item,
                 ),
             }
         )
+        attribution = next(
+            (
+                (attributions or {}).get(_text(_field(event, "execution_id")))
+                for event in session_events
+                if (attributions or {}).get(_text(_field(event, "execution_id")))
+            ),
+            None,
+        )
+        if attribution is not None:
+            rows[-1].update(
+                {
+                    "taskGroupId": attribution["task_group_id"],
+                    "sessionEpoch": attribution["session_epoch"],
+                    "parentSessionId": attribution["parent_session_id"],
+                    "parentSessionEpoch": attribution["parent_session_epoch"],
+                    "sessionKind": attribution["session_kind"],
+                    "title": attribution["title"],
+                    "attributionStatus": attribution["attribution_status"],
+                }
+            )
     return sorted(rows, key=lambda row: row["lastUsageAtMs"] or 0, reverse=True)
+
+
+def _group_tasks(
+    events: Sequence[Any],
+    items_by_event: Mapping[str, Sequence[Any]],
+    receipts_by_event: Mapping[str, Sequence[Any]],
+    receipts_by_item: Mapping[tuple[str, int], Any],
+    session_keys: Mapping[tuple[str, int], str],
+    session_titles: Mapping[tuple[str, int], str],
+    attributions: Mapping[str, Mapping[str, Any]],
+    metering_by_item: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Partition physical calls once; child expansion never adds another bill."""
+
+    def totals_for(selected: Sequence[Any]) -> dict[str, Any]:
+        totals, sessions = _sum_records(selected)
+        for event in selected:
+            event_id = _text(_field(event, "event_id"))
+            for receipt in receipts_by_event.get(event_id, ()):
+                _add_billing_receipt(totals, receipt)
+            for item in items_by_event.get(event_id) or (event,):
+                ordinal = _integer(_field(item, "ordinal"), -1)
+                receipt = receipts_by_item.get((event_id, ordinal))
+                _add_native_receipt_expectation(totals, item, receipt)
+        return _finish_totals(totals, sessions)
+
+    branches = {
+        "self": "self",
+        "inline_subagent": "inlineSubagents",
+        "subsession": "subsessions",
+        "sidechat": "sideChats",
+        "unattributed": "unattributed",
+    }
+    grouped: dict[str, list[tuple[Any, Mapping[str, Any]]]] = defaultdict(list)
+    missing = 0
+    seen: set[str] = set()
+    for event in events:
+        event_id = _text(_field(event, "event_id"))
+        if event_id and event_id in seen:
+            continue
+        seen.add(event_id)
+        run_id = _text(_field(event, "execution_id"))
+        attribution = attributions.get(run_id)
+        if attribution is None:
+            session_id, epoch = _session_epoch_key(event)
+            attribution = {
+                "task_group_id": f"legacy:{session_id}:{epoch}",
+                "root_session_id": session_id,
+                "root_session_epoch": epoch,
+                "session_id": session_id,
+                "session_epoch": epoch,
+                "parent_execution_id": None,
+                "title": "",
+                "root_title": "",
+                "relation": "unattributed",
+                "attribution_status": "partial",
+                "run_attribution_status": "partial",
+            }
+        if attribution.get("run_attribution_status") != "complete":
+            missing += 1
+        grouped[str(attribution["task_group_id"])].append((event, attribution))
+    groups: list[dict[str, Any]] = []
+    for group_id, members in grouped.items():
+        first = members[0][1]
+        root_identity = (str(first["root_session_id"]), int(first["root_session_epoch"]))
+        group_events = [event for event, _ in members]
+        timestamps = [ts for event in group_events if (ts := _event_time_ms(event)) is not None]
+        partition: dict[str, list[Any]] = defaultdict(list)
+        runs: dict[str, list[tuple[Any, Mapping[str, Any]]]] = defaultdict(list)
+        for event, attribution in members:
+            relation = str(attribution.get("relation") or "unattributed")
+            partition[relation if relation in branches else "unattributed"].append(event)
+            runs[_text(_field(event, "execution_id")) or _text(_field(event, "event_id"))].append(
+                (event, attribution)
+            )
+        run_rows = []
+        for run_id, run_members in runs.items():
+            metadata = run_members[0][1]
+            run_rows.append(
+                {
+                    "runId": run_id,
+                    "sessionId": metadata["session_id"],
+                    "sessionEpoch": metadata["session_epoch"],
+                    "parentRunId": metadata.get("parent_execution_id"),
+                    "relation": metadata.get("relation", "unattributed"),
+                    "title": metadata.get("title", ""),
+                    "totals": totals_for([event for event, _ in run_members]),
+                }
+            )
+        groups.append(
+            {
+                "taskGroupId": group_id,
+                "rootSessionId": first["root_session_id"],
+                "rootSessionEpoch": first["root_session_epoch"],
+                "sessionKey": session_keys.get(root_identity),
+                "title": session_titles.get(root_identity) or first.get("root_title") or "",
+                "firstUsageAtMs": min(timestamps) if timestamps else None,
+                "lastUsageAtMs": max(timestamps) if timestamps else None,
+                "attributionStatus": "complete"
+                if all(attr.get("run_attribution_status") == "complete" for _, attr in members)
+                else "partial",
+                "totals": totals_for(group_events),
+                "modelBreakdown": _group_models(
+                    group_events, items_by_event, receipts_by_item, metering_by_item
+                ),
+                "branches": {
+                    wire: totals_for(partition.get(relation, []))
+                    for relation, wire in branches.items()
+                },
+                "runs": run_rows,
+            }
+        )
+    return groups, {
+        "status": "partial" if missing else "complete",
+        "missingEventCount": missing,
+        "reasonCodes": ["missing_usage_lineage"] if missing else [],
+    }
+
+
+def _metering_capability(rows: Sequence[Mapping[str, Any]]) -> str:
+    operations = {
+        str(meter["dimensions"]["operation"])
+        for row in rows
+        for meter in row.get("meters", ())
+        if meter.get("dimensions", {}).get("operation")
+    }
+    if len(operations) == 1:
+        return next(iter(operations))
+    if operations:
+        return "mixed"
+    if rows and all(row.get("token_usage_known", True) for row in rows):
+        return "llm"
+    return "unknown"
+
+
+def _capability_rows(
+    events: Sequence[Any],
+    metering: Sequence[Mapping[str, Any]],
+    items_by_event: Mapping[str, Sequence[Any]],
+    receipts_by_event: Mapping[str, Sequence[Any]],
+    receipts_by_item: Mapping[tuple[str, int], Any],
+) -> list[dict[str, Any]]:
+    measurements: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in metering:
+        measurements[str(row["event_id"])].append(row)
+    grouped: dict[str, list[Any]] = defaultdict(list)
+    for event in events:
+        rows = measurements.get(_text(_field(event, "event_id")), [])
+        grouped[_metering_capability(rows)].append(event)
+    result = []
+    for capability, selected in grouped.items():
+        totals, sessions = _sum_records(selected)
+        selected_measurements = []
+        for event in selected:
+            event_id = _text(_field(event, "event_id"))
+            selected_measurements.extend(measurements.get(event_id, []))
+            for receipt in receipts_by_event.get(event_id, ()):
+                _add_billing_receipt(totals, receipt)
+            for item in items_by_event.get(event_id) or (event,):
+                ordinal = _integer(_field(item, "ordinal"), -1)
+                _add_native_receipt_expectation(
+                    totals, item, receipts_by_item.get((event_id, ordinal))
+                )
+        result.append(
+            {
+                "capability": capability,
+                "totals": _finish_totals(totals, sessions),
+                "meters": summarize_metering(selected_measurements),
+                "tokenUnknownItemCount": sum(
+                    not row.get("token_usage_known", True) for row in selected_measurements
+                ),
+            }
+        )
+    return result
 
 
 def _index_items_by_event(
@@ -605,9 +898,7 @@ def _index_items_by_event(
     """
 
     event_ids = {
-        event_id
-        for event in events
-        if (event_id := _text(_first(event, "event_id", "eventId")))
+        event_id for event in events if (event_id := _text(_first(event, "event_id", "eventId")))
     }
     items_by_event: dict[str, list[Any]] = defaultdict(list)
     for item in items:
@@ -622,9 +913,7 @@ def _index_receipts(
     receipts: Sequence[Any],
 ) -> tuple[dict[str, list[Any]], dict[tuple[str, int], Any]]:
     event_ids = {
-        event_id
-        for event in events
-        if (event_id := _text(_first(event, "event_id", "eventId")))
+        event_id for event in events if (event_id := _text(_first(event, "event_id", "eventId")))
     }
     by_event: dict[str, list[Any]] = defaultdict(list)
     by_item: dict[tuple[str, int], Any] = {}
@@ -642,6 +931,7 @@ def _group_models(
     events: Sequence[Any],
     items_by_event: Mapping[str, Sequence[Any]],
     receipts_by_item: Mapping[tuple[str, int], Any],
+    metering_by_item: Mapping[tuple[str, int], Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     event_by_id = {
         _text(_first(event, "event_id", "eventId")): event
@@ -650,6 +940,7 @@ def _group_models(
     }
 
     grouped: dict[tuple[str, str], list[tuple[Any, str, Any | None]]] = defaultdict(list)
+    measurements: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for event_id, event in event_by_id.items():
         event_items = items_by_event.get(event_id)
         if not event_items:
@@ -661,6 +952,10 @@ def _group_models(
             ordinal = _integer(_first(item, "ordinal"), -1)
             receipt = receipts_by_item.get((event_id, ordinal)) if ordinal >= 0 else None
             grouped[(provider, model)].append((item, session_id, receipt))
+            if metering_by_item is not None:
+                measurement = metering_by_item.get((event_id, ordinal))
+                if measurement is not None:
+                    measurements[(provider, model)].append(measurement)
 
     rows: list[dict[str, Any]] = []
     for (provider, model), values in grouped.items():
@@ -682,6 +977,17 @@ def _group_models(
                 "sessionCount": len(sessions),
             }
         )
+        if metering_by_item is not None:
+            selected_measurements = measurements[(provider, model)]
+            rows[-1].update(
+                {
+                    "capability": _metering_capability(selected_measurements),
+                    "meters": summarize_metering(selected_measurements),
+                    "tokenUnknownItemCount": sum(
+                        not row.get("token_usage_known", True) for row in selected_measurements
+                    ),
+                }
+            )
     return sorted(rows, key=lambda row: row["totals"]["costNanos"], reverse=True)
 
 
@@ -710,9 +1016,7 @@ def _baseline_records(baselines: Sequence[Any]) -> list[dict[str, Any]]:
                 ),
                 "cost_source": _first(baseline, "cost_source", "costSource", default="none"),
                 "session_id": _first(baseline, "session_id", "sessionId", default=""),
-                "session_epoch": _first(
-                    baseline, "session_epoch", "sessionEpoch", default=0
-                ),
+                "session_epoch": _first(baseline, "session_epoch", "sessionEpoch", default=0),
             }
         )
     return rows
@@ -749,8 +1053,7 @@ def _group_epoch_totals(records: Sequence[Any]) -> dict[tuple[str, int], dict[st
 
 def _cost_components_are_consistent(totals: Mapping[str, Any]) -> bool:
     return _integer(totals.get("costNanos")) == (
-        _integer(totals.get("billedCostNanos"))
-        + _integer(totals.get("estimatedCostNanos"))
+        _integer(totals.get("billedCostNanos")) + _integer(totals.get("estimatedCostNanos"))
     )
 
 
@@ -779,16 +1082,14 @@ def _reconcile_historical_events(
     for key, history_totals in historical_by_epoch.items():
         baseline_totals = baseline_by_epoch.get(key)
         conflict = baseline_totals is None or any(
-            not _text(_first(event, "event_id", "eventId"))
-            for event in events_by_epoch[key]
+            not _text(_first(event, "event_id", "eventId")) for event in events_by_epoch[key]
         )
         if baseline_totals is not None:
             conflict = (
                 not _cost_components_are_consistent(baseline_totals)
                 or not _cost_components_are_consistent(history_totals)
                 or any(
-                    _integer(history_totals.get(field))
-                    > _integer(baseline_totals.get(field))
+                    _integer(history_totals.get(field)) > _integer(baseline_totals.get(field))
                     for field in _BASELINE_RECONCILED_COMPONENTS
                 )
             )
@@ -832,6 +1133,20 @@ def _subtract_totals(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[
     )
     for field in numeric_fields:
         result[field] = max(0, _integer(left.get(field)) - _integer(right.get(field)))
+    for prefix in ("", "billed", "estimated"):
+        base = f"{prefix}Cost" if prefix else "cost"
+
+        def exact(source: Mapping[str, Any]) -> Decimal:
+            return Decimal(
+                str(
+                    source.get(
+                        f"{base}UsdExact",
+                        Decimal(_integer(source.get(f"{base}Nanos"))) / 1_000_000_000,
+                    )
+                )
+            )
+
+        result[f"{base}UsdExact"] = format(max(Decimal(0), exact(left) - exact(right)), "f")
     _merge_native_billing(result, left)
     _merge_native_billing(result, right, subtract=True)
     return _finish_totals(result)
@@ -854,6 +1169,25 @@ def _add_totals(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, 
     )
     for field in numeric_fields:
         result[field] = _integer(left.get(field)) + _integer(right.get(field))
+    for prefix in ("", "billed", "estimated"):
+        base = f"{prefix}Cost" if prefix else "cost"
+        result[f"{base}UsdExact"] = format(
+            sum(
+                (
+                    Decimal(
+                        str(
+                            source.get(
+                                f"{base}UsdExact",
+                                Decimal(_integer(source.get(f"{base}Nanos"))) / 1_000_000_000,
+                            )
+                        )
+                    )
+                    for source in (left, right)
+                ),
+                Decimal(0),
+            ),
+            "f",
+        )
     result["sessionCount"] = max(
         _integer(left.get("sessionCount")), _integer(right.get("sessionCount"))
     )
@@ -861,9 +1195,9 @@ def _add_totals(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, 
     right_counts = right.get("costSourceCounts", {})
     if isinstance(left_counts, Mapping) and isinstance(right_counts, Mapping):
         for source in result["costSourceCounts"]:
-            result["costSourceCounts"][source] = _integer(
-                left_counts.get(source)
-            ) + _integer(right_counts.get(source))
+            result["costSourceCounts"][source] = _integer(left_counts.get(source)) + _integer(
+                right_counts.get(source)
+            )
     _merge_native_billing(result, left)
     _merge_native_billing(result, right)
     return _finish_totals(result)
@@ -892,6 +1226,34 @@ async def query_usage_ledger(
 ) -> dict[str, Any]:
     """Execute one consistent usage query against a SessionStorage ledger API."""
 
+    async def read_once(timestamp: int | None) -> dict[str, Any]:
+        with localcontext() as context:
+            context.prec = 64
+            return await _query_usage_ledger_once(storage, params, now_ms=timestamp)
+
+    revision = getattr(storage, "get_usage_accounting_revision", None)
+    if not callable(revision):
+        return await read_once(now_ms)
+    fixed_now = now_ms if now_ms is not None else int(time.time() * 1000)
+    for _ in range(3):
+        before = await revision()
+        result = await read_once(fixed_now)
+        after = await revision()
+        if before == after:
+            result["accountingRevision"] = after
+            return result
+    raise UsageQuerySnapshotBusyError(
+        "Usage accounting changed during this query; retry the request"
+    )
+
+
+async def _query_usage_ledger_once(
+    storage: Any,
+    params: Mapping[str, Any] | None,
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+
     resolved = resolve_usage_range(params, now_ms=now_ms)
     include = params.get("include", {}) if isinstance(params, Mapping) else {}
     if not isinstance(include, Mapping):
@@ -909,6 +1271,9 @@ async def query_usage_ledger(
         resolved.to_ms,
         statuses=("finalized", "unknown"),
     )
+    # Storage primary keys already guarantee this; keep adapters/replays from
+    # multiplying the same physical event across any reporting dimension.
+    events = list({_text(_field(event, "event_id")): event for event in events}.values())
     # Partition by status in one pass.  Equality-based list membership here is
     # quadratic for the common all-finalized case and becomes visible at only
     # a few thousand ledger rows.
@@ -923,7 +1288,6 @@ async def query_usage_ledger(
 
     legacy_unattributed = _finish_totals(_new_totals())
     include_legacy = resolved.preset == "all"
-    baseline_totals = _finish_totals(_new_totals())
     residual_session_epochs: set[tuple[str, int]] = set()
     historical_component_conflicts = 0
     crosses_cutover = resolved.from_ms is None or resolved.from_ms < ledger_started_at
@@ -947,9 +1311,7 @@ async def query_usage_ledger(
             <= ledger_started_at
         ]
         if include_legacy:
-            historical_candidates = [
-                event for event in finalized if not _is_live_event(event)
-            ]
+            historical_candidates = [event for event in finalized if not _is_live_event(event)]
         else:
             complete_history = await storage.query_usage_events(
                 None,
@@ -962,7 +1324,7 @@ async def query_usage_ledger(
         (
             trusted_historical,
             reconciled_residual,
-            baseline_totals,
+            _,
             residual_session_epochs,
             historical_component_conflicts,
         ) = _reconcile_historical_events(baselines, historical_candidates)
@@ -974,56 +1336,36 @@ async def query_usage_ledger(
         attributed_events = [
             event
             for event in attributed_events
-            if _is_live_event(event)
-            or _text(_first(event, "event_id", "eventId")) in trusted_ids
+            if _is_live_event(event) or _text(_first(event, "event_id", "eventId")) in trusted_ids
         ]
-        finalized = [
-            event
-            for event in finalized
-            if _is_live_event(event)
-            or _text(_first(event, "event_id", "eventId")) in trusted_ids
-        ]
-        unknown = [event for event in unknown if _is_live_event(event)]
         legacy_unattributed = reconciled_residual
 
-    attributed_totals, _ = _sum_records(attributed_events)
     attributed_session_epochs = {
-        key
-        for event in attributed_events
-        if (key := _session_epoch_key(event))[0]
+        key for event in attributed_events if (key := _session_epoch_key(event))[0]
     }
-    totals = (
-        _add_totals(attributed_totals, legacy_unattributed)
-        if include_legacy
-        else dict(attributed_totals)
-    )
-    if include_legacy:
-        totals["sessionCount"] = len(
-            attributed_session_epochs | residual_session_epochs
-        )
-    if not _cost_components_are_consistent(totals):
-        # Storage constraints and reconciliation should make this unreachable;
-        # preserve the component facts and the public accounting invariant if a
-        # third-party storage adapter supplies inconsistent data.
-        totals["costNanos"] = (
-            _integer(totals.get("billedCostNanos"))
-            + _integer(totals.get("estimatedCostNanos"))
-        )
-        totals = _finish_totals(totals)
-
     event_ids = [
         event_id
         for event in attributed_events
         if (event_id := _text(_first(event, "event_id", "eventId")))
     ]
     items = await storage.query_usage_event_items(event_ids) if event_ids else []
-    items_by_event = _index_items_by_event(attributed_events, items)
+    items_by_event: Mapping[str, Sequence[Any]] = _index_items_by_event(attributed_events, items)
     query_receipts = getattr(storage, "query_usage_item_billing_receipts", None)
-    receipts = (
-        await query_receipts(event_ids)
-        if event_ids and callable(query_receipts)
-        else []
+    receipts = await query_receipts(event_ids) if event_ids and callable(query_receipts) else []
+    query_settlements = getattr(storage, "query_usage_settlements", None)
+    settlements = (
+        await query_settlements(event_ids) if event_ids and callable(query_settlements) else []
     )
+    attributed_events, items_by_event, receipts = apply_current_settlements(
+        attributed_events,
+        items_by_event,
+        receipts,
+        settlements,
+    )
+    attributed_totals, _ = _sum_records(attributed_events)
+    attributed_totals["sessionCount"] = len(attributed_session_epochs)
+    query_metering = getattr(storage, "query_usage_item_metering", None)
+    metering = await query_metering(event_ids) if event_ids and callable(query_metering) else []
     receipts_by_event, receipts_by_item = _index_receipts(
         attributed_events,
         receipts,
@@ -1044,29 +1386,37 @@ async def query_usage_ledger(
         else dict(attributed_totals)
     )
     if include_legacy:
-        totals["sessionCount"] = len(
-            attributed_session_epochs | residual_session_epochs
-        )
+        totals["sessionCount"] = len(attributed_session_epochs | residual_session_epochs)
     totals = _finish_totals(totals)
 
-    session_ids = list(
+    query_attributions = getattr(storage, "query_usage_attributions", None)
+    execution_ids = list(
         dict.fromkeys(
-            session_id
+            _text(_field(event, "execution_id"))
             for event in attributed_events
-            if (session_id := _text(_first(event, "session_id", "sessionId")))
+            if _field(event, "execution_id")
         )
     )
-    session_keys: dict[str, str] = {}
-    resolve_session_keys = getattr(storage, "resolve_usage_session_keys", None)
-    if callable(resolve_session_keys) and session_ids:
-        try:
-            session_keys = await resolve_session_keys(session_ids)
-        except Exception:  # noqa: BLE001 - optional navigation metadata only.
-            session_keys = {}
-
-    backfill_status = _text(
-        _first(state, "backfill_status", "backfillStatus"), "pending"
+    attributions = (
+        await query_attributions(execution_ids)
+        if execution_ids and callable(query_attributions)
+        else {}
     )
+    session_epochs = attributed_session_epochs | {
+        (str(row["root_session_id"]), int(row["root_session_epoch"]))
+        for row in attributions.values()
+    }
+    session_metadata: dict[tuple[str, int], dict[str, str]] = {}
+    resolve_sessions = getattr(storage, "resolve_usage_sessions", None)
+    if callable(resolve_sessions) and session_epochs:
+        try:
+            session_metadata = await resolve_sessions(sorted(session_epochs))
+        except Exception:  # noqa: BLE001 - optional navigation metadata only.
+            session_metadata = {}
+    session_keys = {identity: row["sessionKey"] for identity, row in session_metadata.items()}
+    session_titles = {identity: row["title"] for identity, row in session_metadata.items()}
+
+    backfill_status = _text(_first(state, "backfill_status", "backfillStatus"), "pending")
     anomaly_count = max(
         0,
         _integer(_first(state, "anomaly_count", "anomalyCount", default=0)),
@@ -1115,8 +1465,7 @@ async def query_usage_ledger(
     missing_confirmed_receipt_count = 0
     if native_exact_from_ms is not None:
         attributed_by_id = {
-            _text(_first(event, "event_id", "eventId")): event
-            for event in attributed_events
+            _text(_first(event, "event_id", "eventId")): event for event in attributed_events
         }
         item_event_ids: set[str] = set()
         for item in items:
@@ -1127,10 +1476,14 @@ async def query_usage_ledger(
             occurred_at = _event_time_ms(event) if event is not None else None
             if occurred_at is None or occurred_at < native_exact_from_ms:
                 continue
-            provider = _text(
-                _first(item, "provider", "provider_id", "providerId"),
-                "",
-            ).strip().lower()
+            provider = (
+                _text(
+                    _first(item, "provider", "provider_id", "providerId"),
+                    "",
+                )
+                .strip()
+                .lower()
+            )
             if provider not in _NATIVE_RECEIPT_PROVIDER_IDS:
                 continue
             source = _text(_first(item, "cost_source", "costSource"), "none")
@@ -1156,10 +1509,14 @@ async def query_usage_ledger(
             occurred_at = _event_time_ms(event)
             if occurred_at is None or occurred_at < native_exact_from_ms:
                 continue
-            provider = _text(
-                _first(event, "provider", "provider_id", "providerId"),
-                "",
-            ).strip().lower()
+            provider = (
+                _text(
+                    _first(event, "provider", "provider_id", "providerId"),
+                    "",
+                )
+                .strip()
+                .lower()
+            )
             source = _text(_first(event, "cost_source", "costSource"), "none")
             if provider == "tokenrhythm" or (
                 provider == "openrouter" and source == "provider_billed"
@@ -1198,9 +1555,7 @@ async def query_usage_ledger(
         "coverage": {
             "status": status,
             "timeAttribution": "partial" if time_attribution_partial else "complete",
-            "pricing": (
-                "partial" if totals["missingCostEntries"] else "complete"
-            ),
+            "pricing": ("partial" if totals["missingCostEntries"] else "complete"),
             "exactFromMs": ledger_started_at,
             "backfill": backfill_status,
             "reasonCodes": reasons,
@@ -1245,6 +1600,7 @@ async def query_usage_ledger(
         )
     else:
         payload["models"] = []
+    metering_by_item = {(str(row["event_id"]), int(row["ordinal"])): row for row in metering}
     if include.get("sessions", True):
         payload["sessions"] = _group_sessions(
             attributed_events,
@@ -1252,9 +1608,45 @@ async def query_usage_ledger(
             receipts_by_event,
             receipts_by_item,
             session_keys,
+            attributions,
+            metering_by_item,
         )
     else:
         payload["sessions"] = []
+    payload["taskGroups"], payload["coverage"]["attribution"] = _group_tasks(
+        attributed_events,
+        items_by_event,
+        receipts_by_event,
+        receipts_by_item,
+        session_keys,
+        session_titles,
+        attributions,
+        metering_by_item,
+    )
+    payload["totals"]["taskCount"] = len(payload["taskGroups"])
+    payload["attributedTotals"]["taskCount"] = len(payload["taskGroups"])
+    model_tasks: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for group in payload["taskGroups"]:
+        for model in group["modelBreakdown"]:
+            model_tasks[(model["provider"], model["model"])].add(group["taskGroupId"])
+    for model in payload["models"]:
+        model["taskCount"] = len(model_tasks[(model["provider"], model["model"])])
+    payload["meters"] = summarize_metering(metering)
+    payload["capabilities"] = _capability_rows(
+        attributed_events,
+        metering,
+        items_by_event,
+        receipts_by_event,
+        receipts_by_item,
+    )
+    payload["coverage"]["measurements"] = {
+        "tokenUnknownItemCount": sum(not row.get("token_usage_known", True) for row in metering),
+        "unknownMeterCount": sum(row["unknownCount"] for row in payload["meters"]),
+    }
+    payload["settlementSummary"] = {
+        authority: sum(row["authority"] == authority for row in settlements)
+        for authority in ("provider_confirmed", "provider_estimate", "local_estimate", "unknown")
+    }
     return payload
 
 

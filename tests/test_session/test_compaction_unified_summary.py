@@ -29,7 +29,6 @@ from opensquilla.session.compaction import (
     CompactionRequestContext,
     _api_round_requires_raw,
     _build_suffix_compaction_call,
-    _fit_compaction_input_to_target,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
     call_compaction_provider,
@@ -90,7 +89,7 @@ def test_purpose_config_serializes_without_business_output_constraints(manual):
     assert config.thinking is (not manual)
     assert config.tool_choice == (None if manual else "none")
     assert messages[0].content == source[0]["content"]
-    assert "Summarize the preceding conversation" in messages[-1].content
+    assert "Condense the conversation ABOVE into a structured checkpoint" in messages[-1].content
     assert ordinary.stop_sequences == ["END"] and ordinary.temperature == 0.8
 
 
@@ -499,10 +498,7 @@ async def test_final_kept_image_uses_same_omission_policy_as_initial_count():
 
 
 @pytest.mark.asyncio
-async def test_required_chunks_do_not_consume_an_implicit_two_call_retry_budget(monkeypatch):
-    monkeypatch.setattr(
-        "opensquilla.session.compaction._compaction_target_input_budget", lambda *args: 200
-    )
+async def test_complete_prefix_uses_one_summary_call():
     entries = [
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"Step {i}. " * 100}
         for i in range(12)
@@ -518,8 +514,8 @@ async def test_required_chunks_do_not_consume_an_implicit_two_call_retry_budget(
         )
     )
     assert result.removed_count == 12
-    assert result.chunks_processed == 6
-    assert config.llm_calls_started == 6
+    assert result.chunks_processed == 1
+    assert config.llm_calls_started == 1
     calls = config.llm_plan.primary.provider.calls
     seen = [message.content for messages, _, _ in calls for message in messages[:-1]]
     assert seen == [entry["content"] for entry in entries]
@@ -573,7 +569,7 @@ def test_legacy_attachment_without_text_field_never_sends_storage_json():
 
 
 @pytest.mark.asyncio
-async def test_chunk_packing_preserves_generation_for_character_heavy_history(monkeypatch):
+async def test_bounded_history_preserves_generation_for_character_heavy_history(monkeypatch):
     provider = OpenAIProvider(api_key="synthetic", model="synthetic-model")
     calls = []
 
@@ -614,43 +610,48 @@ async def test_chunk_packing_preserves_generation_for_character_heavy_history(mo
         )
     )
     assert result.removed_count == len(entries)
-    assert len(calls) > 1
+    assert len(calls) == 1
     for messages, tools, config in calls:
         assert config.max_tokens == 4096
         assert provider.project_final_request(messages, tools, config).fits
-    seen = [m.content for messages, _, _ in calls for m in messages[:-1]]
-    assert seen == [entry["content"] for entry in entries]
+    seen = "\n".join(m.content for messages, _, _ in calls for m in messages[:-1])
+    assert "Historical conversation excerpts" in seen
+    assert "omitted" in seen
+    assert "Recorded step 0" in seen and "Completed step 9" in seen
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oversized_checkpoint", [False, True])
-async def test_indivisible_round_revises_only_when_checkpoint_causes_pressure(
+async def test_large_rounds_and_checkpoint_use_identical_bounded_fit_and_send(
     monkeypatch,
     oversized_checkpoint,
 ):
-    from opensquilla import token_estimation
+    import opensquilla.session.compaction as compaction
 
-    class CharacterBudgetEncoding:
-        def encode(self, text, *, disallowed_special):
-            return range((len(text) + 7) // 8)
-
-    # Exercise character-budget pressure with stable cheap tokens. A sticky
-    # tokenizer fallback can otherwise make the source alone exceed capacity,
-    # invalidating the checkpoint-only pressure premise of the True branch.
-    encoding = CharacterBudgetEncoding()
-    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
     provider = OpenAIProvider(api_key="synthetic", model="synthetic-model")
     calls = []
-    large_checkpoint = "Checkpoint. " * 100
-    short_checkpoint = "Recorded work completed; continue remaining tasks."
+    checkpoint = "Previous task state remains relevant. " * (5000 if oversized_checkpoint else 100)
+    original_builder = compaction._build_suffix_compaction_call
+    context = CompactionRequestContext(chat_config=ChatConfig(
+        context_window_tokens=32768, max_tokens=4096,
+    ))
+    built = []
+
+    def record_build(*args, **kwargs):
+        messages, tools, chat_config = original_builder(*args, **kwargs)
+        built.append((kwargs["summary_output_tokens"],
+                      provider.project_final_request(messages, tools, chat_config).payload))
+        return messages, tools, chat_config
 
     async def chat(messages, tools=None, config=None):
         calls.append((messages, tools, config))
-        yield TextDeltaEvent(
-            text=large_checkpoint
-            if oversized_checkpoint and len(calls) == 1
-            else short_checkpoint
-        )
+        payload = provider.project_final_request(messages, tools, config).payload
+        goals = {goal for goal, candidate in built if candidate == payload}
+        expected_goal = 4096
+        assert goals == {expected_goal}
+        assert "do not add detail merely to fill the available budget" in messages[-1].content
+        assert "Aim for at most" not in messages[-1].content
+        yield TextDeltaEvent(text="Recorded work completed; continue remaining tasks.")
         yield DoneEvent()
 
     monkeypatch.setattr(provider, "chat", chat)
@@ -658,75 +659,46 @@ async def test_indivisible_round_revises_only_when_checkpoint_causes_pressure(
         provider=provider,
         provider_id="openai",
         model="synthetic-model",
-        context_window_tokens=6000,
+        context_window_tokens=32768,
         max_output_tokens=4096,
         max_generation_tokens=4096,
         provider_request_max_chars_explicit_cap=0,
     )
-    round_count = 2 if oversized_checkpoint else 3
-    source_chars = 500 if oversized_checkpoint else 1500
+    # The normal path samples oversized source rather than spending one call
+    # per indivisible round. Both sizing and dispatch must see that same view,
+    # including a previous checkpoint that may itself need projection.
     entries = [
         {
             "role": "user" if i % 2 == 0 else "assistant",
-            "content": f"Step {i}: " + "a" * source_chars,
+            "content": f"Step {i}: " + "a" * 131072,
         }
-        for i in range(2 * round_count)
+        for i in range(6)
     ]
     frozen = deepcopy(entries)
     config = CompactionConfig(
         identifier_policy="off",
         llm_plan=CompactionExecutionPlan(candidates=(target,)),
-        request_context=CompactionRequestContext(chat_config=ChatConfig(max_tokens=4096)),
+        request_context=context,
     )
-    request = CompactionRequest(
-        session_id="indivisible-round",
-        entries=entries,
-        context_window_tokens=4000,
-        forced_prefix_cut=len(entries),
-        config=config,
-    )
-
-    def fits(source, checkpoint="", *, reduce_generation=False):
-        # Keep the real serializer, request proof and generation-budget guard.
-        return _fit_compaction_input_to_target(
-            request=request,
-            target=target,
+    monkeypatch.setattr(compaction, "_build_suffix_compaction_call", record_build)
+    result = await compact_context(
+        CompactionRequest(
+            session_id="indivisible-round",
+            entries=entries,
             previous_summary=checkpoint,
-            chunk=source,
-            allow_generation_reduction=reduce_generation,
-        ) is not None
-
-    source_round = entries[:2]
-    if oversized_checkpoint:
-        assert fits(source_round)
-        assert not fits(source_round, large_checkpoint.strip())
-        assert fits(source_round, short_checkpoint)
-        assert fits([], large_checkpoint.strip())
-    else:
-        assert not fits(source_round)
-        assert not fits(source_round, short_checkpoint)
-        assert fits(source_round, reduce_generation=True)
-        assert fits(source_round, short_checkpoint, reduce_generation=True)
-
-    result = await compact_context(request)
-    assert result.chunks_processed == round_count
-    if oversized_checkpoint:
-        # Source alone admits the full allowance: revise the actual oversized
-        # checkpoint once instead of letting it starve the next generation.
-        assert [len(messages) for messages, _, _ in calls] == [3, 1, 3]
-        assert all(chat_config.max_tokens == 4096 for _, _, chat_config in calls)
-    else:
-        # Three indivisible rounds require three calls. Even an empty checkpoint
-        # cannot reserve 4096 output tokens; shortening a tiny one cannot fix it.
-        assert [len(messages) for messages, _, _ in calls] == [3, 3, 3]
-        assert all(0 < chat_config.max_tokens < 4096 for _, _, chat_config in calls)
+            context_window_tokens=32768,
+            forced_prefix_cut=len(entries),
+            config=config,
+        )
+    )
+    assert result.chunks_processed == len(calls) == 1
+    assert all(chat_config.max_tokens == 4096 for _, _, chat_config in calls)
     assert all(
         provider.project_final_request(messages, tools, chat_config).fits
         for messages, tools, chat_config in calls
     )
-    assert [message.content for messages, _, _ in calls for message in messages[:-1]] == [
-        entry["content"] for entry in entries
-    ]
+    assert "omitted" in calls[0][0][0].content
+    assert "<previous-summary>" in calls[0][0][-1].content
     assert result.removed_count == len(entries) and result.kept_entries == []
     assert entries == frozen
 

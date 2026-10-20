@@ -53,6 +53,43 @@ def normalize_image_generation_intent(value: str | None) -> ImageGenerationInten
     return cast(ImageGenerationIntent, normalized)
 
 
+def preserve_image_routing_provenance(
+    previous: GatewayConfig | None,
+    candidate: GatewayConfig,
+    explicit_paths: set[str],
+    *,
+    full_apply: bool = False,
+) -> set[str]:
+    """Preserve untouched route provenance and return explicitly selected paths."""
+
+    if previous is None:
+        return explicit_paths & {"image_generation.primary", "image_generation.binding"}
+    previous_image = previous.image_generation
+    candidate_image = candidate.image_generation
+    full_roundtrip = (
+        full_apply
+        and all(
+            "image_generation." + name in explicit_paths
+            for name in type(candidate_image).model_fields
+        )
+        and candidate_image.model_dump() == previous_image.model_dump()
+    )
+    fields_set = set(candidate_image.model_fields_set)
+    for field in ("primary", "binding"):
+        if (
+            (f"image_generation.{field}" not in explicit_paths or full_roundtrip)
+            and getattr(candidate_image, field) == getattr(previous_image, field)
+        ):
+            if field in previous_image.model_fields_set:
+                fields_set.add(field)
+            else:
+                fields_set.discard(field)
+    object.__setattr__(candidate_image, "__pydantic_fields_set__", fields_set)
+    return set() if full_roundtrip else explicit_paths & {
+        "image_generation.primary", "image_generation.binding",
+    }
+
+
 def image_generation_is_operator_managed(config: GatewayConfig) -> bool:
     """Return whether an image section or environment override is authored.
 
@@ -334,5 +371,6 @@ __all__ = [
     "default_image_generation_intent_for_provider",
     "image_generation_is_operator_managed",
     "normalize_image_generation_intent",
+    "preserve_image_routing_provenance",
     "resolve_image_generation_state",
 ]

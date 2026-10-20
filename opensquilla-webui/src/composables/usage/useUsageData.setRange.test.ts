@@ -7,7 +7,7 @@ import i18n, { loadLocaleMessages, type LocaleCode } from '@/i18n'
 import { useUsageData } from './useUsageData'
 import { requestUsageSnapshot } from './useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
-import { usageSession } from '@/testing/usage.test-helper'
+import { usageSession, usageTotals } from '@/testing/usage.test-helper'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
 import type { Observability } from '@/modules/observability'
 
@@ -115,6 +115,89 @@ afterEach(() => {
 })
 
 describe('useUsageData range selection under concurrent refreshes', () => {
+  it('renders parent rows and counts without adding the raw child projection or changing server money', async () => {
+    const { api, scope } = mountUsageData()
+    scopes.push(scope)
+    const totals = usageTotals({ cost: 0.7, eventCount: 5, sessions: 4, taskCount: 1 })
+    const snapshot = { ...snapshotFor('all'), totals,
+      sessions: [usageSession({ sessionId: 'child', title: 'Assistant chat', costUsd: 0.3 })],
+      taskGroups: [{ taskGroupId: 'task', rootSessionId: 'root', rootSessionEpoch: 1,
+        sessionKey: 'root-key', title: 'Renamed parent', totals, attributionStatus: 'complete',
+        firstUsageAtMs: 100, lastUsageAtMs: 200,
+        modelBreakdown: [{ provider: 'tokenrhythm', model: 'image', costUsd: 0.7,
+          capability: 'image_generation' }],
+        branches: { self: totals, inlineSubagents: usageTotals(), subsessions: usageTotals(),
+          sideChats: usageTotals(), unattributed: usageTotals() }, runs: [] }] }
+    vi.mocked(requestUsageSnapshot).mockResolvedValue(snapshot)
+    await api.loadData()
+    expect(api.sortedRows.value).toHaveLength(1)
+    expect(api.sortedRows.value[0]).toMatchObject({ sessionKey: 'root-key', rowIdentity: 'task:task',
+      sessionLabel: 'Renamed parent', cost: 0.7, hasModelBreakdown: true })
+    expect(api.usageTotals.value.cost).toBe(0.7)
+    expect(api.sessionCountDisplay.value).toBe('1')
+    expect(api.avgCostDisplay.value).toBe('$0.7000')
+    expect(api.tableColumns.value.map(column => column.key)).toEqual([
+      'session', 'updated_at', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'cost_usd', 'model',
+    ])
+
+    vi.mocked(requestUsageSnapshot).mockResolvedValue({ ...snapshot, taskGroups: [],
+      totals: { ...totals, taskCount: 0 } })
+    await api.loadData()
+    expect(api.sortedRows.value).toEqual([])
+    expect(api.sessionCountDisplay.value).toBe('0')
+    expect(api.usageTotals.value.cost).toBe(0.7)
+  })
+
+  it('keeps provider identity, meters and unknown money in expanded session rows', () => {
+    const { api, scope } = mountUsageData()
+    scopes.push(scope)
+    const rows = api.rowBreakdown(usageSession({ modelBreakdown: [
+      { provider: 'elevenlabs', model: 'eleven_flash_v2_5', capability: 'text_to_speech',
+        missingCostEntries: 1, costSource: 'none', costUsd: 0, tokenUnknownItemCount: 1,
+        meters: [{ metric: 'character_credits', unit: 'credit', quantity: '2', dimensions: {}, unknownCount: 0, measurementCount: 1 }] },
+      { model: 'provider/text-model', costUsd: 0.008 },
+    ] }))
+    expect(rows[0]).toMatchObject({ provider: 'elevenlabs', name: 'eleven_flash_v2_5',
+      capability: 'text_to_speech', missingCostEntries: 1, tokenUnknownItemCount: 1,
+      meters: [{ quantity: '2', unit: 'credit' }] })
+    expect(rows[1]).toMatchObject({ provider: 'provider', name: 'text-model', cost: 0.008 })
+  })
+
+  it.each([
+    { name: 'empty legacy totals', legacy: usageTotals(), included: true, shown: false },
+    { name: 'absent legacy totals', legacy: null, included: true, shown: false },
+    { name: 'excluded legacy usage', legacy: usageTotals({ cost: 1 }), included: false, shown: false },
+    { name: 'legacy money', legacy: usageTotals({ cost: 1 }), included: true, shown: true },
+    { name: 'legacy tokens', legacy: usageTotals({ input: 1 }), included: true, shown: true },
+    { name: 'unpriced legacy usage', legacy: usageTotals({ missingCostEntries: 1 }), included: true, shown: true },
+    { name: 'zero-cost legacy calls', legacy: usageTotals({ eventCount: 1 }), included: true, shown: true },
+  ])('shows the pre-ledger notice only for an included residual: $name', async ({ legacy, included, shown }) => {
+    const snapshot = snapshotFor('all')
+    snapshot.coverage.legacyIncludedInTotals = included
+    snapshot.coverage.legacyTotals = legacy
+    vi.mocked(requestUsageSnapshot).mockResolvedValueOnce(snapshot)
+    const { api, scope } = mountUsageData()
+    scopes.push(scope)
+    await api.loadData()
+    expect(api.rangeHiddenHint.value.includes('Pre-ledger usage')).toBe(shown)
+  })
+
+  it('retains the missing-price notice for calls without receipts', async () => {
+    const snapshot = snapshotFor('all')
+    snapshot.totals = usageTotals({
+      eventCount: 11, missingCostEntries: 6,
+      costSourceCounts: { provider_billed: 4, opensquilla_estimate: 1, unavailable: 5, none: 1 },
+    })
+    snapshot.sessions = [usageSession({ sessionId: 'bocha-403-owner', costSource: 'none' })]
+    vi.mocked(requestUsageSnapshot).mockResolvedValueOnce(snapshot)
+    const { api, scope } = mountUsageData()
+    scopes.push(scope)
+    await api.loadData()
+
+    expect(api.rangeHiddenHint.value).toContain('6 calls are unpriced')
+    expect(api.sessionsMeta.value).toBe('1 tasks')
+  })
+
   it('delegates task-title connection ownership to SessionDirectory', async () => {
     vi.mocked(requestUsageSnapshot).mockResolvedValueOnce(snapshotFor('last_7_calendar_days'))
     const { api, directory, scope } = mountUsageData()

@@ -606,7 +606,7 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         ),
         (
             "tests/test_engine/test_compaction_parent_turn_deadline.py",
-            "test_parent_deadline_after_sqlite_commit_does_not_rollback_checkpoint",
+            "test_parent_deadline_after_writer_settles_preserves_actual_commit_outcome",
         ),
         (
             "tests/test_engine/test_compaction_runtime_boundaries.py",

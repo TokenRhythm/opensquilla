@@ -614,6 +614,7 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_key = "user:legacy-protected"
+    context_window = 32_768
     active_user = TranscriptEntry(
         session_id="test-session-id",
         session_key=session_key,
@@ -634,20 +635,22 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
             session_key=session_key,
             role="user",
             content="old user",
-            token_count=600,
+            # Neither historical entry fits alongside the protected request.
+            token_count=context_window,
         ),
         TranscriptEntry(
             session_id="test-session-id",
             session_key=session_key,
             role="assistant",
             content="old assistant",
-            token_count=600,
+            token_count=context_window,
         ),
         active_user,
         queued_user,
     ]
     durable_calls: list[tuple[str, int]] = []
-    manager = MagicMock()
+    # This legacy manager has no optional checkpoint readers or resolver.
+    manager = MagicMock(spec=["compact", "get_transcript"])
     manager.get_transcript = AsyncMock(return_value=transcript)
 
     async def legacy_compact(key: str, window: int) -> str:
@@ -659,7 +662,7 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
 
     prepared_window = await runner._maybe_preflight_compact(
         session_key,
-        1000,
+        context_window,
         history_has_persisted_user=True,
         bound_user_message_id=active_user.message_id,
     )
@@ -881,6 +884,9 @@ async def test_preflight_checkpoint_failure_prevents_destructive_compaction(
         side_effect=RuntimeError("checkpoint write failed") if checkpoint_raises else None,
         return_value=SimpleNamespace(scope="checkpoint", status="checkpoint_failed"),
     )
+    mock_sm.resolve_compaction_context = AsyncMock(return_value=([], False))
+    mock_sm.get_summaries = AsyncMock(return_value=[])
+    mock_sm.get_context_states = AsyncMock(return_value=[])
     mock_sm.compact = AsyncMock(return_value="summary text")
     runner = TurnRunner(
         provider_selector=MagicMock(),
@@ -890,11 +896,12 @@ async def test_preflight_checkpoint_failure_prevents_destructive_compaction(
     expected_error = (
         "checkpoint write failed" if checkpoint_raises else "durable transcript backup"
     )
-    with (
-        patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000),
-        pytest.raises(RuntimeError, match=expected_error),
-    ):
-        await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
+    with patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000):
+        if checkpoint_raises:
+            with pytest.raises(RuntimeError, match=expected_error):
+                await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
+        else:
+            await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
 
     mock_sm.compact.assert_not_called()
 
@@ -1061,8 +1068,10 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["summary_failed", "rate_limited"])
 async def test_preflight_compact_failure_reports_emergency_without_failed_event(
     monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
 ) -> None:
     session_key = "agent:ops:preflight-emergency-event"
     context_window = 1000
@@ -1077,6 +1086,15 @@ async def test_preflight_compact_failure_reports_emergency_without_failed_event(
         for index in range(8)
     ]
     sm = _FailingResultCompactionSessionManager(entries)
+    original_compact = sm.compact_with_result
+
+    async def classified_failure(*args, **kwargs):
+        result = await original_compact(*args, **kwargs)
+        result.failure_kind = failure_kind
+        result.failure_detail = {"http_status": 429} if failure_kind == "rate_limited" else {}
+        return result
+
+    monkeypatch.setattr(sm, "compact_with_result", classified_failure)
     events: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(
         runtime_module,
@@ -1096,6 +1114,7 @@ async def test_preflight_compact_failure_reports_emergency_without_failed_event(
     assert emergency["user_visible"] is True
     assert emergency["reason"] == "summary_failed"
     assert runner._compaction_failures[session_key].count == 2
+    assert runner._compaction_failures[session_key].failure_kind == failure_kind
 
 
 @pytest.mark.asyncio
@@ -1116,7 +1135,7 @@ async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
         )
         for index in range(8)
     ]
-    mock_sm = MagicMock()
+    mock_sm = MagicMock(spec=["compact", "get_transcript"])
     mock_sm.compact = AsyncMock()
     mock_sm.get_transcript = AsyncMock(return_value=entries)
     events: list[tuple[str, dict[str, Any]]] = []
@@ -1426,7 +1445,7 @@ async def test_preflight_compact_called_with_correct_args() -> None:
     """compact() is called with (session_key, context_window_tokens)."""
     entries = [_make_entry("content")]
 
-    mock_sm = MagicMock()
+    mock_sm = MagicMock(spec=["compact", "get_transcript"])
     mock_sm.compact = AsyncMock(return_value="")
     mock_sm.get_transcript = AsyncMock(return_value=entries)
 
@@ -1529,7 +1548,7 @@ async def test_preflight_compaction_circuit_breaker_retries_after_cooldown() -> 
     context_window = 1000
     entries = [_make_entry("a" * 4000)]
 
-    mock_sm = MagicMock()
+    mock_sm = MagicMock(spec=["compact", "get_transcript"])
     async def failed_summary(session_key, window, config=None):
         if config.on_summary_call_started is not None:
             config.on_summary_call_started()

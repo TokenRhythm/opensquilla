@@ -599,6 +599,41 @@ def test_explicit_image_key_persists_when_equal_to_env_value(tmp_path, monkeypat
     assert reloaded.image_generation.providers.openai.api_key == "sk-img-synthetic"
 
 
+@pytest.mark.parametrize("primary", ["", "openai/gpt-image-2.5-flare", "openai/gpt-image-1"])
+@pytest.mark.parametrize("fallbacks", [[], ["openrouter/selected-image-model"]])
+def test_image_provider_save_preserves_selected_route_after_reload(tmp_path, primary, fallbacks):
+    from opensquilla.onboarding.mutations import upsert_image_generation_provider
+    from opensquilla.provider.image_generation_policy import DEFAULT_IMAGE_GENERATION_PRIMARY
+    from opensquilla.tools.builtin import media
+
+    target = tmp_path / "config.toml"
+    target.write_text(
+        '[llm]\nprovider = "openrouter"\napi_key = "synthetic-openrouter-key"\n'
+    )
+    result = upsert_image_generation_provider(
+        load_config(target),
+        provider_id="openai",
+        primary=primary,
+        api_key="synthetic-openai-key",
+        fallbacks=fallbacks,
+    )
+    persist_config(result.config, path=target)
+
+    expected_primary = primary or DEFAULT_IMAGE_GENERATION_PRIMARY
+    saved = tomllib.loads(target.read_text())["image_generation"]
+    assert saved["primary"] == expected_primary
+    assert saved["binding"] == "custom"
+
+    reloaded = load_config(target)
+    media.configure_image_generation(reloaded.image_generation, llm_config=reloaded.llm)
+    try:
+        assert media._resolve_image_generation_candidates(None, reloaded.image_generation) == [
+            expected_primary, *fallbacks,
+        ]
+    finally:
+        media.configure_image_generation(None)
+
+
 # ---------------------------------------------------------------------------
 # A8: boot-time env resolutions of llm.base_url / llm.proxy must not be
 # baked into the file by an unrelated gateway persist (R13).

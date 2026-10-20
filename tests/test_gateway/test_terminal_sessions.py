@@ -644,6 +644,181 @@ async def test_terminal_cancel_during_partial_spawn_cleanup_releases_create_slot
     assert manager._creating == {}
 
 
+@pytest.mark.asyncio
+async def test_terminal_create_finishing_after_gateway_shutdown_is_rejected(
+    tmp_path, monkeypatch
+):
+    handle = _FakeHandle()
+    spawn_started = asyncio.Event()
+    release_spawn = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def delayed_spawn(*args, **kwargs):
+        loop.call_soon_threadsafe(spawn_started.set)
+        assert release_spawn.wait(10)
+        return handle
+
+    async def terminate(value):
+        assert value is handle
+        handle.terminated = True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", delayed_spawn)
+    monkeypatch.setattr(
+        terminal_sessions,
+        "capture_process_tree_owner",
+        lambda *_args, **_kwargs: SimpleNamespace(start_completion_monitor=lambda: None),
+    )
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    manager = terminal_sessions.TerminalManager(send_event=lambda *_args: None)
+    creating = asyncio.create_task(manager.create(
+        conn_id="conn-shutdown-race", session_key="agent:main:webchat:race",
+        workspace_service=_WorkspaceService(tmp_path), cwd="", command="sleep 30",
+        cols=80, rows=24,
+    ))
+    try:
+        await asyncio.wait_for(spawn_started.wait(), timeout=2)
+        await manager.close_all()
+        release_spawn.set()
+        with pytest.raises(terminal_sessions.TerminalSessionError, match="shutting down"):
+            await creating
+    finally:
+        release_spawn.set()
+        await asyncio.gather(creating, return_exceptions=True)
+        await asyncio.gather(*tuple(manager._cleanup_tasks))
+    assert handle.terminated is True
+    assert manager._sessions == {}
+    assert manager._creating == {}
+
+
+@pytest.mark.asyncio
+async def test_terminal_create_finishing_after_connection_close_is_rejected(
+    tmp_path, monkeypatch
+):
+    handle = _FakeHandle()
+    spawn_started = asyncio.Event()
+    release_spawn = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def delayed_spawn(*args, **kwargs):
+        loop.call_soon_threadsafe(spawn_started.set)
+        assert release_spawn.wait(10)
+        return handle
+
+    async def terminate(value):
+        assert value is handle
+        handle.terminated = True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", delayed_spawn)
+    monkeypatch.setattr(
+        terminal_sessions,
+        "capture_process_tree_owner",
+        lambda *_args, **_kwargs: SimpleNamespace(start_completion_monitor=lambda: None),
+    )
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    manager = terminal_sessions.TerminalManager(send_event=lambda *_args: None)
+    creating = asyncio.create_task(manager.create(
+        conn_id="conn-close-race", session_key="agent:main:webchat:race",
+        workspace_service=_WorkspaceService(tmp_path), cwd="", command="sleep 30",
+        cols=80, rows=24,
+    ))
+    try:
+        await asyncio.wait_for(spawn_started.wait(), timeout=2)
+        manager.on_connection_cleanup("conn-close-race")
+        release_spawn.set()
+        with pytest.raises(terminal_sessions.TerminalSessionError, match="shutting down"):
+            await creating
+    finally:
+        release_spawn.set()
+        await asyncio.gather(creating, return_exceptions=True)
+        await asyncio.gather(*tuple(manager._cleanup_tasks))
+    assert handle.terminated is True
+    assert manager._sessions == {}
+    assert manager._creating == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_creates", [1, 2])
+async def test_terminal_closed_connection_fence_survives_history_eviction(
+    tmp_path, monkeypatch, pending_creates
+):
+    handles = [_FakeHandle() for _ in range(pending_creates)]
+    spawn_started = [asyncio.Event() for _ in handles]
+    release_spawn = [threading.Event() for _ in handles]
+    reader_stopped = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def delayed_spawn(command, **kwargs):
+        assert command != "must-not-spawn"
+        index = int(command)
+        loop.call_soon_threadsafe(spawn_started[index].set)
+        assert release_spawn[index].wait(10)
+        return handles[index]
+
+    async def terminate(handle):
+        handle.terminated = True
+        reader_stopped.set()
+
+    async def read(*_args):
+        await reader_stopped.wait()
+        raise EOFError
+
+    async def wait(*_args):
+        return 0
+
+    async def send(*_args):
+        return True
+
+    monkeypatch.setattr(terminal_sessions, "spawn_pty", delayed_spawn)
+    monkeypatch.setattr(
+        terminal_sessions,
+        "capture_process_tree_owner",
+        lambda *_args, **_kwargs: SimpleNamespace(start_completion_monitor=lambda: None),
+    )
+    monkeypatch.setattr(terminal_sessions, "terminate_pty", terminate)
+    monkeypatch.setattr(terminal_sessions, "read_pty", read)
+    monkeypatch.setattr(terminal_sessions, "wait_pty", wait)
+    manager = terminal_sessions.TerminalManager(send_event=send)
+    conn_id = "conn-pending-close"
+    creating = [
+        asyncio.create_task(manager.create(
+            conn_id=conn_id, session_key="agent:main:webchat:race",
+            workspace_service=_WorkspaceService(tmp_path), cwd="", command=str(index),
+            cols=80, rows=24,
+        ))
+        for index in range(pending_creates)
+    ]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(started.wait() for started in spawn_started)), timeout=2,
+        )
+        await manager.close_connection(conn_id)
+        for index in range(terminal_sessions.MAX_CLOSED_TERMINALS):
+            await manager.close_connection(f"conn-history-{index}")
+        assert conn_id not in manager._closing_connections
+        with pytest.raises(terminal_sessions.TerminalSessionError, match="shutting down"):
+            await asyncio.wait_for(manager.create(
+                conn_id=conn_id, session_key="agent:main:webchat:race",
+                workspace_service=_WorkspaceService(tmp_path), cwd="", command="must-not-spawn",
+                cols=80, rows=24,
+            ), timeout=2)
+        for index, task in enumerate(creating):
+            release_spawn[index].set()
+            with pytest.raises(terminal_sessions.TerminalSessionError, match="shutting down"):
+                await task
+            remaining = pending_creates - index - 1
+            assert manager._creating.get(conn_id, 0) == remaining
+            assert manager._closed_creating == ({conn_id} if remaining else set())
+        await asyncio.gather(*tuple(manager._cleanup_tasks))
+        assert all(handle.terminated for handle in handles)
+        assert manager._sessions == {}
+    finally:
+        for release in release_spawn:
+            release.set()
+        await asyncio.gather(*creating, return_exceptions=True)
+        await asyncio.gather(*tuple(manager._cleanup_tasks))
+        await manager.close_all()
+
+
 
 @pytest.mark.asyncio
 async def test_terminal_reader_failure_terminates_live_shell_before_wait(

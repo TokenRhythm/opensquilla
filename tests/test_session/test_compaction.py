@@ -287,7 +287,7 @@ def test_compaction_attachment_descriptor_is_safe_stable_and_not_truncated() -> 
 
 
 @pytest.mark.asyncio
-async def test_durable_attachment_summary_backfills_id_without_media_metadata(
+async def test_durable_attachment_summary_receives_id_without_forced_backfill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     image_data = base64.b64encode(b"durable-image-bytes").decode("ascii")
@@ -346,8 +346,11 @@ async def test_durable_attachment_summary_backfills_id_without_media_metadata(
         },
     ]
 
+    original = deepcopy(entries)
+    seen = []
+
     async def summary_without_attachment(**kwargs):  # noqa: ANN003
-        del kwargs
+        seen.append(_format_chunk_for_llm(kwargs["source_entries"]))
         return "Safe summary without an attachment reference."
 
     monkeypatch.setattr(
@@ -358,7 +361,7 @@ async def test_durable_attachment_summary_backfills_id_without_media_metadata(
         CompactionRequest(
             session_id="session-image",
             entries=entries,
-            context_window_tokens=2_000,
+            context_window_tokens=32_768,
             config=synthetic_compaction_config(
                 model="test/model",
                 api_key="test-key",
@@ -373,11 +376,13 @@ async def test_durable_attachment_summary_backfills_id_without_media_metadata(
     assert result.removed_count == 2
     assert result.summary_payload is not None
     assert result.summary_payload["files_and_artifacts"] == []
-    assert occurrence.attachment_id in result.summary_payload["important_identifiers"]
+    assert entries == original
+    assert occurrence.attachment_id in seen[0]
+    assert result.summary_payload["important_identifiers"] == []
     serialized_payload = json.dumps(result.summary_payload, sort_keys=True)
     replay = compaction_replay_summary(result)
     for rendered in (serialized_payload, replay):
-        assert occurrence.attachment_id in rendered
+        assert occurrence.attachment_id not in rendered
         assert image_data not in rendered
         assert "/private/tmp" not in rendered
         assert "not-an-occurrence-id" not in rendered
@@ -423,8 +428,14 @@ async def test_compaction_preserves_only_verified_readable_image_paths(
         workspace_dir=workspace,
     )
     received: list[str] = []
+    source_paths: set[str] = set()
 
     async def summarize_without_paths(**kwargs):
+        source_paths.update(
+            path
+            for entry in kwargs["source_entries"]
+            for path in entry.get("_compaction_image_paths", {}).values()
+        )
         received.append(
             _format_chunk_for_llm(kwargs["source_entries"])
             + str(kwargs.get("previous_summary") or "")
@@ -439,7 +450,7 @@ async def test_compaction_preserves_only_verified_readable_image_paths(
         CompactionRequest(
             session_id=session_id,
             entries=entries,
-            context_window_tokens=4_000,
+            context_window_tokens=32_768,
             config=(synthetic_compaction_config if use_llm else CompactionConfig)(
                 model="synthetic-model" if use_llm else None,
                 api_key="synthetic-key" if use_llm else "",
@@ -462,17 +473,19 @@ async def test_compaction_preserves_only_verified_readable_image_paths(
     assert result.removed_count == 2
     assert entries == original
     assert result.summary_payload is not None
-    paths = [item["path"] for item in result.summary_payload["files_and_artifacts"]]
     if retention == "available":
-        assert len(paths) == 1
-        path = paths[0]
+        assert len(source_paths) == 1
+        [path] = source_paths
+        assert result.summary_payload["files_and_artifacts"] == [
+            {"path": path, "provenance": "verified_attachment"},
+        ]
         assert path.startswith(f".opensquilla/attachments/{session_id}/")
         assert native_io_path(workspace / path).read_bytes() == payload
+        assert path in received[0]
         assert path in compaction_replay_summary(result)
-        if use_llm:
-            assert path in received[0]
     else:
-        assert paths == []
+        assert result.summary_payload["files_and_artifacts"] == []
+        assert source_paths == set()
         assert not (workspace / ".opensquilla").exists()
     for rendered in [*received, compaction_replay_summary(result)]:
         assert attachment.get("data", "omitted-base64-placeholder") not in rendered
@@ -528,8 +541,14 @@ async def test_compaction_keeps_original_document_path_when_images_are_not_retai
     original = deepcopy(entries)
     materializer = AttachmentWorkspaceMaterializer(media_root=media_root, workspace_dir=workspace)
     seen = []
+    source_paths: set[str] = set()
 
     async def summarize(**kwargs):
+        source_paths.update(
+            path
+            for entry in kwargs["source_entries"]
+            for path in entry.get("_compaction_image_paths", {}).values()
+        )
         seen.append(
             _format_chunk_for_llm(kwargs["source_entries"])
             + str(kwargs.get("previous_summary") or "")
@@ -541,7 +560,7 @@ async def test_compaction_keeps_original_document_path_when_images_are_not_retai
         CompactionRequest(
             session_id="file-session",
             entries=entries,
-            context_window_tokens=4_000,
+            context_window_tokens=32_768,
             config=synthetic_compaction_config(
                 model="synthetic-model",
                 api_key="synthetic-key",
@@ -556,9 +575,11 @@ async def test_compaction_keeps_original_document_path_when_images_are_not_retai
     assert result.removed_count == 2
     assert result.summary_payload is not None
     assert entries == original
-    paths = [item["path"] for item in result.summary_payload["files_and_artifacts"]]
-    assert len(paths) == 1
-    path = paths[0]
+    assert len(source_paths) == 1
+    [path] = source_paths
+    assert result.summary_payload["files_and_artifacts"] == [
+        {"path": path, "provenance": "verified_attachment"},
+    ]
     assert path.startswith(".opensquilla/attachments/file-session/")
     assert native_io_path(workspace / path).read_bytes() == payload
     assert path in seen[0]
@@ -597,7 +618,6 @@ def test_compaction_image_path_resolution_only_reads_user_envelopes() -> None:
 @pytest.mark.parametrize("retention", ["available", "disabled", "missing", "invalid"])
 async def test_compaction_preserves_verified_tool_image_path(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     retention: str,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -636,30 +656,31 @@ async def test_compaction_preserves_verified_tool_image_path(
         media_root=tmp_path / "media",
         workspace_dir=workspace,
     )
-    seen = []
+    source_paths: set[str] = set()
 
-    async def summarize(**kwargs):
-        seen.append(
-            _format_chunk_for_llm(kwargs["source_entries"])
-            + str(kwargs.get("previous_summary") or "")
-        )
-        return "The downloaded image was discussed."
+    def resolve(attachment, session_id):
+        path = materializer.materialize_image_path(attachment, session_id)
+        if path:
+            source_paths.add(path)
+        return path
 
-    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_provider", summarize)
     config = synthetic_compaction_config(
+        summary="The downloaded image was discussed.",
         model="synthetic-model",
         api_key="synthetic-key",
         safety_margin=1.0,
         protected_recent_messages=2,
+        preserve_historical_images=False,
         attachment_path_resolver=(
-            materializer.materialize_image_path if retention != "disabled" else None
+            resolve if retention != "disabled" else None
         ),
     )
+    provider = config.llm_plan.candidates[0].provider
     first = await compact_context(
         CompactionRequest(
             session_id="tool-image-session",
             entries=entries,
-            context_window_tokens=4_000,
+            context_window_tokens=32_768,
             config=config,
             forced_prefix_cut=2,
             trigger="message_count",
@@ -668,12 +689,21 @@ async def test_compaction_preserves_verified_tool_image_path(
     assert first.removed_count == 2
     assert entries == original
     assert first.summary_payload is not None
-    paths = [item["path"] for item in first.summary_payload["files_and_artifacts"]]
+    seen = [
+        json.dumps([message.model_dump(mode="json") for message in messages], ensure_ascii=False)
+        for messages, _tools, _config in provider.calls
+    ]
+    assert seen
     if retention == "available":
-        assert len(paths) == 1
-        path = paths[0]
+        assert len(source_paths) == 1
+        [path] = source_paths
+        assert first.summary_payload["files_and_artifacts"] == [
+            {"path": path, "provenance": "verified_attachment"},
+        ]
         assert path.startswith(".opensquilla/attachments/tool-image-session/")
         assert native_io_path(workspace / path).read_bytes() == payload
+        assert path in seen[0]
+        assert path in compaction_replay_summary(first)
         second = await compact_context(
             CompactionRequest(
                 session_id="tool-image-session",
@@ -682,16 +712,27 @@ async def test_compaction_preserves_verified_tool_image_path(
                     {"role": "user", "content": "Next.", "token_count": 5},
                     {"role": "assistant", "content": "Next step.", "token_count": 5},
                 ],
-                context_window_tokens=4_000,
+                context_window_tokens=32_768,
                 config=config,
                 previous_summary=compaction_replay_summary(first),
+                previous_attachment_paths=(path,),
                 forced_prefix_cut=2,
                 trigger="message_count",
             )
         )
+        assert second.removed_count == 2
+        assert second.summary_payload["files_and_artifacts"] == [
+            {"path": path, "provenance": "verified_attachment"},
+        ]
         assert path in compaction_replay_summary(second)
+        assert first.summary in json.dumps(
+            [message.model_dump(mode="json") for message in provider.calls[-1][0]],
+            ensure_ascii=False,
+        )
+        assert native_io_path(workspace / path).read_bytes() == payload
     else:
-        assert paths == []
+        assert first.summary_payload["files_and_artifacts"] == []
+        assert source_paths == set()
         assert not (workspace / ".opensquilla").exists()
     for text in [*seen, compaction_replay_summary(first)]:
         assert data not in text
@@ -699,7 +740,7 @@ async def test_compaction_preserves_verified_tool_image_path(
 
 
 @pytest.mark.parametrize("use_llm", [False, True])
-async def test_repeated_compaction_preserves_image_path_without_active_image_envelope(
+async def test_repeated_compaction_passes_model_retained_image_path_to_next_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     use_llm: bool,
@@ -712,6 +753,7 @@ async def test_repeated_compaction_preserves_image_path_without_active_image_env
         workspace_dir=workspace,
     )
     resolved = []
+    seen = []
 
     def resolve(attachment, current_session_id):
         path = materializer.materialize_image_path(attachment, current_session_id)
@@ -719,6 +761,12 @@ async def test_repeated_compaction_preserves_image_path_without_active_image_env
         return path
 
     async def summarize_without_paths(**kwargs):
+        seen.append(
+            _format_chunk_for_llm(kwargs["source_entries"])
+            + str(kwargs.get("previous_summary") or "")
+        )
+        if len(seen) == 1 and resolved:
+            return f"Earlier image remains at {resolved[0]}; continue."
         return "Earlier work was discussed; continue."
 
     monkeypatch.setattr(
@@ -756,7 +804,7 @@ async def test_repeated_compaction_preserves_image_path_without_active_image_env
         CompactionRequest(
             session_id=session_id,
             entries=entries,
-            context_window_tokens=4_000,
+            context_window_tokens=32_768,
             config=config,
             forced_prefix_cut=2,
             trigger="message_count",
@@ -781,7 +829,7 @@ async def test_repeated_compaction_preserves_image_path_without_active_image_env
         CompactionRequest(
             session_id=session_id,
             entries=active_entries,
-            context_window_tokens=4_000,
+            context_window_tokens=32_768,
             config=config,
             previous_summary=compaction_replay_summary(first),
             forced_prefix_cut=2,
@@ -792,8 +840,10 @@ async def test_repeated_compaction_preserves_image_path_without_active_image_env
     assert second.removed_count == 2
     assert resolved == [path]
     assert second.summary_payload is not None
-    assert path in [item["path"] for item in second.summary_payload["files_and_artifacts"]]
-    assert path in compaction_replay_summary(second)
+    assert path in seen[0]
+    assert path in seen[-1]
+    assert second.summary_payload["files_and_artifacts"] == []
+    assert path not in compaction_replay_summary(second)
     assert native_io_path(workspace / path).read_bytes() == payload
 
 
@@ -908,13 +958,19 @@ async def test_nested_tool_result_images_are_projected_out_of_compaction(
     assert result.summary_payload is not None
     serialized_payload = json.dumps(result.summary_payload, sort_keys=True)
     replay = compaction_replay_summary(result)
+    for projected_input in (llm_projection, *captured_chunks):
+        assert "image omitted from compaction input" in projected_input
+    # Coverage is diagnostic: the renderer must not append a second,
+    # code-generated semantic summary to otherwise valid model prose.
+    assert result.summary_payload["current_status"] == (
+        "The tool returned an image for inspection."
+    )
     for rendered in (
         llm_projection,
         *captured_chunks,
         serialized_payload,
         replay,
     ):
-        assert "image omitted from compaction input" in rendered
         assert image_data not in rendered
         assert image_path not in rendered
         assert "/private/tmp" not in rendered
@@ -1642,12 +1698,7 @@ async def test_compaction_source_is_llm_when_all_chunks_use_llm():
 
 
 @pytest.mark.asyncio
-async def test_multichunk_compaction_reuses_remaining_absolute_budget(monkeypatch):
-    monkeypatch.setattr(
-        "opensquilla.session.compaction._chunk_entries",
-        lambda entries, *args, **kwargs: [entries[:2], entries[2:]],
-    )
-
+async def test_compaction_recovery_reuses_remaining_absolute_budget(monkeypatch):
     class Clock:
         now = 100.0
 
@@ -1671,8 +1722,6 @@ async def test_multichunk_compaction_reuses_remaining_absolute_budget(monkeypatc
         api_key="test-key",
         timeout_seconds=90.0,
         total_timeout_seconds=10.0,
-        base_chunk_ratio=0.1,
-        min_chunk_ratio=0.1,
     )
 
     with pytest.raises(CompactionTimeoutError) as exc_info:
@@ -1682,6 +1731,7 @@ async def test_multichunk_compaction_reuses_remaining_absolute_budget(monkeypatc
                 entries=_make_entries(30, tokens_each=200),
                 context_window_tokens=500,
                 config=config,
+                consumer_admission=lambda *_: False,
             )
         )
 
@@ -1694,30 +1744,36 @@ async def test_multichunk_compaction_reuses_remaining_absolute_budget(monkeypatc
 
 @pytest.mark.asyncio
 async def test_partial_summary_failure_preserves_the_complete_source(monkeypatch):
-    monkeypatch.setattr(
-        "opensquilla.session.compaction._chunk_entries",
-        lambda entries, *args, **kwargs: [entries[:2], entries[2:]],
-    )
-    responses = ["LLM summary", None]
+    calls = []
 
     async def fake_llm(**kwargs):
-        return responses.pop(0) if responses else "LLM summary"
+        calls.append(kwargs)
+        return "LLM summary" if len(calls) == 1 else None
 
     monkeypatch.setattr("opensquilla.session.compaction.call_compaction_provider", fake_llm)
+    monkeypatch.setattr(
+        "opensquilla.session.compaction._find_turn_boundary_cut", lambda *args, **kwargs: 2,
+    )
     entries = _make_entries(12, tokens_each=200)
 
     result = await compact_context(
         CompactionRequest(
             session_id="s1",
             entries=entries,
-            context_window_tokens=500,
+            context_window_tokens=2400,
             config=synthetic_compaction_config(model="test/model", api_key="test-key"),
+            consumer_admission=lambda *_: False,
         )
     )
 
     assert result.removed_count == 0
     assert result.kept_entries == entries
     assert result.skip_reason == "summary_failed"
+    assert len(calls) == 3
+    assert calls[0]["source_entries"] == entries[:2]
+    assert calls[1]["source_entries"] == []  # Failed checkpoint revision.
+    assert calls[2]["source_entries"] == entries[2:4]  # Failed additional-source replan.
+    assert "LLM summary" in calls[2]["previous_summary"]
 
 
 @pytest.mark.asyncio

@@ -93,8 +93,8 @@ async def test_new_avoids_mid_turn_cut():
     # and tool result but split it from its 200-token assistant call. The
     # completed tool round must instead move wholly into the summary.
     entries = [
-        {"role": "user", "content": "Earlier request.", "token_count": 1_000},
-        {"role": "assistant", "content": "Earlier answer.", "token_count": 1_000},
+        {"role": "user", "content": "Earlier request details. " * 200, "token_count": 1_000},
+        {"role": "assistant", "content": "Earlier answer details. " * 200, "token_count": 1_000},
         {"role": "user", "content": "q1", "token_count": 200},
         {
             "role": "assistant",

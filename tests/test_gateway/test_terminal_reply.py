@@ -255,17 +255,24 @@ def test_attachment_capacity_failure_preserves_action_without_private_details(
     assert "task failed" not in reply
 
 
-def test_reasoning_only_output_budget_empty_response_reply_is_actionable_and_stable() -> None:
+@pytest.mark.parametrize("budget", ["configured", "available"])
+def test_reasoning_only_output_budget_empty_response_reply_is_actionable_and_stable(
+    budget: str,
+) -> None:
+    engine_message = (
+        f"The provider used the {budget} output budget for reasoning without "
+        "returning a visible answer. Increase llm.max_tokens or choose another "
+        "model or provider."
+    )
+    assert safe_provider_failure_message(
+        "empty_response", code="empty_response", message=engine_message,
+    ) == engine_message
     reply = build_terminal_reply(
         {
             "status": "failed",
             "terminal_reason": "error",
             "error_class": "empty_response",
-            "error_message": (
-                "The provider used the configured output budget for reasoning without "
-                "returning a visible answer. Increase llm.max_tokens or choose another "
-                "model or provider."
-            ),
+            "error_message": engine_message,
         }
     )
 
@@ -273,6 +280,22 @@ def test_reasoning_only_output_budget_empty_response_reply_is_actionable_and_sta
         "The model used its output budget for reasoning without returning a visible answer. "
         "Increase llm.max_tokens or choose another model or provider."
     )
+
+
+@pytest.mark.parametrize("budget", ["configured", "available"])
+def test_reasoning_budget_allowlist_rejects_upstream_suffix(budget: str) -> None:
+    message = (
+        f"The provider used the {budget} output budget for reasoning without "
+        "returning a visible answer. Increase llm.max_tokens or choose another "
+        "model or provider. Synthetic untrusted upstream detail."
+    )
+
+    assert safe_provider_failure_message(
+        "empty_response", code="empty_response", message=message,
+    ) == "The model provider returned an empty response."
+    assert build_terminal_reply({
+        "status": "failed", "error_class": "empty_response", "error_message": message,
+    }) == "The task failed before it could finish."
 
 
 def test_reasoning_only_empty_response_reply_is_actionable_and_stable() -> None:

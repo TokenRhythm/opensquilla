@@ -140,12 +140,28 @@ async def test_auxiliary_chat_done_is_accounted_once(
     [_dream_completion, _media_completion],
 )
 @pytest.mark.parametrize("provider_id", ["custom", "custom_anthropic"])
-async def test_auxiliary_chat_accounts_configured_generic_custom_identity(
+@pytest.mark.parametrize(
+    "price_fields",
+    [
+        None,
+        {"input_cost_per_mtok": 0.0},
+        {"input_cost_per_mtok": 0.0, "output_cost_per_mtok": 0.0},
+    ],
+)
+async def test_auxiliary_chat_distinguishes_missing_price_from_explicit_zero(
     monkeypatch: pytest.MonkeyPatch,
     runner: Callable[[Any], Awaitable[str]],
     provider_id: str,
+    price_fields: dict[str, float] | None,
 ) -> None:
+    from opensquilla.provider.model_catalog import ModelCatalog
+
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    catalog = ModelCatalog()
+    if price_fields is not None:
+        catalog.set_user_overrides({f"{provider_id}/gpt-4.1": price_fields})
+    monkeypatch.setattr("opensquilla.provider.model_catalog.shared_catalog", lambda: catalog)
+    priced = price_fields is not None and "output_cost_per_mtok" in price_fields
     sink = _RecordingSink()
     provider = _ConfiguredGenericCustomStreamProvider(
         [
@@ -164,9 +180,12 @@ async def test_auxiliary_chat_accounts_configured_generic_custom_identity(
     assert call.provider == provider_id
     assert item.provider == provider_id
     assert result.estimated_cost_nanos == 0
-    assert result.cost_source == "free"
-    assert result.estimate_basis == "free"
-    assert result.price_source == "custom_free"
+    assert result.cost_source == ("free" if priced else "unavailable")
+    assert result.estimate_basis == ("free" if priced else None)
+    assert result.price_source == ("user_override" if priced else "custom_free")
+    assert (item.price_snapshot is not None) is priced
+    assert item.settlement.authority == ("local_estimate" if priced else "unknown")
+    assert item.settlement.native_amount == ("0" if priced else None)
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,11 @@ import httpx
 
 from opensquilla.env import trust_env
 from opensquilla.provider.error_redaction import redact_upstream_error_text, redacted_httpx_error
+from opensquilla.provider.media_jobs import (
+    accounted_video_submission,
+    observe_video_job,
+    video_job_needs_settlement,
+)
 from opensquilla.provider.video_generation import (
     VideoGenerationError,
     VideoGenerationPending,
@@ -116,6 +121,7 @@ def _validate_request(
     return duration if duration is not None else 5
 
 
+@accounted_video_submission("tokenrhythm")
 async def _submit(
     client: httpx.AsyncClient,
     *,
@@ -192,6 +198,47 @@ async def _submit(
     return job_id
 
 
+async def _get_job(
+    client: httpx.AsyncClient, *, api_root: str, api_key: str, job_id: str, deadline: float
+) -> dict[str, object]:
+    try:
+        async with asyncio.timeout(_remaining(deadline, job_id=job_id)):
+            async with client.stream(
+                "GET",
+                f"{api_root}/videos/{job_id}",
+                headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+            ) as response:
+                if response.status_code != 200:
+                    if response.status_code in _TRANSIENT_HTTP:
+                        raise VideoGenerationPending(
+                            f"Video job {job_id} status is temporarily unavailable",
+                            job_id=job_id,
+                        )
+                    raise VideoGenerationError(
+                        f"TokenRhythm video status returned HTTP {response.status_code}",
+                        job_id=job_id,
+                    )
+                try:
+                    payload = await _read_json(response)
+                except VideoGenerationError as exc:
+                    raise VideoGenerationPending(str(exc), job_id=job_id) from None
+    except httpx.HTTPError as exc:
+        redacted_httpx_error(exc, api_key=api_key)
+        raise VideoGenerationPending(
+            f"Video job {job_id} status is temporarily unavailable", job_id=job_id
+        ) from None
+    except TimeoutError:
+        raise VideoGenerationPending(
+            f"Video job {job_id} is still pending; check it again using its job ID",
+            job_id=job_id,
+        ) from None
+    if "id" in payload and payload["id"] != job_id:
+        raise VideoGenerationError(
+            "TokenRhythm video status returned a different task", job_id=job_id
+        )
+    return payload
+
+
 async def _poll_until_complete(
     client: httpx.AsyncClient,
     *,
@@ -202,49 +249,21 @@ async def _poll_until_complete(
     poll_interval_seconds: float,
 ) -> str:
     while True:
-        try:
-            async with asyncio.timeout(_remaining(deadline, job_id=job_id)):
-                async with client.stream(
-                    "GET",
-                    f"{api_root}/videos/{job_id}",
-                    headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-                ) as response:
-                    if response.status_code != 200:
-                        if response.status_code in _TRANSIENT_HTTP:
-                            raise VideoGenerationPending(
-                                f"Video job {job_id} status is temporarily unavailable",
-                                job_id=job_id,
-                            )
-                        raise VideoGenerationError(
-                            f"TokenRhythm video status returned HTTP {response.status_code}",
-                            job_id=job_id,
-                        )
-                    try:
-                        payload = await _read_json(response)
-                    except VideoGenerationError as exc:
-                        raise VideoGenerationPending(str(exc), job_id=job_id) from None
-        except httpx.HTTPError as exc:
-            redacted_httpx_error(exc, api_key=api_key)
-            raise VideoGenerationPending(
-                f"Video job {job_id} status is temporarily unavailable", job_id=job_id
-            ) from None
-        except TimeoutError:
-            raise VideoGenerationPending(
-                f"Video job {job_id} is still pending; check it again using its job ID",
-                job_id=job_id,
-            ) from None
-        if "id" in payload and payload["id"] != job_id:
-            raise VideoGenerationError(
-                "TokenRhythm video status returned a different task", job_id=job_id
-            )
+        payload = await _get_job(
+            client, api_root=api_root, api_key=api_key, job_id=job_id, deadline=deadline
+        )
         status = str(payload.get("status") or "").lower()
         result = payload.get("result")
         url = result.get("url") if isinstance(result, dict) else None
         if status in {"succeeded", "completed", "success"}:
+            await observe_video_job("tokenrhythm", api_root, job_id, payload, api_key=api_key)
             if not isinstance(url, str) or not url:
                 raise VideoGenerationPending("TokenRhythm video has no download URL", job_id=job_id)
             return url
         if status in {"failed", "cancelled", "canceled", "expired"}:
+            await observe_video_job(
+                "tokenrhythm", api_root, job_id, payload, api_key=api_key, outcome="failed"
+            )
             reason = payload.get("message") or payload.get("error")
             safe_reason = (
                 redact_upstream_error_text(reason, api_key=api_key)
@@ -297,6 +316,45 @@ async def _complete_job(
         bytes_written=bytes_written,
         provider="tokenrhythm",
     )
+
+
+async def refresh_tokenrhythm_video_billing(*, base_url: str, api_key: str, job_id: str) -> None:
+    """Refresh a delivered job's delayed bill with one status GET, never a submission."""
+    api_root = _api_root(base_url)
+    secret = clean_header_secret(api_key, label="TokenRhythm video API key")
+    safe_job_id = _safe_task_id(job_id)
+    if not secret or not await video_job_needs_settlement(
+        "tokenrhythm", api_root, safe_job_id, api_key=secret
+    ):
+        return
+    async with httpx.AsyncClient(
+        timeout=None, trust_env=trust_env(), follow_redirects=False
+    ) as client:
+        payload = await _get_job(
+            client,
+            api_root=api_root,
+            api_key=secret,
+            job_id=safe_job_id,
+            deadline=time.monotonic() + 10.0,
+        )
+    status = str(payload.get("status") or "").lower()
+    if status in {
+        "succeeded",
+        "completed",
+        "success",
+        "failed",
+        "cancelled",
+        "canceled",
+        "expired",
+    }:
+        await observe_video_job(
+            "tokenrhythm",
+            api_root,
+            safe_job_id,
+            payload,
+            api_key=secret,
+            outcome="completed" if status in {"succeeded", "completed", "success"} else "failed",
+        )
 
 
 async def generate_tokenrhythm_video(

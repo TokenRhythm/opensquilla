@@ -18,7 +18,7 @@ from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolStart
-from opensquilla.provider import video_generation
+from opensquilla.provider import media_jobs, video_generation
 from opensquilla.tools.builtin import media
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.policy_runtime import ToolSurfaceCapabilities, resolve_runtime_tool_surface
@@ -30,6 +30,14 @@ _KEY = "synthetic-video-key"
 _MODEL = "google/veo-3.1-fast"
 _BASE = "https://openrouter.ai/api/v1"
 _MP4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_video_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeated synthetic IDs must not restore a previous test's receipt."""
+    monkeypatch.setattr(media, "_video_job_sessions", {})
+    monkeypatch.setattr(media_jobs, "_volatile", {})
+    monkeypatch.setattr(media_jobs, "_observation_locks", {})
 
 
 class _VideoToolProvider:
@@ -125,7 +133,6 @@ async def test_accepted_video_survives_real_turn_cancellation_and_resumes_withou
     ending: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", _KEY)
-    monkeypatch.setattr(media, "_video_job_sessions", {})
     config = VideoGenerationConfig(enabled=True, primary=_MODEL)
     # Shorten the provider deadline for the pending control without changing
     # the settings contract or relying on a slow external service.
@@ -244,7 +251,6 @@ async def test_stop_during_video_publication_settles_once_before_concurrent_stat
     tool_name: str, repeat_stop: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", _KEY)
-    monkeypatch.setattr(media, "_video_job_sessions", {})
     media.configure_video_generation(VideoGenerationConfig(enabled=True, primary=_MODEL))
     transport = _VideoHTTP()
     original_client = httpx.AsyncClient

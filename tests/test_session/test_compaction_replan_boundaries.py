@@ -6,6 +6,7 @@ from dataclasses import replace
 import pytest
 
 from opensquilla.session.compaction import CompactionRequest, compact_context
+from opensquilla.session.tokenizer import estimate_tokens
 from tests.helpers.compaction import synthetic_compaction_config
 
 
@@ -41,9 +42,13 @@ async def test_replan_keeps_unfinished_tool_round_raw(monkeypatch, status):
         "opensquilla.session.compaction._find_turn_boundary_cut", lambda *a, **k: 2,
     )
     cfg = synthetic_compaction_config(summary="A complete checkpoint.")
+    # This is the consumer's history allocation, not its model window. Leave
+    # a positive body goal after the deliberately small first cut; the stricter
+    # consumer admission below must be what exercises incremental replanning.
+    history_budget = sum(estimate_tokens(entry["content"]) for entry in entries)
     result = await compact_context(CompactionRequest(
         session_id="replan-live", entries=entries, config=cfg,
-        context_window_tokens=2000, consumer_admission=lambda _, kept: len(kept) <= 3,
+        context_window_tokens=history_budget, consumer_admission=lambda _, kept: len(kept) <= 3,
     ))
     assert result.quality_report["replan_count"] > 0
     assert result.removed_count == 8 and result.kept_entries == entries[8:]
@@ -68,9 +73,10 @@ async def test_replan_keeps_original_call_limit_and_deadline(monkeypatch):
         summary="A complete checkpoint.", protected_recent_messages=4,
     )
     cfg.llm_plan = replace(cfg.llm_plan, max_calls=2)
+    history_budget = sum(estimate_tokens(entry["content"]) for entry in entries)
     result = await compact_context(CompactionRequest(
         session_id="replan-budget", entries=entries, config=cfg,
-        context_window_tokens=2000, previous_summary="Prior checkpoint.",
+        context_window_tokens=history_budget, previous_summary="Prior checkpoint.",
         consumer_admission=lambda *_: False,
     ))
     calls = cfg.llm_plan.primary.provider.calls

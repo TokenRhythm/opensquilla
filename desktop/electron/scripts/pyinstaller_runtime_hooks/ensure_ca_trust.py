@@ -1,4 +1,4 @@
-"""Restore a usable default CA store in the frozen Desktop gateway."""
+"""Configure packaged trust and offline tokenizer assets for the frozen gateway."""
 
 from __future__ import annotations
 
@@ -85,6 +85,22 @@ def ensure_frozen_default_ca_trust() -> None:
     if not fallback_is_usable:
         raise RuntimeError(_PACKAGING_ERROR)
 
+
+def ensure_frozen_tokenizer_cache() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+    # Presence matters: an empty explicit cache setting disables caching.
+    if any(name in os.environ for name in ("TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR")):
+        return
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root is None:
+        return
+    cache = Path(bundle_root) / "tiktoken-cache"
+    if cache.is_dir():
+        os.environ["TIKTOKEN_CACHE_DIR"] = os.fspath(cache)
+
+
+ensure_frozen_tokenizer_cache()
 
 _ca_started = _startup_timing.startup_phase_start("frozen_ca_trust") if _startup_timing else None
 try:

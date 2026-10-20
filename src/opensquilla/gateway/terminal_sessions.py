@@ -115,7 +115,20 @@ class TerminalManager:
         self._lock = asyncio.Lock()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_connections: set[str] = set()
+        self._closing_connections: OrderedDict[str, None] = OrderedDict()
+        self._closed_creating: set[str] = set()
         self._creating: dict[str, int] = {}
+        self._closing = False
+
+    def _remember_closing_connection(self, conn_id: str) -> None:
+        # A native spawn may outlive the bounded connection history. Retain its
+        # close fence until every in-flight create releases its admission slot.
+        if conn_id in self._creating:
+            self._closed_creating.add(conn_id)
+        self._closing_connections[conn_id] = None
+        self._closing_connections.move_to_end(conn_id)
+        while len(self._closing_connections) > MAX_CLOSED_TERMINALS:
+            self._closing_connections.popitem(last=False)
 
     def _owned(self, terminal_id: str, conn_id: str) -> TerminalSession:
         session = self._sessions.get(terminal_id)
@@ -175,12 +188,14 @@ class TerminalManager:
         """Schedule one bounded close for every terminal owned by a socket."""
 
         self._cleanup_connections.discard(conn_id)
+        self._remember_closing_connection(conn_id)
         self.schedule_close_connection(conn_id)
 
     def _release_create_slot(self, conn_id: str) -> None:
         pending = self._creating.get(conn_id, 0)
         if pending <= 1:
             self._creating.pop(conn_id, None)
+            self._closed_creating.discard(conn_id)
         else:
             self._creating[conn_id] = pending - 1
 
@@ -198,6 +213,14 @@ class TerminalManager:
         output_flow_control: bool = False,
     ) -> dict[str, Any]:
         async with self._lock:
+            if (
+                self._closing
+                or conn_id in self._closing_connections
+                or conn_id in self._closed_creating
+            ):
+                raise TerminalSessionError(
+                    "TERMINAL_CLOSED", "Gateway terminal sessions are shutting down"
+                )
             owned_count = sum(1 for item in self._sessions.values() if item.conn_id == conn_id)
             creating_count = self._creating.get(conn_id, 0)
             if owned_count + creating_count >= MAX_TERMINALS_PER_CONNECTION:
@@ -313,6 +336,14 @@ class TerminalManager:
                 # Recheck after the potentially slow native spawn. A
                 # concurrent create cannot use the race to exceed the
                 # per-connection bound.
+                if (
+                    self._closing
+                    or conn_id in self._closing_connections
+                    or conn_id in self._closed_creating
+                ):
+                    raise TerminalSessionError(
+                        "TERMINAL_CLOSED", "Gateway terminal sessions are shutting down"
+                    )
                 owned_count = sum(1 for item in self._sessions.values() if item.conn_id == conn_id)
                 if owned_count >= MAX_TERMINALS_PER_CONNECTION:
                     raise TerminalSessionError(
@@ -599,12 +630,20 @@ class TerminalManager:
         task.add_done_callback(self._cleanup_tasks.discard)
 
     async def close_connection(self, conn_id: str) -> None:
+        self._remember_closing_connection(conn_id)
         sessions = [item for item in tuple(self._sessions.values()) if item.conn_id == conn_id]
         for session in sessions:
             await self._close_session(session, reason="connection_closed")
 
     async def close_all(self) -> None:
-        for session in tuple(self._sessions.values()):
+        # Fence creates before taking the snapshot. A native PTY spawn can run
+        # in a worker after this method starts; its publication check below
+        # must reject and dispose that handle instead of registering it after
+        # Gateway shutdown has already passed the terminal phase.
+        async with self._lock:
+            self._closing = True
+            sessions = tuple(self._sessions.values())
+        for session in sessions:
             await self._close_session(session, reason="gateway_shutdown")
 
 

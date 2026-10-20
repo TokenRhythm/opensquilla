@@ -53,6 +53,10 @@ def make_agent():
             context_window_tokens_global_override=16_000,
             context_window_known=True,
             max_tokens=4096,
+            # Pin the original character-pressure boundary. Dynamic output
+            # fitting now admits these inputs under the default derived cap.
+            provider_request_proof_max_chars=39_616,
+            provider_request_proof_max_chars_explicit=True,
             tool_result_projection_max_inline_chars=2_000_000,
             tool_result_compression_enabled=False,
         ),
@@ -70,6 +74,7 @@ def checkpoint(agent, summary=SUMMARY, indices=(0,)):
 
 
 async def recover(agent, messages, *, protected_start=0):
+    canonical_snapshot = [message.model_copy(deep=True) for message in messages]
     config = agent._provider_admission_chat_config(CURRENT, context_window_tokens=16_000)
     runtime = agent._freeze_preflight_runtime_context_message()
     rejected = agent._provider_request_messages_for_count_projection(
@@ -121,6 +126,7 @@ async def recover(agent, messages, *, protected_start=0):
             assert message["tool_call_id"] in pending
             pending.remove(message["tool_call_id"])
     assert not pending
+    assert messages == canonical_snapshot
     return outcome, wire
 
 

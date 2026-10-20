@@ -63,6 +63,7 @@ if TYPE_CHECKING:
         ToolUseStartEvent,
         WarningEvent,
     )
+    from opensquilla.session.manager import CompactionPersistResult, CompactionSourceSnapshot
     from opensquilla.silent_reply import SilentReplySegmentsNormalization
 
 log = structlog.get_logger(__name__)
@@ -167,19 +168,12 @@ class AgentRunPort(Protocol):
 
 @runtime_checkable
 class CompactionPersistPort(Protocol):
-    """Persist the IN-TURN ``CompactionEvent`` result + notify cache monitor.
+    """Persist an in-turn candidate, then refresh its source after a confirmed commit.
 
-    Wraps ``SessionManager.persist_compaction_result(session_key, summary,
-    kept_entries)`` followed by a completed lifecycle notification. The
-    stage handles persistence failures by emitting a failed lifecycle
-    notification and preserving pre-refresh runtime state.
-
-    Compaction refresh: This is the only remaining call site for
-    ``persist_compaction_result``. The compaction contract requires the
-    call to remain re-entrant -- the Agent has already mutated its
-    in-memory message list before the runner sees ``CompactionEvent``,
-    so the DB transcript may have more entries than ``kept_entries``.
-    The stage forwards the call verbatim.
+    The Agent may already use the candidate as its request view. The frozen
+    source, not that view, identifies which durable rows may be replaced.
+    Legacy bool/None writer results are normalized before deciding whether
+    to continue, refresh the source, or stop on an unconfirmed commit.
     """
 
     async def persist_and_notify(
@@ -200,11 +194,18 @@ class CompactionPersistPort(Protocol):
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_context_fingerprint: str | None = None,
+        source_snapshot: CompactionSourceSnapshot | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> bool | None: ...
+    ) -> CompactionPersistResult | bool | None: ...
+
+    async def refresh_source(
+        self, *, session_key: str, source_snapshot: CompactionSourceSnapshot,
+        removed_count: int, expected_session_id: str | None,
+        expected_session_epoch: int | None,
+    ) -> CompactionSourceSnapshot: ...
 
 @runtime_checkable
 class MemorySnapshotRefreshPort(Protocol):
@@ -315,6 +316,7 @@ class _StreamState:
     reasoning: list[str] = field(default_factory=list)
     terminal_generation_reset: bool = False
     control_terminal_event: ControlTerminalEvent | None = None
+    compaction_source_snapshot: CompactionSourceSnapshot | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1529,6 +1531,24 @@ class _CompactionHandler:
         event: CompactionEvent,
         inp: StreamConsumerStageInput,
     ) -> None:
+        from opensquilla.session.manager import CompactionPersistResult
+
+        source = event.source_snapshot
+        if source is not None and (
+            inp.state.compaction_source_snapshot is None
+            or source.context_fingerprint != (
+                inp.state.compaction_source_snapshot.context_fingerprint
+            )
+            or source.preimage != inp.state.compaction_source_snapshot.preimage
+        ):
+            event.persist_result = CompactionPersistResult(False, "stale_candidate_source")
+            return
+        # Until an explicit applied result and refresh arrive, an in-memory
+        # replacement cannot become the authoritative source of another writer.
+        if source is not None:
+            inp.state.compaction_source_snapshot = None
+            inp.agent.bind_compaction_source(None)
+        installed_result = CompactionPersistResult(False, "writer_unavailable")
         state = CompactionState(
             session_key=inp.session_key,
             agent_id=inp.agent_id,
@@ -1566,6 +1586,15 @@ class _CompactionHandler:
                     persist_kwargs["compaction_deadline_at_monotonic"] = (
                         event.compaction_deadline_at_monotonic
                     )
+                if source is not None:
+                    persist_kwargs.update({
+                        "source_snapshot": source,
+                        "source_entries": source.entries,
+                        "source_preimage": source.preimage,
+                        "source_context_fingerprint": source.context_fingerprint,
+                        "source_boundary_message_id": source.boundary_message_id,
+                        "source_boundary_entry_id": source.boundary_entry_id,
+                    })
                 if event.compaction_timeout_seconds is not None:
                     persist_kwargs["compaction_timeout_seconds"] = (
                         event.compaction_timeout_seconds
@@ -1579,14 +1608,20 @@ class _CompactionHandler:
                         inp.expected_session_epoch
                     )
                 installed = await self._persist.persist_and_notify(**persist_kwargs)
-                if installed is False:
+                installed_result = CompactionPersistResult.from_legacy(installed)
+                event.persist_result = installed_result
+                if installed_result.reason == "commit_unconfirmed":
+                    raise RuntimeError("Compaction writer did not confirm its commit result")
+                if not installed_result.applied:
                     await self._fire_after_compact(
                         state,
                         {
                             "status": "skipped",
-                            "reason": "stale_preimage",
+                            "reason": installed_result.reason,
                         },
                     )
+                    if installed_result.cancellation_reconciled:
+                        raise asyncio.CancelledError
                     return
             except asyncio.CancelledError:
                 from opensquilla.engine.cache_break_monitor import notify_compaction
@@ -1616,6 +1651,11 @@ class _CompactionHandler:
                 )
                 raise
             except CompactionTimeoutError as exc:
+                # SessionManager only raises this deadline before starting its
+                # commit task; once started, the barrier settles the real result.
+                event.persist_result = CompactionPersistResult(
+                    False, "compaction_deadline_exceeded",
+                )
                 from opensquilla.engine.cache_break_monitor import notify_compaction
                 from opensquilla.session.compaction_lifecycle import (
                     COMPACTION_TRIGGERED_EVENT,
@@ -1647,6 +1687,7 @@ class _CompactionHandler:
                 return
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
+                event.persist_result = CompactionPersistResult(False, "commit_unconfirmed")
                 from opensquilla.engine.cache_break_monitor import notify_compaction
                 from opensquilla.session.compaction_lifecycle import (
                     COMPACTION_TRIGGERED_EVENT,
@@ -1662,11 +1703,11 @@ class _CompactionHandler:
                     source="automatic",
                     phase="agent_inline_overflow",
                     status="failed",
-                    reason="persist_failed",
+                    reason="commit_unconfirmed",
                     message=str(exc),
                     kept_count=len(event.kept_entries),
                     summary_len=len(event.summary or ""),
-                    **compaction_effect_payload(status="failed", reason="persist_failed"),
+                    **compaction_effect_payload(status="failed", reason="commit_unconfirmed"),
                     **compaction_lifecycle_payload(
                         compaction_id,
                         COMPACTION_TRIGGERED_EVENT,
@@ -1676,12 +1717,33 @@ class _CompactionHandler:
                     state,
                     {
                         "status": "failed",
-                        "reason": "persist_failed",
+                        "reason": "commit_unconfirmed",
                         "message": str(exc),
                     },
                 )
-                return
+                # An unknown transaction outcome cannot authorize another
+                # request against either the old or candidate history.
+                raise
 
+        if installed_result.applied and source is not None:
+            try:
+                refreshed = await self._persist.refresh_source(
+                    session_key=inp.session_key, source_snapshot=source,
+                    removed_count=event.removed_count,
+                    expected_session_id=inp.expected_session_id,
+                    expected_session_epoch=inp.expected_session_epoch,
+                )
+                inp.state.compaction_source_snapshot = refreshed
+                inp.agent.bind_compaction_source(refreshed)
+                from opensquilla.session.context_view import format_compaction_summary_context
+
+                inp.agent.config.compaction_summary_context = format_compaction_summary_context(
+                    [refreshed.previous_summary],
+                ) if refreshed.previous_summary else None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # applied S1 survives; another writer is disabled
+                log.warning("compaction_source_refresh_failed", error=str(exc))
         self._memory_snapshot.refresh_snapshot(
             agent_id=inp.agent_id,
             session_key=inp.session_key,
@@ -1702,6 +1764,8 @@ class _CompactionHandler:
                 "kept_entries": event.kept_entries,
             },
         )
+        if installed_result.cancellation_reconciled:
+            raise asyncio.CancelledError
 
     async def _fire_before_compact(self, state: CompactionState) -> None:
         for hook in self._compaction_hooks:

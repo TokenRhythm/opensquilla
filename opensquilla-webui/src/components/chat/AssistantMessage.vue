@@ -41,6 +41,7 @@
           :class="{ 'conversation-live-edge': message.isStreaming }"
           :lifecycle="activityLifecycle"
           :executing="message.isStreaming === true"
+          :compacting="message.isStreaming === true && visibleActivityProjection.statusSteps.some(step => step.category === 'maintenance' && step.state === 'running')"
           :elapsed-label="message.isStreaming ? activityCompactElapsedLabel : ''"
           :step-count="activityStepCount"
           :failure-count="toolFailureCount"

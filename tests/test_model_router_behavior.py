@@ -564,29 +564,40 @@ async def test_large_material_ratio_floors_low_router_tier_to_t3(
     assert routed.metadata["large_context_material_tokens"] == 40_000
 
 
+@pytest.mark.parametrize(("material_tokens", "blocked"), [(50_000, False), (78_000, True)])
 @pytest.mark.asyncio
 async def test_large_material_head_honors_global_context_override(
     monkeypatch: pytest.MonkeyPatch,
+    material_tokens: int,
+    blocked: bool,
 ) -> None:
     fake_strategy(monkeypatch, "c3", 0.91, {"route_class": "R3"})
     ctx = make_context("Please process the attached archive.")
     object.__setattr__(ctx.config.llm, "context_window_tokens", 80_000)
     object.__setattr__(ctx.config.llm, "max_tokens", 10_000)
-    ctx.metadata["attachment_material_estimated_tokens"] = 50_000
+    ctx.metadata["attachment_material_estimated_tokens"] = material_tokens
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["large_context_capacity_blocked"] is True
     assert routed.metadata["large_context_context_window_override_tokens"] == 80_000
     assert routed.metadata["large_context_max_output_override_tokens"] == 10_000
-    assert "routed_tier" not in routed.metadata
+    assert bool(routed.metadata.get("large_context_capacity_blocked")) is blocked
+    if blocked:
+        assert "routed_tier" not in routed.metadata
+    else:
+        assert routed.metadata["routed_tier"] == "c3"
 
 
+@pytest.mark.parametrize(
+    ("history_tokens", "expected_tier"), [(5_000, "c0"), (6_000, "c0"), (12_000, "c1")],
+)
 @pytest.mark.asyncio
 async def test_attachment_below_large_floor_uses_effective_request_capacity(
     monkeypatch: pytest.MonkeyPatch,
+    history_tokens: int,
+    expected_tier: str,
 ) -> None:
-    """Attachment admission must use usable input, not the raw context window."""
+    """Fit the output ceiling first; still reroute genuine input overflow."""
 
     fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
     catalog = ModelCatalog()
@@ -620,15 +631,16 @@ async def test_attachment_below_large_floor_uses_effective_request_capacity(
         },
     }
     ctx.metadata["attachment_material_estimated_tokens"] = 20_000
-    ctx.metadata["routing_history_capacity_estimated_tokens"] = 5_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = history_tokens
     ctx.metadata["routing_history_capacity_message_count"] = 4
 
     routed = await apply_squilla_router(ctx)
     routed = await finalize_squilla_router_capacity(routed)
 
     assert "large_context_floor_min_tier" not in routed.metadata
-    assert routed.metadata["routed_tier"] == "c1"
-    assert routed.model == "text-safe"
+    assert routed.metadata["routed_tier"] == expected_tier
+    assert routed.model == ("text-tight" if expected_tier == "c0" else "text-safe")
+    assert not routed.metadata.get("large_context_capacity_blocked")
 
 
 @pytest.mark.asyncio
@@ -742,9 +754,11 @@ async def test_same_attachment_fits_short_history_but_long_history_is_filtered(
         )
 
     short_history = await route(1_000)
-    long_history = await route(21_000)
+    medium_history = await route(21_000)
+    long_history = await route(28_000)
 
     assert short_history.metadata["routed_tier"] == "c0"
+    assert medium_history.metadata["routed_tier"] == "c0"
     assert long_history.metadata["routed_tier"] == "c1"
     assert (
         long_history.metadata["large_context_request_input_tokens"]
@@ -920,9 +934,12 @@ async def test_catalog_unknown_custom_plain_text_keeps_existing_routing_behavior
     assert "large_context_capacity_blocked" not in routed.metadata
 
 
+@pytest.mark.parametrize(("history_tokens", "expected_tier"), [(12_000, "c0"), (24_000, "c1")])
 @pytest.mark.asyncio
 async def test_long_user_history_system_tools_and_attachment_share_one_budget(
     monkeypatch: pytest.MonkeyPatch,
+    history_tokens: int,
+    expected_tier: str,
 ) -> None:
     fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
     catalog = ModelCatalog()
@@ -964,16 +981,16 @@ async def test_long_user_history_system_tools_and_attachment_share_one_budget(
         }
     ]
     ctx.metadata["attachment_material_estimated_tokens"] = 4_000
-    ctx.metadata["routing_history_capacity_estimated_tokens"] = 12_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = history_tokens
     ctx.metadata["routing_history_capacity_message_count"] = 12
 
     routed = await finalize_squilla_router_capacity(
         await apply_squilla_router(ctx)
     )
 
-    assert routed.metadata["routed_tier"] == "c1"
+    assert routed.metadata["routed_tier"] == expected_tier
     assert routed.metadata["large_context_material_tokens"] >= 7_000
-    assert routed.metadata["large_context_history_tokens"] == 12_000
+    assert routed.metadata["large_context_history_tokens"] == history_tokens
     assert routed.metadata["large_context_system_tools_tokens"] > 3_000
     assert routed.metadata["large_context_structural_tokens"] > 0
 
@@ -1023,7 +1040,9 @@ async def test_capacity_revalidation_never_downgrades_semantic_tier(
         },
     }
     ctx.metadata["attachment_material_estimated_tokens"] = 4_000
-    ctx.metadata["routing_history_capacity_estimated_tokens"] = 21_000
+    # The selected 32K tier must actually overflow after dynamic output fitting;
+    # the lower semantic tier has ample capacity but must not be selected.
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 28_000
     ctx.metadata["routing_history_capacity_message_count"] = 8
 
     routed = await finalize_squilla_router_capacity(

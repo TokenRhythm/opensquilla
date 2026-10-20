@@ -108,6 +108,14 @@ async def test_submits_native_wan_request_polls_and_downloads_without_bearer(
 async def test_token_plan_uses_same_native_api_with_its_selected_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    from opensquilla.engine.usage_accounting import (
+        UsageAccountingScope,
+        UsageExecutionContext,
+        bind_usage_accounting_scope,
+    )
+    from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
+    from opensquilla.session.storage import SessionStorage
+
     posted: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -124,12 +132,30 @@ async def test_token_plan_uses_same_native_api_with_its_selected_model(
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
     _install_transport(monkeypatch, handler)
-    result = await _generate(
-        tmp_path / "clip.mp4",
-        provider="qwen_token_plan",
-        model="happyhorse-1.1-t2v",
-        aspect_ratio="16:9",
-    )
+    storage = SessionStorage(str(tmp_path / "usage.db"))
+    await storage.connect()
+    try:
+        scope = UsageAccountingScope(
+            sink=SessionUsageEventSink(storage),
+            context=UsageExecutionContext(
+                execution_id="token-plan", agent_run_id="token-plan", session_id="owner"
+            ),
+        )
+        with bind_usage_accounting_scope(scope):
+            result = await _generate(
+                tmp_path / "clip.mp4",
+                provider="qwen_token_plan",
+                model="happyhorse-1.1-t2v",
+                aspect_ratio="16:9",
+            )
+        [event] = await storage.query_usage_events(None, None)
+        assert event.provider == "qwen_token_plan"
+        assert event.session_id == "owner"
+        history = await storage.query_usage_settlements([event.event_id], history=True)
+        assert len(history) == 2
+        assert history[-1]["reason_code"] == "video_completed_amount_unavailable"
+    finally:
+        await storage.close()
 
     assert result.provider == "qwen_token_plan"
     assert posted == [

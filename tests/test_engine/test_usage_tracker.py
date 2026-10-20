@@ -480,11 +480,11 @@ def test_session_total_cost_empty_session_is_zero() -> None:
 
 def test_session_billed_cost_zero_when_no_per_model() -> None:
     """Defensive: empty session (no add() calls) returns 0 billed and
-    estimate cost source. Guards against AttributeError when _per_model
+    unavailable cost source. Guards against AttributeError when _per_model
     is None."""
     usage = SessionUsage()
     assert usage.billed_cost == 0.0
-    assert usage.cost_source == "opensquilla_estimate"
+    assert usage.cost_source == "unavailable"
 
 
 def test_model_usage_positional_construction_keeps_billed_cost_default() -> None:

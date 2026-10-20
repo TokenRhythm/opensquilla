@@ -34,6 +34,7 @@ _RECOVERABLE_CANDIDATE_REASONS = frozenset({
     "empty_summary",
     "non_history_envelope_exhausts_budget",
     "quality_gate_failed",
+    "precommit_read_failed",
     "summary_does_not_fit",
     "summary_call_budget_exceeded",
     "summary_failed",
@@ -106,6 +107,7 @@ class SessionCompactionExecutionResult:
     # Internal recovery classification; the existing transport payload stays unchanged.
     failure_kind: str = ""
     failure_detail: Mapping[str, object] | None = None
+    cancellation_reconciled: bool = False
 
 
 class SessionCompactionMilestone(StrEnum):
@@ -488,6 +490,11 @@ class _ManualCompactionOperation:
             if outcome.applied:
                 committed = outcome
                 self._committed_result = outcome
+            if outcome.cancellation_reconciled:
+                # The barrier settled the write. Preserve that fact in the
+                # existing after-commit cancellation path before stopping.
+                raise asyncio.CancelledError
+            if outcome.applied:
                 for milestone in (
                     SessionCompactionMilestone.CHUNK_SUMMARIZED,
                     SessionCompactionMilestone.SUMMARY_VERIFIED,

@@ -11,6 +11,7 @@
         :phase-label="phaseLabel"
         :phase-announcement="phaseAnnouncement"
         :phase-waiting="phaseWaiting"
+        :compacting="displayProjection.statusSteps.some(step => step.category === 'maintenance' && step.state === 'running')"
         :elapsed-label="elapsedLabel"
         :stale="stale"
         :queued="queued"

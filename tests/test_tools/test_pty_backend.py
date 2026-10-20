@@ -7,6 +7,7 @@ import ctypes.wintypes as wintypes
 import json
 import os
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -234,6 +235,110 @@ async def test_real_pty_cleans_descendant_tree(
         current_tool_context.reset(token)
         if failure is None and cleanup_failure is not None:
             raise cleanup_failure
+
+
+@pytest.mark.platform_pty
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin orphaned process ownership")
+@pytest.mark.parametrize("ignore_sigterm", [False, True], ids=["term", "kill"])
+async def test_darwin_pty_cleans_detached_child_after_parent_exit(
+    ignore_sigterm, tmp_path,
+) -> None:
+    from opensquilla.process_tree import (
+        _darwin_process_info,
+        capture_process_tree_owner,
+    )
+
+    def process_identity(pid):
+        info = _darwin_process_info(pid)
+        return info.start_identity if info is not None else None
+
+    child_ready = tmp_path / "child.json"
+    sentinel_ready = tmp_path / "sentinel.json"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import json, os, pathlib, signal, sys, time\n"
+        "from opensquilla.process_tree import _darwin_process_info\n"
+        "if sys.argv[2] == 'ignore':\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "ready = pathlib.Path(sys.argv[1])\n"
+        "pending = ready.with_suffix('.pending')\n"
+        "pending.write_text(json.dumps({\n"
+        "    'pid': os.getpid(), 'identity': _darwin_process_info(os.getpid()).start_identity,\n"
+        "}))\n"
+        "pending.replace(ready)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(child)!r}, {str(child_ready)!r}, "
+        f"{'ignore' if ignore_sigterm else 'default'!r}], start_new_session=True,\n"
+        "    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "deadline = time.monotonic() + 10\n"
+        f"while not pathlib.Path({str(child_ready)!r}).exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise RuntimeError('child readiness timed out')\n"
+        "    time.sleep(0.001)\n",
+        encoding="utf-8",
+    )
+    # The ready file carries birth identity because successful cleanup may kill
+    # the orphan before the test controller observes the file. The parent exits
+    # immediately after publication; it never waits for a controller barrier.
+    sentinel = subprocess.Popen(
+        [sys.executable, str(child), str(sentinel_ready), "default"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    handle = None
+    owner = None
+    try:
+        handle = await asyncio.to_thread(
+            pty_backend.spawn_pty,
+            shlex.join([sys.executable, str(parent)]),
+            cwd=str(tmp_path),
+            env=dict(os.environ),
+        )
+        owner = capture_process_tree_owner(handle.raw, isolated=True)
+        assert owner.durable
+        owner.start_completion_monitor()
+        async with asyncio.timeout(10):
+            while not child_ready.exists() or not sentinel_ready.exists():
+                await asyncio.sleep(0.01)
+        child_record = json.loads(child_ready.read_text())
+        sentinel_record = json.loads(sentinel_ready.read_text())
+        assert child_record["identity"]
+        assert sentinel_record["identity"]
+        async with asyncio.timeout(5):
+            while owner.is_active():
+                await asyncio.sleep(0.01)
+        assert process_identity(child_record["pid"]) != child_record["identity"], (
+            "PTY owner reported completion while its detached child remained alive"
+        )
+        assert process_identity(sentinel_record["pid"]) == sentinel_record["identity"]
+    finally:
+        # Cleanup must also work on the broken baseline without signalling a
+        # reused PID or an unrelated process.
+        for ready in (child_ready, sentinel_ready):
+            if not ready.exists():
+                continue
+            record = json.loads(ready.read_text())
+            if (
+                record["identity"] is not None
+                and process_identity(record["pid"]) == record["identity"]
+            ):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(record["pid"], signal.SIGKILL)
+        await asyncio.to_thread(sentinel.wait, timeout=5)
+        if handle is not None:
+            await pty_backend.terminate_pty(handle)
+        if owner is not None and owner.posix_anchor is not None:
+            monitor = owner.posix_anchor._monitor_task
+            if monitor is not None:
+                await asyncio.wait_for(asyncio.shield(monitor), timeout=5)
 
 
 class _RawPty:

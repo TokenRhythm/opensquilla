@@ -18,10 +18,9 @@ describe('UsageSessionsTable sorting controls', () => {
       tableColumns: [{ key: 'session', label: 'Task' }, { key: 'cost', label: 'Cost' }],
       sortableCols: ['cost'], sortCol: 'cost', sortAsc: false,
       sortedRows: [], sessionsMeta: '', expandedSessions: new Set<string>(),
-      fmtCost: () => '$0', costSourceLabel: () => '', costSourceTooltip: () => '',
-      costSourceClasses: () => ({}), costSourceClassesForBreakdown: () => ({}),
+      fmtCost: () => '$0', costSourceClassesForBreakdown: () => ({}),
       costSourceLabelForBreakdown: () => '', costSourceTooltipForBreakdown: () => '',
-      modelDisplayLabel: () => '', rowKey: () => '', rowBreakdown: () => [],
+      modelDisplayLabel: () => '', rowBreakdown: () => [],
       rowBreakdownTotalTokens: () => 0, rowBreakdownTotalCost: () => 0,
       rowBreakdownAnyProrated: () => false, onSort: sort,
     })

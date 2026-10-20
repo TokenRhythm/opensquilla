@@ -11,13 +11,15 @@ import pytest
 
 from opensquilla import token_estimation
 from opensquilla.engine.history import reconstruct_messages_from_entry
-from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.request_window import request_window_notice
+from opensquilla.engine.runtime import TurnRunner, _format_compaction_summary_context
 from opensquilla.engine.turn_runner.transcript_snapshot import TurnTranscriptSnapshot
 from opensquilla.provider import (
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
 )
+from opensquilla.session.compaction import estimate_entry_model_replay_tokens
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import (
     SessionContextState,
@@ -25,6 +27,7 @@ from opensquilla.session.models import (
     SessionSummary,
 )
 from opensquilla.session.storage import SessionStorage, StaleEpochError
+from opensquilla.session.tokenizer import estimate_tokens
 
 
 def test_provider_history_cleans_goal_text_segments_without_mutating_source() -> None:
@@ -285,10 +288,20 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
         )
     admitted_entries = list(await manager.get_transcript(key))
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
+    # The fallback estimator needs room for both the explicit omission notice
+    # and the protected tail. The complete history must still require recovery.
+    history_budget = 300
+    raw_entries = [runner._entry_for_emergency_compaction(entry) for entry in admitted_entries]
+    notice = _format_compaction_summary_context([request_window_notice(6)])
+    assert sum(estimate_entry_model_replay_tokens(entry) for entry in raw_entries) > history_budget
+    assert (
+        sum(estimate_entry_model_replay_tokens(entry) for entry in raw_entries[-2:])
+        + estimate_tokens(notice or "") <= history_budget
+    )
     recorded = await runner._prepare_request_window(
         key,
         admitted_entries,
-        200,
+        history_budget,
         compaction_id="cmp-retired-owner",
         phase="preflight",
         reason="compact_failed",
@@ -296,6 +309,12 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
         expected_session_epoch=int(admitted.epoch or 0),
     )
     assert recorded is not None
+    assert (
+        sum(estimate_entry_model_replay_tokens(runner._entry_for_emergency_compaction(entry))
+            for entry in recorded.kept_entries)
+        + estimate_tokens(_format_compaction_summary_context([recorded.summary]) or "")
+        <= history_budget
+    )
     retired_override = recorded
     assert len(retired_override.kept_entries) < len(admitted_entries)
     assert any("retired owner secret" in entry.content for entry in retired_override.kept_entries)

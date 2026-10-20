@@ -23,6 +23,79 @@ async function projected(response: Record<string, unknown>) {
   return rpcWith(call).usage('all', { timezone: 'UTC' })
 }
 
+describe('usage attribution and metering projection', () => {
+  it('preserves parent generation, dates, capability breakdown and distinct task counts', async () => {
+    const result = await projected({
+      totals: { costNanos: 700_000_000, sessionCount: 5, taskCount: 2 },
+      taskGroups: [{ taskGroupId: 'parent', rootSessionId: 'root', rootSessionEpoch: 3,
+        sessionKey: 'root-key', title: 'Current parent title', firstUsageAtMs: 100, lastUsageAtMs: 200,
+        totals: { costNanos: 700_000_000 }, modelBreakdown: [{ provider: 'tokenrhythm', model: 'image',
+          capability: 'image_generation', totals: { costNanos: 700_000_000 },
+          meters: [{ metric: 'output_images', unit: 'image', quantity: '1', dimensions: {}, measurementCount: 1, unknownCount: 0 }] }] }],
+      models: [{ provider: 'tokenrhythm', model: 'image', sessionCount: 5, taskCount: 2,
+        totals: { costNanos: 700_000_000 } }],
+    })
+    expect(result.totals).toMatchObject({ sessions: 5, taskCount: 2, cost: 0.7 })
+    expect(result.models[0].sessions).toBe(2)
+    expect(result.taskGroups?.[0]).toMatchObject({ rootSessionId: 'root', rootSessionEpoch: 3,
+      sessionKey: 'root-key', title: 'Current parent title', firstUsageAtMs: 100, lastUsageAtMs: 200,
+      modelBreakdown: [{ provider: 'tokenrhythm', costUsd: 0.7, meters: [{ quantity: '1' }] }] })
+  })
+
+  it('keeps session capability fees and units separate from global capability totals', async () => {
+    const result = await projected({
+      totals: { costUsdExact: '9.008' },
+      capabilities: [{ capability: 'web_search', totals: { costUsdExact: '9.008' } }],
+      sessions: [{ sessionId: 'child', sessionEpoch: 2, totals: { costUsdExact: '0.008' },
+        modelBreakdown: [
+          { provider: 'exa', model: 'web_search', capability: 'web_search',
+            tokenUnknownItemCount: 1, totals: { costUsdExact: '0.008', costSource: 'opensquilla_estimate' },
+            meters: [{ metric: 'requests', unit: 'request', quantity: '1', unknownCount: 0, measurementCount: 1, dimensions: {} }] },
+          { provider: 'brave', model: 'web_search', capability: 'web_search',
+            totals: { costUsdExact: '0', costSource: 'none', missingCostEntries: 1 } },
+        ],
+      }],
+    })
+    expect(result.sessions[0]).toMatchObject({ sessionEpoch: 2, costUsd: 0.008 })
+    expect(result.sessions[0].modelBreakdown[0]).toMatchObject({
+      provider: 'exa', model: 'web_search', capability: 'web_search', costUsd: 0.008,
+      tokenUnknownItemCount: 1, meters: [{ quantity: '1', unit: 'request' }],
+    })
+    expect(result.sessions[0].modelBreakdown[1]).toMatchObject({ provider: 'brave', missingCostEntries: 1 })
+  })
+
+  it('preserves independent server task totals, exact cost and unknown meters', async () => {
+    const result = await projected({ schemaVersion: 1,
+      totals: { costNanos: 1, costUsdExact: '0.0000000012' },
+      taskGroups: [{ taskGroupId: 'group', rootSessionId: 'deleted', rootSessionEpoch: 0,
+        sessionKey: null, title: 'Stored server title', attributionStatus: 'complete',
+        totals: { costNanos: 700_000_000 }, branches: { self: { costNanos: 100_000_000 },
+          sideChats: { costNanos: 600_000_000 } },
+        runs: [{ runId: 'side', sessionId: 'side', relation: 'sidechat', totals: { costNanos: 600_000_000 } }],
+      }], capabilities: [{ capability: 'image_generation', totals: { missingCostEntries: 1 },
+        tokenUnknownItemCount: 1, meters: [{ metric: 'output_images', unit: 'image', quantity: '0',
+          unknownCount: 1, measurementCount: 1, dimensions: { resolution: '1024x1024' } }] }],
+      coverage: { attribution: { status: 'partial', missingEventCount: 1, reasonCodes: ['missing_usage_lineage'] } },
+      settlementSummary: { provider_confirmed: 2, provider_estimate: 1, local_estimate: 3, unknown: 1 },
+    })
+    expect(result.totals.cost).toBe(0.0000000012)
+    expect(result.totals.costUsdExact).toBe('0.0000000012')
+    expect(result.taskGroups?.[0]).toMatchObject({ title: 'Stored server title', sessionKey: null,
+      totals: { cost: 0.7 }, branches: { self: { cost: 0.1 }, sideChats: { cost: 0.6 } },
+      runs: [{ relation: 'sidechat', totals: { cost: 0.6 } }] })
+    expect(result.capabilities?.[0].meters[0]).toMatchObject({ quantity: '0', unknownCount: 1 })
+    expect(result.coverage.attribution?.missingEventCount).toBe(1)
+    expect(result.settlementSummary?.provider_estimate).toBe(1)
+  })
+
+  it('does not invent task groups or measurements for a legacy gateway', async () => {
+    const result = await projected({ totals: { costNanos: 10 }, sessions: [] })
+    expect(result.taskGroups).toBeUndefined()
+    expect(result.capabilities).toBeUndefined()
+    expect(result.coverage.measurements).toBeUndefined()
+  })
+})
+
 describe('usage.query compatibility client', () => {
   it('maps UI ranges to calendar-day presets', async () => {
     const call = vi.fn(async () => ({ coverage: { status: 'complete' } })) as RpcCall

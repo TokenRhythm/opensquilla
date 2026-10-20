@@ -260,7 +260,7 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
-  it.each(['failed', 'error'])('recovers pending input after %s unless the server blocks sending', status => {
+  it.each(['failed', 'error', 'timed_out'])('recovers pending input after %s unless the server blocks sending', status => {
     const retryable = createHarness()
     const blocked = createHarness()
     try {
@@ -268,12 +268,13 @@ describe('useChatCompaction replay compatibility', () => {
       retryable.api.showCompactionToast({
         status,
         source: 'manual',
+        refused: true,
         reason: 'summary_does_not_fit',
       })
       expect(retryable.popAllPendingIntoComposer).toHaveBeenCalledOnce()
       expect(retryable.api.isCompactInFlightForCurrentSession()).toBe(false)
       expect(retryable.api.compactStatus.value).toMatchObject({
-        status: 'failed',
+        status: status === 'timed_out' ? 'timed_out' : 'failed',
         isBusy: false,
       })
 
@@ -282,6 +283,7 @@ describe('useChatCompaction replay compatibility', () => {
         status,
         source: 'manual',
         refused: true,
+        safe_to_send: false,
         reason: 'no_safe_turn_boundary',
       })
       expect(blocked.popAllPendingIntoComposer).not.toHaveBeenCalled()
@@ -296,14 +298,14 @@ describe('useChatCompaction replay compatibility', () => {
   })
 
   it.each([
-    ['summary_replay_incomplete', 'The summary did not pass the completeness check', true],
-    ['quality_gate_failed', 'The summary did not pass the completeness check', true],
-    ['summary_does_not_fit', "The summary does not fit the current model's context", true],
-    ['summary_target_unavailable', 'The summarization model is unavailable', false],
-    ['summary_failed', 'The model could not generate a usable summary', false],
-    ['compaction_deadline_exceeded', 'Context organization timed out', false],
-    ['unknown_private_provider_error', 'Context organization failed', false],
-  ])('explains manual failure %s without exposing raw provider details', (reason, message, preserved) => {
+    ['summary_replay_incomplete', 'The summary did not pass the completeness check', 'The summary was not applied. You can try again later.'],
+    ['quality_gate_failed', 'The summary did not pass the completeness check', 'The summary was not applied. You can try again later.'],
+    ['summary_does_not_fit', "The summary does not fit the current model's context", 'Shorten the input or choose a model with a larger context window.'],
+    ['summary_target_unavailable', 'The summarization model is unavailable', 'Check the model settings and network connection, or choose another model.'],
+    ['summary_failed', 'The model could not generate a usable summary', 'Try organizing the context again later, or choose another model.'],
+    ['compaction_deadline_exceeded', 'Context organization timed out', 'Try organizing the context again later, or choose another model.'],
+    ['unknown_private_provider_error', 'Context organization failed', 'Try organizing the context again later, or choose another model.'],
+  ])('explains manual failure %s without exposing raw provider details', (reason, message, detail) => {
     const h = createHarness()
     try {
       h.api.showCompactionToast({ status: 'started', source: 'manual', compaction_id: 'cmp-reason' })
@@ -312,10 +314,41 @@ describe('useChatCompaction replay compatibility', () => {
         reason, detail: 'private provider response and prompt data',
       })
       expect(h.api.compactStatus.value.message).toBe(message)
-      expect(h.api.compactStatus.value.detail).toContain('diagnostic ID')
-      expect(h.api.compactStatus.value.detail.includes('original context is preserved')).toBe(preserved)
+      expect(h.api.compactStatus.value.detail).toBe(detail)
+      expect(h.api.compactStatus.value.detail).not.toContain('diagnostic ID')
       expect(h.api.compactStatus.value.detail).not.toContain('private provider')
       expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it.each(['failed', 'timed_out'])('keeps automatic %s informational in the id-less compatibility surface', status => {
+    const h = createHarness()
+    try {
+      h.api.showCompactionToast({ status: 'started', source: 'automatic' })
+      h.api.showCompactionToast({ status, source: 'automatic', reason: 'summary_failed' })
+      expect(h.api.compactStatus.value).toMatchObject({
+        status, tone: 'info', isBusy: false, detail: '',
+        message: 'Context organization did not complete',
+      })
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it.each(['manual', 'automatic'])('inherits a %s source only for the same failed operation', source => {
+    const h = createHarness()
+    try {
+      h.api.showCompactionToast({ status: 'started', source, compaction_id: 'cmp-source' })
+      h.api.showCompactionToast({ status: 'failed', compaction_id: 'cmp-source', reason: 'summary_failed' })
+      expect(h.api.compactStatus.value).toMatchObject({
+        source, status: 'failed', isBusy: false,
+        tone: source === 'manual' ? 'err' : 'info',
+        message: source === 'manual' ? 'The model could not generate a usable summary' : 'Context organization did not complete',
+      })
     } finally {
       h.api.cleanup()
       h.stop()
@@ -337,8 +370,8 @@ describe('useChatCompaction replay compatibility', () => {
         status: 'emergency_ephemeral',
         message: 'History temporarily reduced; continuing',
         durability: 'request_scoped',
-        tone: 'warn',
-        detail: 'Request-scoped; session history was not rewritten',
+        tone: 'ok',
+        detail: '',
         isBusy: false,
       })
       expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)

@@ -280,6 +280,7 @@ async def run_comparison(
         final = continuations[-1] if continuations else None
         facts = harness.compaction_task_facts(settings["task_profile"])
         summary = summaries[-1].summary_text if summaries else ""
+        replay_wrapper = harness.format_compaction_summary_context([summary], max_chars=None)
         answer_checks = harness.compaction_answer_fact_checks(
             str(final.response.get("content") or "") if final else "", facts,
         )
@@ -303,6 +304,10 @@ async def run_comparison(
             "summary_replay_count": sum(str(message.get("content") or "").count(summary)
                                         for message in final.request.get("messages", []))
             if final and summary else 0,
+            "summary_replay_wrapper_count": sum(
+                str(message.get("content") or "").count(replay_wrapper)
+                for message in final.request.get("messages", [])
+            ) if final and replay_wrapper else 0,
             "final_request": harness.wire_pressure_evidence(final) if final else None,
             "actual_system_sha256": digest([message for message in final.request.get("messages", [])
                                              if message.get("role") in {"system", "developer"}])

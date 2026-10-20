@@ -55,7 +55,7 @@ export function compactionFailurePresentation(reason: unknown) {
     return { title: 'chat.compact.failureIntegrity', detail: 'chat.compact.failureRejectedDetail', warning: false }
   }
   if (['summary_does_not_fit', 'consumer_admission_failed'].includes(normalized)) {
-    return { title: 'chat.compact.failureCapacity', detail: 'chat.compact.failureRejectedDetail', warning: false }
+    return { title: 'chat.compact.failureCapacity', detail: 'chat.compact.failureCapacityDetail', warning: false }
   }
   if (['summary_target_unavailable', 'suffix_target_unavailable'].includes(normalized)) {
     return { title: 'chat.compact.failureUnavailable', detail: 'chat.compact.failureUnavailableDetail', warning: false }

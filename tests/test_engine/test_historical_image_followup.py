@@ -984,7 +984,9 @@ async def test_persisted_compacted_archive_rehydrates_explicit_attachment_id() -
             source_boundary_message_id=source.boundary_message_id,
             source_boundary_entry_id=source.boundary_entry_id,
         )
-        assert installed is True
+        assert installed.applied is True
+        assert installed.reason == ""
+        assert installed.cancellation_reconciled is False
         assert [entry.message_id for entry in await manager.get_transcript(key)] == [
             current_entry.message_id
         ]

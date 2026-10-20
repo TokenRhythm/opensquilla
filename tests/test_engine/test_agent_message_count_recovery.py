@@ -684,7 +684,12 @@ async def test_message_count_suffix_uses_current_source_and_request_without_pare
     assert summary_messages[:-1] == history[:cut]
     assert "The newly selected delivery color is azure." in str(summary_messages)
     assert "current user request" not in str(summary_messages)
-    assert "Summarize the preceding conversation" in summary_messages[-1].content
+    assert summary_messages[-1].role == "user"
+    assert "## Primary Request and Intent" in summary_messages[-1].content
+    assert "Keep the checkpoint concise and complete." in summary_messages[-1].content
+    assert "Output only the checkpoint; do not answer the conversation or call tools." in (
+        summary_messages[-1].content
+    )
     assert summary_tools == provider.ordinary_tools[0] == tools
     assert summary_config.system.startswith("You are a conversation compactor.")
     assert "Current shared request instructions." not in summary_config.system
@@ -750,7 +755,12 @@ async def test_legacy_prefix_toggle_uses_current_suffix_generation_budget_across
         assert summary_tools == agent.tool_definitions
         assert summary_config.tool_choice == "none"
         assert len(summary_messages) > 1
-        assert "Summarize the preceding conversation" in summary_messages[-1].content
+        assert summary_messages[-1].role == "user"
+        assert "## Primary Request and Intent" in summary_messages[-1].content
+        assert "Keep the checkpoint concise and complete." in summary_messages[-1].content
+        assert "Output only the checkpoint; do not answer the conversation or call tools." in (
+            summary_messages[-1].content
+        )
         assert agent._compaction_request_context is None
 
 

@@ -32,6 +32,48 @@ from opensquilla.provider.types import (
 from opensquilla.silent_reply import sanitize_historical_silent_reply
 
 _RECORDED_TOOL_HISTORY_PREFIX = "[Recorded tool history]"
+CONTEXT_SUMMARY_MARKER = "[Context Summary]"
+
+
+def strip_context_summary_marker(content: str) -> str:
+    """Return the checkpoint body from a legacy transcript summary row."""
+    if content.startswith(CONTEXT_SUMMARY_MARKER):
+        return content[len(CONTEXT_SUMMARY_MARKER) :].lstrip("\r\n")
+    return content
+
+
+def subagent_terminal_history_notice(entry: Any) -> str | None:
+    """Project trusted terminal status, equally for stored rows and their copies."""
+    def value(name: str) -> Any:
+        return entry.get(name) if isinstance(entry, Mapping) else getattr(entry, name, None)
+
+    if value("role") != "system":
+        return None
+    if value("provenance_kind") != "internal_system":
+        return None
+    if value("provenance_source_tool") != "subagent_completion":
+        return None
+    content = value("content")
+    if not isinstance(content, str) or not content:
+        return None
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "subagent_completion":
+        return None
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"cancelled", "failed", "timeout", "abandoned"}:
+        return None
+    child_session_key = str(payload.get("child_session_key") or "unknown")[:200]
+    terminal_reason = str(payload.get("terminal_reason") or status)[:120]
+    return (
+        "[Trusted runtime status] "
+        f'Subagent {child_session_key} finished with status "{status}" '
+        f'(reason: "{terminal_reason}"). It is no longer running. '
+        "Do not wait for it or call sessions_yield for it. Continue from this terminal "
+        "state unless the user asks to start a replacement subagent."
+    )
 
 # Bump whenever the storage-to-provider history projection changes.  The value
 # is included in compaction admission fingerprints so a budget frozen under an

@@ -3554,6 +3554,45 @@
     "bundleDifferentGateway": "Ouvrez la WebUI de la Gateway connectée pour télécharger son dossier de diagnostic."
   },
   "usageLogs": {
+    "capabilities": {
+      "unknown": "Inconnu",
+      "partialMeter": "{value} · {count} inconnus",
+      "metrics": {
+        "input_tokens": "Jetons d’entrée",
+        "output_tokens": "Jetons de sortie",
+        "cache_read_tokens": "Jetons lus en cache",
+        "cache_write_tokens": "Jetons écrits en cache",
+        "input_images": "Images d’entrée",
+        "input_video_seconds": "Durée de la vidéo d’entrée",
+        "output_audio_seconds": "Durée de l’audio de sortie",
+        "requested_audio_seconds": "Durée audio demandée",
+        "requests": "Requêtes",
+        "output_images": "Images produites",
+        "input_audio_seconds": "Audio entrant",
+        "input_characters": "Caractères entrants",
+        "requested_video_seconds": "Durée vidéo demandée",
+        "video_seconds": "Durée vidéo produite",
+        "search_credits": "Crédits de recherche",
+        "scrape_credits": "Crédits d’extraction",
+        "character_credits": "Crédits de caractères",
+        "cost_in_usd_ticks": "Unités de coût du fournisseur",
+        "input_text_tokens": "Jetons de texte entrants",
+        "output_text_tokens": "Jetons de texte sortants",
+        "input_audio_tokens": "Jetons audio entrants",
+        "output_audio_tokens": "Jetons audio sortants",
+        "input_image_tokens": "Jetons d’image entrants",
+        "output_image_tokens": "Jetons d’image sortants"
+      },
+      "units": {
+        "request": "requêtes",
+        "image": "images",
+        "second": "secondes",
+        "character": "caractères",
+        "credit": "crédits",
+        "token": "jetons",
+        "usd_tick_1e_10": "USD × 10⁻¹⁰"
+      }
+    },
     "tasks": {
       "unnamed": "Tâche sans titre"
     },
@@ -3583,10 +3622,6 @@
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache"
     },
-    "costHintTitle": "Les valeurs en CNY utilisent le taux intégré {rate}. Vérifiez par rapport au taux de change actuel pour un usage comptable.",
-    "nativeCostHintTitle": "La facture d’origine du fournisseur est en CNY ; la valeur USD utilise le taux fixe enregistré sur le reçu.",
-    "nativeMixedCostHintTitle": "La facturation multidevise ou en attente reste en USD canonique ; les reçus d’origine confirmés sont affichés séparément.",
-    "nativeBillingSubtotals": "Reçus d’origine : {amounts}",
     "rangeHiddenHint": "{count} tâches historiques sans date masquées",
     "coverage": {
       "approximate": "Une partie de l’usage historique est estimée à partir des totaux par tâche.",
@@ -3644,10 +3679,10 @@
       "cacheRead": "Lecture cache",
       "cacheWrite": "Écriture cache",
       "cost": "Coût",
-      "source": "Source",
       "model": "Modèle"
     },
     "breakdown": {
+      "callTitle": "Détails des appels",
       "title": "Répartition par modèle",
       "modelCount": "{count} modèles",
       "total": "{tokens} jetons · {cost}",
@@ -3656,35 +3691,28 @@
     "costSource": {
       "actual": {
         "label": "Réel",
-        "tooltip": "Réel — coût facturé par le fournisseur",
-        "short": "réel"
+        "tooltip": "Réel — coût facturé par le fournisseur"
       },
       "estimated": {
         "label": "Estimé",
-        "tooltip": "Estimé — dérivé localement à partir du nombre de jetons",
-        "short": "estimé"
+        "tooltip": "Estimation — devis du fournisseur ou tarif local enregistré"
       },
       "mixed": {
         "label": "Mixte",
-        "tooltip": "Mixte — données de facturation partielles, le reste estimé",
-        "short": "mixte"
+        "tooltip": "Mixte — données de facturation partielles, le reste estimé"
       },
       "unpriced": {
         "label": "Sans tarif",
-        "tooltip": "Sans tarif — aucune entrée de table de tarification pour ce modèle",
-        "short": "sans tarif"
+        "tooltip": "Sans tarif — aucune entrée de table de tarification pour ce modèle"
       },
       "none": {
-        "label": "Aucun",
-        "tooltip": "Aucun coût enregistré",
-        "short": "aucun"
+        "label": "Coût non enregistré",
+        "tooltip": "Aucun coût enregistré"
       },
       "ephemeral": {
         "label": "Éphémère",
-        "tooltip": "Session éphémère — coût pas encore persisté",
-        "short": "éphémère"
-      },
-      "cacheBlindHint": "Inclut des estimations qui tarifient les jetons en cache au tarif d'entrée plein — à considérer comme un plafond."
+        "tooltip": "Session éphémère — coût pas encore persisté"
+      }
     },
     "relTime": {
       "justNow": "à l'instant",
@@ -4012,16 +4040,13 @@
     "subagentPrefix": "Sous-agent : ",
     "subagentCompletion": "Achèvement du sous-agent",
     "turnFailed": "Échec du tour",
-    "copyDiagnosticId": "Copier l’identifiant de diagnostic",
-    "copiedDiagnosticId": "Identifiant de diagnostic copié",
-    "copyDiagnosticFailed": "Échec de la copie. Sélectionnez l’identifiant ci-dessus et copiez-le manuellement.",
     "errorMessage": {
       "unknown": "Cette requête n’a pas abouti.",
       "noProvider": "Aucun modèle n’est disponible.",
       "credentials": "L’authentification auprès du service de modèle a échoué.",
       "credits": "Le solde du compte du service de modèle est insuffisant.",
       "modelUnavailable": "Le modèle sélectionné est indisponible.",
-      "contextLimit": "Le contenu dépasse la limite du modèle.",
+      "contextLimit": "Le contenu dépasse la capacité du modèle. Raccourcissez l’entrée ou choisissez un modèle avec un contexte plus grand.",
       "unsupported": "Ce modèle ne prend pas en charge cette demande.",
       "imageUnsupported": "Ce modèle ne prend pas en charge les images.",
       "ensembleImageUnsupported": "Ce mode ne prend pas en charge les images.",
@@ -4034,7 +4059,7 @@
       "needsConfirmation": "Une confirmation est nécessaire pour continuer.",
       "toolDenied": "Un outil nécessaire n’est pas autorisé.",
       "toolFailed": "Un outil n’a pas pu terminer son travail.",
-      "contextUnavailable": "La conversation actuelle n’a pas pu être traitée.",
+      "contextUnavailable": "L’organisation du contexte n’a pas abouti et cette requête n’a pas pu continuer. Réessayez plus tard.",
       "timeout": "La tâche n’a pas pu se terminer dans le délai imparti.",
       "stopped": "La tâche a été arrêtée.",
       "interrupted": "La tâche a été interrompue.",
@@ -4599,9 +4624,10 @@
       "failureUnavailable": "Le modèle de résumé est indisponible",
       "failureProvider": "Le modèle n’a pas pu générer de résumé utilisable",
       "failureTimeout": "L’organisation du contexte a dépassé le délai",
-      "failureRejectedDetail": "Le résumé n’a pas été appliqué ; votre contexte initial est conservé. Réessayez ou copiez l’identifiant de diagnostic si l’échec se répète.",
-      "failureUnavailableDetail": "Vérifiez la configuration du modèle et la connexion, puis réessayez. Vous pouvez copier l’identifiant de diagnostic.",
-      "failureRetryDetail": "Vous pouvez relancer l’organisation du contexte. En cas de nouvel échec, copiez l’identifiant de diagnostic.",
+      "failureRejectedDetail": "Le résumé n’a pas été appliqué. Vous pouvez réessayer plus tard.",
+      "failureCapacityDetail": "Raccourcissez l’entrée ou choisissez un modèle avec une fenêtre de contexte plus grande.",
+      "failureUnavailableDetail": "Vérifiez les paramètres du modèle et la connexion réseau, ou choisissez un autre modèle.",
+      "failureRetryDetail": "Relancez l’organisation du contexte plus tard ou choisissez un autre modèle.",
       "compacting": "Compactage du contexte",
       "compacted": "Contexte compacté",
       "temporarilyReduced": "Historique temporairement réduit ; traitement en cours",
@@ -4610,12 +4636,12 @@
       "historyIncomplete": "Contexte antérieur résumé ; certains messages d’origine ne sont pas disponibles",
       "historySummarized": "Contexte antérieur résumé",
       "failed": "Échec du compactage",
+      "incomplete": "L’organisation du contexte n’a pas abouti",
       "withinBudget": "Contexte dans les limites du budget.",
       "noSafeHistory": "Aucun historique ne peut actuellement être résumé en toute sécurité",
       "alreadyConcise": "Le contexte actuel est déjà suffisamment concis",
       "skipped": "Le compactage du contexte n’a pas été appliqué.",
-      "cancelled": "Compactage annulé",
-      "requestScoped": "Limité à cette requête ; l’historique de session n’a pas été réécrit"
+      "cancelled": "Compactage annulé"
     },
     "tool": {
       "genericCall": "Appel d’outil",

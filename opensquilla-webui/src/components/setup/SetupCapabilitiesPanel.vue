@@ -409,51 +409,6 @@ function resetLabel(capabilityId: CapabilityId): string {
               </ControlSelect>
             </div>
           </label>
-          <aside
-            v-if="recommendedImageProvider?.actionRequired"
-            class="capability-card__recommendation control-card control-card--compact control-card--accent"
-            data-testid="image-provider-recommendation"
-            role="note"
-            aria-labelledby="image-provider-recommendation-title"
-          >
-            <div class="capability-card__recommendation-copy">
-              <div class="capability-card__recommendation-title-row">
-                <strong id="image-provider-recommendation-title">
-                  {{ t('setup.capabilities.imageRecommendationTitle', {
-                    provider: recommendedImageProvider.label,
-                  }) }}
-                </strong>
-                <span class="control-pill control-pill--accent">
-                  {{ t('setup.capabilities.imageRecommendedBadge') }}
-                </span>
-              </div>
-              <span>{{ t('setup.capabilities.imageRecommendationDesc', {
-                provider: recommendedImageProvider.label,
-              }) }}</span>
-            </div>
-            <div class="capability-card__recommendation-actions">
-              <a
-                v-if="recommendedImageProvider.registrationUrl && !recommendedImageProvider.canReuseCredential"
-                class="btn btn--ghost"
-                :href="recommendedImageProvider.registrationUrl"
-                target="_blank"
-                rel="noopener noreferrer"
-                :aria-label="t('setup.capabilities.imageRecommendationRegisterExternal', {
-                  provider: recommendedImageProvider.label,
-                })"
-              >{{ t('setup.capabilities.imageRecommendationRegister') }}</a>
-              <button
-                type="button"
-                class="btn btn--primary"
-                :disabled="panel.form.imageProvider === recommendedImageProvider.providerId"
-                @click="emit('useImageRecommendation', recommendedImageProvider.providerId)"
-              >{{ panel.form.imageProvider === recommendedImageProvider.providerId
-                ? t('setup.capabilities.imageRecommendationSelected')
-                : t('setup.capabilities.imageRecommendationUse', {
-                  provider: recommendedImageProvider.label,
-                }) }}</button>
-            </div>
-          </aside>
           <template v-if="panel.form.imageProvider">
             <SetupModelCombobox
               :field="{
@@ -672,45 +627,6 @@ function resetLabel(capabilityId: CapabilityId): string {
   text-align: right;
 }
 
-.capability-card__recommendation {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-top: 12px;
-  padding: 12px 14px;
-  background: color-mix(in srgb, var(--accent) 6%, var(--bg-elevated));
-}
-
-.capability-card__recommendation-copy {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: 4px;
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.capability-card__recommendation-title-row {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.capability-card__recommendation-title-row strong {
-  color: var(--text);
-  font-size: 13px;
-}
-
-.capability-card__recommendation-actions {
-  display: flex;
-  align-items: center;
-  flex: 0 0 auto;
-  gap: 8px;
-}
-
 .capability-card__model-input {
   width: min(100%, 360px);
   max-width: 360px;
@@ -782,16 +698,6 @@ function resetLabel(capabilityId: CapabilityId): string {
   .capability-card__field-error {
     text-align: left;
   }
-
-  .capability-card__recommendation {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .capability-card__recommendation-actions {
-    flex-wrap: wrap;
-  }
-
 
 }
 </style>

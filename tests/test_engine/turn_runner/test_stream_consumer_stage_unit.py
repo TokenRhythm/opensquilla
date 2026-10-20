@@ -146,7 +146,7 @@ class _RecordingAgentRun:
 class _RecordingCompactionPersist:
     calls: list[dict[str, Any]] = field(default_factory=list)
     raises: type[BaseException] | None = None
-    result: bool | None = None
+    result: bool | None = True
 
     async def persist_and_notify(
         self,
@@ -1702,9 +1702,9 @@ async def test_compaction_handler_preserves_recoverable_state_on_persist_failure
         system_prompt=prompt,
     )
     inp = _make_input()
-    # Must NOT raise, but failed durable persistence must not refresh runtime state
-    # into a false post-compaction view.
-    await handler.handle(CompactionEvent(summary="s", kept_entries=[]), inp)
+    # An unsettled writer stops the turn without refreshing a false committed view.
+    with pytest.raises(RuntimeError, match="recording persist boom"):
+        await handler.handle(CompactionEvent(summary="s", kept_entries=[]), inp)
     assert len(persist.calls) == 1
     assert snapshot.calls == []
     assert prompt.calls == []

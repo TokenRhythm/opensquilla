@@ -1,4 +1,5 @@
 import type { NativeBilledByCurrency, UsageSnapshot } from '@/types/usage'
+import i18n from '@/i18n'
 
 const NANOS_PER_USD = 1_000_000_000
 
@@ -6,16 +7,20 @@ type NativeBillingSource = {
   readonly nativeBilledByCurrency?: NativeBilledByCurrency
   readonly pendingBillingReceiptCount?: number
   readonly costSource?: string
+  readonly costSourceCounts?: Record<string, number>
+  readonly missingCostEntries?: number | null
   readonly nativeBillingExpectedReceiptCount?: number
   readonly nativeBillingMissingConfirmedReceiptCount?: number
 } | undefined
 
+export function hasUnpricedUsage(source: NativeBillingSource): boolean {
+  return (source?.missingCostEntries ?? 0) > 0
+    || (source?.costSourceCounts?.unavailable ?? 0) > 0
+    || source?.costSource === 'unavailable'
+}
+
 export interface NativeBillingDisplay {
   exactCny: number | null
-  hasNativeReceipts: boolean
-  useCanonicalUsd: boolean
-  pendingReceiptCount: number
-  subtotalText: string
 }
 
 function nativeByCurrency(source: NativeBillingSource): NativeBilledByCurrency {
@@ -42,12 +47,6 @@ function usdEquivalentMatches(entryNanos: string, canonicalUsd: number): boolean
   }
 }
 
-function formatNativeAmount(currency: string, amount: string): string {
-  if (currency === 'CNY') return `¥${amount}`
-  if (currency === 'USD') return `$${amount}`
-  return `${amount} ${currency}`
-}
-
 /**
  * Decide whether a cost can be rendered as an exact native-CNY amount.
  *
@@ -61,7 +60,6 @@ export function nativeBillingDisplay(
   const native = nativeByCurrency(source)
   const entries = Object.entries(native)
     .filter(([, entry]) => Number(entry?.receiptCount || 0) > 0)
-    .sort(([left], [right]) => left.localeCompare(right))
   const pendingReceiptCount = Number(source?.pendingBillingReceiptCount || 0)
   const costSource = String(source?.costSource || 'none')
   const expectedReceiptCount = nonNegativeInteger(source?.nativeBillingExpectedReceiptCount)
@@ -91,24 +89,7 @@ export function nativeBillingDisplay(
     }
   }
 
-  const hasNativeReceipts = entries.length > 0
-  const hasIncompleteCnyReceipt = entries.length === 1
-    && entries[0][0].toUpperCase() === 'CNY'
-    && exactCny == null
-  const useCanonicalUsd = costSource === 'mixed'
-    || pendingReceiptCount > 0
-    || entries.length > 1
-    || hasIncompleteCnyReceipt
-
-  return {
-    exactCny,
-    hasNativeReceipts,
-    useCanonicalUsd,
-    pendingReceiptCount: Number.isFinite(pendingReceiptCount) ? pendingReceiptCount : 0,
-    subtotalText: entries
-      .map(([currency, entry]) => formatNativeAmount(currency.toUpperCase(), entry.amount))
-      .join(' · '),
-  }
+  return { exactCny }
 }
 
 export function serializeNativeBilling(source: NativeBillingSource): string {
@@ -156,12 +137,14 @@ export function formatUsageCost(
 ): string {
   if (usd == null) return '—'
   const canonicalUsd = Number(usd)
-  if (currency !== 'CNY') return '$' + canonicalUsd.toFixed(decimals)
+  const incomplete = hasUnpricedUsage(source)
+  if (incomplete && canonicalUsd === 0) return i18n.global.t('usageLogs.costSource.unpriced.label')
   const native = nativeBillingDisplay(source, canonicalUsd)
-  if (native.exactCny != null) return '¥' + native.exactCny.toFixed(decimals)
   // Native receipt coverage determines whether CNY can be shown as an exact
   // provider-billed amount, but it must not override the user's display
   // currency. Mixed, pending, and older rows still have a canonical USD total
   // that can be converted with the snapshot's effective display rate.
-  return '¥' + (canonicalUsd * cnyRate).toFixed(decimals)
+  return currency === 'CNY'
+    ? '¥' + (native.exactCny ?? canonicalUsd * cnyRate).toFixed(decimals)
+    : '$' + canonicalUsd.toFixed(decimals)
 }

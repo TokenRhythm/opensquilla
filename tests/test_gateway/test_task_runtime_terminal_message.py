@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,6 +28,21 @@ from opensquilla.silent_reply import (
     SILENT_REPLY_NOT_ALLOWED_MESSAGE,
 )
 from opensquilla.tools.types import CallerKind, ToolContext
+
+
+@pytest.fixture(autouse=True)
+def isolated_approval_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from opensquilla.application import approval_queue
+
+    # Terminal settlement expires session approvals. Keep that real async path,
+    # without timing default database initialization or sharing another test's
+    # singleton and event-loop state in these message-contract tests.
+    queue = approval_queue.ApprovalQueue(db_path=":memory:")
+    monkeypatch.setattr(approval_queue, "_queue", queue)
+    try:
+        yield
+    finally:
+        queue.close()
 
 
 def _make_envelope(
@@ -887,12 +902,13 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", [None, "empty_response"])
+@pytest.mark.parametrize("budget", ["configured", "available"])
 async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_terminal_message(
-    failure_kind: str | None,
+    failure_kind: str | None, budget: str,
 ) -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     engine_message = (
-        "The provider used the configured output budget for reasoning without returning a "
+        f"The provider used the {budget} output budget for reasoning without returning a "
         "visible answer. Increase llm.max_tokens or choose another model or provider."
     )
 

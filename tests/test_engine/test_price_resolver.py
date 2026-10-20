@@ -15,6 +15,7 @@ def test_local_provider_resolves_free(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
     r = resolve_model_price("qwen3:4b", provider="lm_studio")
     assert r.source == "local_free"
+    assert r.has_accounting_price
     assert r.entry.input_per_m == 0.0 and r.entry.cache_read_per_m == 0.0
 
 
@@ -28,6 +29,7 @@ def test_generic_custom_provider_defaults_to_zero_price(
     resolved = resolve_model_price(model_id, provider=provider)
 
     assert resolved.source == "custom_free"
+    assert not resolved.has_accounting_price
     assert resolved.entry == PriceEntry(0.0, 0.0, 0.0, 0.0)
 
 
@@ -103,6 +105,7 @@ def test_generic_custom_provider_honors_explicit_zero_price_override(
 
     assert resolved.source == "user_override"
     assert resolved.entry == PriceEntry(0.0, 0.0)
+    assert resolved.has_accounting_price
 
 
 @pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])

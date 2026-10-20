@@ -9,7 +9,7 @@ from typing import Any
 
 import structlog
 
-from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.context_budget import hard_input_tokens
 from opensquilla.gateway.selected_provider import (
     effective_session_model as effective_session_model,
 )
@@ -377,6 +377,11 @@ def build_gateway_compaction_budget(
         generation_reserve_tokens=budget.generation_reserve_tokens or budget.max_output_tokens,
         provider_identity=f"{budget.provider_id}/{budget.model}:{budget.deployment_fingerprint}",
         history_limit_tokens=budget.context_window_tokens,
+        request_character_limit=(
+            budget.provider_request_max_chars_explicit_cap
+            if budget.provider_request_max_chars_explicit_cap is not None
+            else budget.provider_request_max_chars
+        ),
         envelope_reserve_tokens=budget.next_request_reserve_tokens,
         envelope_reserve_chars=budget.next_request_reserve_chars,
         trigger_ratio=trigger_ratio,
@@ -819,12 +824,7 @@ def _consumer_execution_budget(
         projected_generation_budget(projection.payload, config.max_tokens)
         if projection is not None else output_tokens + thinking_budget_tokens
     )
-    derived_cap = ContextBudgetGovernor.from_values(
-        context_window_tokens=context_window,
-        max_output_tokens=generation_reserve_tokens,
-        thinking_budget_tokens=0,
-        context_overflow_threshold=0.85,
-    ).snapshot().provider_request_max_chars
+    derived_cap = max(1, hard_input_tokens(context_window, generation_reserve_tokens) * 4)
     request_max_chars = min(explicit_cap or derived_cap, history_window * 4)
     next_request_reserve_tokens = _manual_next_request_reserve_tokens(
         history_window

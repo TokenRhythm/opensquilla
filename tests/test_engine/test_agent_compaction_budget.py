@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.context_budget import soft_input_tokens
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.execution_status import normalize_execution_status
 from opensquilla.provider import (
@@ -109,7 +110,11 @@ async def test_in_turn_entrypoints_bind_shared_physical_budget_and_raw_tail_admi
     assert budget is not None
     assert budget.physical_context_window_tokens == window
     assert budget.generation_reserve_tokens == output
-    assert 0 < budget.history_capacity_tokens < window - output
+    # Scheduling reserves future-turn room, not the model's maximum output.
+    # The actual summary/tail still goes through the adapter admission below.
+    assert 0 < budget.history_capacity_tokens < soft_input_tokens(window)
+    if output >= window // 2:
+        assert budget.history_capacity_tokens > window - output
     assert request.context_window_tokens == budget.history_capacity_tokens
     assert request.context_window_chars == budget.history_capacity_chars
     assert request.consumer_admission is budget.consumer_admission
@@ -148,9 +153,11 @@ async def test_live_prefix_budget_reserves_native_media_and_exhausted_raw_tail(
                 tool_use_id=f"read-{index}", content="result " * 8_000,
             )]),
         ])
+    # Required images exhaust the native input envelope even when the
+    # adapter can reduce its output cap; completed tool text is summarizable.
     messages.append(Message(role="user", content=[ContentBlockImage(
         media_type="image/png", data="c3ludGhldGlj",
-    )]))
+    ) for _ in range(3)]))
     requests: list[Any] = []
 
     async def capture(request: Any) -> CompactionResult:
@@ -289,8 +296,11 @@ async def test_inline_compaction_honors_configured_trigger_and_effective_summary
     await agent._check_context_overflow(messages, estimated_context_tokens=45_000)
     assert len(requests) == 1
     budget = requests[0].config.budget
-    assert budget.auto_trigger_tokens == int(budget.history_capacity_tokens * 0.6)
-    assert budget.auto_trigger_chars == int(budget.history_capacity_chars * 0.6)
+    soft_tokens = soft_input_tokens(64_000)
+    fixed_tokens = soft_tokens - budget.history_capacity_tokens
+    fixed_chars = soft_tokens * 4 - budget.history_capacity_chars
+    assert budget.auto_trigger_tokens == max(0, int(soft_tokens * 0.6) - fixed_tokens)
+    assert budget.auto_trigger_chars == max(0, int(soft_tokens * 4 * 0.6) - fixed_chars)
     assert budget.summary_output_tokens == 512
     assert budget.retained_tail_messages == 0
     # Being called after a full-request overflow does not grant manual force

@@ -403,6 +403,7 @@ async def test_confirmed_cny_receipts_include_real_zero_in_every_totals_dimensio
             "amountNanos": "13950000",
             "amount": "0.01395",
             "usdEquivalentNanos": "2000000",
+            "usdEquivalentExact": "0.002",
             "receiptCount": 2,
             "normalizationRatesNativePerUsd": ["6.975"],
         }

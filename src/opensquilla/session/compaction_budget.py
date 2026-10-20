@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from opensquilla.context_budget import soft_input_tokens
 from opensquilla.engine.history import HISTORY_REPLAY_PROJECTION_VERSION
 from opensquilla.provider.request_proof import projected_generation_budget
 from opensquilla.session.compaction_deployment import DEFAULT_COMPACTION_OUTPUT_TOKENS
@@ -55,6 +57,7 @@ class CompactionBudget:
     history_capacity_chars: int
     auto_trigger_tokens: int
     auto_trigger_chars: int
+    # Legacy allocation estimate, not the observed retained transcript tokens.
     retained_tail_tokens: int
     retained_tail_messages: int
     summary_output_tokens: int
@@ -63,6 +66,11 @@ class CompactionBudget:
     consumer_admission: Callable[[str, list[dict[str, Any]]], bool] = field(
         repr=False,
         compare=False,
+    )
+    # Optional exact consumer proof. A false/unknown admission alone cannot
+    # prove that shortening the checkpoint is futile.
+    consumer_tail_over_capacity: Callable[[list[dict[str, Any]]], bool] | None = field(
+        default=None, repr=False, compare=False,
     )
 
 
@@ -74,6 +82,7 @@ def resolve_compaction_budget(
     generation_reserve_tokens: int,
     provider_identity: str = "",
     history_limit_tokens: int | None = None,
+    request_character_limit: int = 0,
     envelope_reserve_tokens: int = 0,
     envelope_reserve_chars: int = 0,
     trigger_ratio: float = 0.85,
@@ -94,12 +103,34 @@ def resolve_compaction_budget(
     # capacity must reserve only the envelope absent from those source entries.
     capacity_projection = capacity_project(template, []) if capacity_project else projection
     capacity_proof = capacity_projection.proof if capacity_projection is not None else {}
-    tokens, chars = history_capacity_from_proof(capacity_proof)
-    tokens = max(0, tokens - max(0, envelope_reserve_tokens))
-    chars = max(0, chars - max(0, envelope_reserve_chars))
+    # Scheduling uses a stable input watermark independent of the catalog's
+    # output ceiling. Hard admission below uses each candidate's actual cap.
+    soft_tokens = soft_input_tokens(physical_context_window_tokens)
+    soft_chars = soft_tokens * 4
+    try:
+        environment_character_limit = int(
+            os.environ.get("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS") or 0,
+        )
+    except ValueError:
+        environment_character_limit = 0
+    if request_character_limit > 0 or environment_character_limit > 0:
+        soft_chars = min(soft_chars, int(capacity_proof.get("effective_proof_budget", 0) or 0))
+    if capacity_projection is None:
+        soft_tokens = soft_chars = 0
+    fixed_tokens = int(capacity_proof.get("estimated_tokens", 0) or 0)
+    fixed_chars = int(capacity_proof.get("estimated_chars", 0) or 0)
+    reserve_tokens = max(0, envelope_reserve_tokens)
+    reserve_chars = max(0, envelope_reserve_chars)
+    tokens = max(0, soft_tokens - fixed_tokens - reserve_tokens)
+    chars = max(0, soft_chars - fixed_chars - reserve_chars)
+    ratio = min(1.0, max(0.0, trigger_ratio))
+    trigger_tokens = max(0, int(soft_tokens * ratio) - fixed_tokens - reserve_tokens)
+    trigger_chars = max(0, int(soft_chars * ratio) - fixed_chars - reserve_chars)
     if history_limit_tokens is not None:
         tokens = min(tokens, max(0, history_limit_tokens))
         chars = min(chars, max(0, history_limit_tokens) * 4)
+        trigger_tokens = min(trigger_tokens, int(max(0, history_limit_tokens) * ratio))
+        trigger_chars = min(trigger_chars, int(max(0, history_limit_tokens) * 4 * ratio))
     payload = projection.payload if projection is not None else None
 
     def payload_hash(value: Any) -> str:
@@ -142,15 +173,16 @@ def resolve_compaction_budget(
             "history_chars": chars,
             "reserve_tokens": envelope_reserve_tokens,
             "reserve_chars": envelope_reserve_chars,
+            "request_character_limit": request_character_limit,
             "proof_tokens": proof.get("effective_proof_token_budget"),
             "proof_chars": proof.get("effective_proof_budget"),
         }
     )
 
-    def admit(summary: str, kept: list[dict[str, Any]]) -> bool:
+    def validate_envelope() -> bool:
         from opensquilla.session.compaction import ConsumerAdmissionStaleError
 
-        if projection is None or tokens <= 0 or chars <= 0:
+        if projection is None or capacity_projection is None:
             return False
         current = project(template, [])
         current_capacity = capacity_project(template, []) if capacity_project else current
@@ -171,34 +203,67 @@ def resolve_compaction_budget(
             != capacity_proof_limits
         ):
             raise ConsumerAdmissionStaleError("compaction consumer request changed")
+        return True
+
+    def admit(summary: str, kept: list[dict[str, Any]]) -> bool:
+        if not validate_envelope():
+            return False
         candidate = project(summary, kept)
         if candidate is None or not candidate.fits:
             return False
         candidate_proof = candidate.proof
         used_tokens = int(candidate_proof.get("estimated_tokens", 0) or 0)
         used_chars = int(candidate_proof.get("estimated_chars", 0) or 0)
+        if history_limit_tokens is not None and (
+            max(0, used_tokens - fixed_tokens) > max(0, history_limit_tokens)
+            or max(0, used_chars - fixed_chars) > max(0, history_limit_tokens) * 4
+        ):
+            return False
         return bool(
-            used_tokens + envelope_reserve_tokens
+            used_tokens + reserve_tokens
             <= int(candidate_proof.get("effective_proof_token_budget", 0) or 0)
-            and used_chars + envelope_reserve_chars
+            and used_chars + reserve_chars
             <= int(candidate_proof.get("effective_proof_budget", 0) or 0)
-            and max(0, used_tokens - int(capacity_proof.get("estimated_tokens", 0) or 0)) <= tokens
-            and max(0, used_chars - int(capacity_proof.get("estimated_chars", 0) or 0)) <= chars
         )
 
-    ratio = min(1.0, max(0.0, trigger_ratio))
+    def tail_over_capacity(kept: list[dict[str, Any]]) -> bool:
+        if not validate_envelope():
+            return False
+        candidate = project("", kept)
+        if candidate is None:
+            return False
+        tail_proof = candidate.proof
+        # Read the final adapter's numeric proof, not source estimates or the
+        # soft history allocation. Missing/unknown/message-count rejection is
+        # not evidence that a smaller checkpoint cannot fit.
+        for used_key, limit_key, reserve in (
+            ("estimated_tokens", "effective_proof_token_budget", reserve_tokens),
+            ("estimated_chars", "effective_proof_budget", reserve_chars),
+        ):
+            used, limit = tail_proof.get(used_key), tail_proof.get(limit_key)
+            if (
+                isinstance(used, (int, float))
+                and isinstance(limit, (int, float))
+                and used >= 0
+                and limit >= 0
+                and used + reserve > limit
+            ):
+                return True
+        return False
+
     summary_goal = max(1, min(tokens or 1, summary_output_tokens or generation or 1))
     return CompactionBudget(
         physical_context_window_tokens=physical_context_window_tokens,
         generation_reserve_tokens=generation,
         history_capacity_tokens=tokens,
         history_capacity_chars=chars,
-        auto_trigger_tokens=int(tokens * ratio),
-        auto_trigger_chars=int(chars * ratio),
+        auto_trigger_tokens=trigger_tokens,
+        auto_trigger_chars=trigger_chars,
         retained_tail_tokens=max(0, tokens - summary_goal),
         retained_tail_messages=max(0, retained_tail_messages),
         summary_output_tokens=summary_goal,
         provider_request_max_chars=int(proof.get("effective_proof_budget", 0) or 0),
         consumer_admission_fingerprint=fingerprint,
         consumer_admission=admit,
+        consumer_tail_over_capacity=tail_over_capacity,
     )
