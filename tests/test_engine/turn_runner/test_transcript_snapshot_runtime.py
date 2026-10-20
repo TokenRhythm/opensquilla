@@ -49,6 +49,12 @@ from opensquilla.tools.types import CallerKind, ToolContext
 _MODEL = "deepseek/deepseek-v4-pro"
 
 
+class _CharacterBudgetEncoding:
+    def encode(self, text: str, *, disallowed_special: tuple[Any, ...]) -> range:
+        del disallowed_special
+        return range((len(text) + 7) // 8)
+
+
 class _CountingProvider:
     provider_name = "openrouter"
 
@@ -342,8 +348,14 @@ async def test_failed_preflight_continues_through_cooldown_and_sqlite_reopen(
 async def _exercise_preflight_recovery(
     monkeypatch, tmp_path, failure, hard_overflow, *, recover_on_second=False, follow_up=False,
 ):
+    from opensquilla import token_estimation
     from opensquilla.session import compaction as compaction_module
 
+    # Exercise paid-call recovery and the real 100k character limit. An optional
+    # tokenizer's conservative fallback would exhaust the protected tail's token
+    # budget before any provider call, testing a different failure boundary.
+    encoding = _CharacterBudgetEncoding()
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
     loop = asyncio.get_running_loop()
     compaction_clock = SimpleNamespace(now=loop.time())
