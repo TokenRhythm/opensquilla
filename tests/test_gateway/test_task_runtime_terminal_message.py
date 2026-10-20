@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,6 +28,21 @@ from opensquilla.silent_reply import (
     SILENT_REPLY_NOT_ALLOWED_MESSAGE,
 )
 from opensquilla.tools.types import CallerKind, ToolContext
+
+
+@pytest.fixture(autouse=True)
+def isolated_approval_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from opensquilla.application import approval_queue
+
+    # Terminal settlement expires session approvals. Keep that real async path,
+    # without timing default database initialization or sharing another test's
+    # singleton and event-loop state in these message-contract tests.
+    queue = approval_queue.ApprovalQueue(db_path=":memory:")
+    monkeypatch.setattr(approval_queue, "_queue", queue)
+    try:
+        yield
+    finally:
+        queue.close()
 
 
 def _make_envelope(
