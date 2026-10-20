@@ -618,7 +618,9 @@ async def test_unclassified_flow_failure_never_uses_exception_text_or_arbitrary_
         assert logged["reason_code"] == "flow_admission_unclassified"
         assert logged["failure_kind"] == "flow_admission"
         assert logged["exception_type"] == "PrivateError"
-        dirty.assert_called_once_with({"session_key": "s"})
+        dirty.assert_called_once_with(
+            {"session_key": "s"}, reason_code="event_encode_or_budget_failed",
+        )
         assert not conn._closing
     finally:
         conn._cleanup_transport()

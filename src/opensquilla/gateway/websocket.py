@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import time
@@ -63,6 +64,7 @@ from opensquilla.gateway.transport_flow import (
     FLOW_CAPABILITY,
     FLOW_CAPABILITY_V2,
     FLOW_LANE_WINDOW_BYTES,
+    FLOW_LANE_WINDOW_FRAMES,
     FLOW_V2_MAX_LANE_EPOCHS,
     FLOW_V2_MAX_LANES,
     FLOW_WINDOW_BYTES,
@@ -195,9 +197,13 @@ class _PendingReplay:
     params: dict[str, Any]
     transfer: Any
     dirty_revision: Any
-    dirty_watermark: tuple[str | None, int] | None
     batches: tuple[tuple[Any, ...], ...]
     proof: dict[str, Any]
+    # Raw cursor includes capability-filtered events; the frozen public proof
+    # contains only the original visible consumption target.
+    replay_to_seq: int
+    catching_up: bool = False
+    catchup_logged: bool = False
     batch_index: int = 0
     batch_offset: int = 0
     pending_delivery_ids: set[int] = field(default_factory=set)
@@ -683,7 +689,39 @@ class WsConnection:
         )
         self._enqueue_frame(frame)
 
-    def _mark_flow_dirty(self, payload: Any) -> None:
+    def _log_session_recovery(
+        self, phase: str, key: Any, reason_code: str, *, stream_seq: int = 0,
+        pending: _PendingReplay | None = None,
+    ) -> None:
+        """One structured record per transition, never per suppressed token."""
+        flow = self._flow
+        try:
+            log.info(
+                "gateway.session_recovery",
+                conn_id=self.conn_id,
+                session_key_sha256=(
+                    hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+                    if isinstance(key, str) else None
+                ),
+                phase=phase,
+                reason_code=reason_code,
+                stream_seq=stream_seq,
+                replay_to_seq=pending.replay_to_seq if pending else None,
+                proof_to_seq=pending.proof["replay_to_seq"] if pending else None,
+                flow_unacked_frames=len(flow.deliveries) if flow else 0,
+                flow_unacked_bytes=(
+                    sum(item.size for item in flow.deliveries.values()) if flow else 0
+                ),
+                lane_window_frames=(
+                    FLOW_LANE_WINDOW_FRAMES if self._flow_lane_enabled else FLOW_WINDOW_FRAMES
+                ),
+                queue_depth=self._outbox.qsize() if self._outbox else 0,
+            )
+        except Exception:
+            # Diagnostics cannot change admission, ownership, or cleanup.
+            pass
+
+    def _mark_flow_dirty(self, payload: Any, *, reason_code: str = "stream_invalidated") -> None:
         assert self._flow is not None
         key = _payload_field(payload, "session_key") or _payload_field(payload, "key")
         generation = _payload_field(payload, "stream_generation")
@@ -708,6 +746,10 @@ class WsConnection:
                 # fulfilled global revision as proof of recovery.
                 changed = self._flow.mark_global_dirty(renew=True) or changed
         if changed:
+            self._log_session_recovery(
+                "required", key, reason_code,
+                stream_seq=seq if isinstance(seq, int) and not isinstance(seq, bool) else 0,
+            )
             self._queue_flow_dirty_notice()
 
     def _flow_key_needs_global_recovery(self, key: Any) -> bool:
@@ -839,24 +881,66 @@ class WsConnection:
             raise ValueError("Snapshot installation is not current")
         return transfer.identity
 
-    def _finish_pending_replay(self, pending: _PendingReplay) -> None:
-        """Publish the recovery CAS only after the final batch is ACKed."""
+    def _finish_pending_replay(self, pending: _PendingReplay, *, handoff: bool = False) -> None:
+        """Install the consumed base and atomically hand off its ordered tail.
+
+        New output is not a new loss. After the original target is consumed,
+        catch up from the raw cursor without reopening the snapshot. The final
+        bounded suffix may enter the ordinary delivery ledger before its ACK:
+        it is FIFO-owned output after the frozen proof, never claimed consumed.
+        """
+        from opensquilla.gateway.replay_batches import plan_replay_batches
+        from opensquilla.gateway.session_streams import get_session_streams
+        from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
+
         key = pending.key
         flow = self._flow
         if flow is None or self._pending_replays.get(key) is not pending:
             return
-        # Output may continue while the client is consuming replay. A new
-        # event renews the dirty token; clearing that barrier would otherwise
-        # make the post-base event disappear behind a false CAS success.
         if (
             flow.dirty_revision(key) != pending.dirty_revision
-            or flow.dirty.get(key) != pending.dirty_watermark
+            or pending.transfer.closed
+            or self._subscriptions is None
+            or pending.transfer.lease_token != self._subscriptions.get_message_subscription_token(
+                self.conn_id, key,
+            )
         ):
-            self._pending_replays.pop(key, None)
-            pending.transfer.close()
-            self._mark_flow_dirty({"session_key": key})
-            self._queue_flow_dirty_notice()
+            raise SnapshotTransferError("SNAPSHOT_STALE")
+        replay = get_session_streams().replay(
+            key, pending.replay_to_seq, pending.params["stream_generation"],
+        )
+        if not replay.replay_complete:
+            raise SnapshotTransferError("SNAPSHOT_STALE")
+        try:
+            batches = plan_replay_batches(
+                replay.events, start_seq=pending.replay_to_seq,
+                current_seq=replay.current_stream_seq,
+            )
+        except (TypeError, ValueError) as exc:
+            raise SnapshotTransferError("SNAPSHOT_STALE") from exc
+        if batches:
+            # A multi-batch catch-up may have accumulated another suffix
+            # while earlier batches were consumed. Keep the just-queued last
+            # batch owned until its ACK, then plan that newer contiguous tail.
+            if handoff:
+                return
+            pending.batches = batches
+            pending.batch_index = pending.batch_offset = 0
+            pending.replay_to_seq = replay.current_stream_seq
+            pending.catching_up = True
+            if not pending.catchup_logged:
+                pending.catchup_logged = True
+                self._log_session_recovery("catching_up", key, "output_advanced", pending=pending)
+            self._queue_pending_replay_batch(pending)
             return
+        watermark = flow.dirty.get(key)
+        if watermark is not None and (
+            watermark[0] not in (None, pending.params["stream_generation"])
+            or watermark[1] > pending.replay_to_seq
+        ):
+            # A dirty cursor not represented by this contiguous stream cannot
+            # be covered by the suffix handoff.
+            raise SnapshotTransferError("SNAPSHOT_STALE")
         flow.dirty.pop(key, None)
         if self._subscriptions is not None:
             self._subscriptions.set_message_flow_revision(
@@ -875,6 +959,9 @@ class WsConnection:
         self._pending_replays.pop(key, None)
         pending.transfer.close()
         self._clear_covered_global_flow()
+        self._log_session_recovery(
+            "installed", key, "tail_handoff" if handoff else "replay_consumed", pending=pending,
+        )
 
     def _prepare_replay_suffix(
         self, pending: _PendingReplay, *, lane_epoch: str | None,
@@ -921,11 +1008,23 @@ class WsConnection:
 
     def _queue_pending_replay_batch(self, pending: _PendingReplay) -> None:
         """Publish one owned byte segment, then wait for all of its ACKs."""
+        from opensquilla.gateway.session_streams import get_session_streams
         from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
 
         flow = self._flow
         if flow is None or self._pending_replays.get(pending.key) is not pending:
             return
+        if (
+            pending.transfer.closed
+            or self._closing
+            or self._subscriptions is None
+            or pending.transfer.lease_token != self._subscriptions.get_message_subscription_token(
+                self.conn_id, pending.key,
+            )
+            or flow.dirty_revision(pending.key) != pending.dirty_revision
+            or get_session_streams().stream_generation != pending.params["stream_generation"]
+        ):
+            raise SnapshotTransferError("SNAPSHOT_STALE")
         if pending.pending_delivery_ids:
             return
         if self._outbox is None:
@@ -985,6 +1084,23 @@ class WsConnection:
             for frame in frames:
                 self._enqueue_frame(frame)
             if delivery_ids:
+                if (
+                    pending.catching_up
+                    and pending.batch_index == len(pending.batches)
+                    and sum(
+                        not item.recovery and (
+                            not self._flow_lane_enabled
+                            or (item.lane == pending.key and item.lane_epoch == lane_epoch)
+                        )
+                        for item in flow.deliveries.values()
+                    ) < (
+                        FLOW_LANE_WINDOW_FRAMES if self._flow_lane_enabled else FLOW_WINDOW_FRAMES
+                    )
+                ):
+                    # All of the new suffix is reserved and queued, with at
+                    # least one frame of headroom for the continuing live
+                    # stream. Keep these frames in normal ACK accounting.
+                    self._finish_pending_replay(pending, handoff=True)
                 return
             # A projection-empty batch has no client consumption to await.
         self._finish_pending_replay(pending)
@@ -1002,8 +1118,11 @@ class WsConnection:
             pending.pending_delivery_ids.clear()
             try:
                 self._queue_pending_replay_batch(pending)
-            except Exception:
-                self._mark_flow_dirty({"session_key": pending.key})
+            except Exception as exc:
+                self._log_session_recovery(
+                    "failed", pending.key, getattr(exc, "code", "replay_failed"), pending=pending,
+                )
+                self._mark_flow_dirty({"session_key": pending.key}, reason_code="replay_failed")
                 # Recovery was already dirty; notify the client that this
                 # accepted replay can no longer complete.
                 self._queue_flow_dirty_notice()
@@ -1053,8 +1172,11 @@ class WsConnection:
                 continue
             try:
                 self._queue_pending_replay_batch(pending)
-            except Exception:
-                self._mark_flow_dirty({"session_key": pending.key})
+            except Exception as exc:
+                self._log_session_recovery(
+                    "failed", pending.key, getattr(exc, "code", "replay_failed"), pending=pending,
+                )
+                self._mark_flow_dirty({"session_key": pending.key}, reason_code="replay_failed")
                 self._queue_flow_dirty_notice()
                 pending.transfer.close()
                 self._pending_replays.pop(pending.key, None)
@@ -1101,7 +1223,9 @@ class WsConnection:
                 # Retrying a successful install may repeat its original
                 # dirty declaration too; it must not recreate that barrier.
                 continue
-            self._flow.mark_dirty(key)
+            changed = self._flow.mark_dirty(key)
+            if changed:
+                self._log_session_recovery("required", key, "client_reported_dirty")
             if self._flow.global_dirty:
                 self._subscriptions.set_message_flow_revision(self.conn_id, key, 0)
         for resume in resumes:
@@ -1758,12 +1882,13 @@ class WsConnection:
             raise SnapshotTransferError("SNAPSHOT_BUSY")
         pending = _PendingReplay(
             key=key, params=dict(params), transfer=transfer,
-            dirty_revision=dirty_revision, dirty_watermark=flow.dirty.get(key),
-            batches=replay_batches, proof=proof,
+            dirty_revision=dirty_revision,
+            batches=replay_batches, proof=proof, replay_to_seq=replay.current_stream_seq,
         )
         # Keep the barrier installed while the client consumes replay. The
         # replay metadata is the sole path that may pass this barrier.
         self._pending_replays[key] = pending
+        self._log_session_recovery("started", key, "snapshot_resume", pending=pending)
         try:
             self._queue_pending_replay_batch(pending)
         except Exception:
@@ -2440,10 +2565,11 @@ class WsConnection:
             replay_frame = bool((frame.meta or {}).get("replayed"))
             if is_stream and not replay_frame and (
                 key in self._flow.dirty or self._flow_key_needs_global_recovery(key)
+                or key in self._pending_replays
             ):
                 # The existing barrier already owns these intentionally
-                # suppressed deltas. Resume proves raw replay coverage; a new
-                # token here would starve installation during a live stream.
+                # suppressed deltas. An in-progress clean snapshot also owns
+                # this tail: normal publication must not overtake its replay.
                 prior = self._flow.dirty.get(key)
                 sequence = _payload_field(frame.payload, "stream_seq")
                 generation = _payload_field(frame.payload, "stream_generation")
@@ -2497,7 +2623,10 @@ class WsConnection:
                     lane_epoch=lane_epoch,
                 )
                 if delivery_id is None:
-                    self._mark_flow_dirty(frame.payload)
+                    self._mark_flow_dirty(
+                        frame.payload,
+                        reason_code=self._flow.last_rejection_reason or "flow_admission_rejected",
+                    )
                     return False
                 frame.delivery_id = delivery_id
                 frame.encoded_text = encoded
@@ -2830,7 +2959,9 @@ class WsConnection:
                         "key",
                     )
                     if isinstance(key, str):
-                        self._mark_flow_dirty({"session_key": key})
+                        self._mark_flow_dirty(
+                            {"session_key": key}, reason_code="stale_snapshot_delivery",
+                        )
                     if frame.res_frame is not None:
                         self._enqueue_frame(_OutboundFrame(
                             kind="res",
@@ -2848,7 +2979,9 @@ class WsConnection:
                         ))
                     return
                 if frame.event_name and frame.event_name.startswith("session.event."):
-                    self._mark_flow_dirty(frame.payload)
+                    self._mark_flow_dirty(
+                        frame.payload, reason_code="event_encode_or_budget_failed"
+                    )
                     return
                 # A non-replayable response/control cannot be silently lost.
                 self._closing = True
@@ -3774,7 +3907,9 @@ def _admit_session_mutation(
                     if operation.key == key:
                         scheduler.cancel(operation)
                 if affected._flow is not None:
-                    affected._mark_flow_dirty({"session_key": key})
+                    affected._mark_flow_dirty(
+                        {"session_key": key}, reason_code="session_mutation",
+                    )
     completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
     def complete(_: asyncio.Future[None]) -> None:

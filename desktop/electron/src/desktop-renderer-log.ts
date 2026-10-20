@@ -53,9 +53,8 @@ export interface RendererLogEntry {
   detail: Record<string, unknown>
 }
 
-// Only errors are persisted. Warnings are commonly used for routine application
-// state and are too easy for a hot loop to emit; process hangs have their own
-// structured breadcrumb.
+// Ordinary warnings remain excluded. Only the content-free recovery record
+// validated below is accepted in addition to errors.
 const FORWARDED_LEVELS: ReadonlySet<RendererConsoleLevel> = new Set<RendererConsoleLevel>([
   'error',
 ])
@@ -176,6 +175,57 @@ function sanitizeSource(sourceId: string, homeDir?: string): string {
   return truncateUtf8(redacted, MAX_SOURCE_BYTES)
 }
 
+const RECOVERY_PREFIX = '[opensquilla-recovery] '
+const RECOVERY_REASONS = new Set([
+  'server_dirty', 'delivery_ledger_limit', 'invalid_lane', 'missing_session_key',
+  'retired_lane_delivery', 'stale_lane', 'lane_history_limit',
+  'consumer_timeout', 'consumer_dirty', 'consumer_rejected',
+  'recovery_incomplete', 'recovery_invalidated', 'recovery_terminal',
+  'recovery_completed', 'recovery_exception',
+  'live_subscription_failed', 'metadata_hydration_failed', 'metadata_recovery_failed',
+  'transport_sequence_gap',
+])
+const RECOVERY_ERROR_CODES = new Set([
+  'SNAPSHOT_STALE', 'SNAPSHOT_BUSY', 'SNAPSHOT_TOO_LARGE', 'SNAPSHOT_UNAVAILABLE',
+  'READ_UNAVAILABLE', 'REBASE_REQUIRED', 'BUSY', 'TIMEOUT', 'INVALID_REQUEST',
+  'SESSION_NOT_FOUND', 'NOT_FOUND', 'METHOD_NOT_FOUND', 'DISCONNECTED',
+  'RPC_TIMEOUT', 'RPC_ABORTED', 'RPC_TRANSPORT_ERROR', 'SNAPSHOT_EXPIRED',
+  'READ_STALE', 'STORAGE_BUSY', 'HISTORY_CURSOR_INVALID', 'HISTORY_CURSOR_INVALIDATED',
+])
+
+function buildRecoveryLogEntry(params: RendererConsoleMessage): RendererLogEntry | null {
+  if (params.level !== 'warning' || !params.message.startsWith(RECOVERY_PREFIX)
+    || params.message.length > MAX_MESSAGE_BYTES) return null
+  let value: Record<string, unknown>
+  try {
+    value = JSON.parse(params.message.slice(RECOVERY_PREFIX.length))
+  } catch { return null }
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !['trigger', 'failed', 'recovered'].includes(String(value.phase))
+    || !RECOVERY_REASONS.has(String(value.reason))) return null
+  // Rebuild a schema-bounded record, never forward the original JSON string.
+  const detail: Record<string, unknown> = { phase: value.phase, reason: value.reason }
+  if (typeof value.session_key_sha256 === 'string' && /^[a-f0-9]{16}$/.test(value.session_key_sha256)) {
+    detail.session_key_sha256 = value.session_key_sha256
+  }
+  if (typeof value.delivery_epoch === 'string' && /^[a-zA-Z0-9:_./-]{1,160}$/.test(value.delivery_epoch)) {
+    detail.delivery_epoch = redactRendererLogText(value.delivery_epoch)
+  }
+  for (const key of ['connection_generation', 'delivery_id', 'stream_seq', 'expected_seq', 'actual_seq', 'key_count', 'suppressed_count']) {
+    if (Number.isSafeInteger(value[key]) && (value[key] as number) >= 0) detail[key] = value[key]
+  }
+  for (const key of ['global', 'retryable']) {
+    if (typeof value[key] === 'boolean') detail[key] = value[key]
+  }
+  if (typeof value.error_code === 'string' && RECOVERY_ERROR_CODES.has(value.error_code)) {
+    detail.error_code = value.error_code
+  }
+  if (typeof value.error_kind === 'string' && [
+    'aborted', 'timeout', 'busy', 'unavailable', 'too-large', 'budget-exhausted', 'rebase-required',
+  ].includes(value.error_kind)) detail.error_kind = value.error_kind
+  return { event: 'session_recovery', detail }
+}
+
 /**
  * Build a log entry for a renderer console message, or `null` when the level
  * should not be persisted. Returning the entry (rather than logging directly)
@@ -185,6 +235,8 @@ export function buildRendererConsoleLogEntry(
   params: RendererConsoleMessage,
   options: RendererConsoleLogOptions = {},
 ): RendererLogEntry | null {
+  const recovery = buildRecoveryLogEntry(params)
+  if (recovery) return recovery
   if (!shouldForwardConsoleLevel(params.level)) return null
   return {
     event: 'renderer_console',

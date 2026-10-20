@@ -194,6 +194,7 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
   let holdOwnership = false
   let holdSnapshots = false
   let rejectLive = false
+  let rejectOwnership = false
   let rejectedLiveReads = 0
   let nextDelivery = 1
   const deliveryEpoch = 'warm-race-delivery'
@@ -207,8 +208,26 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
   let advancedHistoryReads = 0
   let degradedHistory = initialHistory === 'fallback'
   const routerModels = ['synthetic/fast', 'synthetic/selected', 'synthetic/reasoning', 'synthetic/quality']
-  const routerEvents: Array<{ event: string; payload: Record<string, unknown> }> = []
-  const currentSequence = () => 7 + routerEvents.length
+  const liveEvents: Array<{ event: string; payload: Record<string, unknown> }> = []
+  let replayOnResume = false
+  let handoffAfterAck: number | null = null
+  let handoffCount = 0
+  const emitTail = (socket: WebSocketRoute, text: string, replayed = false) => {
+    const seq = currentSequence() + 1
+    const event = { event: 'session.event.text_delta', payload: {
+      key: SESSION_A, session_key: SESSION_A, task_id: taskId(), turn_id: taskId(),
+      epoch, stream_generation: 'workspace-switch-generation', stream_seq: seq,
+      emitted_at: startedAt + seq * 100, text, presentation: 'answer',
+    } }
+    liveEvents.push(event)
+    const deliveryId = nextDelivery++
+    socket.send(JSON.stringify({ type: 'event', ...event, meta: {
+      flow: { delivery_epoch: deliveryEpoch, delivery_id: deliveryId },
+      ...(replayed ? { replayed: true } : {}),
+    } }))
+    return deliveryId
+  }
+  const currentSequence = () => 7 + liveEvents.length
   const taskId = (key = SESSION_A) => `warm-live-task-${key === SESSION_B ? 'b-' : ''}${epoch}`
   page.on('pageerror', error => failures.push(error.message))
   const history = (key: string) => {
@@ -261,7 +280,7 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
         ev('tool_input_preview', 7, { preview_id: `warm-draft-${epoch}`, attempt_id: `warm-attempt-${epoch}`,
           tool_use_id: 'warm-code', revision, state: 'generating', tool_name: 'execute_code', path: '',
           content: `print("draft revision ${revision}")`, truncated: false }),
-        ...(key === SESSION_A ? routerEvents : []),
+        ...(key === SESSION_A ? liveEvents : []),
       ] : [],
     })
   }
@@ -277,7 +296,8 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
         return
       }
     }
-    if (rejectLive && key === SESSION_A && method !== 'chat.history') {
+    if (key === SESSION_A && ((rejectLive && method !== 'chat.history')
+      || (rejectOwnership && method === 'sessions.messages.hydrate'))) {
       rejectedLiveReads++
       socket.send(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: {
         code: 'SNAPSHOT_BUSY', message: 'Synthetic live read remains unavailable.', retryable: true, accepted: false,
@@ -339,14 +359,28 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
         return
       }
       if (method === 'transport.flow.update') {
+        if (handoffAfterAck !== null && Number(frame.params?.ack_delivery_id || 0) >= handoffAfterAck) {
+          handoffAfterAck = null
+          // These arrived while the frozen replay was being consumed. The
+          // Gateway hands them to the ordinary FIFO/ACK ledger before lifting
+          // its barrier, without claiming they belong to the consumed proof.
+          for (let i = 1; i <= 4; i++) emitTail(socket, ` [handoff-${i}] `, true)
+          handoffCount++
+        }
         socket.send(response(frame.id, { delivery_epoch: deliveryEpoch,
           ack_delivery_id: Number(frame.params?.ack_delivery_id || 0), dirty_keys: [], global_dirty: false }))
         return
       }
       if (method === resumeMethod || method === releaseMethod) {
+        let replayToSeq = frame.params?.stream_seq
+        if (method === resumeMethod && replayOnResume) {
+          replayOnResume = false
+          for (let i = 1; i <= 3; i++) handoffAfterAck = emitTail(socket, ` [replay-${i}] `, true)
+          replayToSeq = currentSequence()
+        }
         socket.send(response(frame.id, { ...frame.params, ...(method === resumeMethod
           ? { session_id: null, session_epoch: modernSnapshots.get(String(frame.params?.sync_revision))?.value.epoch,
-              replay_to_seq: frame.params?.stream_seq }
+              replay_to_seq: replayToSeq }
           : { retired: true }) }))
         return
       }
@@ -383,6 +417,9 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
   })
   return {
     sockets, requests, failures,
+    replayDuringNextRecovery: () => { replayOnResume = true },
+    handoffCount: () => handoffCount,
+    emitLiveText: (text: string) => emitTail(sockets[0]!, text),
     emitRouterDecision(winner = 1) {
       const seq = currentSequence() + 1
       const decision = {
@@ -398,13 +435,15 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
           },
         },
       }
-      routerEvents.push(decision)
+      liveEvents.push(decision)
       sockets[0]!.send(eventFrame(decision.event, decision.payload))
     },
     pending: (side: 'history' | 'live') => held.filter(item => side === 'history'
       ? item.frame.method === 'chat.history' : item.frame.method !== 'chat.history').length,
     hold: () => { holdHistory = true; holdLive = true },
     failLive: () => { rejectLive = true },
+    failOwnership: () => { rejectOwnership = true },
+    recoverOwnership: () => { rejectOwnership = false },
     canonicalHistory: () => { degradedHistory = false },
     dirtyCurrent: () => sockets[0]!.send(eventFrame('transport.flow.dirty', {
       delivery_epoch: deliveryEpoch, dirty_keys: [SESSION_A], global_dirty: false,
@@ -658,6 +697,143 @@ test('a newer delivery gap keeps the complete warm view and Stop until automatic
   expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
   expect(gateway.sockets).toHaveLength(1)
   expect(gateway.failures).toEqual([])
+})
+
+test('continuous output crosses recovery handoff once without losing text or the readable view', async ({ page }, testInfo) => {
+  const gateway = await prepareWarmLiveRace(page, true)
+  await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+  await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()
+  await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+  const count = (method: string) => gateway.requests.filter(item => item.key === SESSION_A && item.method === method).length
+  const snapshotsBefore = count('sessions.messages.snapshot.read')
+  const resumesBefore = count('sessions.messages.resume')
+  await page.evaluate(() => {
+    const state = window as unknown as {
+      handoffFrames: { live: boolean; prefix: boolean; reasoning: boolean; draft: boolean }[]
+      stopHandoffFrames: () => void
+    }
+    state.handoffFrames = []
+    let active = true
+    state.stopHandoffFrames = () => { active = false }
+    const sample = () => {
+      const live = document.querySelector('.conversation-live-edge')
+      state.handoffFrames.push({
+        live: Boolean(live?.getClientRects().length),
+        prefix: live?.textContent?.includes('Narration before draft revision 1') === true,
+        reasoning: Boolean(live?.querySelector('[data-testid="reasoning-timeline"]')),
+        draft: Boolean(live?.querySelector('[data-testid="tool-input-preview"]')),
+      })
+      if (active) requestAnimationFrame(sample)
+    }
+    requestAnimationFrame(sample)
+  })
+  gateway.hold()
+  gateway.replayDuringNextRecovery()
+  gateway.dirtyCurrent()
+  await expect.poll(gateway.snapshotPending).toBeGreaterThan(0)
+  await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+  gateway.release('history')
+  gateway.release('live')
+  await expect.poll(gateway.handoffCount).toBe(1)
+  await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+  const live = page.locator('.conversation-live-edge')
+  const tokens = [
+    ...Array.from({ length: 3 }, (_, i) => `[replay-${i + 1}]`),
+    ...Array.from({ length: 4 }, (_, i) => `[handoff-${i + 1}]`),
+  ]
+  for (let i = 1; i <= 5; i++) {
+    const token = `[live-${i}]`
+    gateway.emitLiveText(` ${token} `)
+    tokens.push(token)
+    await expect(live).toContainText(token)
+  }
+  // Keep the task active through more than one automatic retry interval.
+  // A moving recovery target must not cause another snapshot or blank frame.
+  await page.evaluate(async () => {
+    for (let i = 0; i < 80; i++) await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+  })
+  const text = await live.innerText()
+  let previous = -1
+  for (const token of tokens) {
+    expect(text.split(token)).toHaveLength(2)
+    expect(text.indexOf(token)).toBeGreaterThan(previous)
+    previous = text.indexOf(token)
+  }
+  await expect(page.locator('.chat-stop-btn')).toBeVisible()
+  expect(count('sessions.messages.snapshot.read')).toBe(snapshotsBefore + 1)
+  expect(count('sessions.messages.resume')).toBe(resumesBefore + 1)
+  const frames = await page.evaluate(() => {
+    const state = window as unknown as { handoffFrames: Record<string, boolean>[]; stopHandoffFrames: () => void }
+    state.stopHandoffFrames()
+    return state.handoffFrames
+  })
+  await testInfo.attach('continuous-recovery-frames', { body: JSON.stringify(frames), contentType: 'application/json' })
+  expect(frames.length).toBeGreaterThan(80)
+  expect(frames.filter(frame => Object.values(frame).some(value => !value))).toEqual([])
+  expect(gateway.sockets).toHaveLength(1)
+  expect(gateway.failures).toEqual([])
+})
+
+test('readable live output stays mounted while an unconfirmed snapshot retries', async ({ page }, testInfo) => {
+  test.setTimeout(60_000)
+  const gateway = await prepareWarmLiveRace(page, true)
+  gateway.deferOwnership()
+  await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+  await expect.poll(gateway.ownershipPending).toBe(true)
+  gateway.failOwnership()
+  gateway.releaseOwnership()
+  const narration = page.getByText('Narration before draft revision 1', { exact: true })
+  await expect(narration).toBeVisible()
+  gateway.hold()
+  await page.evaluate(() => {
+    const state = window as unknown as {
+      liveRetryFrames: { live: boolean; narration: boolean; reasoning: boolean; draft: boolean }[]
+      stopLiveRetryFrames: () => void
+    }
+    state.liveRetryFrames = []
+    let recording = true
+    state.stopLiveRetryFrames = () => { recording = false }
+    const sample = () => {
+      const live = document.querySelector('.conversation-live-edge')
+      state.liveRetryFrames.push({
+        live: Boolean(live?.getClientRects().length),
+        narration: live?.textContent?.includes('Narration before draft revision 1') === true,
+        reasoning: Boolean(live?.querySelector('[data-testid="reasoning-timeline"]')),
+        draft: Boolean(live?.querySelector('[data-testid="tool-input-preview"]')),
+      })
+      if (recording) requestAnimationFrame(sample)
+    }
+    requestAnimationFrame(sample)
+  })
+  try {
+    // Metadata failed after content installation, so the displayed live tail
+    // is readable but unconfirmed. A delivery gap starts automatic recovery.
+    gateway.dirtyCurrent()
+    await expect.poll(() => gateway.pending('live') + gateway.pending('history'), { timeout: 15_000 }).toBeGreaterThan(0)
+    await expect(narration).toBeVisible()
+    await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+    gateway.recoverOwnership()
+    gateway.release('history')
+    gateway.release('live')
+    await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+    await expect(narration).toBeVisible()
+  } finally {
+    const frames = await page.evaluate(() => {
+      const state = window as unknown as {
+        liveRetryFrames: { live: boolean; narration: boolean; reasoning: boolean; draft: boolean }[]
+        stopLiveRetryFrames: () => void
+      }
+      state.stopLiveRetryFrames()
+      return state.liveRetryFrames
+    })
+    const evidencePath = testInfo.outputPath('unconfirmed-live-retry-frames.json')
+    await writeFile(evidencePath, JSON.stringify(frames, null, 2))
+    await testInfo.attach('unconfirmed-live-retry-frames', { path: evidencePath, contentType: 'application/json' })
+    expect(frames.length).toBeGreaterThan(2)
+    expect(frames.filter(frame => !frame.live || !frame.narration || !frame.reasoning || !frame.draft)).toEqual([])
+  }
+  expect(gateway.failures).toEqual([])
+  expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
 })
 
 for (const initialHistory of ['canonical', 'fallback'] as const) {

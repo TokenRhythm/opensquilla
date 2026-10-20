@@ -4004,7 +4004,10 @@ const chatSend = useChatSend({
     // The provisional draft bootstrap can finish before the Gateway creates
     // the first durable session. Re-register immediately after acceptance so
     // buffered text, tool, and reasoning frames replay into the first turn.
-    const bootstrap = startSessionBootstrap({ includeHistory: false, force: true })
+    // Draft bootstrap skips durable history. Once the route is materialized,
+    // the presentation barrier requires that first canonical history receipt
+    // as well as the live snapshot, even when the session key is unchanged.
+    const bootstrap = startSessionBootstrap({ includeHistory: true, force: true })
     void bootstrap.live.then(outcome => {
       if (outcome.authoritative && sessionKey.value === key) {
         // A provisional snapshot may have completed before the first send

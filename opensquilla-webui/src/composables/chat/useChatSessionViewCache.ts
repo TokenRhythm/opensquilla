@@ -58,10 +58,12 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
 
   function capture(key: string, retainReadable = false) {
     if (!options.deliveryIdentity.value || !key) return
-    // A degraded history can already be displayed beside confirmed live work.
-    // Freeze that readable view only for same-session recovery; it must never
-    // replace the authoritative snapshot used when navigating between sessions.
-    if (!installed && !(retainReadable && historyReady.value && liveReady.value && liveConfirmed)) return
+    // A degraded read can already have released a readable view, and accepted
+    // events can keep its live output growing before hydration is confirmed.
+    // Freeze that displayed view for same-session recovery only. Confirmation
+    // still owns navigation snapshots; a partial reread has liveReady=false
+    // and cannot overwrite the last readable presentation.
+    if (!installed && !(retainReadable && historyReady.value && liveReady.value)) return
     if (installed) remove(key)
     if (maxSessions <= 0) return
     // Clone once on departure: mutable live/history objects cannot change a

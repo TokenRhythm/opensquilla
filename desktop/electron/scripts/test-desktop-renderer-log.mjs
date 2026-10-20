@@ -171,6 +171,42 @@ for (const level of ['warning', 'info', 'debug']) {
   )
 }
 
+const recoveryMessage = {
+  level: 'warning',
+  message: '[opensquilla-recovery] ' + JSON.stringify({
+    phase: 'failed', reason: 'live_subscription_failed',
+    session_key_sha256: '8ed3f6ad685b959e', connection_generation: 7,
+    delivery_epoch: 'epoch-1', stream_seq: 91, suppressed_count: 12,
+    error_code: 'SNAPSHOT_STALE', error_kind: 'busy', retryable: true,
+    // The disk boundary must whitelist fields even if the renderer is buggy.
+    message: 'private output', payload: 'private payload', session_key: 'raw-private-session',
+  }),
+  sourceId: 'opensquilla-app://desktop/chat', lineNumber: 10,
+}
+assert.deepEqual(buildRendererConsoleLogEntry(recoveryMessage), {
+  event: 'session_recovery',
+  detail: {
+    phase: 'failed', reason: 'live_subscription_failed',
+    session_key_sha256: '8ed3f6ad685b959e', delivery_epoch: 'epoch-1',
+    connection_generation: 7, stream_seq: 91, suppressed_count: 12,
+    retryable: true, error_code: 'SNAPSHOT_STALE', error_kind: 'busy',
+  },
+})
+for (const message of [
+  '[opensquilla-recovery] not-json',
+  '[opensquilla-recovery] null',
+  '[opensquilla-recovery] []',
+  '[opensquilla-recovery] {"phase":"failed","reason":"private output"}',
+  '[opensquilla-recovery] ' + 'x'.repeat(3000),
+]) assert.equal(buildRendererConsoleLogEntry({ ...recoveryMessage, message }), null)
+assert.equal(buildRendererConsoleLogEntry({ ...recoveryMessage, level: 'info' }), null)
+const recoveryRecords = []
+const recoveryListener = createMainWindowConsoleListener(liveWindow, recoveryRecords)
+recoveryListener({ ...recoveryMessage, frame: trustedMainFrame })
+recoveryListener({ ...recoveryMessage, frame: {} })
+assert.equal(recoveryRecords.length, 1, 'Only the trusted main frame may persist recovery breadcrumbs.')
+assert.equal(recoveryRecords[0].event, 'session_recovery')
+
 const invalidLine = buildRendererConsoleLogEntry({
   level: 'error', message: 'boom', sourceId: 'data:text/javascript,secret', lineNumber: NaN,
 })

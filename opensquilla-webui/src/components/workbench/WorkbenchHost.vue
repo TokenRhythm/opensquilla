@@ -896,7 +896,9 @@ onBeforeUnmount(() => {
   min-width: 0;
   flex: 0 0 auto;
   width: max-content;
-  max-width: min(200px, 100%);
+  /* A percentage cap is cyclic while the strip measures its content width,
+     leaving empty space after truncated titles. The strip handles overflow. */
+  max-width: 200px;
   align-items: center;
   color: var(--text-dim);
 }

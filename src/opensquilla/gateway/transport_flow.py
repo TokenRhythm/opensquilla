@@ -105,6 +105,9 @@ class FlowWindow:
         self._closed = False
         self.next_id = 1
         self.ack_id = 0
+        # Diagnostic only: capture the exact synchronous admission refusal.
+        # No payload or session identity is retained here.
+        self.last_rejection_reason: str | None = None
         # Per-lane watermarks are inert until a v2 caller supplies a lane.
         # Keeping them beside the v1 scalar lets the old contract and all
         # existing accounting paths retain their exact semantics.
@@ -137,10 +140,12 @@ class FlowWindow:
         lane: str | None = None,
         lane_epoch: str | None = None,
     ) -> int | None:
+        self.last_rejection_reason = None
         # An encoded event reserves a little extra for its writer-assigned
         # sequence. Accounting overhead is not part of the public wire limit.
         wire_size = size if wire_size is None else wire_size
         if self._closed:
+            self.last_rejection_reason = "flow_closed"
             return None
         if lane is not None and self._lane_mode:
             state = self._lane_states.get(lane)
@@ -149,20 +154,24 @@ class FlowWindow:
                 (lane, lane_epoch) not in self._lane_epoch_states
                 and len(self._lane_epoch_states) >= FLOW_V2_MAX_LANE_EPOCHS
             ):
+                self.last_rejection_reason = "lane_epoch_limit"
                 return None
             if state in {"RETIRED", "CLOSED"}:
                 # A replacement subscription receives a fresh epoch and may
                 # reuse its session key.  Old-epoch ACKs remain fenced by the
                 # epoch check below; only the replacement lane reactivates it.
                 if lane_epoch is None or lane_epoch == previous_epoch:
+                    self.last_rejection_reason = "lane_retired"
                     return None
                 self._lane_states[lane] = "ACTIVE"
                 self.lane_ack_ids.pop(lane, None)
                 self.lane_delivery_ack_ids.pop(lane, None)
                 self._lane_next_ids[lane] = 1
             if lane not in self._lane_seen and len(self._lane_seen) >= self._lane_limit:
+                self.last_rejection_reason = "lane_limit"
                 return None
         if not 0 < wire_size <= MAX_WIRE_BYTES or not wire_size <= size <= MAX_WIRE_BYTES + 32:
+            self.last_rejection_reason = "frame_wire_limit"
             return None
         ordinary = [entry for entry in self.deliveries.values() if not entry.recovery]
         if self._lane_mode and lane is not None:
@@ -173,6 +182,7 @@ class FlowWindow:
             ]
             active_lanes = {entry.lane for entry in ordinary if entry.lane is not None}
             if lane not in active_lanes and len(active_lanes) >= self._lane_limit:
+                self.last_rejection_reason = "lane_limit"
                 return None
             if (
                 len(lane_entries) >= FLOW_LANE_WINDOW_FRAMES
@@ -182,6 +192,10 @@ class FlowWindow:
                     > FLOW_LANE_WINDOW_BYTES
                 )
             ):
+                self.last_rejection_reason = (
+                    "lane_frames_exhausted" if len(lane_entries) >= FLOW_LANE_WINDOW_FRAMES
+                    else "lane_bytes_exhausted"
+                )
                 return None
             # Keep the aggregate v2 budget bounded as well.  It is deliberately
             # the sum of the small per-lane windows, so one stalled lane cannot
@@ -191,6 +205,7 @@ class FlowWindow:
                 or sum(entry.size for entry in ordinary) + size
                 > FLOW_LANE_WINDOW_BYTES * self._lane_limit
             ):
+                self.last_rejection_reason = "aggregate_window_exhausted"
                 return None
         if recovery:
             pieces = [entry for entry in self.deliveries.values() if entry.recovery]
@@ -199,6 +214,7 @@ class FlowWindow:
                 or sum(entry.size for entry in pieces) + size > RECOVERY_WINDOW_BYTES
                 or (key is not None and any(entry.key == key for entry in pieces))
             ):
+                self.last_rejection_reason = "recovery_window_exhausted"
                 return None
         elif self._lane_mode:
             # Unkeyed events cannot participate in lane fairness, but they
@@ -211,18 +227,22 @@ class FlowWindow:
                     and sum(entry.size for entry in ordinary) + size > FLOW_WINDOW_BYTES
                 )
             ):
+                self.last_rejection_reason = "connection_window_exhausted"
                 return None
             if (
                 len(ordinary) >= FLOW_LANE_WINDOW_FRAMES * self._lane_limit
                 or sum(entry.size for entry in ordinary) + size
                 > FLOW_LANE_WINDOW_BYTES * self._lane_limit
             ):
+                self.last_rejection_reason = "aggregate_window_exhausted"
                 return None
         elif len(ordinary) >= FLOW_WINDOW_FRAMES or (
             ordinary and sum(entry.size for entry in ordinary) + size > FLOW_WINDOW_BYTES
         ):
+            self.last_rejection_reason = "connection_window_exhausted"
             return None
         if not (self._reserve_recovery if recovery else self._reserve)(size):
+            self.last_rejection_reason = "transport_reservation_rejected"
             return None
         delivery_id = self.next_id
         self.next_id += 1

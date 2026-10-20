@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TransportFlowV4 } from './transportFlowV4'
 import type { TransportCallOptions, TransportEventHandler, TransportRecoveryResult } from './transportTypes'
 import { TRANSPORT_SESSION_FLOW_V2_METHOD } from '@/contracts/transportFlowCapabilities'
+import { sessionRecoveryDiagnostics } from '@/lib/sessionRecoveryDiagnostics'
 
 const EPOCH = 'delivery-epoch-1'
 const METHOD = 'transport.flow.update'
@@ -90,9 +91,58 @@ afterEach(() => {
   for (const owner of owners.splice(0)) owner.close()
   vi.clearAllTimers()
   vi.useRealTimers()
+  vi.restoreAllMocks()
 })
 
 describe('connection-local consumption flow', () => {
+  it('records an observed connection sequence gap without launching a second recovery', () => {
+    const log = vi.spyOn(sessionRecoveryDiagnostics, 'log').mockImplementation(() => {})
+    const h = harness(true)
+    h.hello()
+    h.emit('_gap', { expected: 30, actual: 32, event: 'private event content' })
+    expect(log).toHaveBeenCalledExactlyOnceWith({
+      phase: 'trigger', reason: 'transport_sequence_gap', global: true,
+      connectionGeneration: 7, deliveryEpoch: EPOCH, expectedSeq: 30, actualSeq: 32,
+    })
+    expect(h.recover).not.toHaveBeenCalled()
+  })
+
+  it('records the actual trigger and typed recovery failure without exposing event content', async () => {
+    const log = vi.spyOn(sessionRecoveryDiagnostics, 'log').mockImplementation(() => {})
+    const h = harness(true)
+    h.hello()
+    h.recover.mockRejectedValueOnce(Object.assign(new Error('private failure'), { code: 'SNAPSHOT_STALE' }))
+    h.dirty()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(log).toHaveBeenCalledWith(expect.objectContaining({
+      phase: 'trigger', reason: 'server_dirty', sessionKey: 'alpha',
+      connectionGeneration: 7, deliveryEpoch: EPOCH, global: false,
+    }))
+    expect(log).toHaveBeenCalledWith(expect.objectContaining({
+      phase: 'failed', reason: 'recovery_exception',
+      error: expect.objectContaining({ code: 'SNAPSHOT_STALE' }),
+    }))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(log).toHaveBeenCalledWith(expect.objectContaining({
+      phase: 'recovered', reason: 'recovery_completed', sessionKey: 'alpha',
+    }))
+    expect(log.mock.calls.every(([entry]) => !('payload' in entry))).toBe(true)
+  })
+
+  it.each(['dirty', 'rejected', 'timeout'] as const)('distinguishes the consumer %s trigger', async mode => {
+    const log = vi.spyOn(sessionRecoveryDiagnostics, 'log').mockImplementation(() => {})
+    const h = harness(true)
+    h.hello()
+    if (mode === 'dirty') h.consume.mockResolvedValue('dirty')
+    else if (mode === 'rejected') h.consume.mockRejectedValue(new Error('private consumer failure'))
+    else h.consume.mockReturnValue(new Promise(() => {}))
+    h.deliver(1)
+    await vi.advanceTimersByTimeAsync(mode === 'timeout' ? 100 : 0)
+    expect(log).toHaveBeenCalledWith(expect.objectContaining({
+      phase: 'trigger', reason: `consumer_${mode}`, sessionKey: 'alpha', deliveryId: 1,
+    }))
+  })
+
   it.each([false, true])('suspends terminal receipts until a current later installation (modern=%s)', async modern => {
     const h = harness(modern)
     h.consume.mockRejectedValue(new Error('No owner'))

@@ -24,6 +24,7 @@ import type {
   TransportEventHandler, TransportInstalledReceipt, TransportLaneRetireReceipt,
   TransportRecoveryResult,
 } from './transportTypes'
+import { sessionRecoveryDiagnostics, type RecoveryReason } from '@/lib/sessionRecoveryDiagnostics'
 
 interface FlowSource {
   readonly connectionGeneration: number
@@ -102,6 +103,15 @@ export class TransportFlowV4 {
     this.subscriptions.push(
       source.on('_hello', (hello: unknown) => this.start(record(hello)?.policy)),
       source.on('_state', (state: unknown) => { if (state !== 'connected') this.reset() }),
+      source.on('_gap', (value: unknown) => {
+        const detail = record(value)
+        if (!this.enabled || !Number.isSafeInteger(detail?.expected) || !Number.isSafeInteger(detail?.actual)) return
+        sessionRecoveryDiagnostics.log({
+          phase: 'trigger', reason: 'transport_sequence_gap', global: true,
+          connectionGeneration: this.generation, deliveryEpoch: this.epoch ?? undefined,
+          expectedSeq: detail!.expected as number, actualSeq: detail!.actual as number,
+        })
+      }),
       source.on('*', (event: unknown, payload: unknown, meta: unknown) => {
         if (typeof event === 'string') this.receive(event, payload, record(meta) ?? {})
       }),
@@ -208,7 +218,7 @@ export class TransportFlowV4 {
     if (event === 'transport.flow.dirty') {
       const notice = payload as TransportFlowDirtyPayload
       if (validateTransportFlowDirtyPayload(notice) && notice.delivery_epoch === this.epoch) {
-        this.requireRecovery(notice.dirty_keys, notice.global_dirty)
+        this.requireRecovery(notice.dirty_keys, notice.global_dirty, true, 'server_dirty')
         // An explicitly invalidated reservation carries no business event.
         // Owning its dirty notification is sufficient to retire that receipt.
         const invalidated = this.receipt(meta.flow)
@@ -228,7 +238,7 @@ export class TransportFlowV4 {
     const highestComplete = this.completed[this.completed.length - 1]?.[1] ?? this.ack
     if (this.pending.size >= 256 || this.laneByDelivery.size >= 256
       || receipt.delivery_id > highestComplete + 512) {
-      this.requireRecovery([], true)
+      this.requireRecovery([], true, true, 'delivery_ledger_limit', receipt)
       return
     }
     if (this.sessionFlowV2) {
@@ -239,12 +249,12 @@ export class TransportFlowV4 {
       if (connectionEpoch !== this.epoch || subscriptionEpoch === undefined
         || typeof subscriptionEpoch !== 'string' || !subscriptionEpoch
         || laneDelivery !== receipt.delivery_id) {
-        this.requireRecovery([], true)
+        this.requireRecovery([], true, true, 'invalid_lane', receipt)
         return
       }
       const key = sessionKey(payload)
       if (!key) {
-        this.requireRecovery([], true)
+        this.requireRecovery([], true, true, 'missing_session_key', receipt)
         return
       }
       const retired = this.laneRetired.get(subscriptionEpoch)
@@ -253,7 +263,7 @@ export class TransportFlowV4 {
         // FIFO writer may arrive before its confirmation, but cannot reopen
         // the old consumer or generate an ordinary consumption ACK.
         if (receipt.delivery_id <= retired.finalId) this.markComplete(receipt)
-        else this.requireRecovery([key], false)
+        else this.requireRecovery([key], false, true, 'retired_lane_delivery', receipt)
         return
       }
       const knownEpochs = this.laneEpochHistory.get(key) ?? new Set<string>()
@@ -261,14 +271,14 @@ export class TransportFlowV4 {
       if (priorEpoch && priorEpoch !== subscriptionEpoch && knownEpochs.has(subscriptionEpoch)) {
         // A frame from an already retired subscription arrived after its key
         // was replaced. Keep it out of the replacement lane ledger.
-        this.requireRecovery([], true)
+        this.requireRecovery([], true, true, 'stale_lane', receipt)
         return
       }
       if (knownEpochs.size >= MAX_LANE_EPOCH_HISTORY && !knownEpochs.has(subscriptionEpoch)) {
         // The server rejects a seventeenth retained epoch. Do not evict an
         // older fence on the client: a late physical frame for that epoch
         // must remain stale rather than being reclassified as a new lane.
-        this.requireRecovery([], true)
+        this.requireRecovery([], true, true, 'lane_history_limit', receipt)
         return
       }
       knownEpochs.add(subscriptionEpoch)
@@ -288,7 +298,7 @@ export class TransportFlowV4 {
       recoveryRequired = true
       const key = sessionKey(payload)
       this.unowned.set(receipt.delivery_id, { receipt, key })
-      this.requireRecovery(key ? [key] : [], !key)
+      this.requireRecovery(key ? [key] : [], !key, true, 'consumer_timeout', receipt)
     }, 100))
     const work = this.source.consumeEvent(event, payload, meta).then(result => {
       if (!this.current(revision) || recoveryRequired || !this.pending.has(receipt.delivery_id)) return
@@ -296,7 +306,7 @@ export class TransportFlowV4 {
         const key = sessionKey(payload)
         if (key) this.dirty.set(key, (this.dirty.get(key) ?? 0) + 1)
         // The consumer has already registered/fenced its recovery ownership.
-        this.requireRecovery(key ? [key] : [], !key)
+        this.requireRecovery(key ? [key] : [], !key, true, 'consumer_dirty', receipt)
       }
       if (result === 'applied') {
         const data = record(payload)
@@ -314,7 +324,7 @@ export class TransportFlowV4 {
         }
       }
       this.markComplete(receipt)
-    }, () => {
+    }, error => {
       if (!this.current(revision) || recoveryRequired || !this.pending.has(receipt.delivery_id)) return
       const timer = this.observations.get(receipt.delivery_id)
       if (timer !== undefined) clearTimeout(timer)
@@ -323,7 +333,7 @@ export class TransportFlowV4 {
       // authoritative recovery can release this delivery's credit.
       const key = sessionKey(payload)
       this.unowned.set(receipt.delivery_id, { receipt, key })
-      this.requireRecovery(key ? [key] : [], !key)
+      this.requireRecovery(key ? [key] : [], !key, true, 'consumer_rejected', receipt, error)
     }).finally(() => {
       if (this.consumers.get(receipt.delivery_id)?.work === work) {
         this.consumers.delete(receipt.delivery_id)
@@ -521,8 +531,30 @@ export class TransportFlowV4 {
     }
   }
 
-  private requireRecovery(keys: string[], global: boolean, invalidate = true): Promise<boolean> | null {
+  private recoveryDiagnostic(
+    phase: 'trigger' | 'failed' | 'recovered',
+    reason: RecoveryReason,
+    keys: string[],
+    global: boolean,
+    receipt?: TransportDeliveryReceipt,
+    error?: unknown,
+  ): void {
+    // One record per affected key, capped by the shared diagnostic budget.
+    for (const key of keys.length ? keys.slice(0, 4) : [undefined]) {
+      sessionRecoveryDiagnostics.log({
+        phase, reason, sessionKey: key, global, keyCount: keys.length,
+        connectionGeneration: this.generation, deliveryEpoch: this.epoch ?? undefined,
+        deliveryId: receipt?.delivery_id, error,
+      })
+    }
+  }
+
+  private requireRecovery(
+    keys: string[], global: boolean, invalidate = true,
+    reason?: RecoveryReason, receipt?: TransportDeliveryReceipt, error?: unknown,
+  ): Promise<boolean> | null {
     if (!this.enabled) return null
+    if (reason) this.recoveryDiagnostic('trigger', reason, keys, global, receipt, error)
     if (invalidate) {
       if (global) this.globalInvalidation++
       for (const key of keys) {
@@ -545,17 +577,23 @@ export class TransportFlowV4 {
       const capturedVersion = this.recoveryVersion(key)
       const work = Promise.resolve().then(() => this.source.recoverGap({
         reason: 'transport_flow_dirty', keys: scopeGlobal ? [] : [key], global: scopeGlobal,
-      })).catch(() => false).then(ok => {
+      })).catch(error => {
+        if (this.current(revision)) this.recoveryDiagnostic('failed', 'recovery_exception', key ? [key] : [], scopeGlobal, undefined, error)
+        return false
+      }).then(ok => {
         if (!this.current(revision)) return false
         if (ok === true && capturedVersion === this.recoveryVersion(key)) {
+          this.recoveryDiagnostic('recovered', 'recovery_completed', key ? [key] : [], scopeGlobal)
           this.suspendedRecoveries.delete(key)
           if (!scopeGlobal) for (const entry of owned) this.markComplete(entry.receipt)
           return true
         }
         if (typeof ok === 'object' && ok.retryable === false && capturedVersion === this.recoveryVersion(key)) {
+          this.recoveryDiagnostic('failed', 'recovery_terminal', key ? [key] : [], scopeGlobal)
           this.suspendRecovery(key, owned.map(entry => entry.receipt), capturedVersion)
           return false
         }
+        this.recoveryDiagnostic('failed', ok === true ? 'recovery_invalidated' : 'recovery_incomplete', key ? [key] : [], scopeGlobal)
         if (scopeGlobal) this.recoveryGlobal = true
         else this.recoveryKeys.add(key)
         return false
@@ -619,8 +657,18 @@ export class TransportFlowV4 {
     const recover = async (scopeKeys: string[], scopeGlobal: boolean): Promise<TransportRecoveryResult> => {
       if (!this.current(revision)) return false
       try {
-        return await this.source.recoverGap({ reason: 'transport_flow_dirty', keys: scopeKeys, global: scopeGlobal })
-      } catch { return false }
+        const result = await this.source.recoverGap({ reason: 'transport_flow_dirty', keys: scopeKeys, global: scopeGlobal })
+        if (this.current(revision)) this.recoveryDiagnostic(
+          result === true ? 'recovered' : 'failed',
+          result === true ? 'recovery_completed' : typeof result === 'object' && result.retryable === false
+            ? 'recovery_terminal' : 'recovery_incomplete',
+          scopeKeys, scopeGlobal,
+        )
+        return result
+      } catch (error) {
+        if (this.current(revision)) this.recoveryDiagnostic('failed', 'recovery_exception', scopeKeys, scopeGlobal, undefined, error)
+        return false
+      }
     }
     const work = Promise.resolve().then(async () => {
       const scopeKeys = [...requestedKeys]
@@ -861,7 +909,7 @@ export class TransportFlowV4 {
         } else waiter.resolve()
       }
       if (!modern && (result.dirty_keys.length || result.global_dirty)) {
-        this.requireRecovery(result.dirty_keys, result.global_dirty)
+        this.requireRecovery(result.dirty_keys, result.global_dirty, true, 'server_dirty')
       }
     } catch (error) {
       const failure = record(error)
