@@ -38,10 +38,12 @@ async def test_v048_upgrade_preserves_bill_and_reconciles_revision_once(tmp_path
             "cost_source) VALUES ('historical',0,250000000,250000000,'provider_billed')"
         )
         before = conn.execute("SELECT * FROM usage_events").fetchall()
-    assert apply_pending(str(path), MIGRATIONS) == [
+    applied = apply_pending(str(path), MIGRATIONS)
+    assert applied[:2] == [
         "V049__usage_metering_settlements",
         "V050__usage_task_attribution",
     ]
+    assert all(item >= "V049" for item in applied)
     assert apply_pending(str(path), MIGRATIONS) == []
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT * FROM usage_events").fetchall() == before

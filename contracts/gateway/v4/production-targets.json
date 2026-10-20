@@ -1358,6 +1358,22 @@
         "params",
         "result"
       ]
+    },
+    {
+      "kind": "method",
+      "wireName": "chat.send.v2",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "turns.receipt.resolve",
+      "roles": [
+        "params",
+        "result"
+      ]
     }
   ]
 }

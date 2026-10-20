@@ -17,6 +17,7 @@ from opensquilla.gateway.adapters.contract_method import (
 
 TURN_ADMISSION_CONTRACT_METHODS: Final = (
     "chat.send",
+    "chat.send.v2",
     "chat.abort",
     "sessions.send",
     "sessions.abort",

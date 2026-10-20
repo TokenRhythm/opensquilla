@@ -239,7 +239,8 @@ _RECOVERY_CONTROL_METHODS = frozenset({
     "sessions.messages.unsubscribe", "sessions.messages.snapshot.release",
 })
 _SESSION_MUTATION_METHODS = frozenset({
-    "chat.send", "sessions.send", "sessions.steer.v2", "sessions.reset", "sessions.delete",
+    "chat.send", "chat.send.v2", "sessions.send", "sessions.steer.v2",
+    "sessions.reset", "sessions.delete",
     "sessions.truncate", "sessions.contextCompact", "sessions.pending_inputs.enqueue",
     "sessions.pending_inputs.dispatch", "sessions.pending_inputs.steer",
 })
@@ -3333,6 +3334,7 @@ async def handle_ws_connection(
         TURN_RECEIPT_CAPABILITY,
         TURN_RECEIPT_METHOD,
         can_read_turn_receipts,
+        current_turn_receipt_epoch,
     )
 
     hello = HelloOk(
@@ -3346,6 +3348,7 @@ async def handle_ws_connection(
             auth_mode=config.auth.mode,
         ),
         policy=PolicyInfo(
+            turn_receipt_epoch=current_turn_receipt_epoch(),
             turn_receipt_lookup=(
                 TURN_RECEIPT_CAPABILITY
                 if can_read_turn_receipts(conn.principal)
@@ -3515,6 +3518,8 @@ def _websocket_hello_auth_payload(principal: Any) -> dict[str, Any]:
 
 
 async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
+    from opensquilla.gateway.turn_receipts import current_turn_receipt_epoch
+
     interval_s = max(1.0, tick_interval_ms / 1000)
     next_sample = time.monotonic() + 60.0
     worst_lag_ms = 0.0
@@ -3533,7 +3538,10 @@ async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
             next_sample = now + 60.0
             worst_lag_ms = 0.0
         try:
-            await conn.send_event("tick", {"time_ms": int(time.time() * 1000)})
+            await conn.send_event("tick", {
+                "time_ms": int(time.time() * 1000),
+                "turn_receipt_epoch": current_turn_receipt_epoch(),
+            })
         except Exception:
             log.debug("ws.tick_failed", conn_id=conn.conn_id, exc_info=True)
             return
@@ -4106,11 +4114,21 @@ async def _dispatch_and_send(
 def _build_features(dispatcher: RpcDispatcher, *, principal: Principal | None = None) -> Any:
     from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
-    from opensquilla.gateway.turn_receipts import TURN_RECEIPT_METHOD, can_read_turn_receipts
+    from opensquilla.gateway.turn_receipts import (
+        TURN_RECEIPT_METHOD,
+        TURN_RECEIPT_RESOLVE_METHOD,
+        can_read_turn_receipts,
+        can_resolve_turn_receipts,
+    )
 
     methods = dispatcher.list_methods()
     if principal is not None and not can_read_turn_receipts(principal):
         methods = [method for method in methods if method != TURN_RECEIPT_METHOD]
+    if principal is not None and not can_resolve_turn_receipts(principal):
+        methods = [
+            method for method in methods
+            if method not in {"chat.send.v2", TURN_RECEIPT_RESOLVE_METHOD}
+        ]
     events = [
         "connect.challenge",
         "agent",

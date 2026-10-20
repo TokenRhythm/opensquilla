@@ -251,6 +251,7 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.router.catalog": READ_SCOPE,
     # ----- write -----
     "chat.send": WRITE_SCOPE,
+    "chat.send.v2": WRITE_SCOPE,
     "chat.abort": WRITE_SCOPE,
     "chat.clarify_submit": WRITE_SCOPE,
     "artifacts.documents.open": WRITE_SCOPE,
@@ -292,6 +293,7 @@ METHOD_SCOPES: dict[str, str] = {
     "goals.reattach": WRITE_SCOPE,
     "sessions.steer.v2": WRITE_SCOPE,
     "turns.receipt.get": READ_SCOPE,
+    "turns.receipt.resolve": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,

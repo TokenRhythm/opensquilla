@@ -28,6 +28,7 @@ from opensquilla.gateway.project_workspace_runtime import (
 from opensquilla.gateway.routing import RouteEnvelope
 from opensquilla.gateway.rpc import RpcHandlerError
 from opensquilla.gateway.user_input_broker import connection_supports_user_input
+from opensquilla.persistence.turn_request_resolution import is_resolvable_turn_scope
 from opensquilla.project_workspaces import ProjectWorkspaceGuard, ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.guest_profile import GuestProfile, GuestProfileBoundaryError
@@ -147,6 +148,8 @@ async def prepare_route(
                 default_workspace=workspace_dir,
             )
         except ProjectWorkspaceStateError as exc:
+            if is_resolvable_turn_scope(command.source_scope):
+                raise
             raise map_project_workspace_error(exc, owner=principal.is_owner) from exc
         if authoritative_guard is not None:
             workspace_guard = authoritative_guard

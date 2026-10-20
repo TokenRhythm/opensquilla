@@ -153,8 +153,9 @@ registry = get_dispatcher()
 # Interactive terminals add create, write, resize, close, and consume methods.
 # Temporary side conversations add their create and close Contracts.
 # Workspace creation adds its own write Contract.
+# Resolvable WebChat adds chat.send.v2 and turns.receipt.resolve.
 # Keep the exact count so an unrelated RPC cannot slip into the registry.
-assert len(registry.list_methods()) == 285
+assert len(registry.list_methods()) == 287
 workspace_entry = registry.get_entry("workspaces.create")
 assert workspace_entry is not None
 assert workspace_entry.required_scope == "operator.write"

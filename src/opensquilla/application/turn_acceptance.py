@@ -59,6 +59,7 @@ from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
     promote_pending_chat_input_attachments,
 )
+from opensquilla.persistence.turn_request_resolution import is_resolvable_turn_scope
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode
 
@@ -90,6 +91,13 @@ class DurableTurnAdmission:
             if command.receipt_replay_only:
                 return await _replay_retired_request(command, ports)
             try:
+                if is_resolvable_turn_scope(command.source_scope) and (
+                    ports.sessions is None or ports.storage is None
+                    or not ports.storage.capabilities.atomic_acceptance
+                ):
+                    raise AdmissionUnavailableError(
+                        "Versioned sends require atomic durable acceptance"
+                    )
                 _ensure_required_services(command, ports)
                 if command.initial_model is not None or command.initial_provider is not None:
                     if command.intent != "new_chat" or not command.intent_was_provided:
@@ -120,6 +128,10 @@ class DurableTurnAdmission:
                             try:
                                 if await get_session(command.session_key) is None:
                                     intent = "new_chat"
+                            except AdmissionStorageBusyError:
+                                # Preserve unknown acceptance and Retry-After
+                                # even before receipt lookup or preparation.
+                                raise
                             except Exception as exc:
                                 raise AdmissionUnavailableError(
                                     f"Failed to inspect chat session: {exc}"
@@ -162,10 +174,79 @@ class DurableTurnAdmission:
                     key = result.get("sessionKey") or result.get("key") or command.session_key
                     result = {"ok": True, "sessionKey": key, **result}
                 return cast(AdmitTurnResult, result)
-            except Exception:
+            except Exception as exc:
                 if command.surface == "webchat":
                     ports.clear_compaction_marker(command.session_key)
+                if is_resolvable_turn_scope(command.source_scope):
+                    if isinstance(exc, AdmissionError) and exc.kind in {
+                        "STORAGE_BUSY", "IDEMPOTENCY_CONFLICT",
+                    }:
+                        # A failed contender is not proof that another writer
+                        # did not accept this identity. Never turn it into a draft.
+                        raise AdmissionError(
+                            exc.kind, exc.message, details=exc.details,
+                            retryable=exc.retryable, retry_after_ms=exc.retry_after_ms,
+                            accepted=None,
+                        ) from exc
+                    if isinstance(exc, ProjectWorkspaceStateError) or (
+                        isinstance(exc, AdmissionError) and exc.accepted is False
+                        and not (exc.details or {}).get("requestRetired")
+                    ):
+                        return await _close_rejected_resolvable_turn(command, ports, exc)
+                elif isinstance(exc, ProjectWorkspaceStateError):
+                    raise ports.workspace_error(exc) from exc
                 raise
+
+
+async def _close_rejected_resolvable_turn(
+    command: AdmitTurn, ports: AdmissionPrimitives,
+    error: ProjectWorkspaceStateError | AdmissionError,
+) -> AdmitTurnResult:
+    """Preserve typed failures, but derive non-acceptance only from a durable fence."""
+    storage = ports.storage
+    if storage is None:
+        raise AdmissionUnavailableError("Session storage is unavailable") from error
+    try:
+        status = await storage.resolve_turn_request_attempt(
+            source_scope=command.source_scope, request_session_key=command.session_key,
+            client_request_id=command.client_request_id,
+            request_fingerprint=command.request_fingerprint,
+        )
+    except AdmissionIngressConflictError as exc:
+        raise AdmissionError(
+            "IDEMPOTENCY_CONFLICT", str(exc), accepted=None, retryable=False,
+        ) from exc
+    if status == "found":
+        acceptance = await storage.replay_turn_ingress_receipt(
+            source_scope=command.source_scope, request_session_key=command.session_key,
+            client_request_id=command.client_request_id,
+        )
+        if acceptance is not None:
+            result = await ports.accepted_response(
+                acceptance, client_request_id=command.client_request_id, storage=storage,
+            )
+            return {
+                "ok": True, "sessionKey": acceptance.receipt.accepted_session_key, **result,
+            }
+        # Session deletion may race the projection after the writer transaction.
+        status = "accepted_unavailable"
+    if status == "accepted_unavailable":
+        raise AdmissionError(
+            "ACCEPTED_RECEIPT_UNAVAILABLE",
+            "This request was accepted; its session is unavailable.",
+            accepted=True, retryable=False, details={"receiptUnavailable": True},
+        ) from error
+    if status == "not_found":
+        raise AdmissionError(
+            "UNAVAILABLE", "Request admission is closed; its earlier outcome is unknown.",
+            accepted=None, retryable=False,
+        ) from error
+    if isinstance(error, ProjectWorkspaceStateError):
+        raise ports.workspace_error(error, accepted=False, request_retired=True) from error
+    raise AdmissionError(
+        error.kind, error.message, details={**(error.details or {}), "requestRetired": True},
+        retryable=error.retryable, retry_after_ms=error.retry_after_ms, accepted=False,
+    ) from error
 
 
 def _ensure_required_services(command: AdmitTurn, ports: AdmissionPrimitives) -> None:
@@ -536,6 +617,8 @@ async def _accept_turn_in_scope(
                 )
 
     def _project_workspace_error(exc: ProjectWorkspaceStateError) -> Exception:
+        if is_resolvable_turn_scope(command.source_scope):
+            return exc
         return ports.workspace_error(exc)
 
     def _preaccept_storage_busy_error(exc: AdmissionStorageBusyError) -> AdmissionError:

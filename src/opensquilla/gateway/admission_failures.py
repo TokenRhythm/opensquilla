@@ -23,11 +23,26 @@ from opensquilla.session.storage import (
     StorageBusyError,
     TaskCollectionUnavailableError,
     TurnIngressConflictError,
+    TurnRequestAdmissionClosedError,
+    TurnRequestResolvedError,
 )
 
 
 def admission_failure(error: Exception) -> Exception | None:
     """Preserve failure identity and retry facts without exposing native models."""
+    if isinstance(error, TurnRequestAdmissionClosedError):
+        from opensquilla.application.admission_errors import AdmissionError
+
+        return AdmissionError("UNAVAILABLE", str(error), accepted=None, retryable=False)
+    if isinstance(error, TurnRequestResolvedError):
+        from opensquilla.application.admission_errors import AdmissionError
+
+        retired = error.state == "retired"
+        return AdmissionError(
+            "REQUEST_RETIRED" if retired else "ACCEPTED_RECEIPT_UNAVAILABLE", str(error),
+            accepted=not retired, retryable=False,
+            details={"requestRetired": True} if retired else {"receiptUnavailable": True},
+        )
     if isinstance(error, SidechatAdmissionRejectedError):
         from opensquilla.application.admission_errors import AdmissionError
 

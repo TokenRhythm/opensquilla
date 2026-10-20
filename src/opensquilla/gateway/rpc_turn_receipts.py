@@ -1,4 +1,4 @@
-"""Authenticated, read-only lookup of durable turn acceptance."""
+"""Authenticated receipt lookup and explicit versioned request retirement."""
 
 from __future__ import annotations
 
@@ -13,8 +13,10 @@ from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableE
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.turn_receipts import (
     can_read_turn_receipts,
+    can_resolve_turn_receipts,
     decode_turn_receipt_query,
     read_turn_receipt,
+    resolve_turn_receipt,
 )
 
 
@@ -37,5 +39,28 @@ async def _handle_turns_receipt_get(params: dict | None, ctx: RpcContext) -> dic
 
 _handle_turns_receipt_get_contract = register_turn_receipt_contract(
     get_dispatcher(), _handle_turns_receipt_get,
+    internal_error=RpcHandlerError, guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
+async def _handle_turns_receipt_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not can_resolve_turn_receipts(ctx.principal):
+        raise RpcHandlerError(
+            "UNAUTHORIZED", "Request retirement requires authenticated operator write access",
+        )
+    try:
+        validate_turn_receipt_params(params, method="turns.receipt.resolve")
+        assert isinstance(params, dict)
+        query = decode_turn_receipt_query(params, principal_role=ctx.role)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RpcHandlerError("INVALID_REQUEST", "Invalid versioned turn receipt request") from exc
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise RpcUnavailableError("Session storage is unavailable")
+    return await resolve_turn_receipt(storage, query)
+
+
+_handle_turns_receipt_resolve_contract = register_turn_receipt_contract(
+    get_dispatcher(), _handle_turns_receipt_resolve, method="turns.receipt.resolve",
     internal_error=RpcHandlerError, guest_allowed_checker=is_guest_rpc_method_allowed,
 )

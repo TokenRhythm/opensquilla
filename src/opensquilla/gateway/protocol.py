@@ -396,6 +396,7 @@ class PolicyInfo(BaseModel):
     transport_probe_nonce: bool = False
     transport_flow: dict[str, Any] | None = None
     turn_receipt_lookup: Literal["turns.receipt.read.v1"] | None = None
+    turn_receipt_epoch: str | None = None
     # Additive startup contract.  Older clients ignore this field; clients
     # that understand startup.services.v1 can render core readiness separately
     # from integrations that are still starting or degraded.

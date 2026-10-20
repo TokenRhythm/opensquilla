@@ -62,6 +62,15 @@ from opensquilla.persistence.sqlite_diagnostics import (
     register_connection,
     sqlite_failure,
 )
+from opensquilla.persistence.turn_request_resolution import (
+    RESOLUTION_CLEANUP_BATCH,
+    TURN_REQUEST_RESOLUTION_EXPIRY_INDEX,
+    TURN_REQUEST_RESOLUTION_SCHEMA,
+    TurnReceiptEpoch,
+    TurnReceiptEpochPolicy,
+    is_resolvable_turn_scope,
+    request_epoch,
+)
 from opensquilla.session.attachment_history import (
     USER_DISPLAY_TEXT_SQL,
     inline_attachment_digest,
@@ -227,6 +236,20 @@ class StorageConnectionPoisonedError(RuntimeError):
 
 class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
+
+
+class TurnRequestResolvedError(RuntimeError):
+    """A terminal request identity cannot create another durable turn."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        super().__init__(
+            "Request was retired" if state == "retired" else "Accepted receipt is unavailable"
+        )
+
+
+class TurnRequestAdmissionClosedError(RuntimeError):
+    """The old identity cannot enter admission; its historical outcome is unknown."""
 
 
 class SessionRoutingConflictError(ValueError):
@@ -2131,8 +2154,17 @@ class SessionStorage:
         self._monotonic = time.monotonic
         self._random = random.random
         self._restart_abandoned_session_keys: tuple[str, ...] = ()
+        self._turn_receipt_epochs: TurnReceiptEpochPolicy | None = None
+        self._turn_receipt_exclusive_gateway = False
         # Removing a catalog entry does not authorize maintenance of its files.
         self.protected_project_paths: set[str] = set()
+
+    def configure_turn_receipt_epochs(
+        self, policy: TurnReceiptEpochPolicy, *, exclusive_gateway: bool = False,
+    ) -> None:
+        """Wire process validity; only the locked Gateway lifespan may retire other boots."""
+        self._turn_receipt_epochs = policy
+        self._turn_receipt_exclusive_gateway = exclusive_gateway
 
     @property
     def restart_abandoned_session_keys(self) -> tuple[str, ...]:
@@ -2827,6 +2859,8 @@ class SessionStorage:
         await self._conn.execute(_CREATE_SESSION_READ_RECOVERY_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_SESSION_READ_RECOVERY_RECEIPTS_SESSION)
         await self._conn.execute(_CREATE_TURN_INGRESS_RECEIPTS)
+        await self._conn.execute(TURN_REQUEST_RESOLUTION_SCHEMA)
+        await self._conn.execute(TURN_REQUEST_RESOLUTION_EXPIRY_INDEX)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_REQUEST)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
         await self._conn.execute(_CREATE_PENDING_CHAT_INPUTS)
@@ -12573,6 +12607,104 @@ class SessionStorage:
             ),
         )
 
+    @staticmethod
+    async def _select_turn_request_resolution(
+        conn: Any, *, source_scope: str, request_session_key: str, client_request_id: str,
+    ) -> dict[str, Any] | None:
+        async with conn.execute(
+            "SELECT request_fingerprint, state FROM turn_request_resolution "
+            "WHERE source_scope = ? AND request_session_key = ? AND client_request_id = ?",
+            (source_scope, request_session_key, client_request_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    @_serialized_read
+    async def get_turn_request_resolution(
+        self, *, source_scope: str, request_session_key: str,
+        client_request_id: str, request_fingerprint: str,
+    ) -> str | None:
+        if not is_resolvable_turn_scope(source_scope):
+            return None
+        row = await self._select_turn_request_resolution(
+            self.conn, source_scope=source_scope,
+            request_session_key=canonicalize_session_key(request_session_key),
+            client_request_id=client_request_id,
+        )
+        if row is None:
+            return None
+        if row["request_fingerprint"] != request_fingerprint:
+            raise TurnIngressConflictError("Request identity belongs to a different input")
+        return str(row["state"])
+
+    async def resolve_turn_request_attempt(
+        self, *, source_scope: str, request_session_key: str,
+        client_request_id: str, request_fingerprint: str,
+    ) -> str:
+        """Serialize retirement with acceptance, including an entirely absent request."""
+        if not is_resolvable_turn_scope(source_scope):
+            raise ValueError("Only versioned WebChat requests can be retired")
+        key = canonicalize_session_key(request_session_key)
+        async with self._write_transaction("resolve_turn_request_attempt") as conn:
+            await self._prune_closed_turn_resolutions(conn)
+            accepted = await self._select_turn_ingress_receipt(
+                conn, source_scope=source_scope, request_session_key=key,
+                client_request_id=client_request_id,
+            )
+            if accepted is not None:
+                if accepted[0].request_fingerprint != request_fingerprint:
+                    raise TurnIngressConflictError("Request identity belongs to a different input")
+                return "found"
+            previous = await self._select_turn_request_resolution(
+                conn, source_scope=source_scope, request_session_key=key,
+                client_request_id=client_request_id,
+            )
+            if previous is not None:
+                if previous["request_fingerprint"] != request_fingerprint:
+                    raise TurnIngressConflictError("Request identity belongs to a different input")
+                return (
+                    "accepted_unavailable" if previous["state"] == "accepted" else "retired"
+                )
+            epoch = self._active_turn_request_epoch(client_request_id)
+            if epoch is None:
+                return "not_found"
+            # No registration write is required: this new-protocol namespace
+            # cannot contain historical acceptances without terminal evidence.
+            await conn.execute(
+                "INSERT INTO turn_request_resolution "
+                "(source_scope, request_session_key, client_request_id, "
+                "request_fingerprint, state, updated_at, validity_boot_id, validity_expires_hour) "
+                "VALUES (?, ?, ?, ?, 'retired', ?, ?, ?)",
+                (source_scope, key, client_request_id,
+                 request_fingerprint, int(time.time() * 1000), epoch.boot_id, epoch.expires_hour),
+            )
+        return "retired"
+
+    def _active_turn_request_epoch(self, client_request_id: str) -> TurnReceiptEpoch | None:
+        epoch = request_epoch(client_request_id)
+        policy = self._turn_receipt_epochs
+        return epoch if policy is not None and policy.accepts(epoch) else None
+
+    async def _prune_closed_turn_resolutions(self, conn: Any) -> None:
+        """Bound work inside the existing writer; idle databases need no cleanup worker."""
+        policy = self._turn_receipt_epochs
+        if policy is None:
+            return
+        predicate = "(validity_boot_id = ? AND validity_expires_hour <= ?)"
+        params: list[Any] = [policy.boot_id, policy.current_hour]
+        if self._turn_receipt_exclusive_gateway:
+            # The Gateway PID/profile lease is held before DB construction and
+            # until its writers close. A generic SessionStorage has no such
+            # authority over a different live process.
+            predicate += " OR validity_boot_id < ? OR validity_boot_id > ?"
+            params.extend((policy.boot_id, policy.boot_id))
+        params.append(RESOLUTION_CLEANUP_BATCH)
+        await conn.execute(
+            "DELETE FROM turn_request_resolution WHERE rowid IN ("
+            f"SELECT rowid FROM turn_request_resolution WHERE {predicate} LIMIT ?)",
+            params,
+        )
+
     @_serialized_read
     async def get_turn_receipt_context(
         self, session_id: str, message_id: str,
@@ -13994,6 +14126,24 @@ class SessionStorage:
                     ),
                 )
 
+            if is_resolvable_turn_scope(source_scope):
+                await self._prune_closed_turn_resolutions(conn)
+                resolution = await self._select_turn_request_resolution(
+                    conn, source_scope=source_scope, request_session_key=request_session_key,
+                    client_request_id=client_request_id,
+                )
+                if resolution is not None:
+                    if resolution["request_fingerprint"] != request_fingerprint:
+                        raise TurnIngressConflictError(
+                            "Request identity belongs to a different input"
+                        )
+                    raise TurnRequestResolvedError(str(resolution["state"]))
+                resolution_epoch = self._active_turn_request_epoch(client_request_id)
+                if resolution_epoch is None:
+                    raise TurnRequestAdmissionClosedError(
+                        "Request admission is closed; its earlier outcome is unknown"
+                    )
+
             if pending_input_id is not None:
                 pending = await self._select_pending_chat_input(
                     conn,
@@ -14781,6 +14931,18 @@ class SessionStorage:
                 f"VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
+            if is_resolvable_turn_scope(source_scope):
+                # This evidence has no session FK: even an older writer deleting
+                # the receipt must not turn acceptance into permission to resend.
+                await conn.execute(
+                    "INSERT INTO turn_request_resolution "
+                    "(source_scope, request_session_key, client_request_id, "
+                    "request_fingerprint, state, updated_at, validity_boot_id, "
+                    "validity_expires_hour) VALUES (?, ?, ?, ?, 'accepted', ?, ?, ?)",
+                    (source_scope, request_session_key, client_request_id,
+                     request_fingerprint, receipt.accepted_at,
+                     resolution_epoch.boot_id, resolution_epoch.expires_hour),
+                )
             if pending_input_id is not None:
                 if pending_dispatch_client_message_id is None:
                     raise AssertionError(

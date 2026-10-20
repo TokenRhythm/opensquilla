@@ -75,6 +75,38 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     )
 
 
+async def _handle_chat_send_v2(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.session_services import get_session_storage
+    from opensquilla.gateway.turn_receipts import (
+        decode_turn_receipt_query,
+        is_current_turn_receipt_epoch,
+        replay_previous_epoch_send,
+    )
+    from opensquilla.persistence.turn_request_resolution import request_binds_epoch
+
+    values = params or {}
+    if (
+        "client_request_id" in values
+        and values["client_request_id"] != values.get("clientRequestId")
+    ):
+        raise ValueError("clientRequestId and client_request_id must match")
+    epoch = values.get("acceptanceEpoch")
+    if (
+        not is_current_turn_receipt_epoch(epoch)
+        or not request_binds_epoch(values.get("clientRequestId"), epoch)
+    ):
+        query = decode_turn_receipt_query(
+            {"operation": "chat.send.v2", "originalRequest": params}, principal_role=ctx.role,
+        )
+        storage = get_session_storage(ctx.session_manager)
+        if storage is None:
+            raise RpcUnavailableError("Session storage is unavailable")
+        return await replay_previous_epoch_send(storage, query)
+    return await _chat_turn_admission_adapter(ctx).admit(
+        params, surface="webchat", resolvable=True,
+    )
+
+
 async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
     return await _chat_turn_admission_adapter(ctx).cancel(
         params,
@@ -193,6 +225,11 @@ _handle_chat_send_generated_contract = register_turn_admission_contract(
     _d,
     "chat.send",
     _handle_chat_send_contract,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_chat_send_v2_generated_contract = register_turn_admission_contract(
+    _d, "chat.send.v2", _handle_chat_send_v2,
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )

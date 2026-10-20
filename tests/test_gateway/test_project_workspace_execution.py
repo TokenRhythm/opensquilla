@@ -2544,10 +2544,25 @@ async def test_legacy_messages_subscribe_preserves_project_workspace_snapshot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["sessions.send", "chat.send.v2"])
 async def test_project_removal_before_atomic_commit_maps_without_partial_writes(
     tmp_path: Path,
+    method: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from opensquilla.persistence.turn_request_resolution import TurnReceiptEpochPolicy
+
+    policy = TurnReceiptEpochPolicy("c" * 32)
+    epoch = policy.current_epoch()
+    request_id = (
+        f"tr2:{epoch}:project-removal-race-request"
+        if method == "chat.send.v2" else "project-removal-race-request"
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.turn_receipts.current_turn_receipt_epoch", policy.current_epoch,
+    )
     async with open_stack(tmp_path / "sessions.db") as stack:
+        stack.storage.configure_turn_receipt_epochs(policy)
         project = await add_project(stack, tmp_path / "project")
         assert project is not None
         key = "agent:main:webchat:project-removal-race"
@@ -2564,11 +2579,12 @@ async def test_project_removal_before_atomic_commit_maps_without_partial_writes(
         stack.storage.accept_turn = remove_before_accept  # type: ignore[method-assign]
         rejected = await get_dispatcher().dispatch(
             "project-removal-race",
-            "sessions.send",
+            method,
             {
                 "key": key,
                 "message": "must roll back",
-                "clientRequestId": "project-removal-race-request",
+                "clientRequestId": request_id,
+                **({"acceptanceEpoch": epoch} if method == "chat.send.v2" else {}),
             },
             stack.context,
         )
@@ -2583,6 +2599,19 @@ async def test_project_removal_before_atomic_commit_maps_without_partial_writes(
             receipt_count = await cursor.fetchone()
         assert receipt_count is not None
         assert receipt_count[0] == 0
+        if method == "chat.send.v2":
+            assert rejected.error.accepted is False
+            assert rejected.error.details["requestRetired"] is True
+            resolved = await get_dispatcher().dispatch(
+                "close-removed-project", "turns.receipt.resolve",
+                {"operation": method, "originalRequest": {
+                    "key": key, "message": "must roll back",
+                    "clientRequestId": request_id,
+                    "acceptanceEpoch": epoch,
+                }},
+                stack.context,
+            )
+            assert resolved.ok and resolved.payload["status"] == "retired"
 
 
 @pytest.mark.asyncio

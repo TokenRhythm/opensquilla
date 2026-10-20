@@ -19,6 +19,7 @@ from opensquilla.chat.source import chat_source_metadata
 from opensquilla.gateway.admission_input import decode_admit_turn
 from opensquilla.gateway.rpc import RpcHandlerError, RpcUnavailableError
 from opensquilla.gateway.turn_steering import decode_steering_command, map_steering_error
+from opensquilla.persistence.turn_request_resolution import resolvable_webchat_scope
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key
 
 _WEBCHAT_SESSION_KEY = build_webchat_key()
@@ -143,8 +144,13 @@ class GatewayTurnAdmissionAdapter:
         *,
         principal_role: str = "operator",
         connection_id: str = "",
+        resolvable: bool = False,
     ) -> AdmitTurn:
         """Decode original WebChat material without constructing an admission service."""
+        if resolvable:
+            request_id = params.get("clientRequestId")
+            if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 256:
+                raise ValueError("chat.send.v2 requires clientRequestId")
         collaboration = cls._initial_collaboration_mode(params)
         routing = cls._initial_routing_mode(params)
         incoming_source = params.get("_source")
@@ -220,7 +226,7 @@ class GatewayTurnAdmissionAdapter:
             fingerprint["initialCollaborationMode"] = collaboration
         if routing is not None:
             fingerprint["initialRoutingMode"] = routing
-        return replace(
+        command = replace(
             decode_admit_turn(
                 projected,
                 surface="webchat",
@@ -233,20 +239,28 @@ class GatewayTurnAdmissionAdapter:
             initial_routing_mode=routing,
             intent_was_provided=params.get("intent") is not None,
         )
+        return (
+            replace(command, source_scope=resolvable_webchat_scope(principal_role))
+            if resolvable else command
+        )
 
     async def admit(
         self,
         params: dict[str, Any] | None,
         *,
         surface: str,
+        resolvable: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(params, dict) or "message" not in params:
             raise ValueError("params.message is required")
+        if resolvable and surface != "webchat":
+            raise ValueError("Only chat.send.v2 can select resolvable admission")
         key = self._key(params, surface=surface)
         command = (
             self.decode_webchat_command(
                 params, key, principal_role=self._principal_role,
                 connection_id=self._connection_id,
+                resolvable=resolvable,
             )
             if surface == "webchat"
             else decode_admit_turn(
