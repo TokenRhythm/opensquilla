@@ -79,6 +79,8 @@ export interface UseChatSessionRuntimeOptions {
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
   retireAttachments?: () => void
+  /** Clear session-local navigation state without changing the restored draft. */
+  resetInputHistory?: () => void
   resetDraftComposer?: () => void
 }
 
@@ -157,6 +159,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   }
 
   function resetSessionViewState() {
+    options.resetInputHistory?.()
     options.messages.value = []
     options.lastHeaderRole.value = ''
     options.lastHeaderDay.value = ''

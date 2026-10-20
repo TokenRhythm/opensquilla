@@ -51,6 +51,8 @@ describe('useChatSessionRuntime attachment ownership', () => {
   function createRuntime(overrides: Partial<UseChatSessionRuntimeOptions> = {}) {
     const attachments = useChatAttachments()
     const sessionKey = ref('agent:main:webchat:first')
+    const resetInputHistory = vi.fn()
+    const resetDraftComposer = vi.fn()
     const runtime = useChatSessionRuntime({
       sessionKey,
       messages: ref<ChatMessage[]>([]),
@@ -84,18 +86,20 @@ describe('useChatSessionRuntime attachment ownership', () => {
       restoreWidgetState: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
       retireAttachments: attachments.retireAttachments,
+      resetInputHistory,
+      resetDraftComposer,
       ...overrides,
     })
     const addImage = (name: string) => attachments.addAttachment(
       new File([new Uint8Array([0xff, 0xd8, 0xff])], name, { type: 'image/jpeg' }),
     )
-    return { runtime, attachments, sessionKey, addImage }
+    return { runtime, attachments, sessionKey, addImage, resetInputHistory, resetDraftComposer }
   }
 
   it.each(['navigate', 'new task', 'slash reset'])(
     'retires unsent files and late reads on %s',
     async (transition) => {
-      const { runtime, attachments, addImage } = createRuntime()
+      const { runtime, attachments, addImage, resetInputHistory, resetDraftComposer } = createRuntime()
       await addImage('ready.jpg')
       readers[0].finish()
       await addImage('reading.jpg')
@@ -104,6 +108,8 @@ describe('useChatSessionRuntime attachment ownership', () => {
       else if (transition === 'new task') await runtime.startDraftSession()
       else runtime.resetCurrentSessionAfterSlash()
 
+      expect(resetInputHistory).toHaveBeenCalledOnce()
+      expect(resetDraftComposer).toHaveBeenCalledTimes(transition === 'new task' ? 1 : 0)
       expect(attachments.pendingAttachments.value).toEqual([])
       expect(attachments.hasPendingAttachmentWork()).toBe(false)
       await addImage('current.jpg')
@@ -121,7 +127,7 @@ describe('useChatSessionRuntime attachment ownership', () => {
   it.each(['response handoff'])(
     'preserves the composer and in-flight reads during %s',
     async () => {
-      const { runtime, attachments, addImage } = createRuntime()
+      const { runtime, attachments, addImage, resetInputHistory, resetDraftComposer } = createRuntime()
       await addImage('ready.jpg')
       readers[0].finish()
       await addImage('reading.jpg')
@@ -129,6 +135,8 @@ describe('useChatSessionRuntime attachment ownership', () => {
       await runtime.adoptResponseSession('agent:main:webchat:accepted', 'request-1')
       readers[1].finish()
 
+      expect(resetInputHistory).toHaveBeenCalledOnce()
+      expect(resetDraftComposer).not.toHaveBeenCalled()
       expect(attachments.pendingAttachments.value).toMatchObject([
         { kind: 'inline', name: 'ready.jpg' },
         { kind: 'inline', name: 'reading.jpg' },
@@ -140,17 +148,19 @@ describe('useChatSessionRuntime attachment ownership', () => {
   it('retires attachments only when delayed navigation commits', async () => {
     let finishQueue!: () => void
     const queue = new Promise<void>(resolve => { finishQueue = resolve })
-    const { runtime, attachments, addImage } = createRuntime({
+    const { runtime, attachments, addImage, resetInputHistory } = createRuntime({
       switchPendingQueue: () => queue,
     })
     await addImage('source.jpg')
 
     const switching = runtime.switchToSession('agent:main:webchat:second')
     readers[0].finish()
+    expect(resetInputHistory).not.toHaveBeenCalled()
     expect(attachments.pendingAttachments.value).toMatchObject([{ kind: 'inline', name: 'source.jpg' }])
 
     finishQueue()
     await switching
+    expect(resetInputHistory).toHaveBeenCalledOnce()
     expect(attachments.pendingAttachments.value).toEqual([])
   })
 
@@ -159,7 +169,7 @@ describe('useChatSessionRuntime attachment ownership', () => {
     async (outcome) => {
       let finishQueue!: () => void
       const queue = new Promise<void>(resolve => { finishQueue = resolve })
-      const { runtime, attachments, sessionKey, addImage } = createRuntime({
+      const { runtime, attachments, sessionKey, addImage, resetInputHistory } = createRuntime({
         switchPendingQueue: () => outcome === 'failed'
           ? Promise.reject(new Error('queue unavailable'))
           : queue,
@@ -180,6 +190,7 @@ describe('useChatSessionRuntime attachment ownership', () => {
       }
       readers[0].finish()
 
+      expect(resetInputHistory).not.toHaveBeenCalled()
       expect(sessionKey.value).toBe('agent:main:webchat:first')
       expect(attachments.pendingAttachments.value).toMatchObject([{ kind: 'inline', name: 'source.jpg' }])
     },

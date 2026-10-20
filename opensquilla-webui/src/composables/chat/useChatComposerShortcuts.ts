@@ -297,6 +297,13 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
   function cycleHistory(dir: number): boolean {
     const history = options.messages.value
       .filter(message => message.role === 'user' && typeof message.text === 'string')
+    if (inputHistoryIdx.value !== null
+      && (inputHistoryIdx.value < 0 || inputHistoryIdx.value >= history.length)) {
+      // Editing or refreshing history may remove the recalled entry. Retire
+      // its cursor without replacing the current draft with an older snapshot.
+      resetInputHistory()
+      return false
+    }
     if (history.length === 0) return false
 
     const restore = (text: string, paths?: readonly string[]) => {

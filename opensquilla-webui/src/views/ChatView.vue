@@ -3398,10 +3398,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   restoreWidgetState,
   resetStreamLiveTurnState,
   retireAttachments,
+  resetInputHistory: () => resetComposerInputHistory(),
   resetDraftComposer: () => {
     artifactImageLightbox.close()
     inputText.value = ''
-    resetComposerInputHistory()
     autoResizeTextarea()
   },
 })
