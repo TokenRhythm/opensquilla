@@ -3401,6 +3401,7 @@ def _run_posix_group_anchor(
                     group_members = _darwin_group_members(pgid)
                     if (
                         group_members is None
+                        or own_pid not in group_members
                         or len(group_members) > _POSIX_DESCENDANT_CAPTURE_LIMIT
                     ):
                         return 125
@@ -3414,8 +3415,9 @@ def _run_posix_group_anchor(
                         ):
                             return 125
                         darwin_lineage[member.unique_id] = 1
-                    if not darwin_lineage:
-                        return 125
+                    # ARM also supports an empty anchor while its controller
+                    # is blocked. A live gated helper cannot leave this group;
+                    # if it already exited, releasing its gate fails closed.
                 output_pipe.write(_POSIX_ANCHOR_ARMED)
                 output_pipe.flush()
                 break

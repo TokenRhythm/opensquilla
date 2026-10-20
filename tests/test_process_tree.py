@@ -1370,9 +1370,12 @@ def test_darwin_retained_lineage_limit_reports_incomplete_but_cleans_known_child
 @pytest.mark.skipif(os.name != "posix", reason="POSIX anchor uses file descriptors")
 @pytest.mark.parametrize(
     "initial_snapshot",
-    ["ready", "no-target", "unavailable", "identity-missing", "wrong-uid", "wrong-group"],
+    [
+        "ready", "no-target", "unavailable", "empty-list", "missing-anchor",
+        "identity-missing", "wrong-uid", "wrong-group",
+    ],
 )
-def test_darwin_pipe_anchor_records_gated_target_before_acknowledging_arm(
+def test_darwin_pipe_anchor_verifies_group_before_acknowledging_arm(
     monkeypatch, initial_snapshot,
 ) -> None:
     anchor = process_tree._PosixProcessInfo(100, 1, 100, 501, "anchor", 1000, 1)
@@ -1406,6 +1409,8 @@ def test_darwin_pipe_anchor_records_gated_target_before_acknowledging_arm(
         process_tree, "_darwin_group_members",
         lambda _pgid: (
             None if initial_snapshot == "unavailable"
+            else () if initial_snapshot == "empty-list"
+            else (101,) if initial_snapshot == "missing-anchor"
             else (100,) if initial_snapshot == "no-target" else (100, 101)
         ),
     )
@@ -1426,9 +1431,14 @@ def test_darwin_pipe_anchor_records_gated_target_before_acknowledging_arm(
             result = process_tree._run_posix_group_anchor(
                 "-", input_pipe=input_pipe, output_pipe=output,
             )
-        if initial_snapshot == "ready":
+        if initial_snapshot in {"ready", "no-target"}:
             assert result == 0
-            assert events.index("root-identity") < events.index(process_tree._POSIX_ANCHOR_ARMED)
+            if initial_snapshot == "ready":
+                assert events.index("root-identity") < events.index(
+                    process_tree._POSIX_ANCHOR_ARMED,
+                )
+            else:
+                assert "root-identity" not in events
             assert output.getvalue() == b"YBE"
         else:
             assert result == 125
@@ -2251,6 +2261,38 @@ async def test_darwin_pipe_arm_failure_reclaims_gated_helper_and_owner(
     assert case.events.index("process-stopped") < case.events.index("anchor-stopped")
     assert case.events.index("anchor-stopped") < case.events.index("row-deleted")
     assert case.events.count("row-deleted") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin gated pipe launch")
+async def test_darwin_empty_anchor_cannot_release_an_exited_pipe_helper(
+    monkeypatch, tmp_path,
+) -> None:
+    original_arm = process_tree._PosixGroupAnchor.arm
+    anchors = []
+
+    async def arm_after_helper_exit(anchor):
+        anchors.append(anchor)
+        assert anchor._owner is not None
+        helper = anchor._owner.process
+        helper.kill()
+        await asyncio.wait_for(helper.wait(), timeout=5)
+        await original_arm(anchor)
+
+    monkeypatch.setattr(process_tree._PosixGroupAnchor, "arm", arm_after_helper_exit)
+    marker = tmp_path / "must-not-run"
+    with pytest.raises(process_tree.ProcessTreeOwnershipError, match="failed closed") as exc:
+        await process_tree.create_owned_subprocess_exec(
+            sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        )
+
+    assert isinstance(exc.value.__cause__, BrokenPipeError)
+    assert not marker.exists()
+    assert len(anchors) == 1
+    assert anchors[0].process.returncode is not None
+    monitor = anchors[0]._monitor_task
+    assert monitor is not None
+    await asyncio.wait_for(asyncio.shield(monitor), timeout=5)
 
 
 @pytest.mark.asyncio
