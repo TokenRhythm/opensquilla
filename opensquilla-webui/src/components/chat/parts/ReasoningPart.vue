@@ -260,9 +260,9 @@ const summary = computed(() => {
   font-size: 0.75rem;
 }
 .thinking-fold--timeline-phase > .thinking-fold__summary {
-  min-height: 1.75rem;
+  min-height: 2rem;
   gap: 0.625rem;
-  padding: 0.25rem 0;
+  padding: 0.375rem 0;
   border-radius: 0;
   line-height: 1.45;
 }
@@ -272,7 +272,8 @@ const summary = computed(() => {
   font-size: 0.8125rem;
 }
 .thinking-fold--in-activity > .thinking-fold__summary {
-  min-height: 1.75rem;
+  min-height: 2rem;
+  padding: 0.375rem 0;
   line-height: 1.45;
 }
 @media (pointer: coarse) {
