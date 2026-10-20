@@ -1345,6 +1345,8 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const activeProjectWorkspace = useActiveProjectWorkspace()
+let workbenchMetadataScope: string | null = null
+let workbenchIdentityRevision = 0
 const draftProjectHydration = createDraftProjectHydrationGuard()
 const {
   pendingWorkspaceId,
@@ -2876,6 +2878,22 @@ async function handleRegenerateMessage(
 
 let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+watch(
+  [sessionKey, deliveryIdentity, currentEpoch, () => gatewayAccess.subscriptionEpoch],
+  (values, previous) => {
+    const [key, identity, epoch, connectionEpoch] = values
+    const [previousKey, previousIdentity, previousEpoch, previousConnectionEpoch] = previous
+    if (previousIdentity !== null && identity !== previousIdentity) workbenchIdentityRevision++
+    // Delivery identity hashing runs alongside startup. Its first Hello-backed
+    // publication belongs to the same read; losing/replacing a proven identity
+    // or changing the connection/session still invalidates retained metadata.
+    const initialProof = previousIdentity === null && identity !== null
+      && key === previousKey && epoch === previousEpoch && connectionEpoch === previousConnectionEpoch
+      && workbenchMetadataScope === JSON.stringify([key, null, connectionEpoch, epoch])
+    workbenchMetadataScope = initialProof ? JSON.stringify([key, identity, connectionEpoch, epoch]) : null
+  },
+  { flush: 'sync' },
+)
 const chatSessionSubscription = useChatSessionSubscription({
   sessionReadLeaseReader: sessionReadLifecycle,
   conversationRuntime,
@@ -2939,8 +2957,14 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   beginSessionMetadataResolution: key => {
     if (pendingSessionIntent.value === 'new_chat') return -1
+    const scope = JSON.stringify([
+      key, gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch, currentEpoch.value,
+    ])
+    const refresh = Boolean(gatewayAccess.deliveryIdentity && workbenchMetadataScope === scope)
+    workbenchMetadataScope = scope
     const preserveCurrent = workbenchMaterializedSessionKey === key
     workbenchMaterializedSessionKey = ''
+    if (refresh && !preserveCurrent) return activeProjectWorkspace.beginSessionRefresh(key)
     return activeProjectWorkspace.beginSessionResolution(key, preserveCurrent)
   },
   onSessionMetadata: (key, generation, metadata) => {
@@ -2949,8 +2973,16 @@ const chatSessionSubscription = useChatSessionSubscription({
       workspaceBindingMismatch.value = (metadata.workspaceId ?? null) !== props.expectedWorkspaceId
     }
     const connectionEpoch = gatewayAccess.subscriptionEpoch
+    const sessionEpoch = metadata.epoch ?? currentEpoch.value
+    const identityRevision = workbenchIdentityRevision
+    const isCurrent = () => !chatViewDisposed && key === sessionKey.value
+      && connectionEpoch === gatewayAccess.subscriptionEpoch && sessionEpoch === currentEpoch.value
+      && identityRevision === workbenchIdentityRevision
     const cached = projectWorkspaces.workspaces.value.find(item => item.id === metadata.workspaceId)
-    void applySessionProjectWorkspaceMetadata({
+    // Subscription installs this metadata's epoch in onSnapshot immediately
+    // after this callback. Validate/project after that installation so a cold
+    // session with a nonzero epoch cannot invalidate its own workspace read.
+    void Promise.resolve().then(() => applySessionProjectWorkspaceMetadata({
       state: activeProjectWorkspace, sessionKey: key, generation,
       metadata: {
         workspaceId: metadata.workspaceId ?? undefined,
@@ -2960,8 +2992,15 @@ const chatSessionSubscription = useChatSessionSubscription({
       cachedWorkspace: cached ? activeSnapshot(cached) : null,
       loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
         .map(workspace => activeSnapshot(workspace)),
-      isCurrent: () => !chatViewDisposed && key === sessionKey.value
-        && gatewayAccess.subscriptionEpoch === connectionEpoch,
+      isCurrent,
+    })).then(() => {
+      // The first snapshot establishes the session epoch after the read began.
+      // Remember the installed context, not the pre-bootstrap unknown epoch.
+      if (isCurrent() && activeWorkspaceStatus.value !== 'resolving' && activeWorkspaceStatus.value !== 'error') {
+        workbenchMetadataScope = JSON.stringify([
+          key, gatewayAccess.deliveryIdentity, connectionEpoch, sessionEpoch,
+        ])
+      }
     })
   },
   onSessionMetadataError: (key, generation) => {
@@ -6398,8 +6437,13 @@ const chatRouteHeaderRegistration = props.embedded
   sessionDurable: computed(() => !isDraftSurface()),
   // Bootstrap owns whether a history read is needed (materialized drafts skip
   // it). A failed workspace lookup is settled, not an endless loading state.
-  sessionLoading: computed(() => activeWorkspaceStatus.value === 'resolving'
-    || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value)),
+  sessionLoading: computed(() => !activeProjectWorkspace.refreshing.value
+    && (activeWorkspaceStatus.value === 'resolving'
+      || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value))),
+  sessionRefreshing: activeProjectWorkspace.refreshing,
+  sessionContext: computed(() => JSON.stringify([
+    sessionKey.value, gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch, currentEpoch.value,
+  ])),
   sessionPreparable: workbenchSessionPreparation.canPrepare,
   workspaceId: boundWorkspaceId,
   workspaceReady: computed(() => activeWorkspaceStatus.value === 'ready'),

@@ -89,7 +89,7 @@ async function mount(options: { native?: boolean; workspace?: boolean; assistant
     isLocalOwner: true, isAuthenticated: true, subscriptionEpoch: 1, deliveryIdentity: 'verified-connection-a',
   } as GatewayMenuFixture)
   const props = reactive({ sessionId: 'session-a', routeActive: true, conversationStarted: true, sessionDurable: true, sessionPreparable: true,
-    sessionLoading: false,
+    sessionLoading: false, sessionRefreshing: false, sessionContext: 'owner-a:epoch-0',
     enabled: true, modalBlocked: false,
     prepareSession: undefined as ((key: string) => Promise<string | null>) | undefined,
     workspaceId: options.workspace === false ? null : 'workspace-a', workspaceReady: true, workspaceResolved: true })
@@ -120,7 +120,10 @@ async function mount(options: { native?: boolean; workspace?: boolean; assistant
   await settle()
   const trigger = () => host.querySelector<HTMLButtonElement>('[data-testid="workbench-new-panel-trigger"]')!
   const open = async () => { trigger().click(); await settle() }
-  return { gateway, host, props, store, trigger, open, lifecycle }
+  return { gateway, host, props, store, trigger, open, lifecycle, unmount: () => {
+    app.unmount()
+    apps.splice(apps.indexOf(app), 1)
+  } }
 }
 
 describe('AppWorkbench new panel menu interaction', () => {
@@ -233,6 +236,117 @@ describe('AppWorkbench new panel menu interaction', () => {
     const terminal = start.querySelector<HTMLButtonElement>('[data-panel-kind="terminal"]')!
     expect(terminal.disabled).toBe(true)
     expect(terminal.querySelector('small')?.textContent).toBe(key('requiresHostExecute'))
+  })
+
+  it('retains launcher labels during repeated background reads without retaining action authority', async () => {
+    const harness = await mount({ native: false })
+    harness.store.closeAllItems()
+    harness.store.openEmpty()
+    await settle()
+    const start = harness.host.querySelector('[data-testid="workbench-start-panel"]')!
+    const cards = () => [...start.querySelectorAll<HTMLButtonElement>('[data-panel-kind]')]
+      .map(card => ({ text: card.textContent, disabled: card.disabled }))
+    const baseline = cards()
+    for (let cycle = 0; cycle < 2; cycle++) {
+      harness.props.sessionRefreshing = true
+      harness.props.workspaceReady = false
+      harness.props.workspaceResolved = false
+      await settle()
+      expect(cards()).toEqual(baseline)
+      expect(start.getAttribute('aria-busy')).toBe('false')
+      expect(harness.store.items).toHaveLength(0)
+      harness.props.workspaceReady = true
+      harness.props.workspaceResolved = true
+      harness.props.sessionRefreshing = false
+      await settle()
+      expect(cards()).toEqual(baseline)
+    }
+  })
+
+  it('waits for fresh workspace metadata before opening a terminal once', async () => {
+    const harness = await mount({ native: false })
+    harness.props.sessionRefreshing = true
+    harness.props.workspaceReady = false
+    harness.props.workspaceResolved = false
+    await harness.open()
+    expect(option('terminal')?.disabled).toBe(false)
+    option('terminal')!.click()
+    await settle()
+    expect(harness.store.items.some(item => item.kind === 'terminal')).toBe(false)
+    harness.props.workspaceReady = true
+    harness.props.workspaceResolved = true
+    harness.props.sessionRefreshing = false
+    await settle()
+    const terminals = harness.store.items.filter(item => item.kind === 'terminal')
+    expect(terminals).toHaveLength(1)
+    expect(terminals[0]!.payload.target).toEqual({ kind: 'project', workspaceId: 'workspace-a' })
+  })
+
+  it.each(['session', 'owner', 'workspace', 'connection', 'collapse', 'unmount', 'failure', 'permission'] as const)(
+    'does not replay a waiting terminal click after %s changes', async change => {
+      const harness = await mount({ native: false })
+      harness.props.sessionRefreshing = true
+      harness.props.workspaceReady = false
+      harness.props.workspaceResolved = false
+      await harness.open()
+      option('terminal')!.click()
+      await settle()
+      expect(harness.store.items.some(item => item.kind === 'terminal')).toBe(false)
+      if (change === 'session') { harness.props.sessionId = 'session-b'; harness.store.setSessionScope('session-b') }
+      if (change === 'owner') harness.props.sessionContext = 'owner-b:epoch-1'
+      if (change === 'workspace') harness.props.workspaceId = 'workspace-b'
+      if (change === 'connection') harness.gateway.subscriptionEpoch++
+      if (change === 'collapse') harness.store.setExpanded(false)
+      if (change === 'unmount') harness.unmount()
+      if (change === 'permission') {
+        harness.gateway.canExecuteHost = false
+        harness.gateway.hostExecuteUnavailableReason = 'permission'
+      }
+      if (change !== 'failure') {
+        harness.props.workspaceReady = true
+        harness.props.workspaceResolved = true
+      }
+      harness.props.sessionRefreshing = false
+      await settle()
+      expect(harness.store.items.some(item => item.kind === 'terminal')).toBe(false)
+    },
+  )
+
+  it('applies permission revocation immediately while retaining background-refresh presentation', async () => {
+    const harness = await mount({ native: false })
+    harness.props.sessionRefreshing = true
+    harness.props.workspaceReady = false
+    harness.props.workspaceResolved = false
+    await harness.open()
+    expect(option('terminal')?.disabled).toBe(false)
+    harness.gateway.canExecuteHost = false
+    harness.gateway.hostExecuteUnavailableReason = 'permission'
+    await settle()
+    expect(option('terminal')?.disabled).toBe(true)
+    expect(option('terminal')?.title).toBe(key('requiresHostExecute'))
+  })
+
+  it('opens a native browser immediately during a same-session workspace refresh', async () => {
+    const harness = await mount()
+    harness.props.sessionRefreshing = true
+    harness.props.workspaceReady = false
+    harness.props.workspaceResolved = false
+    await harness.open()
+    option('browser')!.click()
+    await settle()
+    expect(harness.store.activeItem?.kind).toBe('browser')
+    expect(harness.props.sessionRefreshing).toBe(true)
+  })
+
+  it('does not reuse workspace readiness after the route owner changes with the same session key', async () => {
+    const harness = await mount({ native: false })
+    harness.props.sessionContext = 'replacement-owner'
+    harness.props.sessionRefreshing = true
+    harness.props.workspaceReady = false
+    harness.props.workspaceResolved = false
+    await harness.open()
+    expect(option('terminal')?.disabled).toBe(true)
+    expect(option('assistant-chat')?.disabled).toBe(true)
   })
 
   it.each(['history-first', 'workspace-first'] as const)(
