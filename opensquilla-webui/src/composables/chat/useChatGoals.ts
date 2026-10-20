@@ -114,6 +114,8 @@ export interface UseChatGoalsOptions {
   // its message subscription is registered. The host owns those two steps.
   ensureSessionKey?: () => Promise<string>
   ensureSubscribed?: (sessionKey: string) => Promise<boolean>
+  /** Recheck current authority at dispatch, after the asynchronous readiness wait. */
+  isSessionReady?: (sessionKey: string) => boolean
   // The Goal mutation already durably accepted its transcript row. Let the
   // host project that confirmed row immediately instead of waiting for a
   // later history refresh to discover it.
@@ -946,6 +948,8 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       options.notify?.(localizeGoalRpcError(error))
       return false
     }
+    if (key !== options.sessionKey.value || current !== goal.value || busy.value
+      || options.isSessionReady?.(key) === false) return false
     const owner = Symbol('goals.reattach.takeover')
     mutationOwner = owner
     busy.value = true
@@ -990,7 +994,8 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       key = await resolveKey()
       if (owner !== startGoalOwner || !key || key !== options.sessionKey.value) return false
       if (options.ensureSubscribed && !await options.ensureSubscribed(key)) return false
-      if (owner !== startGoalOwner || key !== options.sessionKey.value) return false
+      if (owner !== startGoalOwner || key !== options.sessionKey.value
+        || options.isSessionReady?.(key) === false) return false
       mutationOwner = owner
       busy.value = true
       requestIdentity = goalSetIdentity(key, options.currentEpoch?.value ?? 0, objective, localPathReferences)

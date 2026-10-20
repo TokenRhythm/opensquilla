@@ -3549,11 +3549,9 @@ const chatGoals = useChatGoals({
     return key
   },
   ensureSubscribed: async key => {
-    if (key !== sessionKey.value) return false
-    if (livePhase.value === 'ready') return true
-    const outcome = await subscribeSession()
-    return outcome.authoritative
+    return chatSessionBootstrap.ensureLiveReady(key)
   },
+  isSessionReady: key => chatSessionBootstrap.isLiveReady(key),
   onSetAccepted: projectAcceptedGoalMessage,
   notify: message => pushToast(message, { tone: 'danger', duration: 6000 }),
 })
