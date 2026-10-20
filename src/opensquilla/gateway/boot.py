@@ -5634,23 +5634,39 @@ async def start_gateway_server(
                 )
         _publish_legacy_ready_if_complete()
 
-    async def _start_optional_channels(generation: int) -> None:
+    channel_service_generation = svc.optional_generation
+    channels_descriptor = svc.optional_services.setdefault("channels", {})
+
+    async def _start_optional_channels(generation: int) -> str:
         """Start channel adapters after the durable core is ready."""
-        owner_generation = int(
-            getattr(svc.optional_owners.get("channels"), "owner_generation", generation)
-            or generation
-        )
+        def is_current() -> bool:
+            return (
+                channel_service_generation == svc.optional_generation
+                and svc.optional_owners.get("channels") is channels_owner
+                and generation == channels_owner.owner_generation
+            )
+
+        def publish(status: str, **details: Any) -> None:
+            channels_descriptor.update(
+                status=status,
+                state=status,
+                generation=channel_service_generation,
+                config_revision=service_config_revision,
+                owner_generation=generation,
+                **details,
+            )
+
+        if not is_current():
+            raise asyncio.CancelledError
+        # This mapping is also held by OptionalServiceOwner. Preserve its
+        # identity and discard only diagnostics owned by the previous attempt.
+        channels_descriptor.pop("error", None)
+        channels_descriptor.pop("channels", None)
         if channel_manager is None:
-            svc.optional_services["channels"] = {
-                "status": "disabled",
-                "generation": generation,
-            }
+            publish("disabled")
             _publish_legacy_ready_if_complete()
-            return
-        svc.optional_services["channels"] = {
-            "status": "starting",
-            "generation": generation,
-        }
+            return "disabled"
+        publish("starting")
         configured_channel_names = getattr(channel_manager, "_channels", {})
         if not channel_readiness_owned and isinstance(configured_channel_names, dict):
             for name in configured_channel_names:
@@ -5658,14 +5674,14 @@ async def start_gateway_server(
                 if channel_name:
                     svc.optional_services[f"channel:{channel_name}"] = {
                         "status": "starting",
-                        "generation": generation,
+                        "generation": channel_service_generation,
                         "config_revision": service_config_revision,
-                        "owner_generation": owner_generation,
+                        "owner_generation": generation,
                     }
         try:
             results = await channel_manager.start_all()
-            if generation != svc.optional_generation:
-                return
+            if not is_current():
+                raise asyncio.CancelledError
             start_errors_fn = getattr(channel_manager, "start_errors", None)
             start_errors = start_errors_fn() if start_errors_fn is not None else {}
             for name, ok in results.items():
@@ -5677,9 +5693,9 @@ async def start_gateway_server(
                 if channel_name and not channel_readiness_owned:
                     svc.optional_services[f"channel:{channel_name}"] = {
                         "status": "ready" if ok else "degraded",
-                        "generation": generation,
+                        "generation": channel_service_generation,
                         "config_revision": service_config_revision,
-                        "owner_generation": owner_generation,
+                        "owner_generation": generation,
                     }
                 if ok:
                     log.info("gateway.channel_started", channel=name)
@@ -5692,17 +5708,14 @@ async def start_gateway_server(
                         error=details.get("error"),
                         exception=details.get("exception"),
                     )
-            svc.optional_services["channels"] = {
-                "status": "ready" if all(results.values()) else "degraded",
-                "generation": generation,
-                "channels": results,
-            }
+            status = "ready" if all(results.values()) else "degraded"
+            publish(status, channels=results)
             _publish_legacy_ready_if_complete()
+            return status
         except asyncio.CancelledError:
-            svc.optional_services["channels"] = {
-                "status": "stopping",
-                "generation": generation,
-            }
+            if not is_current():
+                raise
+            publish("stopping")
             for name in (
                 configured_channel_names
                 if not channel_readiness_owned and isinstance(configured_channel_names, dict)
@@ -5711,16 +5724,14 @@ async def start_gateway_server(
                 channel_name = str(name).strip().lower()
                 if channel_name:
                     svc.optional_services.setdefault(f"channel:{channel_name}", {}).update(
-                        {"status": "stopping", "generation": generation}
+                        {"status": "stopping", "generation": channel_service_generation}
                     )
             _publish_legacy_ready_if_complete()
             raise
         except Exception as exc:  # noqa: BLE001 - one integration must not kill core.
-            svc.optional_services["channels"] = {
-                "status": "degraded",
-                "generation": generation,
-                "error": type(exc).__name__,
-            }
+            if not is_current():
+                raise asyncio.CancelledError from exc
+            publish("degraded", error=type(exc).__name__)
             for name in (
                 configured_channel_names
                 if not channel_readiness_owned and isinstance(configured_channel_names, dict)
@@ -5731,12 +5742,13 @@ async def start_gateway_server(
                     svc.optional_services.setdefault(f"channel:{channel_name}", {}).update(
                         {
                             "status": "degraded",
-                            "generation": generation,
+                            "generation": channel_service_generation,
                             "error": type(exc).__name__,
                         }
                     )
             log.warning("gateway.channel_start_failed", error=str(exc))
             _publish_legacy_ready_if_complete()
+            return "degraded"
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock
@@ -5918,7 +5930,7 @@ async def start_gateway_server(
         "channels",
         _start_optional_channels,
         config_revision=service_config_revision,
-        descriptor=svc.optional_services.setdefault("channels", {}),
+        descriptor=channels_descriptor,
     )
     optional_owners = getattr(svc, "optional_owners", None)
     if not isinstance(optional_owners, dict):
