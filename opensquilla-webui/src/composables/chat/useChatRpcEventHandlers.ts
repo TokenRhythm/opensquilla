@@ -165,7 +165,7 @@ export interface UseChatRpcEventHandlersOptions {
   onTaskProgress?: (payload: ConversationEventData) => void
   updateRouterExecutionModel?: (model: string, turnId?: string) => void
   onTaskSettled?: (taskId: string, epoch?: number) => void
-  queueRouterDecision: (payload: ConversationRoutingDecision, identityStreamSeq?: number) => void
+  queueRouterDecision: (payload: ConversationRoutingDecision, identityStreamSeq?: number, replayed?: boolean) => void
   bindRouterDecisionToModelCall?: (
     modelCallId: string,
     iteration?: number,
@@ -865,7 +865,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       } else if (event === 'provider-activity') {
         handleRpcProviderActivity(payload)
       } else if (event === 'router-decision') {
-        handleRpcRouterDecision(payload)
+        handleRpcRouterDecision(payload, entry.replayed)
       } else if (event === 'ensemble-progress') {
         handleRpcEnsembleProgress(payload)
       } else if (event === 'router-control-replay') {
@@ -2116,15 +2116,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     noteTaskGroupTerminal(payload, 'failed')
   }
 
-  function handleRpcRouterDecision(payload: ConversationRoutingDecision) {
+  function handleRpcRouterDecision(payload: ConversationRoutingDecision, replayed = false) {
     if (isStaleEpoch(payload)) return
-    if (bufferPendingStreamEvent('router-decision', payload)) return
+    if (bufferPendingStreamEvent('router-decision', payload, replayed)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     if (!stream.isStreaming.value) stream.startStreaming()
     recordActivityPhase('Selecting model', 'router:decided')
-    options.queueRouterDecision(payload, replayActivityOrder)
+    options.queueRouterDecision(payload, replayActivityOrder, replayed)
   }
 
   function handleRpcEnsembleProgress(payload: ConversationEnsembleProgress) {
@@ -2661,7 +2661,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           handleRpcTaskGroupFailed(event.payload)
           break
         case 'router-decision':
-          handleRpcRouterDecision(event.payload)
+          handleRpcRouterDecision(event.payload, event.meta.replayed === true)
           break
         case 'ensemble-progress':
           handleRpcEnsembleProgress(event.payload)

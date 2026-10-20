@@ -1,5 +1,5 @@
 import { projectConversationHistoryMessage, compactionSummaryMessages, summaryCompactionIds, isHistoryMaintenance, mergeHistoryMaintenance, turnOutcomeRecord, attachHistoryTurnOutcomes, preserveAcceptedEnsembleRouterRows } from '@/utils/chat/conversationHistory'
-import { nextTick, ref, type Ref } from 'vue'
+import { nextTick, ref, watch, type Ref } from 'vue'
 import type {
   ChatMessage,
   ChatTurnOutcome,
@@ -122,6 +122,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   // Exposed read-only by convention so session hand-offs can distinguish the
   // prior session's terminal `ready` state from the new session's first load.
   const historySessionKey = ref('')
+  // Capture the departed rows at the actual navigation boundary. A live
+  // snapshot can populate this session before its first history read finishes
+  // (or even starts); those new rows must not be discarded as cross-session.
+  const departedSessionRows = new WeakSet<ChatMessage>()
+  const stopObservingSessionRows = watch(options.sessionKey, () => {
+    for (const message of options.messages.value) departedSessionRows.add(message)
+  }, { flush: 'sync' })
   let hasLoadedEarlier = false
   let loadEarlierPending = false
   let failedHistoryRequest: FailedHistoryRequest | null = null
@@ -412,7 +419,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const lease = options.sessionReadLeaseReader.current()
     const requestIdentity = options.deliveryIdentity?.value
     const requestScrollEpoch = options.scrollEpoch?.value ?? 0
-    const crossedSession = resetForSession(key)
+    resetForSession(key)
     const historyStateBeforeLoad = historyState.value
     const failedHistoryRequestBeforeLoad = failedHistoryRequest
     const requestPreserveLocalTailGeneration = preserveLocalTailGeneration
@@ -525,7 +532,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         msgs.map(message => mapHistoryMessage(message, summaryIds)),
         data,
       )
-      const previousMessages = crossedSession ? [] : options.messages.value
+      const previousMessages = options.messages.value.filter(message => !departedSessionRows.has(message))
       const previousMaintenance = previousMessages.filter(message => (
         isHistoryMaintenance(message)
         && (!params.replaceCanonicalWindow || message.restoredFromHistory !== true)
@@ -680,15 +687,14 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         hasLoadedEarlier = true
         loadedEarlierCursors.add(String(params.before))
       }
-      const preserveLiveTail = !crossedSession && (
+      const preserveLiveTail = (
         Boolean(options.preserveLiveTail?.value)
         || preserveLocalTailGeneration > acknowledgedPreserveLocalTailGeneration
       )
 
       const acknowledgePreservedLocalTail = () => {
         if (
-          !crossedSession
-          && !params.prepend
+          !params.prepend
           && canonicalAvailable !== false
           && requestPreserveLocalTailGeneration > acknowledgedPreserveLocalTailGeneration
           && requestPreserveLocalTailGeneration === preserveLocalTailGeneration
@@ -700,7 +706,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       if (msgs.length === 0 && !params.prepend) {
         const transcript = preserveLiveTail
           ? reconcileRunningHistoryMessages(previousTranscript, [])
-          : !crossedSession && hasLocalOptimisticRows(previousTranscript)
+          : hasLocalOptimisticRows(previousTranscript)
             ? previousTranscript
             : []
         options.messages.value = mergeHistoryMaintenance(
@@ -1038,6 +1044,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function cleanup() {
+    stopObservingSessionRows()
     cancelActiveHistory()
     historySyncPending = false
     loadEarlierPending = false

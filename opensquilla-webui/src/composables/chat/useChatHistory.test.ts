@@ -3015,6 +3015,160 @@ describe('useChatHistory canonical pagination', () => {
     expect(api.historyState.value.initialLoadStatus).toBe('ready')
   })
 
+  it.each(['before history starts', 'while history is pending'] as const)(
+    'retains the new session live route restored %s without retaining departed session rows',
+    async snapshotTiming => {
+      const sessionKey = ref('agent:main:webchat:old')
+      const { api, historyFixture, messages, readHistory } = makeHistory(false, {
+        sessionKey, preserveLiveTail: true,
+        response: { messages: [historyMessage('old-answer')], canonicalAvailable: true },
+      })
+      try {
+        await api.loadHistory()
+        let resolveHistory!: (value: SessionReadHistoryPageFixture) => void
+        historyFixture.mockImplementationOnce(() => new Promise(resolve => { resolveHistory = resolve }))
+        sessionKey.value = 'agent:main:webchat:new'
+        const route: ChatMessage = {
+          role: 'router', text: '', ts: 2, messageId: 'new-route',
+          turnId: 'new-running-turn', routerReplayed: true,
+          routerDecision: { tier: 'c0', model: 'current-model', source: 'classifier' },
+        }
+        // Leave old rows in the shared ref to prove that only the new session's
+        // additions can survive, regardless of when its live snapshot arrives.
+        if (snapshotTiming === 'before history starts') messages.value.push(route)
+        const pending = api.loadHistory()
+        await vi.waitFor(() => expect(readHistory).toHaveBeenCalledTimes(2))
+        if (snapshotTiming === 'while history is pending') messages.value.push(route)
+        resolveHistory({
+          canonicalAvailable: true,
+          messages: [{
+            role: 'user', text: 'New request', messageId: 'new-user',
+            createdAt: 1, turnContext: { turnId: 'new-running-turn' },
+          }],
+        })
+        await pending
+        expect(messages.value.map(message => message.messageId)).toEqual(['new-user', 'new-route'])
+        expect(messages.value[1]?.routerReplayed).toBe(true)
+      } finally {
+        api.cleanup()
+      }
+    },
+  )
+
+  it('retains current live routing after a new session history failure and retry without reviving departed rows', async () => {
+    const sessionKey = ref('agent:main:webchat:old')
+    const { api, historyFixture, messages, readHistory, replaceReadLease } = makeHistory(false, {
+      sessionKey, preserveLiveTail: true,
+      response: { messages: [historyMessage('old-answer')], canonicalAvailable: true },
+    })
+    try {
+      await api.loadHistory()
+      let rejectHistory!: (reason: Error) => void
+      historyFixture.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectHistory = reject }))
+      sessionKey.value = 'agent:main:webchat:new'
+      replaceReadLease()
+      const pending = api.loadHistory()
+      await vi.waitFor(() => expect(readHistory).toHaveBeenCalledTimes(2))
+      messages.value.push({
+        role: 'router', text: '', ts: 2, messageId: 'new-route',
+        turnId: 'new-running-turn', routerReplayed: true,
+        routerDecision: { tier: 'c0', model: 'current-model', source: 'classifier' },
+      })
+      rejectHistory(new Error('temporary history failure'))
+      await expect(pending).resolves.toMatchObject({ ok: false })
+      expect(api.historyState.value.initialLoadStatus).toBe('error')
+      expect(messages.value.some(message => message.messageId === 'new-route')).toBe(true)
+
+      historyFixture.mockResolvedValueOnce({
+        canonicalAvailable: true,
+        messages: [{
+          role: 'user', text: 'New request', messageId: 'new-user',
+          createdAt: 1, turnContext: { turnId: 'new-running-turn' },
+        }],
+      })
+      await api.retryHistory()
+
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value.map(message => message.messageId)).toEqual(['new-user', 'new-route'])
+      expect(messages.value[1]).toMatchObject({
+        routerReplayed: true,
+        routerDecision: { model: 'current-model' },
+      })
+      expect(api.historyState.value).toMatchObject({
+        initialLoadStatus: 'ready', loading: false, retrying: false,
+      })
+    } finally {
+      api.cleanup()
+    }
+  })
+
+  it('keeps the current canonical and live rows after a rapid A to B to A return when retired leases finish late', async () => {
+    const sessionKey = ref('agent:main:webchat:A')
+    const { api, historyFixture, messages, readHistory, replaceReadLease } = makeHistory(false, {
+      sessionKey, preserveLiveTail: true,
+      response: { messages: [historyMessage('old-a-answer')], canonicalAvailable: true },
+    })
+    try {
+      await api.loadHistory()
+      let resolveOldA!: (value: SessionReadHistoryPageFixture) => void
+      let resolveB!: (value: SessionReadHistoryPageFixture) => void
+      let resolveCurrentA!: (value: SessionReadHistoryPageFixture) => void
+      historyFixture
+        .mockImplementationOnce(() => new Promise(resolve => { resolveOldA = resolve }))
+        .mockImplementationOnce(() => new Promise(resolve => { resolveB = resolve }))
+        .mockImplementationOnce(() => new Promise(resolve => { resolveCurrentA = resolve }))
+
+      const oldA = api.loadHistory()
+      await vi.waitFor(() => expect(readHistory).toHaveBeenCalledTimes(2))
+      sessionKey.value = 'agent:main:webchat:B'
+      replaceReadLease()
+      const oldB = api.loadHistory()
+      await vi.waitFor(() => expect(readHistory).toHaveBeenCalledTimes(3))
+      messages.value.push({
+        role: 'router', text: '', ts: 2, messageId: 'b-route',
+        turnId: 'b-running-turn', routerReplayed: true,
+        routerDecision: { tier: 'c1', model: 'b-model', source: 'classifier' },
+      })
+
+      sessionKey.value = 'agent:main:webchat:A'
+      replaceReadLease()
+      const currentA = api.loadHistory()
+      await vi.waitFor(() => expect(readHistory).toHaveBeenCalledTimes(4))
+      messages.value.push({
+        role: 'router', text: '', ts: 4, messageId: 'current-a-route',
+        turnId: 'current-a-turn', routerReplayed: true,
+        routerDecision: { tier: 'c0', model: 'current-a-model', source: 'classifier' },
+      })
+      resolveCurrentA({
+        canonicalAvailable: true,
+        messages: [{
+          role: 'user', text: 'Current A request', messageId: 'current-a-user',
+          createdAt: 3, turnContext: { turnId: 'current-a-turn' },
+        }],
+      })
+      await expect(currentA).resolves.toMatchObject({ ok: true })
+      expect(messages.value.map(message => message.messageId)).toEqual(['current-a-user', 'current-a-route'])
+      const installedMessages = messages.value
+      const installedState = { ...api.historyState.value }
+
+      // The first response has the same session key as the current view.
+      // Its retired lease still must not replace the newly installed turn.
+      resolveOldA({ canonicalAvailable: true, messages: [historyMessage('stale-a-answer')] })
+      resolveB({ canonicalAvailable: true, messages: [historyMessage('stale-b-answer')] })
+      await expect(oldA).resolves.toMatchObject({ ok: false, cancelled: true })
+      await expect(oldB).resolves.toMatchObject({ ok: false, cancelled: true })
+
+      expect(messages.value).toBe(installedMessages)
+      expect(api.historyState.value).toEqual(installedState)
+      expect(messages.value[1]).toMatchObject({
+        routerReplayed: true,
+        routerDecision: { model: 'current-a-model' },
+      })
+    } finally {
+      api.cleanup()
+    }
+  })
+
   it('cancels a scheduled history sync before switching to another session or draft', async () => {
     vi.useFakeTimers()
     try {

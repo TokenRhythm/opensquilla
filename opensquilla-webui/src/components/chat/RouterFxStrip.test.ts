@@ -278,6 +278,54 @@ describe('RouterFxStrip model selection motion', () => {
     history.app.unmount()
   })
 
+  it('keeps a replayed active route static without announcing that its fallback completed', async () => {
+    const message = reactive(routerStrip({
+      routerReplayed: true,
+      routerSelectedModel: 'selected-model',
+      routerExecutionModel: 'fallback-model',
+    }))
+    const { app, el } = await mountStrip(message)
+    expect(el.querySelector('.router-fx')?.getAttribute('data-phase')).toBe('static')
+    expect(el.querySelector('.router-fx')?.getAttribute('data-static')).toBe('true')
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toBe('Currently executing fallback-model')
+    expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
+    message.routerSettled = true
+    await nextTick()
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toBe('Executed by fallback-model')
+    expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
+    app.unmount()
+  })
+
+  it.each([false, true])('announces a new execution model after replay without rescanning (settled: %s)', async settled => {
+    const message = reactive(routerStrip({
+      routerReplayed: true,
+      routerSelectedModel: 'selected-model',
+      routerExecutionModel: 'initial-fallback',
+    }))
+    const { app, el } = await mountStrip(message)
+    expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
+    message.routerExecutionModel = 'next-fallback'
+    message.routerSettled = settled
+    await nextTick()
+    expect(el.querySelector('.router-fx')?.getAttribute('data-phase')).toBe('static')
+    expect(el.querySelector('.router-fx-selector')).toBeNull()
+    expect(el.querySelector('.router-fx-sr-only')?.textContent)
+      .toBe(settled ? 'Executed by next-fallback' : 'Currently executing next-fallback')
+
+    message.routerObserve = true
+    message.routerExecutionModel = 'observed-model'
+    await nextTick()
+    expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
+    message.routerObserve = false
+    message.routerStatic = true
+    message.routerExecutionModel = 'historical-model'
+    await nextTick()
+    expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
+    app.unmount()
+  })
+
   it('announces consecutive physical fallbacks outside the router candidate pool', async () => {
     vi.useFakeTimers()
     const message = reactive(routerStrip({

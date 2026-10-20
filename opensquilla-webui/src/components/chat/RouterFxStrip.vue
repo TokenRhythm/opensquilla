@@ -3,7 +3,7 @@
     class="router-fx"
     :data-source="message.routerSource"
     :data-observe="message.routerObserve ? 'true' : undefined"
-    :data-static="message.routerStatic ? 'true' : undefined"
+    :data-static="isStaticPresentation ? 'true' : undefined"
     :data-settled="routerDataSettled"
     :data-panel="message.routerPanel || 'real-candidates'"
     :data-phase="showsRouterStage ? motionPhase : undefined"
@@ -171,6 +171,9 @@ const selectorVisible = ref(false)
 const selectorStyle = ref<Record<string, string>>({})
 const gridElement = ref<HTMLElement | null>(null)
 const gridCells = computed(() => props.message.gridCells || [])
+// Cached/live-snapshot routes have already happened, but their model calls can
+// still be running. Freeze their motion without turning them into history.
+const isStaticPresentation = computed(() => props.message.routerStatic === true || props.message.routerReplayed === true)
 const visualGridCells = computed(() => gridCells.value.map(cell => ({
   ...cell,
   visualName: cell.executionKind === 'ensemble'
@@ -339,7 +342,7 @@ function shouldAnimate(): boolean {
   return showsRouterStage.value
     && winnerIndex.value >= 0
     && realCandidateIndices.value.length > 1
-    && props.message.routerStatic !== true
+    && !isStaticPresentation.value
     && props.message.routerObserve !== true
     && props.message.routerSettled !== true
     && prefersReducedMotion.value !== true
@@ -421,7 +424,7 @@ function initializeMotion() {
     return
   }
   const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
-    && props.message.routerStatic !== true
+    && !isStaticPresentation.value
     && props.message.routerObserve !== true
   settleStatic(shouldAnnounce)
 }
@@ -436,7 +439,11 @@ watch([winnerIndex, executionModel], ([next, nextExecutionModel], [previous, pre
     || (next === previous && nextExecutionModel === previousExecutionModel)
   ) return
   if (executionDiffersFromRoute.value || nextExecutionModel !== previousExecutionModel) {
-    settleStatic(props.message.routerStatic !== true && props.message.routerObserve !== true)
+    // Replay freezes selection motion, but a later physical model change is
+    // new information even when it arrives through another live snapshot.
+    const executionChanged = Boolean(nextExecutionModel) && nextExecutionModel !== previousExecutionModel
+    settleStatic(props.message.routerStatic !== true && props.message.routerObserve !== true
+      && (!isStaticPresentation.value || executionChanged))
     return
   }
   if (next < 0) return
@@ -449,14 +456,18 @@ watch([winnerIndex, executionModel], ([next, nextExecutionModel], [previous, pre
 
 watch(
   () => [
-    props.message.routerStatic === true,
+    isStaticPresentation.value,
     props.message.routerObserve === true,
     props.message.routerSettled === true,
     prefersReducedMotion.value,
-  ],
-  ([routerStatic, routerObserve, routerSettled, reduceMotion]) => {
-    if (!mounted || (!routerStatic && !routerObserve && !routerSettled && !reduceMotion)) return
-    const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value) && !routerStatic && !routerObserve
+    executionModel.value,
+  ] as const,
+  ([staticPresentation, routerObserve, routerSettled, reduceMotion, nextExecutionModel], [, , , , previousExecutionModel]) => {
+    if (!mounted || (!staticPresentation && !routerObserve && !routerSettled && !reduceMotion)) return
+    const executionChanged = Boolean(nextExecutionModel) && nextExecutionModel !== previousExecutionModel
+    const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
+      && props.message.routerStatic !== true && !routerObserve
+      && (!staticPresentation || executionChanged)
     settleStatic(shouldAnnounce)
   },
 )

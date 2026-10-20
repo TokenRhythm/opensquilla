@@ -764,6 +764,8 @@ export interface ChatMessage {
   interrupted?: boolean
   routerState?: string
   routerSettled?: boolean
+  /** Display-only replay provenance; the router may still belong to an active turn. */
+  routerReplayed?: boolean
   // Live-accumulated ensemble members for the in-flight router strip, grown by
   // `session.event.ensemble_progress` deltas before the final `done` arrives.
   ensemble?: ChatEnsembleMeta
@@ -924,6 +926,8 @@ export interface ChatRenderedMessage {
   routerSource?: string
   routerObserve?: boolean
   routerStatic?: boolean
+  /** Freeze an already observed route without claiming that its active call completed. */
+  routerReplayed?: boolean
   routerSettled?: boolean
   routerPanel?: string
   routerMode?: import('./modelRouting').ModelRoutingMode

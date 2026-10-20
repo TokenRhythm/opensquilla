@@ -2526,6 +2526,7 @@ onScopeDispose(() => window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, in
 const renderSourceMessages = sessionViewCache.messages
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
+  isPreview: sessionViewCache.showingPreview,
   interruptState,
   sessionKey,
   routerSlots,
