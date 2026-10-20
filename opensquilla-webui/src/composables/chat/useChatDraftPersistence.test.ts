@@ -29,6 +29,21 @@ afterEach(() => {
 })
 
 describe('useChatDraftPersistence', () => {
+  it('confirms complete writes but reports unavailable, rejected, or truncated draft storage', () => {
+    const sessionKey = ref('agent:main:webchat:proof')
+    const { api, scope } = mount(sessionKey, ref(''))
+    expect(api.saveDraft(sessionKey.value, 'complete draft')).toBe(true)
+    expect(api.loadDraft(sessionKey.value)).toBe('complete draft')
+    expect(api.saveDraft(sessionKey.value, 'x'.repeat(100_001))).toBe(false)
+    scope.stop()
+    const rejected = useChatDraftPersistence({ sessionKey, inputText: ref(''), storage: {
+      getItem: () => null, removeItem: () => {}, setItem: () => { throw new Error('quota') },
+    } })
+    expect(rejected.saveDraft(sessionKey.value, 'retain handoff')).toBe(false)
+    const unavailable = useChatDraftPersistence({ sessionKey, inputText: ref(''), storage: null })
+    expect(unavailable.saveDraft(sessionKey.value, 'retain handoff')).toBe(false)
+  })
+
   it('keeps temporary drafts in the owner storage and preserves first-send rebinding', async () => {
     const parentKey = 'agent:main:webchat:parent'
     localStorage.setItem(RECENT_DRAFT_SESSION_KEY, parentKey)

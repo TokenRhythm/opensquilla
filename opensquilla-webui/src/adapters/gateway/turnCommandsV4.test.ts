@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { CHAT_ABORT_METHOD } from '@/contracts/generated/v4/chatAbort'
 import { CHAT_SEND_METHOD } from '@/contracts/generated/v4/chatSend'
+import { CHAT_SEND_V2_METHOD } from '@/contracts/generated/v4/chatSendV2'
+import { TURNS_RECEIPT_RESOLVE_METHOD } from '@/contracts/generated/v4/turnsReceiptResolve'
 import { SESSIONS_PENDING_INPUTS_DISPATCH_METHOD } from '@/contracts/generated/v4/pendingInputsDispatch'
 import { SESSIONS_PENDING_INPUTS_STEER_METHOD } from '@/contracts/generated/v4/pendingInputsSteer'
 import { SESSIONS_STEER_V2_METHOD } from '@/contracts/generated/v4/sessionsSteerV2'
@@ -33,6 +35,9 @@ describe('explicit local path display metadata', () => {
 })
 
 describe('read-only delivery receipt adapter', () => {
+  const OLD_EPOCH = `v2.${'a'.repeat(32)}.100.125`
+  const CURRENT_EPOCH = `v2.${'b'.repeat(32)}.100.125`
+  const wireId = `tr2:${OLD_EPOCH}:request-1`
   const send: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn', params: {
     message: 'frozen text', sessionKey: 'source', clientRequestId: 'request-1',
     attachments: [{ type: 'text/plain', mime: 'text/plain', name: 'note.txt', file_uuid: 'original-token' }],
@@ -43,6 +48,180 @@ describe('read-only delivery receipt adapter', () => {
     clientRequestId: 'request-1', messageId: 'message-1', sessionEpoch: 2,
     taskId: 'task-1', taskStatus: 'running',
   } })
+
+  it('pins the versioned admission route and refuses downgrade without sending a legacy frame', async () => {
+    let supported = true
+    const request = vi.fn().mockResolvedValue({ ok: true, taskId: 'task-1', sessionKey: 'source', client_request_id: wireId })
+    const commands = createV4TurnCommands({ request, supports: () => supported, policy: { turn_receipt_epoch: CURRENT_EPOCH } })
+    const original = { kind: 'new-turn' as const, acceptanceProtocol: 'resolvable-v1' as const,
+      acceptanceEpoch: OLD_EPOCH,
+      params: { message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1' } }
+    expect(commands.supportsResolvableSend?.()).toBe(true)
+    await expect(commands.send(original)).resolves.toMatchObject({ metadata: { client_request_id: 'request-1' } })
+    expect(request.mock.calls[0]?.[0]).toBe(CHAT_SEND_V2_METHOD)
+    expect(request.mock.calls[0]?.[1]).toEqual({ ...original.params, clientRequestId: wireId, acceptanceEpoch: OLD_EPOCH })
+    supported = false
+    await expect(commands.send(original)).rejects.toMatchObject({ failureCode: 'RESOLVABLE_SEND_UNSUPPORTED', accepted: null })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['retired', 'accepted_unavailable'] as const)('validates the %s terminal identity and uses explicit resolution as a write', async status => {
+    const result = { status, accepted: status !== 'retired', clientRequestId: wireId, requestSessionKey: 'source',
+      requestFingerprint: `sha256:${'a'.repeat(64)}` }
+    const request = vi.fn().mockResolvedValue(result)
+    const commands = createV4TurnCommands({ request, supports: () => true, policy: { turn_receipt_epoch: CURRENT_EPOCH } })
+    const query: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn', acceptanceProtocol: 'resolvable-v1',
+      acceptanceEpoch: OLD_EPOCH,
+      params: { message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1' } } }
+    await expect(commands.resolveReceipt?.(query, { expectedGeneration: 7 })).resolves.toEqual({
+      status: status === 'retired' ? 'retired' : 'accepted-unavailable',
+    })
+    expect(request).toHaveBeenCalledWith(TURNS_RECEIPT_RESOLVE_METHOD,
+      { operation: CHAT_SEND_V2_METHOD, originalRequest: { ...query.request.params, clientRequestId: wireId, acceptanceEpoch: OLD_EPOCH } }, { expectedGeneration: 7 })
+    request.mockResolvedValue({ ...result, clientRequestId: 'another-request' })
+    await expect(commands.resolveReceipt?.(query)).rejects.toBeInstanceOf(TurnCommandContractError)
+    request.mockResolvedValue(result)
+    await expect(commands.lookupReceipt?.(send)).rejects.toBeInstanceOf(TurnCommandContractError)
+  })
+
+  it('never resolves a legacy missing receipt or downgrades a failed resolution to send', async () => {
+    const request = vi.fn().mockRejectedValue(Object.assign(new Error('unsupported'), { code: 'METHOD_NOT_FOUND' }))
+    const commands = createV4TurnCommands({ request, supports: () => true, policy: { turn_receipt_epoch: OLD_EPOCH } })
+    await expect(commands.resolveReceipt?.(send)).resolves.toEqual({ status: 'unsupported' })
+    expect(request).not.toHaveBeenCalled()
+    await expect(commands.resolveReceipt?.({ kind: 'send', request: { kind: 'new-turn', acceptanceProtocol: 'resolvable-v1',
+      acceptanceEpoch: OLD_EPOCH,
+      params: { message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1' } } })).resolves.toEqual({ status: 'unsupported' })
+    expect(request.mock.calls.map(call => call[0])).toEqual([TURNS_RECEIPT_RESOLVE_METHOD])
+  })
+
+  it.each([undefined, null, '', ' ', 42, 'boot-1',
+    `v3.${'a'.repeat(32)}.100.125`, `v2.${'a'.repeat(32)}.0100.125`,
+    `v2.${'a'.repeat(32)}.100.126`, `v2.${'a'.repeat(32)}.9007199254740992.9007199254741017`,
+  ])('does not advertise resolvable admission for an invalid Hello epoch %s', epoch => {
+    const commands = createV4TurnCommands({ request: vi.fn(), supports: () => true, policy: { turn_receipt_epoch: epoch } })
+    expect(commands.getReceiptEpoch?.()).toBeUndefined()
+    expect(commands.supportsResolvableSend?.()).toBe(false)
+  })
+
+  it.each([OLD_EPOCH, undefined])('distinguishes closed admission from unknown history for saved epoch %s', acceptanceEpoch => {
+    const request = vi.fn()
+    let supported = true
+    const policy: Record<string, unknown> = { turn_receipt_epoch: CURRENT_EPOCH }
+    const commands = createV4TurnCommands({ request, supports: () => supported, policy })
+    const query: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn',
+      acceptanceProtocol: 'resolvable-v1', acceptanceEpoch,
+      params: { message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1' } } }
+    expect(commands.isAdmissionClosed?.(query)).toBe(true)
+    expect(commands.isAdmissionClosed?.(send)).toBe(false)
+    expect(commands.isAdmissionClosed?.({ kind: 'steer', request: {
+      key: 'source', message: 'control', clientRequestId: 'steer-1',
+      expectedTurnId: 'task-1', clientMessageId: 'message-steer-1',
+    } })).toBe(false)
+    expect(commands.isAdmissionClosed?.({ kind: 'send', request: { kind: 'pending-input',
+      params: { key: 'source', pendingInputId: 'pending-1', clientRequestId: 'request-1', requestFingerprint: 'fingerprint-1' },
+    } })).toBe(false)
+    if (query.request.kind === 'new-turn') query.request.acceptanceEpoch = CURRENT_EPOCH
+    expect(commands.isAdmissionClosed?.(query)).toBe(false)
+    if (query.request.kind === 'new-turn') query.request.acceptanceEpoch = acceptanceEpoch
+    for (const epoch of [undefined, null, '', 0]) {
+      policy.turn_receipt_epoch = epoch
+      expect(commands.isAdmissionClosed?.(query)).toBe(false)
+    }
+    policy.turn_receipt_epoch = CURRENT_EPOCH
+    supported = false
+    expect(commands.isAdmissionClosed?.(query)).toBe(false)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it.each([CHAT_SEND_V2_METHOD, TURNS_RECEIPT_GET_METHOD, TURNS_RECEIPT_RESOLVE_METHOD])(
+    'does not infer closed admission when the current server lacks %s', missing => {
+      const commands = createV4TurnCommands({ request: vi.fn(), supports: method => method !== missing,
+        policy: { turn_receipt_epoch: CURRENT_EPOCH } })
+      expect(commands.isAdmissionClosed?.({ kind: 'send', request: {
+        kind: 'new-turn', acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: OLD_EPOCH,
+        params: { message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1' },
+      } })).toBe(false)
+    },
+  )
+
+  it('never fills a saved versioned send epoch from a later Hello or composer extension', async () => {
+    const request = vi.fn().mockResolvedValue({ ok: true, taskId: 'task-1', sessionKey: 'source' })
+    const commands = createV4TurnCommands({ request, supports: () => true, policy: { turn_receipt_epoch: CURRENT_EPOCH } })
+    await commands.send({ kind: 'new-turn', acceptanceProtocol: 'resolvable-v1', params: {
+      message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1', acceptanceEpoch: 'composer-epoch',
+    } })
+    expect(request).toHaveBeenCalledExactlyOnceWith(CHAT_SEND_V2_METHOD, {
+      message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1',
+    })
+  })
+
+  it.each([
+    { originalEpoch: undefined, currentEpoch: CURRENT_EPOCH },
+    { originalEpoch: OLD_EPOCH, currentEpoch: undefined },
+    { originalEpoch: 'boot-1', currentEpoch: CURRENT_EPOCH },
+  ])('uses only read-only evidence when the epoch fence is missing: %j', async ({ originalEpoch, currentEpoch }) => {
+    const request = vi.fn().mockResolvedValue({ status: 'not_found', accepted: null })
+    const commands = createV4TurnCommands({ request, supports: () => true, policy: { turn_receipt_epoch: currentEpoch } })
+    const query: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn', acceptanceProtocol: 'resolvable-v1',
+      ...(originalEpoch ? { acceptanceEpoch: originalEpoch } : {}),
+      params: { message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1' } } }
+    await expect(commands.resolveReceipt?.(query)).resolves.toEqual({ status: 'not-found' })
+    expect(request).toHaveBeenCalledExactlyOnceWith(TURNS_RECEIPT_GET_METHOD, {
+      operation: CHAT_SEND_V2_METHOD, originalRequest: { ...query.request.params,
+        ...(originalEpoch === OLD_EPOCH ? { clientRequestId: wireId } : {}),
+        ...(originalEpoch ? { acceptanceEpoch: originalEpoch } : {}) },
+    }, { recoveryClass: 'safe-read' })
+    request.mockResolvedValue({ ...found(), receipt: { ...found().receipt,
+      clientRequestId: originalEpoch === OLD_EPOCH ? wireId : 'request-1' } })
+    await expect(commands.resolveReceipt?.(query)).resolves.toMatchObject({ status: 'found' })
+    expect(request.mock.calls.every(call => call[0] === TURNS_RECEIPT_GET_METHOD)).toBe(true)
+  })
+
+  it('keeps an earlier epoch on read and resolution after restart without treating absence as retirement', async () => {
+    const request = vi.fn().mockResolvedValue({ status: 'not_found', accepted: null })
+    const commands = createV4TurnCommands({ request, supports: () => true, policy: { turn_receipt_epoch: CURRENT_EPOCH } })
+    const query: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn', acceptanceProtocol: 'resolvable-v1',
+      acceptanceEpoch: OLD_EPOCH, params: { message: 'frozen', sessionKey: 'source', clientRequestId: 'request-1' } } }
+    await expect(commands.lookupReceipt?.(query)).resolves.toEqual({ status: 'not-found' })
+    await expect(commands.resolveReceipt?.(query)).resolves.toEqual({ status: 'not-found' })
+    expect(request.mock.calls.map(call => call[0])).toEqual([TURNS_RECEIPT_GET_METHOD, TURNS_RECEIPT_RESOLVE_METHOD])
+    for (const [, params] of request.mock.calls) {
+      expect(params.originalRequest).toEqual({ ...query.request.params, clientRequestId: wireId, acceptanceEpoch: OLD_EPOCH })
+    }
+  })
+
+  it('keeps overlapping server windows open without using the browser clock', () => {
+    const policy = { turn_receipt_epoch: `v2.${'a'.repeat(32)}.124.149` }
+    const commands = createV4TurnCommands({ request: vi.fn(), supports: () => true, policy })
+    const query: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn',
+      acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: OLD_EPOCH,
+      params: { sessionKey: 'source', message: 'frozen', clientRequestId: 'request-1' } } }
+    expect(commands.isAdmissionClosed?.(query)).toBe(false)
+    policy.turn_receipt_epoch = `v2.${'a'.repeat(32)}.125.150`
+    expect(commands.isAdmissionClosed?.(query)).toBe(true)
+    expect(query.request).toMatchObject({ acceptanceEpoch: OLD_EPOCH })
+  })
+
+  it.each([
+    {}, { client_request_id: 'request-1' },
+    { client_request_id: wireId, clientRequestId: 'another-request' },
+  ])('rejects an unbound versioned acknowledgement %j', async ids => {
+    const request = vi.fn().mockResolvedValue({ ok: true, taskId: 'task-1', sessionKey: 'source', ...ids })
+    const commands = createV4TurnCommands({ request, supports: () => true, policy: { turn_receipt_epoch: CURRENT_EPOCH } })
+    await expect(commands.send({ kind: 'new-turn', acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: OLD_EPOCH,
+      params: { sessionKey: 'source', message: 'frozen', clientRequestId: 'request-1' },
+    })).rejects.toBeInstanceOf(TurnCommandContractError)
+  })
+
+  it('refuses an oversized wire identity before transport without truncating the logical ID', async () => {
+    const request = vi.fn()
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await expect(commands.send({ kind: 'new-turn', acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: OLD_EPOCH,
+      params: { sessionKey: 'source', message: 'frozen', clientRequestId: 'x'.repeat(256) },
+    })).rejects.toBeInstanceOf(TurnCommandContractError)
+    expect(request).not.toHaveBeenCalled()
+  })
 
   it('looks up the frozen request as a fenced safe read and retains the authoritative target', async () => {
     const request = vi.fn().mockResolvedValue(found())

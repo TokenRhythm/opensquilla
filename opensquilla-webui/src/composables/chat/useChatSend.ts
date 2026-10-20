@@ -73,6 +73,7 @@ import {
 import type {
   PendingInputWal,
   ResponseHandoffWalRecord,
+  DeliveryWalRecord,
 } from '@/utils/chat/pendingInputWal'
 import {
   FINISHED_STREAM_TASK_ID,
@@ -166,6 +167,7 @@ interface SendAttempt {
   deliveryIdentity?: string | null
   draftIds: string[]
   promptAnnotations: PromptAnnotationSnapshot[]
+  draftPromptAnnotations?: PromptAnnotationSnapshot[]
   promptAnnotationsAcknowledged?: boolean
   selectedSkills: SelectedSkillRef[]
   localPathReferences: string[]
@@ -198,6 +200,11 @@ interface SendAttempt {
     request: TurnSendRequest
   }
   acceptanceResolved?: boolean
+  /** History-only after a new explicit send outlives this closed admission. */
+  detachedFromComposer?: boolean
+  deliveryClosed?: 'retired' | 'accepted-unavailable'
+  /** Local status-only row detached while this exact admission was unknown. */
+  pendingAssistantClientId?: string
   acceptanceInFlight?: boolean
   acceptedSessionKey?: string
   onAccepted?: () => void
@@ -447,7 +454,10 @@ function sameSendableAttachments(
 }
 
 function matchesRecoveredDraft(
-  attempt: SendAttempt,
+  attempt: Pick<SendAttempt, 'requestSessionKey' | 'draftIds' | 'pageContext' | 'selectedSkills'
+    | 'localPathReferences' | 'text' | 'composerText' | 'intent' | 'initialCollaborationMode'
+    | 'initialRoutingMode' | 'initialModel' | 'initialProvider' | 'forkBeforeMessageId'
+    | 'workspaceId' | 'attachments'>,
   input: {
     requestSessionKey: string
     draftIds: readonly string[]
@@ -530,6 +540,9 @@ export interface UseChatSendOptions {
   pendingForkBeforeMessageId: Ref<string | null>
   draftIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
+  restorePromptAnnotations?: (snapshots: readonly PromptAnnotationSnapshot[], sessionKey: string) => boolean
+  /** Positive confirmation from the existing local draft writers. */
+  persistRestoredDraft?: () => boolean | Promise<boolean>
   acknowledgePromptAnnotations?: (
     snapshots: readonly PromptAnnotationSnapshot[],
     sessionKey: string,
@@ -555,6 +568,8 @@ export interface UseChatSendOptions {
   acceptanceRecoveryPending?: Ref<boolean>
   acceptanceStopAvailable?: Ref<boolean>
   durableStopPending?: Ref<boolean>
+  /** Current subscription and non-turn work must also be idle before bypassing an old closed admission. */
+  canContinueAfterClosedAdmission?: (afterStartingStream?: boolean) => boolean
   autoScroll: Ref<boolean>
   stream: ChatRpcStreamApi
   canStop?: () => boolean
@@ -648,6 +663,7 @@ export interface UseChatSendOptions {
 export function useChatSend(options: UseChatSendOptions) {
   let disposed = false
   const observedAttempts = new Map<string, SendAttempt>()
+  const detachedDeliveryIds = new Set<string>()
   const { pushToast } = useToasts()
   const acceptanceStopPending = options.acceptanceStopPending || ref(false)
   let activeFreshSendToken: FreshSendToken | null = null
@@ -699,8 +715,25 @@ export function useChatSend(options: UseChatSendOptions) {
     return options.durableDelivery.snapshots().filter(item => item.isCurrentIdentity && item.sessionKey === key)
   })
   const deliveryRecoveryEntries = computed(() => currentSessionDeliveries.value.filter(item => (
-    item.phase === 'unknown' || item.stopPending
+    item.phase === 'unknown' || item.stopPending || item.draftAvailable
   )))
+  function admissionClosed(attempt: SendAttempt): boolean {
+    return currentSessionDeliveries.value.some(item => item.id === attempt.clientRequestId && item.admissionClosed)
+  }
+
+  // A closed admission can still have executed before restart. Keep its WAL,
+  // exact Stop intent and receipt reads, but release the composer-only latch.
+  function releaseClosedAdmissionStop() {
+    const owner = [...stoppedAcceptanceAttempts.values()].find(attempt => (
+      attempt.stopOwner != null && attempt.stopOwner === acceptanceStopOwner
+      && !attempt.acceptanceInFlight && admissionClosed(attempt)
+    ))
+    if (owner) {
+      acceptanceStopOwner = null
+      acceptanceStopPending.value = false
+    }
+  }
+  watch(currentSessionDeliveries, releaseClosedAdmissionStop, { flush: 'sync' })
   const deliveryChecks = ref(new Set<string>())
   const checkingDeliveryIds = computed(() => deliveryRecoveryEntries.value
     .filter(item => deliveryChecks.value.has(item.id)).map(item => item.id))
@@ -712,9 +745,15 @@ export function useChatSend(options: UseChatSendOptions) {
     const key = options.sessionKey.value
     deliveryChecks.value = new Set(deliveryChecks.value).add(id)
     try {
-      // The application owner rechecks the original receipt under its identity
-      // and lease. This action never submits a new message or a Stop intent.
-      await options.durableDelivery.retry(id)
+      let record = await options.durableDelivery.get(id)
+      // Only an explicit check may fence unknown admission. Once fenced, this
+      // is a local draft action and cannot open another server recovery round.
+      if (!record?.retired) {
+        await options.durableDelivery.retry(id)
+        record = await options.durableDelivery.get(id)
+      }
+      if (!disposed && options.deliveryIdentity?.value === identity && options.sessionKey.value === key
+        && record?.retired) await restoreRetiredDelivery(record)
     } catch {
       if (!disposed && options.deliveryIdentity?.value === identity && options.sessionKey.value === key) {
         pushToast(i18n.global.t('deliveryRecovery.reason.storage-check'), { tone: 'warn' })
@@ -731,13 +770,14 @@ export function useChatSend(options: UseChatSendOptions) {
     // target an unambiguous request; each unknown can be checked separately in
     // the current conversation's recovery status.
     const candidates = currentSessionDeliveries.value.filter(item => (
-      item.stopAvailable && !pendingDeliveryStops.has(item.id)
+      item.stopAvailable && !item.admissionClosed && !pendingDeliveryStops.has(item.id)
     ))
     return candidates.length === 1 ? candidates[0]! : null
   })
   const acceptanceStopAvailableForCurrentSession = computed(() => Boolean(stoppableDeliveryForCurrentSession.value))
   const durableStopPendingForCurrentSession = computed(() => {
-    return currentSessionDeliveries.value.some(item => item.stopPending || pendingDeliveryStops.has(item.id))
+    return currentSessionDeliveries.value.some(item => !item.admissionClosed
+      && (item.stopPending || pendingDeliveryStops.has(item.id)))
   })
   watch(acceptanceStopAvailableForCurrentSession, available => {
     if (options.acceptanceStopAvailable) options.acceptanceStopAvailable.value = available
@@ -770,6 +810,11 @@ export function useChatSend(options: UseChatSendOptions) {
   const stopDeliveryObserver = options.durableDelivery.observe(record => {
     if (disposed) return
     if (record.deliveryIdentity !== options.deliveryIdentity?.value) return
+    noteDetachedDelivery(record)
+    if (record.retired || record.acceptedUnavailable) {
+      settleClosedDelivery(record)
+      return
+    }
     if (record.phase === 'not-sent' && record.stop?.requested && record.stop.completed) {
       // This is proof about the original request, unlike a rejection of a
       // later receipt read. Mark an in-flight attempt before its catch runs.
@@ -813,12 +858,166 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function settleObservedAcceptance(record: DeliveryUpdate) {
     if (disposed || record.deliveryIdentity !== options.deliveryIdentity?.value) return
+    noteDetachedDelivery(record)
+    if (record.retired || record.acceptedUnavailable) {
+      settleClosedDelivery(record)
+      return
+    }
     const attempt = observedAttempts.get(record.ownerRequestId)
+      || stoppedAcceptanceAttempts.get(`${record.requestSessionKey}\u0000${record.ownerRequestId}`)
     if (!attempt) return
     if (record.stop?.completed && attempt.stopRequested) clearAttemptStop(attempt)
     if (record.phase === 'accepted' && record.response && !attempt.acceptanceInFlight) {
       if (settleRecoveredAcceptance(attempt, record.response)) observedAttempts.delete(record.ownerRequestId)
     }
+  }
+
+  const unavailableClosures = new Set<string>()
+
+  function noteDetachedDelivery(record: DeliveryUpdate & { handoff?: ResponseHandoffWalRecord }) {
+    if (!record.backgroundOnly && !record.handoff?.backgroundOnly) return
+    detachedDeliveryIds.add(record.ownerRequestId)
+    for (const attempt of [observedAttempts.get(record.ownerRequestId), activeAcceptanceTransaction?.attempt,
+      stoppedAcceptanceAttempts.get(`${record.requestSessionKey}\u0000${record.ownerRequestId}`), recoveredAttempt]) {
+      if (attempt?.clientRequestId === record.ownerRequestId
+        && attempt.deliveryIdentity === record.deliveryIdentity) attempt.detachedFromComposer = true
+    }
+  }
+
+  function isLocalAdmissionPlaceholder(message: ChatMessage): boolean {
+    return message.role === 'assistant' && !message.messageId && !message.turnId && !message.contentRef
+      && !message.text.trim() && !message.reasoning?.text && !message.reasoningBlocks?.length
+      && !message.artifacts?.length && !message.tool_calls?.length && !message.interrupts?.length
+      && !message.timeline?.length && !message.attachments?.length && !message.planRevisions?.length
+      && !message.activitySnapshot && !message.routerDecision && !message.ensemble
+      && Boolean(message.statusHistory?.length)
+      && message.statusHistory!.every(status => status.action === 'Sending' || status.action === 'Planning next step')
+  }
+
+  function endPendingAdmissionStream(attempt: SendAttempt) {
+    const pending = options.activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+      && options.activeStreamSessionKey.value === attempt.requestSessionKey
+    const previousLength = options.messages.value.length
+    options.stream.endStreaming()
+    // endStreaming may retain the local Sending/Planning status as an empty
+    // assistant. Attribute only its own synchronous append, never older rows.
+    const appended = options.messages.value[previousLength]
+    if (pending && options.messages.value.length === previousLength + 1 && appended?.clientId
+      && isLocalAdmissionPlaceholder(appended)) attempt.pendingAssistantClientId = appended.clientId
+  }
+
+  function settleClosedDelivery(record: DeliveryUpdate) {
+    if (disposed || record.deliveryIdentity !== options.deliveryIdentity?.value) return
+    noteDetachedDelivery(record)
+    const attempts = new Set([observedAttempts.get(record.ownerRequestId),
+      activeAcceptanceTransaction?.attempt, recoveredAttempt, usageBarrierReplayAttempt])
+    for (const attempt of attempts) {
+      if (!attempt || attempt.clientRequestId !== record.ownerRequestId
+        || attempt.deliveryIdentity !== record.deliveryIdentity) continue
+      attempt.deliveryClosed = record.retired ? 'retired' : 'accepted-unavailable'
+      attempt.acceptanceResolved = true
+      attempt.requiresIdempotentReplay = false
+      clearAttemptStop(attempt)
+      if (record.acceptedUnavailable && !detachedDeliveryIds.has(record.ownerRequestId)) {
+        notifySendAccepted(attempt)
+        consumeAcceptedComposer(attempt)
+        acknowledgeAttemptPromptAnnotations(attempt, { sessionKey: record.requestSessionKey })
+      }
+      observedAttempts.delete(attempt.clientRequestId)
+      if (recoveredAttempt === attempt) recoveredAttempt = null
+      if (usageBarrierReplayAttempt === attempt) usageBarrierReplayAttempt = null
+      // A closed admission owns no cancellable task. Never clear a different
+      // already-running turn which happens to share this session.
+      if (options.sessionKey.value === record.requestSessionKey
+        && options.activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+        && activeAcceptanceTransaction?.attempt === attempt) {
+        activeFreshSendToken = null
+        endPendingAdmissionStream(attempt)
+        options.activeStreamTaskId.value = ''
+        options.activeStreamSessionKey.value = ''
+      }
+      if (record.retired && options.sessionKey.value === record.requestSessionKey) {
+        options.messages.value = options.messages.value.filter(message => {
+          if (message.clientId === attempt.clientMessageId && !message.messageId && !message.turnId) return false
+          // History/events may have enriched the row since the lost ACK. Only
+          // authoritative retirement can discard the still-empty local row.
+          return !attempt.pendingAssistantClientId || message.clientId !== attempt.pendingAssistantClientId
+            || !isLocalAdmissionPlaceholder(message)
+        })
+      }
+    }
+    noteAcceptanceRecoveryChanged()
+    if (record.acceptedUnavailable && !unavailableClosures.has(record.ownerRequestId)) {
+      unavailableClosures.add(record.ownerRequestId)
+      void options.durableDelivery.get(record.ownerRequestId).then(async delivery => {
+        if (disposed || !delivery || delivery.deliveryIdentity !== options.deliveryIdentity?.value || !delivery.acceptedUnavailable) {
+          unavailableClosures.delete(record.ownerRequestId)
+          return
+        }
+        const handoff = delivery.handoff
+        if (!handoff) return
+        // The accepted envelope has no surviving task/session detail. Consume
+        // only immutable local input; never synthesize a task or navigate.
+        if (!handoff.backgroundOnly && !detachedDeliveryIds.has(record.ownerRequestId)) consumeRecoveredComposer(handoff)
+        if (!handoff.backgroundOnly && !detachedDeliveryIds.has(record.ownerRequestId)
+          && ![...attempts].some(attempt => attempt?.clientRequestId === record.ownerRequestId
+          && attempt.promptAnnotationsAcknowledged)) {
+          options.acknowledgePromptAnnotations?.(handoff.recoveryPromptAnnotations || [], record.requestSessionKey)
+        }
+        await deleteResponseHandoff(handoff)
+        await options.durableDelivery.wake()
+      }).catch(() => { unavailableClosures.delete(record.ownerRequestId) })
+    }
+  }
+
+  async function restoreRetiredDelivery(delivery: DeliveryWalRecord): Promise<void> {
+    const record = delivery.handoff
+    if (!record || record.backgroundOnly || record.restoreComposerOnFailure === false || !delivery.retired
+      || delivery.deliveryIdentity !== options.deliveryIdentity?.value
+      || record.requestSessionKey !== options.sessionKey.value) return
+    const current = captureComposerSnapshot()
+    const annotations = record.recoveryPromptAnnotations || []
+    const ids = record.recoveryDraftIds || annotations.map(item => item.annotationId)
+    const paths = copyLocalPathReferences(record.params.localPathReferences, record.composerText)
+    const skills = copySelectedSkills(record.params.selectedSkills)
+    // Nonempty current fields must belong to this exact input. Missing fields
+    // may have been consumed at dispatch, but a newer draft is never merged.
+    if ((current.inputText && current.inputText !== record.composerText)
+      || (current.selectedSkills.length && !sameSelectedSkills(current.selectedSkills, skills))
+      || (current.localPathReferences.length && JSON.stringify(current.localPathReferences) !== JSON.stringify(paths))
+      || (current.draftIds.length && (JSON.stringify(current.draftIds) !== JSON.stringify(ids)
+        || JSON.stringify(current.pageContext) !== JSON.stringify(pageContextForAnnotations(annotations))))
+      || (current.attachmentRefs.length && (current.attachmentRefs.some(item => !isSendableAttachment(item))
+        || !sameSendableAttachments(current.attachmentRefs.filter(isSendableAttachment), {
+          attachments: record.recoveryAttachments.filter(isSendableAttachment),
+        })))
+      || (current.intent && current.intent !== (record.params.intent || null))
+      || (current.forkBeforeMessageId && current.forkBeforeMessageId !== (record.params.forkBeforeMessageId || null))
+      || (current.workspaceId && current.workspaceId !== (record.params.workspaceId || null))) return
+    if (annotations.length && !options.restorePromptAnnotations?.(annotations, record.requestSessionKey)) return
+    if (options.restoreInput) options.restoreInput(record.composerText, paths)
+    else {
+      options.inputText.value = record.composerText
+      if (options.localPathReferences) options.localPathReferences.value = paths
+    }
+    if (options.selectedSkills) options.selectedSkills.value = skills
+    options.pendingAttachments.value = record.recoveryAttachments.map(snapshotAttachment)
+    options.pendingSessionIntent.value = record.params.intent || null
+    options.pendingForkBeforeMessageId.value = record.params.forkBeforeMessageId || null
+    if (options.pendingWorkspaceId) options.pendingWorkspaceId.value = record.params.workspaceId || null
+    // Retiring the local projection does not remove the durable server fence.
+    // The next explicit send constructs fresh request/message identities.
+    const restored = captureComposerSnapshot()
+    const persisted = await options.persistRestoredDraft?.()
+    if (!disposed && delivery.deliveryIdentity === options.deliveryIdentity?.value
+      && record.requestSessionKey === options.sessionKey.value && composerMatchesSnapshot(restored)
+      && JSON.stringify(captureComposerSnapshot().pageContext) === JSON.stringify(restored.pageContext)
+      && persisted === true) {
+      await deleteResponseHandoff(record)
+      await options.durableDelivery.wake()
+    }
+    noteAcceptanceRecoveryChanged()
+    options.autoResizeTextarea()
   }
 
   const recoveredQueuedAttempts = new WeakMap<ChatPendingItem, SendAttempt>()
@@ -994,10 +1193,25 @@ export function useChatSend(options: UseChatSendOptions) {
     return String(response?.taskStatus || '').trim().toLowerCase()
   }
 
-  function hasAuthoritativeWork(): boolean {
+  function hasAuthoritativeWork(explicitNewInput = false): boolean {
+    // Only a user-authored new message may pass closed unknowns. Automatic
+    // queue/prefill dispatch still waits for their actual outcome.
+    const closedAdmissionsOnly = explicitNewInput
+      && options.taskOwnership?.hydrationResolved.value === true
+      && !options.taskOwnership.hasAuthoritativeWork.value
+      && !options.sendBlockedReason?.value
+      && options.canContinueAfterClosedAdmission?.() === true
+      && currentSessionDeliveries.value.every(item => (
+        !(item.phase === 'unknown' || item.phase === 'submitting' || item.stopPending) || item.admissionClosed
+      ))
+      && [...stoppedAcceptanceAttempts.values()].every(attempt => (
+        attempt.deliveryIdentity !== options.deliveryIdentity?.value
+        || attempt.requestSessionKey !== options.sessionKey.value
+        || !attempt.stopRequested || admissionClosed(attempt)
+      ))
     return options.taskOwnership?.hasAuthoritativeWork.value === true
       || acceptanceStopPending.value
-      || acceptanceRecoveryPendingForCurrentSession.value
+      || (acceptanceRecoveryPendingForCurrentSession.value && !closedAdmissionsOnly)
   }
 
   function noteAcceptedTask(
@@ -1181,6 +1395,18 @@ export function useChatSend(options: UseChatSendOptions) {
     response: TurnSendResponse,
   ): boolean {
     if (disposed) return false
+    if (attempt.detachedFromComposer) {
+      // The old task may already have finished before this delayed receipt.
+      // Never let its stale running ACK steal the new task or consume its draft.
+      attempt.acceptanceResolved = true
+      attempt.acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
+      if (options.sessionKey.value === attempt.requestSessionKey) {
+        bindAcceptedUserMessage(attempt.clientMessageId, response)
+        options.scheduleHistorySync()
+      }
+      void retireAcceptedComposerHandoff(attempt)
+      return true
+    }
     notifySendAccepted(attempt)
     consumeAcceptedComposer(attempt)
     acknowledgeAttemptPromptAnnotations(attempt, response)
@@ -1409,6 +1635,8 @@ export function useChatSend(options: UseChatSendOptions) {
       params: structuredClone(attempt.params),
       composerText: attempt.composerText,
       recoveryAttachments: attempt.attachments.map(snapshotAttachment),
+      recoveryDraftIds: [...attempt.draftIds],
+      recoveryPromptAnnotations: structuredClone(attempt.draftPromptAnnotations || attempt.promptAnnotations),
       ...(attempt.restoreComposerOnHandoffFailure === false
         ? { restoreComposerOnFailure: false }
         : {}),
@@ -1771,7 +1999,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function consumeRecoveredComposer(record: ResponseHandoffWalRecord): void {
     const skills = record.params.selectedSkills
-    if (record.restoreComposerOnFailure === false || !skills?.length) return
+    if (record.backgroundOnly || record.restoreComposerOnFailure === false || !skills?.length) return
     if (options.sessionKey.value !== record.requestSessionKey) {
       void Promise.resolve(options.consumeAcceptedDraft?.(record.requestSessionKey, {
         text: record.composerText,
@@ -1814,8 +2042,9 @@ export function useChatSend(options: UseChatSendOptions) {
     targetSessionKey: string,
   ): Promise<void> {
     if (disposed) return
-    consumeRecoveredComposer(record)
-    if (options.sessionKey.value === record.requestSessionKey) {
+    const detached = record.backgroundOnly || detachedDeliveryIds.has(record.ownerRequestId)
+    if (!detached) consumeRecoveredComposer(record)
+    if (!detached && options.sessionKey.value === record.requestSessionKey) {
       consumeAcceptedSessionState({
         requestSessionKey: record.requestSessionKey,
         intent: record.params.intent ?? null,
@@ -1887,8 +2116,10 @@ export function useChatSend(options: UseChatSendOptions) {
         const delivery = await options.durableDelivery.get(record.ownerRequestId)
         if (disposed) return
         if (!delivery || delivery.deliveryIdentity !== options.deliveryIdentity?.value) continue
-        if (delivery.phase === 'accepted' && delivery.response) {
-          await finalizeRecoveredHandoff(record,
+        if (delivery.retired || delivery.acceptedUnavailable) {
+          settleClosedDelivery(delivery)
+        } else if (delivery.phase === 'accepted' && delivery.response) {
+          await finalizeRecoveredHandoff(delivery.handoff || record,
             delivery.response.sessionKey || delivery.response.key || record.requestSessionKey)
         } else void options.durableDelivery.wake()
       }
@@ -2271,6 +2502,8 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   type SendInvocation = {
+    /** Set only by an explicit composer submission, never a queue or prefill. */
+    explicitNewInput?: boolean
     bypassSlashCommand?: boolean
     composerText?: string
     textOverride?: string
@@ -2293,6 +2526,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const identity = options.deliveryIdentity?.value
     return identity && !responseHandoffBlocksCurrentSession()
       && recoveredAttempt?.requiresIdempotentReplay
+      && !admissionClosed(recoveredAttempt)
       && recoveredAttempt.deliveryIdentity === identity
       && recoveredAttempt.requestSessionKey === options.sessionKey.value
       ? recoveredAttempt : null
@@ -2359,7 +2593,7 @@ export function useChatSend(options: UseChatSendOptions) {
       )
     }
 
-    // Unknown acceptance is resolved by replaying the immutable prior payload.
+    // Unknown acceptance is checked against the immutable prior request's receipt.
     // In particular, do this before consulting the current annotation drafts:
     // the first request may already have consumed them and advanced the head.
     // Only live transport/admission state is allowed to block this exact replay.
@@ -2388,7 +2622,8 @@ export function useChatSend(options: UseChatSendOptions) {
       })
     }
 
-    const matchesRecoveredComposer = () => Boolean(recoveredAttempt && matchesRecoveredDraft(recoveredAttempt, {
+    if (!invocation.explicitNewInput && currentSessionDeliveries.value.some(item => item.admissionClosed)) return
+    const recoveredDraftInput = {
       requestSessionKey,
       draftIds: composerSnapshot.draftIds,
       pageContext: composerSnapshot.pageContext,
@@ -2404,7 +2639,44 @@ export function useChatSend(options: UseChatSendOptions) {
       initialProvider: composerSnapshot.initialProvider,
       forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
       workspaceId: composerSnapshot.workspaceId,
-    }))
+    }
+    const matchesRecoveredComposer = () => Boolean(recoveredAttempt && !admissionClosed(recoveredAttempt)
+      && matchesRecoveredDraft(recoveredAttempt, recoveredDraftInput))
+    if (invocation.explicitNewInput) {
+      for (const item of currentSessionDeliveries.value.filter(item => item.admissionClosed)) {
+        const record = await options.durableDelivery.get(item.id).catch(() => null)
+        if (!record || !deliveryStillMatches() || !composerMatchesSnapshot(composerSnapshot)) return
+        const handoff = record.handoff
+        // Do not turn an unchanged uncertain draft into a fresh ID, including
+        // after reload when the original in-memory SendAttempt no longer exists.
+        if (!handoff) {
+          const params = record.request?.kind === 'send' && record.request.request.kind === 'new-turn'
+            ? record.request.request.params : null
+          if (!params || !text || text === params.message || composerText === params.displayText) return
+        } else if (matchesRecoveredDraft({
+          requestSessionKey: record.requestSessionKey,
+          draftIds: handoff.recoveryDraftIds || [],
+          pageContext: normalizePageContext(handoff.params.pageContext)
+            || pageContextForAnnotations(handoff.recoveryPromptAnnotations || []),
+          selectedSkills: copySelectedSkills(handoff.params.selectedSkills),
+          localPathReferences: copyLocalPathReferences(handoff.params.localPathReferences, handoff.composerText),
+          // The stored wire message may contain generated annotation/context
+          // instructions. The visible composer and its structured draft below
+          // identify unchanged input without re-rendering those instructions.
+          text,
+          composerText: handoff.composerText,
+          attachments: handoff.recoveryAttachments.filter(isSendableAttachment),
+          intent: handoff.params.intent ?? null,
+          initialCollaborationMode: handoff.params.intent === 'new_chat'
+            ? handoff.params.collaborationMode ?? 'default' : null,
+          initialRoutingMode: handoff.params.initialRoutingMode ?? null,
+          initialModel: handoff.params.initialModel ?? null,
+          initialProvider: handoff.params.initialProvider ?? null,
+          forkBeforeMessageId: handoff.params.forkBeforeMessageId ?? null,
+          workspaceId: handoff.params.workspaceId ?? null,
+        }, recoveredDraftInput)) return
+      }
+    }
     const offlineIdentity = options.offlineQueueIdentity?.value
     if (offlineIdentity && hasPayload) {
       // This branch has never called the command port. Already-submitted
@@ -2527,13 +2799,13 @@ export function useChatSend(options: UseChatSendOptions) {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (
       options.stream.isStreaming.value
-      || hasAuthoritativeWork()
+      || hasAuthoritativeWork(invocation.explicitNewInput)
       || compactInFlight
       || responseHandoffBlocksCurrentSession()
     ) {
       const currentHandoffInFlight = responseHandoffBlocksCurrentSession()
       const stillBusy = options.stream.isStreaming.value
-        || hasAuthoritativeWork()
+        || hasAuthoritativeWork(invocation.explicitNewInput)
         || options.isCompactInFlightForCurrentSession()
         || currentHandoffInFlight
       if (stillBusy) {
@@ -2661,6 +2933,34 @@ export function useChatSend(options: UseChatSendOptions) {
 
     if (!hasPayload || !deliveryStillMatches()) return
 
+    const closedAdmissionIds = invocation.explicitNewInput
+      ? currentSessionDeliveries.value.filter(item => item.admissionClosed).map(item => item.id) : []
+    if (closedAdmissionIds.length) {
+      for (const id of closedAdmissionIds) {
+        if (!await options.durableDelivery.detachComposer(id) || !deliveryStillMatches()
+          || !composerMatchesSnapshot(composerSnapshot)) return
+      }
+      for (const id of closedAdmissionIds) detachedDeliveryIds.add(id)
+      for (const attempt of new Set([...observedAttempts.values(), ...stoppedAcceptanceAttempts.values(), recoveredAttempt])) {
+        if (!attempt || !admissionClosed(attempt)) continue
+        attempt.detachedFromComposer = true
+        if (recoveredAttempt === attempt) recoveredAttempt = null
+      }
+      releaseClosedAdmissionStop()
+    }
+    const closedAdmissionsStillAllowSend = () => !closedAdmissionIds.length || (
+      options.taskOwnership?.hydrationResolved.value === true
+      && !options.taskOwnership.hasAuthoritativeWork.value
+      && options.canContinueAfterClosedAdmission?.(true) === true
+      && (options.pendingQueueOwnerContext.value?.sessionKey !== requestSessionKey
+        || options.pendingQueueOwnerContext.value?.ownerRequestId === activeAcceptanceTransaction?.attempt?.clientRequestId)
+      && currentSessionDeliveries.value.every(item => (
+        item.id === activeAcceptanceTransaction?.attempt?.clientRequestId
+        || !(item.phase === 'unknown' || item.phase === 'submitting' || item.stopPending)
+        || item.admissionClosed
+      ))
+      && closedAdmissionIds.every(id => currentSessionDeliveries.value.some(item => item.id === id && item.admissionClosed))
+    )
     return await dispatchSend(text, {
       composerText,
       draftIds: composerSnapshot.draftIds,
@@ -2668,6 +2968,8 @@ export function useChatSend(options: UseChatSendOptions) {
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
       preDispatchGuard: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false,
+      beforeDispatch: () => deliveryStillMatches() && invocation.preDispatchGuard?.() !== false
+        && closedAdmissionsStillAllowSend(),
       onAccepted,
       onDeliveryAccepted: invocation.onDeliveryAccepted,
     })
@@ -3205,6 +3507,7 @@ export function useChatSend(options: UseChatSendOptions) {
         onDeliveryAccepted: sendOpts.onDeliveryAccepted,
         draftIds: [...attemptAnnotationDraftIds],
         promptAnnotations: sentSnapshots,
+        draftPromptAnnotations: structuredClone(localSnapshots),
         pageContext: attemptPageContext,
         selectedSkills: copySelectedSkills(attemptSelectedSkills),
         localPathReferences: [...attemptLocalPathReferences],
@@ -3384,10 +3687,31 @@ export function useChatSend(options: UseChatSendOptions) {
             }
       )
       attempt.acceptanceRequest = { request: acceptanceRequest }
+      if (!attempt.requiresIdempotentReplay && !durableHandoffRecord
+        && acceptanceRequest.kind === 'new-turn' && options.turnCommands.supportsResolvableSend?.()) {
+        const now = Date.now()
+        // The delivery owner persists this complete local draft together with
+        // first admission, without a separate pre-registration transaction.
+        options.durableDelivery.registerPreparedHandoff({
+          schemaVersion: 1, ownerRequestId: attempt.clientRequestId,
+          requestSessionKey, clientRequestId: attempt.clientRequestId,
+          clientMessageId: attempt.clientMessageId, params: structuredClone(attempt.params),
+          composerText: attempt.composerText, recoveryAttachments: attempt.attachments.map(snapshotAttachment),
+          recoveryDraftIds: [...attempt.draftIds],
+          recoveryPromptAnnotations: structuredClone(attempt.draftPromptAnnotations || attempt.promptAnnotations),
+          ...(attempt.restoreComposerOnHandoffFailure === false ? { restoreComposerOnFailure: false } : {}),
+          state: 'submitting', createdAt: now, updatedAt: now,
+        })
+      }
       attempt.acceptanceInFlight = true
       let res: TurnSendResponse
       if (attempt.requiresIdempotentReplay) {
         const receipt = await options.turnCommands.lookupReceipt?.({ kind: 'send', request: acceptanceRequest })
+        if (receipt?.status === 'retired' || receipt?.status === 'accepted-unavailable') {
+          const record = await options.durableDelivery.get(attempt.clientRequestId)
+          if (record) settleClosedDelivery(record)
+          return receipt.status === 'retired' ? 'not_sent' : 'accepted'
+        }
         if (receipt?.status !== 'found') throw new TurnCommandError('unavailable',
           'Delivery receipt is still unknown', 'DELIVERY_RECEIPT_UNKNOWN', null, true)
         res = receipt.response
@@ -3398,6 +3722,11 @@ export function useChatSend(options: UseChatSendOptions) {
           : sendOpts.beforeDispatch,
       })
       if (disposed) return 'accepted'
+      if (attempt.detachedFromComposer) {
+        settleRecoveredAcceptance(attempt, res)
+        return 'accepted'
+      }
+      if (attempt.deliveryClosed) return attempt.deliveryClosed === 'retired' ? 'not_sent' : 'accepted'
       notifySendAccepted(attempt)
       consumeAcceptedComposer(attempt)
       acknowledgeAttemptPromptAnnotations(attempt, res)
@@ -3561,6 +3890,12 @@ export function useChatSend(options: UseChatSendOptions) {
       // Keep that WAL for the next page without reviving this one's composer,
       // queue callbacks, navigation or global error notices.
       if (disposed) return acceptedError ? 'accepted' : 'retryable_failure'
+      if (attempt.detachedFromComposer) {
+        options.scheduleHistorySync()
+        return commandError?.accepted === true ? 'accepted'
+          : commandError?.accepted === false ? 'not_sent' : 'retryable_failure'
+      }
+      if (attempt.deliveryClosed) return attempt.deliveryClosed === 'retired' ? 'not_sent' : 'accepted'
       if (acceptedError) notifySendAccepted(attempt)
       const stoppedBeforeAdmission = attempt.stoppedBeforeAdmission === true || (
         commandError?.failureCode === 'DELIVERY_STOPPED' && commandError.accepted === false
@@ -3730,9 +4065,9 @@ export function useChatSend(options: UseChatSendOptions) {
         if (activeFreshSendToken === freshSendToken) {
           activeFreshSendToken = null
         }
+        endPendingAdmissionStream(attempt)
         options.activeStreamTaskId.value = ''
         options.activeStreamSessionKey.value = ''
-        options.stream.endStreaming()
       }
       if (responseHandoff && commandError?.accepted === false) {
         if (stoppedBeforeAdmission) {

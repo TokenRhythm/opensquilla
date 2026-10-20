@@ -5,6 +5,7 @@ import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { copyTurnCommand, isProjectInitTurnCommand } from '@/types/turnCommand'
 import { readTransportFailure } from './transportTypes'
+import { parseTurnReceiptEpoch } from '@/contracts/turnReceiptEpoch'
 import {
   CHAT_ABORT_METHOD,
   type ChatAbortParams,
@@ -16,6 +17,10 @@ import {
   type ChatSendResult,
 } from '@/contracts/generated/v4/chatSend'
 import { validateChatSendResult } from '@/contracts/generated/v4/chatSendValidators.mjs'
+import { CHAT_SEND_V2_METHOD } from '@/contracts/generated/v4/chatSendV2'
+import { validateChatSendV2Params, validateChatSendV2Result } from '@/contracts/generated/v4/chatSendV2Validators.mjs'
+import { TURNS_RECEIPT_RESOLVE_METHOD } from '@/contracts/generated/v4/turnsReceiptResolve'
+import { validateTurnsReceiptResolveParams, validateTurnsReceiptResolveResult } from '@/contracts/generated/v4/turnsReceiptResolveValidators.mjs'
 import {
   SESSIONS_PENDING_INPUTS_DISPATCH_METHOD,
   type SessionsPendingInputsDispatchParams,
@@ -102,6 +107,7 @@ function mapTurnCommandError(error: unknown): TurnCommandError {
 /** Narrow wire port owned by this Adapter. */
 export interface TurnCommandsTransport {
   readonly generation?: number
+  readonly policy?: Readonly<Record<string, unknown>> | null
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -562,48 +568,84 @@ function forwardContract<T>(
   ))
 }
 
-/**
- * Adapt semantic turn commands to the unchanged v4 JSON wire.
- *
- * This is intentionally a compatibility Adapter, not a second implementation:
- * it selects legacy method aliases, projects canonical domain inputs to the
- * historical wire spellings, and projects responses back without touching
- * backend command behavior.
- */
+/** Map domain commands and receipt recovery to the advertised Gateway protocol. */
 export function createV4TurnCommands(transport: TurnCommandsTransport): TurnCommands {
   const hasRpcMethod = (method: string): boolean => (
     transport.supports?.(method) ?? false
   )
+  const getReceiptEpoch = (): string | undefined => {
+    const epoch = transport.policy?.turn_receipt_epoch
+    return parseTurnReceiptEpoch(epoch) ? epoch as string : undefined
+  }
+  const supportsResolvableSend = (): boolean => hasRpcMethod(CHAT_SEND_V2_METHOD)
+    && hasRpcMethod(TURNS_RECEIPT_GET_METHOD) && hasRpcMethod(TURNS_RECEIPT_RESOLVE_METHOD)
+    && getReceiptEpoch() !== undefined
+  const sendParams = (request: Extract<TurnSendRequest, { kind: 'new-turn' }>): Record<string, unknown> => {
+    const params = toWireSendParams(request.params)
+    if (request.acceptanceProtocol === 'resolvable-v1') {
+      // Only the epoch frozen with this delivery can authorize absence.
+      // Never borrow a newer Hello or a composer extension during recovery.
+      delete params.acceptanceEpoch
+      if (request.acceptanceEpoch !== undefined) params.acceptanceEpoch = request.acceptanceEpoch
+      if (parseTurnReceiptEpoch(request.acceptanceEpoch)) {
+        const logicalId = firstDefined(params, 'clientRequestId', 'client_request_id')
+        if (typeof logicalId !== 'string' || !logicalId.trim()) throw new TurnCommandContractError(CHAT_SEND_V2_METHOD)
+        const wireId = `tr2:${request.acceptanceEpoch}:${logicalId}`
+        if (wireId.length > 256) throw new TurnCommandContractError(CHAT_SEND_V2_METHOD)
+        delete params.client_request_id
+        params.clientRequestId = wireId
+      }
+    }
+    return params
+  }
 
-  return {
-    supportsReceiptLookup: () => hasRpcMethod(TURNS_RECEIPT_GET_METHOD),
-
-    lookupReceipt: async (
+  async function readReceipt(
       query: TurnReceiptRequest,
       options?: TurnCommandRequestOptions,
-    ): Promise<TurnReceiptResult> => {
-      if (!hasRpcMethod(TURNS_RECEIPT_GET_METHOD)) return { status: 'unsupported' }
+      resolve = false,
+    ): Promise<TurnReceiptResult> {
+      const resolvable = query.kind === 'send' && query.request.kind === 'new-turn'
+        && query.request.acceptanceProtocol === 'resolvable-v1'
+      if (resolve && !resolvable) return { status: 'unsupported' }
+      // Older saved requests and Gateways can still recover positive evidence,
+      // but an unfenced resolver must never turn their absence into retirement.
+      const originalEpoch = query.kind === 'send' && query.request.kind === 'new-turn'
+        ? query.request.acceptanceEpoch : undefined
+      resolve = resolve && resolvable && parseTurnReceiptEpoch(originalEpoch) !== undefined
+        && getReceiptEpoch() !== undefined
+      const method = resolve ? TURNS_RECEIPT_RESOLVE_METHOD : TURNS_RECEIPT_GET_METHOD
+      if (!hasRpcMethod(method)) return { status: 'unsupported' }
       const originalRequest = query.kind === 'steer'
         ? toWireSteerParams(query.request)
         : query.request.kind === 'pending-input'
           ? { ...query.request.params }
-          : toWireSendParams(query.request.params)
+          : sendParams(query.request)
       const operation = query.kind === 'steer'
         ? query.request.pendingInputId ? SESSIONS_PENDING_INPUTS_STEER_METHOD : SESSIONS_STEER_V2_METHOD
-        : query.request.kind === 'pending-input' ? SESSIONS_PENDING_INPUTS_DISPATCH_METHOD : CHAT_SEND_METHOD
-      const params = response<TurnsReceiptGetParams>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetParams, { operation, originalRequest })
+        : query.request.kind === 'pending-input' ? SESSIONS_PENDING_INPUTS_DISPATCH_METHOD
+        : resolvable ? CHAT_SEND_V2_METHOD : CHAT_SEND_METHOD
+      const params = response<TurnsReceiptGetParams>(method,
+        resolve ? validateTurnsReceiptResolveParams : validateTurnsReceiptGetParams, { operation, originalRequest })
       let raw: unknown
       try {
-        raw = await transport.request(TURNS_RECEIPT_GET_METHOD, params as unknown as Record<string, unknown>, {
-          ...requestOptions(options), recoveryClass: 'safe-read',
+        raw = await transport.request(method, params as unknown as Record<string, unknown>, {
+          ...requestOptions(options), ...(!resolve ? { recoveryClass: 'safe-read' as const } : {}),
         })
       } catch (error) {
         const failure = readTransportFailure(error)
         if (failure.code === 'METHOD_NOT_FOUND' || failure.code === 'UNSUPPORTED') return { status: 'unsupported' }
         throw mapTurnCommandError(error)
       }
-      const result = response<TurnsReceiptGetResult>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetResult, raw)
+      const result = response<TurnsReceiptGetResult>(method,
+        resolve ? validateTurnsReceiptResolveResult : validateTurnsReceiptGetResult, raw)
       if (result.status === 'not_found') return { status: 'not-found' }
+      if (result.status === 'retired' || result.status === 'accepted_unavailable') {
+        if (!resolvable || result.clientRequestId !== firstDefined(originalRequest, 'clientRequestId', 'client_request_id')
+          || result.requestSessionKey !== firstDefined(originalRequest, 'sessionKey', 'session_key', 'key')) {
+          throw new TurnCommandContractError(method)
+        }
+        return { status: result.status === 'retired' ? 'retired' : 'accepted-unavailable' }
+      }
       const { receipt } = result
       // A valid shape is not enough to bind a late response to this logical
       // delivery. Fail closed before it can supply a target to a pending Stop.
@@ -630,7 +672,21 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
           },
         },
       }
+    }
+
+  return {
+    supportsReceiptLookup: () => hasRpcMethod(TURNS_RECEIPT_GET_METHOD),
+    supportsResolvableSend,
+    getReceiptEpoch,
+    isAdmissionClosed: query => {
+      if (query.kind !== 'send' || query.request.kind !== 'new-turn'
+        || query.request.acceptanceProtocol !== 'resolvable-v1' || !supportsResolvableSend()) return false
+      const current = parseTurnReceiptEpoch(getReceiptEpoch())!
+      const original = parseTurnReceiptEpoch(query.request.acceptanceEpoch)
+      return !original || original.boot !== current.boot || current.issued >= original.expires
     },
+    lookupReceipt: (query, options) => readReceipt(query, options),
+    resolveReceipt: (query, options) => readReceipt(query, options, true),
 
     send: async (
       request: TurnSendRequest,
@@ -650,14 +706,30 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
           options,
         ).then(projectSendResult) as Promise<TurnSendResponse>
       }
-      const params = toWireSendParams(request.params)
-      return forwardContract<ChatSendResult>(
+      const params = sendParams(request)
+      const resolvable = request.acceptanceProtocol === 'resolvable-v1'
+      if (resolvable && !hasRpcMethod(CHAT_SEND_V2_METHOD)) {
+        // Never reinterpret a persisted v2 request on a downgraded Gateway.
+        throw new TurnCommandError('unavailable', 'This Gateway cannot resolve this saved request.',
+          'RESOLVABLE_SEND_UNSUPPORTED', null, false)
+      }
+      if (resolvable) response(CHAT_SEND_V2_METHOD, validateChatSendV2Params, params)
+      const result = await forwardContract<ChatSendResult>(
         transport,
-        CHAT_SEND_METHOD,
+        resolvable ? CHAT_SEND_V2_METHOD : CHAT_SEND_METHOD,
         params,
-        validateChatSendResult,
+        resolvable ? validateChatSendV2Result : validateChatSendResult,
         options,
-      ).then(projectSendResult)
+      )
+      if (resolvable && parseTurnReceiptEpoch(request.acceptanceEpoch)) {
+        const ids = ['clientRequestId', 'client_request_id'].filter(key => key in result)
+        if (ids.length === 0 || ids.some(key => asObject(result)[key] !== params.clientRequestId)) {
+          throw new TurnCommandContractError(CHAT_SEND_V2_METHOD)
+        }
+        const logicalId = firstDefined(request.params, 'clientRequestId', 'client_request_id')
+        return projectSendResult({ ...result, ...Object.fromEntries(ids.map(key => [key, logicalId])) })
+      }
+      return projectSendResult(result)
     },
 
     cancel: (
@@ -721,6 +793,7 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
  */
 export function createV4TurnCommandsFromRpcClient(client: {
   readonly connectionGeneration?: number
+  readonly policy?: Readonly<Record<string, unknown>> | null
   call<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -730,6 +803,7 @@ export function createV4TurnCommandsFromRpcClient(client: {
 }, hasRpcMethod?: (method: string) => boolean): TurnCommands {
   return createV4TurnCommands({
     get generation() { return client.connectionGeneration },
+    get policy() { return client.policy },
     request: (method, params, options) => options
       ? client.call(method, params, options)
       : client.call(method, params),

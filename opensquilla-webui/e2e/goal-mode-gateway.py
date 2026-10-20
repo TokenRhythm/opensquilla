@@ -353,7 +353,8 @@ async def main() -> None:
         storage = await SessionStorage.open(state_dir / "sessions.db")
         try:
             for key in initial_keys:
-                await storage.upsert_session(SessionNode(session_key=key, agent_id="main"))
+                if await storage.get_session(key) is None:
+                    await storage.upsert_session(SessionNode(session_key=key, agent_id="main"))
         finally:
             await storage.close()
 

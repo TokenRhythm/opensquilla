@@ -81,6 +81,19 @@ describe('conversation event v4 Adapter', () => {
     })
   })
 
+  it('maps versioned primary-send disposition IDs to their logical delivery owner only', () => {
+    const wireId = `tr2:v2.${'a'.repeat(32)}.100.125:logical-request`
+    const payload = { intent: 'send', client_request_id: wireId }
+    expect(projectConversationContent(payload, 'input-disposition').client_request_id).toBe('logical-request')
+    expect(payload.client_request_id).toBe(wireId)
+    for (const intent of ['steer', undefined]) {
+      expect(projectConversationContent({ ...payload, intent }, 'input-disposition').client_request_id).toBe(wireId)
+    }
+    expect(projectConversationContent(payload, 'text-delta').client_request_id).toBe(wireId)
+    expect(projectConversationContent({ ...payload, client_request_id: wireId.replace('v2.', 'v3.') },
+      'input-disposition').client_request_id).toContain('tr2:v3.')
+  })
+
   it('marks unknown additive names instead of routing them to a typed handler', () => {
     const decoded = decodeConversationEvent(
       'session.event.future_checkpoint',

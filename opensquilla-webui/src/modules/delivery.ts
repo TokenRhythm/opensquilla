@@ -10,20 +10,29 @@ export interface DeliverySnapshot {
   /** Derived from the current connection, never persisted with the request. */
   isCurrentIdentity: boolean
   phase: DeliveryWalRecord['phase']
+  /** Current connection forbids new admission; this is not proof of a historical outcome. */
+  admissionClosed?: boolean
   stopPending: boolean
   /** The owner permits recording an exact Stop, even while offline. */
   stopAvailable?: boolean
   /** Bounded user-facing request text, never attachment material. */
   preview?: string
+  /** A fenced, unaccepted input still has a local draft to recover. */
+  draftAvailable?: boolean
   waitReason?: DeliveryWaitReason
 }
 export type DeliveryUpdate = Pick<DeliveryWalRecord,
-  'ownerRequestId' | 'deliveryIdentity' | 'requestSessionKey' | 'phase' | 'response' | 'stop'> & { kind?: 'send' | 'steer' }
+  'ownerRequestId' | 'deliveryIdentity' | 'requestSessionKey' | 'phase' | 'response' | 'stop' | 'retired' | 'acceptedUnavailable'> & {
+    kind?: 'send' | 'steer'
+    backgroundOnly?: true
+  }
 
 /** Application lifetime owner; subscribing never grants dispatch ownership. */
 export interface DurableDelivery {
   readonly commands: TurnCommands
   registerPreparedHandoff(record: ResponseHandoffWalRecord): void
+  /** Persistently release composer/navigation ownership, without resolving historical acceptance. */
+  detachComposer(requestId: string): Promise<boolean>
   requestStop(requestId: string): Promise<void>
   requestSteerStop(sessionKey: string, expectedTurnId: string): Promise<void>
   noteReceiptChanged(requestId: string, eventToken: string): Promise<void>

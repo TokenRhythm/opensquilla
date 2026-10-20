@@ -404,6 +404,12 @@ export const useRpcStore = defineStore('rpc', () => {
       unavailableMethods.value = new Set()
     })
 
+    rpc.on('tick', () => {
+      if (policy.value?.turn_receipt_epoch !== rpc.policy.turn_receipt_epoch) {
+        policy.value = { ...rpc.policy }
+      }
+    })
+
     rpc.on('_gap', (detail: unknown) => {
       console.warn('[RPC] Sequence gap detected:', detail)
     })

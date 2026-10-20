@@ -192,6 +192,32 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     removedIds.forEach(releaseOverlayEdit)
     return removedIds
   }
+  function restoreUnsent(snapshots: readonly PromptAnnotationSnapshot[], sessionKey: string): boolean {
+    if (!snapshots.length) return true
+    if (snapshots.length > PROMPT_ANNOTATION_MAX_COUNT
+      || snapshots.some(item => !item.body.trim() || !promptAnnotationBodyWithinLimit(item.body))) return false
+    const ids = new Set(snapshots.map(item => item.annotationId))
+    if (ids.size !== snapshots.length || draftsForSession(sessionKey).some(item => !ids.has(item.annotationId))) return false
+    // A retired send can restore missing local copies, never replace a newer edit.
+    if (snapshots.some((item, index) => {
+      const current = annotations.value[item.annotationId]
+      return overlayOwnerSessions.value[item.annotationId] || (current && (
+        current.sessionKey !== sessionKey
+        || JSON.stringify(snapshotOf(current, index)) !== JSON.stringify(snapshotOf({
+          ...item, sessionKey, status: 'draft', createdAt: null, updatedAt: null,
+        }, index))
+      ))
+    })) return false
+    const next = { ...annotations.value }
+    for (const item of snapshots) {
+      if (!next[item.annotationId]) next[item.annotationId] = {
+        ...item, sessionKey, status: 'draft', createdAt: Date.now(), updatedAt: Date.now(),
+      }
+    }
+    commit(next)
+    setActiveDocument(sessionKey, snapshots[0]!.documentId)
+    return true
+  }
   function clearSession(sessionKey: string) {
     commit(Object.fromEntries(Object.entries(annotations.value).filter(([, item]) => (
       item.sessionKey !== sessionKey
@@ -208,5 +234,5 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
   return { annotations, drafts, overlayOwnerSessions, activeDocumentBySession, draftsForSession,
     setActiveDocument, activeDraftsForSession, sendableDraftsForSession, sendBlockedReason,
     beginOverlayEdit, releaseOverlayEdit, completeOverlayEdit, load, create, update, discard,
-    prepareForSend, snapshotsForIds, acknowledgeSent, clearSession, reset }
+    prepareForSend, snapshotsForIds, acknowledgeSent, restoreUnsent, clearSession, reset }
 })

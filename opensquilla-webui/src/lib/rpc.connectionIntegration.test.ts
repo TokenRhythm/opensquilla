@@ -51,6 +51,7 @@ function hello(socket: Socket, principal = localOwner, policy: Record<string, un
 function transports(rpc: RpcClient) {
   const source = {
     get connectionGeneration() { return rpc.connectionGeneration },
+    get policy() { return rpc.policy },
     call: <T = unknown>(...args: Parameters<RpcClient['call']>) => rpc.call(...args) as Promise<T>,
     on: rpc.on.bind(rpc),
     onConsumedEvent: rpc.onConsumedEvent.bind(rpc),
@@ -104,6 +105,41 @@ afterEach(() => {
 })
 
 describe('production connection integration boundaries', () => {
+  it('advances receipt authority only through the current authenticated connection', async () => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const commands = createV4TurnCommands(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws')
+    const socket = Socket.instances[0]
+    expect(commands.getReceiptEpoch?.()).toBeUndefined()
+    expect(commands.supportsResolvableSend?.()).toBe(false)
+    const epoch = (issued: number, boot = 'a') => `v2.${boot.repeat(32)}.${issued}.${issued + 25}`
+    hello(socket, localOwner, { turn_receipt_epoch: epoch(100) })
+    expect(commands.getReceiptEpoch?.()).toBe(epoch(100))
+    expect(commands.supportsResolvableSend?.()).toBe(true)
+    const original = { kind: 'send' as const, request: {
+      kind: 'new-turn' as const, acceptanceProtocol: 'resolvable-v1' as const, acceptanceEpoch: epoch(100),
+      params: { sessionKey: 'source', message: 'frozen', clientRequestId: 'request-1' },
+    } }
+    socket.receive({ type: 'event', event: 'tick', payload: { turn_receipt_epoch: epoch(124) } })
+    expect(commands.getReceiptEpoch?.()).toBe(epoch(124))
+    expect(commands.isAdmissionClosed?.(original)).toBe(false)
+    for (const value of [epoch(99), epoch(150, 'b'), epoch(150).replace('v2.', 'v3.'), 'invalid']) {
+      socket.receive({ type: 'event', event: 'tick', payload: { turn_receipt_epoch: value } })
+      expect(commands.getReceiptEpoch?.()).toBe(epoch(124))
+    }
+    socket.receive({ type: 'event', event: 'tick', payload: { turn_receipt_epoch: epoch(125) } })
+    expect(commands.isAdmissionClosed?.(original)).toBe(true)
+    expect(original.request.acceptanceEpoch).toBe(epoch(100))
+    socket.close()
+    await vi.advanceTimersByTimeAsync(1_000)
+    hello(Socket.instances[1], localOwner, { turn_receipt_epoch: epoch(125, 'b') })
+    socket.receive({ type: 'event', event: 'tick', payload: { turn_receipt_epoch: epoch(500) } })
+    expect(commands.getReceiptEpoch?.()).toBe(epoch(125, 'b'))
+    expect(commands.supportsResolvableSend?.()).toBe(true)
+    expect(commands.isAdmissionClosed?.(original)).toBe(true)
+  })
+
   it('waits for a probe before sending a directory read once while still rejecting writes', async () => {
     const rpc = client()
     const { transport } = transports(rpc)

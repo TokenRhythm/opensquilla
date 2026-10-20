@@ -195,7 +195,7 @@ export interface TurnSteerResponse {
  * `kind` is an application concern; v4 method names stay in the Adapter.
  */
 export type TurnSendRequest =
-  | { kind: 'new-turn'; params: TurnSendParams }
+  | { kind: 'new-turn'; params: TurnSendParams; acceptanceProtocol?: 'resolvable-v1'; acceptanceEpoch?: string }
   | { kind: 'pending-input'; params: PendingInputDispatchRequest }
 
 /** Only these durable operations have a read-only acceptance lookup. */
@@ -205,6 +205,7 @@ export type TurnReceiptRequest =
 
 export type TurnReceiptResult =
   | { status: 'found'; response: TurnSendResponse | TurnSteerResponse }
+  | { status: 'retired' | 'accepted-unavailable' }
   | { status: 'not-found' | 'unsupported' }
 
 export interface TurnCancelRequest {
@@ -242,6 +243,17 @@ export interface TurnCommands {
     options?: TurnCommandRequestOptions,
   ): Promise<TurnReceiptResult>
   supportsReceiptLookup?(): boolean
+  /** Fixed before durable dispatch; a saved request must never change protocol. */
+  supportsResolvableSend?(): boolean
+  /** Authenticated server process epoch, frozen when an unsent delivery is armed. */
+  getReceiptEpoch?(): string | undefined
+  /** The current server cannot newly admit this request; its past outcome may still be unknown. */
+  isAdmissionClosed?(request: TurnReceiptRequest): boolean
+  /** Explicitly stop an unknown request from being accepted; never resend it. */
+  resolveReceipt?(
+    request: TurnReceiptRequest,
+    options?: TurnCommandRequestOptions,
+  ): Promise<TurnReceiptResult>
   send(
     request: TurnSendRequest,
     options?: TurnCommandRequestOptions,

@@ -43,6 +43,7 @@ function harness(overrides: Partial<TurnCommands> = {}, storage = memoryWal()) {
     steer: vi.fn(async () => ({ accepted: true })),
     cancel: vi.fn(async () => ({ aborted: true })),
     lookupReceipt: vi.fn(async () => ({ status: 'not-found' as const })),
+    getReceiptEpoch: () => 'boot-1',
     supportsReceiptLookup: () => true, supports: () => true, ...overrides,
   }
   const owner = createDurableDelivery({ commands, wal: storage.wal, ownerId: crypto.randomUUID(),
@@ -50,10 +51,568 @@ function harness(overrides: Partial<TurnCommands> = {}, storage = memoryWal()) {
   return { owner, commands, ...storage,
     identity: (value: string | null) => { identity = value; generation += 1 },
     available: (value: boolean) => { available = value },
+    reconnect: () => { generation += 1 },
   }
 }
 
 async function flush() { for (let index = 0; index < 60; index += 1) await Promise.resolve() }
+
+describe('resolvable admission safety', () => {
+  function unknown(storage = memoryWal()) {
+    storage.records.set('synthetic-request', { schemaVersion: 3, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session', phase: 'unknown',
+      request: { kind: 'send', request: { ...request(), acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: 'boot-1' } },
+      revision: 1, createdAt: Date.now(), updatedAt: Date.now() })
+    return storage
+  }
+
+  it('refreshes a never-submitted epoch at arming and never replays the resulting unknown request', async () => {
+    vi.useFakeTimers()
+    const storage = memoryWal()
+    const prepare = storage.wal.prepareDelivery!
+    let currentEpoch = 'boot-1'
+    let reconnect = () => {}
+    storage.wal.prepareDelivery = async record => {
+      expect(record.request).toMatchObject({ request: { acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: currentEpoch } })
+      currentEpoch = 'boot-2'
+      reconnect()
+      return prepare(record)
+    }
+    const test = harness({ supportsResolvableSend: () => true,
+      getReceiptEpoch: () => currentEpoch,
+      send: vi.fn(async () => { throw new TurnCommandError('transport', 'ack lost', undefined, null) }),
+      resolveReceipt: vi.fn(async () => ({ status: 'retired' as const })) }, storage)
+    reconnect = test.reconnect
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toThrow('ack lost')
+      await vi.advanceTimersByTimeAsync(6_000)
+      expect(test.records.get('synthetic-request')).toMatchObject({ schemaVersion: 3, phase: 'unknown',
+        request: { request: { acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: 'boot-2' } } })
+      expect(test.commands.send).toHaveBeenCalledTimes(1)
+      expect(test.commands.send).toHaveBeenCalledWith({ ...request(),
+        acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: 'boot-2' }, expect.objectContaining({ expectedGeneration: 2 }))
+      expect(test.commands.resolveReceipt).not.toHaveBeenCalled()
+      await test.owner.retry('synthetic-request')
+      expect(test.records.get('synthetic-request')).toMatchObject({ retired: true, phase: 'not-sent' })
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ accepted: false })
+      expect(test.commands.send).toHaveBeenCalledTimes(1)
+      await expect(test.owner.lookup({ kind: 'send', request: request() })).resolves.toEqual({ status: 'retired' })
+    } finally { test.owner.dispose() }
+  })
+
+  it.each(['boot-1', undefined])('keeps the saved epoch %s through restart and missing evidence without resending', async savedEpoch => {
+    vi.useFakeTimers()
+    const storage = unknown()
+    const frozen = storage.records.get('synthetic-request')!.request!
+    if (frozen.kind === 'send' && frozen.request.kind === 'new-turn') frozen.request.acceptanceEpoch = savedEpoch
+    const test = harness({ supportsResolvableSend: () => true, getReceiptEpoch: () => 'boot-2',
+      resolveReceipt: vi.fn(async () => ({ status: 'not-found' as const })) }, storage)
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ accepted: null })
+      const checking = test.owner.retry('synthetic-request')
+      // The explicit check joins the automatic round before starting its own.
+      await vi.advanceTimersByTimeAsync(12_000)
+      await checking
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'unknown', request: frozen })
+      expect(storage.records.get('synthetic-request')?.retired).not.toBe(true)
+      for (const [query] of vi.mocked(test.commands.resolveReceipt!).mock.calls) expect(query).toEqual(frozen)
+    } finally { test.owner.dispose() }
+    const successor = harness({ getReceiptEpoch: () => 'boot-3',
+      lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: {
+        taskId: 'accepted-task', sessionKey: 'synthetic-session',
+      } })) }, storage)
+    try {
+      await successor.owner.retry('synthetic-request')
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'accepted', request: frozen,
+        response: { taskId: 'accepted-task' } })
+      expect(successor.commands.send).not.toHaveBeenCalled()
+    } finally { successor.owner.dispose() }
+  })
+
+  it.each([
+    { phase: 'prepared' as const, savedEpoch: undefined },
+    { phase: 'prepared' as const, savedEpoch: 'boot-1' },
+    { phase: 'not-sent' as const, savedEpoch: 'boot-1' },
+  ])('atomically refreshes a provably unsent versioned request: %j', async ({ phase, savedEpoch }) => {
+    const storage = unknown()
+    const row = storage.records.get('synthetic-request')!
+    const saved = { ...request(), acceptanceProtocol: 'resolvable-v1' as const, acceptanceEpoch: savedEpoch }
+    storage.records.set(row.ownerRequestId, { ...row, phase, request: { kind: 'send', request: saved } })
+    const compare = storage.wal.compareAndSwapDelivery!
+    let refreshed = false
+    storage.wal.compareAndSwapDelivery = async (id, revision, next) => {
+      if (!refreshed && next?.request?.kind === 'send' && next.request.request.kind === 'new-turn'
+        && next.request.request.acceptanceEpoch === 'boot-2') {
+        expect(next.phase).toBe('submitting')
+        expect(storage.records.get(id)).toMatchObject({ phase, request: { request: { acceptanceEpoch: savedEpoch } } })
+        expect(next.lease?.expiresAt).toBeGreaterThan(Date.now())
+        refreshed = true
+      }
+      return compare(id, revision, next)
+    }
+    const test = harness({ supportsResolvableSend: () => true, getReceiptEpoch: () => 'boot-2' }, storage)
+    try {
+      await test.owner.commands.send(saved)
+      expect(refreshed).toBe(true)
+      expect(test.commands.send).toHaveBeenCalledExactlyOnceWith({ ...saved, acceptanceEpoch: 'boot-2' },
+        expect.objectContaining({ expectedGeneration: 1 }))
+      expect(storage.records.get(row.ownerRequestId)?.request).toEqual({ kind: 'send',
+        request: { ...saved, acceptanceEpoch: 'boot-2' } })
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not transmit when the connection changes during the arming CAS and permits one explicit retry', async () => {
+    const storage = memoryWal()
+    const compare = storage.wal.compareAndSwapDelivery!
+    let currentEpoch = 'boot-1'
+    const test = harness({ supportsResolvableSend: () => true, getReceiptEpoch: () => currentEpoch }, storage)
+    let restarted = false
+    storage.wal.compareAndSwapDelivery = async (id, revision, next) => {
+      const result = await compare(id, revision, next)
+      if (!restarted && result.applied && next?.phase === 'submitting') {
+        restarted = true
+        currentEpoch = 'boot-2'
+        test.reconnect()
+      }
+      return result
+    }
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({
+        accepted: false, failureCode: 'DELIVERY_NOT_SENT',
+      })
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent',
+        request: { request: { acceptanceEpoch: 'boot-1' } } })
+      await test.owner.commands.send(request())
+      expect(test.commands.send).toHaveBeenCalledExactlyOnceWith({ ...request(),
+        acceptanceProtocol: 'resolvable-v1', acceptanceEpoch: 'boot-2' }, expect.objectContaining({ expectedGeneration: 2 }))
+    } finally { test.owner.dispose() }
+  })
+
+  it.each([false, true])('does not arm an unsent v2 request without current capability/epoch: %s', async supported => {
+    const storage = unknown()
+    const row = storage.records.get('synthetic-request')!
+    storage.records.set(row.ownerRequestId, { ...row, phase: 'prepared' })
+    const test = harness({ supportsResolvableSend: () => supported, getReceiptEpoch: () => undefined }, storage)
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ accepted: false })
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(storage.records.get(row.ownerRequestId)).toMatchObject({ phase: 'not-sent', request: row.request })
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not let a second owner rebind an armed request while the original sender holds its lease', async () => {
+    const storage = unknown()
+    const row = storage.records.get('synthetic-request')!
+    storage.records.set(row.ownerRequestId, { ...row, phase: 'prepared' })
+    const compare = storage.wal.compareAndSwapDelivery!
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    storage.wal.compareAndSwapDelivery = async (id, revision, next) => {
+      const result = await compare(id, revision, next)
+      if (result.applied && next?.phase === 'submitting') await barrier
+      return result
+    }
+    const first = harness({ supportsResolvableSend: () => true, getReceiptEpoch: () => 'boot-2' }, storage)
+    const second = harness({ supportsResolvableSend: () => true, getReceiptEpoch: () => 'boot-3' }, storage)
+    try {
+      const sending = first.owner.commands.send(request())
+      await flush()
+      expect(storage.records.get(row.ownerRequestId)).toMatchObject({ phase: 'submitting',
+        request: { request: { acceptanceEpoch: 'boot-2' } } })
+      await expect(second.owner.commands.send(request())).rejects.toMatchObject({ accepted: null, failureCode: 'DELIVERY_LEASED' })
+      expect(storage.records.get(row.ownerRequestId)?.request).toMatchObject({ request: { acceptanceEpoch: 'boot-2' } })
+      release()
+      await sending
+      expect(first.commands.send).toHaveBeenCalledTimes(1)
+      expect(second.commands.send).not.toHaveBeenCalled()
+    } finally { release(); first.owner.dispose(); second.owner.dispose() }
+  })
+
+  it('preserves a peer Stop that wins the epoch-refresh CAS before first dispatch', async () => {
+    const storage = unknown()
+    const row = storage.records.get('synthetic-request')!
+    storage.records.set(row.ownerRequestId, { ...row, phase: 'prepared' })
+    const first = harness({ supportsResolvableSend: () => true, getReceiptEpoch: () => 'boot-2' }, storage)
+    const second = harness({}, storage)
+    const compare = storage.wal.compareAndSwapDelivery!
+    let stopped = false
+    storage.wal.compareAndSwapDelivery = async (id, revision, next) => {
+      if (!stopped && next?.phase === 'submitting') {
+        stopped = true
+        await second.owner.requestStop(id)
+      }
+      return compare(id, revision, next)
+    }
+    try {
+      await expect(first.owner.commands.send(request())).rejects.toMatchObject({
+        accepted: false, failureCode: 'DELIVERY_STOPPED',
+      })
+      expect(storage.records.get(row.ownerRequestId)).toMatchObject({ phase: 'not-sent', request: row.request,
+        stop: { requested: true, completed: true } })
+      expect(first.commands.send).not.toHaveBeenCalled()
+      expect(second.commands.send).not.toHaveBeenCalled()
+      expect(second.commands.cancel).not.toHaveBeenCalled()
+    } finally { first.owner.dispose(); second.owner.dispose() }
+  })
+
+  it('keeps closed admission connection-scoped without changing unknown history, Stop or recovery limits', async () => {
+    const storage = unknown()
+    const row = storage.records.get('synthetic-request')!
+    storage.records.set(row.ownerRequestId, { ...row, stop: { requested: true },
+      recovery: { calls: 4, expiresAt: Date.now() - 1 }, recoveryNotBefore: Date.now() + 120_000 })
+    let supported = true
+    let currentEpoch = 'boot-1'
+    const test = harness({ supportsResolvableSend: () => supported, getReceiptEpoch: () => currentEpoch,
+      isAdmissionClosed: query => query.kind === 'send' && query.request.kind === 'new-turn'
+        && query.request.acceptanceProtocol === 'resolvable-v1' && query.request.acceptanceEpoch !== currentEpoch }, storage)
+    const before = structuredClone(storage.records.get(row.ownerRequestId)!)
+    const changed = vi.fn()
+    test.owner.subscribe(changed)
+    try {
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]?.admissionClosed).toBe(false)
+      // An authenticated policy tick keeps the same connection and retry episode.
+      currentEpoch = 'boot-2'
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]).toMatchObject({ phase: 'unknown', admissionClosed: true, stopPending: true })
+      test.available(false)
+      expect(test.owner.snapshots()[0]?.admissionClosed).toBe(false)
+      await test.owner.wake()
+      test.available(true)
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]?.admissionClosed).toBe(true)
+      supported = false
+      expect(test.owner.snapshots()[0]?.admissionClosed).toBe(false)
+      supported = true
+      test.reconnect()
+      expect(test.owner.snapshots()[0]?.admissionClosed).toBe(false)
+      changed.mockClear()
+      const waking = test.owner.wake()
+      expect(changed).toHaveBeenCalled()
+      await waking
+      expect(test.owner.snapshots()[0]?.admissionClosed).toBe(true)
+      test.identity('different-identity')
+      expect(test.owner.snapshots()[0]).toMatchObject({ admissionClosed: false, isCurrentIdentity: false })
+      expect(storage.records.get(row.ownerRequestId)).toMatchObject({ phase: 'unknown', request: before.request,
+        stop: before.stop, recovery: before.recovery, recoveryNotBefore: before.recoveryNotBefore })
+      expect(storage.records.get(row.ownerRequestId)?.retired).not.toBe(true)
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  function detachable() {
+    const storage = unknown()
+    const row = storage.records.get('synthetic-request')!
+    const params = request().params
+    storage.records.set(row.ownerRequestId, { ...row, recovery: { calls: 4, expiresAt: 100 },
+      recoveryNotBefore: 120_000, handoff: {
+        schemaVersion: 1, ownerRequestId: row.ownerRequestId, requestSessionKey: row.requestSessionKey,
+        clientRequestId: row.ownerRequestId, clientMessageId: params.clientMessageId!, params,
+        composerText: params.message, recoveryAttachments: [], state: 'submitting', createdAt: 1, updatedAt: 1,
+      } })
+    return storage
+  }
+
+  const closedAdmission = {
+    supportsResolvableSend: () => true,
+    getReceiptEpoch: () => 'boot-2',
+    isAdmissionClosed: () => true,
+  }
+
+  it('persists detached composer ownership across owners without changing historical delivery state', async () => {
+    const storage = detachable()
+    const original = structuredClone(storage.records.get('synthetic-request')!)
+    const first = harness(closedAdmission, storage)
+    try {
+      await expect(first.owner.detachComposer(original.ownerRequestId)).resolves.toBe(true)
+      expect(storage.records.get(original.ownerRequestId)).toMatchObject({ phase: 'unknown', request: original.request,
+        recovery: original.recovery, recoveryNotBefore: original.recoveryNotBefore,
+        handoff: { ...original.handoff, backgroundOnly: true } })
+      expect(first.commands.send).not.toHaveBeenCalled()
+      expect(first.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { first.owner.dispose() }
+    const second = harness(closedAdmission, storage)
+    try {
+      const revision = storage.records.get(original.ownerRequestId)!.revision
+      await expect(second.owner.get(original.ownerRequestId)).resolves.toMatchObject({
+        phase: 'unknown', handoff: { backgroundOnly: true },
+      })
+      await expect(second.owner.detachComposer(original.ownerRequestId)).resolves.toBe(true)
+      expect(storage.records.get(original.ownerRequestId)?.revision).toBe(revision)
+    } finally { second.owner.dispose() }
+  })
+
+  it.each(['found', 'accepted-unavailable'] as const)(
+    'notifies an existing observer of peer detachment and retains it through %s', async status => {
+      const storage = detachable()
+      const first = harness({ ...closedAdmission,
+        resolveReceipt: vi.fn(async (): Promise<TurnReceiptResult> => status === 'found'
+          ? { status: 'found', response: { taskId: 'late-task', sessionKey: 'late-fork' } }
+          : { status: 'accepted-unavailable' }),
+      }, storage)
+      const second = harness(closedAdmission, storage)
+      const observed = vi.fn()
+      first.owner.observe(observed)
+      try {
+        await first.owner.wake()
+        expect(observed).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'unknown' }))
+        expect(observed.mock.calls[observed.mock.calls.length - 1]?.[0].backgroundOnly).toBeUndefined()
+        observed.mockClear()
+        await expect(second.owner.detachComposer('synthetic-request')).resolves.toBe(true)
+        await first.owner.wake()
+        expect(observed).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+          ownerRequestId: 'synthetic-request', phase: 'unknown', backgroundOnly: true,
+        }))
+        await first.owner.retry('synthetic-request')
+        expect(observed).toHaveBeenLastCalledWith(expect.objectContaining({
+          phase: 'accepted', backgroundOnly: true,
+          ...(status === 'found' ? { response: { taskId: 'late-task', sessionKey: 'late-fork' } }
+            : { acceptedUnavailable: true }),
+        }))
+        expect(storage.records.get('synthetic-request')?.handoff?.backgroundOnly).toBe(true)
+        expect(first.commands.send).not.toHaveBeenCalled()
+      } finally { first.owner.dispose(); second.owner.dispose() }
+    },
+  )
+
+  it.each(['stop', 'accepted'] as const)('rechecks a concurrent %s before detaching without overwriting it', async race => {
+    const storage = detachable()
+    const compare = storage.wal.compareAndSwapDelivery!
+    let raced = false
+    storage.wal.compareAndSwapDelivery = async (id, revision, next) => {
+      if (!raced && next?.handoff?.backgroundOnly) {
+        raced = true
+        const current = storage.records.get(id)!
+        storage.records.set(id, { ...current, revision: current.revision + 1,
+          ...(race === 'stop' ? { stop: { requested: true } as const }
+            : { phase: 'accepted' as const, response: { taskId: 'late-task', sessionKey: 'forked-session' } }) })
+      }
+      return compare(id, revision, next)
+    }
+    const test = harness(closedAdmission, storage)
+    try {
+      await expect(test.owner.detachComposer('synthetic-request')).resolves.toBe(race === 'stop')
+      const latest = storage.records.get('synthetic-request')!
+      if (race === 'stop') {
+        expect(latest).toMatchObject({ phase: 'unknown', stop: { requested: true }, handoff: { backgroundOnly: true } })
+      } else {
+        expect(latest).toMatchObject({ phase: 'accepted', response: { taskId: 'late-task', sessionKey: 'forked-session' } })
+        expect(latest.handoff?.backgroundOnly).toBeUndefined()
+      }
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not offer a detached historical draft after a late retirement proof', async () => {
+    const storage = detachable()
+    const test = harness({ ...closedAdmission,
+      resolveReceipt: vi.fn(async () => ({ status: 'retired' as const })) }, storage)
+    try {
+      await expect(test.owner.detachComposer('synthetic-request')).resolves.toBe(true)
+      await test.owner.retry('synthetic-request')
+      expect(storage.records.get('synthetic-request')).toMatchObject({
+        phase: 'not-sent', retired: true, handoff: { backgroundOnly: true },
+      })
+      expect(test.owner.snapshots()[0]?.draftAvailable).not.toBe(true)
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it.each(['identity', 'generation', 'offline', 'capability'] as const)(
+    'refuses fresh-send permission if %s changes during detachment persistence', async change => {
+      const storage = detachable()
+      let supported = true
+      const test = harness({ ...closedAdmission, supportsResolvableSend: () => supported }, storage)
+      const compare = storage.wal.compareAndSwapDelivery!
+      storage.wal.compareAndSwapDelivery = async (id, revision, next) => {
+        const result = await compare(id, revision, next)
+        if (result.applied && next?.handoff?.backgroundOnly) {
+          if (change === 'identity') test.identity('other-identity')
+          if (change === 'generation') test.reconnect()
+          if (change === 'offline') test.available(false)
+          if (change === 'capability') supported = false
+        }
+        return result
+      }
+      try {
+        await expect(test.owner.detachComposer('synthetic-request')).resolves.toBe(false)
+        expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'unknown', handoff: { backgroundOnly: true } })
+      } finally { test.owner.dispose() }
+    },
+  )
+
+  it('refuses detachment without closure or durable storage and accepts an eligible record without a handoff', async () => {
+    const storage = detachable()
+    let closed = false
+    const test = harness({ ...closedAdmission, isAdmissionClosed: () => closed }, storage)
+    try {
+      await expect(test.owner.detachComposer('synthetic-request')).resolves.toBe(false)
+      expect(storage.records.get('synthetic-request')?.handoff?.backgroundOnly).toBeUndefined()
+      closed = true
+      storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic storage failure') }
+      await expect(test.owner.detachComposer('synthetic-request')).resolves.toBe(false)
+      const current = storage.records.get('synthetic-request')!
+      storage.records.set(current.ownerRequestId, { ...current, handoff: undefined })
+      await expect(test.owner.detachComposer('synthetic-request')).resolves.toBe(true)
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not promote a previously prepared legacy request when capabilities change', async () => {
+    const storage = unknown()
+    const row = storage.records.get('synthetic-request')!
+    storage.records.set(row.ownerRequestId, { ...row, schemaVersion: 2, phase: 'prepared',
+      request: { kind: 'send', request: request() } })
+    const test = harness({ supportsResolvableSend: () => true }, storage)
+    try {
+      await test.owner.commands.send(request())
+      expect(test.commands.send).toHaveBeenCalledWith(request(), expect.anything())
+      expect(storage.records.get(row.ownerRequestId)?.schemaVersion).toBe(2)
+    } finally { test.owner.dispose() }
+  })
+
+  it('keeps the automatic budget across reconnects, owners and distinct external hints', async () => {
+    vi.useFakeTimers()
+    const storage = unknown()
+    const test = harness({}, storage)
+    const round = test.owner.wake()
+    await vi.advanceTimersByTimeAsync(6_000); await round
+    const budget = structuredClone(storage.records.get('synthetic-request')!.recovery)
+    expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(4)
+    for (let i = 0; i < 6; i++) {
+      test.identity('synthetic-identity')
+      await test.owner.wake()
+      await test.owner.noteReceiptChanged('synthetic-request', `hint-${i}`)
+    }
+    expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(4)
+    test.owner.dispose()
+    const successor = harness({ resolveReceipt: vi.fn(async () => ({ status: 'retired' as const })) }, storage)
+    try {
+      await successor.owner.wake()
+      expect(successor.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(storage.records.get('synthetic-request')?.recovery).toEqual(budget)
+      await successor.owner.retry('synthetic-request')
+      expect(successor.commands.resolveReceipt).toHaveBeenCalledTimes(1)
+      expect(storage.records.get('synthetic-request')?.retired).toBe(true)
+    } finally { successor.owner.dispose() }
+  })
+
+  it('joins only the checked request lease while an unrelated background receipt is stalled', async () => {
+    vi.useFakeTimers()
+    const storage = unknown()
+    storage.records.set('unrelated', { ...storage.records.get('synthetic-request')!, ownerRequestId: 'unrelated',
+      request: { kind: 'send', request: { ...request('unrelated'), acceptanceProtocol: 'resolvable-v1' } } })
+    const test = harness({
+      lookupReceipt: vi.fn((query, opts) => query.kind === 'send' && query.request.params.clientRequestId === 'unrelated'
+        ? new Promise<TurnReceiptResult>((_resolve, reject) => opts?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))
+        : Promise.resolve({ status: 'not-found' as const })),
+      resolveReceipt: vi.fn(async () => ({ status: 'retired' as const })),
+    }, storage)
+    try {
+      let sweepFinished = false
+      const sweep = test.owner.wake().then(() => { sweepFinished = true })
+      await flush()
+      let checked = false
+      const checking = test.owner.retry('synthetic-request').then(() => { checked = true })
+      await vi.advanceTimersByTimeAsync(6_000)
+      expect(checked).toBe(true)
+      expect(sweepFinished).toBe(false)
+      expect(test.commands.resolveReceipt).toHaveBeenCalledTimes(1)
+      await checking
+      test.owner.dispose()
+      await sweep
+    } finally { test.owner.dispose() }
+  })
+
+  it('waits for an explicit resolution claimed by a concurrent wake during the retry WAL update', async () => {
+    const storage = unknown()
+    storage.records.get('synthetic-request')!.paused = 'authority'
+    let resolve!: (value: TurnReceiptResult) => void
+    const test = harness({ resolveReceipt: vi.fn(() => new Promise<TurnReceiptResult>(done => { resolve = done })) }, storage)
+    const swap = storage.wal.compareAndSwapDelivery!
+    let race = true
+    storage.wal.compareAndSwapDelivery = async (id, revision, next) => {
+      const result = await swap(id, revision, next)
+      if (race && result.applied && next?.paused === undefined && !next?.lease) {
+        race = false
+        void test.owner.wake()
+        await flush()
+      }
+      return result
+    }
+    try {
+      let checked = false
+      const checking = test.owner.retry('synthetic-request').then(() => { checked = true })
+      await flush()
+      expect(test.commands.resolveReceipt).toHaveBeenCalledTimes(1)
+      await new Promise(done => setTimeout(done, 0))
+      expect(checked).toBe(false)
+      resolve({ status: 'retired' })
+      await checking
+      expect(storage.records.get('synthetic-request')?.retired).toBe(true)
+      expect(test.commands.resolveReceipt).toHaveBeenCalledTimes(1)
+    } finally { resolve?.({ status: 'retired' }); test.owner.dispose() }
+  })
+
+  it('retains a long server wait through explicit checks and owner replacement', async () => {
+    vi.useFakeTimers()
+    const storage = unknown()
+    const test = harness({ lookupReceipt: vi.fn(async () => {
+      throw new TurnCommandError('unavailable', 'busy', 'STORAGE_BUSY', null, true, 120_000)
+    }) }, storage)
+    await test.owner.wake()
+    const floor = storage.records.get('synthetic-request')!.recoveryNotBefore!
+    expect(floor).toBe(Date.now() + 120_000)
+    for (let i = 0; i < 5; i++) await test.owner.retry('synthetic-request')
+    expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(1)
+    test.owner.dispose()
+    const successor = harness({ resolveReceipt: vi.fn(async () => ({ status: 'retired' as const })) }, storage)
+    try {
+      await successor.owner.retry('synthetic-request')
+      expect(successor.commands.resolveReceipt).not.toHaveBeenCalled()
+      expect(successor.owner.snapshots()[0]).toMatchObject({ waitReason: 'budget' })
+      await vi.advanceTimersByTimeAsync(120_000)
+      await Promise.all([successor.owner.retry('synthetic-request'), successor.owner.retry('synthetic-request')])
+      expect(successor.commands.resolveReceipt).toHaveBeenCalledTimes(1)
+      expect(successor.commands.send).not.toHaveBeenCalled()
+    } finally { successor.owner.dispose() }
+  })
+
+  it('ends an uncertain Stop when acceptance survives deleted receipt history', async () => {
+    const storage = unknown()
+    storage.records.get('synthetic-request')!.stop = { requested: true }
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'accepted-unavailable' as const })) }, storage)
+    try {
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'accepted', acceptedUnavailable: true,
+        stop: { requested: true, completed: true } })
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false })
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ accepted: true })
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('ends an unacknowledged send wait without authorizing a second transmission', async () => {
+    vi.useFakeTimers()
+    const test = harness({ supportsResolvableSend: () => true,
+      send: vi.fn((_request, opts) => new Promise<TurnSendResponse>((_resolve, reject) => {
+        opts?.signal?.addEventListener('abort', () => reject(new TurnCommandError('aborted', 'ack timeout', undefined, null)), { once: true })
+      })) })
+    try {
+      const pending = expect(test.owner.commands.send(request())).rejects.toMatchObject({ accepted: null })
+      await vi.advanceTimersByTimeAsync(30_000); await pending
+      await vi.advanceTimersByTimeAsync(40_000)
+      expect(test.commands.send).toHaveBeenCalledTimes(1)
+      expect(test.records.get('synthetic-request')?.phase).toBe('unknown')
+      expect(test.owner.snapshots()[0]?.waitReason).toBe('budget')
+    } finally { test.owner.dispose() }
+  })
+})
 
 function sharedQueuePermission() {
   const values = new Map<string, string>()

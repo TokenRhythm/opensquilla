@@ -3829,6 +3829,14 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   durableDelivery,
+  canContinueAfterClosedAdmission: afterStartingStream => chatSessionBootstrap.isLiveReady(sessionKey.value)
+    && !isSessionHydrating.value && !effectiveSendBlockedReason.value
+    && activeTaskGroups.value.size === 0 && !isCompactInFlightForCurrentSession()
+    // startStreaming projects local "running" before the frame is sent. The
+    // sender still checks authoritative task ownership at the dispatch boundary.
+    && (afterStartingStream || !['queued', 'running', 'approval_pending'].includes(runStatus.value.status))
+    && activePlanRun.value?.status !== 'queued' && activePlanRun.value?.status !== 'running'
+    && (afterStartingStream || pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value),
   selectedSkills,
   localPathReferences: localPaths,
   restoreInput,
@@ -3853,6 +3861,7 @@ const chatSend = useChatSend({
     lookupReceipt: (request, options) => turnCommands.lookupReceipt?.(request, options)
       || Promise.resolve({ status: 'unsupported' as const }),
     supportsReceiptLookup: () => turnCommands.supportsReceiptLookup?.() ?? false,
+    supportsResolvableSend: () => turnCommands.supportsResolvableSend?.() ?? false,
     supports: capability => turnCommands.supports(capability),
   },
   activeSteerCapability,
@@ -3895,6 +3904,16 @@ const chatSend = useChatSend({
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(
     ids.filter(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id])),
   ).filter(annotationAllowed),
+  restorePromptAnnotations: (snapshots, key) => snapshots.every(annotationAllowed)
+    && artifactPromptAnnotationsStore.restoreUnsent(snapshots, key),
+  persistRestoredDraft: async () => {
+    const stored = draftPersistence.saveDraft(draftSessionKey.value, composerText.value,
+      selectedSkills.value, localPaths.value, skillPositions.value)
+    const attachmentsStored = await chatAttachments.flushAttachmentDraft()
+    // Embedded owners may supply only memory storage. Keep their durable
+    // recovery copy until that owner has a durable draft contract.
+    return stored && attachmentsStored && !props.embedded
+  },
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -4222,6 +4241,7 @@ async function onComposerSend() {
     const withContext = context && await acceptsVisualizeContext(composer, classifySlashCommand)
     if (context && (!context.isCurrent() || composerRevision.value !== submittedRevision)) return
     void onSend({
+      explicitNewInput: true,
       resumeQueueOnSuccess: !isStopPending.value,
       ...(withContext ? {
         composerText: composer, textOverride: context.message(composer, t('visualize.contextAttached')),

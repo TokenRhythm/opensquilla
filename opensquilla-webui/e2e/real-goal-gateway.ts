@@ -106,6 +106,8 @@ export async function startRealGoalGateway(options: {
   scenario?: RealGoalGatewayScenario
   authMode?: 'none' | 'token'
   initialSessionKeys?: readonly string[]
+  /** Reuse only this fixture's stopped listener for restart/restore tests. */
+  port?: number
 }): Promise<RealGoalGateway> {
   const requestedFlow = process.env.OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED
     ?.trim().toLowerCase()
@@ -129,7 +131,7 @@ export async function startRealGoalGateway(options: {
   await mkdir(appDataDir, { recursive: true })
   await mkdir(localAppDataDir, { recursive: true })
 
-  const port = await reserveLoopbackPort()
+  const port = options.port ?? await reserveLoopbackPort()
   const python = process.env.OPENSQUILLA_WEBUI_E2E_PYTHON
     || join(
       repoRoot,

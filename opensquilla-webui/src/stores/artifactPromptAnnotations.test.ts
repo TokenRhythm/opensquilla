@@ -15,6 +15,35 @@ const request = {
 beforeEach(() => { localStorage.clear(); setActivePinia(createPinia()) })
 
 describe('local page annotation drafts', () => {
+  it('restores fenced input snapshots after reload and never overwrites a newer annotation', async () => {
+    const store = useArtifactPromptAnnotationsStore()
+    await store.create(request)
+    const snapshots = store.snapshotsForIds(['draft-1'])
+    await store.discard('draft-1')
+    setActivePinia(createPinia())
+    const restored = useArtifactPromptAnnotationsStore()
+    expect(restored.restoreUnsent(snapshots, 'session-1')).toBe(true)
+    expect(restored.snapshotsForIds(['draft-1'])).toEqual(snapshots)
+    expect(restored.restoreUnsent(snapshots, 'session-1')).toBe(true)
+    await restored.update('draft-1', 'new instruction with the same ID')
+    expect(restored.restoreUnsent(snapshots, 'session-1')).toBe(false)
+    expect(restored.annotations['draft-1']?.body).toBe('new instruction with the same ID')
+    expect(restored.acknowledgeSent(snapshots)).toEqual([])
+    expect(restored.annotations['draft-1']?.body).toBe('new instruction with the same ID')
+  })
+
+  it('keeps a retired annotation handoff separate from another draft or active editor', async () => {
+    const store = useArtifactPromptAnnotationsStore()
+    await store.create(request)
+    const snapshots = store.snapshotsForIds(['draft-1'])
+    store.beginOverlayEdit('draft-1', 'session-1')
+    expect(store.restoreUnsent(snapshots, 'session-1')).toBe(false)
+    store.releaseOverlayEdit('draft-1')
+    await store.create({ ...request, annotationId: 'new-draft', body: 'different request' })
+    expect(store.restoreUnsent(snapshots, 'session-1')).toBe(false)
+    expect(store.draftsForSession('session-1')).toHaveLength(2)
+  })
+
   it('persists ordinary annotation input across store recreation without a gateway', async () => {
     const store = useArtifactPromptAnnotationsStore()
     await store.create(request)

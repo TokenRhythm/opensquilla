@@ -634,6 +634,83 @@ function deliveryRecord(id = 'synthetic-delivery'): DeliveryWalRecord {
   }
 }
 
+it('keeps composer detachment through late handoff writes and IndexedDB reopen without resolving unknown acceptance', async () => {
+  vi.stubGlobal('IDBKeyRange', MemoryIdbKeyRange)
+  const factory = new MemoryIdbFactory()
+  const first = createPendingInputWal(factory)!
+  const original = deliveryRecord('detached-request')
+  const handoff: ResponseHandoffWalRecord = {
+    schemaVersion: 1, ownerRequestId: original.ownerRequestId, requestSessionKey: original.requestSessionKey,
+    clientRequestId: original.ownerRequestId, clientMessageId: 'synthetic-message', composerText: 'synthetic text',
+    params: { sessionKey: original.requestSessionKey, clientRequestId: original.ownerRequestId,
+      clientMessageId: 'synthetic-message', message: 'synthetic text' },
+    recoveryAttachments: [], walOwnerId: 'original-owner', walRevision: 1, state: 'submitting', createdAt: 1, updatedAt: 1,
+  }
+  const record: DeliveryWalRecord = { ...original, handoff, stop: { requested: true },
+    recovery: { calls: 4, expiresAt: 30_000 }, recoveryNotBefore: 120_000 }
+  await first.prepareDelivery!(record)
+  await first.compareAndSwapDelivery!(record.ownerRequestId, 1, { ...record, revision: 2,
+    handoff: { ...handoff, backgroundOnly: true } })
+  // A late callback still holds the original projection from before detachment.
+  await first.putHandoff!({ ...handoff, state: 'accepted', acceptedSessionKey: 'late-fork' })
+  const updated = await first.compareAndSwapHandoff!(record.ownerRequestId, 'original-owner', 1,
+    { ...handoff, state: 'accepted', acceptedSessionKey: 'late-fork', walRevision: 2 })
+  expect(updated.record).toMatchObject({ backgroundOnly: true, acceptedSessionKey: 'late-fork' })
+  first.close()
+  const second = createPendingInputWal(factory)!
+  try {
+    expect(await second.getDelivery!(record.ownerRequestId)).toMatchObject({
+      phase: 'unknown', request: original.request, stop: record.stop, recovery: record.recovery, recoveryNotBefore: 120_000,
+      handoff: { backgroundOnly: true, state: 'accepted', acceptedSessionKey: 'late-fork' },
+    })
+    expect((await second.listHandoffs!())[0]).toMatchObject({ backgroundOnly: true, walRevision: 2 })
+    expect((await second.listRecoveryDeliveries!()).records).toHaveLength(1)
+    const latest = (await second.getDelivery!(record.ownerRequestId))!
+    await second.compareAndSwapDelivery!(record.ownerRequestId, latest.revision, {
+      ...latest, revision: latest.revision + 1, phase: 'not-sent', retired: true,
+      stop: { requested: true, completed: true },
+    })
+    expect((await second.listRecoveryDeliveries!()).records).toEqual([])
+    expect(await second.getDelivery!(record.ownerRequestId)).toMatchObject({
+      phase: 'not-sent', retired: true, handoff: { backgroundOnly: true },
+    })
+  } finally { second.close() }
+})
+
+it.each(['boot-1', undefined])('preserves the original epoch %s and retired evidence across IndexedDB reopen', async acceptanceEpoch => {
+  vi.stubGlobal('IDBKeyRange', MemoryIdbKeyRange)
+  const factory = new MemoryIdbFactory()
+  const first = createPendingInputWal(factory)!
+  const original = deliveryRecord('resolved-request')
+  const record: DeliveryWalRecord = { ...original, schemaVersion: 3,
+    request: { kind: 'send', request: { kind: 'new-turn', acceptanceProtocol: 'resolvable-v1',
+      ...(acceptanceEpoch ? { acceptanceEpoch } : {}), params: {
+      message: 'text', sessionKey: original.requestSessionKey, clientRequestId: original.ownerRequestId,
+    } } }, recovery: { calls: 4, expiresAt: 30_000 }, recoveryNotBefore: 120_000,
+    handoff: { schemaVersion: 1, ownerRequestId: original.ownerRequestId, requestSessionKey: original.requestSessionKey,
+      clientRequestId: original.ownerRequestId, clientMessageId: 'draft-message', composerText: 'text', recoveryAttachments: [],
+      params: { message: 'text', sessionKey: original.requestSessionKey, clientRequestId: original.ownerRequestId },
+      state: 'submitting', createdAt: 1, updatedAt: 1 } }
+  await first.prepareDelivery!(record)
+  await first.compareAndSwapDelivery!(record.ownerRequestId, 1, { ...record, revision: 2, phase: 'not-sent', retired: true })
+  first.close()
+  const second = createPendingInputWal(factory)!
+  try {
+    expect(await second.getDelivery!(record.ownerRequestId)).toMatchObject({ schemaVersion: 3, retired: true,
+      recovery: record.recovery, recoveryNotBefore: 120_000, request: record.request })
+    const replacement = await second.prepareDelivery!(original)
+    expect(replacement.applied).toBe(false)
+    expect(replacement.record).toMatchObject({ schemaVersion: 3, retired: true })
+    expect((await second.listRecoveryDeliveries!()).records.map(item => item.ownerRequestId)).toEqual([record.ownerRequestId])
+    await second.deleteHandoff!(record.ownerRequestId)
+    expect((await second.listRecoveryDeliveries!()).records).toEqual([])
+    expect(await second.getDelivery!(record.ownerRequestId)).toMatchObject({ retired: true })
+    const malformed = { ...record, ownerRequestId: 'malformed', request: original.request }
+    await expect(second.prepareDelivery!(malformed)).rejects.toThrow()
+    expect(await second.getDelivery!('malformed')).toBeNull()
+  } finally { second.close() }
+})
+
 it('uses v4 and preserves delivery authority while handoff fields change', async () => {
   const factory = new ControlledIdbFactory()
   const wal = createPendingInputWal(factory.idbFactory)!

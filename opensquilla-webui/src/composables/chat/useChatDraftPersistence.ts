@@ -124,11 +124,11 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     options.sessionKey.value = key
   }
 
-  function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = [], localPaths: readonly string[] = [], skillPositions: Record<string, number> = {}): void {
-    if (!key) return
+  function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = [], localPaths: readonly string[] = [], skillPositions: Record<string, number> = {}): boolean {
+    if (!key) return false
     try {
       const storage = draftStorage()
-      if (!storage) return
+      if (!storage) return false
       if (text || selectedSkills.length || localPaths.length) {
         // Keep the existing capped text fallback if a draft outgrows metadata
         // limits; never silently drop just its referenced paths.
@@ -141,12 +141,16 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
             ...(Object.keys(positions).length ? { skillPositions: positions } : {}),
           }) : trimmed)
         storage.setItem(RECENT_DRAFT_SESSION_KEY, key)
+        return trimmed === (paths.length ? text : composeLocalPathText(text, localPaths))
+          && paths.length === localPaths.length
       } else {
         storage.removeItem(draftKey(key))
         clearRecentDraftPointer(key, storage)
+        return true
       }
     } catch {
       // Ignore storage failures in private or restricted contexts.
+      return false
     }
   }
 
