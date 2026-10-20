@@ -74,6 +74,44 @@ def _gateway_server_for_ws_close_test() -> tuple[
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["terminals", "goals", "mcp", "services"])
+async def test_required_cleanup_exception_retains_ownership(
+    monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    server, listener, services, pid_lock = _gateway_server_for_ws_close_test()
+    failing = AsyncMock(side_effect=RuntimeError("synthetic cleanup failure"))
+    terminal_close = failing if phase == "terminals" else AsyncMock()
+    mcp_close = failing if phase == "mcp" else AsyncMock()
+    if phase == "goals":
+        services.goal_service = SimpleNamespace(prepare_shutdown=failing)
+    if phase == "services":
+        services.close = failing
+    monkeypatch.setattr(
+        "opensquilla.gateway.terminal_sessions.get_terminal_manager",
+        lambda: SimpleNamespace(close_all=terminal_close),
+    )
+    monkeypatch.setattr("opensquilla.mcp.discovery.close_active_clients", mcp_close)
+    monkeypatch.setattr(
+        "opensquilla.gateway.boot.get_registry",
+        lambda: SimpleNamespace(broadcast=AsyncMock(), all=lambda: []),
+    )
+
+    if phase == "mcp":
+        with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+            await server.close()
+    else:
+        result = await server.close()
+        assert result is not None and not result.clean
+    assert listener.should_exit is True
+    assert server._task.done()
+    pid_lock.release.assert_not_called()
+    if phase in {"goals", "mcp"}:
+        services.close.assert_not_awaited()
+    else:
+        services.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_runtime_drained_before_channel_stop() -> None:
     """task_runtime.shutdown() must complete before channel_manager.stop_all()."""
     call_order: list[str] = []
@@ -126,8 +164,8 @@ async def test_close_stops_server_even_if_teardown_raises() -> None:
     close() is now invoked on every shutdown (signal or HTTP), so the serve task
     is typically still running when it runs. If a teardown step (channel stop, WS
     broadcast) raises, the error still propagates to the caller, but the server
-    stop + serve-task join + pid-lock release must run first — otherwise the
-    uvicorn serve task is leaked ("Task was destroyed but it is pending").
+    stop + serve-task join must run first. A failed resource owner retains its
+    shared dependencies and pid lock until process exit.
     """
     server = GatewayServer.__new__(GatewayServer)
 
@@ -145,8 +183,8 @@ async def test_close_stops_server_even_if_teardown_raises() -> None:
     mock_services.close = AsyncMock()
     server._services = mock_services
 
-    # The teardown step raises — close() must still stop the server and release
-    # the pid lock (in finally) before the error propagates.
+    # The teardown step raises — close() must still stop the server before the
+    # error propagates, without declaring ownership safely released.
     mock_channel_manager = MagicMock()
     mock_channel_manager.stop_all = AsyncMock(side_effect=RuntimeError("boom"))
     server._channel_manager = mock_channel_manager
@@ -163,8 +201,8 @@ async def test_close_stops_server_even_if_teardown_raises() -> None:
             await server.close(reason="test")
 
     assert fake_server.should_exit is True  # server stop ran despite the failure
-    mock_services.close.assert_awaited_once()
-    mock_pid_lock.release.assert_called_once()  # pid lock always released
+    mock_services.close.assert_not_awaited()
+    mock_pid_lock.release.assert_not_called()
     assert server._task.done()  # serve task awaited, not leaked
 
 
@@ -272,7 +310,7 @@ async def test_close_cancellation_detaches_websocket_tasks_and_runs_finally(
         assert connection.cancelled.is_set()
         assert fake_server.should_exit is True
         mock_services.close.assert_awaited_once()
-        mock_pid_lock.release.assert_called_once()
+        mock_pid_lock.release.assert_not_called()
     finally:
         connection.release.set()
         if close_task is not None and not close_task.done():
@@ -297,7 +335,7 @@ async def test_close_preserves_connection_cancellation_semantics() -> None:
 
     assert fake_server.should_exit is True
     mock_services.close.assert_awaited_once()
-    mock_pid_lock.release.assert_called_once()
+    mock_pid_lock.release.assert_not_called()
 
 
 @pytest.mark.asyncio
