@@ -444,7 +444,7 @@ def test_old_ladder_upgrade_preserves_explicit_reasoning_and_other_tier_options(
         llm={"provider": "openrouter"},
         squilla_router={"preset_binding": "custom", "tiers": tiers},
     )
-    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek/deepseek-v4-flash-0731"
+    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek/deepseek-v4.1-flash-1017"
     assert cfg.squilla_router.tiers["c1"]["thinking_level"] == "low"
     assert cfg.squilla_router.tiers["c1"]["temperature"] == 0.42
 
@@ -609,10 +609,10 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     tiers = cfg.squilla_router.tiers
     assert set(tiers) == {"c0", "c1", "c2", "c3", "image_model"}
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-flash",
-        "c2": "deepseek-v4-pro-0813",
-        "c3": "glm-5.3",
+        "c0": "qwen3.8-flash",
+        "c1": "deepseek-v4.1-flash-1017",
+        "c2": "glm-5.3",
+        "c3": "kimi-k3",
         "image_model": "kimi-k2.6",
     }
     for name, tier in tiers.items():

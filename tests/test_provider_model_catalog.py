@@ -141,10 +141,10 @@ def test_openrouter_public_physical_limits_are_available_offline(
 @pytest.mark.parametrize(
     ("provider", "expected_limits"),
     [
-        ("openrouter", [(1_000_000, 65_536), (1_048_576, 943_718),
-                        (1_024_000, 384_000), (1_048_576, 131_072)]),
-        ("tokenrhythm", [(1_000_000, 65_536), (1_000_000, 384_000),
-                         (1_000_000, 384_000), (1_048_576, 131_072)]),
+        ("openrouter", [(1_000_000, 131_072), (1_048_576, 393_216),
+                        (1_048_576, 131_072), (1_048_576, 943_718)]),
+        ("tokenrhythm", [(1_000_000, 131_072), (1_000_000, 384_000),
+                         (1_048_576, 131_072), (1_048_576, 1_048_576)]),
     ],
 )
 def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
@@ -161,7 +161,8 @@ def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
         limits = catalog.resolve_deployment_limits(model, provider=provider)
         expected_request_output = (
             window // 2
-            if provider == "openrouter" and output >= (window * 9) // 10
+            if (provider == "openrouter" and output >= (window * 9) // 10)
+            or (provider == "tokenrhythm" and output == window)
             else output
         )
         assert (limits.context_window, limits.max_output_tokens) == (
@@ -181,7 +182,7 @@ def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
         )
         assert catalog.resolve_vision_support(model, provider_name=provider) == (
             "supported"
-            if tier == "c0" or (provider == "tokenrhythm" and tier == "c1")
+            if tier in {"c0", "c1", "c3"}
             else "unsupported"
         )
         capabilities = catalog.get_capabilities(model, provider_name=provider)
