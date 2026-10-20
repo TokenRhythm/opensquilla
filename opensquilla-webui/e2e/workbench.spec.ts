@@ -275,6 +275,7 @@ async function installDesktopWorkbenchV2Bridge(
       activations: [] as string[],
       createRequests: [] as Array<Record<string, unknown>>,
       destroyedSurfaces: [] as string[],
+      navigationRequests: [] as Array<Record<string, unknown>>,
       leaseRequests: [] as Array<Record<string, unknown>>,
       rectRequests: [] as Array<Record<string, unknown>>,
       releaseLease: () => resolveLease(leaseResponse(initialMode, 1)),
@@ -356,6 +357,19 @@ async function installDesktopWorkbenchV2Bridge(
       },
       activateWorkbenchSurface: async (surfaceId: string) => {
         probe.activations.push(surfaceId)
+        return { ok: true }
+      },
+      navigateWorkbenchSurface: async (request: Record<string, unknown>) => {
+        probe.navigationRequests.push(request)
+        if (request.action === 'navigate') {
+          const url = String(request.url || '')
+          queueMicrotask(() => probe.surfaceListener?.({
+            version: 2,
+            surfaceId: request.surfaceId,
+            type: 'navigation-state',
+            detail: { url, title: new URL(url).hostname, loading: false, navigationError: null },
+          }))
+        }
         return { ok: true }
       },
       destroyWorkbenchSurface: async (surfaceId: string) => {
@@ -657,13 +671,15 @@ test.describe('Application Workbench', () => {
           surfaceId: string; payload: { url: string; scopeId: string }
         }> }
       }).__opensquillaNativeWorkbenchProbe.createRequests)
-      expect(await creates()).toHaveLength(0)
+      await expect.poll(creates).toHaveLength(1)
+      expect((await creates())[0]!.payload.url).toBe('about:blank')
       await address.fill('localhost:18807/check')
       await start.getByRole('button', { name: 'Go', exact: true }).click()
       await expect(workbench.getByRole('tab')).toHaveCount(1)
       await expect.poll(creates).toHaveLength(1)
       const first = (await creates())[0]!
-      expect(first.payload.url).toBe('http://localhost:18807/check')
+      await expect(workbench.locator('.browser-preview__address'))
+        .toHaveValue('http://localhost:18807/check')
       expect(first.payload.scopeId).toMatch(/^agent:main:webchat:/)
       if (recoverDraft) expect(first.payload.scopeId).toBe(recoveredKey)
       else expect(first.payload.scopeId).not.toBe(recoveredKey)
@@ -679,7 +695,7 @@ test.describe('Application Workbench', () => {
 
       await openBrowserPanel(page)
       await expect(start).toBeVisible()
-      await expect(workbench.getByRole('tab')).toHaveCount(1)
+      await expect(workbench.getByRole('tab')).toHaveCount(2)
       await address.fill('localhost:18807/check')
       await start.getByRole('button', { name: 'Go', exact: true }).click()
       await expect(workbench.getByRole('tab')).toHaveCount(2)
@@ -698,6 +714,8 @@ test.describe('Application Workbench', () => {
       await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
       await openBrowserPanel(page)
       await start.getByRole('button', { name: 'Reopen closed tab' }).click()
+      await expect(workbench.getByRole('tab')).toHaveCount(3)
+      await workbench.getByRole('button', { name: 'Close tab: New tab', exact: true }).click()
       await expect(workbench.getByRole('tab')).toHaveCount(2)
       await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).last().click()
       await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).click()
@@ -705,13 +723,82 @@ test.describe('Application Workbench', () => {
       await openBrowserPanel(page)
       await expect(toggle).toHaveAttribute('aria-expanded', 'true')
       await start.getByRole('button', { name: 'Reopen closed tab' }).click()
+      await expect(workbench.getByRole('tab')).toHaveCount(2)
+      await workbench.getByRole('button', { name: 'Close tab: New tab', exact: true }).click()
       await expect(workbench.getByRole('tab')).toHaveCount(1)
       await page.getByRole('button', { name: 'New task', exact: true }).click()
+      await expect(page).toHaveURL(/\/chat\/new/)
+      await expect(workbench).toBeHidden()
+      await toggle.click()
       await expect(workbench.getByTestId('workbench-start-panel')).toBeVisible()
       await expect(workbench.getByRole('tab')).toHaveCount(0)
       await expect(toggle).toBeVisible()
     })
   }
+
+  test('keeps a blank browser tab through resource switching and navigates within that tab', async ({ page }, testInfo) => {
+    await installDesktopWorkbenchV2Bridge(page)
+    await openWorkbenchSession(page)
+    await page.locator('.msg-artifact-chip', { hasText: 'notes.txt' })
+      .getByRole('button', { name: 'Open notes.txt', exact: true }).click()
+    const workbench = page.getByTestId('workbench-host')
+    const tabs = workbench.getByRole('tablist', { name: 'Open workbench items', exact: true })
+    const notes = tabs.getByRole('tab', { name: 'notes.txt', exact: true })
+    await expect(notes).toHaveAttribute('aria-selected', 'true')
+
+    await openBrowserPanel(page)
+    const browser = tabs.getByRole('tab', { name: 'New tab', exact: true })
+    await expect(tabs.getByRole('tab')).toHaveCount(2)
+    await expect(browser).toHaveAttribute('aria-selected', 'true')
+    const browserTabId = (await browser.getAttribute('id'))!
+    const start = workbench.getByTestId('browser-start')
+    const address = start.getByRole('textbox', { name: 'Web address', exact: true })
+    await address.fill('localhost:18807/blank-tab-check')
+    const probe = () => page.evaluate(() => {
+      const value = (window as unknown as {
+        __opensquillaNativeWorkbenchProbe: {
+          createRequests: Array<{ surfaceId: string; payload: { url: string } }>
+          navigationRequests: Array<{ surfaceId: string; action: string; url?: string }>
+          destroyedSurfaces: string[]
+        }
+      }).__opensquillaNativeWorkbenchProbe
+      return {
+        creates: value.createRequests,
+        navigations: value.navigationRequests,
+        destroyed: value.destroyedSurfaces,
+      }
+    })
+    await expect.poll(async () => (await probe()).creates).toHaveLength(1)
+    const surface = (await probe()).creates[0]!
+    expect(surface.payload.url).toBe('about:blank')
+    await expect(workbench.locator('[data-workbench-native-surface-slot]')).toHaveCount(0)
+
+    await notes.click()
+    await expect(workbench.locator('.artifact-preview__text')).toContainText('Workbench notes stay mounted.')
+    await expect(start).toBeHidden()
+    await browser.click()
+    await expect(browser).toHaveAttribute('id', browserTabId)
+    await expect(address).toHaveValue('localhost:18807/blank-tab-check')
+    await page.screenshot({ path: testInfo.outputPath('blank-browser-tab.png') })
+    await start.getByRole('button', { name: 'Go', exact: true }).click()
+
+    await expect.poll(async () => (await probe()).navigations).toContainEqual({
+      version: 2, surfaceId: surface.surfaceId, action: 'navigate',
+      url: 'http://localhost:18807/blank-tab-check',
+    })
+    await expect(tabs.getByRole('tab')).toHaveCount(2)
+    await expect(tabs.getByRole('tab', { selected: true })).toHaveAttribute('id', browserTabId)
+    await expect(workbench.locator('.browser-preview__address'))
+      .toHaveValue('http://localhost:18807/blank-tab-check')
+    await expect(workbench.locator('[data-workbench-native-surface-slot]')).toBeVisible()
+    expect((await probe()).creates).toHaveLength(1)
+
+    await workbench.getByRole('button', { name: 'Close tab: localhost', exact: true }).click()
+    await expect(tabs.getByRole('tab')).toHaveCount(1)
+    await expect(notes).toHaveAttribute('aria-selected', 'true')
+    await expect(workbench.locator('.artifact-preview__text')).toContainText('Workbench notes stay mounted.')
+    await expect.poll(async () => (await probe()).destroyed).toContain(surface.surfaceId)
+  })
 
   for (const recovered of [false, true]) {
     test(`New panel stays anchored through pane animation and unrelated scroll (recovered=${recovered})`, async ({ page }) => {
@@ -836,16 +923,18 @@ test.describe('Application Workbench', () => {
     await expect.poll(counts).toMatchObject({ creates: 0, destroyed: ['browser-second'] })
     await workbench.getByRole('button', { name: 'Close tab: Browser cart', exact: true }).click()
     await expect(workbench.getByTestId('workbench-start-panel')).toBeVisible()
-    await openBrowserPanel(page)
+    await workbench.getByTestId('workbench-new-panel-trigger').click()
     await expect(reopen).toBeVisible()
-    await workbench.getByRole('button', { name: 'Reopen closed tab', exact: true }).click()
+    await page.getByRole('menuitem', { name: 'Reopen closed tab', exact: true }).click()
     await expect(workbench).toBeVisible()
+    await expect(workbench.getByRole('tab')).toHaveCount(1)
+    await expect(workbench.getByTestId('browser-start')).toHaveCount(0)
     await expect.poll(counts).toMatchObject({ creates: 1, destroyed: ['browser-second', 'browser-retained'] })
     await expect.poll(() => page.evaluate(() => {
       const probe = (window as unknown as {
         __opensquillaNativeWorkbenchProbe: { createRequests: Array<Record<string, unknown>> }
       }).__opensquillaNativeWorkbenchProbe
-      return probe.createRequests[0]
+      return probe.createRequests.at(-1)
     })).toEqual({ version: 2, surfaceId: 'browser-retained', kind: 'url-preview',
       payload: { url: 'https://example.test/cart', scopeId: SESSION_KEY } })
   })

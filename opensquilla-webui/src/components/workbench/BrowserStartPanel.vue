@@ -46,13 +46,14 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { normalizeBrowserAddress } from '@/workbench/browserItems'
 
-const props = withDefaults(defineProps<{ ready: boolean; canReopen: boolean; canOpenWorkspace?: boolean; canOpenTerminal?: boolean }>(), {
+const props = withDefaults(defineProps<{ ready: boolean; canReopen: boolean; active?: boolean; canOpenWorkspace?: boolean; canOpenTerminal?: boolean }>(), {
+  active: true,
   canOpenWorkspace: false,
   canOpenTerminal: false,
 })
 const emit = defineEmits<{ open: [url: string]; reopen: []; 'open-workspace': []; 'open-terminal': [] }>()
 const { t } = useI18n()
-const address = ref('')
+const address = defineModel<string>({ default: '' })
 const invalid = ref(false)
 const addressRef = ref<HTMLInputElement | null>(null)
 
@@ -63,7 +64,9 @@ function open() {
   if (url) emit('open', url)
 }
 
-onMounted(() => addressRef.value?.focus({ preventScroll: true }))
+onMounted(() => {
+  if (props.active) addressRef.value?.focus({ preventScroll: true })
+})
 </script>
 
 <style scoped>

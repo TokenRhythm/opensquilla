@@ -13,6 +13,7 @@ import { CONVERSATION_EVENTS_KEY, type ConversationEvents } from '@/modules/conv
 import type { Platform } from '@/platform/types'
 import { useNativeSurfaceOcclusionState } from '@/composables/useDialogA11y'
 import { useWorkbenchStore } from '@/workbench/store'
+import { createBrowserWorkbenchItem } from '@/workbench/browserItems'
 import { workbenchPanelRegistry } from '@/workbench/registry'
 import AppWorkbench from './AppWorkbench.vue'
 import { createAssistantChatOwner } from '@/modules/assistantChat'
@@ -58,6 +59,7 @@ type GatewayMenuFixture = { -readonly [K in keyof Pick<GatewayAccess,
   | 'isAuthenticated' | 'subscriptionEpoch' | 'deliveryIdentity'>]: GatewayAccess[K] }
 const menu = () => document.querySelector<HTMLElement>('[data-testid="workbench-new-panel-menu-list"]')
 const option = (kind: PanelKind) => menu()?.querySelector<HTMLButtonElement>(`[data-panel-kind="${kind}"]`) ?? null
+const reopenBrowserOption = () => menu()?.querySelector<HTMLButtonElement>('[data-testid="workbench-reopen-browser"]') ?? null
 async function settle() { for (let index = 0; index < 5; index++) { await Promise.resolve(); await nextTick() } }
 
 beforeEach(() => { localStorage.clear(); workbenchPanelRegistry.clear(); pushToast.mockClear() })
@@ -318,11 +320,13 @@ describe('AppWorkbench new panel menu interaction', () => {
     }
     option('browser')!.click()
     await settle()
-    expect(harness.host.querySelector('[data-testid="browser-start"]')).not.toBeNull()
+    expect(harness.store.activeItem).toMatchObject({
+      kind: 'browser', title: 'workbench.browser.newTab', payload: { initialUrl: 'about:blank' },
+    })
     expect(harness.lifecycle.createSidechat).not.toHaveBeenCalled()
   })
 
-  it('shows the URL form only after choosing Browser and restores cards when its last tab closes', async () => {
+  it('opens a browser tab immediately and restores cards when its last tab closes', async () => {
     const harness = await mount()
     harness.store.closeAllItems()
     harness.store.openEmpty()
@@ -330,18 +334,88 @@ describe('AppWorkbench new panel menu interaction', () => {
     harness.host.querySelector<HTMLButtonElement>('[data-testid="workbench-start-panel"] [data-panel-kind="browser"]')!.click()
     await settle()
     expect(harness.host.querySelector('[data-testid="workbench-start-panel"]')).toBeNull()
-    const address = harness.host.querySelector<HTMLInputElement>('[data-testid="browser-start"] input')!
-    expect(address).not.toBeNull()
-    address.value = 'https://example.com'
-    address.dispatchEvent(new Event('input', { bubbles: true }))
-    harness.host.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
-    await settle()
-    expect(harness.store.activeItem?.kind).toBe('browser')
+    expect(harness.store.activeItem).toMatchObject({
+      kind: 'browser', title: 'workbench.browser.newTab', payload: { initialUrl: 'about:blank' },
+    })
     expect(harness.store.items).toHaveLength(1)
     harness.store.closeItem(harness.store.activeItemId!)
     await settle()
     expect(harness.host.querySelector('[data-testid="workbench-start-panel"]')).not.toBeNull()
     expect(harness.host.querySelector('[data-testid="browser-start"]')).toBeNull()
+  })
+
+  it('reopens the eighth browser directly from the menu without consuming a slot for a blank tab', async () => {
+    const harness = await mount()
+    const browsers = Array.from({ length: 8 }, (_, index) => createBrowserWorkbenchItem({
+      scopeId: 'session-a', url: `https://example.test/page-${index}`,
+    }))
+    for (const item of browsers) expect(harness.store.openItem(item, { activate: false })).toBe(true)
+    harness.store.closeItem(browsers[7]!.id)
+    await harness.open()
+    expect(reopenBrowserOption()).not.toBeNull()
+    reopenBrowserOption()!.click()
+    await settle()
+    expect(menu()).toBeNull()
+    expect(harness.store.items.filter(item => item.kind === 'browser')).toHaveLength(8)
+    expect(harness.store.items.some(item => item.kind === 'browser' && item.payload.initialUrl === 'about:blank')).toBe(false)
+    expect(harness.store.activeItemId).toBe(browsers[7]!.id)
+    expect(harness.store.closedBrowserItems).toHaveLength(0)
+    expect(pushToast).not.toHaveBeenCalled()
+  })
+
+  it('only reopens closed browsers for the current session and ignores a dismissed menu action', async () => {
+    const harness = await mount()
+    const closedA = createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'https://example.test/a' })
+    const closedB = createBrowserWorkbenchItem({ scopeId: 'session-b', url: 'https://example.test/b' })
+    for (const item of [closedA, closedB]) {
+      harness.store.openItem(item, { activate: false })
+      harness.store.closeItem(item.id)
+    }
+    await harness.open()
+    const staleReopen = reopenBrowserOption()
+    expect(staleReopen).not.toBeNull()
+    harness.props.sessionId = 'session-b'
+    await settle()
+    expect(menu()).toBeNull()
+    staleReopen!.click()
+    await settle()
+    expect(harness.store.items.some(item => item.kind === 'browser')).toBe(false)
+    expect(harness.store.closedBrowserItems).toHaveLength(2)
+    harness.store.openEmpty()
+    await settle()
+    await harness.open()
+    reopenBrowserOption()!.click()
+    await settle()
+    expect(harness.store.activeItemId).toBe(closedB.id)
+    expect(harness.store.closedBrowserItems.map(item => item.id)).toEqual([closedA.id])
+    await harness.open()
+    expect(reopenBrowserOption()).toBeNull()
+    harness.props.sessionId = 'session-a'
+    await settle()
+    await harness.open()
+    reopenBrowserOption()!.click()
+    await settle()
+    expect(harness.store.activeItemId).toBe(closedA.id)
+  })
+
+  it('keeps the closed browser recoverable when the menu reopen reaches browser capacity', async () => {
+    const harness = await mount()
+    const closed = createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'https://example.test/closed' })
+    harness.store.openItem(closed, { activate: false })
+    harness.store.closeItem(closed.id)
+    for (let index = 0; index < 8; index += 1) {
+      harness.store.openItem(createBrowserWorkbenchItem({
+        scopeId: 'session-a', url: `https://example.test/open-${index}`,
+      }), { activate: false })
+    }
+    await harness.open()
+    expect(reopenBrowserOption()).not.toBeNull()
+    reopenBrowserOption()!.click()
+    await settle()
+    expect(harness.store.items.filter(item => item.kind === 'browser')).toHaveLength(8)
+    expect(harness.store.activeItemId).toBe('existing-panel')
+    expect(harness.store.closedBrowserItems.map(item => item.id)).toEqual([closed.id])
+    expect(pushToast).toHaveBeenCalledWith('workbench.itemLimitReached', { tone: 'warn', duration: 6000 })
   })
 
   it('keeps the plus beside an existing panel and omits denial copy on available entries', async () => {

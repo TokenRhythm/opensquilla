@@ -106,6 +106,19 @@
               <small v-if="option.disabledReason">{{ option.disabledReason }}</small>
             </span>
           </button>
+          <button
+            v-if="canReopenBrowser"
+            type="button"
+            role="menuitem"
+            class="app-workbench__new-panel-option"
+            data-testid="workbench-reopen-browser"
+            @click="reopenBrowserFromMenu"
+          >
+            <Icon name="refresh" :size="16" aria-hidden="true" />
+            <span class="app-workbench__new-panel-option-copy">
+              <span>{{ t('workbench.browser.reopen') }}</span>
+            </span>
+          </button>
         </div>
         </Teleport>
       </div>
@@ -230,16 +243,7 @@
     </template>
 
     <template #empty>
-      <BrowserStartPanel
-        v-if="browserStartRequested"
-        :key="`${sessionId}:${browserStartSequence}`"
-        :ready="canOpenBrowser"
-        :can-reopen="store.closedBrowserItems.some(item => item.scope.type === 'session'
-          && item.scope.id === sessionId)"
-        @open="openBrowserUrl($event, true)"
-        @reopen="reopenBrowser"
-      />
-      <section v-else class="app-workbench__start" data-testid="workbench-start-panel" :aria-busy="panelContextLoading">
+      <section class="app-workbench__start" data-testid="workbench-start-panel" :aria-busy="panelContextLoading">
         <h2>{{ t('workbench.newPanel.title') }}</h2>
         <div class="app-workbench__start-options">
           <button
@@ -410,7 +414,6 @@ import { createAssistantChatWorkbenchDefinition } from './assistantChatWorkbench
 import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import type { WorkbenchLayoutMode } from '@/workbench/layout'
-import BrowserStartPanel from './BrowserStartPanel.vue'
 import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
 import { createTabThumbnailCache } from '@/workbench/tabThumbnailCache'
 import { createNativeTabSnapshots } from './nativeTabSnapshots'
@@ -494,7 +497,6 @@ interface NewPanelOption {
   disabledReason?: string
 }
 const newPanelMenuOpen = ref(false)
-const browserStartRequested = ref(false)
 const newPanelMenuTopmost = useDialogLayer(newPanelMenuOpen)
 const newPanelMenuRoot = ref<HTMLElement | null>(null)
 const newPanelMenu = ref<HTMLElement | null>(null)
@@ -522,6 +524,8 @@ const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && props.
 const newPanelMenuVisible = computed(() => Boolean(nativeApi || workspaceFiles || terminal || referenceGateway))
 
 const panelContextLoading = computed(() => !sessionReady.value || props.sessionLoading)
+const canReopenBrowser = computed(() => canOpenBrowser.value && !panelContextLoading.value && !preparingPanel.value
+  && store.closedBrowserItems.some(item => item.scope.type === 'session' && item.scope.id === props.sessionId))
 // A pending session has unknown capabilities, not fewer capabilities. Preserve
 // the last settled entry positions while resolving the next session; these are
 // presentation keys only and never grant access to the previous session.
@@ -667,7 +671,6 @@ const baseOrigin = (() => {
   ) return 'opensquilla-app://desktop'
   return window.location.origin
 })()
-const browserStartSequence = ref(0)
 const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
   nativeWorkbenchApi: nativeApi,
   setExpanded: expanded => {
@@ -778,11 +781,6 @@ watch(() => store.activeSessionId, () => {
   tabMenu.value?.cancel()
   menuItemId.value = null
   closeNewPanelMenu()
-  browserStartRequested.value = false
-})
-watch(() => props.sessionId, () => { browserStartRequested.value = false })
-watch(() => store.visibleItems.length, (count, previous) => {
-  if (count === 0 && previous > 0) browserStartRequested.value = false
 })
 watch(() => [props.enabled, props.routeActive, props.modalBlocked, store.expanded], () => {
   if (!props.enabled || !props.routeActive || props.modalBlocked || !store.expanded) closeNewPanelMenu()
@@ -990,11 +988,9 @@ function openBrowserUrl(value: string, newTab = false) {
 }
 
 function openBrowserStart() {
+  if (!canOpenBrowser.value) return
   closeNewPanelMenu()
-  browserStartRequested.value = true
-  browserStartSequence.value += 1
-  store.openEmpty()
-  store.requestReveal()
+  openBrowserUrl('about:blank', true)
 }
 
 function openWorkspaceFiles() {
@@ -1065,6 +1061,13 @@ async function launchSideChatCommand(request: SideChatLaunchRequest): Promise<bo
   if (!current()) return false
   const accepted = await sideChatHandles.get(itemId)?.launchSideChat({ ...request, isCurrent: current }) ?? false
   return accepted
+}
+
+function reopenBrowserFromMenu() {
+  if (!newPanelMenuOpen.value || !props.routeActive || !props.enabled || props.modalBlocked
+    || !store.expanded || !canReopenBrowser.value) return
+  closeNewPanelMenu()
+  reopenBrowser()
 }
 
 function reopenBrowser() {
@@ -1556,10 +1559,17 @@ function panelProps(
   active: boolean,
   nativeSurface: boolean,
 ): Readonly<Record<string, unknown>> {
-  return workbenchPanelRegistry.resolve(item)?.getProps?.(
+  const resolved = workbenchPanelRegistry.resolve(item)?.getProps?.(
     item,
     panelRenderState(item, active, nativeSurface),
   ) || {}
+  if (item.kind !== 'browser') return resolved
+  return {
+    ...resolved,
+    active,
+    canReopen: store.closedBrowserItems.some(closed => closed.scope.type === 'session'
+      && item.scope.type === 'session' && closed.scope.id === item.scope.id),
+  }
 }
 
 function artifactNavigationItems(
@@ -1724,6 +1734,11 @@ function panelEventHandler(item: WorkbenchItem) {
 }
 
 function handlePanelEvent(item: WorkbenchItem, event: WorkbenchComponentEvent) {
+  if (event.type === 'browser-reopen') {
+    if (item.kind === 'browser' && store.activeItemId === item.id
+      && item.scope.type === 'session' && item.scope.id === props.sessionId) reopenBrowser()
+    return
+  }
   if (event.type === 'preview-thumbnail' && event.payload instanceof Blob) {
     // The Office navigator already rendered this image for the visible document.
     // Store a bounded independent URL so closing its renderer cannot break the tab card.
