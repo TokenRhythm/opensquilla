@@ -22,16 +22,16 @@ function toPlain(value) {
 }
 
 const defaults = {
-  c0: { provider: 'tokenrhythm', model: 'qwen3.7-flash' },
-  c1: { provider: 'tokenrhythm', model: 'deepseek-flash' },
-  c2: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813' },
-  c3: { provider: 'tokenrhythm', model: 'glm-5.3', ensembleEnabled: false },
+  c0: { provider: 'tokenrhythm', model: 'qwen3.8-flash' },
+  c1: { provider: 'tokenrhythm', model: 'deepseek-v4.1-flash-1017' },
+  c2: { provider: 'tokenrhythm', model: 'glm-5.3' },
+  c3: { provider: 'tokenrhythm', model: 'kimi-k3', ensembleEnabled: false },
 }
 assert.equal(defaultRouterTiers('openrouter', 'recommended').c1.provider, 'openrouter')
 assert.equal(defaultRouterTiers('tokenrhythm', 'recommended').c3.ensembleEnabled, false)
 const textTiers = ['c0', 'c1', 'c2', 'c3']
 for (const [provider, models] of Object.entries({
-  openrouter: ['qwen/qwen3.7-flash', 'deepseek/deepseek-v4-flash-0731', 'deepseek/deepseek-v4-pro-0813', 'z-ai/glm-5.3'],
+  openrouter: ['qwen/qwen3.8-flash', 'deepseek/deepseek-v4.1-flash-1017', 'z-ai/glm-5.3', 'moonshotai/kimi-k3'],
   tokenrhythm: Object.values(defaults).map(tier => tier.model),
 })) {
   const profile = defaultRouterTiers(provider, 'recommended')
@@ -59,7 +59,7 @@ assert.equal(update({}, savedFusion).routerTiers.c3.ensembleEnabled, true)
 assert.equal(update({}, savedFusion).routerTiers.c3.model, 'glm-5.2')
 const resetFusion = update({ routerResetToRecommended: true }, savedFusion)
 assert.equal(resetFusion.routerTiers.c3.ensembleEnabled, false)
-assert.equal(resetFusion.routerTiers.c3.model, 'glm-5.3')
+assert.equal(resetFusion.routerTiers.c3.model, 'kimi-k3')
 
 for (const invalid of [undefined, null, '', 'recommended', 'FOLLOW_PRIMARY', {}, true]) {
   assert.equal(normalizeRouterPresetBinding(invalid), undefined)

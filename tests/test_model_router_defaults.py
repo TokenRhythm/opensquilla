@@ -465,12 +465,12 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     for name in ("c0", "c1", "c2", "c3", "image_model"):
         assert tiers[name]["provider"] == "tokenrhythm"
         assert "thinking_level" not in tiers[name]
-    assert tiers["c0"]["model"] == "qwen3.7-flash"
+    assert tiers["c0"]["model"] == "qwen3.8-flash"
     assert tiers["c0"]["supports_image"] is False
-    assert tiers["c1"]["model"] == "deepseek-flash"
-    assert tiers["c2"]["model"] == "deepseek-v4-pro-0813"
+    assert tiers["c1"]["model"] == "deepseek-v4.1-flash-1017"
+    assert tiers["c2"]["model"] == "glm-5.3"
     assert tiers["c2"]["supports_image"] is False
-    assert tiers["c3"]["model"] == "glm-5.3"
+    assert tiers["c3"]["model"] == "kimi-k3"
     assert tiers["c3"]["ensemble_enabled"] is False
     assert "ensemble_selection_mode" not in tiers["c3"]
     assert tiers["image_model"]["model"] == "kimi-k2.6"

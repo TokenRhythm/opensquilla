@@ -189,7 +189,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # router uses four single-model tiers; enable the shared plan explicitly when
 # C3 should use fusion. Keep this global switch off for single-model routing.
 # C3 fusion itself does not handle images. Image requests use a configured
-# C0-C3 tier with catalog-proven vision support (Qwen3.7 Flash in this preset).
+# C0-C3 tier with catalog-proven vision support (Qwen3.8 Flash in this preset).
 # image_model is retained below for legacy configuration compatibility.
 # The static_tokenrhythm_b5 profile remains available as an opt-in legacy
 # fusion plan. It needs a TokenRhythm credential: the [llm] api_key when
@@ -389,7 +389,7 @@ auto_thinking = true
 rollout_phase = "full"
 strategy = "v4_phase3"
 # Optional provider tier profile. Leave unset to preserve the built-in
-# OpenRouter defaults below. If set, it must match [llm].provider; the router
+# TokenRhythm defaults below. If set, it must match [llm].provider; the router
 # does not switch providers at runtime.
 # tier_profile = "dashscope"  # openrouter | dashscope | deepseek | gemini | volcengine | openai | zhipu | moonshot
 # Bundled router prerequisites:
@@ -418,26 +418,26 @@ estimated_output_savings_pct = 0.03
 # on C1), and explicit turn settings remain available for compatible models.
 [squilla_router.tiers.c0]
 provider = "tokenrhythm"
-model = "qwen3.7-flash"
-description = "Fast Qwen3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
+model = "qwen3.8-flash"
+description = "Fast Qwen3.8 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
 supports_image = false
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-flash"
-description = "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-v4.1-flash-1017"
+description = "Default DeepSeek V4.1 Flash 1017 route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro-0813"
-description = "Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+model = "glm-5.3"
+description = "Stronger GLM 5.3 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
 supports_image = false
 
 [squilla_router.tiers.c3]
 provider = "tokenrhythm"
-model = "glm-5.3"
-description = "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
+model = "kimi-k3"
+description = "Highest-tier Kimi K3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
 supports_image = false
 ensemble_enabled = false
 

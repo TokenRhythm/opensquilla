@@ -1312,7 +1312,7 @@ try {
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
   assert.equal(await page.locator('#modelEditor').isVisible(), false)
   assert.equal(await page.locator('#modelSummaryLabel').innerText(), '推荐模型')
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-flash')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4.1-flash-1017')
   assert.deepEqual(
     await page.evaluate(() => [
       getComputedStyle(document.getElementById('providerSelectLabel')).fontSize,
@@ -1422,7 +1422,7 @@ try {
 
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm')
   assert.equal(await page.locator('#baseUrl').inputValue(), 'https://tokenrhythm.studio/v1')
-  assert.equal(await page.locator('#model').inputValue(), 'deepseek-flash')
+  assert.equal(await page.locator('#model').inputValue(), 'deepseek-v4.1-flash-1017')
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
 
@@ -1487,7 +1487,7 @@ try {
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-flash')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4.1-flash-1017')
   await page.locator('#apiKey').fill('synthetic-tokenrhythm-key')
   assert.equal(await page.locator('.inline-search-section').isVisible(), true)
   assert.equal(await page.locator('#inlineSearchHeading').innerText(), 'Choose web search')
@@ -1594,11 +1594,11 @@ try {
   const remainingGrowthSpool = await readDirectoryOrEmpty(join(earlySpoolRoot, 'growth'))
   assert.equal(remainingGrowthSpool.some(isManagedTelemetrySpoolEntry), false)
   assert.equal(credential.routerDefaultTier, 'c1')
-  assert.equal(credential.model, 'deepseek-flash')
-  assert.equal(credential.routerTiers.c0.model, 'qwen3.7-flash')
-  assert.equal(credential.routerTiers.c1.model, 'deepseek-flash')
-  assert.equal(credential.routerTiers.c2.model, 'deepseek-v4-pro-0813')
-  assert.equal(credential.routerTiers.c3.model, 'glm-5.3')
+  assert.equal(credential.model, 'deepseek-v4.1-flash-1017')
+  assert.equal(credential.routerTiers.c0.model, 'qwen3.8-flash')
+  assert.equal(credential.routerTiers.c1.model, 'deepseek-v4.1-flash-1017')
+  assert.equal(credential.routerTiers.c2.model, 'glm-5.3')
+  assert.equal(credential.routerTiers.c3.model, 'kimi-k3')
   assert.equal(Object.hasOwn(credential.routerTiers.c0, 'supportsImage'), false)
   assert.equal(Object.hasOwn(credential.routerTiers.c1, 'supportsImage'), false)
   assert.equal(Object.hasOwn(credential.routerTiers.c2, 'supportsImage'), false)
@@ -1607,11 +1607,11 @@ try {
   assert.equal(credential.routerTiers.image_model.model, 'kimi-k2.6')
   assert.equal(Object.hasOwn(credential.routerTiers.image_model, 'supportsImage'), false)
   assert.match(config, /\[squilla_router\]\nenabled = true/)
-  assert.match(config, /\[llm\][\s\S]*?model = "deepseek-flash"/)
-  assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "qwen3.7-flash"/)
-  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-flash"/)
-  assert.match(config, /\[squilla_router\.tiers\.c2\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-pro-0813"/)
-  assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.3"[\s\S]*?ensemble_enabled = false/)
+  assert.match(config, /\[llm\][\s\S]*?model = "deepseek-v4.1-flash-1017"/)
+  assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "qwen3.8-flash"/)
+  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4.1-flash-1017"/)
+  assert.match(config, /\[squilla_router\.tiers\.c2\]\nprovider = "tokenrhythm"\nmodel = "glm-5.3"/)
+  assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "kimi-k3"[\s\S]*?ensemble_enabled = false/)
   assert.doesNotMatch(config, /thinking_level\s*=/)
   assert.doesNotMatch(config, /supports_image\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
@@ -1731,7 +1731,7 @@ try {
   const routerCredentialPath = join(userDataDir, 'desktop-credential.json')
   const operatorConfig = config
     .replace('preset_binding = "follow_primary"', 'preset_binding = "custom"')
-    .replace('model = "qwen3.7-flash"', 'model = "operator-custom-c0"')
+    .replace('model = "qwen3.8-flash"', 'model = "operator-custom-c0"')
     + '\n[squilla_router.budget_gate]\naction = "cap"\nlimit_usd = 2.5\n'
   await writeFile(routerConfigPath, operatorConfig)
   const operatorRouter = desktopRouterConfigTomlLines(credential, operatorConfig, 'preserve')
@@ -1764,7 +1764,7 @@ try {
   const reset = await saveDesktop({ routerResetToRecommended: true,
     routerTiers: { c1: { provider: 'tokenrhythm', model: 'untrusted-renderer-model' } } })
   assert.equal(reset.routerPresetBinding, 'follow_primary')
-  assert.equal(reset.routerTiers.c1.model, 'deepseek-flash')
+  assert.equal(reset.routerTiers.c1.model, 'deepseek-v4.1-flash-1017')
   assert.match(await readFile(routerConfigPath, 'utf8'), /preset_binding = "follow_primary"/)
 
   // Switching a generated Desktop profile must follow config.toml ownership,
