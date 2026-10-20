@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import structlog
 
 from opensquilla.session.sidechat import set_state, sidechat_metadata
+from opensquilla.session.storage import StorageBusyError, _is_sqlite_busy
 
 _leases: dict[tuple[int, str], asyncio.Task[None]] = {}
 log = structlog.get_logger(__name__)
@@ -35,13 +37,28 @@ def watch_sidechat_lease(
         return
 
     async def watch() -> None:
+        delay = 0.25
+        next_warning = 0.0
         try:
             while True:
-                node = await storage.get_session(key)
-                metadata = sidechat_metadata(node)
-                if metadata is None or metadata.get("state") == "closed":
-                    return
-                parent = await storage.get_session(metadata["parentKey"])
+                try:
+                    node = await storage.get_session(key)
+                    metadata = sidechat_metadata(node)
+                    if metadata is None or metadata.get("state") == "closed":
+                        return
+                    parent = await storage.get_session(metadata["parentKey"])
+                except (StorageBusyError, sqlite3.OperationalError) as exc:
+                    if not isinstance(exc, StorageBusyError) and not _is_sqlite_busy(exc):
+                        raise
+                    now = time.monotonic()
+                    if now >= next_warning:
+                        log.warning("sidechat.lease_read_deferred", session_key=key)
+                        next_warning = now + 30
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 5.0)
+                    continue
+                delay = 0.25
+                next_warning = 0.0
                 parent_changed = (
                     parent is None
                     or parent.session_id != metadata["parentSessionId"]
@@ -61,8 +78,13 @@ def watch_sidechat_lease(
                         await asyncio.sleep(5)
                         continue
                 await asyncio.sleep(min(remaining, 60))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("sidechat.lease_watch_failed", session_key=key)
         finally:
-            _leases.pop(identity, None)
+            if _leases.get(identity) is asyncio.current_task():
+                _leases.pop(identity, None)
 
     _leases[identity] = asyncio.create_task(watch(), name=f"sidechat-lease:{key}")
 

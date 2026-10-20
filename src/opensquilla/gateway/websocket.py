@@ -58,6 +58,7 @@ from opensquilla.gateway.transport_flow import (
     CONTROL_BUFFER_FRAMES,
     FLOW_CAPABILITY,
     FLOW_CAPABILITY_V2,
+    FLOW_LANE_WINDOW_BYTES,
     FLOW_V2_MAX_LANE_EPOCHS,
     FLOW_V2_MAX_LANES,
     FLOW_WINDOW_BYTES,
@@ -194,6 +195,7 @@ class _PendingReplay:
     batches: tuple[tuple[Any, ...], ...]
     proof: dict[str, Any]
     batch_index: int = 0
+    batch_offset: int = 0
     pending_delivery_ids: set[int] = field(default_factory=set)
     pending_delivery_lanes: dict[int, tuple[str | None, str | None]] = field(default_factory=dict)
 
@@ -852,60 +854,114 @@ class WsConnection:
         pending.transfer.close()
         self._clear_covered_global_flow()
 
+    def _prepare_replay_suffix(
+        self, pending: _PendingReplay, *, lane_epoch: str | None,
+    ) -> list[tuple[int, _OutboundFrame, int, int]]:
+        """Validate a logical batch before reserving or publishing its prefix."""
+        from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
+
+        assert self._flow is not None
+        prepared: list[tuple[int, _OutboundFrame, int, int]] = []
+        batch = pending.batches[pending.batch_index]
+        for offset in range(pending.batch_offset, len(batch)):
+            event = batch[offset]
+            projected = project_session_event_for_client(
+                event.event_name, event.payload, client_caps=self.client_caps,
+            )
+            if projected is None:
+                continue
+            name, payload = projected
+            frame = _OutboundFrame(
+                f"event:{name}", "control", payload, name, None,
+                # These coordinates describe the logical batch. A byte-limited
+                # physical segment keeps them stable across ACKs and retries.
+                meta={"replayed": True, "replay_batch": {
+                    "index": pending.batch_index, "count": len(pending.batches),
+                }},
+            )
+            try:
+                encoded, size, wire_size = self._encode_flow_event(
+                    frame, delivery_id=self._flow.next_id + len(prepared),
+                    lane_epoch=lane_epoch, event_offset=len(prepared),
+                )
+            except _FlowAdmissionError as exc:
+                raise SnapshotTransferError("SNAPSHOT_STALE") from exc
+            if wire_size > MAX_PAYLOAD_BYTES or (
+                self._flow_lane_enabled
+                and size > FLOW_LANE_WINDOW_BYTES * FLOW_V2_MAX_LANES
+            ):
+                # This event cannot fit even with empty credit. A new snapshot
+                # must absorb it; retrying the same frozen base stays impossible.
+                raise SnapshotTransferError("SNAPSHOT_STALE")
+            frame.encoded_text = encoded
+            prepared.append((offset, frame, size, wire_size))
+        return prepared
+
     def _queue_pending_replay_batch(self, pending: _PendingReplay) -> None:
-        """Queue one bounded replay batch, advancing empty batches synchronously."""
+        """Publish one owned byte segment, then wait for all of its ACKs."""
         from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
 
         flow = self._flow
         if flow is None or self._pending_replays.get(pending.key) is not pending:
             return
-        while pending.batch_index < len(pending.batches):
-            batch = pending.batches[pending.batch_index]
-            frames: list[_OutboundFrame] = []
-            total_bytes = 0
-            for event in batch:
-                projected = project_session_event_for_client(
-                    event.event_name, event.payload, client_caps=self.client_caps,
-                )
-                if projected is None:
-                    continue
-                name, payload = projected
-                frames.append(_OutboundFrame(
-                    f"event:{name}", "control", payload, name, None,
-                    meta={"replayed": True, "replay_batch": {
-                        "index": pending.batch_index, "count": len(pending.batches),
-                    }},
-                ))
-                encoded = make_event(
-                    name,
-                    encode_payload_for_protocol(payload, protocol=self.protocol),
-                    meta={"replayed": True, "replay_batch": {
-                        "index": pending.batch_index, "count": len(pending.batches),
-                    }},
-                ).model_dump_json(exclude={"seq"})
-                total_bytes += len(encoded.encode("utf-8")) + 32
-            ordinary = [item for item in flow.deliveries.values() if not item.recovery]
+        if pending.pending_delivery_ids:
+            return
+        if self._outbox is None:
+            raise SnapshotTransferError("SNAPSHOT_BUSY")
+        lane_epoch = (
+            self._subscriptions.get_message_subscription_epoch(self.conn_id, pending.key)
+            if self._flow_lane_enabled and self._subscriptions is not None else None
+        )
+        if self._session_flow_v2_enabled:
+            if lane_epoch is None:
+                raise SnapshotTransferError("SNAPSHOT_STALE")
             if (
-                self._outbox is None
-                or self._outbox.qsize() + len(frames) + 1 > self._outbox.maxsize
-                or len(ordinary) + len(frames) > FLOW_WINDOW_FRAMES
-                or sum(item.size for item in ordinary) + total_bytes > FLOW_WINDOW_BYTES
+                lane_epoch not in self._flow_lane_epochs
+                and not self._register_flow_subscription_epoch(pending.key)
             ):
                 raise SnapshotTransferError("SNAPSHOT_BUSY")
+        while pending.batch_index < len(pending.batches):
+            batch = pending.batches[pending.batch_index]
+            prepared = self._prepare_replay_suffix(pending, lane_epoch=lane_epoch)
+            # Keep one queue slot for the resume/control reply. Admission and
+            # publication below never yield, so another producer cannot take it.
+            capacity = max(0, self._outbox.maxsize - self._outbox.qsize() - 1)
+            frames: list[_OutboundFrame] = []
             delivery_ids: set[int] = set()
             delivery_lanes: dict[int, tuple[str | None, str | None]] = {}
-            for frame in frames:
-                self._enqueue_frame(frame)
-                if frame.delivery_id is None:
-                    raise SnapshotTransferError("SNAPSHOT_BUSY")
-                delivery_ids.add(frame.delivery_id)
-                delivery = flow.deliveries.get(frame.delivery_id)
-                if delivery is None:
-                    raise SnapshotTransferError("SNAPSHOT_BUSY")
-                delivery_lanes[frame.delivery_id] = (delivery.lane, delivery.lane_epoch)
+            next_offset = len(batch)
+            for offset, frame, size, wire_size in prepared:
+                if len(frames) >= capacity:
+                    next_offset = offset
+                    break
+                # Use real lane, aggregate and connection/global credit. A
+                # refused suffix is backpressure, not a new dirty barrier.
+                delivery_id = flow.admit(
+                    size, wire_size=wire_size,
+                    lane=pending.key if self._flow_lane_enabled else None,
+                    lane_epoch=lane_epoch,
+                )
+                if delivery_id is None:
+                    next_offset = offset
+                    break
+                frame.delivery_id = delivery_id
+                frames.append(frame)
+                delivery_ids.add(delivery_id)
+                delivery_lanes[delivery_id] = (
+                    flow.deliveries[delivery_id].lane, lane_epoch,
+                )
+            if prepared and not frames:
+                raise SnapshotTransferError("SNAPSHOT_BUSY")
+            # Every admitted frame has its pending owner before the first
+            # frame becomes visible to the writer. Never replay an ACKed prefix.
             pending.pending_delivery_ids = delivery_ids
             pending.pending_delivery_lanes = delivery_lanes
-            pending.batch_index += 1
+            pending.batch_offset = next_offset
+            if next_offset == len(batch):
+                pending.batch_index += 1
+                pending.batch_offset = 0
+            for frame in frames:
+                self._enqueue_frame(frame)
             if delivery_ids:
                 return
             # A projection-empty batch has no client consumption to await.
@@ -926,6 +982,9 @@ class WsConnection:
                 self._queue_pending_replay_batch(pending)
             except Exception:
                 self._mark_flow_dirty({"session_key": pending.key})
+                # Recovery was already dirty; notify the client that this
+                # accepted replay can no longer complete.
+                self._queue_flow_dirty_notice()
                 pending.transfer.close()
                 self._pending_replays.pop(pending.key, None)
 
@@ -974,6 +1033,7 @@ class WsConnection:
                 self._queue_pending_replay_batch(pending)
             except Exception:
                 self._mark_flow_dirty({"session_key": pending.key})
+                self._queue_flow_dirty_notice()
                 pending.transfer.close()
                 self._pending_replays.pop(pending.key, None)
 
@@ -2288,6 +2348,44 @@ class WsConnection:
                 text = make_event("transport.flow.dirty", fallback).model_dump_json(exclude={"seq"})
         return text
 
+    def _encode_flow_event(
+        self, frame: _OutboundFrame, *, delivery_id: int | None = None,
+        lane_epoch: str | None = None, event_offset: int = 0,
+    ) -> tuple[str, int, int]:
+        """Encode and measure an event without mutating credit or queue state."""
+        assert self._flow is not None and self._outbox is not None
+        assert frame.event_name is not None
+        meta = dict(frame.meta or {})
+        if delivery_id is not None:
+            meta["flow"] = {
+                "delivery_epoch": self._flow.epoch, "delivery_id": delivery_id,
+            }
+            if self._session_flow_v2_enabled and lane_epoch is not None:
+                meta["session_flow_v2"] = {
+                    "connection_epoch": self._flow.epoch,
+                    "subscription_epoch": lane_epoch, "delivery_id": delivery_id,
+                }
+        estimated_payload_size = _bounded_json_size(frame.payload, MAX_PAYLOAD_BYTES)
+        if estimated_payload_size > MAX_PAYLOAD_BYTES:
+            raise _FlowAdmissionError(
+                "Outbound event exceeds the wire limit",
+                reason_code="frame_wire_limit", wire_bytes=estimated_payload_size,
+            )
+        encoded = make_event(
+            frame.event_name,
+            encode_payload_for_protocol(frame.payload, protocol=self.protocol),
+            meta=meta or None,
+        ).model_dump_json(exclude={"seq"})
+        encoded_size = len(encoded.encode("utf-8"))
+        pending_events = sum(
+            isinstance(queued, _OutboundFrame) and queued.event_name is not None
+            for queued in self._outbox._queue  # type: ignore[attr-defined]
+        )
+        wire_size = encoded_size + len(
+            f',"seq":{self._seq + pending_events + event_offset + 1}'
+        )
+        return encoded, encoded_size + 32, wire_size
+
     def _prepare_flow_frame(self, frame: _OutboundFrame) -> bool:
         assert self._flow is not None
         if frame.encoded_text is not None:
@@ -2314,9 +2412,8 @@ class WsConnection:
                         max(prior[1], sequence),
                     )
                 return False
-            meta = dict(frame.meta or {})
+            lane_epoch = None
             if is_stream:
-                lane_epoch = None
                 if (
                     self._flow_lane_enabled
                     and isinstance(key, str)
@@ -2334,10 +2431,6 @@ class WsConnection:
                     # is pruned, so publication must use current subscription
                     # authority rather than relying on historical CLOSED keys.
                     return False
-                meta["flow"] = {
-                    "delivery_epoch": self._flow.epoch,
-                    "delivery_id": self._flow.next_id,
-                }
                 if self._session_flow_v2_enabled and lane_epoch is not None:
                     if lane_epoch not in self._flow_lane_epochs:
                         if not self._register_flow_subscription_epoch(key):
@@ -2345,32 +2438,10 @@ class WsConnection:
                                 "Too many unretired session flow lanes",
                                 reason_code="lane_epoch_limit",
                             )
-                    meta["session_flow_v2"] = {
-                        "connection_epoch": self._flow.epoch,
-                        "subscription_epoch": lane_epoch,
-                        "delivery_id": self._flow.next_id,
-                    }
-            estimated_payload_size = _bounded_json_size(frame.payload, MAX_PAYLOAD_BYTES)
-            if estimated_payload_size > MAX_PAYLOAD_BYTES:
-                raise _FlowAdmissionError(
-                    "Outbound event exceeds the wire limit",
-                    reason_code="frame_wire_limit", wire_bytes=estimated_payload_size,
-                )
-            encoded = make_event(
-                frame.event_name,
-                encode_payload_for_protocol(frame.payload, protocol=self.protocol),
-                meta=meta or None,
-            ).model_dump_json(exclude={"seq"})
-            encoded_size = len(encoded.encode("utf-8"))
-            size = encoded_size + 32  # bounded writer-assigned seq field
-            # This synchronous FIFO admission cannot be overtaken by another
-            # producer. Responses do not mint seq; only queued events count.
-            assert self._outbox is not None
-            pending_events = sum(
-                isinstance(queued, _OutboundFrame) and queued.event_name is not None
-                for queued in self._outbox._queue  # type: ignore[attr-defined]
+            encoded, size, wire_size = self._encode_flow_event(
+                frame, delivery_id=self._flow.next_id if is_stream else None,
+                lane_epoch=lane_epoch,
             )
-            wire_size = encoded_size + len(f',"seq":{self._seq + pending_events + 1}')
             if frame.event_name == "transport.flow.dirty" and frame.delivery_id is None:
                 # The writer refreshes this coalesced notice with every dirty
                 # key discovered while it was queued. Reserve an initial

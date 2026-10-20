@@ -12,6 +12,8 @@ import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from opensquilla.session.usage_titles import resolve_usage_titles_on_conn
+
 USAGE_ATTRIBUTION_SCHEMA = (
     """CREATE TABLE IF NOT EXISTS usage_attribution_owners (
         session_id TEXT NOT NULL, session_epoch INTEGER NOT NULL,
@@ -142,7 +144,8 @@ async def ensure_usage_owner_on_conn(
         )
     elif status == "partial":
         branch = "unattributed"
-    title = str(_value(node, "display_name") or _value(node, "derived_title") or "")[:240]
+    titles = await resolve_usage_titles_on_conn(conn, [node]) if node is not None else {}
+    title = titles.get(identity, "")
     owner = {
         "session_id": session_id,
         "session_epoch": session_epoch,

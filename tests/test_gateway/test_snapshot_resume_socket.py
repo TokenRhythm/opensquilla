@@ -5,6 +5,7 @@ import json
 import socket
 from types import SimpleNamespace
 
+import pytest
 import uvicorn
 from starlette.applications import Starlette
 from starlette.routing import WebSocketRoute
@@ -21,7 +22,10 @@ from opensquilla.session.storage import SessionStorage
 assert rpc_sessions and rpc_transport
 
 
-async def test_two_session_pending_resume_retries_over_real_socket(tmp_path, monkeypatch):
+@pytest.mark.parametrize("text_bytes", [1, 150_000])
+async def test_two_session_pending_resume_retries_over_real_socket(
+    tmp_path, monkeypatch, text_bytes,
+):
     registry = websocket.ConnectionRegistry()
     streams = session_streams.SessionStreamRegistry(stream_generation="resume-retry-socket")
     monkeypatch.setattr(websocket, "_registry", registry)
@@ -111,10 +115,13 @@ async def test_two_session_pending_resume_retries_over_real_socket(tmp_path, mon
                     "key", "sync_revision", "snapshot_id", "stream_generation",
                 )} | {"stream_seq": part["current_stream_seq"]}
                 for index in range(17):
-                    streams.record(key, "session.event.text_delta", {"text": str(index)})
+                    streams.record(key, "session.event.text_delta", {
+                        "text": str(index).ljust(text_bytes, "x"),
+                    })
 
             proofs = {key: await rpc("sessions.messages.resume", receipts[key]) for key in keys}
-            for expected_count in (8, 16, 17):
+            segment_counts = (8, 16, 17) if text_bytes == 1 else range(1, 18)
+            for expected_count in segment_counts:
                 for key in keys:
                     current = replay_frames(key)
                     assert len(current) == expected_count
@@ -134,6 +141,9 @@ async def test_two_session_pending_resume_retries_over_real_socket(tmp_path, mon
             for key in keys:
                 assert len(replay_frames(key)) == 17
                 assert len({frame["payload"]["stream_seq"] for frame in replay_frames(key)}) == 17
+                assert [frame["meta"]["replay_batch"] for frame in replay_frames(key)] == [
+                    {"index": index // 8, "count": 3} for index in range(17)
+                ]
                 assert await rpc("sessions.messages.resume", receipts[key]) == proofs[key]
                 await rpc("sessions.messages.snapshot.release", {
                     name: receipts[key][name] for name in ("key", "sync_revision", "snapshot_id")
