@@ -143,6 +143,26 @@ describe('chat route header bridge', () => {
     expect(bridge.model.sessionLoading.value).toBe(false)
   })
 
+  it('changes the workbench context when the same session acquires a new route owner', () => {
+    const bridge = createBridge()
+    const first = owner('same-session')
+    first.model.sessionRefreshing = ref(true)
+    first.model.sessionContext = ref('gateway-a:epoch-0')
+    const stale = bridge.register(first.model, first.commands)
+    const originalContext = bridge.model.sessionContext.value
+    expect(bridge.model.sessionRefreshing.value).toBe(true)
+    const replacement = owner('same-session')
+    const context = ref('gateway-a:epoch-0')
+    replacement.model.sessionContext = context
+    bridge.register(replacement.model, replacement.commands)
+    expect(stale.release()).toBe(false)
+    expect(bridge.model.sessionContext.value).not.toBe(originalContext)
+    expect(bridge.model.sessionRefreshing.value).toBe(false)
+    const replacementContext = bridge.model.sessionContext.value
+    context.value = 'gateway-a:epoch-1'
+    expect(bridge.model.sessionContext.value).not.toBe(replacementContext)
+  })
+
   it('keeps optional find capability absent for existing header owners', () => {
     const bridge = createBridge()
     const current = owner('old')

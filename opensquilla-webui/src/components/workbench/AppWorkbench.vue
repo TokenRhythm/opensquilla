@@ -106,6 +106,19 @@
               <small v-if="option.disabledReason">{{ option.disabledReason }}</small>
             </span>
           </button>
+          <button
+            v-if="canReopenBrowser"
+            type="button"
+            role="menuitem"
+            class="app-workbench__new-panel-option"
+            data-testid="workbench-reopen-browser"
+            @click="reopenBrowserFromMenu"
+          >
+            <Icon name="refresh" :size="16" aria-hidden="true" />
+            <span class="app-workbench__new-panel-option-copy">
+              <span>{{ t('workbench.browser.reopen') }}</span>
+            </span>
+          </button>
         </div>
         </Teleport>
       </div>
@@ -230,16 +243,7 @@
     </template>
 
     <template #empty>
-      <BrowserStartPanel
-        v-if="browserStartRequested"
-        :key="`${sessionId}:${browserStartSequence}`"
-        :ready="canOpenBrowser"
-        :can-reopen="store.closedBrowserItems.some(item => item.scope.type === 'session'
-          && item.scope.id === sessionId)"
-        @open="openBrowserUrl($event, true)"
-        @reopen="reopenBrowser"
-      />
-      <section v-else class="app-workbench__start" data-testid="workbench-start-panel" :aria-busy="panelContextLoading">
+      <section class="app-workbench__start" data-testid="workbench-start-panel" :aria-busy="panelContextLoading">
         <h2>{{ t('workbench.newPanel.title') }}</h2>
         <div class="app-workbench__start-options">
           <button
@@ -410,7 +414,6 @@ import { createAssistantChatWorkbenchDefinition } from './assistantChatWorkbench
 import { createToolHistoryFileDefinition } from './toolHistoryFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import type { WorkbenchLayoutMode } from '@/workbench/layout'
-import BrowserStartPanel from './BrowserStartPanel.vue'
 import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
 import { createTabThumbnailCache } from '@/workbench/tabThumbnailCache'
 import { createNativeTabSnapshots } from './nativeTabSnapshots'
@@ -431,6 +434,8 @@ const props = withDefaults(defineProps<{
   conversationStarted?: boolean
   sessionDurable?: boolean
   sessionLoading?: boolean
+  sessionRefreshing?: boolean
+  sessionContext?: string
   sessionPreparable?: boolean
   prepareSession?: (expectedSessionKey: string) => Promise<string | null>
   workspaceId?: string | null
@@ -447,6 +452,8 @@ const props = withDefaults(defineProps<{
   conversationStarted: false,
   sessionDurable: false,
   sessionLoading: false,
+  sessionRefreshing: false,
+  sessionContext: '',
   sessionPreparable: false,
   workspaceId: null,
   workspaceReady: false,
@@ -494,7 +501,6 @@ interface NewPanelOption {
   disabledReason?: string
 }
 const newPanelMenuOpen = ref(false)
-const browserStartRequested = ref(false)
 const newPanelMenuTopmost = useDialogLayer(newPanelMenuOpen)
 const newPanelMenuRoot = ref<HTMLElement | null>(null)
 const newPanelMenu = ref<HTMLElement | null>(null)
@@ -503,6 +509,7 @@ const newPanelMenuStyle = ref({ left: '0px', top: '0px' })
 const sessionReady = computed(() => Boolean(props.sessionId && store.activeSessionId === props.sessionId))
 const preparingPanel = ref(false)
 let panelOpeningGeneration = 0
+let cancelPanelRefreshWait: (() => void) | null = null
 const canPrepareSession = computed(() => sessionReady.value
   && (props.sessionDurable || props.sessionPreparable && Boolean(props.prepareSession)))
 const gatewayAvailable = computed(() => Boolean(gateway?.availability === 'available'
@@ -510,18 +517,48 @@ const gatewayAvailable = computed(() => Boolean(gateway?.availability === 'avail
   && (!gateway.connectionPhase || gateway.connectionPhase === 'healthy')))
 const gatewayCanExecuteHost = computed(() => gateway?.canExecuteHost === true)
 const canOpenBrowser = computed(() => Boolean(nativeApi && sessionReady.value))
-const canOpenWorkspaceFiles = computed(() => Boolean(workspaceFiles && props.workspaceId && props.workspaceReady
-  && canPrepareSession.value && gatewayAvailable.value && gateway?.isLocalOwner))
-const canOpenTerminal = computed(() => Boolean(terminal && sessionReady.value
-  && props.workspaceResolved && (!props.workspaceId || props.workspaceReady)
-  && gatewayAvailable.value && gatewayCanExecuteHost.value))
-const canOpenAssistantChat = computed(() => Boolean(sessionReady.value && props.sessionDurable && props.conversationStarted && gatewayAvailable.value
-  && gateway?.deliveryIdentity && assistantPortsAvailable && props.workspaceResolved
-  && (!assistantSessionLifecycle?.supportsSidechat || assistantSessionLifecycle.supportsSidechat())
-  && (!props.workspaceId || props.workspaceReady)))
+function workspacePanelCapabilities(ready: boolean, resolved: boolean) {
+  return {
+    files: Boolean(workspaceFiles && props.workspaceId && ready
+      && canPrepareSession.value && gatewayAvailable.value && gateway?.isLocalOwner),
+    terminal: Boolean(terminal && sessionReady.value && resolved && (!props.workspaceId || ready)
+      && gatewayAvailable.value && gatewayCanExecuteHost.value),
+    assistant: Boolean(sessionReady.value && props.sessionDurable && props.conversationStarted && gatewayAvailable.value
+      && gateway?.deliveryIdentity && assistantPortsAvailable && resolved
+      && (!assistantSessionLifecycle?.supportsSidechat || assistantSessionLifecycle.supportsSidechat())
+      && (!props.workspaceId || ready)),
+  }
+}
+const currentPanelCapabilities = computed(() => workspacePanelCapabilities(props.workspaceReady, props.workspaceResolved))
+const canOpenWorkspaceFiles = computed(() => !props.sessionRefreshing && currentPanelCapabilities.value.files)
+const canOpenTerminal = computed(() => !props.sessionRefreshing && currentPanelCapabilities.value.terminal)
+const canOpenAssistantChat = computed(() => !props.sessionRefreshing && currentPanelCapabilities.value.assistant)
 const newPanelMenuVisible = computed(() => Boolean(nativeApi || workspaceFiles || terminal || referenceGateway))
 
 const panelContextLoading = computed(() => !sessionReady.value || props.sessionLoading)
+const panelContext = computed(() => JSON.stringify([
+  props.sessionId, props.sessionContext, store.activeSessionId,
+  gateway?.deliveryIdentity, gateway?.subscriptionEpoch,
+]))
+const settledWorkspacePresentation = ref<{
+  context: string; workspaceId: string | null; ready: boolean; resolved: boolean
+} | null>(null)
+watch(() => [panelContext.value, props.workspaceId, props.workspaceReady, props.workspaceResolved,
+  panelContextLoading.value, props.sessionRefreshing] as const, () => {
+  if (panelContextLoading.value || props.sessionRefreshing) return
+  settledWorkspacePresentation.value = {
+    context: panelContext.value, workspaceId: props.workspaceId,
+    ready: props.workspaceReady, resolved: props.workspaceResolved,
+  }
+}, { immediate: true })
+const presentedWorkspace = computed(() => {
+  const settled = settledWorkspacePresentation.value
+  return props.sessionRefreshing && settled?.context === panelContext.value
+    && settled.workspaceId === props.workspaceId
+    ? settled : { ready: props.workspaceReady, resolved: props.workspaceResolved }
+})
+const canReopenBrowser = computed(() => canOpenBrowser.value && !panelContextLoading.value && !preparingPanel.value
+  && store.closedBrowserItems.some(item => item.scope.type === 'session' && item.scope.id === props.sessionId))
 // A pending session has unknown capabilities, not fewer capabilities. Preserve
 // the last settled entry positions while resolving the next session; these are
 // presentation keys only and never grant access to the previous session.
@@ -544,8 +581,9 @@ function gatewayUnavailableReason(): string {
   return t('workbench.newPanel.requiresConnection')
 }
 
-const newPanelOptions = computed<NewPanelOption[]>(() => {
+function buildPanelOptions(workspace: { ready: boolean; resolved: boolean }): NewPanelOption[] {
   const sessionReason = sessionReady.value ? undefined : sessionUnavailableReason()
+  const capabilities = workspacePanelCapabilities(workspace.ready, workspace.resolved)
   const options: NewPanelOption[] = [
     {
       kind: 'browser', label: t('workbench.newPanel.browser'), icon: 'languages',
@@ -555,25 +593,25 @@ const newPanelOptions = computed<NewPanelOption[]>(() => {
     },
     {
       kind: 'workspace-files', label: t('workbench.newPanel.workspaceFiles'), icon: 'folder',
-      disabled: !canOpenWorkspaceFiles.value,
-      disabledReason: canOpenWorkspaceFiles.value ? undefined : sessionReason || (!gatewayAvailable.value
+      disabled: !capabilities.files,
+      disabledReason: capabilities.files ? undefined : sessionReason || (!gatewayAvailable.value
         ? gatewayUnavailableReason() : t('workbench.newPanel.workspaceUnavailable')),
     },
     {
       kind: 'terminal', label: t('workbench.newPanel.terminal'), icon: 'terminal',
-      disabled: !canOpenTerminal.value,
-      disabledReason: canOpenTerminal.value ? undefined : sessionReason
+      disabled: !capabilities.terminal,
+      disabledReason: capabilities.terminal ? undefined : sessionReason
         || (!gatewayAvailable.value || gateway?.hostExecuteUnavailableReason === 'disconnected'
           ? gatewayUnavailableReason() : gateway?.hostExecuteUnavailableReason === 'permission'
-          ? t('workbench.newPanel.requiresHostExecute') : !props.workspaceResolved || props.workspaceId && !props.workspaceReady
+          ? t('workbench.newPanel.requiresHostExecute') : !workspace.resolved || props.workspaceId && !workspace.ready
             ? t('workbench.newPanel.workspaceNotReady') : t('workbench.newPanel.terminalUnavailable')),
     },
     {
       kind: 'assistant-chat', label: t('workbench.newPanel.assistantChat'), icon: 'chat',
-      disabled: !canOpenAssistantChat.value,
-      disabledReason: canOpenAssistantChat.value ? undefined : sessionReason
+      disabled: !capabilities.assistant,
+      disabledReason: capabilities.assistant ? undefined : sessionReason
         || (!gatewayAvailable.value ? gatewayUnavailableReason()
-          : !props.workspaceResolved || props.workspaceId && !props.workspaceReady
+          : !workspace.resolved || props.workspaceId && !workspace.ready
             ? t('workbench.newPanel.workspaceNotReady')
             : t('workbench.newPanel.assistantUnavailable')),
     },
@@ -583,10 +621,15 @@ const newPanelOptions = computed<NewPanelOption[]>(() => {
   return options.filter(option => kinds.includes(option.kind))
     .map(option => preparingPanel.value || panelContextLoading.value ? { ...option, disabled: true,
       disabledReason: t('workbench.newPanel.preparing') } : option)
-})
-watch(() => [props.sessionId, props.workspaceId, props.routeActive, props.enabled, props.modalBlocked, store.expanded,
+}
+const newPanelOptions = computed(() => buildPanelOptions(presentedWorkspace.value))
+const actionablePanelOptions = computed(() => buildPanelOptions({
+  ready: props.workspaceReady, resolved: props.workspaceResolved,
+}))
+watch(() => [props.sessionId, props.sessionContext, props.workspaceId, props.routeActive, props.enabled, props.modalBlocked, store.expanded,
   gateway?.subscriptionEpoch, gateway?.deliveryIdentity, gatewayAvailable.value], () => {
   panelOpeningGeneration += 1
+  cancelPanelRefreshWait?.()
   preparingPanel.value = false
 }, { flush: 'sync' })
 watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability,
@@ -667,7 +710,6 @@ const baseOrigin = (() => {
   ) return 'opensquilla-app://desktop'
   return window.location.origin
 })()
-const browserStartSequence = ref(0)
 const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
   nativeWorkbenchApi: nativeApi,
   setExpanded: expanded => {
@@ -778,11 +820,6 @@ watch(() => store.activeSessionId, () => {
   tabMenu.value?.cancel()
   menuItemId.value = null
   closeNewPanelMenu()
-  browserStartRequested.value = false
-})
-watch(() => props.sessionId, () => { browserStartRequested.value = false })
-watch(() => store.visibleItems.length, (count, previous) => {
-  if (count === 0 && previous > 0) browserStartRequested.value = false
 })
 watch(() => [props.enabled, props.routeActive, props.modalBlocked, store.expanded], () => {
   if (!props.enabled || !props.routeActive || props.modalBlocked || !store.expanded) closeNewPanelMenu()
@@ -925,6 +962,31 @@ async function selectNewPanel(option: NewPanelOption) {
   if (!props.routeActive || !props.enabled || props.modalBlocked || !store.expanded) return
   if (option.disabled || newPanelOptions.value.find(current => current.kind === option.kind)?.disabled !== false) return
   closeNewPanelMenu()
+  if (props.sessionRefreshing && option.kind !== 'browser') {
+    // Retained labels are presentation only. An explicit click can wait for the
+    // current read, but may never create a panel from the old workspace binding.
+    const generation = ++panelOpeningGeneration
+    preparingPanel.value = true
+    const refreshed = await new Promise<boolean>(resolve => {
+      const stop = watch(() => props.sessionRefreshing, refreshing => {
+        if (!refreshing) finish(true)
+      }, { flush: 'post' })
+      const cancel = () => finish(false)
+      function finish(value: boolean) {
+        stop()
+        if (cancelPanelRefreshWait === cancel) cancelPanelRefreshWait = null
+        resolve(value)
+      }
+      cancelPanelRefreshWait = cancel
+    })
+    if (generation !== panelOpeningGeneration) return
+    preparingPanel.value = false
+    if (!refreshed) return
+    const current = actionablePanelOptions.value.find(candidate => candidate.kind === option.kind)
+    if (current) await selectNewPanel(current)
+    return
+  }
+  if (actionablePanelOptions.value.find(current => current.kind === option.kind)?.disabled !== false) return
   if (option.kind === 'browser') { openBrowserStart(); return }
   // A PTY or an empty side chat is not a durable main-chat session.
   if (option.kind === 'terminal') { openTerminal(); return }
@@ -990,11 +1052,9 @@ function openBrowserUrl(value: string, newTab = false) {
 }
 
 function openBrowserStart() {
+  if (!canOpenBrowser.value) return
   closeNewPanelMenu()
-  browserStartRequested.value = true
-  browserStartSequence.value += 1
-  store.openEmpty()
-  store.requestReveal()
+  openBrowserUrl('about:blank', true)
 }
 
 function openWorkspaceFiles() {
@@ -1065,6 +1125,13 @@ async function launchSideChatCommand(request: SideChatLaunchRequest): Promise<bo
   if (!current()) return false
   const accepted = await sideChatHandles.get(itemId)?.launchSideChat({ ...request, isCurrent: current }) ?? false
   return accepted
+}
+
+function reopenBrowserFromMenu() {
+  if (!newPanelMenuOpen.value || !props.routeActive || !props.enabled || props.modalBlocked
+    || !store.expanded || !canReopenBrowser.value) return
+  closeNewPanelMenu()
+  reopenBrowser()
 }
 
 function reopenBrowser() {
@@ -1556,10 +1623,17 @@ function panelProps(
   active: boolean,
   nativeSurface: boolean,
 ): Readonly<Record<string, unknown>> {
-  return workbenchPanelRegistry.resolve(item)?.getProps?.(
+  const resolved = workbenchPanelRegistry.resolve(item)?.getProps?.(
     item,
     panelRenderState(item, active, nativeSurface),
   ) || {}
+  if (item.kind !== 'browser') return resolved
+  return {
+    ...resolved,
+    active,
+    canReopen: store.closedBrowserItems.some(closed => closed.scope.type === 'session'
+      && item.scope.type === 'session' && closed.scope.id === item.scope.id),
+  }
 }
 
 function artifactNavigationItems(
@@ -1724,6 +1798,11 @@ function panelEventHandler(item: WorkbenchItem) {
 }
 
 function handlePanelEvent(item: WorkbenchItem, event: WorkbenchComponentEvent) {
+  if (event.type === 'browser-reopen') {
+    if (item.kind === 'browser' && store.activeItemId === item.id
+      && item.scope.type === 'session' && item.scope.id === props.sessionId) reopenBrowser()
+    return
+  }
   if (event.type === 'preview-thumbnail' && event.payload instanceof Blob) {
     // The Office navigator already rendered this image for the visible document.
     // Store a bounded independent URL so closing its renderer cannot break the tab card.
@@ -2144,6 +2223,7 @@ onBeforeUnmount(() => {
   sideChatHandles.clear()
   sideChatLaunchItems.clear()
   panelOpeningGeneration += 1
+  cancelPanelRefreshWait?.()
   document.removeEventListener('pointerdown', onNewPanelOutside, true)
   window.removeEventListener('resize', onNewPanelViewportChange)
   window.removeEventListener('scroll', onNewPanelViewportChange, true)

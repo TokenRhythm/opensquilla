@@ -10,7 +10,7 @@ import pytest
 from opensquilla.gateway.usage_query import query_usage_ledger
 from opensquilla.gateway.usage_settlement_projection import apply_current_settlements
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import AgentTaskRecord, SessionNode
+from opensquilla.session.models import AgentTaskRecord, SessionNode, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
 from opensquilla.session.usage_attribution import backfill_usage_attribution_on_conn
 from opensquilla.session.usage_ledger import UsageEventCompletion, UsageEventItem, UsageEventStart
@@ -245,6 +245,85 @@ async def test_root_title_refreshes_only_for_matching_live_generation(tmp_path):
         assert groups[1]["title"] == "New generation"
         assert groups[1]["sessionKey"] == parent.session_key
         assert groups[1]["totals"]["costNanos"] == 300_000_000
+    finally:
+        await storage.close()
+
+
+async def test_existing_placeholder_owner_uses_live_generated_title(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "usage-title.db"))
+    try:
+        parent = SessionNode(
+            session_key="agent:main:webchat:placeholder",
+            session_id="placeholder", display_name="WebChat",
+        )
+        await storage.upsert_session(parent)
+        await _call(storage, parent, "before-title", 20)
+        parent.derived_title = "制作我的世界复刻游戏"
+        await storage.upsert_session(parent)
+        [group] = (await _report(storage))["taskGroups"]
+        assert group["title"] == parent.derived_title
+        assert group["totals"]["costNanos"] == 200_000_000
+        assert group["rootSessionEpoch"] == 0
+    finally:
+        await storage.close()
+
+
+async def test_usage_owner_captures_transcript_title_before_deletion(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "usage-transcript-title.db"))
+    try:
+        parent = SessionNode(
+            session_key="agent:main:webchat:unnamed",
+            session_id="unnamed", display_name="WebChat",
+        )
+        await storage.upsert_session(parent)
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id=parent.session_id, session_key=parent.session_key,
+            role="user", content="Review the release plan",
+        ))
+        await _call(storage, parent, "first-call", 20)
+        assert (await _report(storage))["taskGroups"][0]["title"] == "Review the release plan"
+        await storage.delete_session(parent.session_key)
+        [group] = (await _report(storage))["taskGroups"]
+        assert group["title"] == "Review the release plan"
+        assert group["sessionKey"] is None
+        assert group["totals"]["costNanos"] == 200_000_000
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("snapshot", ["WebChat", ""])
+@pytest.mark.parametrize("retire", ["delete", "reset"])
+async def test_legacy_title_snapshot_remains_fenced_after_live_owner_retires(
+    tmp_path, snapshot, retire,
+):
+    storage = await SessionStorage.open(str(tmp_path / "usage-legacy-title.db"))
+    try:
+        parent = SessionNode(
+            session_key="agent:main:webchat:legacy-title",
+            session_id="legacy-title", display_name="WebChat",
+        )
+        await storage.upsert_session(parent)
+        await _call(storage, parent, "legacy-call", 20)
+        # A pre-fix owner may have captured a generic name or no title at all.
+        await storage.conn.execute(
+            "UPDATE usage_attribution_owners SET title=? WHERE session_id=?",
+            (snapshot, parent.session_id),
+        )
+        await storage.conn.commit()
+        parent.derived_title = "Recovered current title"
+        await storage.upsert_session(parent)
+        [live] = (await _report(storage))["taskGroups"]
+        assert live["title"] == parent.derived_title
+        if retire == "delete":
+            await storage.delete_session(parent.session_key)
+        else:
+            await storage.upsert_session(parent.model_copy(update={
+                "epoch": 1, "derived_title": "Different task",
+            }))
+        [old] = (await _report(storage))["taskGroups"]
+        assert old["title"] == snapshot
+        assert old["sessionKey"] is None
+        assert old["totals"] == live["totals"]
     finally:
         await storage.close()
 

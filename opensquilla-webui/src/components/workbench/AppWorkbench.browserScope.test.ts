@@ -111,6 +111,143 @@ async function mountWorkbench() {
 }
 
 describe('AppWorkbench retained browser session isolation', () => {
+  it('reopens a closed browser from the new tab without replacing the blank tab', async () => {
+    const harness = await mountWorkbench()
+    harness.store.closeItem('page-a')
+    harness.store.openItem(createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'about:blank' })!)
+    await settle()
+    const blankId = harness.store.activeItemId!
+    const layer = harness.element.querySelector<HTMLElement>(`[data-workbench-item-id="${blankId}"]`)!
+    const reopen = [...layer.querySelectorAll<HTMLButtonElement>('.browser-start button')]
+      .find(button => button.textContent?.includes(en.workbench.browser.reopen))!
+    expect(reopen).toBeDefined()
+    reopen.click()
+    await settle()
+    expect(harness.store.activeItemId).toBe('page-a')
+    expect(harness.store.visibleItems.map(item => item.id)).toEqual([blankId, 'page-a'])
+    expect(harness.pages.get('page-a')?.visible).toBe(true)
+  })
+
+  it('retries blank surface creation and failed navigation within the same browser tab', async () => {
+    const harness = await mountWorkbench()
+    vi.mocked(harness.api.createSurface).mockResolvedValueOnce({
+      ok: false, code: 'BROWSER_CRASHED', message: 'Synthetic browser creation failure',
+    })
+    harness.store.openItem(createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'about:blank' })!)
+    await settle()
+    const blankId = harness.store.activeItemId!
+    const layer = harness.element.querySelector<HTMLElement>(`[data-workbench-item-id="${blankId}"]`)!
+    expect(layer.querySelector('.browser-preview__error')?.textContent).toContain('Synthetic browser creation failure')
+    expect(layer.querySelector('[data-workbench-native-surface-slot]')).toBeNull()
+    layer.querySelector<HTMLButtonElement>('.browser-preview__error button')!.click()
+    await settle()
+    const start = layer.querySelector<HTMLElement>('[data-testid="browser-start"]')!
+    expect(start).not.toBeNull()
+    expect(harness.pages.get(blankId)?.visible).toBe(false)
+    vi.mocked(harness.api.createSurface).mockClear()
+    vi.mocked(harness.api.navigateSurface!).mockResolvedValueOnce({
+      ok: false, code: 'NAVIGATION_FAILED', navigationError: {
+        code: 'NAVIGATION_FAILED', message: 'Synthetic navigation failure', url: 'https://example.test/unavailable',
+      },
+    })
+    const address = start.querySelector<HTMLInputElement>('input')!
+    address.value = 'https://example.test/unavailable'
+    address.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    start.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await settle()
+    expect(harness.api.navigateSurface).toHaveBeenLastCalledWith({
+      version: 2, surfaceId: blankId, action: 'navigate', url: 'https://example.test/unavailable',
+    })
+    expect(layer.querySelector('.browser-preview__error')?.textContent).toContain('Synthetic navigation failure')
+    expect(harness.store.activeItemId).toBe(blankId)
+    layer.querySelector<HTMLButtonElement>('.browser-preview__error button')!.click()
+    await settle()
+    expect(harness.api.navigateSurface).toHaveBeenLastCalledWith({
+      version: 2, surfaceId: blankId, action: 'reload',
+    })
+    await harness.emit({ version: 2, surfaceId: blankId, type: 'navigation-state', detail: {
+      sessionKey: 'session-a', url: 'https://example.test/recovered', loading: false,
+    } })
+    expect(layer.querySelector('.browser-preview__error')).toBeNull()
+    expect(layer.querySelector('[data-workbench-native-surface-slot]')).not.toBeNull()
+    expect(harness.pages.get(blankId)?.visible).toBe(true)
+    expect(harness.store.activeItemId).toBe(blankId)
+    expect(harness.api.createSurface).not.toHaveBeenCalled()
+  })
+
+  it('does not focus a blank start form opened in a background session', async () => {
+    const harness = await mountWorkbench()
+    const address = harness.element.querySelector<HTMLInputElement>('.browser-preview__address')!
+    address.focus()
+    harness.pages.set('background-blank', { url: 'about:blank', form: '', loggedIn: false, visible: false })
+    await harness.emit({ version: 2, surfaceId: 'background-blank', type: 'browser-opened', detail: {
+      sessionKey: 'session-b', url: 'about:blank', targetRef: 'background-target',
+    } })
+    expect(harness.store.activeItemId).toBe('page-a')
+    expect(document.activeElement).toBe(address)
+    expect(harness.pages.get('background-blank')?.visible).toBe(false)
+  })
+
+  it('retains the browser start page as its own tab and navigates that tab after switching sessions', async () => {
+    const harness = await mountWorkbench()
+    harness.element.querySelector<HTMLButtonElement>('[data-testid="workbench-new-panel-trigger"]')!.click()
+    await settle()
+    document.querySelector<HTMLButtonElement>('[data-testid="workbench-new-panel-menu-list"] [data-panel-kind="browser"]')!.click()
+    await settle()
+
+    const blank = harness.store.activeItem
+    expect(blank).toMatchObject({
+      kind: 'browser', title: 'New tab', scope: { type: 'session', id: 'session-a' },
+      payload: { initialUrl: 'about:blank' },
+    })
+    expect(harness.store.visibleItems).toHaveLength(2)
+    expect([...harness.element.querySelectorAll('[role="tab"]')].map(tab => tab.textContent))
+      .toContain('New tab')
+    const layer = harness.element.querySelector<HTMLElement>(`[data-workbench-item-id="${blank!.id}"]`)!
+    const start = layer.querySelector<HTMLElement>('[data-testid="browser-start"]')!
+    const address = start.querySelector<HTMLInputElement>('input')!
+    expect(layer.querySelector('[data-workbench-native-surface-slot]')).toBeNull()
+    expect(harness.pages.get(blank!.id)?.visible).toBe(false)
+    address.value = 'example.test/new-page'
+    address.dispatchEvent(new Event('input', { bubbles: true }))
+    await settle()
+
+    harness.store.activateItem('page-a')
+    await settle()
+    expect(harness.visibleLayers()).toEqual(['page-a'])
+    harness.store.activateItem(blank!.id)
+    await settle()
+    expect(harness.visibleLayers()).toEqual([blank!.id])
+    expect(address.value).toBe('example.test/new-page')
+    await harness.switchSession('session-b')
+    expect(harness.visibleLayers()).toEqual([])
+    harness.store.openItem(browser('page-b', 'session-b'))
+    await settle()
+    await harness.switchSession('session-a')
+    expect(harness.visibleLayers()).toEqual([blank!.id])
+    expect(layer.querySelector('[data-testid="browser-start"]')).toBe(start)
+    expect(address.value).toBe('example.test/new-page')
+
+    vi.mocked(harness.api.createSurface).mockClear()
+    start.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await settle()
+    expect(harness.api.navigateSurface).toHaveBeenCalledExactlyOnceWith({
+      version: 2, surfaceId: blank!.id, action: 'navigate', url: 'https://example.test/new-page',
+    })
+    await harness.emit({ version: 2, surfaceId: blank!.id, type: 'navigation-state', detail: {
+      sessionKey: 'session-a', url: 'https://example.test/new-page', loading: false,
+    } })
+    expect(harness.store.activeItem).toMatchObject({
+      id: blank!.id, title: 'example.test', payload: { initialUrl: 'https://example.test/new-page' },
+    })
+    expect(harness.store.visibleItems).toHaveLength(2)
+    expect(layer.querySelector('[data-testid="browser-start"]')).toBeNull()
+    expect(layer.querySelector('[data-workbench-native-surface-slot]')).not.toBeNull()
+    expect(harness.pages.get(blank!.id)?.visible).toBe(true)
+    expect(harness.api.createSurface).not.toHaveBeenCalled()
+  })
+
   it('adopts an agent-opened blank target, navigates it from the address bar and closes it', async () => {
     const harness = await mountWorkbench()
     vi.mocked(harness.api.createSurface).mockClear()
@@ -122,12 +259,12 @@ describe('AppWorkbench retained browser session isolation', () => {
     expect(harness.store.activeItem).toMatchObject({ id: 'blank-target', title: 'New tab',
       payload: { initialUrl: 'about:blank', adoptedNativeSurface: true, targetRef: 'page-blank' } })
     expect(harness.visibleLayers()).toEqual(['blank-target'])
-    expect(harness.pages.get('blank-target')?.visible).toBe(true)
+    expect(harness.pages.get('blank-target')?.visible).toBe(false)
     expect(harness.api.createSurface).not.toHaveBeenCalled()
     const panel = harness.element.querySelector<HTMLElement>('[data-workbench-item-id="blank-target"]')!
     const address = panel.querySelector<HTMLInputElement>('.browser-preview__address')!
-    const nativeSlot = panel.querySelector('[data-workbench-native-surface-slot]')
-    expect(nativeSlot).not.toBeNull()
+    expect(panel.querySelector('[data-workbench-native-surface-slot]')).toBeNull()
+    expect(panel.querySelector('[data-testid="browser-start"]')).not.toBeNull()
     expect(address.value).toBe('')
     expect(address.placeholder).toBe('Enter a URL, e.g. example.com')
     expect(panel.querySelector<HTMLButtonElement>('button[aria-label="Open externally"]')?.disabled).toBe(true)
@@ -142,7 +279,8 @@ describe('AppWorkbench retained browser session isolation', () => {
       sessionKey: 'session-a', url: 'https://example.test/next', targetRef: 'page-blank', loading: false,
     } })
     expect(address.value).toBe('https://example.test/next')
-    expect(panel.querySelector('[data-workbench-native-surface-slot]')).toBe(nativeSlot)
+    expect(panel.querySelector('[data-workbench-native-surface-slot]')).not.toBeNull()
+    expect(panel.querySelector('[data-testid="browser-start"]')).toBeNull()
     expect(harness.store.activeItem).toMatchObject({ id: 'blank-target', title: 'example.test',
       payload: { initialUrl: 'https://example.test/next', targetRef: 'page-blank' } })
     expect(harness.api.createSurface).not.toHaveBeenCalled()

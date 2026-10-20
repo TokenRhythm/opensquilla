@@ -99,6 +99,8 @@ export interface UseChatRenderedMessagesOptions {
   /** Next-turn session state; retained for compatibility and never used to classify a turn. */
   modelRoutingMode?: Ref<ModelRoutingMode>
   isStreaming?: Ref<boolean>
+  /** A cached view is readable while current history/live state is being restored. */
+  isPreview?: Readonly<Ref<boolean>>
   currentPlanRevisionId?: Readonly<Ref<string>>
   renderMarkdown: (text: string) => string
   stripGeneratedArtifactMarkers: (text: string) => string
@@ -839,6 +841,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: decision.source || 'none',
       routerObserve: decision.routing_applied === false,
       routerStatic: msg.restoredFromHistory === true,
+      routerReplayed: msg.routerReplayed === true || options.isPreview?.value === true,
       routerSettled: msg.routerSettled === true,
       routerPanel: routerPanelDataset(options.routerVisualMode.value),
       routerMode: 'squilla_router',
@@ -954,6 +957,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: 'llm_ensemble',
       routerObserve: false,
       routerStatic: msg.restoredFromHistory === true,
+      routerReplayed: msg.routerReplayed === true || options.isPreview?.value === true,
       routerExecutionModel: executionModelFromMessage(msg) || undefined,
       // Live strips stay unsettled (animating) while members stream in; a member
       // list alone no longer forces 'settled'. History strips are frozen instead.
@@ -1658,6 +1662,7 @@ function upsertRouterStrip(
   if (previousIndex >= 0) {
     if (options.settleReplacement !== false) stripItem.routerSettled = true
     const previous = result[previousIndex]
+    if (previous?.routerReplayed) stripItem.routerReplayed = true
     if (options.settlement && !stripItem.routerExecutionModel) {
       stripItem.routerExecutionModel = previous?.routerExecutionModel
     }

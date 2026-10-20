@@ -55,6 +55,7 @@ function harness(over: {
   handleLongPaste?: (text: string) => boolean
 } = {}) {
   const inputText = over.draft?.inputText ?? ref(over.inputText ?? '')
+  const messages = ref<ChatMessage[]>(over.messages ?? [])
   const spies = {
     popPendingTail: vi.fn(() => true),
     enqueuePendingInput: vi.fn(() => true),
@@ -73,7 +74,7 @@ function harness(over: {
     textareaText: over.draft?.composerText,
     composing: ref(over.composing ?? false),
     getEditorSelection: over.getEditorSelection,
-    messages: ref<ChatMessage[]>(over.messages ?? []),
+    messages,
     pendingQueue: ref<ChatPendingItem[]>(over.pendingQueue ?? []),
     canQueueMore: ref(over.canQueueMore ?? true),
     slashOpen: ref(over.slashOpen ?? false),
@@ -84,7 +85,7 @@ function harness(over: {
     handleLongPaste: over.handleLongPaste,
     ...spies,
   })
-  return { api, inputText, spies }
+  return { api, inputText, messages, spies }
 }
 
 function keydown(opts: {
@@ -472,6 +473,33 @@ describe('useChatComposerShortcuts', () => {
 })
 
 describe('Escape and message edits', () => {
+  it.each([
+    [0, 'ArrowUp'], [0, 'ArrowDown'], [1, 'ArrowUp'], [1, 'ArrowDown'],
+  ] as const)('preserves the draft when history shrinks to %i entries before %s', (count, key) => {
+    const draft = useLocalPathDraft()
+    const { api, messages } = harness({
+      draft,
+      messages: Array.from({ length: 5 }, (_, index) => ({
+        role: 'user', text: `Request ${index + 1}`, ts: null,
+      })),
+    })
+    api.onTextareaKeydown(keydown({ key: 'ArrowUp', target: field('', 'start') }))
+    expect(draft.composerText.value).toBe('Request 5')
+    messages.value = messages.value.slice(0, count)
+    draft.restoreInput('Current draft\nC:\\draft.pdf', ['C:\\draft.pdf'])
+
+    const event = keydown({ key, target: field(draft.composerText.value, 'end') })
+    expect(() => api.onTextareaKeydown(event)).not.toThrow()
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(draft.composerText.value).toBe('Current draft')
+    expect(draft.localPaths.value).toEqual(['C:\\draft.pdf'])
+
+    const down = keydown({ key: 'ArrowDown', target: field(draft.composerText.value, 'end') })
+    api.onTextareaKeydown(down)
+    expect(down.preventDefault).not.toHaveBeenCalled()
+    expect(draft.inputText.value).toBe('Current draft\nC:\\draft.pdf')
+  })
+
   it('resets history navigation so ArrowDown cannot overwrite the restored draft', () => {
     const { api, inputText, spies } = harness({
       messages: [{ role: 'user', text: 'earlier request', ts: null }],

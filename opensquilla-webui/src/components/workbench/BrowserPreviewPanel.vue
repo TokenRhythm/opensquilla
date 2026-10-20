@@ -159,6 +159,16 @@
         {{ t('chat.retry') }}
       </button>
     </div>
+    <BrowserStartPanel
+      v-else-if="currentUrl === 'about:blank'"
+      v-model="address"
+      :active="active"
+      :ready="true"
+      :can-reopen="canReopen"
+      @update:model-value="onAddressInput"
+      @open="navigate"
+      @reopen="emit('workbench-event', { type: 'browser-reopen' })"
+    />
     <div
       v-else
       class="browser-preview__native-slot"
@@ -172,14 +182,17 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import BrowserStartPanel from './BrowserStartPanel.vue'
 import { copyTextWithFallback } from '@/utils/browser'
 import { createMutationClientRequestId } from '@/utils/mutationRequestIdentity'
 import { normalizeBrowserAddress } from '@/workbench/browserItems'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 
 const props = withDefaults(defineProps<{
+  active?: boolean
   canGoBack?: boolean
   canGoForward?: boolean
+  canReopen?: boolean
   currentUrl?: string
   errorMessage?: string
   loading?: boolean
@@ -198,8 +211,10 @@ const props = withDefaults(defineProps<{
   navigationAddressSequence?: number
   navigationAddressRequestId?: string
 }>(), {
+  active: true,
   canGoBack: false,
   canGoForward: false,
+  canReopen: false,
   currentUrl: '',
   errorMessage: '',
   loading: false,
