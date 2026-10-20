@@ -23,6 +23,7 @@ import {
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
+  requestElectronQuitWithConfirmation,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 
@@ -350,7 +351,9 @@ async function profileShutdownDiagnostics(targetApp, profileUserData, phase) {
   }
 }
 
-async function closeActiveApp(phase, { failOnError = true } = {}) {
+async function closeActiveApp(phase, {
+  failOnError = true, allowOptionalQuitConfirmation = false,
+} = {}) {
   if (!app) return
   const targetApp = app
   const profileUserData = activeAppUserData
@@ -360,6 +363,11 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
   const result = await closeElectronWithDeadline({
     app: targetApp,
     phase,
+    ...(allowOptionalQuitConfirmation ? {
+      requestClose: options => requestElectronQuitWithConfirmation(targetApp, {
+        ...options, allowExitWithoutConfirmation: true,
+      }),
+    } : {}),
     timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
     diagnostics: () => profileShutdownDiagnostics(targetApp, profileUserData, phase),
   })
@@ -669,7 +677,9 @@ try {
     'not_required',
   )
 
-  await closeActiveApp('config-only-electron-shutdown')
+  // The first activity read can still be unavailable immediately after startup.
+  // Handle its real Quit prompt while also allowing the ordinary idle exit.
+  await closeActiveApp('config-only-electron-shutdown', { allowOptionalQuitConfirmation: true })
 
   // A credential-only recovery still contains enough provider authority for
   // Electron to generate a canonical primary config. The config and
