@@ -563,7 +563,8 @@ async def test_short_quit_bounds_channel_budget_and_preserves_settlement_window(
     try:
         await asyncio.wait_for(entered.wait(), 1)
         await asyncio.wait_for(transports.wait(), 1)
-        assert 0 < observed_budgets[0] <= 0.4
+        # Subtracting absolute monotonic deadlines can round just above 0.4.
+        assert 0 < observed_budgets[0] <= 0.4 + 1e-6
         assert not closing.done()
         assert not saved.is_set()
         services.close.assert_not_awaited()
