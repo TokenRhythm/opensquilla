@@ -6,9 +6,10 @@ $processes = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name=
 $builders = @(
     foreach ($process in $processes) {
         $command = $process.CommandLine
-        if (-not $command) { continue }
         $kind = if ($process.Name -match '^(?i:7za|7z|makensis|app-builder)\.exe$') {
             'archive-or-package-build'
+        } elseif (-not $command) {
+            $null
         } elseif ($command -match '(?i)pyinstaller') {
             'pyinstaller'
         } elseif ($command -match '(?i)build-gateway\.mjs|build-webui-dist\.mjs') {
@@ -25,7 +26,7 @@ $builders = @(
                 name = $process.Name
                 kind = $kind
                 createdAt = $process.CreationDate.ToUniversalTime().ToString('o')
-                worktreeIds = @([regex]::Matches($command, 'worktrees[\\/]([a-f0-9]{4})') |
+                worktreeIds = @([regex]::Matches([string]$command, 'worktrees[\\/]([a-f0-9]{4})') |
                     ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
             }
         }
