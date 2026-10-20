@@ -99,7 +99,7 @@ _OWNER_DATABASE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
 _POSIX_DESCENDANT_CAPTURE_LIMIT = 1024
-_DARWIN_PROC_PIDTBSDINFO = 3
+_DARWIN_PROC_PIDT_BSDINFOWITHUNIQID = 18
 
 _windows_launch_semaphores: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, tuple[asyncio.Semaphore, int]
@@ -279,6 +279,9 @@ class _PosixProcessInfo:
     pgid: int
     uid: int
     start_identity: str
+    unique_id: int | None = None
+    parent_unique_id: int | None = None
+    is_zombie: bool = False
 
 
 @dataclass(frozen=True)
@@ -321,6 +324,21 @@ class _DarwinProcBsdInfo(ctypes.Structure):
         ("pbi_start_tvsec", ctypes.c_uint64),
         ("pbi_start_tvusec", ctypes.c_uint64),
     ]
+
+
+class _DarwinProcUniqueInfo(ctypes.Structure):
+    _fields_ = [
+        ("uuid", ctypes.c_uint8 * 16),
+        ("unique_id", ctypes.c_uint64),
+        ("parent_unique_id", ctypes.c_uint64),
+        ("id_version", ctypes.c_int32),
+        ("original_parent_version", ctypes.c_int32),
+        ("reserved", ctypes.c_uint64 * 2),
+    ]
+
+
+class _DarwinProcBsdUniqueInfo(ctypes.Structure):
+    _fields_ = [("bsd", _DarwinProcBsdInfo), ("unique", _DarwinProcUniqueInfo)]
 
 
 _CURRENT_TASK_PROCESS_SCOPE: contextvars.ContextVar[_TaskProcessScope | None] = (
@@ -934,29 +952,41 @@ def _darwin_libproc() -> Any | None:
     return library
 
 
-def _darwin_process_info(pid: int, library: Any | None = None) -> _PosixProcessInfo | None:
+def _darwin_process_info(
+    pid: int, library: Any | None = None, *, include_zombies: bool = False,
+) -> _PosixProcessInfo | None:
     library = library or _darwin_libproc()
     if library is None:
         return None
-    raw = _DarwinProcBsdInfo()
+    raw = _DarwinProcBsdUniqueInfo()
     size = ctypes.sizeof(raw)
     if library.proc_pidinfo(
         int(pid),
-        _DARWIN_PROC_PIDTBSDINFO,
-        0,
+        _DARWIN_PROC_PIDT_BSDINFOWITHUNIQID,
+        # arg=0 also hides processes in exit() before they become zombies.
+        # Keep their identity verifiable until exit, then filter SZOMB below.
+        1,
         ctypes.byref(raw),
         size,
     ) != size:
         return None
+    if raw.bsd.pbi_pid != pid or not raw.unique.unique_id:
+        return None
+    is_zombie = raw.bsd.pbi_status == 5  # SZOMB: awaiting collection by parent
+    if is_zombie and not include_zombies:
+        return None
     return _PosixProcessInfo(
-        pid=int(raw.pbi_pid),
-        ppid=int(raw.pbi_ppid),
-        pgid=int(raw.pbi_pgid),
-        uid=int(raw.pbi_uid),
+        pid=int(raw.bsd.pbi_pid),
+        ppid=int(raw.bsd.pbi_ppid),
+        pgid=int(raw.bsd.pbi_pgid),
+        uid=int(raw.bsd.pbi_uid),
         start_identity=(
-            f"darwin-libproc-start:{int(raw.pbi_start_tvsec)}:"
-            f"{int(raw.pbi_start_tvusec)}"
+            f"darwin-libproc-start:{int(raw.bsd.pbi_start_tvsec)}:"
+            f"{int(raw.bsd.pbi_start_tvusec)}"
         ),
+        unique_id=int(raw.unique.unique_id),
+        parent_unique_id=int(raw.unique.parent_unique_id),
+        is_zombie=is_zombie,
     )
 
 
@@ -1046,7 +1076,17 @@ def _captured_posix_process_matches(
 
 
 def _posix_pid_definitively_gone(pid: int) -> bool:
-    """A failed identity lookup is safe to dismiss only after ESRCH."""
+    """Prove execution ended, including an unreaped Darwin zombie.
+
+    This does not prove the PID has been released for reuse. Missing metadata
+    alone never proves exit, nor does a stopped (SSTOP) process.
+    """
+    if sys.platform == "darwin":
+        info = _darwin_process_info(pid, include_zombies=True)
+        if info is not None and info.is_zombie:
+            return True
+    # Probe last: the process can be reaped between the metadata query and
+    # this check, even when it was still present during the first lookup.
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1098,6 +1138,7 @@ def _capture_posix_group_descendants(
     anchor_pid: int,
     *,
     include_anchor_children: bool = False,
+    darwin_lineage: dict[int, int] | None = None,
 ) -> _PosixDescendantCapture:
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
         return _PosixDescendantCapture((), True)
@@ -1123,20 +1164,46 @@ def _capture_posix_group_descendants(
         # snapshot or a surviving member must still fail closed. The anchor
         # retains its consecutive-empty checks before releasing ownership.
         return _PosixDescendantCapture((), _posix_group_members(pgid) == (anchor_pid,))
-    children: dict[int, list[_PosixProcessInfo]] = {}
+    track_lineage = sys.platform == "darwin" and darwin_lineage is not None
+    children: dict[int | None, list[_PosixProcessInfo]] = {}
     for info in snapshot.values():
-        children.setdefault(info.ppid, []).append(info)
+        parent_key = info.parent_unique_id if track_lineage else info.ppid
+        children.setdefault(parent_key, []).append(info)
     seen = {root.pid for root in roots}
     if len(seen) > _POSIX_DESCENDANT_CAPTURE_LIMIT:
         return _PosixDescendantCapture((), False)
-    pending = [(root.pid, 0) for root in roots]
+    pending = [(root.unique_id if track_lineage else root.pid, 0) for root in roots]
     candidates: list[tuple[_PosixProcessInfo, int]] = (
         [(root, 1) for root in owned_group_roots] if darwin_anchor_capture else []
     )
     complete = not darwin_anchor_capture or len(owned_group_roots) == len(group_roots)
+    if track_lineage:
+        assert darwin_lineage is not None
+        # The kernel keeps the parent's unique ID across reparenting. Unlike
+        # PPID, this still identifies ordinary setsid children after the target
+        # exits. Retain observed identities for subsequent cleanup snapshots.
+        # This is not arbitrary daemon containment: an unobserved intermediate
+        # may disappear, and exec after reparenting rewrites parent_unique_id.
+        for info in snapshot.values():
+            depth = darwin_lineage.get(info.unique_id) if info.unique_id is not None else None
+            if depth is None and info.parent_unique_id in darwin_lineage:
+                depth = darwin_lineage[info.parent_unique_id] + 1
+            if depth is None or info.pid in seen:
+                continue
+            if info.uid != anchor.uid:
+                complete = False
+                continue
+            seen.add(info.pid)
+            pending.append((info.unique_id, depth))
+            candidates.append((info, depth))
     while pending:
-        parent_pid, parent_depth = pending.pop(0)
-        for child in children.get(parent_pid, ()):
+        if len(seen) > _POSIX_DESCENDANT_CAPTURE_LIMIT:
+            return _PosixDescendantCapture((), False)
+        parent_key, parent_depth = pending.pop(0)
+        if parent_key is None:
+            complete = False
+            continue
+        for child in children.get(parent_key, ()):
             if child.pid in seen:
                 continue
             seen.add(child.pid)
@@ -1146,17 +1213,33 @@ def _capture_posix_group_descendants(
                 complete = False
                 continue
             depth = parent_depth + 1
-            pending.append((child.pid, depth))
+            pending.append((child.unique_id if track_lineage else child.pid, depth))
             if include_anchor_children or child.pgid != pgid:
                 candidates.append((child, depth))
     captured: list[_CapturedPosixProcess] = []
     for candidate, depth in sorted(candidates, key=lambda item: item[1]):
+        if track_lineage:
+            assert darwin_lineage is not None
+            if candidate.unique_id is None:
+                complete = False
+                continue
+            # The snapshot already proved this relationship. Retain it even
+            # if the parent exits before the live recheck: later snapshots may
+            # still find its children. A reused PID is never captured below.
+            if candidate.unique_id not in darwin_lineage:
+                if len(darwin_lineage) >= _POSIX_DESCENDANT_CAPTURE_LIMIT:
+                    complete = False
+                else:
+                    darwin_lineage[candidate.unique_id] = depth
         current = _posix_process_info(candidate.pid)
         if current is None:
             if not _posix_pid_definitively_gone(candidate.pid):
                 complete = False
             continue
-        if current.start_identity != candidate.start_identity:
+        if (
+            current.start_identity != candidate.start_identity
+            or (track_lineage and current.unique_id != candidate.unique_id)
+        ):
             continue
         if current.uid != candidate.uid:
             complete = False
@@ -3174,6 +3257,13 @@ def _run_posix_group_anchor(
     target: subprocess.Popen[bytes] | None = None
     target_cleanup_at: float | None = None
     adopt_children = target_argv is not None and sys.platform.startswith("linux")
+    darwin_lineage: dict[int, int] | None = (
+        {} if sys.platform == "darwin" else None
+    )
+    if darwin_lineage is not None:
+        # Keep an immediately exiting target queryable until this sole reaper
+        # has captured its identity. An inherited SIG_IGN would auto-reap it.
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     if adopt_children:
         # Keep setsid/double-fork children attributable after the PTY shell exits.
         # This changes only the private PTY anchor, never the Gateway or pipe owners.
@@ -3204,8 +3294,10 @@ def _run_posix_group_anchor(
                 result = _capture_posix_group_descendants(
                     pgid, own_pid,
                     include_anchor_children=(
-                        adopt_children or (refresh and sys.platform == "darwin")
+                        adopt_children or darwin_lineage is not None
+                        or (refresh and sys.platform == "darwin")
                     ),
+                    darwin_lineage=darwin_lineage,
                 )
             except Exception:
                 result = _PosixDescendantCapture((), False)
@@ -3237,7 +3329,9 @@ def _run_posix_group_anchor(
 
     def signal_owned(command: bytes) -> bytes:
         nonlocal cleanup_complete
-        prepare_capture(refresh=command == _POSIX_ANCHOR_KILL)
+        prepare_capture(
+            refresh=command == _POSIX_ANCHOR_KILL or darwin_lineage is not None,
+        )
         if command == _POSIX_ANCHOR_TERMINATE:
             try:
                 os.killpg(pgid, signal.SIGTERM)
@@ -3298,6 +3392,30 @@ def _run_posix_group_anchor(
             if input_pipe.fileno() in ready:
                 if input_pipe.read(1) != _POSIX_ANCHOR_ARM:
                     return 125
+                if darwin_lineage is not None and target_argv is None:
+                    # The pipe helper is already in this group, blocked behind
+                    # its launch gate. Record its identity before ARMED lets
+                    # the caller release it; asyncio may reap it immediately
+                    # after exec. Failure must keep user code behind the gate.
+                    # No whole-machine snapshot is needed on the startup path.
+                    group_members = _darwin_group_members(pgid)
+                    if (
+                        group_members is None
+                        or len(group_members) > _POSIX_DESCENDANT_CAPTURE_LIMIT
+                    ):
+                        return 125
+                    for member_pid in group_members:
+                        if member_pid == own_pid:
+                            continue
+                        member = _darwin_process_info(member_pid)
+                        if (
+                            member is None or member.pgid != pgid
+                            or member.uid != os.geteuid() or member.unique_id is None
+                        ):
+                            return 125
+                        darwin_lineage[member.unique_id] = 1
+                    if not darwin_lineage:
+                        return 125
                 output_pipe.write(_POSIX_ANCHOR_ARMED)
                 output_pipe.flush()
                 break
@@ -3306,6 +3424,18 @@ def _run_posix_group_anchor(
                 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                     signal.signal(sig, signal.SIG_DFL)
             target = subprocess.Popen(target_argv, preexec_fn=restore_signals)
+            if darwin_lineage is not None:
+                # arg=1 includes unreaped zombies, so even a target that exits
+                # before Popen returns cannot outrun this identity capture.
+                # Do this before any poll()/wait(), without an extra launcher.
+                target_info = _darwin_process_info(target.pid, include_zombies=True)
+                if (
+                    target_info is not None and target_info.ppid == own_pid
+                    and target_info.uid == os.geteuid() and target_info.unique_id is not None
+                ):
+                    darwin_lineage[target_info.unique_id] = 1
+                else:
+                    cleanup_complete = False
         stdin_fd = input_pipe.fileno()
         os.set_blocking(stdin_fd, False)
         stdin_open = True
@@ -3331,6 +3461,14 @@ def _run_posix_group_anchor(
             members = _posix_group_members(pgid)
             if adopt_children and (target_exited or target_cleanup_at is not None):
                 prepare_capture()
+            elif darwin_lineage is not None and (
+                target_exited or target_cleanup_at is not None
+                or (target is None and members == (own_pid,))
+            ):
+                # A pipe target can leave the group (or exit) while its setsid
+                # children remain alive. Keep ownership until explicit cleanup,
+                # just as for pipe descendants still in the original group.
+                prepare_capture(refresh=True)
             captured_alive = children_present or _captured_posix_processes_alive(captured)
             if sys.platform == "darwin" and target is not None and not target_exited:
                 captured_alive = True
