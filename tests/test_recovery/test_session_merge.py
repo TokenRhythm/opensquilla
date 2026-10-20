@@ -306,6 +306,18 @@ def test_legacy_schema_usage_attribution_backfill_is_idempotent(tmp_path: Path) 
         ).fetchall()
         revision = upgraded.execute("SELECT revision FROM usage_accounting_state").fetchone()
         assert owner == [("legacy-session", 0, "legacy-session", "complete")]
+        # Upgrading usage attribution must preserve deferred transcript backfill:
+        # install the title-query schema without scanning or rewriting old bodies.
+        for table, index in (
+            ("transcript_entries", "idx_transcript_title_candidates"),
+            ("compacted_transcript_entries", "idx_compacted_transcript_title_candidates"),
+        ):
+            assert upgraded.execute(
+                f"SELECT content, content_byte_length FROM {table}"
+            ).fetchall() == [("legacy", None)]
+            assert index in {
+                row[1] for row in upgraded.execute(f"PRAGMA index_list({table})")
+            }
 
     prepare_session_schema(path)
     with sqlite3.connect(path) as replayed:

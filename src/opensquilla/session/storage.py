@@ -2875,13 +2875,15 @@ class SessionStorage:
         await self._migrate_collaboration_columns()
         await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
-        await backfill_usage_attribution_on_conn(self._conn)
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_assistant_replay_column()
         await self._migrate_transcript_content_byte_length_column()
         await self._migrate_transcript_content_revision_column()
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_TITLE_CANDIDATES)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_TITLE_CANDIDATES)
+        # Usage-owner titles query transcript length metadata and candidate indexes.
+        # Install those dependencies before backfilling owners in legacy databases.
+        await backfill_usage_attribution_on_conn(self._conn)
         await self._migrate_transcript_turn_usage_column()
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
