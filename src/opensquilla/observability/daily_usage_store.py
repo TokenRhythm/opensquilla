@@ -13,6 +13,7 @@ import secrets
 import sqlite3
 import time
 from collections.abc import Callable
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,10 @@ def daily_usage_finalizes_at(day: str) -> float:
 
 def _utc_timestamp() -> float:
     return time.time()
+
+
+class DailyUsageCommittedCancellation(asyncio.CancelledError):
+    """The caller was cancelled after its SQLite operation committed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,10 +95,16 @@ class DailyUsageStore:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("Daily usage store is closed")
-            worker = asyncio.create_task(asyncio.to_thread(self._with_connection, operation))
+            # Runner shutdown cancels every Task, including a to_thread Task,
+            # while its SQLite thread can still commit. Keep the executor
+            # Future alive so completion remains observable during shutdown.
+            context = copy_context()
+            worker = asyncio.get_running_loop().run_in_executor(
+                None, context.run, self._with_connection, operation,
+            )
             try:
                 return await asyncio.shield(worker)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancelled:
                 # Cancelling an await cannot stop SQLite in its worker thread.
                 # Observe completion before releasing ownership or closing.
                 while not worker.done():
@@ -103,8 +114,8 @@ class DailyUsageStore:
                         continue
                     except Exception:
                         break
-                if not worker.cancelled():
-                    worker.exception()
+                if not worker.cancelled() and worker.exception() is None:
+                    raise DailyUsageCommittedCancellation(*cancelled.args) from cancelled
                 raise
 
     @staticmethod

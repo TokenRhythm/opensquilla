@@ -22,6 +22,7 @@ from typing import Any, Protocol
 from opensquilla import __version__
 from opensquilla.observability import install_telemetry
 from opensquilla.observability.daily_usage_store import (
+    DailyUsageCommittedCancellation,
     DailyUsageDelta,
     DailyUsageStore,
     daily_usage_finalizes_at,
@@ -349,7 +350,13 @@ class StandaloneUsageTelemetry:
         snapshot = tuple(self._pending.values())
         if self._storage is None:
             self._storage = await DailyUsageStore.open(standalone_daily_usage_path(self._config))
-        await self._storage.record_daily_usage_batch(snapshot, discard_expired=True)
+        cancelled: DailyUsageCommittedCancellation | None = None
+        try:
+            await self._storage.record_daily_usage_batch(snapshot, discard_expired=True)
+        except DailyUsageCommittedCancellation as exc:
+            # A cancellation receipt confirms this exact batch committed.
+            # Acknowledge it before preserving the caller's cancellation.
+            cancelled = exc
         for saved in snapshot:
             current = self._pending[saved.day]
             remaining_turns = current.conversation_turns - saved.conversation_turns
@@ -366,6 +373,8 @@ class StandaloneUsageTelemetry:
                     updated_at=current.updated_at,
                 )
         self._overflow_logged = False
+        if cancelled is not None:
+            raise cancelled
 
     async def close(self) -> None:
         if self._closed:
@@ -405,11 +414,22 @@ class StandaloneUsageTelemetry:
                 await asyncio.gather(*closing, return_exceptions=True)
             finally:
                 try:
-                    flush_task = self._flush_task
-                    if flush_task is not None and not flush_task.done():
-                        await asyncio.shield(flush_task)
-                    if self._pending:
-                        await self.flush()
+                    cancelled = False
+                    while True:
+                        try:
+                            flush_task = self._flush_task
+                            if flush_task is not None and not flush_task.done():
+                                await asyncio.shield(flush_task)
+                            if self._pending:
+                                await self.flush()
+                            break
+                        except asyncio.CancelledError:
+                            # Settle the old snapshot before draining additions
+                            # accepted before close. Shutdown can cancel both
+                            # this cleanup and its writer more than once.
+                            cancelled = True
+                    if cancelled:
+                        raise asyncio.CancelledError
                 finally:
                     storage, self._storage = self._storage, None
                     if storage is not None:
