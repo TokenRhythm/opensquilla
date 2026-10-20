@@ -79,6 +79,7 @@
             v-for="annotation in promptAnnotations"
             :key="annotation.annotationId"
             class="chat-prompt-annotation-chip"
+            :class="{ 'is-stale': annotation.freshness === 'stale' }"
             :data-annotation-id="annotation.annotationId"
             role="group"
           >
@@ -111,7 +112,6 @@
                 type="button"
                 class="chat-prompt-annotation-chip__main"
                 :title="annotation.body"
-                :disabled="Boolean(annotation.selection)"
                 @click="emit('jumpPromptAnnotation', annotation.annotationId)"
               >
                 <span class="chat-prompt-annotation-chip__target">
@@ -119,6 +119,9 @@
                 </span>
                 <span class="chat-prompt-annotation-chip__text">
                   {{ annotation.body || t('chat.promptAnnotations.emptyDraft') }}
+                </span>
+                <span v-if="annotation.freshness === 'stale'" class="chat-prompt-annotation-chip__stale">
+                  {{ t('workbench.annotationUnified.stale') }}
                 </span>
               </button>
               <button
@@ -1268,6 +1271,7 @@ defineExpose<ChatComposerExpose>({
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.chat-prompt-annotation-chip__stale { color: var(--warn); font-size: 11px; }
 
 .chat-prompt-annotation-chip__target {
   padding: 0.125rem 0.375rem;

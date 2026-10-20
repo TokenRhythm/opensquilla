@@ -72,21 +72,28 @@ afterEach(() => {
 })
 
 describe('ChatComposer prompt annotation drafts', () => {
-  it('keeps Office draft editing without offering the native DOM focus action', async () => {
+  it.each([
+    { format: 'docx' as const, kind: 'text' as const, paragraphIds: ['paragraph-1'], truncated: false },
+    { format: 'pptx' as const, kind: 'element' as const, slideIndex: 0, shapeId: 'title', truncated: false },
+    { format: 'xlsx' as const, kind: 'range' as const, sheetIndex: 0, range: 'B2:C4', truncated: false },
+  ])('opens the $format draft target through the shared locate action', async selection => {
     const jump = vi.fn()
+    const send = vi.fn()
     const host = document.createElement('div')
     document.body.append(host)
     const app = createApp(ChatComposer, composerProps({
-      promptAnnotations: [annotation({ selection: { format: 'pptx', kind: 'element', shapeId: 'title', truncated: false } })],
+      promptAnnotations: [annotation({ selection })],
       onJumpPromptAnnotation: jump,
+      onSend: send,
     }))
     app.use(i18n)
     app.mount(host)
     await nextTick()
     const main = host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip__main')!
-    expect(main.disabled).toBe(true)
+    expect(main.disabled).toBe(false)
     main.click()
-    expect(jump).not.toHaveBeenCalled()
+    expect(jump).toHaveBeenCalledWith('annotation-1')
+    expect(send).not.toHaveBeenCalled()
     expect(host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip .attachment-action')?.disabled).toBe(false)
     app.unmount()
   })
@@ -176,20 +183,53 @@ describe('ChatComposer prompt annotation drafts', () => {
     app.unmount()
   })
 
-  it('keeps a compatibility stale draft sendable without exposing revision state', async () => {
+  it('shows a stale draft warning while retaining locate, edit and delete recovery actions', async () => {
+    const jump = vi.fn()
+    const discard = vi.fn()
     const host = document.createElement('div')
     document.body.append(host)
     const app = createApp(ChatComposer, composerProps({
       promptAnnotations: [annotation({ freshness: 'stale', staleReason: 'head-changed' })],
+      onJumpPromptAnnotation: jump,
+      onDiscardPromptAnnotation: discard,
     }))
     app.use(i18n)
     app.mount(host)
     await nextTick()
 
     expect(host.querySelector('.chat-prompt-annotation-chip')?.classList.contains('is-stale'))
+      .toBe(true)
+    expect(host.querySelector('.chat-prompt-annotation-chip__stale')?.textContent?.trim()).toBeTruthy()
+    const main = host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip__main')!
+    expect(main.disabled).toBe(false)
+    main.click()
+    expect(jump).toHaveBeenCalledWith('annotation-1')
+    expect(host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip .attachment-action:not(.attachment-remove)')?.disabled)
       .toBe(false)
-    expect(host.querySelector('.chat-prompt-annotation-chip__stale')).toBeNull()
-    expect(host.textContent).not.toContain('Select this element again')
+    host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip .attachment-remove')!.click()
+    expect(discard).toHaveBeenCalledWith('annotation-1')
+    app.unmount()
+  })
+
+  it('keeps an Office stale warning visible and blocks sending when its owner reports a stale selection', async () => {
+    const send = vi.fn()
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = createApp(ChatComposer, composerProps({
+      promptAnnotations: [annotation({ freshness: 'stale', selection: {
+        format: 'pptx', kind: 'element', slideIndex: 0, shapeId: 'title', truncated: false,
+      } })],
+      sendBlockedMessage: 'Select the target again before sending.',
+      onSend: send,
+    }))
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+    expect(host.querySelector('.chat-prompt-annotation-chip__stale')?.textContent?.trim()).toBeTruthy()
+    const sendButton = host.querySelector<HTMLButtonElement>('.chat-send-btn')!
+    expect(sendButton.disabled).toBe(true)
+    sendButton.click()
+    expect(send).not.toHaveBeenCalled()
     app.unmount()
   })
 

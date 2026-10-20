@@ -16,6 +16,14 @@ import type { TurnCommandsTransport } from './turnCommandsV4'
 import type { TurnReceiptRequest } from '@/modules/turnCommands'
 
 describe('explicit local path display metadata', () => {
+  it.each(['pageContext', 'page_context'])('rejects invalid %s at the final wire boundary', key => {
+    const context = { annotations: Array.from({ length: 17 }, () => ({ text: 'Keep this change' })) }
+    expect(() => toWireSendParams({ message: 'Keep my message', sessionKey: 's', [key]: context }))
+      .toThrow(expect.objectContaining({ failureCode: 'INVALID_REQUEST', accepted: false }))
+    expect(context.annotations).toHaveLength(17)
+  })
+
+
   it('copies references without replacing the complete provider text', () => {
     const paths = ['C:\\资料\\book.pdf']
     const text = `Summarize\n${paths[0]}`

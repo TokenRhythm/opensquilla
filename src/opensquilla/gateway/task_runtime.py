@@ -609,6 +609,7 @@ def _reusable_route_envelope(envelope: RouteEnvelope) -> RouteEnvelope:
     metadata = dict(envelope.metadata)
     metadata.pop("selected_skills", None)
     metadata.pop("office_candidate", None)
+    metadata.pop("annotation_selection", None)
     authority = metadata.get("activation_authority")
     if isinstance(authority, Mapping) and authority.get("authority_kind") == "goal_lease":
         # The route can outlive its Goal turn. Preserve its authenticated
@@ -4689,7 +4690,10 @@ class TaskRuntime:
         _validate_route_session_owner(envelope)
         # One Office selection owns one candidate transaction. Merging another
         # input would lose either its pinned identity or the original candidate.
-        if envelope.metadata.get("office_candidate") is not None:
+        if (
+            envelope.metadata.get("office_candidate") is not None
+            or envelope.metadata.get("annotation_selection") is not None
+        ):
             return None
         async with self._state_lock:
             pending = self._pending_by_session.get(envelope.session_key, [])
@@ -4716,7 +4720,10 @@ class TaskRuntime:
                     or candidate.status != AgentTaskStatus.QUEUED
                 ):
                     return None
-                if candidate.envelope.metadata.get("office_candidate") is not None:
+                if (
+                    candidate.envelope.metadata.get("office_candidate") is not None
+                    or candidate.envelope.metadata.get("annotation_selection") is not None
+                ):
                     return None
                 candidate_session_id = getattr(candidate.envelope, "session_id", None)
                 incoming_session_id = getattr(envelope, "session_id", None)
@@ -5777,6 +5784,7 @@ class TaskRuntime:
         metadata = dict(metadata_raw) if isinstance(metadata_raw, dict) else {}
         # Promoted steering is a new turn, not recovery of the original Office edit.
         metadata.pop("office_candidate", None)
+        metadata.pop("annotation_selection", None)
         recovery_target_turn_id = str(
             metadata.get("promoted_from_turn_id")
             or metadata.get("target_turn_id")

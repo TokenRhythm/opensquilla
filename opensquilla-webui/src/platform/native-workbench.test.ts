@@ -12,6 +12,37 @@ afterEach(() => {
 })
 
 describe('native Workbench platform bridge', () => {
+  it('negotiates editor v2 only with its state update bridge and separates record from batch submit', async () => {
+    let emit: ((payload: unknown) => void) | undefined
+    const base = {
+      createWorkbenchSurface: vi.fn(), setWorkbenchSurfaceRect: vi.fn(), activateWorkbenchSurface: vi.fn(),
+      destroyWorkbenchSurface: vi.fn(),
+      onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => { emit = callback; return () => {} },
+      getArtifactAnnotationCapabilities: async () => ({
+        version: 4, available: true, trustedOverlay: true, overlayEditorVersion: 2,
+      }),
+    }
+    setDesktopApi(base)
+    expect((await createDesktopPlatform().workbench.native!.getArtifactAnnotationCapabilities!()).overlayEditorVersion).toBeUndefined()
+    const update = vi.fn(async () => ({ ok: true }))
+    setDesktopApi({ ...base, updateArtifactAnnotationOverlay: update })
+    const native = createDesktopPlatform().workbench.native!
+    expect((await native.getArtifactAnnotationCapabilities!()).overlayEditorVersion).toBe(2)
+    const request = { version: 4 as const, surfaceId: 'document:1', annotationId: 'annotation_1',
+      editorState: { batchCount: 2, busy: false, error: 'Try again' } }
+    await native.updateArtifactAnnotationOverlay!(request)
+    expect(update).toHaveBeenCalledExactlyOnceWith(request)
+    const receive = vi.fn()
+    native.onSurfaceEvent(receive)
+    for (const type of ['annotation-submit', 'annotation-record-current', 'annotation-batch-submit']) {
+      emit!({ version: 4, surfaceId: 'document:1', type, detail: { annotationId: 'annotation_1', body: '正文' } })
+    }
+    emit!({ version: 4, surfaceId: 'document:1', type: 'annotation-batch-submit', detail: { body: 'missing id' } })
+    expect(receive.mock.calls.map(call => call[0].type)).toEqual([
+      'annotation-submit', 'annotation-record-current', 'annotation-batch-submit',
+    ])
+  })
+
   it('forwards optional automation state while preserving older native clients', async () => {
     const base = {
       createWorkbenchSurface: vi.fn(),

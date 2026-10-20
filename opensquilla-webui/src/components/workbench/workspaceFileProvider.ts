@@ -19,6 +19,22 @@ interface WorkspaceFileViewSnapshot {
   paged?: boolean
   focusLine?: number
 }
+export interface WorkspaceFileAnnotationOptions {
+  openCurrentDocument?(item: WorkbenchItem, isCurrent: () => boolean): Promise<boolean>
+  onAnnotate?(item: WorkbenchItem, isCurrent: () => boolean): void | Promise<void>
+  annotationAvailable?(item: WorkbenchItem): boolean
+}
+function annotationFormat(item: WorkbenchItem): boolean {
+  const file = workspaceFilePayload(item)
+  const path = file?.path || workspaceFileReference(item)?.locator.relativePath || ''
+  return /\.(?:html?|docx|pptx|xlsx)$/i.test(path)
+    || Boolean(file && ['html', 'docx', 'pptx', 'xlsx'].includes(resourcePreviewKind(file)))
+}
+function annotationAvailable(item: WorkbenchItem, options: WorkspaceFileAnnotationOptions): boolean {
+  return Boolean(options.onAnnotate) && annotationFormat(item)
+    && workspaceFilePayload(item)?.annotationCapability?.supported !== false
+    && options.annotationAvailable?.(item) !== false
+}
 
 function lineCount(content: string): number {
   const values = content.split(/\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/)
@@ -58,10 +74,12 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
   private viewId = 0
   private restoring = false
   private restoreEpoch = 0
+  private annotationEpoch = 0
   constructor(
     private readonly references: WorkspaceReferences | null,
     private readonly files: WorkspaceFiles | null,
     private readonly context: WorkbenchRuntimeContext,
+    private readonly annotation: WorkspaceFileAnnotationOptions = {},
   ) {}
   // Network work must not block the manager queue that delivers cancellation.
   activate(item: WorkbenchItem) { this.restore(item) }
@@ -76,6 +94,8 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
       : JSON.stringify([workspaceFileSessionKey(item), workspaceFileReference(item)])
   }
   private restore(item: WorkbenchItem) {
+    this.annotationEpoch += 1
+    this.context.updateRenderState({ annotationPreparing: false })
     const epoch = ++this.restoreEpoch
     this.restoring = true
     const saved = this.context.getViewState?.()
@@ -89,12 +109,24 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
     })
   }
   performAction(action: string, item: WorkbenchItem) {
+    if (action === 'annotate') { void this.prepareAnnotation(item); return }
     if (action === 'refresh') {
+      this.annotationEpoch++
+      this.context.updateRenderState({ annotationPreparing: false })
       this.restoreEpoch++
       this.restoring = false
       this.context.updateRenderState({ readingState: undefined })
       void this.load(item, 1, undefined, true)
     }
+  }
+  private async prepareAnnotation(item: WorkbenchItem) {
+    if (!annotationAvailable(item, this.annotation) || this.context.getRenderState().annotationPreparing) return
+    const epoch = ++this.annotationEpoch
+    const isCurrent = () => epoch === this.annotationEpoch && this.context.isItemOpen()
+    this.context.updateRenderState({ annotationPreparing: true })
+    try { await this.annotation.onAnnotate!(item, isCurrent) }
+    catch (error) { if (isCurrent()) this.context.reportError(error instanceof Error ? error : new Error(String(error))) }
+    finally { if (isCurrent()) this.context.updateRenderState({ annotationPreparing: false }) }
   }
   handleComponentEvent(event: { type: string; payload?: unknown }, item: WorkbenchItem) {
     if (item.scope.type !== 'session') return
@@ -134,13 +166,14 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
     this.copyTimer = null
   }
   suspend() {
+    this.annotationEpoch += 1
     this.restoreEpoch++
     this.restoring = false
     this.pending?.abort()
     this.pending = null
     this.cancelCopy()
     this.context.updateRenderState({ snapshot: null, previewBlob: null, previewErrorKey: '', loading: false, errorKey: '', copying: false,
-      copied: false, copyErrorKey: '', searchStatus: 'idle', searchQuery: '', searchErrorKey: '' })
+      copied: false, copyErrorKey: '', searchStatus: 'idle', searchQuery: '', searchErrorKey: '', annotationPreparing: false })
   }
   dispose() { this.suspend() }
   private current(request: AbortController) {
@@ -241,6 +274,10 @@ class WorkspaceFileRuntime implements WorkbenchPanelRuntime {
     this.pending = request
     this.context.updateRenderState({ loading: true })
     try {
+      if (annotationFormat(item) && this.annotation.openCurrentDocument) {
+        if (await this.annotation.openCurrentDocument(item, () => this.current(request))) return
+        if (!this.current(request)) return
+      }
       let snapshot: WorkspaceFileViewSnapshot | null = null
       if (reference && this.references) {
         snapshot = await this.references.read(workspaceFileSessionKey(item), reference, request.signal)
@@ -328,11 +365,13 @@ export function createWorkspaceFileDefinition(
   references: WorkspaceReferences | null,
   files: WorkspaceFiles | null,
   t: (key: string) => string,
+  options?: WorkspaceFileAnnotationOptions,
 ): WorkbenchPanelDefinition
 export function createWorkspaceFileDefinition(
   references: WorkspaceReferences | null,
   filesOrTranslate: WorkspaceFiles | null | ((key: string) => string),
   maybeTranslate?: (key: string) => string,
+  options: WorkspaceFileAnnotationOptions = {},
 ): WorkbenchPanelDefinition {
   const files = typeof filesOrTranslate === 'function' ? null : filesOrTranslate
   const t = typeof filesOrTranslate === 'function' ? filesOrTranslate : maybeTranslate!
@@ -350,9 +389,21 @@ export function createWorkspaceFileDefinition(
         icon: 'fileText',
       }
     },
-    getToolbarItems: () => [{ kind: 'action', id: 'refresh', icon: 'refresh', label: t('workspaceReference.refresh') }],
+    getToolbarItems: (item, state) => [
+      ...(options.onAnnotate && annotationFormat(item) ? [{
+        kind: 'action' as const, id: 'annotate', icon: 'pencil' as const, label: t('workbench.annotationUnified.start'),
+        disabled: !annotationAvailable(item, options) || state.runtimeState.annotationPreparing === true,
+        ...(!annotationAvailable(item, options) ? { tooltip: t(
+          /\.html?$/i.test(workspaceFilePayload(item)?.path || workspaceFileReference(item)?.locator.relativePath || '')
+            && options.annotationAvailable?.(item) === false
+            ? 'workbench.artifactAnnotation.desktopEditingOnly'
+            : 'workbench.annotationUnified.unavailable',
+        ) } : {}),
+      }] : []),
+      { kind: 'action', id: 'refresh', icon: 'refresh', label: t('workspaceReference.refresh') },
+    ],
     getProps: (item, state) => ({ ...state.runtimeState,
       file: workspaceFilePayload(item), sessionKey: workspaceFileSessionKey(item) }),
-    createRuntime: (_item, context) => new WorkspaceFileRuntime(references, files, context),
+    createRuntime: (_item, context) => new WorkspaceFileRuntime(references, files, context, options),
   }
 }

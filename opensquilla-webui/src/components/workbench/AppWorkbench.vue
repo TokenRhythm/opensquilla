@@ -22,6 +22,7 @@
     :maximize-label="t('workbench.maximize')"
     :restore-label="t('workbench.restore')"
     :close-item-label="t('workbench.closeItem')"
+    :historical-label="t('workbench.artifactDocument.historicalVersion')"
     :resize-label="t('workbench.resize')"
     :pixels-label="t('workbench.pixels')"
     :before-close-item="beforeCloseItem"
@@ -158,20 +159,21 @@
           v-if="isActiveAnnotationToolbarItem(toolbarItem)"
           id="workbench-annotation-mode-status"
           class="app-workbench__annotation-mode-status"
-          :aria-label="t('workbench.artifactAnnotation.selectElement')"
-          :title="t('workbench.artifactAnnotation.selectElement')"
+          :aria-label="t('workbench.annotationUnified.selectTarget')"
+          :title="t('workbench.annotationUnified.selectTarget')"
           aria-atomic="true"
           aria-live="polite"
           data-testid="workbench-annotation-mode-status"
           role="status"
         >
           <span class="app-workbench__annotation-mode-status-full" aria-hidden="true">
-            {{ t('workbench.artifactAnnotation.selectElement') }}
+            {{ t('workbench.annotationUnified.selectTarget') }}
           </span>
         </span>
         <span
           v-if="toolbarItem.kind === 'status'"
           class="app-workbench__warning"
+          :class="{ 'app-workbench__warning--neutral': toolbarItem.tone === 'neutral' }"
           :title="toolbarItem.label"
           role="status"
         >
@@ -219,7 +221,7 @@
           class="app-workbench__action"
           :class="{
             'is-active': toolbarItem.pressed,
-            'app-workbench__action--annotation': toolbarItem.id === 'toggle-annotation-mode',
+            'app-workbench__action--annotation': ['toggle-annotation-mode', 'prepare-annotation', 'annotate'].includes(toolbarItem.id),
           }"
           :aria-label="toolbarItem.label"
           :aria-describedby="isActiveAnnotationToolbarItem(toolbarItem)
@@ -227,12 +229,12 @@
             : undefined"
           :aria-pressed="toolbarItem.pressed"
           :disabled="toolbarItem.disabled"
-          :title="toolbarItem.label"
+          :title="toolbarItem.tooltip || toolbarItem.label"
           @click="performPanelAction(item, toolbarItem.id)"
         >
           <Icon :name="toolbarItem.icon" :size="15" aria-hidden="true" />
           <span
-            v-if="toolbarItem.id === 'toggle-annotation-mode'"
+            v-if="['toggle-annotation-mode', 'prepare-annotation', 'annotate'].includes(toolbarItem.id)"
             class="app-workbench__action-label"
             aria-hidden="true"
           >
@@ -332,6 +334,7 @@ import { workbenchPanelRegistry } from '@/workbench/registry'
 import {
   artifactWorkbenchItemId,
   artifactFromWorkbenchItem,
+  artifactResourceRefFromWorkbenchItem,
   isFixedArtifactPreview,
   fileActionArtifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
@@ -340,6 +343,8 @@ import {
   requestInitialSectionForWorkbenchItem,
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
+import { workspaceFilePayload, workspaceFileReference, workspaceFileSessionKey } from '@/workbench/workspaceFileItems'
+import { resolveWorkspaceDocumentFile } from '@/workbench/workspaceDocumentOpening'
 import {
   BROWSER_WORKBENCH_OPEN_EVENT,
   createBrowserWorkbenchItem,
@@ -358,6 +363,8 @@ import {
   WorkbenchRuntimeManager,
 } from '@/workbench/runtime'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import { prepareCurrentDocumentPreview, resolveCurrentDocumentResource } from '@/workbench/currentDocumentOpening'
+import type { WorkspaceFile } from '@/modules/workspaceFiles'
 import {
   workbenchResourceActionReasonCode,
 } from '@/workbench/resourceCapabilityPresentation'
@@ -1193,6 +1200,12 @@ const promptAnnotationActions: NonNullable<ArtifactWorkbenchProviderOptions['pro
     setActiveDocument: (sessionKey, documentId) => {
       artifactPromptAnnotations.setActiveDocument(sessionKey, documentId)
     },
+    setActivePage: (sessionKey, pagePath) => artifactPromptAnnotations.setActivePage(sessionKey, pagePath),
+    list: (sessionKey, documentId) => artifactPromptAnnotations.draftsForSession(sessionKey).filter(item => item.documentId === documentId),
+    get: annotationId => artifactPromptAnnotations.annotations[annotationId],
+    isQueued: annotationId => artifactPromptAnnotations.isQueued(annotationId),
+    replaceSelection: (annotationId, request) => artifactPromptAnnotations.replaceSelection(annotationId, request),
+    restoreReplacement: (original, replacementId) => artifactPromptAnnotations.restoreReplacement(original, replacementId),
 }
 
 for (const definition of createArtifactWorkbenchDefinitions({
@@ -1210,6 +1223,15 @@ for (const definition of createArtifactWorkbenchDefinitions({
     primaryClass: 'btn--primary',
   }),
   currentSessionId: () => store.activeSessionId || props.sessionId,
+  prepareAnnotation: prepareWorkbenchAnnotation,
+  viewRevision: openHistoricalRevision,
+  openLatest: async (item, isCurrent) => {
+    const artifact = artifactFromWorkbenchItem(item)
+    const ref = typeof artifact?.documentId === 'string'
+      ? createWorkbenchResourceRef('document', artifact.documentId)
+      : artifactResourceRefFromWorkbenchItem(item)
+    if (ref) await openLatestResource(ref, item, isCurrent)
+  },
   editCurrentResource: async (ref, item, requestIsCurrent) => {
     const generation = scopeChangeGeneration
     const navigationGeneration = artifactNavigationGeneration
@@ -1273,12 +1295,23 @@ if (workspaceReferences || workspaceFiles) {
     workspaceReferences,
     workspaceFiles,
     key => String(t(key)),
+    {
+      openCurrentDocument: openWorkspaceDocument,
+      onAnnotate: prepareWorkbenchAnnotation,
+      annotationAvailable: item => {
+        const path = workspaceFilePayload(item)?.path || workspaceFileReference(item)?.locator.relativePath || ''
+        return /\.html?$/i.test(path)
+          ? props.promptAnnotationsEnabled && platform.capabilities.hasNativeWorkbenchSurfaces
+          : props.officePromptAnnotationsEnabled
+      },
+    },
   ), { replace: true })
 }
 if (workspaceFiles) {
   workbenchPanelRegistry.register(createWorkspaceFilesWorkbenchDefinition(
     workspaceFiles,
     key => String(t(key)),
+    openResolvedWorkspaceDocument,
   ), { replace: true })
 }
 if (terminal) {
@@ -1342,25 +1375,172 @@ function openResourceArtifact(
   // their preview stays visible in the owning parent's Workbench.
   const opened = store.openItem(ownerItem ? { ...previewItem, scope: ownerItem.scope } : previewItem)
   if (opened && store.activeItemId === previewItem.id) store.requestReveal()
+  return opened ? store.items.find(item => item.id === previewItem.id) : undefined
 }
 
-async function openCollectionResource(resource: WorkbenchResource, item: WorkbenchItem) {
-  if (resource.resource.type !== 'deliverable') return openWorkbenchResource(resource, item)
-  const sessionKey = resourceSessionKey(item)
-  if (!sessionKey) return
-  const artifact = artifactPayloadFromWorkbenchResource(resource)
+function openingIsCurrent(item: WorkbenchItem, requestIsCurrent: () => boolean) {
+  const generation = scopeChangeGeneration
+  const navigationGeneration = artifactNavigationGeneration
+  const identity = gateway?.deliveryIdentity
+  const epoch = gateway?.subscriptionEpoch
+  return () => requestIsCurrent() && generation === scopeChangeGeneration
+    && navigationGeneration === artifactNavigationGeneration
+    && gateway?.deliveryIdentity === identity && gateway?.subscriptionEpoch === epoch
+    && props.routeActive && props.enabled && !props.modalBlocked
+    && store.activeItemId === item.id && store.items.some(candidate => candidate.id === item.id)
+}
+
+async function openLatestResource(
+  ref: import('@/types/workbenchResources').WorkbenchResourceRef,
+  item: WorkbenchItem,
+  requestIsCurrent: () => boolean = () => true,
+  pagePath?: string,
+) {
+  const isCurrent = openingIsCurrent(item, requestIsCurrent)
+  const sessionKey = item.kind === 'file' ? workspaceFileSessionKey(item) : resourceSessionKey(item)
+  if (!sessionKey || !isCurrent()) return false
+  const resource = await resolveCurrentDocumentResource(
+    (session, resource) => workbenchResources.resolveFresh(session, resource, isCurrent), sessionKey, ref, isCurrent)
+  if (!resource || !isCurrent()) return false
+  const artifact = await prepareCurrentDocumentPreview(resource, sessionKey, artifactDocuments, isCurrent)
+  if (!artifact || !isCurrent()) return false
   if (!resource.capabilities.preview) {
     if (artifactWorkbenchPreviewKind(artifact) !== 'html' && resource.capabilities.download) {
       await downloadWorkbenchResource(resource, item)
-      return
+      return true
     }
     throw artifactProductClientError('RESOURCE_UNSUPPORTED', {
       reasonCode: workbenchResourceActionReasonCode(resource.capabilities, 'preview') || undefined,
     })
   }
-  // A collection's Deliverable Open has the same immutable semantics as a
-  // historical chat card. Continue editing is the explicit current-head path.
-  openResourceArtifact(resource, artifact, sessionKey, undefined, 'preview', item)
+  if (pagePath) artifact.previewPagePath = pagePath
+  const opened = openResourceArtifact(resource, artifact, sessionKey, undefined, 'preview', item)
+  if (opened && item.kind === 'file' && opened.id !== item.id) store.closeItem(item.id)
+  return Boolean(opened)
+}
+
+async function openResolvedWorkspaceDocument(file: WorkspaceFile, item: WorkbenchItem, isCurrent: () => boolean) {
+  if (!props.workbenchResourcesEnabled || !file.documentTarget
+    || !/\.(?:html?|docx|pptx|xlsx)$/i.test(file.path)) return false
+  return openLatestResource(createWorkbenchResourceRef('document', file.documentTarget.documentId),
+    item, isCurrent, file.documentTarget.pagePath)
+}
+
+async function openWorkspaceDocument(item: WorkbenchItem, requestIsCurrent: () => boolean) {
+  if (!workspaceFiles || !props.workbenchResourcesEnabled) return false
+  const isCurrent = openingIsCurrent(item, requestIsCurrent)
+  const file = await resolveWorkspaceDocumentFile(workspaceFiles, item, isCurrent)
+  return file ? openResolvedWorkspaceDocument(file, item, isCurrent) : false
+}
+
+function openHistoricalRevision(artifact: ArtifactPayload, item: WorkbenchItem) {
+  if (!store.items.some(candidate => candidate.id === item.id) || store.activeItemId !== item.id) return
+  const document = artifactFromWorkbenchItem(item)
+  if (!artifact.revisionId || !artifact.id || !document?.documentId) return
+  const historicalArtifact = { ...artifact, documentId: document.documentId,
+    sourcePath: document.sourcePath, workbenchOpenIntent: 'history' }
+  // A revision can be private. Fetch its authorized revision URL directly;
+  // do not resolve its ArtifactStore ID as a public deliverable.
+  const preview = artifactPreviewItemForExplicitOpen({
+    artifact: historicalArtifact, historical: true,
+    nativeHtml: Boolean(platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native),
+    resourceIdentity: `revision:${document.documentId}:${artifact.revisionId}`,
+    sessionKey: resourceSessionKey(item),
+  })
+  if (store.openItem({ ...preview, scope: item.scope })) store.requestReveal()
+}
+
+async function prepareWorkbenchAnnotation(
+  item: WorkbenchItem,
+  requestIsCurrent: () => boolean = () => true,
+  reselectAnnotationId?: string,
+) {
+  const generation = scopeChangeGeneration
+  const navigationGeneration = artifactNavigationGeneration
+  const identity = gateway?.deliveryIdentity
+  const isCurrent = () => requestIsCurrent() && generation === scopeChangeGeneration
+    && navigationGeneration === artifactNavigationGeneration
+    && gateway?.deliveryIdentity === identity && props.routeActive && props.enabled && !props.modalBlocked
+    && store.activeItemId === item.id
+  const sessionKey = item.kind === 'file' ? workspaceFileSessionKey(item) : resourceSessionKey(item)
+  if (!sessionKey || !isCurrent()) return
+  let file = workspaceFilePayload(item)
+  if (item.kind === 'file' && !file) {
+    if (!workspaceFiles) throw artifactProductClientError('RESOURCE_UNSUPPORTED')
+    file = await resolveWorkspaceDocumentFile(workspaceFiles, item, isCurrent)
+  }
+  if (!isCurrent()) return
+  const resourceRef = artifactResourceRefFromWorkbenchItem(item)
+    || (artifactFromWorkbenchItem(item)?.documentId
+      ? createWorkbenchResourceRef('document', String(artifactFromWorkbenchItem(item)?.documentId)) : null)
+  if (!file && !resourceRef) throw artifactProductClientError('RESOURCE_UNSUPPORTED')
+  const prepared = await workbenchResources.prepareAnnotation(sessionKey, file
+    ? { workspaceFile: { path: file.path, workspaceBinding: file.workspaceBinding, expectedRevision: file.revision || '' } }
+    : { resourceRef: resourceRef! }).catch(error => {
+      if (isCurrent()) throw error
+      return null
+    })
+  if (!isCurrent()) return
+  if (!prepared || prepared.disposition !== 'document') throw artifactProductClientError('RESOURCE_UNSUPPORTED')
+  const artifact = artifactPayloadFromRevision(prepared.revision)
+  artifact.documentId = prepared.document.documentId
+  artifact.revisionId = prepared.revision.revisionId
+  artifact.sourcePath = prepared.resource.sourcePath
+  if (prepared.pageContext?.pagePath) artifact.previewPagePath = prepared.pageContext.pagePath
+  const reselectDraft = reselectAnnotationId ? artifactPromptAnnotations.annotations[reselectAnnotationId] : undefined
+  if (reselectDraft?.pagePath) artifact.previewPagePath = reselectDraft.pagePath
+  await artifactDocuments.load(artifact, sessionKey, { force: true })
+  if (!isCurrent()) return
+  const loaded = artifactDocuments.snapshot(artifact, sessionKey)
+  const workspace = loaded.workspace
+  if (!loaded.loaded || loaded.loading || loaded.stale || loaded.error
+    || workspace?.source !== 'document-api'
+    || workspace.document.documentId !== prepared.document.documentId) {
+    throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+  }
+  // A concurrent edit can advance the head after preparation. Validate drafts
+  // against the preview we actually loaded, and require a fresh preparation
+  // before opening selection against a different baseline.
+  artifactPromptAnnotations.validateDocumentVersion(sessionKey, workspace.document.documentId,
+    workspace.document.headRevisionId, String(workspace.headArtifact.sha256 || ''))
+  if (workspace.document.headRevisionId !== prepared.revision.revisionId
+    || String(workspace.headArtifact.sha256 || '') !== String(artifact.sha256 || '')) {
+    throw artifactProductClientError('DOCUMENT_CHANGED')
+  }
+  const opened = openResourceArtifact(prepared.resource, artifact, sessionKey, undefined, 'preview', item)
+  if (!opened) return
+  if (opened.id !== item.id && item.payload.historical !== true
+    && (item.kind === 'file' || isFixedArtifactPreview(item))) store.closeItem(item.id)
+  artifactPromptAnnotations.setActiveDocument(sessionKey, prepared.document.documentId)
+  artifactPromptAnnotations.setActivePage(sessionKey, prepared.pageContext?.pagePath)
+  if (prepared.baselineUpdated || (artifactFromWorkbenchItem(item)?.revisionId
+    && artifactFromWorkbenchItem(item)?.revisionId !== artifact.revisionId)) {
+    pushToast(t('workbench.annotationUnified.versionChanged'), { tone: 'info' })
+  }
+  // Do not await the same runtime queue from inside its prepare action.
+  const openedNavigationGeneration = artifactNavigationGeneration
+  void nextTick(async () => {
+    const stillCurrent = () => generation === scopeChangeGeneration && gateway?.deliveryIdentity === identity
+      && openedNavigationGeneration === artifactNavigationGeneration
+      && props.routeActive && store.activeItemId === opened.id && store.items.some(candidate => candidate.id === opened.id)
+    await runtimeManager.flush(opened.id)
+    for (let attempt = 0; attempt < 60 && stillCurrent(); attempt++) {
+      const state = runtimeManager.getRenderState(opened.id)
+      if (artifactWorkbenchPreviewKind(artifact) !== 'html' || state.annotationAvailable === true) {
+        if (reselectAnnotationId) runtimeManager.handleComponentEvent(opened, {
+          type: 'artifact-annotation-summary', payload: { type: 'reselect', annotationId: reselectAnnotationId, prepared: true },
+        })
+        else runtimeManager.performAction(opened, 'begin-prepared-annotation')
+        return
+      }
+      await new Promise(resolve => window.setTimeout(resolve, 50))
+    }
+    if (stillCurrent()) pushToast(t('workbench.annotationUnified.unavailable'), { tone: 'warn' })
+  })
+}
+
+async function openCollectionResource(resource: WorkbenchResource, item: WorkbenchItem) {
+  await openLatestResource(resource.resource, item)
 }
 
 async function openWorkbenchResource(
@@ -1374,9 +1554,11 @@ async function openWorkbenchResource(
   if (!isCurrent()) return
   if (current?.disposition === 'document') {
     refreshResourceCollectionItem(sessionKey)
-    const artifact = artifactPayloadFromRevision(current.revision)
+    const artifact = await prepareCurrentDocumentPreview(current.resource, sessionKey, artifactDocuments, isCurrent)
+    if (!artifact || !isCurrent()) return
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
+    artifact.sourcePath = current.resource.sourcePath
     openResourceArtifact(current.resource, artifact, sessionKey, undefined, 'preview', item)
     return
   }
@@ -1575,6 +1757,10 @@ async function refreshArtifactDocumentItem(
     payload: { ...current.payload },
   }
   store.updateItem(updated)
+  if (workspace.source === 'document-api') {
+    artifactPromptAnnotations.validateDocumentVersion(sessionKey, workspace.document.documentId,
+      workspace.document.headRevisionId, String(workspace.headArtifact.sha256 || ''))
+  }
   if (
     workspace.source === 'document-api'
     && previousRevisionId
@@ -1639,15 +1825,25 @@ function panelProps(
 function artifactNavigationItems(
   item: WorkbenchItem | null,
 ): readonly ArtifactPayload[] {
+  if (item?.payload.historical === true) return []
+  const seen = new Set<string>()
   return previewableNavigationArtifactsFromWorkbenchItem(item)
+    .filter(artifact => {
+      const key = artifactNavigationId(item, artifact)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
 }
 
 function artifactNavigationId(
   item: WorkbenchItem | null,
   artifact: ArtifactPayload,
 ): string {
-  const documentId = artifact.source === 'workspace-preview'
-    ? String(artifact.documentId || artifact.document_id || '') : ''
+  const known = artifact.id ? workbenchResources.find(sessionKeyFromWorkbenchItem(item),
+    createWorkbenchResourceRef('deliverable', String(artifact.id))) : null
+  const documentId = known?.relations.documentId || (artifact.source === 'workspace-preview'
+    ? String(artifact.documentId || artifact.document_id || '') : '')
   const resourceIdentity = documentId ? `document:${documentId}`
     : artifact.id ? `deliverable:${artifact.id}` : undefined
   return artifactWorkbenchItemId(sessionKeyFromWorkbenchItem(item), artifact, resourceIdentity)
@@ -1695,13 +1891,15 @@ async function selectNavigationArtifact(
     && (kind === 'html' || isOfficePreviewFormat(kind))) {
     try {
       const workingFile = artifact.source === 'workspace-preview' && documentId
-      const resource = await workbenchResources.resolve(sessionKey, createWorkbenchResourceRef(
+      const resource = await resolveCurrentDocumentResource(
+        (session, resource) => workbenchResources.resolveFresh(session, resource, isCurrent), sessionKey, createWorkbenchResourceRef(
         workingFile ? 'document' : 'deliverable', workingFile || artifactId,
-      ))
+      ), isCurrent)
       if (!isCurrent()) return
       if (resource) {
-        if (workingFile) await openWorkbenchResource(resource, item, isCurrent)
-        else openResourceArtifact(resource, artifactPayloadFromWorkbenchResource(resource), sessionKey,
+        const previewArtifact = await prepareCurrentDocumentPreview(resource, sessionKey, artifactDocuments, isCurrent)
+        if (!previewArtifact || !isCurrent()) return
+        openResourceArtifact(resource, previewArtifact, sessionKey,
           undefined, 'preview', item)
         return
       }
@@ -1972,6 +2170,8 @@ async function activatePromptAnnotationItem(
       state.annotationAvailable === true
       && state.nativeSurfaceState === 'ready'
     ) return item
+    const artifact = artifactFromWorkbenchItem(item)
+    if (props.officePromptAnnotationsEnabled && artifact && isOfficePreviewFormat(artifactWorkbenchPreviewKind(artifact))) return item
     if (
       state.nativeSurfaceState === 'error'
       || state.nativeSurfaceState === 'crashed'
@@ -1984,7 +2184,7 @@ async function activatePromptAnnotationItem(
 
 async function onPromptAnnotationFocus(event: Event) {
   const detail = (event as CustomEvent<ArtifactPromptAnnotationFocusDetail>).detail
-  if (!props.promptAnnotationsEnabled || !detail?.annotationId || !detail.documentId || !detail.sessionKey) {
+    if ((!props.promptAnnotationsEnabled && !props.officePromptAnnotationsEnabled) || !detail?.annotationId || !detail.documentId || !detail.sessionKey) {
     detail?.complete?.(false)
     return
   }
@@ -1994,6 +2194,22 @@ async function onPromptAnnotationFocus(event: Event) {
     return
   }
   const draft = artifactPromptAnnotations.annotations[detail.annotationId]
+  if (draft?.freshness === 'stale') {
+    runtimeManager.handleComponentEvent(item, {
+      type: 'artifact-annotation-summary', payload: { type: 'edit', annotationId: draft.annotationId },
+    })
+    await runtimeManager.flush(item.id)
+    detail.complete?.(true)
+    return
+  }
+  if (draft?.selection && props.officePromptAnnotationsEnabled) {
+    runtimeManager.handleComponentEvent(item, {
+      type: 'artifact-annotation-summary', payload: { type: 'edit', annotationId: draft.annotationId },
+    })
+    await runtimeManager.flush(item.id)
+    detail.complete?.(true)
+    return
+  }
   if (!draft?.targetRef || !draft.locatorHint || !nativeApi?.focusWorkbenchAnnotation) {
     detail.complete?.(false)
     return
@@ -2037,6 +2253,7 @@ async function onPromptAnnotationReuse(event: Event) {
 async function deliverPageAnnotationSend(
   item: WorkbenchItem,
   draftIds: readonly string[],
+  documentId?: string,
 ): Promise<boolean> {
   // A descriptor may be replaced while the runtime queue is draining. Keep
   // the acknowledgement queued in that case; the store's update lifecycle
@@ -2045,7 +2262,7 @@ async function deliverPageAnnotationSend(
   if (current !== item || item.kind !== 'artifact-preview') return false
   runtimeManager.handleComponentEvent(item, {
     type: 'page-annotations-sent',
-    payload: { draftIds: [...draftIds] },
+    payload: { draftIds: [...draftIds], ...(documentId ? { documentId } : {}) },
   })
   await runtimeManager.flush(item.id)
   if (store.items.find(candidate => candidate.id === item.id) !== item) return false
@@ -2056,6 +2273,7 @@ async function deliverPageAnnotationSend(
   // matching runtime exists and has processed the event.
   if (!runtimeManager.hasRuntime(item.id)) return false
   const state = runtimeManager.getRenderState(item.id)
+  if (state.annotationAckDeferredToNewDraft === JSON.stringify(draftIds)) return true
   // A runtime instance may be present before its provider constructor has
   // published the initial render state. Treat that as an unprocessed event,
   // rather than consuming the acknowledgement from an empty state object.
@@ -2081,6 +2299,11 @@ async function flushPageAnnotationSendQueue(): Promise<void> {
     artifactItems,
     sessionKeyFromWorkbenchItem,
     deliverPageAnnotationSend,
+    Date.now(),
+    item => {
+      const artifact = artifactFromWorkbenchItem(item)
+      return artifact ? artifactDocuments.snapshot(artifact, sessionKeyFromWorkbenchItem(item)).workspace?.document.documentId : undefined
+    },
   )
   if (pageAnnotationSendQueue.size === 0) {
     pageAnnotationSendRetryDelay = 250
@@ -2518,6 +2741,10 @@ onBeforeUnmount(() => {
   max-width: 150px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.app-workbench__warning--neutral {
+  color: var(--text-muted);
 }
 
 .app-workbench__unsupported {

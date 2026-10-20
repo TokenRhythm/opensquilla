@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, reactive, ref, watch, type EffectScope } from 'vue'
+import { createPinia } from 'pinia'
 import { transpileModule, ScriptTarget } from '@typescript/typescript6'
-import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import { artifactPayloadFromRevision, createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
+import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
+import { prepareCurrentDocumentPreview } from '@/workbench/currentDocumentOpening'
+import type { ArtifactDocumentWorkspace } from '@/types/artifactDocuments'
+import type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
 import { artifactPayloadFromWorkbenchResource, resourceFromPreparedPreview, workbenchResourceKey } from '@/workbench/workbenchResourceItems'
 import chatViewSource from './ChatView.vue?raw'
 
@@ -26,10 +31,22 @@ function harness() {
   const attachment = { attachmentId: 'input-1', name: 'input.html', mime: 'text/html' }
   const resource = { resource: { type: 'attachment', attachmentId: 'input-1', id: 'input-1' }, name: 'input.html', mime: 'text/html',
     sha256: 'a'.repeat(64), capabilities: { preview: true, edit: true }, relations: {} }
-  const revision = { documentId: 'doc_input', revisionId: 'rev_input', artifactId: 'head', filename: 'input.html', mediaType: 'text/html', artifactSha256: 'b'.repeat(64) }
+  const revision = { ...createLegacyArtifactWorkspace({ id: 'head', name: 'input.html', mime: 'text/html' }, 'main-a').revisions[0]!,
+    documentId: 'doc_input', revisionId: 'rev_input', artifactId: 'head', filename: 'input.html',
+    mediaType: 'text/html', artifactSha256: 'b'.repeat(64) }
   const document = { documentId: 'doc_input', headRevisionId: revision.revisionId }
   const current = { disposition: 'document', document, revision,
-    resource: { ...resource, resource: { type: 'document', documentId: 'doc_input', id: 'doc_input' } } }
+    resource: { ...resource, resource: { type: 'document', documentId: 'doc_input', id: 'doc_input' },
+      relations: { documentId: 'doc_input', headRevisionId: revision.revisionId, headArtifactId: revision.artifactId } } }
+  const artifactDocumentsStore = useArtifactDocumentsStore(createPinia())
+  const workspace = () => {
+    const artifact = artifactPayloadFromRevision(current.revision)
+    const legacy = createLegacyArtifactWorkspace(artifact, 'main-a')
+    return { ...legacy, source: 'document-api', document: { ...legacy.document, ...current.document },
+      headArtifact: artifact } as ArtifactDocumentWorkspace
+  }
+  const loadWorkspace = vi.fn(async (): Promise<ArtifactDocumentWorkspace> => workspace())
+  artifactDocumentsStore.setProvider({ loadWorkspace } as unknown as ArtifactDocumentProvider)
   const prepared = { resource, preview: { resource: resource.resource, mode: 'isolated', launchUrl: '/preview' } }
   const services = {
     find: vi.fn(() => resource as typeof resource | null), load: vi.fn(async (): Promise<unknown> => ({})),
@@ -42,6 +59,7 @@ function harness() {
     workbenchResourcesEnabled: { value: true }, workbenchEnabled: { value: true }, workbenchResourcesStore: services,
     workbenchStore: { openItem, requestReveal }, artifactPreviewItemForExplicitOpen: (item: unknown) => item,
     platform: { capabilities: {}, workbench: {} }, artifactPayloadFromRevision, artifactPayloadFromWorkbenchResource,
+    prepareCurrentDocumentPreview, artifactDocumentsStore,
     resourceFromPreparedPreview, workbenchResourceKey, t: (key: string) => key, pushToast,
     classifyArtifactProductError: () => ({ messageKey: 'error', fallbackMessage: 'Unavailable' }),
     workbenchResourceUnavailableReasonKey: () => 'unavailable', workbenchResourceActionReasonCode: () => 'unavailable',
@@ -50,7 +68,7 @@ function harness() {
     previewAttachmentResource(value: typeof attachment): Promise<void>
   }
   return { api, attachment, resource, current, prepared, document, revision, services, openItem, requestReveal, pushToast,
-    sessionKey, currentEpoch, deliveryIdentity, gatewayAccess }
+    sessionKey, currentEpoch, deliveryIdentity, gatewayAccess, artifactDocumentsStore, loadWorkspace, workspace }
 }
 
 describe('main attachment preview session ownership', () => {
@@ -69,6 +87,33 @@ describe('main attachment preview session ownership', () => {
     expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: 'main-a', previewLeaseEligible: true,
       resourceIdentity: 'document:doc_input', artifact: expect.objectContaining({ documentId: 'doc_input', revisionId: 'rev_input' }) }))
     expect(h.requestReveal).toHaveBeenCalledOnce()
+  })
+
+  it('refreshes a cached older attachment Document before showing its latest revision', async () => {
+    const h = harness()
+    await h.artifactDocumentsStore.load(artifactPayloadFromRevision(h.current.revision), 'main-a')
+    h.current.revision = { ...h.current.revision, revisionId: 'revision-two', artifactId: 'head-two' }
+    h.current.document = { ...h.current.document, headRevisionId: 'revision-two' }
+    h.current.resource.relations = { ...h.current.resource.relations, headRevisionId: 'revision-two', headArtifactId: 'head-two' }
+    await h.api.previewAttachmentResource(h.attachment)
+    expect(h.loadWorkspace).toHaveBeenCalledTimes(2)
+    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({
+      resourceIdentity: 'document:doc_input',
+      artifact: expect.objectContaining({ revisionId: 'revision-two', id: 'head-two' }),
+    }))
+  })
+
+  it('does not reopen the previous conversation after a delayed document cache refresh', async () => {
+    const h = harness()
+    let finish!: (workspace: ArtifactDocumentWorkspace) => void
+    h.loadWorkspace.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const opening = h.api.previewAttachmentResource(h.attachment)
+    await vi.waitFor(() => expect(h.loadWorkspace).toHaveBeenCalledOnce())
+    h.sessionKey.value = 'main-b'
+    finish(h.workspace())
+    await opening
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.pushToast).not.toHaveBeenCalled()
   })
 
   it.each(['load', 'resolve', 'openCurrent', 'importDocument', 'preview'] as const)(

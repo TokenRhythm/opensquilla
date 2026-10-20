@@ -3,7 +3,7 @@ import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@
 import { copyLocalPathReferences, localPathPresentation } from '@/types/localPathReferences'
 import { copyTurnCommand, type ProjectInitTurnCommand } from '@/types/turnCommand'
 import type { AttachmentDraftConsumption } from '@/utils/chat/attachmentDrafts'
-import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, type ChatPageContext } from '@/types/pageContext'
+import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, assertPageContextWithinLimits, type ChatPageContext } from '@/types/pageContext'
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
@@ -248,6 +248,8 @@ interface DispatchSendOptions {
   queueMode?: 'steer'
   payload?: ExplicitSendPayload
   preserveComposer?: boolean
+  /** A frozen queue payload does not depend on the current annotation editor. */
+  queuedSend?: boolean
   composerSnapshot?: ComposerSnapshot
   cancelIfComposerChanged?: boolean
   retryAttempt?: SendAttempt | null
@@ -530,6 +532,7 @@ export interface UseChatSendOptions {
   pendingForkBeforeMessageId: Ref<string | null>
   draftIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
+  invalidatePromptAnnotations?: (snapshots: readonly PromptAnnotationSnapshot[]) => void
   acknowledgePromptAnnotations?: (
     snapshots: readonly PromptAnnotationSnapshot[],
     sessionKey: string,
@@ -537,6 +540,8 @@ export interface UseChatSendOptions {
   ) => void
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
+  /** Queue admission gates, excluding the unrelated live annotation draft. */
+  queuedSendBlockedReason?: Readonly<Ref<string | null>>
   /** Proven identity supplied only for an eligible, never-sent offline click. */
   offlineQueueIdentity?: Readonly<Ref<string | null>>
   deliveryIdentity?: Readonly<Ref<string | null>>
@@ -827,7 +832,6 @@ export function useChatSend(options: UseChatSendOptions) {
     return [...(options.draftIds?.value || [])]
       .map(value => String(value || '').trim())
       .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
-      .slice(0, 16)
   }
 
   function acknowledgeAttemptPromptAnnotations(
@@ -2300,6 +2304,12 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function onSend(invocation: SendInvocation = {}) {
     if (disposed) return
+    try {
+      pageContextForAnnotations(options.promptAnnotationSnapshots?.(currentAnnotationDraftIds()) || [])
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : i18n.global.t('workbench.annotationUnified.submitFailed'), { tone: 'warn' })
+      return
+    }
     const key = options.sessionKey.value
     const identity = options.deliveryIdentity?.value || null
     if ([...composerSubmissions.values()].some(entry => (
@@ -2717,7 +2727,8 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
-    if (!identityStillMatches() || options.sendBlockedReason?.value) {
+    const queuedBlockedReason = options.queuedSendBlockedReason ?? options.sendBlockedReason
+    if (!identityStillMatches() || queuedBlockedReason?.value) {
       return blockedOutcome()
     }
     if (options.validateActiveProjectBeforeSend) {
@@ -2725,7 +2736,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (disposed || options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (!identityStillMatches() || options.sendBlockedReason?.value) return blockedOutcome()
+      if (!identityStillMatches() || queuedBlockedReason?.value) return blockedOutcome()
     }
     if (options.hasPendingAttachmentWork()) {
       if (delivery === 'steer') {
@@ -2766,7 +2777,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (disposed || options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (queuedBlockedReason?.value) return blockedOutcome()
       if (
         options.validateActiveProjectBeforeSend
         && await refreshedActiveProjectBlocksSend()
@@ -2774,7 +2785,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (disposed || options.sessionKey.value !== ownerSessionKey) {
         return preserveRetryState('not_sent')
       }
-      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (queuedBlockedReason?.value) return blockedOutcome()
       if (
         options.stream.isStreaming.value
         || hasAuthoritativeWork()
@@ -2848,6 +2859,7 @@ export function useChatSend(options: UseChatSendOptions) {
         forkBeforeMessageId: null,
       },
       preserveComposer: true,
+      queuedSend: true,
       preDispatchGuard: identityStillMatches,
       beforeDispatch: identityStillMatches,
       retryAttempt,
@@ -2904,7 +2916,9 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!requestSessionKey) return 'not_sent'
     const blockedReason = sendOpts.idempotentReplay
       ? options.idempotentReplayBlockedReason || options.sendBlockedReason
-      : options.sendBlockedReason
+      : sendOpts.queuedSend
+        ? options.queuedSendBlockedReason ?? options.sendBlockedReason
+        : options.sendBlockedReason
     if (blockedReason?.value) return 'not_sent'
     const preDispatchAllowed = (
       stage: 'preflight' | 'before_rpc' = 'preflight',
@@ -2971,10 +2985,17 @@ export function useChatSend(options: UseChatSendOptions) {
       sendOpts.payload ? sendOpts.payload.localPathReferences : options.localPathReferences?.value,
       text,
     )
-    const requestedPageContext = normalizePageContext(sendOpts.payload?.pageContext)
-      || pageContextForAnnotations(options.promptAnnotationSnapshots?.(
-        sendOpts.draftIds ?? currentAnnotationDraftIds(),
-      ) || [])
+    let requestedPageContext: ChatPageContext | null
+    try {
+      requestedPageContext = normalizePageContext(sendOpts.payload?.pageContext)
+        || pageContextForAnnotations(options.promptAnnotationSnapshots?.(
+          sendOpts.draftIds ?? currentAnnotationDraftIds(),
+        ) || [])
+      if (requestedPageContext) assertPageContextWithinLimits(requestedPageContext)
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : i18n.global.t('workbench.annotationUnified.submitFailed'), { tone: 'warn' })
+      return 'not_sent'
+    }
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
     if (modelImageSendBlocked(sourceAttachments)) return 'not_sent'
@@ -2984,7 +3005,6 @@ export function useChatSend(options: UseChatSendOptions) {
       : [...sendOpts.draftIds]
           .map(value => String(value || '').trim())
           .filter((value, index, values) => Boolean(value) && values.indexOf(value) === index)
-          .slice(0, 16)
     const requiresRecoveryReplay = Boolean(
       retryCandidate?.requiresIdempotentReplay
       && retryCandidate.deliveryIdentity === requestDeliveryIdentity
@@ -3057,6 +3077,12 @@ export function useChatSend(options: UseChatSendOptions) {
       return 'not_sent'
     }
     const attemptPageContext = retryAttempt?.pageContext ?? requestedPageContext
+    try {
+      if (attemptPageContext != null) assertPageContextWithinLimits(attemptPageContext)
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : i18n.global.t('workbench.annotationUnified.submitFailed'), { tone: 'warn' })
+      return 'not_sent'
+    }
     const sendAttachmentIds = new Set(
       (retryAttempt?.attachments || initialSendableAttachments)
         .map(attachment => attachment.local_id),
@@ -3194,6 +3220,10 @@ export function useChatSend(options: UseChatSendOptions) {
         annotationId: attemptAnnotationDraftIds[index] || input.annotationId,
         documentName: localSnapshots[index]?.documentName || input.documentName,
         tagName: localSnapshots[index]?.tagName || input.tagName,
+        // This display field is not sent on the wire. Keep the captured draft
+        // value for exact ACK comparison; every wire target field above still
+        // comes from the immutable outgoing context.
+        targetText: localSnapshots[index] ? localSnapshots[index].targetText : input.targetText,
       }))
       attempt = {
         clientRequestId: params.clientRequestId!,
@@ -3561,6 +3591,10 @@ export function useChatSend(options: UseChatSendOptions) {
       // Keep that WAL for the next page without reviving this one's composer,
       // queue callbacks, navigation or global error notices.
       if (disposed) return acceptedError ? 'accepted' : 'retryable_failure'
+      if (commandError?.accepted === false && ['DOCUMENT_CHANGED', 'ANNOTATION_SELECTION_STALE', 'OFFICE_SELECTION_STALE']
+        .includes(commandError.failureCode || '')) {
+        options.invalidatePromptAnnotations?.(attempt.promptAnnotations)
+      }
       if (acceptedError) notifySendAccepted(attempt)
       const stoppedBeforeAdmission = attempt.stoppedBeforeAdmission === true || (
         commandError?.failureCode === 'DELIVERY_STOPPED' && commandError.accepted === false

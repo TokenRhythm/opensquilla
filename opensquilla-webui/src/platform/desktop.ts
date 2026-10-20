@@ -120,6 +120,8 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'annotation-selected',
   'annotation-draft-change',
   'annotation-submit',
+  'annotation-record-current',
+  'annotation-batch-submit',
   'annotation-cancel',
   'annotation-overlay-fallback',
 ])
@@ -202,7 +204,8 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
     : undefined
   if (raw.type === 'annotation-selected' && !selection) return null
   if (
-    (raw.type === 'annotation-draft-change' || raw.type === 'annotation-submit')
+    (raw.type === 'annotation-draft-change' || raw.type === 'annotation-submit'
+      || raw.type === 'annotation-record-current' || raw.type === 'annotation-batch-submit')
     && (!annotationId || body === undefined)
   ) return null
   if (
@@ -365,6 +368,8 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
                 ? { trustedOverlay: raw.trustedOverlay }
                 : {}),
               ...(raw.overlayCopyVersion === 1 ? { overlayCopyVersion: 1 as const } : {}),
+              ...(raw.overlayEditorVersion === 2 && typeof api.updateArtifactAnnotationOverlay === 'function'
+                ? { overlayEditorVersion: 2 as const } : {}),
               ...(raw.atomicCloseRearm === true ? { atomicCloseRearm: true as const } : {}),
               ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
             }
@@ -379,6 +384,9 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
       : {}),
     ...(typeof api.closeArtifactAnnotationOverlay === 'function'
       ? { closeArtifactAnnotationOverlay: payload => api.closeArtifactAnnotationOverlay!(payload) }
+      : {}),
+    ...(typeof api.updateArtifactAnnotationOverlay === 'function'
+      ? { updateArtifactAnnotationOverlay: payload => api.updateArtifactAnnotationOverlay!(payload) }
       : {}),
     ...(typeof api.getWorkbenchBrowserTarget === 'function'
       ? { getWorkbenchBrowserTarget: payload => api.getWorkbenchBrowserTarget!(payload) } : {}),

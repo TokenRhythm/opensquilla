@@ -96,6 +96,102 @@ function pendingUiId(
   return id!
 }
 
+describe('annotation queue recovery', () => {
+  it('never takes an annotation context back as plain composer text', async () => {
+    const h = makeQueue(undefined, () => true)
+    h.inputText.value = 'Keep this unsent message'
+    await h.queue.enqueuePendingPayload({ text: '', pageContext: { resourceId: 'document:one', annotations: [{ text: 'Make this larger' }] }, draftIds: ['one'] })
+    expect(h.queue.popPendingTail()).toBe(false)
+    expect(h.queue.popAllPendingIntoComposer()).toBe(false)
+    expect(h.inputText.value).toBe('Keep this unsent message')
+    expect(h.queue.pendingQueue.value[0].pageContext?.annotations?.[0].text).toBe('Make this larger')
+    h.queue.cleanup()
+  })
+
+  it('restores the full snapshot only after durable cancellation without consuming the composer', async () => {
+    const h = makeQueue(undefined, () => true)
+    h.inputText.value = 'unrelated'
+    await h.queue.enqueuePendingPayload({ text: '', pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change it', locatorHint: 'h1' }] }, draftIds: ['one'] })
+    const restore = vi.fn()
+    expect(await h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), restore)).toBe(true)
+    expect(restore).toHaveBeenCalledWith(expect.objectContaining({ pageContext: expect.objectContaining({ annotations: [{ text: 'Change it', locatorHint: 'h1' }] }) }))
+    expect(h.inputText.value).toBe('unrelated')
+    expect(h.queue.pendingQueue.value).toEqual([])
+    h.queue.cleanup()
+  })
+
+  it('restores annotation text, paths, attachments and skills alongside the existing composer', async () => {
+    const draft = useLocalPathDraft()
+    const selectedSkills = ref([{ name: 'existing-skill', instanceId: 'existing', digest: 'one' }])
+    const queuedSkill = { name: 'queued-skill', instanceId: 'queued', digest: 'two' }
+    const queuedAttachment: Attachment = { kind: 'inline', local_id: 1, name: 'queued.txt', mime: 'text/plain', data: 'cXVldWVk' }
+    const currentAttachment: Attachment = { kind: 'inline', local_id: 2, name: 'current.txt', mime: 'text/plain', data: 'Y3VycmVudA==' }
+    const queuedPath = 'C:\\资料\\queued.docx'
+    const currentPath = 'C:\\资料\\current.xlsx'
+    const h = makeQueue(undefined, () => true, { inputText: draft.inputText,
+      localPathReferences: draft.localPaths, restoreInput: draft.restoreInput, selectedSkills })
+    try {
+      expect(await h.queue.enqueuePendingPayload({ text: `Queued explanation\n${queuedPath}`, localPathReferences: [queuedPath],
+        selectedSkills: [queuedSkill], attachments: [queuedAttachment], intent: 'queued-intent',
+        pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change the title' }] } })).toBe(true)
+      draft.restoreInput(`Current explanation\n${currentPath}`, [currentPath])
+      h.pendingAttachments.value = [currentAttachment]
+      h.pendingSessionIntent.value = 'current-intent'
+      const restore = vi.fn()
+      expect(await h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), restore)).toBe(true)
+      expect(draft.composerText.value).toBe('Queued explanation\nCurrent explanation')
+      expect(draft.localPaths.value).toEqual([queuedPath, currentPath])
+      expect(h.pendingAttachments.value.map(item => item.name)).toEqual(['queued.txt', 'current.txt'])
+      expect(selectedSkills.value.map(item => item.name)).toEqual(['existing-skill', 'queued-skill'])
+      expect(h.pendingSessionIntent.value).toBe('current-intent')
+      expect(restore).toHaveBeenCalledOnce()
+      expect(h.sendCurrentInput).not.toHaveBeenCalled()
+      expect(h.queue.pendingQueue.value).toEqual([])
+    } finally { h.queue.cleanup() }
+  })
+
+  it.each(['session', 'composer'] as const)('retains the canceled annotation queue item if %s ownership changes during cancellation', async changed => {
+    const { wal } = memoryWal()
+    const h = makeQueue(undefined, () => true, { pendingInputWal: wal })
+    try {
+      await h.queue.enqueuePendingPayload({ text: 'Queued explanation',
+        pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change the title' }] } })
+      h.inputText.value = 'Existing composer'
+      const originalPut = vi.mocked(wal.put).getMockImplementation()!
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const writing = vi.spyOn(wal, 'put').mockImplementation(async record => {
+        if (record.state === 'cancelling') await gate
+        await originalPut(record)
+      })
+      const restore = vi.fn()
+      const result = h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), restore)
+      await vi.waitFor(() => expect(writing).toHaveBeenCalled())
+      if (changed === 'session') h.sessionKey.value = 'agent:main:webchat:other'
+      else h.inputText.value = 'New composer typed while canceling'
+      release()
+      expect(await result).toBe(false)
+      expect(restore).not.toHaveBeenCalled()
+      expect(h.inputText.value).toBe(changed === 'session' ? 'Existing composer' : 'New composer typed while canceling')
+      expect(h.queue.pendingQueue.value[0]).toMatchObject({ text: 'Queued explanation', pendingRetainAfterCancel: true })
+    } finally { h.queue.cleanup() }
+  })
+
+  it('keeps the full canceled queue payload when restoring the annotation snapshot fails', async () => {
+    const h = makeQueue(undefined, () => true)
+    try {
+      await h.queue.enqueuePendingPayload({ text: 'Keep all material',
+        pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change the title' }] } })
+      h.inputText.value = 'Current composer'
+      await expect(h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), () => {
+        throw new Error('Annotation storage unavailable')
+      })).rejects.toThrow('Annotation storage unavailable')
+      expect(h.inputText.value).toBe('Current composer')
+      expect(h.queue.pendingQueue.value[0]).toMatchObject({ text: 'Keep all material', pendingRetainAfterCancel: true })
+    } finally { h.queue.cleanup() }
+  })
+})
+
 describe('queued project initialization intent', () => {
   const turnCommand = { name: 'project.init' as const, args: 'preserve existing notes' }
 
@@ -1829,6 +1925,29 @@ describe('useChatPendingQueue delivery state', () => {
     await vi.waitFor(() => expect(inputText.value).toBe('Update this heading'))
     queue.cleanup()
   })
+
+  it('retains invalid restored annotations as retryable without uploading or enqueueing', async () => {
+    const enqueue = vi.fn(async () => ({ requestFingerprint: 'fingerprint', revision: 1 }))
+    const prepareAttachmentsForSend = vi.fn(async () => true)
+    const { records, wal } = memoryWal()
+    const onPendingPersistenceError = vi.fn()
+    const { queue } = makeQueue(undefined, () => true, {
+      pendingInputWal: wal, prepareAttachmentsForSend, onPendingPersistenceError,
+      pendingInputQueue: { supportsQueue: () => true, supportsReorder: () => false, enqueue,
+        list: async () => [], cancel: async () => {}, reorder: async () => ({ items: [] }) },
+    })
+    const pageContext = { annotations: Array.from({ length: 17 }, () => ({ text: 'Keep every change' })) }
+    await queue.enqueuePendingPayload({ text: 'Keep my companion message', pageContext })
+    await vi.waitFor(() => expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('retryable'))
+    expect(enqueue).not.toHaveBeenCalled()
+    expect(prepareAttachmentsForSend).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(onPendingPersistenceError).toHaveBeenCalledWith('server_rejected'))
+    expect([...records.values()][0]).toMatchObject({
+      text: 'Keep my companion message', pageContext, state: 'retryable', mayHaveServerCopy: false,
+    })
+    queue.cleanup()
+  })
+
 
   it('stages annotation-only input through the ordinary queue without changing the visible body', async () => {
     const enqueue = vi.fn(async () => ({ requestFingerprint: 'fingerprint', revision: 1 }))

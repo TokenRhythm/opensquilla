@@ -2,7 +2,7 @@ import { normalizeWorkspaceFileReferences } from '@/utils/chat/attachments'
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
 import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
-import { normalizePageContext } from '@/types/pageContext'
+import { assertPageContextWithinLimits, normalizePageContext } from '@/types/pageContext'
 import { copyTurnCommand, isProjectInitTurnCommand } from '@/types/turnCommand'
 import {
   readTransportFailure,
@@ -256,6 +256,11 @@ function withPendingInputValidation(
     supportsQueue: raw.supportsQueue,
     supportsReorder: raw.supportsReorder,
     enqueue: async request => {
+      try {
+        if (request.pageContext != null) assertPageContextWithinLimits(request.pageContext)
+      } catch (error) {
+        throw new PendingInputQueueError('invalid', error instanceof Error ? error.message : 'Invalid page context.', false)
+      }
       const result = projectEnqueueResult(await raw.enqueue(request))
       if (!validateEnqueueResult(result)) throw invalidResponse('enqueue')
       return result

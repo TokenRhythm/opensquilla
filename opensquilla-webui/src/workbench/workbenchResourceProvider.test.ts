@@ -4,8 +4,58 @@ import {
   createRpcWorkbenchResourceProvider,
   WORKBENCH_RESOURCE_RPC_METHODS,
 } from '@/adapters/gateway/workbenchResourcesV4'
+import { normalizeWorkbenchResource } from './workbenchResourceProvider'
 
 describe('workbench resource provider', () => {
+  it('retains only workspace-relative source labels and never uses them as identities', () => {
+    const raw = {
+      resource: { type: 'document', documentId: 'doc-a' },
+      name: 'report.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      capabilities: {}, relations: { documentId: 'doc-a' },
+    }
+    expect(normalizeWorkbenchResource({ ...raw, sourcePath: 'copy/report.docx' }))
+      .toMatchObject({ sourcePath: 'copy/report.docx', resource: { documentId: 'doc-a' } })
+    for (const sourcePath of [
+      'C:/private/report.docx', '/private/report.docx', '../report.docx',
+      'copy/../report.docx', 'copy\\report.docx', 'copy//report.docx', 'copy/\u0000report.docx',
+      'x'.repeat(4097),
+    ]) {
+      expect(normalizeWorkbenchResource({ ...raw, sourcePath })).not.toHaveProperty('sourcePath')
+    }
+  })
+
+  it('prepares annotation against one identity and preserves the updated baseline and page', async () => {
+    const call = vi.fn(async () => ({
+      disposition: 'document', resolution: { status: 'current' }, materialized: false,
+      baselineUpdated: true, previousRevisionId: 'rev-old',
+      resource: {
+        resource: { type: 'document', documentId: 'doc-a' }, name: 'page.html', mime: 'text/html',
+        capabilities: { preview: true, download: true, edit: true, publish: true }, relations: {},
+      },
+      document: { documentId: 'doc-a', sessionKey: 'session-a', name: 'page.html', format: 'html',
+        headRevisionId: 'rev-a', capabilities: { preview: true, sourceEdit: true, versionHistory: true } },
+      revision: { revisionId: 'rev-a', documentId: 'doc-a', artifactId: 'internal-a',
+        sha256: 'a'.repeat(64), name: 'page.html', mime: 'text/html' },
+      pageContext: { resourceId: 'document:doc-a', revisionId: 'rev-a', pagePath: 'pages/chart.html' },
+    }))
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
+    const workspaceFile = { path: 'site/pages/chart.html', workspaceBinding: 'binding-a', expectedRevision: 'file-rev-a' }
+    await expect(provider.prepareAnnotation!('session-a', { workspaceFile, idempotencyKey: 'prepare-a' }))
+      .resolves.toMatchObject({ baselineUpdated: true, previousRevisionId: 'rev-old',
+        pageContext: { resourceId: 'document:doc-a', revisionId: 'rev-a', pagePath: 'pages/chart.html' } })
+    expect(call).toHaveBeenLastCalledWith(WORKBENCH_RESOURCE_RPC_METHODS.open, {
+      sessionKey: 'session-a', intent: 'annotate', workspaceFile, idempotencyKey: 'prepare-a',
+    }, expect.any(Object))
+    await provider.prepareAnnotation!('session-a', { resourceRef: { type: 'document', documentId: 'doc-a' }, expectedSha256: 'b'.repeat(64) })
+    expect(call).toHaveBeenLastCalledWith(WORKBENCH_RESOURCE_RPC_METHODS.open, {
+      sessionKey: 'session-a', intent: 'annotate', resourceRef: { type: 'document', documentId: 'doc-a', id: 'doc-a' },
+      expectedSha256: 'b'.repeat(64),
+    }, expect.any(Object))
+    await expect(provider.prepareAnnotation!('session-a', {
+      resourceRef: { type: 'document', documentId: 'doc-a' }, workspaceFile,
+    } as never)).rejects.toThrow('Choose one annotation resource.')
+    expect(call).toHaveBeenCalledTimes(2)
+  })
   it('keeps selection and Agent editing independent from preview and legacy edit', async () => {
     const call = vi.fn(async () => ({
       resources: [{

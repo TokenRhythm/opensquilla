@@ -156,7 +156,36 @@
           }
         },
         "intent": {
-          "const": "edit-current"
+          "enum": [
+            "edit-current",
+            "annotate"
+          ]
+        },
+        "workspaceFile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "workspaceBinding",
+            "expectedRevision"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "workspaceBinding": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "expectedRevision": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          }
         },
         "expectedSha256": {
           "type": "string",
@@ -170,7 +199,40 @@
           "type": "string",
           "minLength": 1
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "workspaceFile"
+            ]
+          },
+          "then": {
+            "required": [
+              "intent"
+            ],
+            "properties": {
+              "intent": {
+                "const": "annotate"
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "resourceRef"
+                  ]
+                },
+                {
+                  "required": [
+                    "resource"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
     },
     "Request": {
       "type": "object",
@@ -217,8 +279,7 @@
           "additionalProperties": true
         },
         "resource": {
-          "type": "object",
-          "additionalProperties": true
+          "$ref": "#/$defs/WorkbenchResourceProjection"
         },
         "document": {
           "type": "object",
@@ -239,6 +300,13 @@
         "materialized": {
           "type": "boolean"
         },
+        "baselineUpdated": {
+          "type": "boolean"
+        },
+        "previousRevisionId": {
+          "type": "string",
+          "minLength": 1
+        },
         "reasonCode": {
           "type": "string",
           "minLength": 1
@@ -254,6 +322,11 @@
               "type": "string",
               "pattern": "^document:.+",
               "maxLength": 512
+            },
+            "pagePath": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
             },
             "revisionId": {
               "type": "string",
@@ -349,6 +422,21 @@
           "$ref": "#/$defs/Err"
         }
       ]
+    },
+    "WorkbenchResourceProjection": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sourcePath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "Authorized workspace-relative path to the existing working source; presentation metadata, never a resource identity or host absolute path."
+        }
+      }
     }
   }
 }

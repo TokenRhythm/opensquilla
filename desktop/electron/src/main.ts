@@ -202,6 +202,7 @@ import {
   parseNativeWorkbenchAnnotationModeRequest,
   parseNativeWorkbenchAnnotationOverlayCloseRequest,
   parseNativeWorkbenchAnnotationOverlayShowRequest,
+  parseNativeWorkbenchAnnotationOverlayUpdateRequest,
 } from './native-workbench-annotation-contract.js'
 import { DesktopBrowserError, DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
@@ -13489,6 +13490,16 @@ ipcMain.handle('desktop:workbench:annotation:close-overlay', async (event, paylo
   try {
     return await nativeWorkbenchSurfaces.closeArtifactAnnotationOverlay(
       parseNativeWorkbenchAnnotationOverlayCloseRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('desktop:workbench:annotation:update-overlay', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return nativeWorkbenchSurfaces.updateArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayUpdateRequest(payload),
     )
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }

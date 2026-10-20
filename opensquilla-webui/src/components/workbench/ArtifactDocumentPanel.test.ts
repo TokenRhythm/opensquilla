@@ -96,15 +96,24 @@ describe('ArtifactDocumentPanel', () => {
       state.value.workspace!.document.headRevisionId = revisionId
       return state.value.workspace!
     }) }
+    const onWorkbenchEvent = vi.fn()
     const mounted = mountPanel({
       artifact: htmlArtifact, documentSnapshot: state.value, documentActions: actions,
       sessionKey: 'session-a', initialSection: 'versions', nativeHtml: true, suspended: true,
+      onWorkbenchEvent,
     })
     await nextTick()
     const panel = mounted.element.querySelector('[data-document-section="versions"]')!
     const rows = [...panel.querySelectorAll('li')]
     expect(rows).toHaveLength(2)
     expect(rows[0]?.textContent).toContain('Current')
+    expect(mounted.element.querySelector('.artifact-document__current-version')?.textContent).toContain('Current v2')
+    rows[1]!.querySelector<HTMLButtonElement>('[data-artifact-action="view-revision"]')!.click()
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({
+      type: 'artifact-view-revision',
+      payload: expect.objectContaining({ revisionId: 'revision-1', id: initial.artifactId }),
+    })
+    expect(actions.restoreRevision).not.toHaveBeenCalled()
     const currentRestore = rows[0]!.querySelector<HTMLButtonElement>('[data-artifact-action="restore-revision"]')!
     expect(currentRestore).not.toBeNull()
     expect(currentRestore.disabled).toBe(false)
@@ -120,7 +129,7 @@ describe('ArtifactDocumentPanel', () => {
     expect(rows[1]?.textContent).toContain('Current')
     expect(rows[1]!.querySelector('[data-artifact-action="restore-revision"]')).not.toBeNull()
     expect([...mounted.element.querySelectorAll('[role="tab"]')]
-      .find(tab => tab.textContent?.includes('Versions'))?.textContent?.replace(/\s/g, '')).toBe('Versions2')
+      .find(tab => tab.textContent?.includes('Version history'))?.textContent?.replace(/\s/g, '')).toBe('Versionhistory(2)')
     mounted.unmount()
   })
 
@@ -538,8 +547,8 @@ describe('ArtifactDocumentPanel', () => {
     })
     await nextTick()
     const dialog = mounted.element.querySelector('[role="dialog"]')
-    expect(dialog?.querySelector('strong')?.textContent).toBe('Request changes')
-    expect(dialog?.textContent).toContain(en.workbench.office.requestHint)
+    expect(dialog?.getAttribute('aria-modal')).toBe('false')
+    expect(dialog?.querySelector('textarea')?.getAttribute('placeholder')).toBe(en.workbench.annotationUnified.placeholder)
     expect(dialog?.textContent).not.toContain(en.workbench.office.previewHint)
     expect(dialog?.textContent).not.toContain('temporarily hidden')
     expect(dialog?.textContent).not.toContain('Continue annotation')
@@ -569,10 +578,10 @@ describe('ArtifactDocumentPanel', () => {
       const app = createApp({ render: () => h('div', [
         h(OfficePreviewPanel, {
           data, format: 'pptx', annotationEnabled: true,
-          onSelectionRequest: () => { fallback.value = { annotationId: 'office-focus', body: '', reason: 'office-selection' } },
+          onSelectionRequest: () => { fallback.value = { annotationId: 'office-focus', body: 'Draft body', reason: 'office-selection' } },
         }),
         h(ArtifactDocumentPanel, {
-          artifact: officeArtifact, documentSnapshot: snapshot(), suspended: true,
+          artifact: { ...officeArtifact, name: 'focus.bin', mime: 'application/octet-stream' }, documentFeatures: false,
           annotationFallback: fallback.value,
           onWorkbenchEvent: (event: { type: string }) => {
             if (event.type === 'artifact-annotation-fallback-cancel') fallback.value = null
@@ -602,8 +611,8 @@ describe('ArtifactDocumentPanel', () => {
           expect(escape.defaultPrevented).toBe(true)
         } else {
           if (closeMethod === 'focus moved elsewhere') elsewhere.focus()
-          else dialog.querySelector<HTMLButtonElement>('button[type="button"]')!.focus()
-          dialog.querySelector<HTMLButtonElement>('button[type="button"]')!.click()
+          else dialog.querySelector<HTMLButtonElement>('.annotation-comment__actions button:last-child')!.focus()
+          dialog.querySelector<HTMLButtonElement>('.annotation-comment__actions button:last-child')!.click()
         }
         await nextTick(); await nextTick()
         expect(element.querySelector('[role="dialog"]')).toBeNull()
@@ -645,11 +654,10 @@ describe('ArtifactDocumentPanel', () => {
 
     const dialog = mounted.element.querySelector('[role="dialog"]')
     const input = dialog?.querySelector<HTMLTextAreaElement>('textarea')
-    expect(dialog?.textContent).toContain('Continue annotation')
-    expect(dialog?.textContent).toContain('The preview is temporarily hidden.')
+    expect(dialog?.getAttribute('aria-modal')).toBe('false')
     expect(dialog?.querySelector('img')).toBeNull()
     expect(input?.value).toBe('Initial draft')
-    expect(dialog?.textContent).toContain('Shift + Enter for a new line')
+    expect(dialog?.textContent).toContain(en.workbench.annotationUnified.recordHint)
     if (input) {
       input.value = 'Updated draft'
       input.dispatchEvent(new Event('input', { bubbles: true }))
@@ -682,15 +690,15 @@ describe('ArtifactDocumentPanel', () => {
       type: 'artifact-annotation-fallback-submit',
       payload: { annotationId: 'annotation-1', body: 'Updated draft' },
     })
-    dialog?.querySelector<HTMLButtonElement>('button[type="button"]')?.click()
+    dialog?.querySelector<HTMLButtonElement>('.annotation-comment__actions button:last-child')?.click()
     expect(onWorkbenchEvent).toHaveBeenCalledWith({
       type: 'artifact-annotation-fallback-cancel',
-      payload: { annotationId: 'annotation-1', reason: 'user-cancelled' },
+      payload: { annotationId: 'annotation-1', body: 'Updated draft', reason: 'user-cancelled' },
     })
     mounted.unmount()
   })
 
-  it('uses the compact macOS newline chord in the annotation fallback hint', async () => {
+  it('keeps the blank comment card compact until the user types', async () => {
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
     )
@@ -705,9 +713,8 @@ describe('ArtifactDocumentPanel', () => {
     })
     await nextTick()
 
-    expect(mounted.element.querySelector(
-      '.artifact-document__annotation-shortcut-hint',
-    )?.textContent).toContain('⇧ Return for a new line')
+    expect(mounted.element.querySelector('.annotation-comment__actions')).toBeNull()
+    expect(mounted.element.querySelector('textarea')?.getAttribute('placeholder')).toBe(en.workbench.annotationUnified.placeholder)
     mounted.unmount()
   })
 
@@ -788,7 +795,7 @@ describe('ArtifactDocumentPanel', () => {
     const tabs = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
     expect(tabs.map(tab => tab.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
       'Preview',
-      'Versions1',
+      'Version history (1)',
       'Changes1',
     ])
 
@@ -888,7 +895,7 @@ describe('ArtifactDocumentPanel', () => {
     await nextTick()
 
     const tabs = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
-    tabs.find(tab => tab.textContent?.includes('Versions'))?.click()
+    tabs.find(tab => tab.textContent?.includes('Version history'))?.click()
     await nextTick()
     const versionPanel = mounted.element.querySelector('[data-document-section="versions"]')!
     const oldVersion = [...versionPanel.querySelectorAll('li')]
@@ -975,7 +982,7 @@ describe('ArtifactDocumentPanel', () => {
     })
     await nextTick()
     const tabs = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
-    tabs.find(tab => tab.textContent?.includes('Versions'))?.click()
+    tabs.find(tab => tab.textContent?.includes('Version history'))?.click()
     await nextTick()
     mounted.element.querySelector<HTMLButtonElement>(
       '[data-artifact-action="restore-revision"]',

@@ -1415,6 +1415,7 @@ async def dispatch_task_runtime_turn(
             event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
             preview_service=getattr(adopter, "preview_service", None),
             office_candidate=run.envelope.metadata.get("office_candidate"),
+            annotation_selection=run.envelope.metadata.get("annotation_selection"),
         )
         await _emit_task_runtime_stream_events(
             raw_stream,

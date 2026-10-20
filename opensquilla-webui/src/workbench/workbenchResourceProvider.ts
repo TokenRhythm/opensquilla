@@ -147,11 +147,13 @@ export function normalizeWorkbenchResource(value: unknown): WorkbenchResource | 
   const resource = normalizeRef(valueAt(raw, 'resource') || raw)
   const name = stringAt(raw, 'name')
   const mime = stringAt(raw, 'mime', 'mediaType', 'media_type')
+  const sourcePath = stringAt(raw, 'sourcePath')
   if (!resource || !name || !mime) return null
   return {
     resource,
     name,
     mime,
+    ...(sourcePath && isResourceSourcePath(sourcePath) ? { sourcePath } : {}),
     source: stringAt(raw, 'source') || undefined,
     visibility: stringAt(raw, 'visibility') || undefined,
     presentation: stringAt(raw, 'presentation') || undefined,
@@ -166,4 +168,10 @@ export function normalizeWorkbenchResource(value: unknown): WorkbenchResource | 
     capabilities: normalizeCapabilities(valueAt(raw, 'capabilities')),
     relations: normalizeRelations(valueAt(raw, 'relations')),
   }
+}
+
+function isResourceSourcePath(value: string): boolean {
+  return value.length <= 4096
+    && !/^[\\/]|[\\:\u0000-\u001f]/.test(value)
+    && value.split('/').every(part => Boolean(part) && part !== '.' && part !== '..')
 }

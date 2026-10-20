@@ -68,6 +68,31 @@ afterEach(() => {
 })
 
 describe('shared resource actions', () => {
+  it('opens the delivered snapshot only through the explicit history action', async () => {
+    const delivered = { id: 'report-v1', name: 'report.docx',
+      mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }
+    const f = await mount(delivered)
+    await f.open()
+    const latest = item('resourceActions.preview')
+    expect(latest).toBeDefined()
+    latest!.click()
+    expect(f.onOpen).toHaveBeenLastCalledWith(delivered)
+    expect(delivered).not.toHaveProperty('workbenchOpenIntent')
+    await f.open()
+    item('workbench.artifactDocument.viewDeliveredVersion')!.click()
+    expect(f.onOpen).toHaveBeenLastCalledWith({ ...delivered, workbenchOpenIntent: 'history' })
+    expect(delivered).not.toHaveProperty('workbenchOpenIntent')
+    expect(f.content.fetchArtifact).not.toHaveBeenCalled()
+    expect(f.content.fetchWorkingFile).not.toHaveBeenCalled()
+  })
+
+  it('does not offer another delivery-history action inside an already historical view', async () => {
+    const f = await mount({ id: 'report-v1', name: 'report.docx', workbenchOpenIntent: 'history',
+      mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' })
+    await f.open()
+    expect(item('workbench.artifactDocument.viewDeliveredVersion')).toBeUndefined()
+  })
+
   it('retains a compact panel download when its optional working source is unavailable', async () => {
     const f = await mount(source, false, false, true)
     f.props.downloadAction = 'panel:download'

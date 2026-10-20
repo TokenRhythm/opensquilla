@@ -37,7 +37,43 @@ async def with_working_versions(
     event_emitter: Any = None,
     preview_service: Any = None,
     office_candidate: dict[str, Any] | None = None,
+    annotation_selection: dict[str, Any] | None = None,
 ) -> AsyncIterator[Any]:
+    if annotation_selection is not None:
+        selection_service = None
+        try:
+            from opensquilla.gateway.annotation_preparation import validate_annotation_source
+            from opensquilla.gateway.workspace_files import WorkspaceFiles
+
+            if not session_id or not workspace:
+                raise ValueError("Annotation has no session workspace")
+            storage = get_session_storage(session_manager)
+            if storage is None:
+                raise ValueError("Annotation requires session storage")
+            selection_service = await ArtifactSessionService.from_session_storage(storage)
+            selected_workspace = await WorkspaceFiles(
+                config, session_manager,
+            ).workspace(session_key)
+            if selected_workspace.root != Path(workspace).resolve():
+                raise ValueError("Annotation workspace changed")
+            await validate_annotation_source(
+                selection_service, ArtifactStore(media_root_from_config(config)),
+                document_id=annotation_selection["documentId"], session_key=session_key,
+                session_id=session_id, revision_id=annotation_selection["revisionId"],
+                sha256=annotation_selection["sha256"], workspace=selected_workspace,
+            )
+        except Exception:
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                await close()
+            yield ErrorEvent(
+                code="ANNOTATION_SELECTION_STALE",
+                message="The selected file changed. Reopen it and select again.",
+            )
+            return
+        finally:
+            if selection_service is not None:
+                await selection_service.close()
     candidate_service = None
     candidate_store = None
     if office_candidate is not None:

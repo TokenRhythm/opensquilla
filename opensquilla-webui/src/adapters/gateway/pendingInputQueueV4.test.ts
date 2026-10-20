@@ -3,6 +3,24 @@ import { describe, expect, it, vi } from 'vitest'
 import { createV4PendingInputQueue } from './pendingInputQueueV4'
 
 describe('pending input queue v4 adapter', () => {
+  it.each([
+    { annotations: Array.from({ length: 17 }, () => ({ text: 'Keep every change' })) },
+    { annotations: [{ text: '🙂'.repeat(4097) }] },
+    { annotations: [{ text: 'Keep this change', selection: { format: 'docx', kind: 'range' } }] },
+  ])('rejects invalid restored page context before calling the queue RPC', async pageContext => {
+    const request = vi.fn(async <T>() => ({ requestFingerprint: 'fp', revision: 1 } as T))
+    const adapter = createV4PendingInputQueue({
+      request: request as unknown as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
+      supports: () => true,
+    })
+    await expect(adapter.enqueue({
+      key: 's', pendingInputId: 'p1', message: 'Keep my message', attachments: [],
+      pageContext: pageContext as import('@/types/pageContext').ChatPageContext,
+    })).rejects.toMatchObject({ kind: 'invalid', accepted: false })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+
   it('round trips explicit turn intent without inferring it from the message', async () => {
     const turnCommand = { name: 'project.init' as const, args: '' }
     const request = vi.fn(async (method: string) => method.endsWith('.list')

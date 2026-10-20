@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { createV4WorkspaceFiles } from './workspaceFilesV4'
 import { HttpTransportError } from './privateHttpTransport'
 import { WorkspaceFilesChangedError, WorkspaceTextLimitError, type WorkspaceRootScope } from '@/modules/workspaceFiles'
+import type { WorkspaceFileReferenceV1 } from '@/types/references'
 
 function fixture() {
   const file = { requestedPath: 'outputs/中文 图.svg', path: 'outputs/中文 图.svg', name: '中文 图.svg',
@@ -12,6 +13,54 @@ function fixture() {
 }
 
 describe('workspace files HTTP adapter', () => {
+  it('passes reference scope and accepts only explicitly validated file metadata', async () => {
+    const { access, http, file } = fixture()
+    const reference: WorkspaceFileReferenceV1 = {
+      version: 1, kind: 'workspace_file', id: file.path, label: file.name,
+      locator: { relativePath: file.path }, scope: { sessionKey: 'session-A', workspaceId: 'workspace-a' },
+      state: { available: true, revision: 'file_0000000000000000' }, capabilities: { open: true },
+    }
+    const response = { workspaceBinding: 'binding-A', files: [{
+      ...file, documentTarget: { documentId: 'doc-a' },
+    }] }
+    http.requestJson.mockResolvedValue(response)
+    expect(await access.resolveReference!('session-A', reference)).toEqual([])
+    http.requestJson.mockResolvedValue({ ...response, referenceScopeValidated: true })
+    expect(await access.resolveReference!('session-A', reference)).toMatchObject([
+      { documentTarget: { documentId: 'doc-a' } },
+    ])
+    expect(http.requestJson).toHaveBeenLastCalledWith('/api/v1/workspace-files/resolve', {
+      method: 'POST', sessionKey: 'session-A', json: { paths: [file.path], reference }, signal: undefined,
+    })
+    expect(http.requestBlob).not.toHaveBeenCalled()
+    http.requestJson.mockResolvedValue({ ...response, files: [file], referenceScopeValidated: true })
+    expect(await access.resolveReference!('session-A', reference)).toMatchObject([
+      { path: file.path, workspaceBinding: 'binding-A' },
+    ])
+    http.requestJson.mockRejectedValue(new HttpTransportError('http-status', 'scope mismatch', 404))
+    await expect(access.resolveReference!('session-A', reference)).rejects.toThrow()
+  })
+
+  it('preserves annotation capabilities and the registered HTML page identity', async () => {
+    const { access, http, file } = fixture()
+    http.requestJson.mockResolvedValue({ workspaceBinding: 'binding-A', files: [{
+      ...file, documentTarget: { documentId: 'doc-a', pagePath: 'pages/chart.html' },
+      annotationCapability: { supported: false, reasonCode: 'document_target_ambiguous' },
+    }] })
+    expect((await access.resolve('session-A', [file.path]))[0]).toMatchObject({
+      documentTarget: { documentId: 'doc-a', pagePath: 'pages/chart.html' },
+      annotationCapability: { supported: false, reasonCode: 'document_target_ambiguous' },
+    })
+  })
+  it.each([
+    { documentTarget: { documentId: '', pagePath: 'page.html' } },
+    { documentTarget: { documentId: 'doc-a', pagePath: '../page.html' } },
+    { annotationCapability: { supported: 'yes' } },
+  ])('rejects malformed annotation metadata %j', async metadata => {
+    const { access, http, file } = fixture()
+    http.requestJson.mockResolvedValue({ workspaceBinding: 'binding-A', files: [{ ...file, ...metadata }] })
+    await expect(access.resolve('session-A', [file.path])).rejects.toThrow()
+  })
   const root = { kind: 'workspace-root' as const, name: '中文 项目', path: 'C:\\Projects\\中文 项目', workspaceBinding: 'a'.repeat(64) }
   it('opens project roots without a session and never submits a host path', async () => {
     const { access, http } = fixture()

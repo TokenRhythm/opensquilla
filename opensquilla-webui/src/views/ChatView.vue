@@ -517,6 +517,7 @@
       :stopping="isStopPending"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
+      @restore-annotations="restorePendingAnnotations"
       @remove="removePendingChip"
       @reorder="reorderPendingItem"
       @reorder-end="endPendingReorder"
@@ -779,6 +780,7 @@ import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
+import { pageAnnotationSnapshots, assertPageContextWithinLimits } from '@/types/pageContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
@@ -1045,8 +1047,11 @@ import {
   requestInitialSectionForWorkbenchItem,
 } from '@/workbench/artifactItems'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import { prepareCurrentDocumentPreview, resolveCurrentDocumentResource } from '@/workbench/currentDocumentOpening'
+import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import {
   artifactPayloadFromWorkbenchResource,
+  canonicalWorkbenchResources,
   createResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
   workbenchResourceKey,
@@ -1337,6 +1342,7 @@ function artifactPreviewItemForExplicitOpen(
 
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
+const artifactDocumentsStore = useArtifactDocumentsStore()
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1469,6 +1475,7 @@ function annotationAllowed(annotation: Pick<PromptAnnotationSnapshot, 'selection
 const workbenchResourcesEnabled = computed(() => (
   appStore.features.documentWorkbenchResources === true
   || promptAnnotationsEnabled.value
+  || officePromptAnnotationsEnabled.value
 ))
 const attachmentWorkbenchPreviewEnabled = computed(() => (
   workbenchEnabled.value
@@ -1488,6 +1495,7 @@ const sendableAnnotationDraftIds = computed(() =>
 function promptAnnotationBlockedMessage(): string {
   if (!promptAnnotationsEnabled.value && !officePromptAnnotationsEnabled.value) return ''
   const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value, annotationAllowed)
+  if (reason === 'stale') return t('workbench.annotationUnified.stale')
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
@@ -1512,7 +1520,7 @@ async function discardPromptAnnotation(annotationId: string) {
 
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
-  if (!promptAnnotationsEnabled.value || !annotation || annotation.selection !== undefined) return
+  if (!annotation || !annotationAllowed(annotation)) return
   const activated = await focusArtifactPromptAnnotation({
     annotationId,
     documentId: annotation.documentId,
@@ -2163,6 +2171,26 @@ const {
   flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
+watch([sessionKey, pendingQueue], ([key, items]) => {
+  artifactPromptAnnotationsStore.setQueuedDraftIds(key, items.flatMap(item => item.pageContext ? item.draftIds || [] : []))
+}, { deep: true, immediate: true, flush: 'sync' })
+
+async function restorePendingAnnotations(pendingUiId: string) {
+  try {
+    await chatPendingQueue.restoreQueuedAnnotations(pendingUiId, item => {
+      if (!item.pageContext) throw new Error('Missing annotation context')
+      assertPageContextWithinLimits(item.pageContext)
+      const snapshots = pageAnnotationSnapshots(item.pageContext)
+      if (!snapshots.length) throw new Error('Missing annotation instructions')
+      artifactPromptAnnotationsStore.restoreSnapshots(
+        item.ownerSessionKey || sessionKey.value,
+        snapshots, item.draftIds,
+      )
+    })
+  } catch {
+    pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'danger' })
+  }
+}
 watch(attachmentWorkBusy, (busy) => {
   if (!busy) flushDeferredPendingDrain()
 })
@@ -3261,11 +3289,17 @@ const promptAnnotationSendBlockedReason = computed<string | null>(() =>
 const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
-const effectiveSendBlockedReason = computed<string | null>(() => (
+const baseSendBlockedReason = computed<string | null>(() => (
   (props.ownerBlocked || preparingHostSession.value ? t('chat.liveSendBlockedConnecting') : null)
   || (workspaceBindingMismatch.value ? t('workbench.newPanel.workspaceNotReady') : null)
   || (projectBindingBusy.value || workbenchSessionPreparing.value ? t('workspaces.activeProjectResolving') : null)
-  || deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+  || deliveryBlockedReason.value
+))
+const queuedSendBlockedReason = computed<string | null>(() => (
+  baseSendBlockedReason.value || newTaskModelSendBlockedReason.value
+))
+const effectiveSendBlockedReason = computed<string | null>(() => (
+  baseSendBlockedReason.value || promptAnnotationSendBlockedReason.value
   || newTaskModelSendBlockedReason.value
 ))
 const provenSessionDelivery = ref<{
@@ -3921,6 +3955,7 @@ const chatSend = useChatSend({
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
+  queuedSendBlockedReason,
   offlineQueueIdentity,
   deliveryIdentity,
   validateActiveProjectBeforeSend,
@@ -3937,6 +3972,10 @@ const chatSend = useChatSend({
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(
     ids.filter(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id])),
   ).filter(annotationAllowed),
+  invalidatePromptAnnotations: snapshots => {
+    try { artifactPromptAnnotationsStore.invalidateSnapshots(snapshots) }
+    catch { pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'warn' }) }
+  },
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -3949,6 +3988,7 @@ const chatSend = useChatSend({
       draftIds: removedIds,
       sessionKey: acceptedSessionKey,
       requestSessionKey,
+      documentId: snapshots[0]?.documentId,
     })
   },
   materializeDraftSession: key => {
@@ -5653,9 +5693,8 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     const current = await workbenchResourcesStore.openCurrent(key, resource)
     if (!isCurrent()) return
     if (current?.disposition === 'document') {
-      const artifact = artifactPayloadFromRevision(current.revision)
-      artifact.documentId = current.document.documentId
-      artifact.revisionId = current.revision.revisionId
+      const artifact = await prepareCurrentDocumentPreview(current.resource, key, artifactDocumentsStore, isCurrent)
+      if (!artifact || !isCurrent()) return
       openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
@@ -5670,8 +5709,10 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       return
     }
     if (!current && resource.resource.type === 'document') {
+      const artifact = await prepareCurrentDocumentPreview(resource, key, artifactDocumentsStore, isCurrent)
+      if (!artifact || !isCurrent()) return
       openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-        artifact: artifactPayloadFromWorkbenchResource(resource),
+        artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
           platform.capabilities.hasNativeWorkbenchSurfaces
@@ -5785,12 +5826,10 @@ const headerDeliverableCount = computed(() => {
   if (!workbenchEnabled.value || !workbenchResourcesEnabled.value) {
     return sessionArtifacts.value.length
   }
-  // Local previews are Documents, not public artifacts. Keep their existing
-  // resource-list entry reachable without creating a delivery just for the UI.
-  return Math.max(
-    sessionArtifacts.value.length,
-    workbenchResourcesStore.navigationResources(sessionKey.value).length,
-  )
+  const snapshot = workbenchResourceSnapshot.value
+  return snapshot.loaded && snapshot.available
+    ? canonicalWorkbenchResources(snapshot.resources).length
+    : sessionArtifacts.value.length
 })
 const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResource>>(() => (
   new Map(
@@ -5944,9 +5983,8 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
   try {
-    // Working-file cards deliberately follow their Document. Published chat
-    // cards instead retain the original ArtifactStore identity below.
-    if (artifact.source === 'workspace-preview') {
+    const historical = artifact.workbenchOpenIntent === 'history'
+    if (!historical && artifact.source === 'workspace-preview') {
       await openWorkspacePreviewExplicit(
         documentId || { artifactId }, key,
         typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
@@ -5958,7 +5996,10 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const ref = createWorkbenchResourceRef('deliverable', artifactId)
-    const resource = await workbenchResourcesStore.resolve(key, ref)
+    const resource = historical
+      ? await workbenchResourcesStore.resolve(key, ref)
+      : await resolveCurrentDocumentResource(
+          (session, resource) => workbenchResourcesStore.resolveFresh(session, resource, isCurrent), key, ref, isCurrent)
     if (!isCurrent()) return
     if (!resource) {
       openLegacyArtifactWorkbench(artifact)
@@ -5970,13 +6011,17 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       )), { tone: 'warn' })
       return
     }
-    // Viewing a delivery must neither open the current head nor import a
-    // working copy. HTML uses its existing lease; Office uses previews.create.
+    // Discovery follows existing Document lineage without importing a copy.
+    // Explicit history retains the immutable delivery and its own tab.
+    const previewArtifact = historical ? artifactPayloadFromWorkbenchResource(resource)
+      : await prepareCurrentDocumentPreview(resource, key, artifactDocumentsStore, isCurrent)
+    if (!isCurrent() || !previewArtifact) return
     openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-      artifact: artifactPayloadFromWorkbenchResource(resource),
+      artifact: previewArtifact,
+      historical,
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: Boolean(platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native),
-      resourceIdentity: workbenchResourceKey(ref),
+      resourceIdentity: workbenchResourceKey(resource.resource),
       sessionKey: key,
     }))
   } catch (error) {
@@ -6002,10 +6047,12 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
   getArtifact: (key, artifactId) => artifactWorkbench.artifacts.get(key, artifactId),
   resolve: (key, resource) => workbenchResourcesStore.resolve(key, resource),
   openCurrent: (key, resource) => workbenchResourcesStore.openCurrent(key, resource),
+  prepareCurrent: (current, key, isCurrent) => prepareCurrentDocumentPreview(current.resource, key, artifactDocumentsStore, isCurrent),
   show: (current, key, previewPagePath) => {
     const artifact = artifactPayloadFromRevision(current.revision)
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
+    artifact.sourcePath = current.resource.sourcePath
     if (previewPagePath) artifact.previewPagePath = previewPagePath
     const item = artifactPreviewItemForExplicitOpen({
       artifact,

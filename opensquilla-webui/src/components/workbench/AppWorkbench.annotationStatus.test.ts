@@ -29,7 +29,7 @@ describe('AppWorkbench annotation mode status', () => {
     expect(appWorkbenchSource).toContain('role="status"')
     expect(appWorkbenchSource).toContain('aria-live="polite"')
     expect(appWorkbenchSource).toContain(
-      "t('workbench.artifactAnnotation.selectElement')",
+      "t('workbench.annotationUnified.selectTarget')",
     )
     const predicateStart = appWorkbenchSource.indexOf(
       'function isActiveAnnotationToolbarItem',
@@ -48,7 +48,7 @@ describe('AppWorkbench annotation mode status', () => {
 
   it('shows the annotation action label with no beta badge and preserves its accessible state', () => {
     expect(appWorkbenchSource).toContain(
-      "v-if=\"toolbarItem.id === 'toggle-annotation-mode'\"",
+      "v-if=\"['toggle-annotation-mode', 'prepare-annotation', 'annotate'].includes(toolbarItem.id)\"",
     )
     expect(appWorkbenchSource).toContain('class="app-workbench__action-label"')
     expect(appWorkbenchSource).toMatch(

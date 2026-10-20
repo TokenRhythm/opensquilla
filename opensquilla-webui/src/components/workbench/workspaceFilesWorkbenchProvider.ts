@@ -1,4 +1,4 @@
-import type { WorkspaceFiles } from '@/modules/workspaceFiles'
+import type { WorkspaceFile, WorkspaceFiles } from '@/modules/workspaceFiles'
 import type { WorkbenchItem, WorkbenchPanelDefinition } from '@/workbench/types'
 import WorkspaceFilesPanel from './WorkspaceFilesPanel.vue'
 import { workspaceFilesReadingState } from './workspaceReadingState'
@@ -6,6 +6,7 @@ import { workspaceFilesReadingState } from './workspaceReadingState'
 export function createWorkspaceFilesWorkbenchDefinition(
   files: WorkspaceFiles | null,
   t: (key: string) => string,
+  openDocument?: (file: WorkspaceFile, item: WorkbenchItem, isCurrent: () => boolean) => Promise<boolean>,
 ): WorkbenchPanelDefinition {
   return {
     kind: 'workspace-files',
@@ -17,6 +18,7 @@ export function createWorkspaceFilesWorkbenchDefinition(
       icon: 'folder',
     }),
     getProps: (item, state) => ({ ...state.runtimeState, runtimeReady: state.runtimeState.runtimeReady === true,
+      ...(openDocument ? { openDocument: (file: WorkspaceFile, isCurrent: () => boolean) => openDocument(file, item, isCurrent) } : {}),
       sessionKey: item.scope.type === 'session' ? item.scope.id : '' }),
     createRuntime: (_item, context) => {
       context.updateRenderState({ runtimeReady: true, readingState: workspaceFilesReadingState(context.getViewState?.()?.reading), runRestore: context.runRestore })

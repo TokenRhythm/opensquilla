@@ -19,6 +19,7 @@ export function useWorkspacePreviewOpening(options: {
   getArtifact: (key: string, artifactId: string) => Promise<ArtifactPayload | null>
   resolve: (key: string, ref: WorkbenchResourceRef) => Promise<WorkbenchResource | null>
   openCurrent: (key: string, resource: WorkbenchResource) => Promise<WorkbenchResourceOpenResponse | null>
+  prepareCurrent?: (current: CurrentDocument, key: string, isCurrent: () => boolean) => Promise<unknown>
   show: (current: CurrentDocument, key: string, previewPagePath?: string) => boolean | void
   onError: (error: unknown) => void
 }) {
@@ -79,6 +80,8 @@ export function useWorkspacePreviewOpening(options: {
         || !current.resource.capabilities.preview || !hasPage(current.resource)) {
         throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
       }
+      await options.prepareCurrent?.(current, key, isCurrent)
+      if (!isCurrent()) return
       const shown = previewPagePath === undefined
         ? options.show(current, key)
         : options.show(current, key, previewPagePath)

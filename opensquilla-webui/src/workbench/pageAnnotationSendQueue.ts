@@ -10,6 +10,7 @@ interface PendingSendNotification {
   sessionKeys: Set<string>
   draftIds: Set<string>
   expiresAt: number
+  documentId?: string
 }
 
 export interface PageAnnotationSendQueueOptions {
@@ -59,7 +60,7 @@ export class PageAnnotationSendQueue {
 
     this.prune(now)
     const overlapping = [...this.entries.values()].filter(entry => (
-      [...entry.sessionKeys].some(key => sessionKeys.has(key))
+      entry.documentId === detail.documentId && [...entry.sessionKeys].some(key => sessionKeys.has(key))
     ))
     // Preserve the first-seen order so activity rendering remains stable when
     // replayed responses are merged into one handoff.
@@ -74,12 +75,13 @@ export class PageAnnotationSendQueue {
     }
     for (const key of sessionKeys) mergedSessionKeys.add(key)
     for (const id of draftIds) mergedDraftIds.add(id)
-    const key = [...mergedSessionKeys].sort().join(SESSION_KEY_SEPARATOR)
+    const key = [...mergedSessionKeys].sort().join(SESSION_KEY_SEPARATOR) + (detail.documentId ? `${SESSION_KEY_SEPARATOR}document:${detail.documentId}` : '')
     this.entries.set(key, {
       key,
       sessionKeys: mergedSessionKeys,
       draftIds: mergedDraftIds,
       expiresAt,
+      documentId: detail.documentId,
     })
     this.trimToLimit()
     return true
@@ -92,8 +94,9 @@ export class PageAnnotationSendQueue {
   async flush<T>(
     items: readonly T[],
     sessionKeyForItem: (item: T) => string,
-    deliver: (item: T, draftIds: readonly string[]) => Promise<boolean | void> | boolean | void,
+    deliver: (item: T, draftIds: readonly string[], documentId?: string) => Promise<boolean | void> | boolean | void,
     now = Date.now(),
+    documentIdForItem?: (item: T) => string | undefined,
   ): Promise<number> {
     this.prune(now)
     let delivered = 0
@@ -101,12 +104,13 @@ export class PageAnnotationSendQueue {
       if (this.entries.get(entry.key) !== entry) continue
       const matchingItems = items.filter(item => (
         entry.sessionKeys.has(String(sessionKeyForItem(item) || '').trim())
+          && (!entry.documentId || documentIdForItem?.(item) === entry.documentId)
       ))
       if (matchingItems.length === 0) continue
       const ids = [...entry.draftIds]
       try {
         const results = await Promise.all(
-          matchingItems.map(item => deliver(item, ids)),
+          matchingItems.map(item => entry.documentId ? deliver(item, ids, entry.documentId) : deliver(item, ids)),
         )
         if (results.some(result => result === false)) continue
       } catch {

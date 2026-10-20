@@ -83,6 +83,7 @@ export interface WorkbenchResourceProvider {
   list(sessionKey: string, options?: { types?: WorkbenchResourceType[]; limit?: number; signal?: AbortSignal; singlePage?: boolean }): Promise<WorkbenchResourcesListResponse>
   get(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchResource | null>
   open?(sessionKey: string, resource: WorkbenchResourceRef, request: { intent: 'edit-current'; expectedSha256?: string; idempotencyKey: string }, signal?: AbortSignal): Promise<WorkbenchResourceOpenResponse | null>
+  prepareAnnotation?(sessionKey: string, request: import('@/types/workbenchResources').WorkbenchAnnotationRequest, signal?: AbortSignal): Promise<WorkbenchResourceOpenResponse | null>
   createPreview?(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchPreviewResponse | null>
   importDocument(request: { sessionKey: string; source: WorkbenchResourceRef; expectedSha256: string; idempotencyKey: string; name?: string }, signal?: AbortSignal): Promise<DocumentImportResponse>
   publishDocument(request: { sessionKey: string; documentId: string; revisionId: string; idempotencyKey: string; name?: string }, signal?: AbortSignal): Promise<DocumentPublishResponse>
@@ -363,6 +364,8 @@ export interface ArtifactPreviewLease {
   idle_timeout_seconds: number
   source: ArtifactPreviewLeaseSource
   workingDocumentId?: string
+  /** True only when the lease serves immutable artifact bundle bytes. */
+  snapshot?: boolean
 }
 
 export interface ArtifactPreviewLeaseRenewal {
@@ -382,6 +385,7 @@ export interface ArtifactPreviewLeaseRequest {
   nativeBroker?: ArtifactPreviewNativeBroker
   sessionKey?: string
   pagePath?: string
+  snapshot?: boolean
 }
 
 export class ArtifactPreviewLeaseError extends Error {

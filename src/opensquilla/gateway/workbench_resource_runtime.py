@@ -975,6 +975,61 @@ async def _scoped_document(
     return document, current.revision
 
 
+async def _add_resource_source_paths(
+    ctx: RpcContext,
+    *,
+    session_key: str,
+    service: ArtifactSessionService,
+    resources: Sequence[dict[str, Any]],
+) -> None:
+    """Project existing source identities without registering or materializing files.
+
+    Paths are presentation metadata, not an alternative document identity. Only
+    return a workspace-relative path after validating the current workspace and
+    its read policy; stale bindings and private host paths remain undisclosed.
+    """
+    from opensquilla.artifact_session.working_files import get_working_files
+    from opensquilla.gateway.workspace_files import (
+        WorkspaceFiles,
+        WorkspaceFileUnavailableError,
+        _readable_file,
+    )
+
+    document_ids = {
+        str(resource.get("relations", {}).get("documentId") or "")
+        for resource in resources
+    } - {""}
+    if not document_ids:
+        return
+    working_files = {
+        document_id: binding
+        for document_id in document_ids
+        if (binding := await get_working_files(service, document_id)) is not None
+    }
+    if not working_files:
+        return
+    try:
+        workspace = await WorkspaceFiles(ctx.config, ctx.session_manager).workspace(session_key)
+    except WorkspaceFileUnavailableError:
+        return
+    paths: dict[str, str] = {}
+    for document_id, binding in working_files.items():
+        try:
+            if Path(binding.workspace) != workspace.root:
+                continue
+            relative = binding.entry.relative_to(workspace.root).as_posix()
+            if len(relative) > 4096:
+                continue
+            await asyncio.to_thread(_readable_file, workspace, relative)
+        except (OSError, ValueError, ArtifactValidationError):
+            continue
+        paths[document_id] = relative
+    for resource in resources:
+        document_id = str(resource.get("relations", {}).get("documentId") or "")
+        if document_id in paths:
+            resource["sourcePath"] = paths[document_id]
+
+
 async def _resource_inventory(
     ctx: RpcContext,
     *,
@@ -1076,6 +1131,10 @@ async def _resource_inventory(
         )
         for item in deliverables
     ]
+    await _add_resource_source_paths(
+        ctx, session_key=session_key, service=service,
+        resources=[*document_resources, *deliverable_resources],
+    )
     return {
         "attachment": attachment_resources,
         "document": document_resources,
@@ -1948,6 +2007,9 @@ async def _resources_get(
         resource_type=resource_type, resource_id=resource_id,
         materials=_ResourceMaterials(ArtifactStore(media_root_from_config(ctx.config)), session_id),
     )
+    await _add_resource_source_paths(
+        ctx, session_key=session_key, service=service, resources=[resource],
+    )
     return {"resource": resource}
 
 
@@ -2007,6 +2069,9 @@ async def _current_document_open_response(
             "resourceId": f"document:{document_id}",
             "revisionId": head.revision_id, "sha256": head.artifact_sha256,
         }
+    await _add_resource_source_paths(
+        ctx, session_key=session_key, service=service, resources=[resource],
+    )
     return response
 
 
@@ -2220,12 +2285,94 @@ def _open_idempotency_key(
     return "open-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+async def _resources_annotate(
+    command: WorkbenchResourceOpen, ctx: RpcContext,
+) -> dict[str, Any]:
+    from opensquilla.gateway.annotation_preparation import (
+        annotation_authority,
+        find_document_target,
+        refresh_annotation_baseline,
+        register_annotation_source,
+    )
+    from opensquilla.gateway.workspace_files import _readable_file
+
+    if ctx.principal is not None and not ctx.principal.is_owner:
+        raise ValueError("Annotation preparation requires the workspace owner")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    store = ArtifactStore(media_root_from_config(ctx.config))
+    files, workspace, validate = await annotation_authority(ctx, session_key, session_id)
+    page_path = None
+    resource = command.resource
+    if command.workspace_file is not None:
+        source = command.workspace_file
+        if source["workspaceBinding"] != workspace.binding:
+            raise ArtifactConflictError("Annotation workspace binding changed")
+        path, _, revision = await asyncio.to_thread(_readable_file, workspace, source["path"])
+        if revision != source["expectedRevision"]:
+            raise ArtifactConflictError("Annotation source changed since the file was opened")
+        target, ambiguous = await find_document_target(
+            service, store, session_key=session_key, session_id=session_id,
+            workspace=workspace, path=path,
+        )
+        if ambiguous:
+            raise ArtifactConflictError("Annotation document target is ambiguous")
+        if target is None:
+            document_id = await register_annotation_source(
+                service, store, session_key=session_key, session_id=session_id,
+                workspace=workspace, path=path, validate=validate,
+            )
+        else:
+            document_id = target["documentId"]
+            page_path = target.get("pagePath")
+        resource = WorkbenchResourceRef("document", document_id)
+    assert resource is not None
+    opened = await _resources_open(
+        replace(command, resource=resource, workspace_file=None, intent="edit-current"), ctx,
+    )
+    if opened.get("disposition") != "document" or not opened.get("workingFile"):
+        return opened
+    document_id = opened["document"]["documentId"]
+    previous_revision_id = opened["revision"]["revisionId"]
+    await refresh_annotation_baseline(
+        service, store, document_id=document_id, session_key=session_key,
+        session_id=session_id, workspace=workspace, validate=validate,
+    )
+    if await files.workspace(session_key) != workspace:
+        raise ArtifactConflictError("Annotation workspace changed during preparation")
+    # Another prepare may have advanced the head before our baseline check.
+    # Return that current head even when this call did not create a revision.
+    opened = await _current_document_open_response(
+        ctx, session_key=session_key, session_id=session_id, service=service,
+        document_id=document_id, materialized=bool(opened.get("materialized")),
+    )
+    opened["baselineUpdated"] = opened["revision"]["revisionId"] != previous_revision_id
+    if opened["baselineUpdated"]:
+        opened["previousRevisionId"] = previous_revision_id
+    if page_path is not None:
+        from opensquilla.artifact_session.working_files import get_working_files
+
+        binding = await get_working_files(service, document_id)
+        assert binding is not None
+        bundle = await asyncio.to_thread(binding.bundle)
+        if not any(
+            item.path == page_path and item.mime in _HTML_MIMES for item in bundle.files
+        ):
+            raise ArtifactConflictError("Annotation page is no longer in the document")
+        opened["pageContext"]["pagePath"] = page_path
+    return opened
+
+
 async def _resources_open(
     command: WorkbenchResourceOpen,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     """Resolve a resource to its current editable Document when supported."""
 
+    if command.intent == "annotate":
+        try:
+            return await _resources_annotate(command, ctx)
+        except ArtifactConflictError as exc:
+            raise _conflict(exc) from exc
     session_key, session_id, service = await _scope(command.session_key, ctx)
     materials = _ResourceMaterials(ArtifactStore(media_root_from_config(ctx.config)), session_id)
     intent = command.intent
@@ -2237,6 +2384,7 @@ async def _resources_open(
         if _SHA256_RE.fullmatch(expected_sha256) is None:
             raise ValueError("expected resource digest must be a SHA-256 value")
     requested_idempotency_key = command.idempotency_key
+    assert command.resource is not None
     resource_type = command.resource.resource_type
     resource_id = command.resource.resource_id
     if resource_type == "document":

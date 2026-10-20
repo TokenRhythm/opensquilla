@@ -45,6 +45,33 @@ const lease = {
 }
 
 describe('artifact preview lease client', () => {
+  it.each(['desktop', 'web'] as const)('keeps a complete HTML history bundle immutable through %s transport', async client => {
+    const snapshotLease = { ...lease, snapshot: true }
+    const create = vi.fn(async () => ({ ok: true as const, status: 201, payload: snapshotLease }))
+    const http = httpTransport({ requestJson: vi.fn(async () => snapshotLease) })
+    const result = await createArtifactPreviewLease(http, { id: 'art-history', workbenchOpenIntent: 'history' },
+      'full', client, { baseOrigin: 'http://127.0.0.1:18792', sessionKey: 'session-a',
+        ...(client === 'desktop' ? { nativeBroker: { createArtifactPreviewLease: create } } : {}) })
+    expect(result.snapshot).toBe(true)
+    expect(result.source.file_count).toBe(3)
+    if (client === 'desktop') expect(create).toHaveBeenCalledWith(expect.objectContaining({ snapshot: true }))
+    else expect(http.requestJson).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      json: { version: 1, mode: 'full', client: 'web', snapshot: true },
+    }))
+  })
+
+  it.each([
+    lease,
+    { ...lease, snapshot: true, workingDocumentId: 'doc-live' },
+  ])('revokes a history lease if immutable handling is unconfirmed or contradictory', async response => {
+    const http = httpTransport({ requestJson: vi.fn(async () => response) })
+    await expect(createArtifactPreviewLease(http, { id: 'art-history', workbenchOpenIntent: 'history' },
+      'full', 'web', { baseOrigin: 'http://127.0.0.1:18792', sessionKey: 'session-a' }))
+      .rejects.toMatchObject({ code: 'PREVIEW_SNAPSHOT_UNSUPPORTED' })
+    expect(http.requestBlob).toHaveBeenCalledWith(expect.stringContaining('/lease-1'),
+      expect.objectContaining({ method: 'DELETE' }))
+  })
+
   it.each(['stream', 'json'] as const)('distinguishes a Web response %s failure after HTTP 200', async kind => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(kind === 'stream'
       ? new ReadableStream({ start(controller) { controller.error(new TypeError('Connection lost')) } })

@@ -1,6 +1,6 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 import { copyLocalPathReferences, localPathPresentation } from '@/types/localPathReferences'
-import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
+import { assertPageContextWithinLimits, normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import { copyTurnCommand, type ProjectInitTurnCommand } from '@/types/turnCommand'
 import { computed, nextTick, ref, shallowReactive, toRaw, watch, type Ref } from 'vue'
 import type {
@@ -617,6 +617,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       }
       let refreshedLostUpload = false
       try {
+        try {
+          if (item.pageContext != null) assertPageContextWithinLimits(item.pageContext)
+        } catch (error) {
+          // Hydration retries staging. An unchanged invalid row must not write
+          // another WAL revision and trigger hydration indefinitely.
+          if (item.pendingPersistenceState === 'retryable') return
+          throw new PendingInputQueueError('invalid', error instanceof Error ? error.message : 'Invalid page context.', false)
+        }
         while (true) {
           if (!identityAllowsDelivery(item)) return
           if (wasRemoved(sessionKey, pendingInputId)) return
@@ -1805,6 +1813,37 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       && (!item.pendingDeliveryIdentity || item.pendingDeliveryIdentity === options.deliveryIdentity?.value)
   }
 
+  async function restoreQueuedAnnotations(
+    pendingUiId: string,
+    restore: (item: ChatPendingItem) => void,
+  ): Promise<boolean> {
+    const item = pendingQueue.value.find(candidate => candidate.pendingUiId === pendingUiId)
+    if (!item?.pageContext || item.deliveryState || item.steerAttempt
+      || item.pendingPersistenceState === 'saving' || item.pendingPersistenceState === 'cancelling'
+      || !canRestoreToComposer(item) || hasUneditablePendingAttachments(item)) return false
+    const stillOwnsComposer = composerOwnershipGuard()
+    const restoredAttachments = (item.attachments || []).map(attachment => (
+      item.pendingPersistenceState === 'staged' && attachment.kind === 'staged' && attachment.file
+        ? { ...attachment, expires_at: 0 }
+        : attachment
+    ))
+    if (durableItem(item) && !await cancelDurableItem(item, { retainAfterCancel: true })) return false
+    if (!stillOwnsComposer() || !canRestoreToComposer(item)
+      || !pendingQueue.value.includes(item)) return false
+    // Restore durable context first. A local storage failure leaves the cancelled
+    // queue item available for another recovery attempt.
+    restore(item)
+    restoreSkills([item])
+    restoreCombinedInput([item, currentComposerInput()])
+    options.pendingAttachments.value = [...restoredAttachments, ...options.pendingAttachments.value]
+    options.pendingSessionIntent.value = options.pendingSessionIntent.value || item.intent || null
+    options.autoResizeTextarea()
+    const index = pendingQueue.value.indexOf(item)
+    if (index >= 0) pendingQueue.value.splice(index, 1)
+    if (durableItem(item)) await forgetDurableItem(item, 'removed').catch(() => {})
+    return true
+  }
+
   async function cancelForComposer(
     item: ChatPendingItem,
     stillOwnsComposer: () => boolean,
@@ -1875,6 +1914,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       && (
         pendingQueue.value[tailIndex]?.deliveryState
         || pendingQueue.value[tailIndex]?.steerAttempt
+        || pendingQueue.value[tailIndex]?.pageContext
       )
     ) tailIndex--
     if (tailIndex < 0) return false
@@ -1909,12 +1949,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const visible = pendingQueue.value.filter(
       p => !p.deliveryState
         && !p.steerAttempt
+        && !p.pageContext
         && canRestoreToComposer(p)
         && !hasUneditablePendingAttachments(p),
     )
     const retained = pendingQueue.value.filter(
       p => p.deliveryState
         || p.steerAttempt
+        || p.pageContext
         || !canRestoreToComposer(p)
         || hasUneditablePendingAttachments(p),
     )
@@ -2352,6 +2394,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     isReordering,
     maxPending: MAX_PENDING,
     enqueuePendingPayload,
+    restoreQueuedAnnotations,
     enqueuePendingInput,
     enqueuePendingSteerAttempt,
     removePendingChip,

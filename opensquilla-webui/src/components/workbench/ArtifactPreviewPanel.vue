@@ -112,9 +112,14 @@
       <template v-else-if="isRenderable">
         <OfficePreviewPanel
           v-if="officeFormat && preview.binary?.value"
+          ref="officePanel"
           :data="preview.binary.value"
           :format="officeFormat"
           :annotation-enabled="officeAnnotationEnabled"
+          :revision-id="typeof artifact.revisionId === 'string' ? artifact.revisionId : undefined"
+          :selection-to-locate="officeSelectionToLocate"
+          :selection-mode="officeSelectionMode"
+          :selection-locked="officeSelectionLocked"
           :suspended="suspended"
           :reading-state="readingState"
           @reading-state="saveReading"
@@ -122,9 +127,12 @@
           @thumbnail="emit('workbench-event', { type: 'preview-thumbnail', payload: $event })"
           @ready="officeRenderState = 'ready'"
           @error="officeRenderState = 'error'"
-          @selection-request="selection => emit('workbench-event', { type: 'office-annotation-selected', payload: {
-            selection, revisionId: artifact.revisionId, sha256: artifact.sha256,
+          @selection-commit="value => emit('workbench-event', { type: 'office-annotation-selected', payload: {
+            ...value, revisionId: artifact.revisionId, sha256: artifact.sha256,
           } })"
+          @anchor-change="anchor => emit('workbench-event', { type: 'office-annotation-anchor', payload: anchor })"
+          @locate-result="result => emit('workbench-event', { type: 'office-annotation-located', payload: result })"
+          @selection-mode-change="enabled => emit('workbench-event', { type: 'office-annotation-mode', payload: { enabled } })"
         />
         <img
           v-else-if="preview.kind.value === 'image'"
@@ -193,6 +201,7 @@ import {
   type NativeHtmlArtifactResource,
 } from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
+import type { OfficeSelection } from '@/types/officeSelection'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 import {
   artifactFileSubtitle,
@@ -219,6 +228,9 @@ const props = withDefaults(defineProps<{
   showHeader?: boolean
   suspended?: boolean
   officeAnnotationEnabled?: boolean
+  officeSelectionMode?: boolean
+  officeSelectionLocked?: boolean
+  officeSelectionToLocate?: { selection: OfficeSelection; revisionId?: string; stale?: boolean; requestId: string | number }
   readingState?: ResourceReadingState
 }>(), {
   baseOrigin: '',
@@ -235,6 +247,7 @@ const props = withDefaults(defineProps<{
   showHeader: true,
   suspended: false,
   officeAnnotationEnabled: false,
+  officeSelectionMode: undefined,
 })
 
 const emit = defineEmits<{
@@ -280,6 +293,7 @@ const preview = artifactWorkbench.previews.createResource({
   sessionKey: () => props.sessionKey,
 })
 const officeFormat = computed(() => isOfficePreviewFormat(preview.kind.value) ? preview.kind.value : null)
+const officePanel = ref<InstanceType<typeof OfficePreviewPanel> | null>(null)
 const officeRenderState = ref<ArtifactPreviewResourceState>('loading')
 const readingSources = new WeakMap<ArrayBuffer, string>()
 watch(() => preview.binary?.value, data => {
@@ -508,6 +522,9 @@ defineExpose({
   kind: preview.kind,
   reload: reloadPreview,
   state: preview.state,
+  clearTransientSelection: () => officePanel.value?.clearTransientSelection(),
+  reselect: () => officePanel.value?.reselect(),
+  setSelectionMode: (enabled: boolean) => officePanel.value?.setSelectionMode(enabled),
 })
 </script>
 

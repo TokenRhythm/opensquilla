@@ -343,7 +343,7 @@ export function createArtifactPreviewLeaseHttp<T>(
   artifactId: string,
   mode: ArtifactPreviewMode,
   client: PlatformId,
-  context: ArtifactPreviewHttpContext & { pagePath?: string },
+  context: ArtifactPreviewHttpContext & { pagePath?: string; snapshot?: boolean },
 ): Promise<T> {
   const url = new URL(
     `${ARTIFACT_CONTENT_PATH}${encodeURIComponent(artifactId)}/preview-leases`,
@@ -351,7 +351,8 @@ export function createArtifactPreviewLeaseHttp<T>(
   ).toString()
   return http.requestJson<T>(url, {
     method: 'POST',
-    json: { version: 1, mode, client, ...(context.pagePath ? { pagePath: context.pagePath } : {}) },
+    json: { version: 1, mode, client, ...(context.pagePath ? { pagePath: context.pagePath } : {}),
+      ...(context.snapshot === true ? { snapshot: true } : {}) },
     sessionKey: context.sessionKey,
     timeoutMs: 0,
   })

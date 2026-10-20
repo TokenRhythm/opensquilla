@@ -86,17 +86,24 @@
             :aria-controls="panelId(item.id)"
             :aria-describedby="hoveredItem?.id === item.id ? hoverCardId : undefined"
             :aria-busy="tabInfo?.(item).loading || undefined"
+            :aria-label="tabAccessibleLabel(item)"
             :tabindex="item.id === activeItem?.id || (!activeItem && index === 0) ? 0 : -1"
             @click="activateTab(item.id)"
             @keydown="onTabKeydown($event, index)"
           >
             <Icon v-if="tabInfo?.(item).loading" name="refresh" :size="14" class="workbench-host__tab-spinner" aria-hidden="true" />
-            <span class="workbench-host__tab-title">{{ item.title }}</span>
+            <span class="workbench-host__tab-copy">
+              <span class="workbench-host__tab-name">
+                <span class="workbench-host__tab-title">{{ workbenchTabName(item) }}</span>
+                <small v-if="workbenchTabIsHistorical(item)" class="workbench-host__tab-version">{{ historicalLabel }}</small>
+              </span>
+              <small v-if="tabSourceLabel(item)" class="workbench-host__tab-source">{{ tabSourceLabel(item) }}</small>
+            </span>
           </button>
           <button
             class="workbench-host__tab-close"
             type="button"
-            :aria-label="`${closeItemLabel}: ${item.title}`"
+            :aria-label="`${closeItemLabel}: ${tabAccessibleLabel(item)}`"
             :tabindex="item.id === activeItem?.id ? 0 : -1"
             @click="closeWorkbenchItem(item.id)"
           >
@@ -210,7 +217,8 @@
     <div v-if="hoveredItem && shouldRender && !modalBlocked" :id="hoverCardId" ref="hoverCardRef"
       class="workbench-tab-preview" role="tooltip" :style="hoverStyle"
       @pointerenter="cancelHideHover" @pointerleave="scheduleHideHover">
-      <strong>{{ hoveredItem.title }}</strong>
+      <strong>{{ workbenchTabName(hoveredItem) }}<template v-if="workbenchTabIsHistorical(hoveredItem)"> · {{ historicalLabel }}</template></strong>
+      <span v-if="workbenchTabSourcePath(hoveredItem)">{{ workbenchTabSourcePath(hoveredItem) }}</span>
       <span v-if="tabInfo?.(hoveredItem).subtitle">{{ tabInfo?.(hoveredItem).subtitle }}</span>
       <img v-if="hoveredItem.id !== activeItem?.id && tabInfo?.(hoveredItem).thumbnailUrl"
         :src="tabInfo?.(hoveredItem).thumbnailUrl" alt="" draggable="false" />
@@ -241,6 +249,7 @@ import {
 } from '@/workbench/layout'
 import { useWorkbenchStore } from '@/workbench/store'
 import type { NativeSurfaceRect, WorkbenchItem } from '@/workbench/types'
+import { workbenchTabIsHistorical, workbenchTabName, workbenchTabSourceLabel, workbenchTabSourcePath } from '@/workbench/workbenchTabPresentation'
 import WorkbenchResizer from './WorkbenchResizer.vue'
 
 type WorkbenchResizerHandle = { cancel: () => boolean }
@@ -266,6 +275,7 @@ const props = withDefaults(defineProps<{
   maximizeLabel?: string
   restoreLabel?: string
   closeItemLabel?: string
+  historicalLabel?: string
   resizeLabel?: string
   pixelsLabel?: string
   beforeCloseItem?: (item: WorkbenchItem) => boolean | Promise<boolean>
@@ -286,6 +296,7 @@ const props = withDefaults(defineProps<{
   maximizeLabel: 'Maximize workbench',
   restoreLabel: 'Restore workbench size',
   closeItemLabel: 'Close tab',
+  historicalLabel: 'History',
   resizeLabel: 'Resize workbench',
   pixelsLabel: 'pixels',
 })
@@ -325,6 +336,16 @@ const showTabStrip = computed(() => store.visibleItems.length > 0)
 const activeItem = computed(() => store.visibleItems.find(
   item => item.id === store.activeItemId,
 ) ?? null)
+function tabSourceLabel(item: WorkbenchItem): string {
+  return workbenchTabSourceLabel(item, store.visibleItems)
+}
+function tabAccessibleLabel(item: WorkbenchItem): string {
+  return [
+    workbenchTabName(item),
+    workbenchTabIsHistorical(item) ? props.historicalLabel : '',
+    tabSourceLabel(item),
+  ].filter(Boolean).join(' · ')
+}
 const hoverCardId = useId()
 const hoveredId = ref<string | null>(null)
 const hoveredItem = computed(() => store.visibleItems.find(item => item.id === hoveredId.value) ?? null)
@@ -915,6 +936,33 @@ onBeforeUnmount(() => {
   min-width: 0;
   display: block;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-host__tab-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.workbench-host__tab-name {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+}
+
+.workbench-host__tab-version {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+}
+
+.workbench-host__tab-source {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }

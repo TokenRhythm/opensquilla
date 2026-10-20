@@ -1,6 +1,7 @@
 import { TurnCommandError } from '@/modules/turnCommands'
 import { useToasts } from '@/composables/useToasts'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
+import { RpcTransportError } from '@/lib/rpc'
 import { computed, ref } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -113,6 +114,94 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
   return { ...createChatSendHarness(options), rpc }
 }
 
+describe('annotation batch preflight and receipt identity', () => {
+  it('rejects 17 annotations without truncating or consuming the composer', async () => {
+    const result = createHarness({ draftIds: ref(Array.from({ length: 17 }, (_, index) => `draft-${index}`)),
+      inputText: ref('Keep this instruction') })
+    await result.api.onSend()
+    expect(result.rpc.call).not.toHaveBeenCalled()
+    expect(result.options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(result.options.inputText.value).toBe('Keep this instruction')
+    expect(result.options.draftIds?.value).toHaveLength(17)
+    result.api.dispose()
+  })
+
+  it('keeps local target metadata in receipts while sending only the frozen wire target', async () => {
+    const result = createHarness({ draftIds: ref(['annotation-1']),
+      promptAnnotationSnapshots: () => [{ ...snapshot('annotation-1', 0), targetText: 'original display label' }] })
+    await result.api.onSend()
+    expect(result.options.acknowledgePromptAnnotations).toHaveBeenCalledWith([
+      expect.objectContaining({ targetText: 'original display label', quote: '<button>', locatorHint: '#button' }),
+    ], expect.anything(), undefined)
+    expect(result.rpc.call.mock.calls[0]?.[1].pageContext.annotations[0]).not.toHaveProperty('targetText')
+    result.api.dispose()
+  })
+
+  it('marks a rejected source version for reselection while retaining the draft', async () => {
+    const invalidatePromptAnnotations = vi.fn()
+    const result = createHarness({ invalidatePromptAnnotations, inputText: ref('Keep my message') })
+    result.rpc.call.mockRejectedValueOnce(new TurnCommandError('rejected', 'Source changed', 'DOCUMENT_CHANGED', false, false))
+    await result.api.onSend()
+    expect(invalidatePromptAnnotations).toHaveBeenCalledWith([
+      expect.objectContaining({ annotationId: 'annotation-2' }),
+      expect.objectContaining({ annotationId: 'annotation-1' }),
+    ])
+    expect(result.options.inputText.value).toBe('Keep my message')
+    expect(result.options.acknowledgePromptAnnotations).not.toHaveBeenCalled()
+    result.api.dispose()
+  })
+
+  it('checks the original receipt while a newer annotation batch exceeds the budget', async () => {
+    const draftIds = ref(['original'])
+    let receiptAvailable = false
+    const rpc = {
+      call: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.send') throw new RpcTransportError('Connection closed', null)
+        const original = params?.originalRequest as Record<string, unknown>
+        return {
+          status: 'found', accepted: true, requestFingerprint: `sha256:${'b'.repeat(64)}`,
+          receipt: {
+            requestSessionKey: original.sessionKey, sessionKey: original.sessionKey,
+            sessionId: 'synthetic-session', sessionEpoch: 1,
+            clientRequestId: original.clientRequestId, messageId: 'accepted-message',
+            taskId: 'accepted-task', taskStatus: 'succeeded',
+          },
+        }
+      }),
+    }
+    const harness = createHarness({
+      draftIds,
+      turnCommands: createV4TurnCommandsFromRpcClient(
+        rpc as unknown as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
+        method => receiptAvailable && method === 'turns.receipt.get',
+      ),
+      promptAnnotationSnapshots: ids => ids.map((id, index) => ({
+        ...snapshot(id, index), revisionId: 'original-revision', sha256: 'a'.repeat(64),
+        quote: id === 'original' ? 'Original heading' : 'x'.repeat(16_384),
+      })),
+    })
+    await harness.api.onSend()
+    const original = rpc.call.mock.calls[0]?.[1]
+    draftIds.value = ['new-1', 'new-2', 'new-3', 'new-4']
+    receiptAvailable = true
+    const delivery = harness.api.deliveryRecoveryEntries.value[0]
+    expect(delivery).toBeDefined()
+    await harness.api.checkDelivery(delivery!.id)
+
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'chat.send')).toHaveLength(1)
+    expect(rpc.call).toHaveBeenCalledWith('turns.receipt.get', expect.objectContaining({
+      originalRequest: original,
+    }), expect.anything())
+    expect(draftIds.value).toEqual(['new-1', 'new-2', 'new-3', 'new-4'])
+    expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
+      [expect.objectContaining({
+        annotationId: 'original', revisionId: 'original-revision', sha256: 'a'.repeat(64),
+      })],
+      'agent:main:webchat:test', undefined,
+    )
+  })
+})
+
 describe('sending with empty page annotation drafts', () => {
   beforeEach(() => {
     const values = new Map<string, string>()
@@ -132,6 +221,7 @@ describe('sending with empty page annotation drafts', () => {
     const draft = {
       annotationId: 'empty-draft', sessionKey, documentId: 'document-1',
       documentName: 'page.html', resourceId: 'document:document-1', body: ' \n\t ',
+      revisionId: 'revision-1', sha256: 'a'.repeat(64),
       selection: {
         selectionId: 'selection-1', targetRef: 'target-1', tagName: 'h1',
         elementPath: 'h1', selectionText: 'Welcome', locatorHint: 'h1',
@@ -322,6 +412,61 @@ describe('ordinary page annotation input', () => {
       ownerSessionKey: 'agent:main:webchat:test', pageContext,
     })
     expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({ pageContext }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
+  })
+
+  it.each(['editing', 'stale'])('sends a frozen queued batch independently of a %s live annotation', async reason => {
+    const harness = createHarness({
+      draftIds: ref([]), inputText: ref('Keep the new composer'),
+      sendBlockedReason: ref(reason), queuedSendBlockedReason: ref(null),
+    })
+    const pageContext = {
+      resourceId: 'document:queued', revisionId: 'queued-revision', sha256: 'a'.repeat(64),
+      annotations: [{ text: 'Change the queued target', locatorHint: 'h1' }],
+    }
+    const outcome = await harness.api.sendQueuedFollowup({
+      pendingUiId: 'frozen-batch', text: '', attachments: [], intent: null,
+      ownerSessionKey: 'agent:main:webchat:test', pageContext, draftIds: ['queued-annotation'],
+    })
+    expect(outcome).toBe('accepted')
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(harness.rpc.call.mock.calls[0]?.[1].pageContext).toEqual(pageContext)
+    expect(harness.options.inputText.value).toBe('Keep the new composer')
+
+    await harness.api.onSend()
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(harness.options.inputText.value).toBe('Keep the new composer')
+  })
+
+  it.each([false, true])('keeps queue admission gates revocable during preparation: %s', revokeDuringPreparation => {
+    const queuedSendBlockedReason = ref<string | null>(revokeDuringPreparation ? null : 'Disconnected')
+    const harness = createHarness({
+      draftIds: ref([]), queuedSendBlockedReason,
+      validateActiveProjectBeforeSend: async () => {
+        queuedSendBlockedReason.value = 'Workspace changed'
+        return null
+      },
+    })
+    return harness.api.sendQueuedFollowup({
+      pendingUiId: 'frozen-batch', text: '', attachments: [], intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pageContext: { resourceId: 'document:queued', annotations: [{ text: 'Retain this change' }] },
+    }).then(outcome => {
+      expect(outcome).toBe('deferred')
+      expect(harness.rpc.call).not.toHaveBeenCalled()
+    })
+  })
+
+  it('rejects invalid queued context without consuming its preserved batch', async () => {
+    const harness = createHarness({ draftIds: ref([]), inputText: ref('Keep current composer') })
+    const item = {
+      pendingUiId: 'pending-invalid', text: 'Keep queued message', attachments: [], intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pageContext: { annotations: Array.from({ length: 17 }, () => ({ text: 'Keep every change' })) },
+    }
+    expect(await harness.api.sendQueuedFollowup(item)).toBe('not_sent')
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.inputText.value).toBe('Keep current composer')
+    expect(item.pageContext.annotations).toHaveLength(17)
   })
 })
 

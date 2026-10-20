@@ -1,7 +1,7 @@
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
 import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
-import { normalizePageContext } from '@/types/pageContext'
+import { assertPageContextWithinLimits, normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { copyTurnCommand, isProjectInitTurnCommand } from '@/types/turnCommand'
 import { readTransportFailure } from './transportTypes'
@@ -403,7 +403,13 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
   if (turnCommand !== undefined && !isProjectInitTurnCommand(turnCommand)) {
     throw new TurnCommandError('rejected', 'Invalid turn command.', 'INVALID_REQUEST', false)
   }
-  const context = normalizePageContext(pageContext ?? legacyPageContext)
+  const rawPageContext = pageContext ?? legacyPageContext
+  try {
+    if (rawPageContext != null) assertPageContextWithinLimits(rawPageContext)
+  } catch (error) {
+    throw new TurnCommandError('rejected', error instanceof Error ? error.message : 'Invalid page context.', 'INVALID_REQUEST', false)
+  }
+  const context = normalizePageContext(rawPageContext)
 
   return {
     ...extensions,

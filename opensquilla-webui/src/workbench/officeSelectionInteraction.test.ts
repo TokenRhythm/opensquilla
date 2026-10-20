@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createOfficeSelectionInteraction, type OfficeHitTarget } from './officeSelectionInteraction'
+import { createOfficeSelectionInteraction, type OfficeHitTarget, type OfficeSelectionInteractionOptions } from './officeSelectionInteraction'
 import type { OfficeSelection } from '@/types/officeSelection'
 
 const hit: OfficeHitTarget = { kind: 'element', rect: { left: 30, top: 40, width: 100, height: 40 },
@@ -17,13 +17,13 @@ async function flushFrame() {
   callbacks.forEach(callback => callback(0))
   await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
 }
-function harness(hitTest = vi.fn(async () => hit as OfficeHitTarget | null)) {
+function harness(hitTest = vi.fn(async () => hit as OfficeHitTarget | null), overrides: Partial<OfficeSelectionInteractionOptions> = {}) {
   const container = document.createElement('div'); document.body.append(container)
   vi.spyOn(container, 'getBoundingClientRect').mockReturnValue(new DOMRect(10, 20, 400, 300))
   const onSelection = vi.fn(), onSelectionCommit = vi.fn(), clearNativeSelection = vi.fn()
   const readNativeSelection = vi.fn<() => OfficeSelection | null>(() => null)
   const api = createOfficeSelectionInteraction({ container, hitTest, onSelection, onSelectionCommit, readNativeSelection, clearNativeSelection,
-    labels: { text: '选择文字', element: '选择对象', range: '选择单元格' } })
+    labels: { text: '选择文字', element: '选择对象', range: '选择单元格' }, ...overrides })
   const move = (x = 50) => container.dispatchEvent(new PointerEvent('pointermove', { clientX: x, clientY: 50, bubbles: true }))
   const down = () => container.dispatchEvent(new PointerEvent('pointerdown', { clientX: 50, clientY: 50, button: 0, pointerId: 1, bubbles: true }))
   const up = () => window.dispatchEvent(new PointerEvent('pointerup', { clientX: 50, clientY: 50, button: 0, pointerId: 1, bubbles: true }))
@@ -37,6 +37,32 @@ function harness(hitTest = vi.fn(async () => hit as OfficeHitTarget | null)) {
 }
 
 describe('Office annotation interaction', () => {
+  it('retains and tracks a committed target while input is locked, then clears it on record or cancel', async () => {
+    let left = 30
+    const onAnchorChange = vi.fn()
+    const resolveAnchor = vi.fn(async () => ({ rect: { ...hit.rect, left }, rects: [{ ...hit.rect, left }],
+      viewport: { left: 10, top: 20, width: 400, height: 300 }, visible: true }))
+    const h = harness(undefined, { onAnchorChange, resolveAnchor })
+    h.api.setSelectionMode(true); h.click(); await flushFrame()
+    h.api.setSelectionMode(false, true); await flushFrame()
+    expect(h.api.enabled).toBe(false)
+    expect(h.api.tracking).toBe(true)
+    expect(h.selected().style.display).toBe('block')
+    const clears = h.clearNativeSelection.mock.calls.length
+    const calls = h.hitTest.mock.calls.length
+    h.move(); h.click(); await flushFrame()
+    expect(h.hitTest).toHaveBeenCalledTimes(calls)
+    left = 100
+    h.container.dispatchEvent(new Event('scroll')); await flushFrame()
+    expect(h.selected().style.left).toBe('90px')
+    expect(onAnchorChange).toHaveBeenLastCalledWith(expect.objectContaining({ rect: { ...hit.rect, left: 100 } }))
+    expect(h.clearNativeSelection).toHaveBeenCalledTimes(clears)
+    h.api.setSelectionMode(false)
+    expect(h.selected().style.display).toBe('none')
+    expect(h.api.tracking).toBe(false)
+    expect(onAnchorChange).toHaveBeenLastCalledWith(null)
+    h.api.destroy()
+  })
   it('does no annotation work while idle and batches hover moves to one public hit test', async () => {
     const h = harness()
     h.move(); h.click(); h.api.nativeSelection(hit.selection!)
