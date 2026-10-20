@@ -11,7 +11,7 @@ import secrets
 import socket
 import sys
 import time
-from collections.abc import Callable, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
 from dataclasses import dataclass, field, replace
 from functools import partial
 from importlib import import_module
@@ -2590,7 +2590,7 @@ class GatewayServer:
         if not hasattr(self, "_shutdown_phase_tasks"):
             self._shutdown_phase_tasks = set()
 
-        def own_phase(awaitable: Any) -> asyncio.Future[Any]:
+        def own_phase(awaitable: Awaitable[Any]) -> asyncio.Future[Any]:
             task = asyncio.ensure_future(awaitable)
             if task not in self._shutdown_phase_tasks:
                 self._shutdown_phase_tasks.add(task)
@@ -2603,7 +2603,7 @@ class GatewayServer:
             return task
 
         async def wait_phase(
-            awaitable: Any,
+            awaitable: Awaitable[Any],
             name: str,
             *,
             limit: float | None = None,
