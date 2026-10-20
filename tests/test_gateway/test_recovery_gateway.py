@@ -374,6 +374,21 @@ async def test_replay_owns_prefix_when_global_reservation_refuses_suffix(
     conn = resumable_connection
     key = f"agent:main:global-prefix-{conn.conn_id}-{recover_credit}"
     subscribe(conn, key)
+    conn._mark_flow_dirty({"session_key": key})
+
+    def dirty_notices():
+        return [
+            frame for frame in conn.ws.frames
+            if frame.get("event") == "transport.flow.dirty"
+        ]
+
+    async def wait_for_dirty_notices(count):
+        while len(dirty_notices()) < count:
+            await asyncio.sleep(0)
+
+    # Consume the original notice before starting recovery, so an old notice
+    # cannot satisfy the assertion about a later terminal replay failure.
+    await asyncio.wait_for(wait_for_dirty_notices(1), 1)
     payload = await snapshot(conn, key)
     await stage(conn, payload)
     for text in ("first", "second", "third"):
@@ -399,6 +414,7 @@ async def test_replay_owns_prefix_when_global_reservation_refuses_suffix(
     assert (pending.batch_index, pending.batch_offset) == (0, 1)
     assert conn._flow.dirty_revision(key) == revision
     assert set(conn._flow.deliveries) == pending.pending_delivery_ids
+    original_notice_count = len(dirty_notices())
     if recover_credit:
         monkeypatch.setattr(budget, "reserve", reserve)
     await ack_replay(conn, pending.pending_delivery_ids)
@@ -407,14 +423,16 @@ async def test_replay_owns_prefix_when_global_reservation_refuses_suffix(
         assert len(pending.pending_delivery_ids) == 2
         await ack_replay(conn, pending.pending_delivery_ids)
         assert conn.installed_snapshot_proof(receipt(payload)) == response.payload
-        replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
+        replayed = [frame for frame in conn.ws.frames if (frame.get("meta") or {}).get("replayed")]
         assert [frame["payload"]["text"] for frame in replayed] == ["first", "second", "third"]
+        assert len(dirty_notices()) == original_notice_count
     else:
         assert pending.transfer.closed
         assert key in conn._flow.dirty
         assert conn.installed_snapshot_proof(receipt(payload)) is None
-        await asyncio.sleep(0.01)
-        assert any(frame.get("event") == "transport.flow.dirty" for frame in conn.ws.frames)
+        await asyncio.wait_for(wait_for_dirty_notices(original_notice_count + 1), 1)
+        assert len(dirty_notices()) == original_notice_count + 1
+        assert key in dirty_notices()[-1]["payload"]["dirty_keys"]
     assert key not in conn._pending_replays
     assert not conn._flow.deliveries
 

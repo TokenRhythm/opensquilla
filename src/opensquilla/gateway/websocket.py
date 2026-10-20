@@ -982,6 +982,9 @@ class WsConnection:
                 self._queue_pending_replay_batch(pending)
             except Exception:
                 self._mark_flow_dirty({"session_key": pending.key})
+                # Recovery was already dirty; notify the client that this
+                # accepted replay can no longer complete.
+                self._queue_flow_dirty_notice()
                 pending.transfer.close()
                 self._pending_replays.pop(pending.key, None)
 
@@ -1030,6 +1033,7 @@ class WsConnection:
                 self._queue_pending_replay_batch(pending)
             except Exception:
                 self._mark_flow_dirty({"session_key": pending.key})
+                self._queue_flow_dirty_notice()
                 pending.transfer.close()
                 self._pending_replays.pop(pending.key, None)
 
