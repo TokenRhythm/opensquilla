@@ -750,7 +750,9 @@ for (const initialHistory of ['canonical', 'fallback'] as const) {
         gateway.canonicalHistory()
         gateway.dirtyCurrent()
       }
-      await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+      // The failed history reads and final delivery gap share the same bounded
+      // recovery backoff. Keep observing the retained view through that delay.
+      await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '', { timeout: 15_000 })
       await expect(narration).toBeVisible()
       await page.evaluate(async () => {
         for (let frame = 0; frame < 8; frame++) {

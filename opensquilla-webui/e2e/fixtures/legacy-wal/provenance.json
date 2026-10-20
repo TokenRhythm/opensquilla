@@ -9,6 +9,14 @@
     "types/selectedSkills.ts": "b3dce18d4376685e0a02d5371e866283f85eaf1300b91c0dedfb3f0ca4997881",
     "types/localPathReferences.ts": "2678acde5ef09d818f49b2b13259a307f0253399b74542b89e97925f10a70ba1",
     "types/pageContext.ts": "075389e5b2b0594889ede5cb880843a183242cce33b07b12a85aa3450234cd3e",
+    "types/officeSelection.ts": "93d221a452a5f3a35243f4b9ba376cd2a4d14f7b1df6496fd6dff6a1f98a6e1b",
     "types/turnCommand.ts": "5394a3af9059176c400013b36ebeb09eb2fb124dfc1ccf8f05c9c4c9c4c808f5"
+  },
+  "frozenDependencies": {
+    "types/pageContext.ts": {
+      "fixture": "pageContext.schema2.ts.txt",
+      "gitBlob": "ccd9ce95adf28ba5fa597aeb77c24ca0a1104c28",
+      "bytes": 3797
+    }
   }
 }

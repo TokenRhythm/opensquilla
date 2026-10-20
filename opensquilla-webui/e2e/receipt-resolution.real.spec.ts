@@ -24,13 +24,21 @@ async function originMainWalModule(testInfo: TestInfo) {
   const sha256 = (value: string) => createHash('sha256').update(value).digest('hex')
   expect(sha256(source)).toBe(provenance.sha256)
   // The immutable historical reader works in a shallow, offline checkout.
-  // Reuse only its unchanged runtime dependencies; do not copy the old bundle.
+  // Pin the old page-context normalizer; reuse only unchanged runtime dependencies.
   for (const [path, hash] of Object.entries(provenance.dependencies)) {
-    const dependency = await readFile(new URL(`../src/${path}`, import.meta.url), 'utf8')
+    const dependency = await readFile(path === 'types/pageContext.ts'
+      ? new URL('pageContext.schema2.ts.txt', baseline)
+      : new URL(`../src/${path}`, import.meta.url), 'utf8')
     expect(sha256(dependency.replaceAll('\r\n', '\n')), path).toBe(hash)
   }
   const modulePath = testInfo.outputPath('origin-main-pendingInputWal.ts')
-  await writeFile(modulePath, source)
+  await writeFile(modulePath, source.replace(
+    "from '@/types/pageContext'", "from './origin-main-pageContext'",
+  ))
+  await writeFile(testInfo.outputPath('origin-main-pageContext.ts'),
+    await readFile(new URL('pageContext.schema2.ts.txt', baseline), 'utf8'))
+  await writeFile(testInfo.outputPath('officeSelection.ts'),
+    "export { normalizeOfficeSelection } from '@/types/officeSelection'\n")
   await writeFile(testInfo.outputPath('attachments.ts'), "export { snapshotAttachment } from '@/utils/chat/attachments'\n")
   await writeFile(testInfo.outputPath('origin-main-reader.json'), JSON.stringify(provenance, null, 2))
   return `/@fs/${modulePath.replaceAll('\\', '/')}`
@@ -285,20 +293,40 @@ test('annotation-only draft survives retirement and reload before one fresh exec
   test.setTimeout(90_000)
   const network = await faultFirstSend(page, 'drop-request')
   const annotationBody = 'Clarify the selected synthetic heading.'
-  // Seed a completed immutable draft, not a native selection or resource edit
-  // capability. The existing explicit test feature gate makes its chip visible
-  // in Chromium; every send, receipt, reload and execution below is production.
-  await page.addInitScript(({ sessionKey, body }) => {
+  const stateDir = testInfo.outputPath('isolated-real-gateway', 'state')
+  const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
+  const python = process.env.OPENSQUILLA_WEBUI_E2E_PYTHON
+    || join(repoRoot, '.venv', process.platform === 'win32' ? 'Scripts' : 'bin',
+      process.platform === 'win32' ? 'python.exe' : 'python')
+  const { stdout } = await promisify(execFile)(python, [
+    '-I', fileURLToPath(new URL('./fixtures/receipt-annotation-document.py', import.meta.url)), stateDir, SESSION,
+  ], {
+    cwd: stateDir, windowsHide: true, timeout: 30_000,
+    env: {
+      PATH: process.env.PATH, SYSTEMROOT: process.env.SYSTEMROOT,
+      HOME: stateDir, USERPROFILE: stateDir, APPDATA: join(stateDir, 'appdata'),
+      LOCALAPPDATA: join(stateDir, 'local-appdata'), OPENSQUILLA_HOME: stateDir,
+      OPENSQUILLA_STATE_DIR: stateDir,
+    },
+  })
+  const document = JSON.parse(stdout) as {
+    documentId: string; resourceId: string; revisionId: string; sha256: string
+  }
+  await testInfo.attach('annotation-document', { body: JSON.stringify(document), contentType: 'application/json' })
+  // Seed a completed immutable draft for a real session-owned document/version.
+  // Unversioned legacy drafts are intentionally stale; do not bypass that guard.
+  // Every send, receipt, reload and execution below remains production.
+  await page.addInitScript(({ sessionKey, body, document }) => {
     Object.assign(window, { OPENSQUILLA_FEATURES: { artifactPromptAnnotations: true } })
     if (localStorage.getItem('receipt-annotation-fixture-seeded')) return
     localStorage.setItem('receipt-annotation-fixture-seeded', '1')
     localStorage.setItem('opensquilla.page-annotation-drafts.v1', JSON.stringify([{
       annotationId: 'receipt-annotation-fixture', sessionKey,
-      documentId: 'synthetic-page', documentName: 'fixture.html',
+      ...document, documentName: 'fixture.html',
       targetRef: 'synthetic-heading', body, status: 'draft', tagName: 'h1',
       quote: 'Synthetic heading', targetText: 'Synthetic heading', createdAt: 1, updatedAt: 1,
     }]))
-  }, { sessionKey: SESSION, body: annotationBody })
+  }, { sessionKey: SESSION, body: annotationBody, document })
   try {
     const { input, send, recovery, check } = await openChat(page, isolatedRealGateway.controlUrl)
     const chip = page.locator('.chat-prompt-annotation-chip').filter({ hasText: annotationBody })
@@ -312,6 +340,7 @@ test('annotation-only draft survives retirement and reload before one fresh exec
     expect(network.sends[0]?.forwarded).toBe(false)
     const original = network.sends[0]!.request.params
     expect(original.pageContext).toMatchObject({
+      resourceId: document.resourceId, revisionId: document.revisionId, sha256: document.sha256,
       annotations: [{ text: annotationBody, selectionText: 'Synthetic heading' }],
     })
     await expect(check).toBeEnabled()
