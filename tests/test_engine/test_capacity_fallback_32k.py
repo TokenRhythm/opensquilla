@@ -135,6 +135,8 @@ async def test_native_overflow_exhausts_local_window_before_authorized_capacity_
 async def test_same_total_window_dynamic_output_reaches_agent_capacity_fallback(
     monkeypatch,
 ):
+    # Keep this capacity boundary offline and valid without an optional tokenizer.
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
     primary = CapacityProvider()
     wrapper, fallback, metadata, _configs = wrap(
         monkeypatch, primary, same_window=True, output=24576,
@@ -148,7 +150,7 @@ async def test_same_total_window_dynamic_output_reaches_agent_capacity_fallback(
         model_capabilities=ModelCapabilities(supports_tools=True),
         max_provider_retries=0, max_overflow_retries=2, timeout=30, iteration_timeout=30,
     ))
-    current = "Current protected request. " + "word " * 12000
+    current = "Current protected request. " + "word " * 10000
     events = [event async for event in agent.run_turn(current)]
     assert [call["model"] for call in physical] == ["capacity-primary", "capacity-fallback"]
     assert 2048 < physical[0]["max_tokens"] < 24576

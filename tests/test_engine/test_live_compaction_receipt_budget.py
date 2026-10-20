@@ -189,9 +189,11 @@ async def test_live_summary_receipts_use_same_frozen_tools_as_consumer_admission
     from opensquilla.provider.types import ToolDefinition
     from opensquilla.session.compaction import CompactionRequestContext
 
+    # The frozen schema must itself fit with the conservative offline estimator.
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
     agent, config = make_agent()
     frozen_tools = [ToolDefinition(
-        name="frozen_schema", description="schema material " * 5000,
+        name="frozen_schema", description="schema material " * 2000,
         input_schema={"type": "object", "properties": {}},
     )]
     # A physical attempt freezes its selected schema. Its subsequent recovery
