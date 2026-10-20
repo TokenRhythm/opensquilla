@@ -462,12 +462,15 @@ watch(
     prefersReducedMotion.value,
     executionModel.value,
   ] as const,
-  ([staticPresentation, routerObserve, routerSettled, reduceMotion, nextExecutionModel], [, , , , previousExecutionModel]) => {
+  ([staticPresentation, routerObserve, routerSettled, reduceMotion, nextExecutionModel], [, , previousSettled, , previousExecutionModel]) => {
     if (!mounted || (!staticPresentation && !routerObserve && !routerSettled && !reduceMotion)) return
     const executionChanged = Boolean(nextExecutionModel) && nextExecutionModel !== previousExecutionModel
+    // A restored active call can finish later without changing its model.
+    // Announce that live transition, while an already settled replay mounts silently.
+    const newlySettled = routerSettled && !previousSettled
     const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
       && props.message.routerStatic !== true && !routerObserve
-      && (!staticPresentation || executionChanged)
+      && (!staticPresentation || executionChanged || newlySettled)
     settleStatic(shouldAnnounce)
   },
 )

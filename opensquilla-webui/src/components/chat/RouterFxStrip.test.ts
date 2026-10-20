@@ -278,7 +278,7 @@ describe('RouterFxStrip model selection motion', () => {
     history.app.unmount()
   })
 
-  it('keeps a replayed active route static without announcing that its fallback completed', async () => {
+  it('keeps an active replay silent and static, then announces its later live completion', async () => {
     const message = reactive(routerStrip({
       routerReplayed: true,
       routerSelectedModel: 'selected-model',
@@ -292,6 +292,22 @@ describe('RouterFxStrip model selection motion', () => {
     expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
     message.routerSettled = true
     await nextTick()
+    expect(el.querySelector('.router-fx')?.getAttribute('data-phase')).toBe('static')
+    expect(el.querySelector('.router-fx-selector')).toBeNull()
+    expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
+      .toBe('Executed by fallback-model')
+    expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('Executed by fallback-model')
+    app.unmount()
+  })
+
+  it('does not announce an already completed replay when mounting', async () => {
+    const { app, el } = await mountStrip(routerStrip({
+      routerReplayed: true,
+      routerSettled: true,
+      routerSelectedModel: 'selected-model',
+      routerExecutionModel: 'fallback-model',
+    }))
+    expect(el.querySelector('.router-fx')?.getAttribute('data-phase')).toBe('static')
     expect(el.querySelector('[data-testid="router-execution-model"]')?.textContent)
       .toBe('Executed by fallback-model')
     expect(el.querySelector('.router-fx-sr-only')?.textContent).toBe('')
