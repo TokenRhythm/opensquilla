@@ -25,6 +25,10 @@ try {
     <input type="submit" value="Save settings"><input type="reset" value="Reset settings">
     <label for="display-name">Display name</label><input id="display-name" value="Initial name">
     <input type="search" placeholder="Search settings">
+    <input id="volume" type="range" aria-label="Volume" min="2" max="18" step="2" value="6"
+      oninput="window.volumeChanges=(window.volumeChanges||0)+1">
+    <input id="accent" type="color" aria-label="Accent" value="#112233">
+    <input type="range" aria-label="Disabled volume" disabled value="6">
     <label><input type="checkbox" value="yes">Receive updates</label>
     <label for="secret">Secret</label><input id="secret" type="password" value="synthetic-private-value">
     <input type="file" aria-label="Upload attachment">
@@ -67,6 +71,13 @@ try {
   assert.equal(ref('Display name').editable, true)
   assert.equal(ref('Display name').value, 'Initial name')
   assert.equal(ref('Search settings').role, 'searchbox')
+  assert.equal(ref('Volume').role, 'slider')
+  assert.equal(ref('Volume').editable, true)
+  assert.equal(ref('Volume').value, '6')
+  assert.equal(ref('Accent').editable, true)
+  assert.equal(ref('Accent').value, '#112233')
+  assert.equal(ref('Disabled volume').disabled, true)
+  assert.equal(ref('Disabled volume').editable, false)
   assert.equal(ref('Receive updates').role, 'checkbox')
   assert.equal(ref('Receive updates').editable, false)
   assert.equal(ref('Secret').editable, true)
@@ -91,11 +102,19 @@ try {
   assert.equal(ref('Accessible caption').role, 'button')
 
   await driver.act({ action: 'fill', ref: ref('Display name').ref, text: 'Updated name' }, 1, guard, signal)
+  await driver.act({ action: 'fill', ref: ref('Volume').ref, text: '10' }, 1, guard, signal)
+  await driver.act({ action: 'fill', ref: ref('Volume').ref, text: '14' }, 1, guard, signal)
+  await driver.act({ action: 'fill', ref: ref('Accent').ref, text: '#abcdef' }, 1, guard, signal)
   await driver.act({ action: 'click', ref: ref('Show preferences').ref }, 1, guard, signal)
   assert.equal(await page.locator('#display-name').inputValue(), 'Updated name')
+  assert.equal(await page.locator('#volume').inputValue(), '14')
+  assert.equal(await page.locator('#accent').inputValue(), '#abcdef')
+  assert.equal(await page.evaluate(() => window.volumeChanges), 2)
   assert.equal(await page.evaluate(() => window.opened), 1)
   const refreshed = await driver.snapshot(1, guard, signal)
   assert.equal(refreshed.refs.find(value => value.name === 'Display name' && value.role === 'textbox').value, 'Updated name')
+  assert.equal(refreshed.refs.find(value => value.name === 'Volume').value, '14')
+  assert.equal(refreshed.refs.find(value => value.name === 'Accent').value, '#abcdef')
   assert.equal(JSON.stringify(refreshed.refs).includes('synthetic-private-value'), false)
   driver.invalidate()
   console.log('Browser ref semantics passed: native input buttons, accessible names, field state, editability, secret omission and executable refs.')

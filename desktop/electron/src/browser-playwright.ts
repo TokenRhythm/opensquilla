@@ -286,7 +286,7 @@ function describeBrowserElement(node: Element) {
   const disabled = node.matches(':disabled,[aria-disabled="true"]')
   const readonly = Boolean(input?.readOnly || textarea?.readOnly || node.getAttribute('aria-readonly') === 'true')
   const fillable = textarea || (node as HTMLElement).isContentEditable || input && [
-    'text', 'email', 'password', 'tel', 'url', 'search', 'number', 'date', 'datetime-local', 'time', 'month', 'week',
+    'text', 'email', 'password', 'tel', 'url', 'search', 'number', 'date', 'datetime-local', 'time', 'month', 'week', 'color', 'range',
   ].includes(input.type)
   // The ref describes the action the control accepts, not merely
   // its HTML tag. Button values are labels; text values are state.
