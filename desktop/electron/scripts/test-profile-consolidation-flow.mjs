@@ -23,6 +23,7 @@ import {
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
+  requestElectronQuitWithConfirmation,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 
@@ -361,6 +362,9 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
     app: targetApp,
     phase,
     timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    requestClose: options => requestElectronQuitWithConfirmation(targetApp, {
+      ...options, requireConfirmation: false,
+    }),
     diagnostics: () => profileShutdownDiagnostics(targetApp, profileUserData, phase),
   })
   if (!result.error) return

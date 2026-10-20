@@ -38,7 +38,10 @@ const emitted = []
 try {
   // Exercise the actual quit document's click handler without Electron. Only
   // this explicit request callback may accept the expected interruption prompt.
-  for (const mode of ['confirm', 'missing-window', 'missing-exit', 'early-exit', 'already-exited', 'wrong-window', 'click-failed']) {
+  const quitModes = ['confirm', 'missing-window', 'missing-exit', 'early-exit',
+    'exit-after-window', 'already-exited', 'wrong-window', 'click-failed']
+  for (const { mode, requireConfirmation } of [true, false].flatMap(requireConfirmation =>
+    quitModes.map(mode => ({ mode, requireConfirmation })))) {
     const calls = []
     const child = new EventEmitter()
     Object.assign(child, { pid: process.pid, exitCode: mode === 'already-exited' ? 0 : null, signalCode: null })
@@ -100,15 +103,22 @@ try {
         child.emit('exit', 0)
       } else if (mode !== 'missing-window' && mode !== 'already-exited') {
         app.emit('window', page)
+        if (mode === 'exit-after-window') {
+          child.exitCode = 0
+          child.emit('exit', 0)
+        }
       }
     } } })
     const abort = new AbortController()
     let seenSignal
-    const run = requestElectronQuitWithConfirmation(app, { signal: abort.signal, timeoutMs: 100 })
+    const run = requestElectronQuitWithConfirmation(app, {
+      signal: abort.signal, timeoutMs: 100, requireConfirmation,
+    })
     if (mode.startsWith('missing-')) setImmediate(() => abort.abort())
-    if (mode === 'confirm') {
+    if (mode === 'confirm' || (mode === 'early-exit' && !requireConfirmation)) {
       await run
-      assert.deepEqual(calls, ['quit-request', 'click', 'ipc:confirm'])
+      assert.deepEqual(calls, mode === 'confirm'
+        ? ['quit-request', 'click', 'ipc:confirm'] : ['quit-request'])
       // Verify that the shared shutdown helper supplies its one deadline's
       // abort signal to custom requests and cancels it after completion.
       const result = await closeElectronWithDeadline({
@@ -122,10 +132,11 @@ try {
       assert.equal(result.closed, true)
       assert.equal(seenSignal.aborted, true)
     } else {
-      await assert.rejects(run, mode.startsWith('missing-')
+      const expectedError = mode.startsWith('missing-')
         ? /Expected quit confirmation timed out/
         : mode === 'click-failed' ? /synthetic confirmation click failed/
-        : mode === 'wrong-window' ? /Expected the self-contained/ : /before the expected/)
+        : mode === 'wrong-window' ? /Expected the self-contained/ : /before the expected/
+      await assert.rejects(run, expectedError, `${mode}, requireConfirmation=${requireConfirmation}`)
       if (mode !== 'missing-exit') assert.ok(!calls.includes('ipc:confirm'))
     }
     assert.equal(app.listenerCount('window'), 0)
