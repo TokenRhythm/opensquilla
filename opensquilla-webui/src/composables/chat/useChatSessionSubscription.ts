@@ -1,4 +1,5 @@
 import { ref, type Ref } from 'vue'
+import { sessionRecoveryDiagnostics } from '@/lib/sessionRecoveryDiagnostics'
 import type {
   ChatRunStatus,
   ChatRunStatusSource,
@@ -375,6 +376,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         'Session metadata hydration failed:',
         cause instanceof Error ? cause.message : cause,
       )
+      sessionRecoveryDiagnostics.log({
+        phase: 'failed', reason: 'metadata_hydration_failed', sessionKey: key,
+        streamSeq: options.lastStreamSeq.value, error: cause,
+      })
     })
   }
 
@@ -499,6 +504,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       // Replacing a socket/lease intentionally aborts its pending read. Keep
       // genuine current failures observable without reporting cancellation as one.
       if (!cancelled) console.warn('Session stream subscription failed:', err instanceof Error ? err.message : err)
+      if (!cancelled) sessionRecoveryDiagnostics.log({
+        phase: 'failed', reason: 'live_subscription_failed', sessionKey: key,
+        streamSeq: options.lastStreamSeq.value, error: err,
+      })
       const sessionMissing = !cancelled
         && err instanceof SessionReadSessionMissingError
       if (sessionMissing) options.onSessionMissing?.(key)
@@ -574,6 +583,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           'Session metadata recovery failed:',
           cause instanceof Error ? cause.message : cause,
         )
+        sessionRecoveryDiagnostics.log({
+          phase: 'failed', reason: 'metadata_recovery_failed', sessionKey: key,
+          streamSeq: options.lastStreamSeq.value, error: cause,
+        })
       }
       return false
     } finally {

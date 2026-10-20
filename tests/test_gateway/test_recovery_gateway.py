@@ -539,42 +539,204 @@ async def test_pending_resume_retry_does_not_bypass_new_dirty_barrier(resumable_
     assert conn.installed_snapshot_proof(receipt(payload)) is None
 
 
-async def test_replay_final_cas_rejects_output_arriving_during_consumption(
-    connection, monkeypatch,
+@pytest.mark.parametrize("suffix_count", [1, 8, 17])
+@pytest.mark.parametrize("initially_dirty", [False, True])
+async def test_replay_catches_up_and_hands_off_while_output_continues(
+    resumable_connection, monkeypatch, suffix_count, initially_dirty,
 ):
     from opensquilla.gateway import session_streams
 
+    connection = resumable_connection
     streams = session_streams.SessionStreamRegistry(stream_generation="synthetic-live-cas")
     monkeypatch.setattr(session_streams, "_session_streams", streams)
     key = "agent:main:batch-live-cas"
     subscribe(connection, key)
-    connection._mark_flow_dirty({"session_key": key})
+    if initially_dirty:
+        connection._mark_flow_dirty({"session_key": key})
     payload = await snapshot(connection, key)
     for index in range(9):
         streams.record(key, "session.event.text_delta", {"text": str(index)})
     await stage(connection, payload)
     installed = await request(connection, "sessions.messages.resume", receipt(payload))
     assert installed.ok, installed.error
-    await connection.send_res(installed)
-    await asyncio.sleep(0.05)
-    pending = connection._pending_replays[key]
-    live = streams.record(key, "session.event.text_delta", {"text": "live"})
-    await connection.send_event("session.event.text_delta", live)
-    first_end = max(pending.pending_delivery_ids)
-    await asyncio.sleep(0.05)
-    update = await request(connection, "transport.flow.update", {
-        "delivery_epoch": connection._flow.epoch, "ack_delivery_id": first_end,
-    })
-    assert update.ok, update.error
-    await asyncio.sleep(0.05)
-    second_end = max(connection._pending_replays[key].pending_delivery_ids)
-    update = await request(connection, "transport.flow.update", {
-        "delivery_epoch": connection._flow.epoch, "ack_delivery_id": second_end,
-    })
-    assert update.ok, update.error
+    frozen_proof = dict(installed.payload)
+    for index in range(suffix_count):
+        live = streams.record(key, "session.event.text_delta", {"text": f"suffix-{index}"})
+        await connection.send_event("session.event.text_delta", live)
+    # There is new output before EVERY ACK, including the ACK that completes
+    # recovery. Waiting for a quiet ACK window would never finish this test.
+    for index in range(12):
+        pending = connection._pending_replays.get(key)
+        if pending is None:
+            break
+        live = streams.record(key, "session.event.text_delta", {"text": f"continuing-{index}"})
+        await connection.send_event("session.event.text_delta", live)
+        retry = await request(connection, "sessions.messages.resume", receipt(payload))
+        assert retry.ok and retry.payload == frozen_proof
+        await ack_replay(connection, set(pending.pending_delivery_ids))
+        window = 8 if connection._session_flow_v2_enabled else 128
+        assert len(connection._flow.deliveries) <= window
     assert key not in connection._pending_replays
-    assert key in connection._flow.dirty
-    assert connection.installed_snapshot_proof(receipt(payload)) is None
+    assert key not in connection._flow.dirty
+    assert connection.installed_snapshot_proof(receipt(payload)) == frozen_proof
+    assert frozen_proof["replay_to_seq"] == 9
+    # Handoff retains ordinary credit for the not-yet-consumed suffix, and
+    # leaves room for a real live delta before its first ACK.
+    assert connection._flow.deliveries
+    live = streams.record(key, "session.event.text_delta", {"text": "live-after-handoff"})
+    await connection.send_event("session.event.text_delta", live)
+    assert key not in connection._flow.dirty
+    await ack_replay(connection, set(connection._flow.deliveries))
+    delivered = [
+        frame["payload"]["stream_seq"] for frame in connection.ws.frames
+        if frame.get("event") == "session.event.text_delta"
+    ]
+    assert delivered == list(range(1, streams.current_seq(key) + 1))
+    assert not connection._flow.deliveries
+    repeated = await request(connection, "sessions.messages.resume", receipt(payload))
+    assert repeated.ok and repeated.payload == frozen_proof
+
+
+@pytest.mark.parametrize("failure", ["dirty", "generation", "subscription", "deadline", "gap"])
+async def test_replay_catchup_preserves_recovery_fences(
+    resumable_connection, monkeypatch, failure,
+):
+    from opensquilla.gateway import session_streams
+
+    conn = resumable_connection
+    streams = session_streams.SessionStreamRegistry(stream_generation="synthetic-fenced-catchup")
+    monkeypatch.setattr(session_streams, "_session_streams", streams)
+    key = "agent:main:fenced-catchup"
+    subscribe(conn, key)
+    conn._mark_flow_dirty({"session_key": key})
+    payload = await snapshot(conn, key)
+    streams.record(key, "session.event.text_delta", {"text": "first"})
+    await stage(conn, payload)
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok
+    pending = conn._pending_replays[key]
+    if failure == "dirty":
+        conn._mark_flow_dirty({"session_key": key})
+    elif failure == "generation":
+        streams._stream_generation = "replacement-generation"
+    elif failure == "subscription":
+        conn._subscriptions.unsubscribe_messages(conn.conn_id, key)
+        subscribe(conn, key)
+        await asyncio.sleep(0.01)
+        # Retirement owns disposal of the old delivery and dirty barrier.
+        # It must not contaminate the replacement subscription.
+        assert key not in conn._pending_replays
+        assert key not in conn._flow.dirty
+        assert conn.installed_snapshot_proof(receipt(payload)) is None
+        return
+    elif failure == "deadline":
+        pending.transfer.deadline = 0
+    else:
+        streams.record(key, "session.event.text_delta", {"text": "missing"})
+        monkeypatch.setattr(streams, "replay", lambda *_: session_streams.ReplayResult(
+            streams.stream_generation, 2, False, [], "synthetic_gap",
+        ))
+    await ack_replay(conn, set(pending.pending_delivery_ids))
+    assert key in conn._flow.dirty
+    assert key not in conn._pending_replays
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+
+
+async def test_catchup_uses_raw_cursor_past_capability_filtered_events(
+    resumable_connection, monkeypatch,
+):
+    from opensquilla.gateway import session_streams, websocket
+
+    conn = resumable_connection
+    streams = session_streams.SessionStreamRegistry(stream_generation="synthetic-filtered-catchup")
+    monkeypatch.setattr(session_streams, "_session_streams", streams)
+    project = websocket.project_session_event_for_client
+
+    def filtered(name, payload, **kwargs):
+        return None if payload.get("text") == "filtered" else project(name, payload, **kwargs)
+
+    monkeypatch.setattr(websocket, "project_session_event_for_client", filtered)
+    key = "agent:main:filtered-catchup"
+    subscribe(conn, key)
+    conn._mark_flow_dirty({"session_key": key})
+    payload = await snapshot(conn, key)
+    streams.record(key, "session.event.text_delta", {"text": "first"})
+    streams.record(key, "session.event.text_delta", {"text": "filtered"})
+    await stage(conn, payload)
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok and result.payload["replay_to_seq"] == 1
+    live = streams.record(key, "session.event.text_delta", {"text": "third"})
+    await conn.send_event("session.event.text_delta", live)
+    await ack_replay(conn, set(conn._pending_replays[key].pending_delivery_ids))
+    assert key not in conn._flow.dirty
+    assert conn.installed_snapshot_proof(receipt(payload)) == result.payload
+    await ack_replay(conn, set(conn._flow.deliveries))
+    delivered = [
+        frame["payload"]["stream_seq"] for frame in conn.ws.frames
+        if frame.get("event") == "session.event.text_delta"
+    ]
+    assert delivered == [1, 3]
+
+
+async def test_recovery_logs_first_admission_reason_once_without_content(
+    v2_connection, monkeypatch,
+):
+    import hashlib
+
+    from opensquilla.gateway import session_streams, websocket
+
+    conn = v2_connection
+    streams = session_streams.SessionStreamRegistry(stream_generation="PRIVATE_GENERATION")
+    monkeypatch.setattr(session_streams, "_session_streams", streams)
+    logger = Mock()
+    monkeypatch.setattr(websocket, "log", logger)
+    key = "agent:main:PRIVATE_SESSION_KEY"
+    subscribe(conn, key)
+    for _ in range(100):
+        event = streams.record(key, "session.event.text_delta", {"text": "PRIVATE_OUTPUT"})
+        await conn.send_event("session.event.text_delta", event)
+    required = [
+        call.kwargs for call in logger.info.call_args_list
+        if call.args == ("gateway.session_recovery",) and call.kwargs["phase"] == "required"
+    ]
+    assert len(required) == 1
+    assert required[0]["reason_code"] == "lane_frames_exhausted"
+    assert required[0]["flow_unacked_frames"] == 8
+    assert required[0]["stream_seq"] == 9
+    assert required[0]["session_key_sha256"] == hashlib.sha256(key.encode()).hexdigest()[:16]
+    assert "PRIVATE" not in json.dumps(required)
+    # A later admission success cannot reuse the earlier refusal diagnostic.
+    await ack_replay(conn, set(conn._flow.deliveries))
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok and key not in conn._flow.dirty
+    assert conn._flow.last_rejection_reason is None
+    phases = [
+        call.kwargs["phase"] for call in logger.info.call_args_list
+        if call.args == ("gateway.session_recovery",)
+    ]
+    assert phases == ["required", "started", "installed"]
+
+
+async def test_recovery_logging_failure_does_not_change_dirty_ownership(
+    v2_connection, monkeypatch,
+):
+    from opensquilla.gateway import websocket
+
+    conn = v2_connection
+    key = "agent:main:diagnostic-failure"
+    subscribe(conn, key)
+    logger = Mock()
+    logger.info.side_effect = RuntimeError("logging unavailable")
+    monkeypatch.setattr(websocket, "log", logger)
+    conn._mark_flow_dirty({"session_key": key}, reason_code="client_reported_dirty")
+    assert key in conn._flow.dirty
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok and key not in conn._flow.dirty
+    assert conn.installed_snapshot_proof(receipt(payload)) == result.payload
 
 
 async def test_slow_snapshot_cannot_publish_across_subscription_replacement(

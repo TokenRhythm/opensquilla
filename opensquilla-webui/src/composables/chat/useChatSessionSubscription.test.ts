@@ -24,6 +24,7 @@ import {
   type SessionReadSnapshot,
 } from '@/modules/sessionReadLifecycle'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
+import { sessionRecoveryDiagnostics } from '@/lib/sessionRecoveryDiagnostics'
 import type {
   ChatRunStatus,
   ChatRunStatusSource,
@@ -376,6 +377,7 @@ describe('useChatSessionSubscription domain lease', () => {
     const sessionKey = ref(KEY)
     const subject = harness(leaseFixture({ live: pendingLive.promise }).lease, { sessionKey })
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const diagnostic = vi.spyOn(sessionRecoveryDiagnostics, 'log').mockImplementation(() => {})
     try {
       const pending = subject.api.subscribeSession()
       if (reason === 'local-cancel') subject.api.cancelActiveSubscription()
@@ -385,19 +387,27 @@ describe('useChatSessionSubscription domain lease', () => {
         : new Error('Previous read ended'))
       await expect(pending).resolves.toMatchObject({ authoritative: false, cancelled: true })
       expect(warn).not.toHaveBeenCalled()
-    } finally { warn.mockRestore() }
+      expect(diagnostic).not.toHaveBeenCalled()
+    } finally { warn.mockRestore(); diagnostic.mockRestore() }
   })
 
   it('still warns when the current subscription genuinely fails', async () => {
     const pendingLive = deferred<SessionReadLive>()
     const subject = harness(leaseFixture({ live: pendingLive.promise }).lease)
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const diagnostic = vi.spyOn(sessionRecoveryDiagnostics, 'log').mockImplementation(() => {})
     try {
       const pending = subject.api.subscribeSession()
-      pendingLive.reject(new Error('Gateway unavailable'))
+      const cause = Object.assign(new Error('private Gateway response'), { code: 'SNAPSHOT_STALE' })
+      const failure = new SessionReadFailure('busy', 'Gateway unavailable', true, undefined, cause)
+      pendingLive.reject(failure)
       await expect(pending).resolves.toMatchObject({ authoritative: false, cancelled: false })
       expect(warn).toHaveBeenCalledExactlyOnceWith('Session stream subscription failed:', 'Gateway unavailable')
-    } finally { warn.mockRestore() }
+      expect(diagnostic).toHaveBeenCalledExactlyOnceWith({
+        phase: 'failed', reason: 'live_subscription_failed', sessionKey: KEY,
+        streamSeq: subject.lastStreamSeq.value, error: failure,
+      })
+    } finally { warn.mockRestore(); diagnostic.mockRestore() }
   })
 
   it('projects only a current domain missing failure as terminal session absence', async () => {

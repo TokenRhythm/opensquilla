@@ -491,15 +491,59 @@ describe('useChatSessionViewCache complete presentation handoff', () => {
     },
   )
 
-  it('does not retain a degraded view with unconfirmed live state', () => {
+  it.each([false, true])(
+    'keeps already readable live output through failed retries without granting navigation authority (history confirmed=%s)',
+    historyConfirmed => {
+      const h = liveHarness()
+      h.switchTo('C')
+      h.messages.value = [row('readable-history')]
+      h.presentation.value.live.text = 'Accepted live output after a degraded read'
+      h.cache.historyInstalled('C', historyConfirmed)
+      h.cache.liveInstalled('C', false)
+      expect(h.cache.ready.value).toBe(true)
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        h.cache.beginLiveRead('C')
+        expect(h.cache.ready.value).toBe(false)
+        expect(h.cache.showingPreview.value).toBe(true)
+        expect(h.cache.messages.value).toEqual([row('readable-history')])
+        expect(h.cache.presentation.value?.live.text).toBe('Accepted live output after a degraded read')
+        expect(h.cache.restoredViewport.value).toBeUndefined()
+        h.messages.value = [row(`partial-${attempt}`)]
+        h.presentation.value.live.text = `Partial replay ${attempt}`
+        h.cache.liveInstalled('C', false)
+        expect(h.cache.ready.value).toBe(false)
+        expect(h.cache.presentation.value?.live.text).toBe('Accepted live output after a degraded read')
+      }
+
+      h.switchTo('B')
+      h.switchTo('C')
+      expect(h.cache.showingPreview.value).toBe(false)
+      expect(h.cache.messages.value).toEqual([])
+      expect(h.cache.presentation.value).toBeUndefined()
+      h.scope.stop()
+    },
+  )
+
+  it('replaces an unconfirmed readable recovery preview only after confirmed live installation', () => {
     const h = liveHarness()
     h.switchTo('C')
-    h.messages.value = [row('fallback')]
-    h.cache.historyInstalled('C', false)
+    h.messages.value = [row('readable-history')]
+    h.presentation.value.live.text = 'Accepted live output'
+    h.cache.historyInstalled('C')
     h.cache.liveInstalled('C', false)
-    expect(h.cache.ready.value).toBe(true)
     h.cache.beginLiveRead('C')
+    h.messages.value = [row('recovered-history')]
+    h.presentation.value.live.text = 'Recovered live output'
+    h.cache.historyInstalled('C')
+    expect(h.cache.presentation.value?.live.text).toBe('Accepted live output')
+    h.cache.liveInstalled('C')
     expect(h.cache.showingPreview.value).toBe(false)
+    expect(h.cache.ready.value).toBe(true)
+    h.switchTo('B')
+    h.switchTo('C')
+    expect(h.cache.messages.value).toEqual([row('recovered-history')])
+    expect(h.cache.presentation.value?.live.text).toBe('Recovered live output')
     h.scope.stop()
   })
 
