@@ -656,6 +656,7 @@ def _preserve_router_as_custom(
 ) -> None:
     """Materialize the effective ladder and mark explicit operator ownership."""
 
+    followed_primary = cfg.squilla_router.preset_binding == "follow_primary"
     router_payload = cfg.squilla_router.model_dump(mode="python")
     router_payload["tier_profile"] = None
     router_payload["preset_binding"] = "custom"
@@ -668,6 +669,10 @@ def _preserve_router_as_custom(
     if enable_cross_provider:
         router_payload["cross_provider_tiers"] = True
     cfg.squilla_router = SquillaRouterConfig(**router_payload)
+    if followed_primary:
+        # Managed presets can refresh only in memory at load time. Capture
+        # those effective tiers before custom ownership stops the refresh.
+        cfg.mark_force_persist("squilla_router.tiers")
 
 
 def _apply_primary_provider_router_policy(
@@ -1201,6 +1206,13 @@ def upsert_router(
 
     new_cfg = _clone(config)
     new_cfg.squilla_router = SquillaRouterConfig(**router_payload)
+    if (
+        config.squilla_router.preset_binding == "follow_primary"
+        and new_cfg.squilla_router.preset_binding == "custom"
+    ):
+        # The effective ladder may equal the load baseline while the file
+        # still holds an older preset. Ownership changes must materialize it.
+        new_cfg.mark_force_persist("squilla_router.tiers")
     if router_mode == "disabled":
         apply_model_routing_mode(new_cfg, "direct")
     elif not bool(getattr(config.squilla_router, "enabled", False)):
