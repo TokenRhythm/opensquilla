@@ -17,15 +17,27 @@ PRODUCER_NAMES = {"build", "Windows NSIS acceptance / build"}
 # dependency wait on their VM instead of in GitHub's needs scheduler.
 WAIT_SECONDS = 3600
 POLL_SECONDS = 10
+API_PAGE_SIZE = 20
 
 
 def api(endpoint: str, *, pages: bool = False) -> object:
     command = ["gh", "api", endpoint]
     if pages:
         command += ["--paginate", "--slurp"]
-    result = subprocess.run(command, check=True, capture_output=True, text=True,
-                            encoding="utf-8", timeout=60)
-    return json.loads(result.stdout)
+    for attempt in range(3):
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True,
+                                    encoding="utf-8", timeout=60)
+        except subprocess.CalledProcessError as exc:
+            # Large job-list responses can intermittently fail at GitHub's
+            # gateway. Retry only explicit transient HTTP statuses, never
+            # authentication, missing artifacts, or candidate validation.
+            if attempt == 2 or not re.search(r"\bHTTP (?:502|503|504)\b", exc.stderr or ""):
+                raise
+            time.sleep(2 ** attempt)
+        else:
+            return json.loads(result.stdout)
+    raise AssertionError("unreachable")
 
 
 def producer_ready(pages: list[dict]) -> bool:
@@ -120,7 +132,7 @@ def wait_for_candidate(artifact_name: str, destination: Path, source_sha: str) -
     producer_attempt = attempt
     while time.monotonic() - started < WAIT_SECONDS:
         if producer_id is None:
-            jobs = api(f"{run_path}/attempts/{attempt}/jobs?per_page=100", pages=True)
+            jobs = api(f"{run_path}/attempts/{attempt}/jobs?per_page={API_PAGE_SIZE}", pages=True)
             producers = [job for page in jobs for job in page["jobs"]
                          if job["name"] in PRODUCER_NAMES]
             # A failed-jobs rerun can retain the successful producer from a
@@ -128,11 +140,15 @@ def wait_for_candidate(artifact_name: str, destination: Path, source_sha: str) -
             # the downloaded manifest to its attempt as well as source/run.
             if not producers and int(attempt) > 1:
                 time.sleep(POLL_SECONDS)
-                jobs = api(f"{run_path}/attempts/{attempt}/jobs?per_page=100", pages=True)
+                jobs = api(
+                    f"{run_path}/attempts/{attempt}/jobs?per_page={API_PAGE_SIZE}", pages=True,
+                )
                 producers = [job for page in jobs for job in page["jobs"]
                              if job["name"] in PRODUCER_NAMES]
                 if not producers:
-                    jobs = api(f"{run_path}/jobs?filter=latest&per_page=100", pages=True)
+                    jobs = api(
+                        f"{run_path}/jobs?filter=latest&per_page={API_PAGE_SIZE}", pages=True,
+                    )
                     producers = [job for page in jobs for job in page["jobs"]
                                  if job["name"] in PRODUCER_NAMES]
                     if not producers:
@@ -157,7 +173,9 @@ def wait_for_candidate(artifact_name: str, destination: Path, source_sha: str) -
     run = api(run_path)
     if str(run["run_attempt"]) != attempt or str(run["id"]) != run_id:
         raise ValueError("Candidate producer workflow identity changed")
-    artifact = select_artifact(api(f"{run_path}/artifacts?per_page=100", pages=True), artifact_name)
+    artifact = select_artifact(
+        api(f"{run_path}/artifacts?per_page={API_PAGE_SIZE}", pages=True), artifact_name,
+    )
     destination.mkdir(parents=True, exist_ok=False)
     archive = destination / "candidate-artifact.zip"
     with archive.open("wb") as output:

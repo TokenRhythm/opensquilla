@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -21,6 +22,51 @@ def helper():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_api_retries_only_transient_http_errors_with_pagination(helper, monkeypatch, status):
+    calls, sleeps = [], []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(
+                1, command, stderr=f"gh: Server Error (HTTP {status})",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout='[{"jobs": []}]')
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    assert helper.api("repos/owner/repo/actions/jobs?per_page=20", pages=True) == [{"jobs": []}]
+    assert calls == [
+        ["gh", "api", "repos/owner/repo/actions/jobs?per_page=20", "--paginate", "--slurp"],
+    ] * 3
+    assert sleeps == [1, 2]
+
+
+@pytest.mark.parametrize("stderr,attempts", [
+    ("gh: Server Error (HTTP 502)", 3),
+    ("gh: Bad credentials (HTTP 401)", 1),
+    ("gh: Forbidden (HTTP 403)", 1),
+    ("gh: Not Found (HTTP 404)", 1),
+    ("unknown failure", 1),
+])
+def test_api_preserves_failure_and_bounds_retries(helper, monkeypatch, stderr, attempts):
+    calls, sleeps = [], []
+    failure = subprocess.CalledProcessError(1, ["gh"], stderr=stderr)
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        raise failure
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        helper.api("repos/owner/repo/actions/runs/123")
+    assert caught.value is failure
+    assert len(calls) == attempts
+    assert sleeps == ([1, 2] if attempts == 3 else [])
 
 
 def manifest_fixture(destination):
@@ -139,7 +185,7 @@ def test_wait_uses_current_attempt_and_pins_producer_before_download(helper, mon
                         lambda *a: (a[0] / "candidate.exe", {"verified": True}))
     result = helper.wait_for_candidate("candidate", tmp_path / "download", SOURCE)
     assert result[1] == {"verified": True}
-    assert endpoints[1].endswith("/attempts/2/jobs?per_page=100")
+    assert endpoints[1].endswith("/attempts/2/jobs?per_page=20")
     assert endpoints[2].endswith("/jobs/456")
     assert downloads == [["gh", "api", "repos/owner/repo/actions/artifacts/789/zip"]]
     assert not responses
