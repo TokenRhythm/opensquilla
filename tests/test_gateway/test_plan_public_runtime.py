@@ -11,6 +11,10 @@ from opensquilla.gateway.task_runtime import TaskRun
 from opensquilla.session.models import AgentTaskStatus
 from opensquilla.session.plans import new_plan_revision
 
+# These integration checks assert durable results, not completion latency.
+# Leave real SQLite work room on contended CI hosts while bounding hangs.
+_COMPLETION_TIMEOUT_SECONDS = 15.0
+
 
 @pytest.mark.parametrize("submission", ["none", "current_turn", "other_turn"])
 @pytest.mark.parametrize("failed_writes", [0, 1, 2])
@@ -77,10 +81,15 @@ async def test_plan_revision_result_is_durable_and_attributed_to_its_turn(
             },
             stack.context,
         )
-        terminal = await stack.runtime.wait(response["turn_id"], timeout=2)
+        terminal = await stack.runtime.wait(
+            response["turn_id"], timeout=_COMPLETION_TIMEOUT_SECONDS,
+        )
         assert terminal.status == AgentTaskStatus.SUCCEEDED, terminal.error_message
         if stack.runtime._terminal_retry_task is not None:
-            await asyncio.wait_for(asyncio.shield(stack.runtime._terminal_retry_task), timeout=2)
+            await asyncio.wait_for(
+                asyncio.shield(stack.runtime._terminal_retry_task),
+                timeout=_COMPLETION_TIMEOUT_SECONDS,
+            )
         stored = await stack.storage.get_agent_task(response["turn_id"])
         assert attempts == failed_writes + 1
         assert stored.details["metadata"]["synthetic_audit"] == {"revision": attempts}
