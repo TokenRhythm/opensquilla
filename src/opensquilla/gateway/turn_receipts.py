@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from opensquilla.application.turn_admission import AdmitTurn, SteerTurn
+from opensquilla.contracts.turn_request_scope import resolvable_webchat_scope
 from opensquilla.gateway.adapters.turn_admission import (
     GatewayTurnAdmissionAdapter,
     webchat_session_key,
@@ -23,7 +24,6 @@ from opensquilla.gateway.turn_steering import decode_steering_command
 from opensquilla.persistence.turn_request_resolution import (
     parse_turn_receipt_epoch,
     request_binds_epoch,
-    resolvable_webchat_scope,
 )
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.storage import (

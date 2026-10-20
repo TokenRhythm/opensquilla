@@ -388,13 +388,13 @@ test.describe('0.5.0 long-task resilience', () => {
 
   test('resets the stream cursor across a Gateway generation and automatically re-subscribes', async ({
     page,
-  }) => {
+  }, testInfo) => {
     test.setTimeout(30_000)
     await preparePage(page)
 
     const generations = ['generation-before-restart', 'generation-after-restart']
     const sockets: WebSocketRoute[] = []
-    const subscribeParams: Array<Record<string, unknown>> = []
+    const subscriptions: Array<{ socketIndex: number; params: Record<string, unknown> }> = []
     const composerCommands: RpcRequest[] = []
     let replacementHandshakeAt = 0
     let replacementSubscribeAt = 0
@@ -415,7 +415,7 @@ test.describe('0.5.0 long-task resilience', () => {
         }
         if (frame.type !== 'req') return
         const method = String(frame.method || '')
-        if (['chat.send', 'chat.abort', 'sessions.pending_inputs.enqueue'].includes(method)) {
+        if (['chat.send', 'chat.send.v2', 'chat.abort', 'sessions.pending_inputs.enqueue'].includes(method)) {
           composerCommands.push(frame)
         }
         if (method === 'connect') {
@@ -424,7 +424,7 @@ test.describe('0.5.0 long-task resilience', () => {
           return
         }
         if (method === 'sessions.messages.subscribe') {
-          subscribeParams.push({ ...(frame.params || {}) })
+          subscriptions.push({ socketIndex, params: { ...(frame.params || {}) } })
           if (socketIndex === 1) {
             replacementSubscribeAt = performance.now()
             releaseReplacementSubscription = () => ws.send(successResponse(
@@ -500,11 +500,17 @@ test.describe('0.5.0 long-task resilience', () => {
     await expect.poll(() => Boolean(releaseReplacementSubscription)).toBe(true)
 
     expect(replacementSubscribeAt - replacementHandshakeAt).toBeLessThanOrEqual(2_000)
-    expect(subscribeParams[1]).toMatchObject({
+    const subscriptionsPath = testInfo.outputPath('restart-subscriptions.json')
+    await writeFile(subscriptionsPath, JSON.stringify(subscriptions, null, 2))
+    await testInfo.attach('restart-subscriptions', { path: subscriptionsPath, contentType: 'application/json' })
+    // The initial socket can reconcile more than once before the restart.
+    // Bind the resume assertion to the replacement connection itself.
+    const replacementSubscriptions = subscriptions.filter(subscription => subscription.socketIndex === 1)
+    expect(replacementSubscriptions.map(subscription => subscription.params)).toEqual([expect.objectContaining({
       key: SESSION_KEY,
       since_stream_generation: generations[0],
       since_stream_seq: 51,
-    })
+    })])
     // The topbar reports the shared transport; the session owns its separate
     // recovery notice and action gates until the subscription has recovered.
     // This task was authoritatively running before the disconnect: retain its

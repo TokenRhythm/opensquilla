@@ -16,6 +16,7 @@ from opensquilla.application.turn_admission import AdmitTurn
 from opensquilla.artifact_session import (
     ArtifactSessionService,
 )
+from opensquilla.contracts.turn_request_scope import is_resolvable_turn_scope
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.project_workspace_runtime import (
@@ -28,7 +29,6 @@ from opensquilla.gateway.project_workspace_runtime import (
 from opensquilla.gateway.routing import RouteEnvelope
 from opensquilla.gateway.rpc import RpcHandlerError
 from opensquilla.gateway.user_input_broker import connection_supports_user_input
-from opensquilla.persistence.turn_request_resolution import is_resolvable_turn_scope
 from opensquilla.project_workspaces import ProjectWorkspaceGuard, ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.guest_profile import GuestProfile, GuestProfileBoundaryError

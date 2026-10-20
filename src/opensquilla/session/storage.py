@@ -46,6 +46,7 @@ from opensquilla.content_reader import (
     LegacyContentRef,
     validate_content_range,
 )
+from opensquilla.contracts.turn_request_scope import is_resolvable_turn_scope
 from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.persistence.memory_flush_retirement import (
     RETIRED_MEMORY_COLUMNS,
@@ -68,7 +69,6 @@ from opensquilla.persistence.turn_request_resolution import (
     TURN_REQUEST_RESOLUTION_SCHEMA,
     TurnReceiptEpoch,
     TurnReceiptEpochPolicy,
-    is_resolvable_turn_scope,
     request_epoch,
 )
 from opensquilla.session.attachment_history import (
@@ -14125,6 +14125,7 @@ class SessionStorage:
                     ),
                 )
 
+            resolution_epoch: TurnReceiptEpoch | None = None
             if is_resolvable_turn_scope(source_scope):
                 await self._prune_closed_turn_resolutions(conn)
                 resolution = await self._select_turn_request_resolution(
@@ -14930,7 +14931,7 @@ class SessionStorage:
                 f"VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
-            if is_resolvable_turn_scope(source_scope):
+            if resolution_epoch is not None:
                 # This evidence has no session FK: even an older writer deleting
                 # the receipt must not turn acceptance into permission to resend.
                 await conn.execute(

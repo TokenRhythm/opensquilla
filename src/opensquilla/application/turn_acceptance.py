@@ -59,7 +59,7 @@ from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
     promote_pending_chat_input_attachments,
 )
-from opensquilla.persistence.turn_request_resolution import is_resolvable_turn_scope
+from opensquilla.contracts.turn_request_scope import is_resolvable_turn_scope
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode
 

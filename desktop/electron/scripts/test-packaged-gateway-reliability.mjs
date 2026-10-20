@@ -49,7 +49,7 @@ const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url))
 export const ORDINARY_PROFILE_ROOT = join(REPO_ROOT, '.cache', 'perf-ordinary-profile')
 export const ORDINARY_RUNS_ROOT = join(REPO_ROOT, '.cache', 'perf-ordinary-runs')
 const ORDINARY_PROFILE_MARKER = 'opensquilla-synthetic-ordinary-performance-v1'
-const METHODS = new Set(['connect', 'chat.send', 'chat.history', 'sessions.list',
+const METHODS = new Set(['connect', 'chat.send', 'chat.send.v2', 'chat.history', 'sessions.list',
   'sessions.subscribe', 'sessions.unsubscribe',
   'sessions.messages.subscribe', 'sessions.messages.unsubscribe', ...READ_V2_METHODS,
   'sessions.messages.snapshot.read', 'sessions.messages.snapshot.release', FLOW_V2_METHOD,
@@ -1086,7 +1086,7 @@ async function run(options) {
     await verifySingleRenderedTurn()
     assert.equal(chats, expectedChats, 'One UI submission must produce exactly one provider chat request')
     if (options.scenario === 'configuration') assert.equal(alternateChats, 1, 'The edited endpoint must serve the actual user turn')
-    assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.methods['chat.send'] || 0), 0), expectedChats, 'No repeated chat.send')
+    assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.methods['chat.send'] || 0) + (socket.methods['chat.send.v2'] || 0), 0), expectedChats, 'No repeated chat.send')
     assert.equal(pageErrors, 0, 'Renderer must not raise page errors')
     assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.conversationFailures || 0), 0), 0,
       'Synthetic turns must not fail after displaying partial text')
@@ -1144,7 +1144,7 @@ async function run(options) {
         || report.sockets.length === socketsBefore,
       'renderer authority recovery', 45_000)
       assert.equal(chats, 1, 'Renderer recovery must not replay an accepted turn')
-      assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.methods['chat.send'] || 0), 0), 1,
+      assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.methods['chat.send'] || 0) + (socket.methods['chat.send.v2'] || 0), 0), 1,
         'Renderer recovery must not resend chat.send')
       Object.assign(report.rendererFault, { ownerPreserved: true, authorityReadAfterReload: true,
         singleSendPreserved: true, gatewayOwnerCount: records.size })

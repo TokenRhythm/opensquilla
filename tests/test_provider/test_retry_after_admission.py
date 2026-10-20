@@ -7,6 +7,7 @@ import json
 import math
 import time
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -600,13 +601,21 @@ async def test_selector_overload_cooldown_uses_independent_fallback(
     )
 
 
-async def test_ensemble_lifecycle_gate_excludes_provider_timeout_and_start(cooling):
+async def test_ensemble_lifecycle_gate_excludes_provider_timeout_and_start(cooling, monkeypatch):
     registry, clock = cooling
+    # Advance the provider's own deadline clock with the synthetic cooldown,
+    # without changing asyncio's real event-loop clock or relying on a 1 ms
+    # scheduling window under the parallel CI load.
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.time",
+        SimpleNamespace(monotonic=clock, time_ns=time.time_ns),
+    )
     provider = PhysicalProvider()
     registry.record(provider, 7, scope=provider_retry_after_scope(provider))
     starts = []
 
     async def started():
+        assert clock.sleeps == [7]
         starts.append(True)
 
     events = [
@@ -620,7 +629,7 @@ async def test_ensemble_lifecycle_gate_excludes_provider_timeout_and_start(cooli
             owner="cooldown-test",
             phase="ensemble_aggregator_wait",
             message="waiting",
-            timeout_seconds=0.001,
+            timeout_seconds=1,
             reset_deadline_on_event=False,
             on_request_start=started,
             physical_provider=provider,

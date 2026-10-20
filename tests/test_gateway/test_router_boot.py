@@ -494,6 +494,7 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
     services_holder: dict[str, Any] = {}
     usage_started = asyncio.Event()
     ready_telemetry: list[Any] = []
+    receipt_epoch_configs: list[tuple[Any, bool]] = []
 
     def record_ready(services: Any, *, duration_ms: int) -> None:
         assert app_holder["app"].state.gateway_ready is True
@@ -553,6 +554,11 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
             return None
 
     class FakeStorage:
+        def configure_turn_receipt_epochs(
+            self, policy: Any, *, exclusive_gateway: bool = False,
+        ) -> None:
+            receipt_epoch_configs.append((policy, exclusive_gateway))
+
         async def close(self) -> None:
             call_order.append("storage_closed")
 
@@ -680,6 +686,9 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
             await asyncio.sleep(0)
             assert server.app.state.gateway_ready is True
             assert server.app.state.gateway_start_ready is True
+            assert receipt_epoch_configs == (
+                [(boot._turn_receipt_epochs, True)] if storage_available else []
+            )
             telemetry_logs = [
                 kwargs for event, kwargs in debug_logs if event == "gateway.install_telemetry"
             ]

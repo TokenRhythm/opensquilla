@@ -16,10 +16,10 @@ from opensquilla.application.turn_admission import (
 )
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
 from opensquilla.chat.source import chat_source_metadata
+from opensquilla.contracts.turn_request_scope import resolvable_webchat_scope
 from opensquilla.gateway.admission_input import decode_admit_turn
 from opensquilla.gateway.rpc import RpcHandlerError, RpcUnavailableError
 from opensquilla.gateway.turn_steering import decode_steering_command, map_steering_error
-from opensquilla.persistence.turn_request_resolution import resolvable_webchat_scope
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key
 
 _WEBCHAT_SESSION_KEY = build_webchat_key()

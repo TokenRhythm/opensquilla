@@ -252,7 +252,7 @@ function installBrowserRpcProbe() {
         const frame = JSON.parse(data)
         if (frame?.type === 'req' && typeof frame.method === 'string') {
           probe.methods[frame.method] = (probe.methods[frame.method] || 0) + 1
-          if (frame.method === 'chat.send') {
+          if (['chat.send', 'chat.send.v2'].includes(frame.method)) {
             probe.sends.push({
               message: typeof frame.params?.message === 'string' ? frame.params.message : '',
               sessionKey: typeof frame.params?.sessionKey === 'string'

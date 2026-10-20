@@ -253,11 +253,11 @@ test('passive frame evidence never serializes credentials, bodies, URL, unknown 
   observeFrame(summary, 'received', JSON.stringify({ type: 'res', payload: { type: 'hello-ok', protocol: 3,
     auth: secret, snapshot: { state_dir: state, secret }, features: { methods: ['sessions.messages.resume', 'sessions.messages.snapshot.release'] },
     policy: { transport_flow: { delivery_epoch: secret, window_frames: 128, window_bytes: 4194304 }, secret } } }), state)
-  observeFrame(summary, 'sent', JSON.stringify({ type: 'req', method: 'chat.send', params: { message: secret, sessionKey: secret } }), state)
+  observeFrame(summary, 'sent', JSON.stringify({ type: 'req', method: 'chat.send.v2', params: { message: secret, sessionKey: secret } }), state)
   assert.equal(summary.hello.flow, true)
   assert.equal(summary.hello.recoveryMethods, true)
   assert.equal(summary.hello.stateDirMatches, true)
-  assert.equal(summary.methods['chat.send'], 1)
+  assert.equal(summary.methods['chat.send.v2'], 1)
   assert.equal(JSON.stringify(summary).includes(secret), false)
   assert.equal(JSON.stringify(summary).includes(state), false)
 })

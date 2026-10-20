@@ -23,12 +23,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from opensquilla.contracts.turn_request_scope import resolvable_webchat_scope
 from opensquilla.persistence.turn_request_resolution import (
     EPOCH_VALID_HOURS,
     RESOLUTION_CLEANUP_BATCH,
     TurnReceiptEpochPolicy,
     parse_turn_receipt_epoch,
-    resolvable_webchat_scope,
 )
 from opensquilla.session.models import AgentTaskRecord, SessionNode, TranscriptEntry
 from opensquilla.session.storage import (
