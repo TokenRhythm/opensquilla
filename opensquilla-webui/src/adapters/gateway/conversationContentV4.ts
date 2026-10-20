@@ -1,4 +1,5 @@
 import { skillLoadReceipt } from '@/types/skillLoads'
+import { parseTurnReceiptEpoch } from '@/contracts/turnReceiptEpoch'
 import { normalizeTaskProgress } from '@/utils/chat/taskProgress'
 import type { ConversationCronResult, ConversationEventData, ConversationEventContext, ConversationRoutingSnapshot, ConversationUsage } from '@/modules/conversationEventContent'
 import type { ConversationEventProjection, ConversationSemanticEventKind } from '@/modules/conversationEvents'
@@ -218,6 +219,11 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
   for (const key of STRING_FIELDS) {
     const value = alias(source, key)
     if (typeof value === 'string') result[key] = value
+  }
+  if (kind === 'input-disposition' && result.intent && result.intent !== 'steer'
+    && typeof result.client_request_id === 'string') {
+    const wireId = /^tr2:([^:]+):(.+)$/.exec(result.client_request_id)
+    if (wireId && parseTurnReceiptEpoch(wireId[1])) result.client_request_id = wireId[2]
   }
   for (const key of NUMBER_FIELDS) {
     const value = alias(source, key)

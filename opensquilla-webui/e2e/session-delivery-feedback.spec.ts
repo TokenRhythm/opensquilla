@@ -7,6 +7,8 @@ type Request = { type: string; id: string; method: string; params?: Record<strin
 type Response = { type?: string; id?: string; ok?: boolean; payload?: Record<string, unknown> }
 const SESSION_A = 'agent:main:webchat:e2e-delivery-feedback-a'
 const SESSION_B = 'agent:main:webchat:e2e-delivery-feedback-b'
+const SEND_METHODS = new Set(['chat.send', 'chat.send.v2'])
+const RECEIPT_METHODS = new Set(['turns.receipt.get', 'turns.receipt.resolve'])
 
 test.use({
   isolatedRealGatewayInitialSessionKeys: [SESSION_A, SESSION_B],
@@ -37,8 +39,8 @@ async function deliveryFault(page: Page) {
       const frame = JSON.parse(String(raw)) as Request
       if (frame.type === 'req') {
         requests.set(frame.id, frame)
-        if (frame.method === 'chat.send') sends.push(frame)
-        if (frame.method === 'turns.receipt.get') receipts.push(frame)
+        if (SEND_METHODS.has(frame.method)) sends.push(frame)
+        if (RECEIPT_METHODS.has(frame.method)) receipts.push(frame)
         if (frame.method === 'chat.abort') aborts.push(frame)
       }
       server.send(raw)
@@ -47,13 +49,13 @@ async function deliveryFault(page: Page) {
       const frame = JSON.parse(String(raw)) as Response
       const request = frame.type === 'res' ? requests.get(String(frame.id)) : undefined
       if (request) requests.delete(request.id)
-      if (request === sends[0] && request?.method === 'chat.send') {
+      if (request && request === sends[0]) {
         acknowledgement = frame
         browser.close({ code: 1012, reason: 'Synthetic lost admission acknowledgement' })
         server.close({ code: 1012, reason: 'Synthetic lost admission acknowledgement' })
         return
       }
-      if (request?.method === 'turns.receipt.get' && frame.ok && !receiptsVisible) {
+      if (request && RECEIPT_METHODS.has(request.method) && frame.ok && !receiptsVisible) {
         browser.send(JSON.stringify({ ...frame, payload: { status: 'not_found', accepted: null } }))
         return
       }
@@ -152,7 +154,7 @@ test('long-chat delivery feedback stays visible after the receipt budget and che
   expect(network.sends).toHaveLength(1)
   expect(network.aborts).toHaveLength(0)
   for (const receipt of network.receipts) {
-    expect(receipt.params).toEqual({ operation: 'chat.send', originalRequest: network.sends[0]!.params })
+    expect(receipt.params).toEqual({ operation: network.sends[0]!.method, originalRequest: network.sends[0]!.params })
   }
 
   await page.setViewportSize({ width: 1440, height: 900 })

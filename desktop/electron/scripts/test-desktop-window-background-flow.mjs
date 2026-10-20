@@ -372,7 +372,7 @@ try {
         if (blackholedClients.has(client)) return
         try {
           const frame = JSON.parse(String(message))
-          if (frame.type === 'req' && frame.method === 'chat.send') {
+          if (frame.type === 'req' && ['chat.send', 'chat.send.v2'].includes(frame.method)) {
             sentIdleMessages++
             idleSendIds.add(frame.id)
           }

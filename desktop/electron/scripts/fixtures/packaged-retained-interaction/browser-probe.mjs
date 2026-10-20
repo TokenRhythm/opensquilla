@@ -43,7 +43,7 @@ export function installRetainedRpcProbe() {
       if (frame?.type === 'req') {
         probe.transport.push({ type: 'req', id: frame.id, method: frame.method, at: Date.now() })
       }
-      if (frame?.type === 'req' && ['chat.send', 'chat.abort'].includes(frame.method)) {
+      if (frame?.type === 'req' && ['chat.send', 'chat.send.v2', 'chat.abort'].includes(frame.method)) {
         const params = frame.params || {}
         probe.requests.push({ method: frame.method, params: {
           sessionKey: params.sessionKey, taskId: params.taskId,

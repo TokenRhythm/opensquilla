@@ -593,7 +593,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess, opti
     hasPendingAttachmentWork,
     prepareAttachmentsForSend,
     captureDraftConsumption: (attachments: readonly Attachment[]) => draftPersistence?.captureConsumption(attachments),
-    flushAttachmentDraft: () => draftPersistence?.flush() ?? Promise.resolve(),
+    flushAttachmentDraft: () => draftPersistence?.flush() ?? Promise.resolve(pendingAttachments.value.length === 0),
   }
 }
 

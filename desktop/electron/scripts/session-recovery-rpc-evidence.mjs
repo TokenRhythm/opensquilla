@@ -6,8 +6,8 @@ const READ = 'sessions.messages.snapshot.read'
 const RESUME = 'sessions.messages.resume'
 const RELEASE = 'sessions.messages.snapshot.release'
 const UNSUBSCRIBE = 'sessions.messages.unsubscribe'
-const SEND = 'chat.send'
-const METHODS = new Set([SUBSCRIBE, HYDRATE, READ, RESUME, RELEASE, UNSUBSCRIBE, 'chat.history', SEND])
+const SEND_METHODS = new Set(['chat.send', 'chat.send.v2'])
+const METHODS = new Set([SUBSCRIBE, HYDRATE, READ, RESUME, RELEASE, UNSUBSCRIBE, 'chat.history', ...SEND_METHODS])
 const LIVE_EVENTS = new Set(['session.event.text_delta', 'session.event.done', 'session.event.turn_committed'])
 
 export function sessionRecoveryFaultDomain(frame, sessionKey) {
@@ -129,18 +129,18 @@ export function createSessionRecoveryEvidence(sessionKey, now = Date.now) {
       snapshot: identifier(frame.payload?.snapshot_id) ?? item.snapshot,
       ...(typeof frame.payload?.hydration_complete === 'boolean'
         ? { hydrationComplete: frame.payload.hydration_complete } : {}),
-      ...(item.method === SEND ? { accepted: frame.payload?.accepted === true,
+      ...(SEND_METHODS.has(item.method) ? { accepted: frame.payload?.accepted === true,
         task: identifier(frame.payload?.task_id) } : {}),
       ...(frame.ok !== true ? { errorCode: identifier(frame.error?.code) } : {}),
     })
   }
-  const sendCount = () => events.filter(item => item.direction === 'request' && item.method === SEND).length
+  const sendCount = () => events.filter(item => item.direction === 'request' && SEND_METHODS.has(item.method)).length
   function assertUserTurn(after, { complete = true } = {}) {
     assert.equal(overflow, false, 'recovery RPC evidence must be complete')
     const turn = events.filter(item => item.sequence > after)
-    const sends = turn.filter(item => item.direction === 'request' && item.method === SEND)
+    const sends = turn.filter(item => item.direction === 'request' && SEND_METHODS.has(item.method))
     assert.equal(sends.length, 1, 'explicit user action must send exactly one request')
-    const accepted = turn.find(item => item.direction === 'response' && item.method === SEND
+    const accepted = turn.find(item => item.direction === 'response' && SEND_METHODS.has(item.method)
       && item.requestSequence === sends[0].sequence && item.ok && item.accepted && item.task)
     assert.ok(accepted, 'the recovered Gateway must accept the explicit user send')
     const live = turn.filter(item => item.direction === 'event' && item.task === accepted.task

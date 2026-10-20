@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   useChatSessionSubscription,
+  isAuthoritativeSessionSubscription,
   type UseChatSessionSubscriptionOptions,
 } from './useChatSessionSubscription'
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
@@ -254,6 +255,25 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it('requires affirmative, uncancelled evidence before releasing recovery', () => {
+    expect(isAuthoritativeSessionSubscription(undefined)).toBe(false)
+    expect(isAuthoritativeSessionSubscription(false)).toBe(false)
+    expect(isAuthoritativeSessionSubscription(true)).toBe(true)
+    expect(isAuthoritativeSessionSubscription({ authoritative: true, live: false,
+      backgroundOnly: false, cancelled: true })).toBe(false)
+  })
+
+  it('does not install old task state when a metadata callback changes the current session', async () => {
+    const sessionKey = ref(KEY)
+    const initialMetadata = metadata({ runStatus: 'running', activeTask: { taskId: 'old-task', status: 'running' } })
+    const subject = harness(leaseFixture({ live: live({ initialMetadata }) }).lease, {
+      sessionKey, onSnapshot: () => { sessionKey.value = 'agent:main:webchat:replacement' },
+    })
+    await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: false, cancelled: true })
+    expect(subject.isStreaming.value).toBe(false)
+    expect(subject.activeStreamTaskId.value).toBe('')
+    subject.api.cancelActiveSubscription()
+  })
   it.each([false, true])('preserves reader follow=%s when metadata restores an active task without a live bubble', async follow => {
     const autoScroll = ref(follow)
     const stream = useChatStream({

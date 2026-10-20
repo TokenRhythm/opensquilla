@@ -27,6 +27,7 @@ export function useAttachmentDraftPersistence(options: {
   let suppressed = false
   let retired = false
   let failureReported = false
+  let currentDraftStored = false
   let writes = Promise.resolve()
   let restoration = Promise.resolve()
   let nextWrite = 0
@@ -50,10 +51,13 @@ export function useAttachmentDraftPersistence(options: {
     try { key = attachmentDraftKey(target) } catch (error) { report(error); return }
     const version = ++nextWrite
     const savedContentRevision = contentRevision
+    if (key === scopeKey) currentDraftStored = false
     latestWrite.set(key, version)
     writes = writes.then(async () => {
       if (latestWrite.get(key) !== version) return
       await store.save(target, snapshot, savedContentRevision)
+      if (key === scopeKey && savedContentRevision === contentRevision
+        && latestWrite.get(key) === version) currentDraftStored = true
       if (latestWrite.get(key) === version) latestWrite.delete(key)
       if (retireSource) {
         const previousKey = attachmentDraftKey(retireSource)
@@ -97,6 +101,7 @@ export function useAttachmentDraftPersistence(options: {
     scopeKey = key
     const currentEpoch = ++epoch
     failureReported = false
+    currentDraftStored = false
     suppressed = true
     if ((wasScoped || retired) && !preserveHandoff) options.beforeScopeChange()
     retired = false
@@ -127,6 +132,7 @@ export function useAttachmentDraftPersistence(options: {
       if (epoch === currentEpoch) {
         clean = unchanged !== false && currentOwnerRevision === ownerRevision
         if (clean) {
+          currentDraftStored = true
           if (loaded.revision) {
             contentRevision = loaded.revision
             restoredGeneration += 1
@@ -222,5 +228,11 @@ export function useAttachmentDraftPersistence(options: {
     stopScope()
   }
   if (getCurrentScope()) onScopeDispose(dispose)
-  return { restoring, retire, resume, captureConsumption, dispose, flush: async () => { await restoration; await writes } }
+  return { restoring, retire, resume, captureConsumption, dispose, flush: async () => {
+    await restoration
+    await writes
+    return scopeKey && store
+      ? currentDraftStored && !latestWrite.has(scopeKey)
+      : options.attachments.value.length === 0
+  } }
 }

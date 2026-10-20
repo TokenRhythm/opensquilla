@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -70,6 +71,8 @@ class _FakeSelector:
 
 
 class _SlowHistoryStrategy:
+    called = False
+
     async def classify(
         self,
         message: str,
@@ -77,7 +80,7 @@ class _SlowHistoryStrategy:
         routing_history: list[dict] | None = None,
         **kwargs: object,
     ) -> tuple[str, float, str, dict]:
-        time.sleep(0.08)
+        self.called = True
         return (
             "c2",
             0.95,
@@ -91,6 +94,8 @@ class _SlowHistoryStrategy:
 
 
 class _MutatingHistoryStrategy:
+    mutated_history: list[dict] | None = None
+
     async def classify(
         self,
         message: str,
@@ -98,9 +103,9 @@ class _MutatingHistoryStrategy:
         routing_history: list[dict] | None = None,
         **kwargs: object,
     ) -> tuple[str, float, str, dict]:
-        time.sleep(0.08)
         assert routing_history
         routing_history[0]["final_tier"] = "poisoned"
+        self.mutated_history = routing_history
         return (
             "c2",
             0.95,
@@ -117,6 +122,53 @@ def _config_with_router_timeout() -> GatewayConfig:
     return GatewayConfig(
         squilla_router=SquillaRouterConfig(routing_timeout_seconds=0.01)
     )
+
+
+@asynccontextmanager
+async def _blocked_router_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    router: Callable[[TurnContext], Awaitable[TurnContext]],
+) -> AsyncIterator[list[float | None]]:
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    completed = asyncio.Event()
+    release = threading.Event()
+    observed_timeouts: list[float | None] = []
+    worker_errors: list[BaseException] = []
+    real_wait_for = asyncio.wait_for
+
+    async def blocked_router(ctx: TurnContext) -> TurnContext:
+        try:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5), "router worker was not released"
+            return await router(ctx)
+        except BaseException as exc:
+            worker_errors.append(exc)
+            raise
+        finally:
+            loop.call_soon_threadsafe(completed.set)
+
+    async def wait_for_started_router(awaitable: Any, timeout: float | None) -> Any:
+        observed_timeouts.append(timeout)
+        # Observe the configured deadline after the worker has started. The
+        # outer watchdog covers host scheduling, not the routing time budget.
+        await real_wait_for(entered.wait(), timeout=5)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", blocked_router)
+    monkeypatch.setattr(
+        runtime_module,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"wait_for": wait_for_started_router})),
+    )
+    try:
+        yield observed_timeouts
+    finally:
+        # Late history writes must actually finish before their assertions or
+        # monkeypatch teardown; elapsed sleeps cannot establish that ordering.
+        release.set()
+        await real_wait_for(completed.wait(), timeout=5)
+        assert not worker_errors
 
 
 @pytest.mark.asyncio
@@ -148,30 +200,29 @@ async def test_squilla_router_timeout_fails_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def slow_router(ctx: TurnContext) -> TurnContext:
-        await asyncio.sleep(1.0)
         ctx.model = "should-not-route"
         return ctx
 
-    slow_router.__name__ = "apply_squilla_router"
-    monkeypatch.setattr("opensquilla.engine.steps.apply_squilla_router", slow_router)
     runner = TurnRunner(
         provider_selector=None,
         config=_config_with_router_timeout(),
     )
     provider = _Provider()
 
-    turn, resolved_provider = await asyncio.wait_for(
-        runner._run_pipeline(
-            "hello",
-            "agent:main:test",
-            provider,
-            None,
-            [],
-            "system prompt",
-            [],
-        ),
-        timeout=0.25,
-    )
+    async with _blocked_router_completion(monkeypatch, slow_router) as router_timeouts:
+        turn, resolved_provider = await asyncio.wait_for(
+            runner._run_pipeline(
+                "hello",
+                "agent:main:test",
+                provider,
+                None,
+                [],
+                "system prompt",
+                [],
+            ),
+            timeout=5,
+        )
+        assert router_timeouts == [0.01]
 
     assert resolved_provider is provider
     assert turn.model != "should-not-route"
@@ -189,11 +240,12 @@ async def test_squilla_router_timeout_does_not_late_append_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_key = "agent:main:test-router-timeout-history"
+    strategy = _SlowHistoryStrategy()
     squilla_router_step._history_store.clear()
     monkeypatch.setattr(
         squilla_router_step,
         "_get_strategy",
-        lambda _config: _SlowHistoryStrategy(),
+        lambda _config: strategy,
     )
     runner = TurnRunner(
         provider_selector=None,
@@ -201,21 +253,26 @@ async def test_squilla_router_timeout_does_not_late_append_history(
     )
     provider = _Provider()
 
-    turn, resolved_provider = await asyncio.wait_for(
-        runner._run_pipeline(
-            "hello",
-            session_key,
-            provider,
-            None,
-            [],
-            "system prompt",
-            [],
-        ),
-        timeout=0.25,
-    )
-    await asyncio.sleep(0.1)
+    async with _blocked_router_completion(
+        monkeypatch,
+        squilla_router_step.apply_squilla_router,
+    ) as router_timeouts:
+        turn, resolved_provider = await asyncio.wait_for(
+            runner._run_pipeline(
+                "hello",
+                session_key,
+                provider,
+                None,
+                [],
+                "system prompt",
+                [],
+            ),
+            timeout=5,
+        )
+        assert router_timeouts == [0.01]
 
     assert resolved_provider is provider
+    assert strategy.called
     assert squilla_router_step._history_store.get(session_key) is None
     router_record = next(
         record
@@ -231,6 +288,7 @@ async def test_squilla_router_timeout_does_not_late_mutate_history_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session_key = "agent:main:test-router-timeout-history-mutation"
+    strategy = _MutatingHistoryStrategy()
     original_history = [
         {
             "turn_index": 0,
@@ -244,7 +302,7 @@ async def test_squilla_router_timeout_does_not_late_mutate_history_entries(
     monkeypatch.setattr(
         squilla_router_step,
         "_get_strategy",
-        lambda _config: _MutatingHistoryStrategy(),
+        lambda _config: strategy,
     )
     runner = TurnRunner(
         provider_selector=None,
@@ -252,21 +310,27 @@ async def test_squilla_router_timeout_does_not_late_mutate_history_entries(
     )
     provider = _Provider()
 
-    turn, resolved_provider = await asyncio.wait_for(
-        runner._run_pipeline(
-            "hello",
-            session_key,
-            provider,
-            None,
-            [],
-            "system prompt",
-            [],
-        ),
-        timeout=0.25,
-    )
-    await asyncio.sleep(0.1)
+    async with _blocked_router_completion(
+        monkeypatch,
+        squilla_router_step.apply_squilla_router,
+    ) as router_timeouts:
+        turn, resolved_provider = await asyncio.wait_for(
+            runner._run_pipeline(
+                "hello",
+                session_key,
+                provider,
+                None,
+                [],
+                "system prompt",
+                [],
+            ),
+            timeout=5,
+        )
+        assert router_timeouts == [0.01]
 
     assert resolved_provider is provider
+    assert strategy.mutated_history is not None
+    assert strategy.mutated_history[0]["final_tier"] == "poisoned"
     stored_history = squilla_router_step._history_store.get(session_key)
     assert stored_history == original_history
     assert stored_history is not None

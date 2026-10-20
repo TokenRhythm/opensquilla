@@ -505,6 +505,12 @@
           "items": {
             "$ref": "#/$defs/ChatSendOriginalWorkspaceFileReference"
           }
+        },
+        "acceptanceEpoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Gateway policy/tick turn_receipt_epoch, bound into clientRequestId as tr2:<epoch>:<logical-id> before first dispatch and unchanged thereafter. Canonical v2.<boot>.<issued-hour>.<expires-hour> tokens admit for 24-25 hours. Missing, expired, or foreign-boot tokens permit only existing evidence lookup; absence remains unknown."
         }
       }
     },
@@ -1280,6 +1286,9 @@
           "$ref": "#/$defs/ChatSendReceiptQuery"
         },
         {
+          "$ref": "#/$defs/ChatSendV2ReceiptQuery"
+        },
+        {
           "$ref": "#/$defs/SessionsSendReceiptQuery"
         },
         {
@@ -1529,6 +1538,12 @@
         },
         {
           "$ref": "#/$defs/TurnsReceiptGetNotFound"
+        },
+        {
+          "$ref": "#/$defs/TurnReceiptRetired"
+        },
+        {
+          "$ref": "#/$defs/TurnReceiptAcceptedUnavailable"
         }
       ]
     },
@@ -1899,6 +1914,88 @@
           }
         }
       ]
+    },
+    "ChatSendV2ReceiptQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "originalRequest"
+      ],
+      "properties": {
+        "operation": {
+          "const": "chat.send.v2"
+        },
+        "originalRequest": {
+          "$ref": "#/$defs/ChatSendOriginalRequest"
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "TurnReceiptRetired": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "accepted",
+        "requestFingerprint",
+        "clientRequestId",
+        "requestSessionKey"
+      ],
+      "properties": {
+        "status": {
+          "const": "retired"
+        },
+        "accepted": {
+          "const": false
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "clientRequestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requestSessionKey": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "TurnReceiptAcceptedUnavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "accepted",
+        "requestFingerprint",
+        "clientRequestId",
+        "requestSessionKey"
+      ],
+      "properties": {
+        "status": {
+          "const": "accepted_unavailable"
+        },
+        "accepted": {
+          "const": true
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "clientRequestId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requestSessionKey": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
     }
   }
 }

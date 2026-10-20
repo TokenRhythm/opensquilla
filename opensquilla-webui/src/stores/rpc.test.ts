@@ -19,6 +19,7 @@ const clients: Array<{
   notifyResume: ReturnType<typeof vi.fn>
   readonly lifecycle: string
   connectionGeneration: number
+  policy: Record<string, unknown>
 }> = []
 
 function deliveryHello(overrides: Record<string, unknown> = {}) {
@@ -35,6 +36,7 @@ vi.mock('@/lib/rpc', () => ({
     state = 'disconnected'
     get lifecycle() { return this.state === 'disconnected' ? 'stopped' : this.state }
     connectionGeneration = 0
+    policy: Record<string, unknown> = {}
     private listeners = new Map<string, Array<(...args: unknown[]) => void>>()
 
     constructor() {
@@ -91,6 +93,17 @@ describe('rpc link-token bootstrap', () => {
     sessionStorage.clear()
     delete window.opensquillaDesktop
     window.history.replaceState(null, '', '/control/sessions')
+  })
+
+  it('publishes a validated receipt-window tick through the reactive policy', () => {
+    const rpc = useRpcStore()
+    rpc.init()
+    clients[0]!.emit('_hello', { ...deliveryHello(), policy: { turn_receipt_epoch: 'original' } })
+    const epoch = computed(() => rpc.policy?.turn_receipt_epoch)
+    expect(epoch.value).toBe('original')
+    clients[0]!.policy = { turn_receipt_epoch: 'advanced' }
+    clients[0]!.emit('tick', { turn_receipt_epoch: 'untrusted-raw-payload' })
+    expect(epoch.value).toBe('advanced')
   })
 
   it('loads requested attachment inventory when Hello advertises resources after initial mount', async () => {

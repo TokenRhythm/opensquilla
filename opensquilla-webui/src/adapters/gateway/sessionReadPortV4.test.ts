@@ -548,6 +548,36 @@ describe('read-v2 consumption covered by an installed snapshot', () => {
 describe('read-v2 admission and retirement ownership', () => {
   const historyRequest = (signal: AbortSignal) => ({ direction: 'latest' as const, limit: 100, signal })
 
+  it.each([50, 200])('confirms the live base before one initial history page at the requested limit %s', async limit => {
+    const h = v2AdmissionHarness()
+    const request = openRequest()
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    const history = lease.readHistory({ ...historyRequest(request.signal), limit })
+    try {
+      const live = await lease.live
+      await lease.criticalRequestsQueued
+      expect(h.calls.filter(call => call.method === HISTORY_V2)).toHaveLength(0)
+      await live.confirmInstalled?.()
+      await history
+      const pages = h.calls.filter(call => call.method === HISTORY_V2)
+      expect(pages).toHaveLength(1)
+      expect(pages[0]!.params?.target_items).toBe(limit)
+      const methods = h.calls.map(call => call.method)
+      expect(methods.indexOf(HISTORY_V2)).toBeGreaterThan(methods.lastIndexOf(READ_INSTALL_V2))
+    } finally { await lease.close() }
+  })
+
+  it('retires an initial history waiter when its unconfirmed lease closes', async () => {
+    const h = v2AdmissionHarness()
+    const request = openRequest()
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    const history = expect(lease.readHistory(historyRequest(request.signal))).rejects.toMatchObject({ name: 'AbortError' })
+    await lease.live
+    await lease.close()
+    await history
+    expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(false)
+  })
+
   it.each(['REBASE_REQUIRED', 'READ_STALE'])('projects %s as a read-base replacement request', code => {
     expect(mapSessionReadError(Object.assign(new Error('Reload state'), { code })))
       .toMatchObject({ kind: 'rebase-required', retryable: true })
@@ -568,14 +598,13 @@ describe('read-v2 admission and retirement ownership', () => {
     const request = openRequest()
     const lease = createV4SessionReadPort(h.rpc).open(request)
     try {
+      await (await lease.live).confirmInstalled?.()
       const results = await Promise.allSettled([
         lease.live, lease.metadata, lease.criticalRequestsQueued,
         lease.readHistory(historyRequest(request.signal)),
       ])
-      expect(results.map(result => result.status)).toEqual(failure === 'response'
-        ? ['fulfilled', 'fulfilled', 'fulfilled', 'rejected']
-        : ['rejected', 'rejected', 'rejected', 'rejected'])
-      expect(h.calls.some(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toBe(failure === 'response')
+      expect(results.map(result => result.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled', 'rejected'])
+      expect(h.calls.some(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toBe(true)
     } finally { await lease.close() }
   })
 
@@ -632,8 +661,10 @@ describe('read-v2 admission and retirement ownership', () => {
       h.setGeneration(generation)
       const durable = port.open(openRequest())
       try {
-        const [live, page] = await Promise.all([durable.live, durable.readHistory(historyRequest(new AbortController().signal))])
+        const pageRequest = durable.readHistory(historyRequest(new AbortController().signal))
+        const live = await durable.live
         await live.confirmInstalled?.()
+        const page = await pageRequest
         expect(page.messages).toEqual([])
       } finally { await durable.close() }
     }
@@ -674,8 +705,9 @@ describe('read-v2 admission and retirement ownership', () => {
       expect(h.calls).toEqual([])
       negotiated = true
       ready.resolve()
-      const [live, page] = await Promise.all([lease.live, history, lease.metadata, lease.criticalRequestsQueued])
+      const [live] = await Promise.all([lease.live, lease.metadata, lease.criticalRequestsQueued])
       await live.confirmInstalled?.()
+      const page = await history
       expect(h.calls.some(call => call.method === READ_OPEN_V2)).toBe(true)
       expect(h.calls.some(call => call.method === HISTORY_V2)).toBe(true)
       expect(h.calls.some(call => call.method === CHAT_HISTORY_METHOD)).toBe(false)

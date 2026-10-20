@@ -4,12 +4,15 @@ import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 import { TurnCommandError, type TurnSendRequest, type TurnSendResponse, type TurnReceiptResult } from '@/modules/turnCommands'
 import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
 import { decideSendResponseSession, type UseChatSendOptions } from './useChatSend'
-import { createChatSendHarness, memoryDeliveryWal } from './chatSendTestHarness'
+import { createChatSendHarness, memoryDeliveryWal, flushDelivery } from './chatSendTestHarness'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
 import type { DeliveryWalRecord } from '@/utils/chat/pendingInputWal'
 import { acceptsVisualizeContext, useVisualizeDraft } from '@/visualize/useVisualizeDraft'
 import type { VisualizeReceipt } from '@/visualize/types'
 import type { SlashCommandClassification } from './useChatSlashCommands'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import { useChatStream } from './useChatStream'
 
 const { pushToast } = vi.hoisted(() => ({ pushToast: vi.fn() }))
 vi.mock('@/composables/useToasts', () => ({ useToasts: () => ({ pushToast }) }))
@@ -32,6 +35,10 @@ function queuedSendHarness(overrides: Partial<UseChatSendOptions> = {}) {
     supports: () => true,
     lookupReceipt: vi.fn(async (): Promise<TurnReceiptResult> => ({ status: 'not-found' })),
     supportsReceiptLookup: () => true,
+    supportsResolvableSend: () => false,
+    getReceiptEpoch: () => 'epoch-1',
+    isAdmissionClosed: vi.fn(() => false),
+    resolveReceipt: vi.fn(async (): Promise<TurnReceiptResult> => ({ status: 'retired' })),
   }
   const scope = { sessionKey: 'agent:main:webchat:test', deliveryIdentity: 'synthetic-identity' }
   const policy = createPendingQueuePolicy(null)
@@ -53,10 +60,322 @@ function queuedSendHarness(overrides: Partial<UseChatSendOptions> = {}) {
     classifySlashCommand: vi.fn(async () => 'unknown' as const), executeSlashCommand: vi.fn(async () => false),
     closeSlashMenu: vi.fn(), autoResizeTextarea: vi.fn(), scrollToBottom: vi.fn(),
     canStop: () => true, pausePendingAutoSend,
+    persistRestoredDraft: () => true,
     ...overrides,
   }
   return { ...createChatSendHarness(options), commands, policy, scope, pausePendingAutoSend }
 }
+
+const closureAnnotation: PromptAnnotationSnapshot = {
+  annotationId: 'original-note', documentId: 'page-1', documentName: 'page.html',
+  body: 'Make this heading larger', targetRef: 'page:1', resourceId: 'document:page-1',
+  tagName: 'h1', quote: 'Heading', sentOrder: 0,
+}
+
+describe('automatic prefill admission through the real durable owner', () => {
+  it('ignores only its own published submitting row at the final guard', async () => {
+    const h = queuedSendHarness()
+    const checkedIds: Array<string | undefined> = []
+    const current = (id?: string) => {
+      checkedIds.push(id)
+      if (id) {
+        expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+        expect(h.options.durableDelivery.snapshots()).toContainEqual(expect.objectContaining({
+          id, phase: 'submitting', stopPending: false,
+        }))
+      }
+      return !h.api.hasAcceptanceRecoveryPending(id)
+    }
+    await h.api.onSend({
+      cancelIfComposerChanged: true, preflightGuard: () => current(), preDispatchGuard: current,
+    })
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    const request = h.commands.send.mock.calls[0]![0]
+    expect(checkedIds).toContain(request.params.clientRequestId)
+    expect((await h.options.durableDelivery.get(request.params.clientRequestId!))?.phase).toBe('accepted')
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+  })
+
+  it.each(['unknown', 'submitting', 'stop', 'identity'] as const)(
+    'revokes prefill when another %s appears during WAL preparation', async kind => {
+      const wal = memoryDeliveryWal()
+      const prepare = wal.prepareDelivery!
+      let reached = false
+      let release!: () => void
+      const barrier = new Promise<void>(resolve => { release = resolve })
+      wal.prepareDelivery = async (record, owner) => {
+        if (record.ownerRequestId !== 'other-request') { reached = true; await barrier }
+        return prepare(record, owner)
+      }
+      const deliveryIdentity = ref('synthetic-identity')
+      const h = queuedSendHarness({ pendingInputWal: wal, deliveryIdentity })
+      const identity = h.options.deliveryIdentity.value
+      const current = (id?: string) => h.options.deliveryIdentity.value === identity
+        && !h.api.hasAcceptanceRecoveryPending(id)
+      const sending = h.api.onSend({ preflightGuard: () => current(), preDispatchGuard: current })
+      await vi.waitFor(() => expect(reached).toBe(true))
+      if (kind === 'identity') deliveryIdentity.value = 'replacement-identity'
+      else {
+        const now = Date.now()
+        await prepare({
+          schemaVersion: 2, ownerRequestId: 'other-request', deliveryIdentity: identity!,
+          requestSessionKey: h.scope.sessionKey,
+          request: { kind: 'send', request: { kind: 'new-turn', params: {
+            sessionKey: h.scope.sessionKey, message: 'Another request', clientRequestId: 'other-request',
+          } } },
+          phase: kind === 'stop' ? 'accepted' : kind,
+          ...(kind === 'stop' ? { stop: { requested: true as const } } : {}),
+          revision: 1, createdAt: now, updatedAt: now,
+          lease: { owner: 'other-tab', epoch: 1, expiresAt: now + 60_000 },
+        })
+        await h.options.durableDelivery.wake()
+        expect(h.api.hasAcceptanceRecoveryPending('other-request')).toBe(kind !== 'submitting')
+      }
+      release()
+      await sending
+      expect(h.commands.send).not.toHaveBeenCalled()
+    },
+  )
+})
+
+describe('fenced delivery draft recovery', () => {
+  it.each(['retired', 'accepted-unavailable', 'text', 'provider activity', 'bound history', 'later content'] as const)(
+    'cleans only its retired local admission placeholder: %s', async (scenario) => {
+      vi.useFakeTimers()
+      vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
+      vi.stubGlobal('cancelAnimationFrame', vi.fn())
+      const previous: ChatMessage = { role: 'assistant', clientId: 'previous-empty-row', text: '', ts: 1 }
+      const messages = ref<ChatMessage[]>([previous])
+      const stream = useChatStream({ messages, lastHeaderRole: ref(''), aborted: ref(false), autoScroll: ref(false),
+        applySessionRunState: vi.fn(), renderMarkdown: text => text,
+        stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text, scrollToBottom: vi.fn() })
+      const h = queuedSendHarness({ messages, stream })
+      try {
+        h.commands.supportsResolvableSend = () => true
+        h.commands.send.mockImplementationOnce(async () => {
+          if (scenario === 'text') stream.appendDelta('Actual answer')
+          if (scenario === 'provider activity') stream.setStreamActivity('Waiting for model', 'provider:requesting')
+          if (scenario === 'bound history') stream.setAssistantMessageId('durable-message')
+          throw new TurnCommandError('transport', 'lost ACK', undefined, null)
+        })
+        await h.api.onSend()
+        const pending = messages.value.filter(message => message.role === 'assistant' && message.clientId !== previous.clientId)
+        expect(pending).toHaveLength(1)
+        if (scenario === 'later content') pending[0]!.text = 'History caught up before Check'
+        await vi.advanceTimersByTimeAsync(6_000)
+        const id = h.api.deliveryRecoveryEntries.value[0]!.id
+        if (scenario === 'accepted-unavailable') h.commands.resolveReceipt.mockResolvedValueOnce({ status: 'accepted-unavailable' })
+        await h.api.checkDelivery(id)
+        const remaining = messages.value.filter(message => message.role === 'assistant')
+        expect(remaining.map(message => message.clientId)).toEqual(scenario === 'retired'
+          ? [previous.clientId] : [previous.clientId, pending[0]!.clientId])
+        expect(h.commands.send).toHaveBeenCalledOnce()
+        expect(stream.isStreaming.value).toBe(false)
+      } finally {
+        h.api.dispose(); h.options.durableDelivery.dispose(); stream.cleanup()
+        vi.unstubAllGlobals(); vi.useRealTimers()
+      }
+    },
+  )
+
+  it('keeps the old handoff when attachments change while the restored draft write is pending', async () => {
+    vi.useFakeTimers()
+    let stored!: (result: boolean) => void
+    const h = queuedSendHarness({ persistRestoredDraft: () => new Promise(resolve => { stored = resolve }) })
+    try {
+      h.commands.supportsResolvableSend = () => true
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost ACK', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(6_000)
+      const id = h.api.deliveryRecoveryEntries.value[0]!.id
+      const checking = h.api.checkDelivery(id)
+      await vi.advanceTimersByTimeAsync(0)
+      h.options.pendingAttachments.value = [{ kind: 'staged', local_id: 2, name: 'new.txt', mime: 'text/plain', file_uuid: 'new-upload' }]
+      stored(true)
+      await checking
+      expect((await h.options.durableDelivery.get(id))?.handoff).toBeDefined()
+      expect(h.options.pendingAttachments.value[0]?.local_id).toBe(2)
+      expect(h.commands.send).toHaveBeenCalledOnce()
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+
+  it('retains the fenced handoff if local draft persistence fails and can recover it after reload', async () => {
+    vi.useFakeTimers()
+    const wal = memoryDeliveryWal()
+    const h = queuedSendHarness({ pendingInputWal: wal, persistRestoredDraft: () => false })
+    try {
+      h.commands.supportsResolvableSend = () => true
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost ACK', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(6_000)
+      const id = h.api.deliveryRecoveryEntries.value[0]!.id
+      await h.api.checkDelivery(id)
+      expect(h.options.inputText.value).toBe('unrelated composer draft')
+      expect((await h.options.durableDelivery.get(id))?.handoff?.composerText).toBe('unrelated composer draft')
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([expect.objectContaining({ draftAvailable: true })])
+      h.api.dispose(); h.options.durableDelivery.dispose()
+      const fresh = queuedSendHarness({ inputText: ref(''), pendingInputWal: wal })
+      await fresh.options.durableDelivery.wake()
+      await fresh.api.checkDelivery(id)
+      expect(fresh.options.inputText.value).toBe('unrelated composer draft')
+      expect(fresh.commands.send).not.toHaveBeenCalled()
+      expect(fresh.commands.resolveReceipt).not.toHaveBeenCalled()
+      expect(fresh.api.deliveryRecoveryEntries.value).toEqual([])
+      fresh.options.durableDelivery.dispose()
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+
+  it('completes an explicit Check that joins an already-running background receipt round', async () => {
+    vi.useFakeTimers()
+    const h = queuedSendHarness()
+    try {
+      h.commands.supportsResolvableSend = () => true
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost ACK', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.commands.lookupReceipt).toHaveBeenCalledOnce()
+      const id = h.api.deliveryRecoveryEntries.value[0]!.id
+      const checking = h.api.checkDelivery(id)
+      await vi.advanceTimersByTimeAsync(6_000)
+      await checking
+      expect(h.commands.resolveReceipt).toHaveBeenCalledOnce()
+      expect(h.options.inputText.value).toBe('unrelated composer draft')
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+      expect(h.commands.send).toHaveBeenCalledOnce()
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+
+  it('keeps annotation-only input intact, resolves only on Check, and uses a fresh ID for the next send', async () => {
+    vi.useFakeTimers()
+    const drafts = ref([closureAnnotation.annotationId])
+    const acknowledge = vi.fn(() => { drafts.value = [] })
+    const h = queuedSendHarness({ inputText: ref(''), draftIds: drafts,
+      promptAnnotationSnapshots: () => [closureAnnotation], acknowledgePromptAnnotations: acknowledge,
+      restorePromptAnnotations: vi.fn(() => true) })
+    try {
+      h.commands.supportsResolvableSend = () => true
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost ACK', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await h.options.durableDelivery.wake()
+      const original = h.commands.send.mock.calls[0]![0]
+      const id = h.api.deliveryRecoveryEntries.value[0]!.id
+      expect(h.commands.resolveReceipt).not.toHaveBeenCalled()
+      expect((await h.options.durableDelivery.get(id))?.handoff).toMatchObject({
+        composerText: '', recoveryDraftIds: ['original-note'],
+        recoveryPromptAnnotations: [expect.objectContaining({ body: closureAnnotation.body })],
+      })
+      await h.api.checkDelivery(id)
+      expect(h.commands.resolveReceipt).toHaveBeenCalledOnce()
+      expect(h.commands.send).toHaveBeenCalledOnce()
+      expect(acknowledge).not.toHaveBeenCalled()
+      expect(drafts.value).toEqual(['original-note'])
+      expect(h.options.inputText.value).toBe('')
+      expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+      expect(h.api.acceptanceStopAvailableForCurrentSession.value).toBe(false)
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+      await h.api.onSend()
+      expect(h.commands.send).toHaveBeenCalledTimes(2)
+      expect(h.commands.send.mock.calls[1]![0].params.clientRequestId).not.toBe(original.params.clientRequestId)
+      expect(acknowledge).toHaveBeenCalledOnce()
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+
+  it('retains the original handoff behind a newer draft and later restores locally without another RPC', async () => {
+    vi.useFakeTimers()
+    const skills = [{ name: 'review', instanceId: 'skill-1', digest: 'digest-1' }]
+    const attachment = { kind: 'staged' as const, local_id: 1, name: 'notes.txt', mime: 'text/plain', file_uuid: 'original-upload' }
+    const h = queuedSendHarness({ inputText: ref('review\nC:/notes/source.txt'), selectedSkills: ref(skills), localPathReferences: ref(['C:/notes/source.txt']),
+      pendingAttachments: ref([attachment]),
+      pendingSessionIntent: ref('new_chat'), pendingWorkspaceId: ref('workspace-1') })
+    try {
+      h.commands.supportsResolvableSend = () => true
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost ACK', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(6_000)
+      const id = h.api.deliveryRecoveryEntries.value[0]!.id
+      h.options.inputText.value = 'a different request'
+      h.options.selectedSkills!.value = []
+      h.options.localPathReferences!.value = []
+      h.options.pendingAttachments.value = []
+      await h.api.checkDelivery(id)
+      expect(h.options.inputText.value).toBe('a different request')
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([expect.objectContaining({ draftAvailable: true })])
+      h.options.inputText.value = ''
+      await h.api.checkDelivery(id)
+      expect(h.options.inputText.value).toBe('review\nC:/notes/source.txt')
+      expect(h.options.selectedSkills!.value).toEqual(skills)
+      expect(h.options.localPathReferences!.value).toEqual(['C:/notes/source.txt'])
+      expect(h.options.pendingSessionIntent.value).toBe('new_chat')
+      expect(h.options.pendingWorkspaceId!.value).toBe('workspace-1')
+      expect(h.options.pendingAttachments.value).toEqual([attachment])
+      expect(h.commands.resolveReceipt).toHaveBeenCalledOnce()
+      expect(h.commands.send).toHaveBeenCalledOnce()
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+
+  it('recovers annotation-only material after page recreation without an in-memory SendAttempt', async () => {
+    vi.useFakeTimers()
+    const wal = memoryDeliveryWal()
+    const h = queuedSendHarness({ inputText: ref(''), pendingInputWal: wal,
+      draftIds: ref(['original-note']), promptAnnotationSnapshots: () => [closureAnnotation] })
+    try {
+      h.commands.supportsResolvableSend = () => true
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost ACK', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(6_000)
+      const id = h.api.deliveryRecoveryEntries.value[0]!.id
+      h.api.dispose(); h.options.durableDelivery.dispose()
+      const restored = ref<PromptAnnotationSnapshot[]>([])
+      const fresh = queuedSendHarness({ inputText: ref(''), pendingInputWal: wal, draftIds: ref([]),
+        restorePromptAnnotations: (snapshots) => { restored.value = [...snapshots]; return true } })
+      fresh.commands.supportsResolvableSend = () => true
+      await fresh.options.durableDelivery.wake()
+      await fresh.api.checkDelivery(id)
+      expect(restored.value).toEqual([expect.objectContaining({ annotationId: 'original-note', body: closureAnnotation.body })])
+      expect(fresh.options.inputText.value).toBe('')
+      expect(fresh.commands.send).not.toHaveBeenCalled()
+      expect(fresh.options.adoptResponseSession).not.toHaveBeenCalled()
+      expect(fresh.api.deliveryRecoveryEntries.value).toEqual([])
+      fresh.options.durableDelivery.dispose()
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+
+  it('closes accepted-unavailable without restoring, routing, or consuming a newer annotation edit twice', async () => {
+    vi.useFakeTimers()
+    let current = { ...closureAnnotation }
+    const acknowledge = vi.fn((snapshots: readonly PromptAnnotationSnapshot[]) => {
+      if (snapshots[0]?.body === current.body) throw new Error('newer annotation was incorrectly acknowledged')
+    })
+    const h = queuedSendHarness({ inputText: ref(''), draftIds: ref(['original-note']),
+      promptAnnotationSnapshots: () => [current], acknowledgePromptAnnotations: acknowledge,
+      restorePromptAnnotations: vi.fn(() => true) })
+    try {
+      h.commands.supportsResolvableSend = () => true
+      h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost ACK', undefined, null))
+      await h.api.onSend()
+      await vi.advanceTimersByTimeAsync(6_000)
+      current = { ...closureAnnotation, body: 'A newer edited instruction' }
+      h.options.inputText.value = 'new draft'
+      h.commands.resolveReceipt.mockResolvedValue({ status: 'accepted-unavailable' })
+      const id = h.api.deliveryRecoveryEntries.value[0]!.id
+      await h.api.checkDelivery(id)
+      await h.api.recoverResponseHandoffs()
+      await h.options.durableDelivery.wake()
+      expect(acknowledge).toHaveBeenCalledOnce()
+      expect(acknowledge.mock.calls[0]![0][0]?.body).toBe(closureAnnotation.body)
+      expect(current.body).toBe('A newer edited instruction')
+      expect(h.options.inputText.value).toBe('new draft')
+      expect(h.options.restorePromptAnnotations).not.toHaveBeenCalled()
+      expect(h.options.adoptResponseSession).not.toHaveBeenCalled()
+      expect(h.options.activeStreamTaskId.value).toBe('')
+      expect(h.api.deliveryRecoveryEntries.value).toEqual([])
+      expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+      expect(h.api.acceptanceStopAvailableForCurrentSession.value).toBe(false)
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+})
 
 describe('ordinary send recovery stays separate from rendering', () => {
   it('keeps a running turn after navigating A, sending in B, and returning before A ACK', async () => {
@@ -474,6 +793,379 @@ function savedDelivery(id: string, overrides: Partial<DeliveryWalRecord> = {}): 
     ...overrides,
   }
 }
+
+describe('explicit continuation past a closed unknown admission', () => {
+  function harness(overrides: Partial<UseChatSendOptions> = {}) {
+    const taskOwnership = useChatTaskOwnership(false)
+    const h = queuedSendHarness({ taskOwnership, canContinueAfterClosedAdmission: () => true, ...overrides })
+    h.commands.supportsResolvableSend = () => true
+    h.commands.lookupReceipt.mockResolvedValue({ status: 'unsupported' })
+    h.commands.resolveReceipt.mockResolvedValue({ status: 'not-found' })
+    return { ...h, taskOwnership }
+  }
+
+  async function restartIdle(h: ReturnType<typeof harness>) {
+    h.commands.isAdmissionClosed.mockReturnValue(true)
+    const waking = h.options.durableDelivery.wake()
+    if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(31_000)
+    await waking
+    h.taskOwnership.applySnapshot({ run_status: 'idle', active_task: null, last_task: null }, true)
+    h.options.stream.isStreaming.value = false
+    await nextTick()
+  }
+
+  it('retains an expired-token attempt and waits for explicit new input after a later policy tick', async () => {
+    const attachment = { kind: 'staged' as const, local_id: 1, name: 'notes.txt', mime: 'text/plain', file_uuid: 'original-upload' }
+    const h = harness({ pendingAttachments: ref([attachment]),
+      draftIds: ref(['original-note']), promptAnnotationSnapshots: () => [closureAnnotation] })
+    const oldEpoch = `v2.${'a'.repeat(32)}.100.125`
+    let currentEpoch = oldEpoch
+    h.commands.getReceiptEpoch = () => currentEpoch
+    h.commands.isAdmissionClosed.mockImplementation(() => currentEpoch !== oldEpoch)
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('unavailable',
+      'Request admission is closed; its earlier outcome is unknown', 'UNAVAILABLE', null, false))
+    await h.api.onSend()
+    const oldId = h.commands.send.mock.calls[0]![0].params.clientRequestId!
+    expect(await h.options.durableDelivery.get(oldId)).toMatchObject({
+      phase: 'unknown', request: { request: { acceptanceEpoch: oldEpoch } },
+      handoff: { composerText: 'unrelated composer draft', recoveryAttachments: [attachment],
+        recoveryPromptAnnotations: [expect.objectContaining({ body: closureAnnotation.body })] },
+    })
+    currentEpoch = `v2.${'a'.repeat(32)}.125.150`
+    await h.options.durableDelivery.wake()
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    h.options.stream.isStreaming.value = false
+    await nextTick()
+    await h.api.onSend()
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    h.options.inputText.value = 'An intentional new instruction after the server window advanced.'
+    await h.api.onSend({ explicitNewInput: true })
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    expect(h.commands.send.mock.calls[1]![0]).toMatchObject({ acceptanceEpoch: currentEpoch })
+    expect(h.commands.send.mock.calls[1]![0].params.clientRequestId).not.toBe(oldId)
+    expect(await h.options.durableDelivery.get(oldId)).toMatchObject({
+      phase: 'unknown', request: { request: { acceptanceEpoch: oldEpoch } },
+    })
+  })
+
+  it.each([false, true])('allows a fresh explicit ID in the original session; pending Stop=%s', async stopped => {
+    vi.useFakeTimers()
+    const h = harness()
+    try {
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    let fail!: (error: Error) => void
+    h.commands.send.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject }))
+    const first = h.api.onSend()
+    await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+    if (stopped) h.api.onStop()
+    fail(new TurnCommandError('transport', 'lost response', undefined, null))
+    await first
+    const oldId = h.commands.send.mock.calls[0]![0].params.clientRequestId!
+    await restartIdle(h)
+    expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+    expect(h.api.acceptanceStopAvailableForCurrentSession.value).toBe(false)
+    expect(h.api.durableStopPendingForCurrentSession.value).toBe(false)
+    h.options.inputText.value = 'explicit new message'
+    h.commands.send.mockResolvedValueOnce({ taskId: 'new-task', taskStatus: 'running' })
+    await Promise.all([h.api.onSend({ explicitNewInput: true }), h.api.onSend({ explicitNewInput: true })])
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    expect(h.commands.send.mock.calls[1]![0].params.clientRequestId).not.toBe(oldId)
+    expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+    expect(h.commands.cancel).not.toHaveBeenCalled()
+    expect(h.options.enqueuePendingInput).not.toHaveBeenCalled()
+    const record = await h.options.pendingInputWal!.getDelivery!(oldId)
+    expect(record?.phase).toBe('unknown')
+    expect(record?.retired).not.toBe(true)
+    if (stopped) expect(record?.stop).toMatchObject({ requested: true })
+    h.taskOwnership.noteTerminal('new-task')
+    h.options.stream.isStreaming.value = false
+    h.options.inputText.value = 'automatic draft'
+    await h.api.onSend()
+    await h.api.sendQueuedFollowup({ pendingUiId: 'queued', text: 'queued content', attachments: [], intent: null }, h.scope.sessionKey)
+    const waking = h.options.durableDelivery.wake()
+    await vi.advanceTimersByTimeAsync(31_000)
+    await waking
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+
+  it.each(['no-proof', 'hydrating', 'running', 'queued', 'additional-work', 'blocked'] as const)(
+    'keeps the normal admission gate for %s', async gate => {
+      const h = harness()
+      const wal = h.options.pendingInputWal!
+      await wal.prepareDelivery!(savedDelivery('old', { deliveryIdentity: h.scope.deliveryIdentity,
+        schemaVersion: 3 }))
+      await restartIdle(h)
+      if (gate === 'no-proof') { h.commands.isAdmissionClosed.mockReturnValue(false); await h.options.durableDelivery.wake() }
+      if (gate === 'hydrating') h.taskOwnership.beginHydration()
+      if (gate === 'running') h.taskOwnership.noteRunning('still-running')
+      if (gate === 'queued') h.taskOwnership.noteQueued('still-queued')
+      if (gate === 'additional-work') h.options.canContinueAfterClosedAdmission = () => false
+      if (gate === 'blocked') h.options.sendBlockedReason = ref('blocked')
+      await h.api.onSend({ explicitNewInput: true })
+      expect(h.commands.send).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([false, true])('does not mistake its own stream projection for authoritative work; fork=%s', async fork => {
+    vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const messages = ref<ChatMessage[]>([])
+    const projectedStatus = ref('idle')
+    const stream = useChatStream({ messages, lastHeaderRole: ref(''), aborted: ref(false), autoScroll: ref(false),
+      applySessionRunState: source => { projectedStatus.value = String(source?.run_status || 'idle') },
+      renderMarkdown: text => text, stripDirectiveTags: text => text,
+      stripGeneratedArtifactMarkers: text => text, scrollToBottom: vi.fn() })
+    const ownerContext = ref<UseChatSendOptions['pendingQueueOwnerContext']['value']>(null)
+    const h = harness({ messages, stream, pendingQueueOwnerContext: ownerContext,
+      pendingForkBeforeMessageId: ref(fork ? 'new-fork-anchor' : null),
+      canContinueAfterClosedAdmission: afterStartingStream => Boolean(afterStartingStream
+        || (projectedStatus.value === 'idle' && !ownerContext.value)),
+    })
+    try {
+      await h.options.pendingInputWal!.prepareDelivery!(savedDelivery('old', {
+        deliveryIdentity: h.scope.deliveryIdentity, schemaVersion: 3,
+      }))
+      await restartIdle(h)
+      h.commands.send.mockResolvedValueOnce({ taskId: 'new-task', taskStatus: 'running' })
+      await h.api.onSend({ explicitNewInput: true })
+      expect(projectedStatus.value).toBe('running')
+      expect(h.commands.send).toHaveBeenCalledOnce()
+      expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+      expect(h.api.sendPending.value).toBe(false)
+    } finally { h.api.dispose(); h.options.durableDelivery.dispose(); stream.cleanup(); vi.unstubAllGlobals() }
+  })
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])(
+    'does not assign a new ID to an unchanged unknown draft; reload=%s, annotations=%s', async (reload, annotations) => {
+    const draft: Partial<UseChatSendOptions> = annotations ? {
+      inputText: ref(''), draftIds: ref([closureAnnotation.annotationId]),
+      promptAnnotationSnapshots: () => [closureAnnotation],
+    } : {}
+    const original = harness(draft)
+    original.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    original.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost response', undefined, null))
+    await original.api.onSend()
+    const oldId = original.commands.send.mock.calls[0]![0].params.clientRequestId!
+    let h = original
+    if (reload) {
+      original.api.dispose(); original.options.durableDelivery.dispose()
+      h = harness({ ...draft, pendingInputWal: original.options.pendingInputWal })
+    }
+    await restartIdle(h)
+    h.options.inputText.value = annotations ? '' : 'unrelated composer draft'
+    await h.api.onSend({ explicitNewInput: true })
+    expect(h.commands.send).toHaveBeenCalledTimes(reload ? 0 : 1)
+    expect((await h.options.pendingInputWal!.getDelivery!(oldId))?.phase).toBe('unknown')
+    expect(h.options.inputText.value).toBe(annotations ? '' : 'unrelated composer draft')
+  })
+
+  it('rechecks continuation permission after asynchronous WAL preparation', async () => {
+    const h = harness()
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost response', undefined, null))
+    await h.api.onSend()
+    await restartIdle(h)
+    const wal = h.options.pendingInputWal!
+    const prepare = wal.prepareDelivery!
+    let release!: () => void
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const preparing = vi.fn(async (...args: Parameters<typeof prepare>) => { await blocked; return prepare(...args) })
+    wal.prepareDelivery = preparing
+    h.options.inputText.value = 'new explicit input'
+    const sending = h.api.onSend({ explicitNewInput: true })
+    await vi.waitFor(() => expect(preparing).toHaveBeenCalledOnce())
+    h.options.canContinueAfterClosedAdmission = () => false
+    release()
+    await sending
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.options.inputText.value).toBe('new explicit input')
+  })
+
+  it.each(['default', 'plan'] as const)('does not resend an unchanged first-task draft in %s mode', async mode => {
+    const h = harness({ pendingSessionIntent: ref('new_chat'), initialCollaborationMode: ref(mode) })
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost response', undefined, null))
+    await h.api.onSend()
+    await restartIdle(h)
+    h.options.inputText.value = 'unrelated composer draft'
+    await h.api.onSend({ explicitNewInput: true })
+    expect(h.commands.send).toHaveBeenCalledOnce()
+  })
+
+  it.each(['none', 'before-new', 'after-new'])('keeps a late fork receipt in the background; reload=%s', async reload => {
+    const original = harness({ pendingForkBeforeMessageId: ref('fork-anchor') })
+    original.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    original.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost response', undefined, null))
+    await original.api.onSend()
+    const oldId = original.commands.send.mock.calls[0]![0].params.clientRequestId!
+    let h = original
+    if (reload === 'before-new') {
+      original.api.dispose(); original.options.durableDelivery.dispose()
+      h = harness({ pendingInputWal: original.options.pendingInputWal })
+    }
+    await restartIdle(h)
+    h.options.pendingForkBeforeMessageId.value = null
+    h.options.inputText.value = 'new input in original session'
+    h.commands.send.mockResolvedValueOnce({ taskId: 'new-task', taskStatus: 'running' })
+    await h.api.onSend({ explicitNewInput: true })
+    expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+    expect((await h.options.pendingInputWal!.getDelivery!(oldId))?.handoff?.backgroundOnly).toBe(true)
+    if (reload === 'after-new') {
+      const wal = h.options.pendingInputWal
+      h.api.dispose(); h.options.durableDelivery.dispose()
+      h = harness({ pendingInputWal: wal })
+      h.taskOwnership.noteRunning('new-task')
+      h.commands.isAdmissionClosed.mockReturnValue(true)
+      await h.options.durableDelivery.wake()
+      await h.api.recoverResponseHandoffs()
+    }
+    h.options.inputText.value = 'newer draft'
+    h.commands.resolveReceipt.mockResolvedValueOnce({ status: 'found',
+      response: { taskId: 'old-task', taskStatus: 'running', sessionKey: 'child-session' } })
+    await h.api.checkDelivery(oldId)
+    await flushDelivery()
+    expect(h.options.adoptResponseSession).not.toHaveBeenCalled()
+    expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+    expect(h.options.inputText.value).toBe('newer draft')
+    expect(h.options.sessionKey.value).toBe(h.scope.sessionKey)
+  })
+
+  it('keeps new input editable if releasing old composer ownership cannot be persisted', async () => {
+    const h = harness()
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost response', undefined, null))
+    await h.api.onSend()
+    await restartIdle(h)
+    h.options.inputText.value = 'new input'
+    const detach = vi.spyOn(h.options.durableDelivery, 'detachComposer').mockResolvedValueOnce(false)
+    await h.api.onSend({ explicitNewInput: true })
+    expect(h.commands.send).toHaveBeenCalledOnce()
+    expect(h.options.inputText.value).toBe('new input')
+    detach.mockRestore()
+    await h.api.onSend({ explicitNewInput: true })
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['accepted', 'unknown', 'not-sent'] as const)(
+    'honors a peer detach while the original %s result is awaiting WAL persistence', async outcome => {
+      const h = harness()
+      h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+      const wal = h.options.pendingInputWal!
+      const cas = wal.compareAndSwapDelivery!
+      let release!: () => void
+      const blocked = new Promise<void>(resolve => { release = resolve })
+      let waiting = false
+      wal.compareAndSwapDelivery = async (id, revision, record) => {
+        if (!waiting && record?.phase === outcome) { waiting = true; await blocked }
+        return cas(id, revision, record)
+      }
+      if (outcome === 'accepted') h.commands.send.mockResolvedValueOnce({ taskId: 'old-task', taskStatus: 'running' })
+      else h.commands.send.mockRejectedValueOnce(new TurnCommandError(
+        'transport', 'delayed original result', undefined, outcome === 'not-sent' ? false : null))
+      const accepted = vi.fn()
+      const sending = h.api.onSend({ onAccepted: accepted })
+      await vi.waitFor(() => expect(waiting).toBe(true))
+      const oldId = h.commands.send.mock.calls[0]![0].params.clientRequestId!
+      const peer = harness({ pendingInputWal: wal })
+      peer.commands.isAdmissionClosed.mockReturnValue(true)
+      expect(await peer.options.durableDelivery.detachComposer(oldId)).toBe(true)
+      h.taskOwnership.noteRunning('new-task')
+      h.options.activeStreamTaskId.value = 'new-task'
+      h.options.inputText.value = 'newer draft'
+      release()
+      await sending
+      expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+      expect(h.options.activeStreamTaskId.value).toBe('new-task')
+      expect(h.options.inputText.value).toBe('newer draft')
+      expect(accepted).not.toHaveBeenCalled()
+      expect(h.commands.send).toHaveBeenCalledOnce()
+      expect(h.commands.cancel).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not let a delayed old running receipt steal the new task or consume its draft', async () => {
+    const h = harness()
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    let receipt!: (response: TurnReceiptResult) => void
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost response', undefined, null))
+    await h.api.onSend()
+    const oldId = h.commands.send.mock.calls[0]![0].params.clientRequestId!
+    await restartIdle(h)
+    h.commands.resolveReceipt.mockImplementationOnce(() => new Promise(resolve => { receipt = resolve }))
+    const checking = h.api.checkDelivery(oldId)
+    await vi.waitFor(() => expect(h.commands.resolveReceipt).toHaveBeenCalledOnce())
+    h.options.inputText.value = 'new explicit message'
+    h.commands.send.mockResolvedValueOnce({ taskId: 'new-task', taskStatus: 'running' })
+    await h.api.onSend({ explicitNewInput: true })
+    expect(h.commands.send).toHaveBeenCalledTimes(2)
+    h.options.inputText.value = 'next draft untouched'
+    receipt({ status: 'found', response: { taskId: 'old-task', taskStatus: 'running' } })
+    await checking
+    await flushDelivery()
+    expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+    expect(h.options.inputText.value).toBe('next draft untouched')
+    expect((await h.options.pendingInputWal!.getDelivery!(oldId))?.phase).toBe('accepted')
+    expect(h.commands.cancel).not.toHaveBeenCalled()
+  })
+
+  it.each(['found', 'accepted-unavailable'] as const)('keeps a peer-detached %s receipt history-only', async status => {
+    const h = harness()
+    h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+    h.commands.send.mockRejectedValueOnce(new TurnCommandError('transport', 'lost response', undefined, null))
+    const accepted = vi.fn()
+    await h.api.onSend({ onAccepted: accepted })
+    const oldId = h.commands.send.mock.calls[0]![0].params.clientRequestId!
+    await restartIdle(h)
+    const peer = harness({ pendingInputWal: h.options.pendingInputWal })
+    peer.commands.isAdmissionClosed.mockReturnValue(true)
+    expect(await peer.options.durableDelivery.detachComposer(oldId)).toBe(true)
+    h.taskOwnership.noteRunning('new-task')
+    h.options.inputText.value = 'newer draft'
+    h.commands.resolveReceipt.mockResolvedValueOnce(status === 'found'
+      ? { status, response: { taskId: 'old-task', taskStatus: 'running' } } : { status })
+    await h.api.checkDelivery(oldId)
+    await flushDelivery()
+    expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+    expect(h.options.inputText.value).toBe('newer draft')
+    expect(accepted).not.toHaveBeenCalled()
+  })
+
+  it('clears the old local Stop latch when its exact durable cancellation finishes', async () => {
+    vi.useFakeTimers()
+    const h = harness()
+    try {
+      h.taskOwnership.applySnapshot({ run_status: 'idle' }, true)
+      let fail!: (error: Error) => void
+      h.commands.send.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = reject }))
+      const first = h.api.onSend()
+      await vi.waitFor(() => expect(h.commands.send).toHaveBeenCalledOnce())
+      h.api.onStop()
+      fail(new TurnCommandError('transport', 'lost response', undefined, null))
+      await first
+      const oldId = h.commands.send.mock.calls[0]![0].params.clientRequestId!
+      await restartIdle(h)
+      h.options.inputText.value = 'new input'
+      h.commands.send.mockResolvedValueOnce({ taskId: 'new-task', taskStatus: 'running' })
+      await h.api.onSend({ explicitNewInput: true })
+      h.commands.resolveReceipt.mockResolvedValue({ status: 'found',
+        response: { taskId: 'old-task', taskStatus: 'running' } })
+      const checking = h.api.checkDelivery(oldId)
+      await vi.advanceTimersByTimeAsync(31_000)
+      await checking
+      expect(h.commands.cancel).toHaveBeenCalledOnce()
+      expect((await h.options.pendingInputWal!.getDelivery!(oldId))?.stop?.completed).toBe(true)
+      expect(h.taskOwnership.runningTaskId.value).toBe('new-task')
+      expect(h.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(false)
+      h.taskOwnership.noteTerminal('new-task')
+      h.options.stream.isStreaming.value = false
+      h.options.inputText.value = 'next message'
+      await h.api.onSend({ explicitNewInput: true })
+      expect(h.commands.send).toHaveBeenCalledTimes(3)
+    } finally { h.options.durableDelivery.dispose(); vi.useRealTimers() }
+  })
+})
 
 describe('current identity delivery recovery', () => {
   it.each([

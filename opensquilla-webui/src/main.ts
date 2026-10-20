@@ -91,6 +91,7 @@ const stopDeliveryWatch = watch(() => [
   gatewayAdapters.gatewayAccess.isAvailable,
   gatewayAdapters.gatewayAccess.connectionPhase,
   gatewayAdapters.gatewayAccess.subscriptionEpoch,
+  gatewayAdapters.turnCommands.getReceiptEpoch?.(),
 ], () => { void durableDelivery.wake() }, { immediate: true })
 const stopDeliveryEvents = gatewayAdapters.conversationEvents.subscribe({
   onEvent(message) {

@@ -48,6 +48,29 @@ async function ready(persistence: ReturnType<typeof useAttachmentDraftPersistenc
 }
 
 describe('attachment draft ownership', () => {
+  it('reports persistence proof only after its write commits and retains failure evidence', async () => {
+    const committed = deferred<void>()
+    const f = fixture({ save: vi.fn(() => committed.promise) })
+    await ready(f.persistence)
+    f.attachments.value = [item]
+    let completed = false
+    const flushing = f.persistence.flush().then(result => { completed = result })
+    await Promise.resolve()
+    expect(completed).toBe(false)
+    committed.resolve()
+    await flushing
+    expect(completed).toBe(true)
+    f.persistence.dispose()
+    const failed = fixture({ save: vi.fn(async () => { throw new Error('quota') }) })
+    await ready(failed.persistence)
+    failed.attachments.value = [item]
+    await expect(failed.persistence.flush()).resolves.toBe(false)
+    vi.mocked(failed.store.save).mockResolvedValue(undefined)
+    failed.attachments.value = [{ ...item }]
+    await expect(failed.persistence.flush()).resolves.toBe(true)
+    failed.persistence.dispose()
+  })
+
   it('restores a Blob-backed draft only for the matching gateway/user/session scope', async () => {
     const f = fixture({ load: vi.fn(async () => [{ ...item, file: new File(['text'], item.name) }]) })
     await ready(f.persistence)

@@ -49,7 +49,7 @@ async function interceptAdmission(page: Page, fault: 'hold-first-ack' | 'lose-fi
       const frame = JSON.parse(String(raw)) as Request
       if (frame.type === 'req') {
         const sent = ++order
-        if (frame.method === 'chat.send') {
+        if (frame.method === 'chat.send' || frame.method === 'chat.send.v2') {
           const send = { request: frame }
           sends.push(send)
           pending.set(frame.id, send)
@@ -203,7 +203,7 @@ function observeHealthyAdmission(page: Page) {
     socket.on('framesent', ({ payload }) => {
       const frame = JSON.parse(String(payload)) as Request
       if (frame.type !== 'req') return
-      if (frame.method === 'chat.send') {
+      if (frame.method === 'chat.send' || frame.method === 'chat.send.v2') {
         const send = { request: frame }
         sends.push(send)
         pending.set(frame.id, send)

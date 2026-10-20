@@ -6,6 +6,7 @@ import type {
 import {
   SessionReadSessionMissingError,
   SessionReadFailure,
+  SessionReadContractError,
   type SessionReadActivity,
   type SessionReadLease,
   type SessionReadLeaseReader,
@@ -92,12 +93,12 @@ export interface SessionSubscriptionOutcome {
 
 export type SessionSubscriptionResult = boolean | void | SessionSubscriptionOutcome
 
-/** Treat only explicit structured failures (or legacy false) as non-authoritative. */
+/** Completion without an affirmative outcome is not proof of recovery. */
 export function isAuthoritativeSessionSubscription(
   value: SessionSubscriptionResult,
 ): boolean {
-  if (typeof value === 'object' && value !== null) return value.authoritative === true
-  return value !== false
+  if (typeof value === 'object' && value !== null) return value.authoritative === true && value.cancelled !== true
+  return value === true
 }
 
 const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
@@ -117,7 +118,10 @@ function waitForMetadataRetry<T>(
   signal: AbortSignal,
   timeoutMs: number,
 ): Promise<T> {
-  if (signal.aborted) return Promise.reject(localAbortError('Metadata retry was cancelled.'))
+  if (signal.aborted) {
+    void operation.catch(() => {})
+    return Promise.reject(localAbortError('Metadata retry was cancelled.'))
+  }
   return new Promise<T>((resolve, reject) => {
     let settled = false
     const finish = (callback: () => void) => {
@@ -129,7 +133,7 @@ function waitForMetadataRetry<T>(
     }
     const abort = () => finish(() => reject(localAbortError('Metadata retry was cancelled.')))
     const timer = setTimeout(
-      () => finish(() => reject(new Error('Session metadata recovery timed out.'))),
+      () => finish(() => reject(new SessionReadFailure('timeout', 'Session metadata recovery timed out.', true))),
       timeoutMs,
     )
     signal.addEventListener('abort', abort, { once: true })
@@ -212,13 +216,22 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     metadata: SessionReadMetadata,
     activity: SessionReadActivity = 'unknown',
     ownershipRevision?: number,
+    isCurrent?: () => boolean,
   ): SessionSubscriptionOutcome {
+    const assertCurrent = () => {
+      if (isCurrent && !isCurrent()) throw localAbortError('Session metadata owner changed during installation.')
+    }
+    assertCurrent()
+    if (metadata.sessionKey !== key || !metadata.hydrationComplete) {
+      throw new SessionReadContractError('Session metadata is incomplete or belongs to another session.')
+    }
     assertOwnershipSnapshotCurrent(ownershipRevision)
-    metadataRecoveryError.value = null
     if (metadataGeneration !== undefined) {
       options.onSessionMetadata?.(key, metadataGeneration, metadata)
     }
+    assertCurrent()
     options.onRunModeLock?.(metadata.runModeLock)
+    assertCurrent()
     const source = metadataRunStatusSource(metadata)
     const rawActiveTask = source.activeTask || null
     const rawActiveTaskId = chatTaskId(rawActiveTask)
@@ -231,7 +244,11 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       : metadata
     const effectiveSource = metadataRunStatusSource(effectiveMetadata)
     options.onSnapshot?.(effectiveMetadata)
-    options.taskOwnership?.applySnapshot(effectiveSource, true, ownershipRevision)
+    assertCurrent()
+    assertOwnershipSnapshotCurrent(ownershipRevision)
+    if (options.taskOwnership && !options.taskOwnership.applySnapshot(effectiveSource, true, ownershipRevision)) {
+      throw new SessionReadFailure('busy', 'Task ownership changed while installing metadata.', true)
+    }
     // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
     // The subscription can race ahead of the original ingress commit, so only
     // the matching send transaction (receipt/rejection) or an explicit session
@@ -306,6 +323,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       backgroundOnly: groupLive && !taskOrInterruptLive,
     }
     if (!outcome.live) options.onAuthoritativeIdle?.()
+    assertCurrent()
+    metadataRecoveryError.value = null
     return outcome
   }
 
@@ -361,7 +380,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!metadata.hydrationComplete) {
         throw new Error('Session state hydration remained incomplete')
       }
-      applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity, ownershipRevision)
+      applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity, ownershipRevision,
+        () => isCurrentSubscription(lease, key, sequence, signal) && metadataHydration === metadataHydrationSequence)
     }).catch((cause) => {
       if (
         !isCurrentSubscription(lease, key, sequence, signal)
@@ -452,6 +472,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           live.initialMetadata,
           live.activity,
           ownershipRevision,
+          () => isCurrentSubscription(lease, key, sequence, signal),
         )
         if (reconciliation) await options.onReconciliationInstalled?.()
         if (!isCurrentSubscription(lease, key, sequence, signal)) return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
@@ -562,7 +583,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!hydration.hydrationComplete) {
         throw new Error('Session state hydration remained incomplete')
       }
-      applyHydratedSubscriptionState(key, metadataGeneration, hydration, 'unknown', ownershipRevision)
+      applyHydratedSubscriptionState(key, metadataGeneration, hydration, 'unknown', ownershipRevision, isCurrent)
       return true
     } catch (cause) {
       if (isCurrent() && metadataGeneration !== undefined) {

@@ -159,10 +159,8 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    # V2 recovery, video discovery, message search, five interactive terminal
-    # methods, side create/close and workspace creation add sixteen to the
-    # previous 269-method surface.
-    assert len(registry.list_methods()) == 285
+    # Freeze the complete surface, including versioned send and receipt resolution.
+    assert len(registry.list_methods()) == 287
     workspace_entry = registry.get_entry("workspaces.create")
     assert workspace_entry is not None
     assert workspace_entry.required_scope == "operator.write"
@@ -207,6 +205,12 @@ def test_production_registry_uses_contract_wrappers_without_surface_drift() -> N
     assert receipt_entry.required_scope == "operator.read"
     assert receipt_entry.generated_contract_name == "turns.receipt.get"
     assert receipt_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    for method in ("chat.send.v2", "turns.receipt.resolve"):
+        resolution_entry = registry.get_entry(method)
+        assert resolution_entry is not None
+        assert resolution_entry.required_scope == "operator.write"
+        assert resolution_entry.generated_contract_name == method
+        assert resolution_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert tuple(PRODUCTION_HANDLER_NAMES) == SANDBOX_RUNTIME_CONTRACT_METHODS
     for method, implementation_name in PRODUCTION_HANDLER_NAMES.items():
         entry = registry.get_entry(method)

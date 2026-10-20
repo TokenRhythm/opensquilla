@@ -307,7 +307,7 @@ test('real Send waits for signed Gateway idle after the answer and Send button a
     },
     snapshot: async () => {
       snapshots += 1
-      return { requests: [{ method: 'chat.send', params: { message: 'synthetic turn' } }] }
+      return { requests: [{ method: 'chat.send.v2', params: { message: 'synthetic turn' } }] }
     },
   })
   const button = {
@@ -554,6 +554,15 @@ test('browser observation forwards every original frame and records terminal eve
   ])
   assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('private-'), false)
   assert.equal(socket.sent.at(-1), request, 'Diagnostics must forward the unmodified request')
+  const send = JSON.stringify({ type: 'req', id: 'send-v2', method: 'chat.send.v2',
+    params: { sessionKey: 'session-a', message: 'Retained profile synthetic turn', clientRequestId: 'private-request-id' } })
+  assert.equal(socket.send(send), 'original-return')
+  const sends = context.__retainedAuditRpc.requests.filter(item => item.method === 'chat.send.v2')
+  assert.equal(sends.length, 1, 'The versioned renderer send must be observed exactly once')
+  assert.equal(sends[0].params.message, 'Retained profile synthetic turn')
+  assert.equal(sends[0].params.sessionKey, 'session-a')
+  assert.equal(socket.sent.at(-1), send, 'Observation must preserve the versioned request')
+  assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('private-request-id'), false)
 })
 
 async function providerFixture(t) {

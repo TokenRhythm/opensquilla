@@ -1,4 +1,4 @@
-import { ref, type Ref } from 'vue'
+import { nextTick, ref, type Ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type {
@@ -37,8 +37,10 @@ function createBootstrap(overrides: {
   reconcileSession?: (context: SessionBootstrapPhaseContext) => Promise<SessionSubscriptionOutcome>
   connectionState?: Ref<string>
   metadataRecoveryError?: Ref<unknown>
+  metadataReady?: Ref<boolean>
   retryMetadata?: () => Promise<unknown>
   isProvisionalDraft?: () => boolean
+  incidentScope?: () => string
 } = {}) {
   const loadHistoryImplementation = overrides.loadHistory || (async () => ({ ok: true }))
   const loadHistory = vi.fn(async (
@@ -79,8 +81,10 @@ function createBootstrap(overrides: {
     reconcileSession: overrides.reconcileSession,
     connectionState: overrides.connectionState,
     metadataRecoveryError: overrides.metadataRecoveryError,
+    metadataReady: overrides.metadataReady,
     retryMetadata: overrides.retryMetadata,
     isProvisionalDraft: overrides.isProvisionalDraft,
+    incidentScope: overrides.incidentScope,
     cancelHistory,
     cancelSubscription,
   })
@@ -101,6 +105,451 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('keeps dismissal and the existing wait when first authority binds during a failed read', async () => {
+    vi.useFakeTimers()
+    const authority = ref('')
+    const failure = { ...LIVE_READY, authoritative: false,
+      error: new SessionReadFailure('busy', 'Waiting for storage', true, 20_000) }
+    const reconcileSession = vi.fn(async () => failure)
+    const h = createBootstrap({
+      connectionState: ref('connected'), incidentScope: () => authority.value,
+      subscribeSession: async () => failure, reconcileSession,
+    })
+    await h.api.startSessionBootstrap().live
+    await vi.advanceTimersByTimeAsync(5_000)
+    authority.value = 'authority-a'
+    await nextTick()
+    h.api.dismissRecoveryNotice()
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(reconcileSession).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(reconcileSession).toHaveBeenCalledOnce()
+    expect(h.api.noticeDismissed.value).toBe(true)
+    expect(h.openSessionRead).toHaveBeenCalledOnce()
+    expect(h.subscribeSession.mock.calls.every(call => call[0].deadlineAt === h.subscribeSession.mock.calls[0]![0].deadlineAt)).toBe(true)
+    h.api.cancelSessionBootstrap()
+  })
+
+  describe('service wake after exhaustion', () => {
+    async function outage(retryAfter = 0) {
+      vi.useFakeTimers()
+      let available = false
+      const connectionState = ref('connected')
+      const h = createBootstrap({
+        connectionState,
+        subscribeSession: async () => available ? LIVE_READY : {
+          ...LIVE_READY, authoritative: false,
+          error: new SessionReadFailure('unavailable', 'Session service unavailable', true, retryAfter),
+        },
+      })
+      await h.api.startSessionBootstrap().live
+      await vi.advanceTimersByTimeAsync(retryAfter ? 125_000 : 150_000)
+      return { ...h, connectionState, recover: () => { available = true } }
+    }
+
+    it('recovers on a real health return, without treating duplicate connected events as new attempts', async () => {
+      const h = await outage()
+      const reads = h.subscribeSession.mock.calls.length
+      h.recover()
+      await h.api.handleConnectionState('connected')?.live
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads)
+      h.connectionState.value = 'connecting'
+      await nextTick()
+      h.connectionState.value = 'connected'
+      await nextTick()
+      await h.api.currentSessionBootstrap()?.live
+      expect(h.api.isLiveReady()).toBe(true)
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads + 1)
+      await vi.advanceTimersByTimeAsync(180_000)
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads + 1)
+      h.api.cancelSessionBootstrap()
+    })
+
+    it('coalesces wake signals behind a long Retry-After without renewing it or the old deadline', async () => {
+      const h = await outage(180_000)
+      const oldDeadline = h.subscribeSession.mock.calls[0]![0].deadlineAt
+      h.recover()
+      const wake = h.api.recoverAfterServiceWake()!
+      for (let i = 0; i < 20; i++) h.api.recoverAfterServiceWake()
+      await vi.advanceTimersByTimeAsync(54_999)
+      expect(h.subscribeSession).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1)
+      await wake.live
+      expect(h.subscribeSession).toHaveBeenCalledTimes(2)
+      expect(h.subscribeSession.mock.calls[1]![0].deadlineAt).toBe(oldDeadline + 67_000)
+      expect(h.api.isLiveReady()).toBe(true)
+      h.api.cancelSessionBootstrap()
+    })
+
+    it('does not turn a failed wake into a fresh automatic retry episode', async () => {
+      const h = await outage()
+      const wake = h.api.recoverAfterServiceWake()!
+      await wake.live
+      const reads = h.subscribeSession.mock.calls.length
+      for (let i = 0; i < 20; i++) await h.api.retryLive(false)
+      await vi.advanceTimersByTimeAsync(300_000)
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads)
+      expect(h.api.isLiveReady()).toBe(false)
+      h.recover()
+      await h.api.retryLive(true)
+      expect(h.api.isLiveReady()).toBe(true)
+      h.api.cancelSessionBootstrap()
+    })
+
+    it('cancels a delayed wake without reading a retired session', async () => {
+      const h = await outage(180_000)
+      const wake = h.api.recoverAfterServiceWake()!
+      h.api.cancelSessionBootstrap()
+      h.recover()
+      await vi.advanceTimersByTimeAsync(180_000)
+      await wake.live
+      expect(h.subscribeSession).toHaveBeenCalledOnce()
+      expect(h.api.isLiveReady()).toBe(false)
+    })
+
+    it('bounds a hanging wake and ignores its late success', async () => {
+      vi.useFakeTimers()
+      let resolveWake: ((result: SessionSubscriptionOutcome) => void) | undefined
+      let hang = false
+      const h = createBootstrap({
+        connectionState: ref('connected'),
+        subscribeSession: async () => hang ? new Promise(resolve => { resolveWake = resolve }) : {
+          ...LIVE_READY, authoritative: false, error: new SessionReadFailure('unavailable', 'Unavailable', true),
+        },
+      })
+      await h.api.startSessionBootstrap().live
+      await vi.advanceTimersByTimeAsync(150_000)
+      hang = true
+      const wake = h.api.recoverAfterServiceWake()!
+      await vi.advanceTimersByTimeAsync(7_000)
+      await expect(wake.live).resolves.toMatchObject({ authoritative: false, error: { kind: 'budget-exhausted' } })
+      resolveWake!(LIVE_READY)
+      await vi.advanceTimersByTimeAsync(180_000)
+      expect(h.api.isLiveReady()).toBe(false)
+      h.api.cancelSessionBootstrap()
+    })
+
+    it('replaces changed authority during a wake without extending its deadline', async () => {
+      vi.useFakeTimers()
+      const authority = ref('authority-a')
+      let hang = false
+      const h = createBootstrap({
+        connectionState: ref('connected'), incidentScope: () => authority.value,
+        subscribeSession: async () => hang ? new Promise(() => {}) : {
+          ...LIVE_READY, authoritative: false, error: new SessionReadFailure('unavailable', 'Unavailable', true),
+        },
+      })
+      await h.api.startSessionBootstrap().live
+      await vi.advanceTimersByTimeAsync(150_000)
+      hang = true
+      const wake = h.api.recoverAfterServiceWake()!
+      await vi.advanceTimersByTimeAsync(1_000)
+      const calls = h.subscribeSession.mock.calls
+      const deadline = calls[calls.length - 1]![0].deadlineAt
+      const reads = h.subscribeSession.mock.calls.length
+      authority.value = 'authority-b'
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads + 1)
+      expect(calls[calls.length - 1]![0].deadlineAt).toBe(deadline)
+      await vi.advanceTimersByTimeAsync(6_000)
+      await wake.live
+      expect(h.api.isLiveReady()).toBe(false)
+      h.api.cancelSessionBootstrap()
+    })
+
+    it('keeps explicit history retry usable after a failed wake', async () => {
+      vi.useFakeTimers()
+      let available = false
+      const h = createBootstrap({
+        connectionState: ref('connected'),
+        loadHistory: async () => available ? { ok: true } : {
+          ok: false, error: new SessionReadFailure('busy', 'History busy', true),
+        },
+      })
+      await h.api.startSessionBootstrap().history
+      await vi.advanceTimersByTimeAsync(150_000)
+      const wake = h.api.recoverAfterServiceWake()!
+      await Promise.all([wake.live, wake.history])
+      await vi.advanceTimersByTimeAsync(15_000)
+      available = true
+      await expect(h.api.retryHistory()).resolves.toMatchObject({ ok: true })
+      expect(h.api.historyPhase.value).toBe('ready')
+      h.api.cancelSessionBootstrap()
+    })
+
+    it('keeps a metadata wake bounded until hydration completes and retains a new server wait', async () => {
+      vi.useFakeTimers()
+      const metadataReady = ref(false)
+      const metadataRecoveryError = ref<unknown>(new SessionReadFailure('busy', 'Metadata unavailable', true))
+      const retryMetadata = vi.fn(async () => false)
+      const h = createBootstrap({ connectionState: ref('connected'), metadataReady, metadataRecoveryError, retryMetadata })
+      await h.api.startSessionBootstrap().live
+      await vi.advanceTimersByTimeAsync(150_000)
+      const probe = h.api.recoverAfterServiceWake()!
+      metadataRecoveryError.value = null
+      await probe.live
+      const retries = retryMetadata.mock.calls.length
+      metadataRecoveryError.value = new SessionReadFailure('busy', 'Still unavailable', true, 180_000)
+      await nextTick()
+      const reads = h.subscribeSession.mock.calls.length
+      const second = h.api.recoverAfterServiceWake()!
+      metadataRecoveryError.value = null
+      metadataReady.value = true
+      await vi.advanceTimersByTimeAsync(179_999)
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads)
+      expect(retryMetadata).toHaveBeenCalledTimes(retries)
+      await vi.advanceTimersByTimeAsync(1)
+      await second.live
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads + 1)
+      expect(h.api.isLiveReady()).toBe(true)
+      h.api.cancelSessionBootstrap()
+    })
+
+    it.each(['too-large', 'missing'] as const)('does not wake an explicitly terminal %s read', async kind => {
+      vi.useFakeTimers()
+      const h = createBootstrap({
+        connectionState: ref('connected'),
+        loadHistory: async () => ({ ok: false, error: new SessionReadFailure('busy', 'History busy', true) }),
+        subscribeSession: async () => ({ ...LIVE_READY, authoritative: false,
+          sessionMissing: kind === 'missing', error: new SessionReadFailure(kind === 'missing' ? 'unavailable' : kind, 'Terminal', false) }),
+      })
+      await h.api.startSessionBootstrap().live
+      await vi.advanceTimersByTimeAsync(125_000)
+      const reads = h.subscribeSession.mock.calls.length
+      expect(h.api.recoverAfterServiceWake()).toBeUndefined()
+      await vi.advanceTimersByTimeAsync(180_000)
+      expect(h.subscribeSession).toHaveBeenCalledTimes(reads)
+      h.api.cancelSessionBootstrap()
+    })
+  })
+
+  it('installs a fresh read when the first identity binds after live readiness', async () => {
+    const authority = ref('')
+    const h = createBootstrap({ connectionState: ref('connected'), incidentScope: () => authority.value })
+    try {
+      const first = h.api.startSessionBootstrap()
+      await Promise.all([first.live, first.history])
+      expect(h.api.isLiveReady()).toBe(true)
+      authority.value = 'authority-a'
+      expect(h.api.isLiveReady()).toBe(false)
+      await nextTick()
+      const replacement = h.api.currentSessionBootstrap()!
+      expect(replacement.generation).not.toBe(first.generation)
+      await replacement.live
+      expect(h.api.isLiveReady()).toBe(true)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      expect(h.closeLease).toHaveBeenCalledOnce()
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('rejects the old response when authority changes during its live read', async () => {
+    const authority = ref('authority-a')
+    let resolveOld!: (result: SessionSubscriptionOutcome) => void
+    const h = createBootstrap({ connectionState: ref('connected'), incidentScope: () => authority.value,
+      subscribeSession: async () => authority.value === 'authority-a'
+        ? new Promise(resolve => { resolveOld = resolve }) : LIVE_READY,
+    })
+    try {
+      const first = h.api.startSessionBootstrap()
+      authority.value = 'authority-b'
+      await nextTick()
+      await h.api.currentSessionBootstrap()!.live
+      resolveOld(LIVE_READY)
+      await expect(first.live).resolves.toMatchObject({ authoritative: false, cancelled: true })
+      expect(h.api.isLiveReady()).toBe(true)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('starts a bounded new incident when a healthy authority changes after the old deadline', async () => {
+    vi.useFakeTimers()
+    const authority = ref('authority-a')
+    const h = createBootstrap({ connectionState: ref('connected'), incidentScope: () => authority.value })
+    try {
+      await h.api.startSessionBootstrap().live
+      const initialDeadline = h.subscribeSession.mock.calls[0]![0].deadlineAt
+      await vi.advanceTimersByTimeAsync(120_001)
+      authority.value = 'authority-b'
+      await nextTick()
+      await h.api.currentSessionBootstrap()!.live
+      expect(h.api.isLiveReady()).toBe(true)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      expect(h.subscribeSession.mock.calls[1]![0].deadlineAt).toBe(initialDeadline + 120_001)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('defers an authority replacement until the existing handoff rolls back', async () => {
+    const authority = ref('authority-a')
+    const h = createBootstrap({ connectionState: ref('connected'), incidentScope: () => authority.value })
+    try {
+      await h.api.startSessionBootstrap().live
+      h.api.setSessionHandoffTarget('agent:main:webchat:target', 1)
+      authority.value = 'authority-b'
+      await nextTick()
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+      expect(h.api.isLiveReady()).toBe(false)
+      await h.api.setSessionHandoffTarget(null, 1, 'failed')!.live
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      expect(h.api.isLiveReady()).toBe(true)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('retains Retry-After, backoff and the deadline across repeated authority replacements', async () => {
+    vi.useFakeTimers()
+    const authority = ref('authority-a')
+    const deadlines: number[] = []
+    const h = createBootstrap({ connectionState: ref('connected'), incidentScope: () => authority.value,
+      subscribeSession: async context => {
+        deadlines.push(context.deadlineAt)
+        return { ...LIVE_READY, authoritative: false,
+          error: new SessionReadFailure('unavailable', 'Read unavailable', true, deadlines.length === 1 ? 10_000 : 0) }
+      },
+    })
+    try {
+      await h.api.startSessionBootstrap().live
+      for (const scope of ['authority-b', 'authority-c']) {
+        authority.value = scope
+        await nextTick()
+      }
+      await vi.advanceTimersByTimeAsync(9_999)
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      // The second failure retains the first failure's exponential backoff.
+      await vi.advanceTimersByTimeAsync(999)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(3)
+      await vi.advanceTimersByTimeAsync(110_000)
+      const attempts = h.openSessionRead.mock.calls.length
+      authority.value = 'authority-d'
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(h.openSessionRead).toHaveBeenCalledTimes(attempts)
+      expect(new Set(deadlines).size).toBe(1)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('does not let exhausted optional metadata recovery prevent a later real live reconnect', async () => {
+    vi.useFakeTimers()
+    const state = ref('connected')
+    const metadataRecoveryError = ref<unknown>(new SessionReadFailure('unavailable', 'optional metadata unavailable', true))
+    const retryMetadata = vi.fn(async () => false)
+    let liveAvailable = true
+    const h = createBootstrap({ connectionState: state, metadataRecoveryError, retryMetadata,
+      subscribeSession: async () => liveAvailable ? LIVE_READY : {
+        ...LIVE_READY, authoritative: false, error: new SessionReadFailure('unavailable', 'offline', true),
+      } })
+    const first = h.api.startSessionBootstrap()
+    await Promise.all([first.live, first.history])
+    await vi.advanceTimersByTimeAsync(180_000)
+    const metadataCalls = retryMetadata.mock.calls.length
+    expect(metadataCalls).toBeGreaterThan(0)
+    expect(h.api.isLiveReady()).toBe(true)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(retryMetadata).toHaveBeenCalledTimes(metadataCalls)
+    state.value = 'disconnected'
+    liveAvailable = false
+    await h.api.handleConnectionState('disconnected')!.live
+    state.value = 'connected'
+    liveAvailable = true
+    await vi.advanceTimersByTimeAsync(500)
+    await expect(h.api.retryLive()).resolves.toMatchObject({ authoritative: true })
+    expect(h.api.isLiveReady()).toBe(true)
+    h.api.cancelSessionBootstrap()
+  })
+
+  it('rejects a successful response after its current read lease was retired', async () => {
+    let resolve!: (result: SessionSubscriptionOutcome) => void
+    const h = createBootstrap({ subscribeSession: () => new Promise(done => { resolve = done }) })
+    const run = h.api.startSessionBootstrap()
+    h.retireCurrentLease()
+    resolve(LIVE_READY)
+    await expect(run.live).resolves.toMatchObject({ authoritative: false, cancelled: true })
+    expect(h.api.isLiveReady()).toBe(false)
+    expect(h.api.isSessionBootstrapCurrent(run.generation)).toBe(false)
+    h.api.cancelSessionBootstrap()
+  })
+
+  it('uses existing current proof for Goal readiness without another healthy request', async () => {
+    const authority = ref('authority-a')
+    const metadataRecoveryError = ref<unknown>(new SessionReadFailure('unavailable', 'Optional metadata unavailable', true))
+    const h = createBootstrap({ incidentScope: () => authority.value, metadataRecoveryError })
+    await h.api.startSessionBootstrap().live
+    await expect(h.api.ensureLiveReady()).resolves.toBe(true)
+    expect(h.subscribeSession).toHaveBeenCalledOnce()
+    expect(h.openSessionRead).toHaveBeenCalledOnce()
+    authority.value = 'authority-b'
+    expect(h.api.isLiveReady()).toBe(false)
+    h.api.cancelSessionBootstrap()
+  })
+
+  it('preserves a long server wait across external wakes, new leases and explicit retry', async () => {
+    vi.useFakeTimers()
+    let available = false
+    const h = createBootstrap({ connectionState: ref('connected'), subscribeSession: async () => available
+      ? LIVE_READY : { ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('busy', 'Wait before another read', true, 180_000) } })
+    try {
+      await h.api.startSessionBootstrap().live
+      h.api.handleConnectionState('connected')
+      h.api.startSessionBootstrap({ force: true })
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+      await expect(h.api.retryLive()).resolves.toMatchObject({ authoritative: false,
+        error: { kind: 'budget-exhausted' } })
+      available = true
+      const explicit = h.api.retryLive(true)
+      await vi.advanceTimersByTimeAsync(59_999)
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1)
+      await expect(explicit).resolves.toMatchObject({ authoritative: true })
+      expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('keeps one deadline when ordinary reconciliation repeatedly fails on the same lease', async () => {
+    vi.useFakeTimers()
+    const deadlines: number[] = []
+    const failure = { ...LIVE_READY, authoritative: false,
+      error: new SessionReadFailure('unavailable', 'Read unavailable', true, 1_000) }
+    const h = createBootstrap({ connectionState: ref('connected'),
+      subscribeSession: async context => { deadlines.push(context.deadlineAt); return failure },
+      reconcileSession: async context => { deadlines.push(context.deadlineAt); return failure },
+    })
+    try {
+      await h.api.startSessionBootstrap().live
+      for (let index = 0; index < 20; index++) void h.api.retryLive()
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(new Set(deadlines).size).toBe(1)
+      const attempts = deadlines.length
+      expect(attempts).toBeGreaterThan(1)
+      for (let index = 0; index < 20; index++) void h.api.retryLive()
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(deadlines).toHaveLength(attempts)
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('bounds a progressing read by the existing incident deadline and rejects late success', async () => {
+    vi.useFakeTimers()
+    let resolve!: (result: SessionSubscriptionOutcome) => void
+    let signal!: AbortSignal
+    const h = createBootstrap({ subscribeSession: context => {
+      signal = context.signal
+      return new Promise(done => { resolve = done })
+    } })
+    try {
+      const run = h.api.startSessionBootstrap()
+      await vi.advanceTimersByTimeAsync(120_000)
+      await expect(run.live).resolves.toMatchObject({ authoritative: false, error: { kind: 'budget-exhausted' } })
+      expect(signal.aborted).toBe(true)
+      resolve(LIVE_READY)
+      await Promise.resolve()
+      expect(h.api.isLiveReady()).toBe(false)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
   it.each(['initial', 'reconcile'])('replaces an obsolete read base after %s failure while retaining history', async source => {
     vi.useFakeTimers()
     const rebase = { ...LIVE_READY, authoritative: false,
@@ -239,7 +688,9 @@ describe('useChatSessionBootstrap', () => {
       await initial.live
       if (phase === 'error') await initial.history
       expect(h.api.historyPhase.value).toBe(phase)
-      await h.api.retryLive()
+      const retry = h.api.retryLive()
+      await vi.advanceTimersByTimeAsync(500)
+      await retry
       await vi.waitFor(() => expect(h.api.historyPhase.value).toBe('ready'))
       expect(h.openSessionRead).toHaveBeenLastCalledWith({ sessionKey: 'agent:main:webchat:bootstrap-test', includeInitialHistory: true })
       expect(h.loadHistory).toHaveBeenCalledTimes(2)
@@ -848,6 +1299,7 @@ describe('incident presentation budget', () => {
     h.api.dismissRecoveryNotice()
     await vi.advanceTimersByTimeAsync(15_000)
     const replacement = h.api.handleConnectionState('connected')
+    await vi.advanceTimersByTimeAsync(15_000)
     await replacement?.live
     expect(h.api.livePhase.value).toBe('degraded')
     expect(h.api.noticeDismissed.value).toBe(true)

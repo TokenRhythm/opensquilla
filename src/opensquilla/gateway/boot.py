@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from opensquilla.memory.sync_manager import (
         MemorySyncManager as MemoryFileWatcher,  # SyncManager replaces watcher
     )
+    from opensquilla.persistence.turn_request_resolution import TurnReceiptEpochPolicy
     from opensquilla.provider.model_catalog import ModelCatalog
     from opensquilla.provider.selector import ModelSelector
     from opensquilla.scheduler import SchedulerEngine
@@ -961,6 +962,12 @@ _boot_time_ms: int = 0
 # Per-boot identity token: lets clients tell "same process, config changed"
 # (a pending restart is still pending) from "process restarted" (apply it).
 _boot_id: str = ""
+_turn_receipt_epochs: TurnReceiptEpochPolicy | None = None
+
+
+def get_gateway_turn_receipt_epochs() -> TurnReceiptEpochPolicy | None:
+    """The locked Gateway lifespan owns this non-restorable, monotonic validity policy."""
+    return _turn_receipt_epochs
 
 
 def _configured_agent_ids(
@@ -4922,9 +4929,20 @@ async def start_gateway_server(
     usage_event_sink = getattr(svc, "usage_event_sink", None)
 
     # Record boot time for uptime calculation (gateway-specific)
-    global _boot_time_ms, _boot_id
+    global _boot_time_ms, _boot_id, _turn_receipt_epochs
     _boot_time_ms = int(time.time() * 1000)
     _boot_id = secrets.token_hex(16)
+    from opensquilla.persistence.turn_request_resolution import TurnReceiptEpochPolicy
+
+    _turn_receipt_epochs = TurnReceiptEpochPolicy(_boot_id)
+    receipt_storage = get_session_storage(svc.session_manager)
+    if receipt_storage is not None:
+        # This official lifespan holds GatewayPidLock for the same STATE_DIR
+        # that contains sessions.db. build_services/custom databases do not
+        # independently gain authority to clear another process's markers.
+        receipt_storage.configure_turn_receipt_epochs(
+            _turn_receipt_epochs, exclusive_gateway=True,
+        )
 
     log.info(
         "gateway.starting",

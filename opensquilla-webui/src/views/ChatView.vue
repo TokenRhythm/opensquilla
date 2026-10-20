@@ -927,8 +927,8 @@ import {
    useChatSessionBootstrap,
    type SessionBootstrapRun,
  } from '@/composables/chat/useChatSessionBootstrap'
+import { useChatAutoSendDraftGuard } from '@/composables/chat/useChatAutoSendDraftGuard'
  import {
-   autoSendDraftIsUnchanged,
    sessionRecoverySucceeded,
  } from '@/composables/chat/sessionBootstrapContract'
 import {
@@ -1389,6 +1389,16 @@ const landingPrefilled = ref(false)
 // so the first turn streams into this view. Empty string = nothing pending.
 const pendingAutoSend = ref('')
 const pendingAutoSendSessionKey = ref('')
+let pendingAutoSendSnapshot: {
+  guard: ReturnType<typeof useChatAutoSendDraftGuard>
+  projectReady: boolean
+} | null = null
+function cancelPendingAutoSend() {
+  pendingAutoSend.value = ''
+  pendingAutoSendSessionKey.value = ''
+  pendingAutoSendSnapshot?.guard.dispose()
+  pendingAutoSendSnapshot = null
+}
 
 /* ── DOM refs ──────────────────────────────────────────────────────── */
 
@@ -2068,7 +2078,6 @@ watch(
 )
 
 let sendCurrentInput: () => void = () => {}
-let sendAutomaticInput: () => void = () => {}
 let sendUsageBarrierReplay: (payload: {
   text: string
   localPathReferences?: string[]
@@ -3083,6 +3092,7 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   connectionState: gatewayConnectionState,
   metadataRecoveryError: chatSessionSubscription.metadataRecoveryError,
   retryMetadata: () => retrySessionMetadata(),
+  metadataReady: presentationMetadataReady,
   incidentScope: () => deliveryIdentity.value ?? '',
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
@@ -3623,11 +3633,9 @@ const chatGoals = useChatGoals({
     return key
   },
   ensureSubscribed: async key => {
-    if (key !== sessionKey.value) return false
-    if (livePhase.value === 'ready') return true
-    const outcome = await subscribeSession()
-    return outcome.authoritative
+    return chatSessionBootstrap.ensureLiveReady(key)
   },
+  isSessionReady: key => chatSessionBootstrap.isLiveReady(key),
   onSetAccepted: projectAcceptedGoalMessage,
   notify: message => pushToast(message, { tone: 'danger', duration: 6000 }),
 })
@@ -3905,6 +3913,14 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
   durableDelivery,
+  canContinueAfterClosedAdmission: afterStartingStream => chatSessionBootstrap.isLiveReady(sessionKey.value)
+    && !isSessionHydrating.value && !effectiveSendBlockedReason.value
+    && activeTaskGroups.value.size === 0 && !isCompactInFlightForCurrentSession()
+    // startStreaming projects local "running" before the frame is sent. The
+    // sender still checks authoritative task ownership at the dispatch boundary.
+    && (afterStartingStream || !['queued', 'running', 'approval_pending'].includes(runStatus.value.status))
+    && activePlanRun.value?.status !== 'queued' && activePlanRun.value?.status !== 'running'
+    && (afterStartingStream || pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value),
   selectedSkills,
   localPathReferences: localPaths,
   restoreInput,
@@ -3929,6 +3945,7 @@ const chatSend = useChatSend({
     lookupReceipt: (request, options) => turnCommands.lookupReceipt?.(request, options)
       || Promise.resolve({ status: 'unsupported' as const }),
     supportsReceiptLookup: () => turnCommands.supportsReceiptLookup?.() ?? false,
+    supportsResolvableSend: () => turnCommands.supportsResolvableSend?.() ?? false,
     supports: capability => turnCommands.supports(capability),
   },
   activeSteerCapability,
@@ -3972,6 +3989,16 @@ const chatSend = useChatSend({
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(
     ids.filter(id => annotationAllowed(artifactPromptAnnotationsStore.annotations[id])),
   ).filter(annotationAllowed),
+  restorePromptAnnotations: (snapshots, key) => snapshots.every(annotationAllowed)
+    && artifactPromptAnnotationsStore.restoreUnsent(snapshots, key),
+  persistRestoredDraft: async () => {
+    const stored = draftPersistence.saveDraft(draftSessionKey.value, composerText.value,
+      selectedSkills.value, localPaths.value, skillPositions.value)
+    const attachmentsStored = await chatAttachments.flushAttachmentDraft()
+    // Embedded owners may supply only memory storage. Keep their durable
+    // recovery copy until that owner has a durable draft contract.
+    return stored && attachmentsStored && !props.embedded
+  },
   invalidatePromptAnnotations: snapshots => {
     try { artifactPromptAnnotationsStore.invalidateSnapshots(snapshots) }
     catch { pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'warn' }) }
@@ -4196,15 +4223,34 @@ function flushPendingAutoSend(targetSessionKey: string): boolean {
   ) {
     return false
   }
-  const text = pendingAutoSend.value
+  const snapshot = pendingAutoSendSnapshot
+  if (!snapshot || !snapshot.guard.isUnchanged()) {
+    cancelPendingAutoSend()
+    return false
+  }
+  if (!deliveryIdentity.value || !snapshot.projectReady || !chatSessionBootstrap.isLiveReady(targetSessionKey)
+    || effectiveSendBlockedReason.value || attachmentWorkBusy.value
+    || chatSend.sendPending.value || acceptanceRecoveryPending.value) return false
+  // Claim once, retaining the content guard through the sender's preflight.
+  // Reusing sendComposerText would enqueue this already-present draft twice.
   pendingAutoSend.value = ''
   pendingAutoSendSessionKey.value = ''
-  // The handoff is no longer automatic once the user edits its prefill while
-  // waiting for an authoritative reconnect.
-  if (inputText.value !== text) return false
-  sendComposerText(text)
+  pendingAutoSendSnapshot = null
+  const authority = deliveryIdentity.value
+  const current = (ownSubmittingRequestId?: string) => !chatViewDisposed && sessionKey.value === targetSessionKey
+    && deliveryIdentity.value === authority && chatSessionBootstrap.isLiveReady(targetSessionKey)
+    && !chatSend.hasAcceptanceRecoveryPending(ownSubmittingRequestId)
+  void onSend({ cancelIfComposerChanged: true,
+    preflightGuard: () => current() && snapshot.guard.isUnchanged(),
+    preDispatchGuard: current,
+  }).finally(() => snapshot.guard.dispose())
   return true
 }
+
+watch([livePhase, effectiveSendBlockedReason, deliveryIdentity, attachmentWorkBusy,
+  acceptanceRecoveryPending, () => chatSend.sendPending.value], () => {
+  if (pendingAutoSend.value) flushPendingAutoSend(sessionKey.value)
+})
 
 async function handleAuthoritativeSessionSubscription(targetSessionKey: string): Promise<void> {
   if (chatViewActive && sessionKey.value === targetSessionKey) flushPendingAutoSend(targetSessionKey)
@@ -4304,6 +4350,7 @@ async function onComposerSend() {
     const withContext = context && await acceptsVisualizeContext(composer, classifySlashCommand)
     if (context && (!context.isCurrent() || composerRevision.value !== submittedRevision)) return
     void onSend({
+      explicitNewInput: true,
       resumeQueueOnSuccess: !isStopPending.value,
       ...(withContext ? {
         composerText: composer, textOverride: context.message(composer, t('visualize.contextAttached')),
@@ -4328,9 +4375,6 @@ async function onComposerSend() {
 }
 
 sendCurrentInput = onComposerSend
-sendAutomaticInput = () => {
-  void onSend({ cancelIfComposerChanged: true })
-}
 dispatchQueuedItem = sendQueuedFollowup
 
 function editPendingMessage(pendingUiId: string) {
@@ -4873,6 +4917,7 @@ watch([sessionKey, isStreaming], ([key, streaming], [previousKey, wasStreaming])
 const stallWatchdog = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: streamIdleTimeoutMs })
 const { stallActive, stallSeconds } = stallWatchdog
 
+let recoveryWakePosition: { owner: string; generation: string; seq: number } | null = null
 const chatRpcSubscriptions = useChatRpcSubscriptions({
   // The private v4 adapter emits one semantic message. Feed that projection to
   // both business consumers without exposing protocol names in the view.
@@ -4887,7 +4932,23 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
       )
     }
     const previousEpoch = currentEpoch.value
+    const previousStreamSeq = lastStreamSeq.value
     const result = rpcEventHandlers.consumeConversationEvent(message)
+    if (message.kind === 'conversation' && message.event.kind === 'known'
+      && message.event.sessionKey === sessionKey.value
+      && !message.event.meta.replayed
+      && (message.event.semanticKind === 'state-changed' || message.event.semanticKind === 'turn-committed')) {
+      const event = message.event
+      if (event.payload.epoch !== undefined && event.payload.epoch < currentEpoch.value) return result
+      const owner = JSON.stringify([deliveryIdentity.value, sessionKey.value, currentEpoch.value])
+      const seenSeq = recoveryWakePosition?.owner === owner
+        && recoveryWakePosition.generation === event.streamGeneration ? recoveryWakePosition.seq : 0
+      if (event.streamGeneration && (!streamGeneration.value || event.streamGeneration === streamGeneration.value)
+        && event.streamSeq !== null && event.streamSeq > Math.max(previousStreamSeq, seenSeq)) {
+        recoveryWakePosition = { owner, generation: event.streamGeneration, seq: event.streamSeq }
+        chatSessionBootstrap.recoverAfterServiceWake()
+      }
+    }
     if (currentEpoch.value !== previousEpoch) {
       const viewGeneration = sessionViewCache.generation.value
       sessionViewCache.observeEpoch(sessionKey.value, currentEpoch.value)
@@ -7360,6 +7421,19 @@ function consumeDraftPrefill() {
   if (state?.autosend === true && !skills.length) {
     pendingAutoSend.value = prefill
     pendingAutoSendSessionKey.value = sessionKey.value
+    const endpoint = gatewayAccess.loadConnectionEndpoint()
+    pendingAutoSendSnapshot?.guard.dispose()
+    pendingAutoSendSnapshot = {
+      projectReady: false,
+      guard: useChatAutoSendDraftGuard(() => ({
+        text: inputText.value, composerText: composerText.value,
+        localPaths: localPaths.value, attachments: pendingAttachments.value,
+        skills: selectedSkills.value, annotationIds: activePromptAnnotations.value.map(item => item.annotationId),
+        annotationDrafts: activePromptAnnotations.value,
+        visualization: visualizeDraft.snapshot.value,
+        sessionKey: sessionKey.value, authority: deliveryIdentity.value, projectKey: readProjectFromUrl(),
+      }), { isAuthorityCurrent: () => !chatViewDisposed && gatewayAccess.loadConnectionEndpoint() === endpoint }),
+    }
   }
   try {
     window.history.replaceState({ ...window.history.state, prefill: undefined, autosend: undefined, selectedSkillPrefill: undefined }, '')
@@ -7725,24 +7799,12 @@ onMounted(async () => {
   // /chat/new entry. Explicit new-task handoffs always remain clean.
   sessionKey.value = initialSession.sessionKey
   let initialDraftProjectGeneration: number | null = null
-  let initialAutoSendSnapshot: {
-    text: string
-    revision: number
-    attachments: Attachment[]
-  } | null = null
   if (initialSession.draft && !props.embedded) {
     pendingSessionIntent.value = 'new_chat'
     initialDraftProjectGeneration = draftProjectHydration.begin()
     // Apply the hand-off before any asynchronous project/live work. A later
     // completion must never overwrite text the operator typed while waiting.
     consumeDraftPrefill()
-    if (pendingAutoSend.value) {
-      initialAutoSendSnapshot = {
-        text: pendingAutoSend.value,
-        revision: composerRevision.value,
-        attachments: [...pendingAttachments.value],
-      }
-    }
   } else if (initialSession.sessionKey) {
     activeProjectWorkspace.beginSessionResolution(initialSession.sessionKey)
     persistSession(sessionKey.value, {
@@ -7837,34 +7899,10 @@ onMounted(async () => {
   // Sessions Hub "Start task" hand-off: send the prefilled draft in one step.
   // Wait for the subscription first so the first turn streams into this view
   // rather than being missed before sessions.messages.subscribe registers.
-  if (pendingAutoSend.value && initialAutoSendSnapshot) {
-    const text = initialAutoSendSnapshot.text
-    const autoSendSessionKey = sessionKey.value
-    const autoSendGeneration = sessionBootstrap.generation
-    const subscription = await sessionBootstrap.live
-    pendingAutoSend.value = ''
-    const composerUnchanged = autoSendDraftIsUnchanged(
-      text,
-      inputText.value,
-      initialAutoSendSnapshot.attachments,
-      pendingAttachments.value,
-      initialAutoSendSnapshot.revision,
-      composerRevision.value,
-    )
-    if (
-      !chatViewDisposed
-      && sessionKey.value === autoSendSessionKey
-      && isSessionBootstrapCurrent(autoSendGeneration, autoSendSessionKey)
-      && subscription.authoritative
-      && livePhase.value === 'ready'
-      && composerUnchanged
-    ) {
-      sendAutomaticInput()
-    } else {
-      // Fail closed: the Sessions Hub hand-off remains an editable draft. The
-      // inline live-recovery state owns retry and explains why sending paused.
-      composerRef.value?.focusTextarea()
-    }
+  if (pendingAutoSend.value && pendingAutoSendSnapshot) {
+    pendingAutoSendSnapshot.projectReady = true
+    await sessionBootstrap.live
+    flushPendingAutoSend(sessionKey.value)
   }
 })
 
@@ -7877,6 +7915,7 @@ watch(
 )
 
 onUnmounted(() => {
+  cancelPendingAutoSend()
   chatSend.dispose()
   cancelDraftProjectChoice()
   window.removeEventListener('pointerup', onThreadPointerEnd)

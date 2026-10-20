@@ -3,6 +3,7 @@ import { copyLocalPathReferences } from '@/types/localPathReferences'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
+import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import { copyTurnCommand, isProjectInitTurnCommand, type ProjectInitTurnCommand } from '@/types/turnCommand'
 import { snapshotAttachment } from './attachments'
 import type {
@@ -69,8 +70,13 @@ export interface ResponseHandoffWalRecord {
   params: TurnSendParams
   composerText: string
   recoveryAttachments: Attachment[]
+  /** Local draft identities and immutable content; never sent as wire fields. */
+  recoveryDraftIds?: string[]
+  recoveryPromptAnnotations?: PromptAnnotationSnapshot[]
   /** A protocol-owned replay must never be restored into the user composer. */
   restoreComposerOnFailure?: boolean
+  /** Historical delivery may settle, but no longer owns composer content or navigation. */
+  backgroundOnly?: true
   /** Stable source-session + barrier identity used for cross-tab coordination. */
   replayCoordinationKey?: string
   /** Identifies the live dispatcher allowed to arm an unsubmitted handoff. */
@@ -86,7 +92,9 @@ export interface ResponseHandoffWalRecord {
 
 /** One authority for a delivery and its optional session handoff projection. */
 export interface DeliveryWalRecord {
-  schemaVersion: 2
+  /** Version 3 pins the resolvable send protocol and its original acceptance epoch.
+   * Earlier version 3 rows without an epoch remain readable for positive recovery. */
+  schemaVersion: 2 | 3
   ownerRequestId: string
   deliveryIdentity: string
   requestSessionKey: string
@@ -95,6 +103,13 @@ export interface DeliveryWalRecord {
   response?: TurnSendResponse | TurnSteerResponse
   stop?: { requested: true; request?: TurnCancelRequest; completed?: boolean }
   paused?: 'authority' | 'conflict'
+  /** Only a server writer fence can authorize restoring this input as a new send. */
+  retired?: boolean
+  /** A positive acceptance survives removal of its session and detailed receipt. */
+  acceptedUnavailable?: boolean
+  /** Absolute server floor survives tab/lease changes and manual recovery. */
+  recoveryNotBefore?: number
+  recovery?: { calls: number; expiresAt: number }
   handoff?: ResponseHandoffWalRecord
   revision: number
   lease?: { owner: string; epoch: number; expiresAt: number }
@@ -175,7 +190,10 @@ export interface PendingInputWal {
 function isDeliveryWalRecord(value: unknown): value is DeliveryWalRecord {
   if (!value || typeof value !== 'object') return false
   const record = value as DeliveryWalRecord
-  return record.schemaVersion === 2
+  return (record.schemaVersion === 2 || record.schemaVersion === 3)
+    && (record.schemaVersion !== 3 || (record.request?.kind === 'send'
+      && record.request.request.kind === 'new-turn'
+      && record.request.request.acceptanceProtocol === 'resolvable-v1'))
     && typeof record.ownerRequestId === 'string' && record.ownerRequestId.length > 0
     && typeof record.deliveryIdentity === 'string' && record.deliveryIdentity.length > 0
     && typeof record.requestSessionKey === 'string' && record.requestSessionKey.length > 0
@@ -191,6 +209,9 @@ function handoffFromStored(value: unknown): ResponseHandoffWalRecord | null {
 }
 
 function withHandoff(value: unknown, handoff: ResponseHandoffWalRecord | null): unknown {
+  // An older in-memory projection must not reclaim a handoff detached by
+  // another window before a late receipt arrives.
+  if (handoff && handoffFromStored(value)?.backgroundOnly) handoff = { ...handoff, backgroundOnly: true }
   return isDeliveryWalRecord(value)
     ? indexedDelivery({ ...value, handoff: handoff || undefined, revision: value.revision + 1, updatedAt: Date.now() })
     : handoff
@@ -203,6 +224,8 @@ function indexedDelivery(record: DeliveryWalRecord) {
     || (response && 'promotedTurnId' in response ? response.promotedTurnId : undefined)
     || (response && 'turnId' in response ? response.turnId : undefined)
   const pending = ['prepared', 'unknown', 'submitting'].includes(record.phase) || !!(record.stop && !record.stop.completed)
+    || Boolean(record.retired && record.handoff && !record.handoff.backgroundOnly
+      && record.handoff.restoreComposerOnFailure !== false)
   return { ...record, recoveryState: pending ? 'pending' : 'settled',
     ...(record.request?.kind === 'steer' ? { steerScope: [record.deliveryIdentity, record.request.request.key, record.request.request.expectedTurnId] } : {}),
     ...(task ? { taskScope: [record.deliveryIdentity, record.stop?.request?.sessionKey
@@ -305,10 +328,20 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
     && record.recoveryAttachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
     ))
+    && validAnnotationDraftIds(record.recoveryDraftIds)
+    && (record.recoveryPromptAnnotations === undefined || (
+      Array.isArray(record.recoveryPromptAnnotations)
+      && record.recoveryPromptAnnotations.length <= 16
+      && record.recoveryPromptAnnotations.every(item => item && typeof item === 'object'
+        && typeof item.annotationId === 'string' && typeof item.documentId === 'string'
+        && typeof item.documentName === 'string' && typeof item.body === 'string'
+        && typeof item.tagName === 'string' && (item.quote === null || typeof item.quote === 'string'))
+    ))
     && (
       record.restoreComposerOnFailure === undefined
       || typeof record.restoreComposerOnFailure === 'boolean'
     )
+    && (record.backgroundOnly === undefined || record.backgroundOnly === true)
     && (
       record.replayCoordinationKey === undefined
       || (
@@ -589,9 +622,10 @@ class BrowserPendingInputWal implements PendingInputWal {
       throw new Error('Invalid response handoff compare-and-swap transition')
     }
     const next = cloneHandoffRecord(record)
-    store.put(withHandoff(stored, next))
+    const updated = withHandoff(stored, next)
+    store.put(updated)
     await transactionDone(transaction)
-    return { applied: true, record: next }
+    return { applied: true, record: handoffFromStored(updated) }
   }
 
   async listHandoffs(requestSessionKey?: string): Promise<ResponseHandoffWalRecord[]> {

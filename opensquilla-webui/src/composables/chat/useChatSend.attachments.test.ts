@@ -50,6 +50,7 @@ import type {
 } from '@/utils/chat/pendingInputWal'
 
 const pushToast = vi.hoisted(() => vi.fn())
+const RECEIPT_EPOCH = `v2.${'a'.repeat(32)}.100.125`
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast }),
@@ -251,10 +252,11 @@ interface UseChatSendOptions extends Omit<DomainUseChatSendOptions, 'durableDeli
 
 type SendHarnessOverrides = Partial<UseChatSendOptions> & {
   methodAvailability?: (method: string) => boolean
+  receiptEpoch?: string
 }
 
 function makeOptions(overrides: SendHarnessOverrides = {}) {
-  const { rpc: rpcOverride, methodAvailability, ...sendOverrides } = overrides
+  const { rpc: rpcOverride, methodAvailability, receiptEpoch, ...sendOverrides } = overrides
   const rpc = rpcOverride ?? {
     call: vi.fn().mockResolvedValue({ sessionKey: 'agent:main:webchat:test' }),
   }
@@ -356,6 +358,7 @@ function makeOptions(overrides: SendHarnessOverrides = {}) {
     // their payload fixtures while exercising the new read-only RPC method;
     // adapter tests independently verify the real receipt wire envelope.
     const receiptRpc = {
+      policy: receiptEpoch ? { turn_receipt_epoch: receiptEpoch } : undefined,
       async call(method: string, params?: Record<string, unknown>, requestOptions?: unknown) {
         if (method !== 'turns.receipt.get') return requestOptions
           ? options.rpc.call(method, params, requestOptions) : options.rpc.call(method, params)
@@ -3454,8 +3457,9 @@ describe('useChatSend attachment payloads', () => {
       name: 'notes.md', mime: 'text/markdown', size: 14 }
     attachments.pendingAttachments.value = [{ kind: 'workspace', local_id: 1,
       name: workspaceFile.name, mime: workspaceFile.mime, workspaceFile }]
-    let accept!: (response: { sessionKey: string }) => void
-    const call = vi.fn(() => new Promise<{ sessionKey: string }>(resolve => { accept = resolve }))
+    let accept!: (response: { sessionKey: string; clientRequestId: string }) => void
+    const call = vi.fn((_method: string, _params: Record<string, unknown>) =>
+      new Promise<{ sessionKey: string; clientRequestId: string }>(resolve => { accept = resolve }))
     const composerRevision = ref(0)
     scope.run(() => watch([inputText, selectedSkills, attachments.pendingAttachments], () => { composerRevision.value += 1 }, { deep: true, flush: 'sync' }))
     const captureConsumption = vi.fn(attachments.captureDraftConsumption)
@@ -3464,11 +3468,12 @@ describe('useChatSend attachment payloads', () => {
       ...(scenario === 'pinned-task' ? { initialModel: ref('model-a'), initialProvider: ref('provider-a') } : {}),
       pendingAttachments: attachments.pendingAttachments, consumeAcceptedDraft: textDraft.consumeAcceptedDraft,
       captureAttachmentDraftConsumption: captureConsumption,
-      rpc: { call }, methodAvailability: () => true })
+      rpc: { call }, methodAvailability: () => true, receiptEpoch: RECEIPT_EPOCH })
     try {
       const sending = api.onSend()
       await vi.waitFor(() => expect(call).toHaveBeenCalledOnce())
-      expect(call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      expect(call).toHaveBeenCalledWith('chat.send.v2', expect.objectContaining({
+        acceptanceEpoch: RECEIPT_EPOCH,
         selectedSkills: selectedSkills.value, workspaceFiles: [workspaceFile],
         ...(scenario === 'pinned-task' ? { initialModel: 'model-a', initialProvider: 'provider-a', initialRoutingMode: 'direct' } : {}),
       }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
@@ -3502,7 +3507,7 @@ describe('useChatSend attachment payloads', () => {
           attachments.pendingAttachments.value = [{ ...attachments.pendingAttachments.value[0]!, local_id: 2 }]
         }
       }
-      accept({ sessionKey: sourceScope.sessionKey })
+      accept({ sessionKey: sourceScope.sessionKey, clientRequestId: String(call.mock.calls[0]![1].clientRequestId) })
       await sending
       if (delayLoad) releaseLoad!()
       await attachments.flushAttachmentDraft()
@@ -3530,9 +3535,14 @@ describe('useChatSend attachment payloads', () => {
       { kind: 'staged', local_id: 2, name: 'imported.pdf', mime: 'application/pdf',
         file_uuid: 'fixture-upload-id' },
     ])
-    const { api, options, rpc } = makeOptions({ pendingAttachments, selectedSkills, methodAvailability: () => true })
+    const rpc = { call: vi.fn(async (_method: string, params: Record<string, unknown>) => ({
+      sessionKey: 'agent:main:webchat:test', clientRequestId: params.clientRequestId,
+    })) }
+    const { api, options } = makeOptions({ pendingAttachments, selectedSkills, rpc,
+      methodAvailability: () => true, receiptEpoch: RECEIPT_EPOCH })
     await api.onSend()
-    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+    expect(rpc.call).toHaveBeenCalledWith('chat.send.v2', expect.objectContaining({
+      acceptanceEpoch: RECEIPT_EPOCH,
       workspaceFiles: [workspaceFile],
       ...(withSkills ? { selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }] } : {}),
       attachments: [{ type: 'application/pdf', mime: 'application/pdf',

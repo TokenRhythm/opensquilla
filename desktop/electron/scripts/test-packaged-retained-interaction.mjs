@@ -165,7 +165,7 @@ async function send(page, message, answer) {
   await waitFor(async () => await button.count() === 1 && await button.isEnabled(), 'completed real Send', remainingSendTime(deadline))
   await waitForRetainedGatewayIdle(active?.ownership, deadline)
   const rpc = await snapshot(page)
-  assert.equal(rpc.requests.filter(request => request.method === 'chat.send' && request.params.message === message).length, 1, 'One user click must produce exactly one chat.send')
+  assert.equal(rpc.requests.filter(request => ['chat.send', 'chat.send.v2'].includes(request.method) && request.params.message === message).length, 1, 'One user click must produce exactly one chat.send')
 }
 async function quit() {
   const current = active
@@ -240,7 +240,7 @@ try {
   await send(page, messages.afterStop, messages.afterStopAnswer)
   await screenshot(page, 'after-stop')
   report.initialRpc = await snapshot(page)
-  assert.equal(report.initialRpc.requests.filter(request => request.method === 'chat.send').length, 4)
+  assert.equal(report.initialRpc.requests.filter(request => ['chat.send', 'chat.send.v2'].includes(request.method)).length, 4)
   await stage('normal-quit-before-restart')
   await quit()
   await preserved('before-restart')
@@ -254,7 +254,7 @@ try {
   }
   await send(page, messages.restart, messages.restartAnswer)
   report.restartRpc = await snapshot(page)
-  assert.equal(report.restartRpc.requests.filter(request => request.method === 'chat.send').length, 1)
+  assert.equal(report.restartRpc.requests.filter(request => ['chat.send', 'chat.send.v2'].includes(request.method)).length, 1)
   report.restartVerified = true
   await screenshot(page, 'restart-send')
   await stage('final-normal-quit')

@@ -16,6 +16,7 @@ from opensquilla.application.turn_admission import AdmitTurn
 from opensquilla.artifact_session import (
     ArtifactSessionService,
 )
+from opensquilla.contracts.turn_request_scope import is_resolvable_turn_scope
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.project_workspace_runtime import (
@@ -147,6 +148,8 @@ async def prepare_route(
                 default_workspace=workspace_dir,
             )
         except ProjectWorkspaceStateError as exc:
+            if is_resolvable_turn_scope(command.source_scope):
+                raise
             raise map_project_workspace_error(exc, owner=principal.is_owner) from exc
         if authoritative_guard is not None:
             workspace_guard = authoritative_guard

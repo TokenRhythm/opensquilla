@@ -80,6 +80,19 @@ class GatewayAdmissionStorage:
             return result
         raise TypeError("Receipt replay did not return durable acceptance")
 
+    async def resolve_turn_request_attempt(
+        self, *, source_scope: str, request_session_key: str,
+        client_request_id: str, request_fingerprint: str,
+    ) -> str:
+        with translate_admission_failure():
+            result = await getattr(self.raw, "resolve_turn_request_attempt")(
+                source_scope=source_scope, request_session_key=request_session_key,
+                client_request_id=client_request_id, request_fingerprint=request_fingerprint,
+            )
+        if result not in {"found", "retired", "accepted_unavailable", "not_found"}:
+            raise TypeError("Unexpected turn resolution")
+        return str(result)
+
     async def consume_replayed_pending_chat_input(
         self,
         *,

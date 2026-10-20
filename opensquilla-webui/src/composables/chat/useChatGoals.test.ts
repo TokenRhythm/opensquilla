@@ -165,6 +165,7 @@ function harness(
   const onSetAccepted = vi.fn()
   const ensureSessionKey = vi.fn(async () => sessionKey.value)
   const ensureSubscribed = vi.fn(async () => true)
+  const isSessionReady = vi.fn(() => true)
   const api = useChatGoals({
     goalCenter,
     goalContinuity,
@@ -175,6 +176,7 @@ function harness(
     connectionEpoch,
     ensureSessionKey,
     ensureSubscribed,
+    isSessionReady,
     onSetAccepted,
     notify,
     continuityStorage,
@@ -191,6 +193,7 @@ function harness(
     goalContinuity,
     ensureSessionKey,
     ensureSubscribed,
+    isSessionReady,
     onSetAccepted,
   }
 }
@@ -201,6 +204,29 @@ async function flushAsyncWork() {
 }
 
 describe('useChatGoals', () => {
+  it('does not dispatch Goal set after the awaited readiness proof has been revoked', async () => {
+    const h = harness()
+    h.ensureSubscribed.mockImplementationOnce(async () => {
+      h.isSessionReady.mockReturnValue(false)
+      return true
+    })
+    expect(await h.api.startGoal('Preserve current read ownership')).toBe(false)
+    expect(h.rpc.call).not.toHaveBeenCalled()
+    expect(h.api.busy.value).toBe(false)
+  })
+
+  it('does not dispatch takeover after navigation during its readiness wait', async () => {
+    const h = harness()
+    h.api.applyHydration({ sessionKey: SESSION_KEY, sessionId: SESSION_ID, epoch: 1,
+      goal: goalPayload('active', { continuationDeferredReason: 'owner_disconnected' }) })
+    h.ensureSubscribed.mockImplementationOnce(async () => {
+      h.sessionKey.value = 'agent:main:webchat:other'
+      return true
+    })
+    expect(await h.api.takeOverConnection()).toBe(false)
+    expect(h.goalContinuity.reattach).not.toHaveBeenCalled()
+  })
+
   it('freezes local references before subscription and retains them in the accepted message', async () => {
     const path = 'C:\\Users\\tester\\Downloads\\report.pdf'
     const references = ref([path])

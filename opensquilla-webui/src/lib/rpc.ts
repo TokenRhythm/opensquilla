@@ -1,6 +1,7 @@
 /** OpenSquilla Web UI — WebSocket RPC client (TypeScript port). */
 
 import { TRANSPORT_SESSION_FLOW_V2_CAPABILITY } from '@/contracts/transportFlowCapabilities';
+import { parseTurnReceiptEpoch } from '@/contracts/turnReceiptEpoch';
 
 const ANSWER_GENERATION_RESET_CAPABILITY = 'session.answer_generation_reset.v1';
 const TURN_COMMITTED_CAPABILITY = 'session.turn_committed.v1';
@@ -1879,6 +1880,13 @@ export class RpcClient {
 
   private _noteIncomingFrame(data: RpcFrame): boolean {
     this._lastFrameAt = Date.now();
+    if (data?.type === 'event' && data.event === 'tick' && isRecord(data.payload)) {
+      const current = parseTurnReceiptEpoch(this._policy?.turn_receipt_epoch);
+      const next = parseTurnReceiptEpoch(data.payload.turn_receipt_epoch);
+      if (current && next && next.boot === current.boot && next.issued > current.issued) {
+        this._policy = { ...this._policy, turn_receipt_epoch: data.payload.turn_receipt_epoch };
+      }
+    }
     if (data?.type === 'pong' && this._wakeProbeGeneration === this._socketGeneration
       && (this._probeNonce === null ? data.nonce === undefined : data.nonce === this._probeNonce)) {
       this._noteRoundTrip();

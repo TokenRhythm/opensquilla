@@ -68,6 +68,7 @@ log = structlog.get_logger(__name__)
 
 _SEND_COMMAND_METHODS = frozenset({
     "chat.send",
+    "chat.send.v2",
     "sessions.send",
     "sessions.steer.v2",
     "sessions.pending_inputs.enqueue",

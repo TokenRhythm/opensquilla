@@ -38,7 +38,12 @@ const emitted = []
 try {
   // Exercise the actual quit document's click handler without Electron. Only
   // this explicit request callback may accept the expected interruption prompt.
-  for (const mode of ['confirm', 'missing-window', 'missing-exit', 'early-exit', 'already-exited', 'wrong-window', 'click-failed']) {
+  for (const { mode, allowExitWithoutConfirmation = false } of [
+    ...['confirm', 'missing-window', 'missing-exit', 'early-exit', 'already-exited', 'wrong-window', 'click-failed']
+      .map(mode => ({ mode })),
+    ...['confirm', 'early-exit', 'missing-exit', 'early-exit-evaluate-closed', 'missing-exit-evaluate-closed', 'window-before-exit']
+      .map(mode => ({ mode, allowExitWithoutConfirmation: true })),
+  ]) {
     const calls = []
     const child = new EventEmitter()
     Object.assign(child, { pid: process.pid, exitCode: mode === 'already-exited' ? 0 : null, signalCode: null })
@@ -93,22 +98,38 @@ try {
         },
       }),
     }
-    app.evaluate = async callback => callback({ app: { quit() {
-      calls.push('quit-request')
-      if (mode === 'early-exit') {
-        child.exitCode = 0
-        child.emit('exit', 0)
-      } else if (mode !== 'missing-window' && mode !== 'already-exited') {
-        app.emit('window', page)
+    app.evaluate = async callback => {
+      callback({ app: { quit() {
+        calls.push('quit-request')
+        if (mode === 'early-exit') {
+          child.exitCode = 0
+          child.emit('exit', 0)
+        } else if (mode === 'early-exit-evaluate-closed') {
+          setImmediate(() => {
+            child.exitCode = 0
+            child.emit('exit', 0)
+          })
+        } else if (mode !== 'missing-window' && mode !== 'already-exited' && mode !== 'missing-exit-evaluate-closed') {
+          app.emit('window', page)
+          if (mode === 'window-before-exit') {
+            child.exitCode = 0
+            child.emit('exit', 0)
+          }
+        }
+      } } })
+      if (mode.endsWith('evaluate-closed')) {
+        throw new Error('electronApplication.evaluate: Target page, context or browser has been closed')
       }
-    } } })
+    }
     const abort = new AbortController()
     let seenSignal
-    const run = requestElectronQuitWithConfirmation(app, { signal: abort.signal, timeoutMs: 100 })
+    const run = requestElectronQuitWithConfirmation(app, {
+      signal: abort.signal, timeoutMs: 100, allowExitWithoutConfirmation,
+    })
     if (mode.startsWith('missing-')) setImmediate(() => abort.abort())
-    if (mode === 'confirm') {
+    if (mode === 'confirm' || (allowExitWithoutConfirmation && mode.startsWith('early-exit'))) {
       await run
-      assert.deepEqual(calls, ['quit-request', 'click', 'ipc:confirm'])
+      assert.deepEqual(calls, mode.startsWith('early-exit') ? ['quit-request'] : ['quit-request', 'click', 'ipc:confirm'])
       // Verify that the shared shutdown helper supplies its one deadline's
       // abort signal to custom requests and cancels it after completion.
       const result = await closeElectronWithDeadline({
