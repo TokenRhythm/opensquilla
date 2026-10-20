@@ -501,11 +501,14 @@ async def test_standalone_counter_store_does_not_replace_damaged_identity(tmp_pa
         await storage.close()
 
 
-async def test_standalone_counter_store_close_drains_repeatedly_cancelled_write(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("operation_kind", ["write", "read"])
+async def test_standalone_counter_store_close_drains_repeatedly_cancelled_operation(
+    tmp_path, monkeypatch, operation_kind
 ):
     path = tmp_path / "usage.sqlite3"
     storage = await DailyUsageStore.open(path)
+    if operation_kind == "read":
+        await _record_turns(storage)
     entered = threading.Event()
     release = threading.Event()
     with_connection = storage._with_connection
@@ -516,21 +519,26 @@ async def test_standalone_counter_store_close_drains_repeatedly_cancelled_write(
         return with_connection(operation)
 
     monkeypatch.setattr(storage, "_with_connection", blocked_write)
-    write = asyncio.create_task(_record_turns(storage))
+    operation = asyncio.create_task(
+        _record_turns(storage) if operation_kind == "write"
+        else storage.list_pending_daily_usage(before_day=_TODAY.isoformat())
+    )
     close = None
     try:
         assert await asyncio.to_thread(entered.wait, 2)
-        write.cancel()
+        operation.cancel()
         await asyncio.sleep(0)
-        write.cancel()
+        operation.cancel()
         await asyncio.sleep(0)
         close = asyncio.create_task(storage.close())
         await asyncio.sleep(0)
         assert not close.done()
     finally:
         release.set()
+        # Both operations propagate cancellation after SQLite finishes. Writes
+        # carry a commit receipt, while cancelled reads must not resume uploads.
         with pytest.raises(asyncio.CancelledError):
-            await write
+            await operation
         if close is not None:
             await close
         await storage.close()
