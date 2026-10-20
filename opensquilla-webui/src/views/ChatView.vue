@@ -517,6 +517,7 @@
       :stopping="isStopPending"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
+      @restore-annotations="restorePendingAnnotations"
       @remove="removePendingChip"
       @reorder="reorderPendingItem"
       @reorder-end="endPendingReorder"
@@ -779,6 +780,7 @@ import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
+import { pageAnnotationSnapshots, assertPageContextWithinLimits } from '@/types/pageContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
@@ -1045,8 +1047,11 @@ import {
   requestInitialSectionForWorkbenchItem,
 } from '@/workbench/artifactItems'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
+import { prepareCurrentDocumentPreview, resolveCurrentDocumentResource } from '@/workbench/currentDocumentOpening'
+import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import {
   artifactPayloadFromWorkbenchResource,
+  canonicalWorkbenchResources,
   createResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
   workbenchResourceKey,
@@ -1337,6 +1342,7 @@ function artifactPreviewItemForExplicitOpen(
 
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
+const artifactDocumentsStore = useArtifactDocumentsStore()
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1345,6 +1351,8 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const activeProjectWorkspace = useActiveProjectWorkspace()
+let workbenchMetadataScope: string | null = null
+let workbenchIdentityRevision = 0
 const draftProjectHydration = createDraftProjectHydrationGuard()
 const {
   pendingWorkspaceId,
@@ -1477,6 +1485,7 @@ function annotationAllowed(annotation: Pick<PromptAnnotationSnapshot, 'selection
 const workbenchResourcesEnabled = computed(() => (
   appStore.features.documentWorkbenchResources === true
   || promptAnnotationsEnabled.value
+  || officePromptAnnotationsEnabled.value
 ))
 const attachmentWorkbenchPreviewEnabled = computed(() => (
   workbenchEnabled.value
@@ -1496,6 +1505,7 @@ const sendableAnnotationDraftIds = computed(() =>
 function promptAnnotationBlockedMessage(): string {
   if (!promptAnnotationsEnabled.value && !officePromptAnnotationsEnabled.value) return ''
   const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value, annotationAllowed)
+  if (reason === 'stale') return t('workbench.annotationUnified.stale')
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
@@ -1520,7 +1530,7 @@ async function discardPromptAnnotation(annotationId: string) {
 
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
-  if (!promptAnnotationsEnabled.value || !annotation || annotation.selection !== undefined) return
+  if (!annotation || !annotationAllowed(annotation)) return
   const activated = await focusArtifactPromptAnnotation({
     annotationId,
     documentId: annotation.documentId,
@@ -2170,6 +2180,26 @@ const {
   flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
 } = chatPendingQueue
+watch([sessionKey, pendingQueue], ([key, items]) => {
+  artifactPromptAnnotationsStore.setQueuedDraftIds(key, items.flatMap(item => item.pageContext ? item.draftIds || [] : []))
+}, { deep: true, immediate: true, flush: 'sync' })
+
+async function restorePendingAnnotations(pendingUiId: string) {
+  try {
+    await chatPendingQueue.restoreQueuedAnnotations(pendingUiId, item => {
+      if (!item.pageContext) throw new Error('Missing annotation context')
+      assertPageContextWithinLimits(item.pageContext)
+      const snapshots = pageAnnotationSnapshots(item.pageContext)
+      if (!snapshots.length) throw new Error('Missing annotation instructions')
+      artifactPromptAnnotationsStore.restoreSnapshots(
+        item.ownerSessionKey || sessionKey.value,
+        snapshots, item.draftIds,
+      )
+    })
+  } catch {
+    pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'danger' })
+  }
+}
 watch(attachmentWorkBusy, (busy) => {
   if (!busy) flushDeferredPendingDrain()
 })
@@ -2535,6 +2565,7 @@ onScopeDispose(() => window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, in
 const renderSourceMessages = sessionViewCache.messages
 const chatRenderedMessages = useChatRenderedMessages({
   messages: renderSourceMessages,
+  isPreview: sessionViewCache.showingPreview,
   interruptState,
   sessionKey,
   routerSlots,
@@ -2884,6 +2915,22 @@ async function handleRegenerateMessage(
 
 let applyPendingUserInputSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
 let applyGoalSnapshot: (snapshot: SessionReadMetadata) => void = () => {}
+watch(
+  [sessionKey, deliveryIdentity, currentEpoch, () => gatewayAccess.subscriptionEpoch],
+  (values, previous) => {
+    const [key, identity, epoch, connectionEpoch] = values
+    const [previousKey, previousIdentity, previousEpoch, previousConnectionEpoch] = previous
+    if (previousIdentity !== null && identity !== previousIdentity) workbenchIdentityRevision++
+    // Delivery identity hashing runs alongside startup. Its first Hello-backed
+    // publication belongs to the same read; losing/replacing a proven identity
+    // or changing the connection/session still invalidates retained metadata.
+    const initialProof = previousIdentity === null && identity !== null
+      && key === previousKey && epoch === previousEpoch && connectionEpoch === previousConnectionEpoch
+      && workbenchMetadataScope === JSON.stringify([key, null, connectionEpoch, epoch])
+    workbenchMetadataScope = initialProof ? JSON.stringify([key, identity, connectionEpoch, epoch]) : null
+  },
+  { flush: 'sync' },
+)
 const chatSessionSubscription = useChatSessionSubscription({
   sessionReadLeaseReader: sessionReadLifecycle,
   conversationRuntime,
@@ -2947,8 +2994,14 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   beginSessionMetadataResolution: key => {
     if (pendingSessionIntent.value === 'new_chat') return -1
+    const scope = JSON.stringify([
+      key, gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch, currentEpoch.value,
+    ])
+    const refresh = Boolean(gatewayAccess.deliveryIdentity && workbenchMetadataScope === scope)
+    workbenchMetadataScope = scope
     const preserveCurrent = workbenchMaterializedSessionKey === key
     workbenchMaterializedSessionKey = ''
+    if (refresh && !preserveCurrent) return activeProjectWorkspace.beginSessionRefresh(key)
     return activeProjectWorkspace.beginSessionResolution(key, preserveCurrent)
   },
   onSessionMetadata: (key, generation, metadata) => {
@@ -2957,8 +3010,16 @@ const chatSessionSubscription = useChatSessionSubscription({
       workspaceBindingMismatch.value = (metadata.workspaceId ?? null) !== props.expectedWorkspaceId
     }
     const connectionEpoch = gatewayAccess.subscriptionEpoch
+    const sessionEpoch = metadata.epoch ?? currentEpoch.value
+    const identityRevision = workbenchIdentityRevision
+    const isCurrent = () => !chatViewDisposed && key === sessionKey.value
+      && connectionEpoch === gatewayAccess.subscriptionEpoch && sessionEpoch === currentEpoch.value
+      && identityRevision === workbenchIdentityRevision
     const cached = projectWorkspaces.workspaces.value.find(item => item.id === metadata.workspaceId)
-    void applySessionProjectWorkspaceMetadata({
+    // Subscription installs this metadata's epoch in onSnapshot immediately
+    // after this callback. Validate/project after that installation so a cold
+    // session with a nonzero epoch cannot invalidate its own workspace read.
+    void Promise.resolve().then(() => applySessionProjectWorkspaceMetadata({
       state: activeProjectWorkspace, sessionKey: key, generation,
       metadata: {
         workspaceId: metadata.workspaceId ?? undefined,
@@ -2968,8 +3029,15 @@ const chatSessionSubscription = useChatSessionSubscription({
       cachedWorkspace: cached ? activeSnapshot(cached) : null,
       loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
         .map(workspace => activeSnapshot(workspace)),
-      isCurrent: () => !chatViewDisposed && key === sessionKey.value
-        && gatewayAccess.subscriptionEpoch === connectionEpoch,
+      isCurrent,
+    })).then(() => {
+      // The first snapshot establishes the session epoch after the read began.
+      // Remember the installed context, not the pre-bootstrap unknown epoch.
+      if (isCurrent() && activeWorkspaceStatus.value !== 'resolving' && activeWorkspaceStatus.value !== 'error') {
+        workbenchMetadataScope = JSON.stringify([
+          key, gatewayAccess.deliveryIdentity, connectionEpoch, sessionEpoch,
+        ])
+      }
     })
   },
   onSessionMetadataError: (key, generation) => {
@@ -3231,11 +3299,17 @@ const promptAnnotationSendBlockedReason = computed<string | null>(() =>
 const deliveryBlockedReason = computed<string | null>(() => (
   sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value
 ))
-const effectiveSendBlockedReason = computed<string | null>(() => (
+const baseSendBlockedReason = computed<string | null>(() => (
   (props.ownerBlocked || preparingHostSession.value ? t('chat.liveSendBlockedConnecting') : null)
   || (workspaceBindingMismatch.value ? t('workbench.newPanel.workspaceNotReady') : null)
   || (projectBindingBusy.value || workbenchSessionPreparing.value ? t('workspaces.activeProjectResolving') : null)
-  || deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+  || deliveryBlockedReason.value
+))
+const queuedSendBlockedReason = computed<string | null>(() => (
+  baseSendBlockedReason.value || newTaskModelSendBlockedReason.value
+))
+const effectiveSendBlockedReason = computed<string | null>(() => (
+  baseSendBlockedReason.value || promptAnnotationSendBlockedReason.value
   || newTaskModelSendBlockedReason.value
 ))
 const provenSessionDelivery = ref<{
@@ -3408,10 +3482,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   restoreWidgetState,
   resetStreamLiveTurnState,
   retireAttachments,
+  resetInputHistory: () => resetComposerInputHistory(),
   resetDraftComposer: () => {
     artifactImageLightbox.close()
     inputText.value = ''
-    resetComposerInputHistory()
     autoResizeTextarea()
   },
 })
@@ -3898,6 +3972,7 @@ const chatSend = useChatSend({
   pendingSessionIntent,
   pendingWorkspaceId,
   sendBlockedReason: effectiveSendBlockedReason,
+  queuedSendBlockedReason,
   offlineQueueIdentity,
   deliveryIdentity,
   validateActiveProjectBeforeSend,
@@ -3924,6 +3999,10 @@ const chatSend = useChatSend({
     // recovery copy until that owner has a durable draft contract.
     return stored && attachmentsStored && !props.embedded
   },
+  invalidatePromptAnnotations: snapshots => {
+    try { artifactPromptAnnotationsStore.invalidateSnapshots(snapshots) }
+    catch { pushToast(t('chat.promptAnnotations.updateFailed'), { tone: 'warn' }) }
+  },
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -3936,6 +4015,7 @@ const chatSend = useChatSend({
       draftIds: removedIds,
       sessionKey: acceptedSessionKey,
       requestSessionKey,
+      documentId: snapshots[0]?.documentId,
     })
   },
   materializeDraftSession: key => {
@@ -5674,9 +5754,8 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     const current = await workbenchResourcesStore.openCurrent(key, resource)
     if (!isCurrent()) return
     if (current?.disposition === 'document') {
-      const artifact = artifactPayloadFromRevision(current.revision)
-      artifact.documentId = current.document.documentId
-      artifact.revisionId = current.revision.revisionId
+      const artifact = await prepareCurrentDocumentPreview(current.resource, key, artifactDocumentsStore, isCurrent)
+      if (!artifact || !isCurrent()) return
       openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
@@ -5691,8 +5770,10 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       return
     }
     if (!current && resource.resource.type === 'document') {
+      const artifact = await prepareCurrentDocumentPreview(resource, key, artifactDocumentsStore, isCurrent)
+      if (!artifact || !isCurrent()) return
       openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-        artifact: artifactPayloadFromWorkbenchResource(resource),
+        artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
           platform.capabilities.hasNativeWorkbenchSurfaces
@@ -5806,12 +5887,10 @@ const headerDeliverableCount = computed(() => {
   if (!workbenchEnabled.value || !workbenchResourcesEnabled.value) {
     return sessionArtifacts.value.length
   }
-  // Local previews are Documents, not public artifacts. Keep their existing
-  // resource-list entry reachable without creating a delivery just for the UI.
-  return Math.max(
-    sessionArtifacts.value.length,
-    workbenchResourcesStore.navigationResources(sessionKey.value).length,
-  )
+  const snapshot = workbenchResourceSnapshot.value
+  return snapshot.loaded && snapshot.available
+    ? canonicalWorkbenchResources(snapshot.resources).length
+    : sessionArtifacts.value.length
 })
 const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResource>>(() => (
   new Map(
@@ -5965,9 +6044,8 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
   try {
-    // Working-file cards deliberately follow their Document. Published chat
-    // cards instead retain the original ArtifactStore identity below.
-    if (artifact.source === 'workspace-preview') {
+    const historical = artifact.workbenchOpenIntent === 'history'
+    if (!historical && artifact.source === 'workspace-preview') {
       await openWorkspacePreviewExplicit(
         documentId || { artifactId }, key,
         typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined,
@@ -5979,7 +6057,10 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const ref = createWorkbenchResourceRef('deliverable', artifactId)
-    const resource = await workbenchResourcesStore.resolve(key, ref)
+    const resource = historical
+      ? await workbenchResourcesStore.resolve(key, ref)
+      : await resolveCurrentDocumentResource(
+          (session, resource) => workbenchResourcesStore.resolveFresh(session, resource, isCurrent), key, ref, isCurrent)
     if (!isCurrent()) return
     if (!resource) {
       openLegacyArtifactWorkbench(artifact)
@@ -5991,13 +6072,17 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       )), { tone: 'warn' })
       return
     }
-    // Viewing a delivery must neither open the current head nor import a
-    // working copy. HTML uses its existing lease; Office uses previews.create.
+    // Discovery follows existing Document lineage without importing a copy.
+    // Explicit history retains the immutable delivery and its own tab.
+    const previewArtifact = historical ? artifactPayloadFromWorkbenchResource(resource)
+      : await prepareCurrentDocumentPreview(resource, key, artifactDocumentsStore, isCurrent)
+    if (!isCurrent() || !previewArtifact) return
     openWorkbenchItemExplicit(artifactPreviewItemForExplicitOpen({
-      artifact: artifactPayloadFromWorkbenchResource(resource),
+      artifact: previewArtifact,
+      historical,
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: Boolean(platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native),
-      resourceIdentity: workbenchResourceKey(ref),
+      resourceIdentity: workbenchResourceKey(resource.resource),
       sessionKey: key,
     }))
   } catch (error) {
@@ -6023,10 +6108,12 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
   getArtifact: (key, artifactId) => artifactWorkbench.artifacts.get(key, artifactId),
   resolve: (key, resource) => workbenchResourcesStore.resolve(key, resource),
   openCurrent: (key, resource) => workbenchResourcesStore.openCurrent(key, resource),
+  prepareCurrent: (current, key, isCurrent) => prepareCurrentDocumentPreview(current.resource, key, artifactDocumentsStore, isCurrent),
   show: (current, key, previewPagePath) => {
     const artifact = artifactPayloadFromRevision(current.revision)
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
+    artifact.sourcePath = current.resource.sourcePath
     if (previewPagePath) artifact.previewPagePath = previewPagePath
     const item = artifactPreviewItemForExplicitOpen({
       artifact,
@@ -6458,8 +6545,13 @@ const chatRouteHeaderRegistration = props.embedded
   sessionDurable: computed(() => !isDraftSurface()),
   // Bootstrap owns whether a history read is needed (materialized drafts skip
   // it). A failed workspace lookup is settled, not an endless loading state.
-  sessionLoading: computed(() => activeWorkspaceStatus.value === 'resolving'
-    || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value)),
+  sessionLoading: computed(() => !activeProjectWorkspace.refreshing.value
+    && (activeWorkspaceStatus.value === 'resolving'
+      || !isDraftSurface() && ['idle', 'loading'].includes(chatSessionBootstrap.historyPhase.value))),
+  sessionRefreshing: activeProjectWorkspace.refreshing,
+  sessionContext: computed(() => JSON.stringify([
+    sessionKey.value, gatewayAccess.deliveryIdentity, gatewayAccess.subscriptionEpoch, currentEpoch.value,
+  ])),
   sessionPreparable: workbenchSessionPreparation.canPrepare,
   workspaceId: boundWorkspaceId,
   workspaceReady: computed(() => activeWorkspaceStatus.value === 'ready'),

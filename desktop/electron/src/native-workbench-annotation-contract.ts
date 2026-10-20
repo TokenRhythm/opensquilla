@@ -12,6 +12,9 @@ export const NATIVE_WORKBENCH_ANNOTATION_BODY_MAX_BYTES = 16 * 1024
 export const NATIVE_WORKBENCH_ANNOTATION_ELEMENT_PATH_MAX_LENGTH = 4096
 export const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH = 304
 export const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT = 160
+export const NATIVE_WORKBENCH_ANNOTATION_EDITOR_WIDTH = 352
+export const NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT = 48
+export const NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT = 320
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
@@ -21,6 +24,7 @@ export interface NativeWorkbenchAnnotationCapabilities {
   picker: boolean
   trustedOverlay: boolean
   overlayCopyVersion?: 1
+  overlayEditorVersion?: 2
   atomicCloseRearm?: true
   reason?: string
 }
@@ -50,6 +54,25 @@ export interface NativeWorkbenchAnnotationOverlayShowRequest {
   initialBody: string
   overlayCopyVersion?: 1
   copy?: NativeWorkbenchAnnotationOverlayCopy
+  overlayEditorVersion?: 2
+  editorState?: NativeWorkbenchAnnotationEditorState
+}
+
+export interface NativeWorkbenchAnnotationEditorState {
+  /** Total batch size including the current annotation. */
+  batchCount: number
+  busy: boolean
+  error?: string
+  theme?: 'light' | 'dark' | 'system'
+  /** Recording is the default. Only an explicit consumer may offer batch execution. */
+  action?: 'record' | 'submit'
+}
+
+export interface NativeWorkbenchAnnotationOverlayUpdateRequest {
+  version: NativeWorkbenchAnnotationProtocolVersion
+  surfaceId: string
+  annotationId: string
+  editorState: NativeWorkbenchAnnotationEditorState
 }
 
 export interface NativeWorkbenchAnnotationOverlayCloseRequest {
@@ -98,6 +121,16 @@ export type NativeWorkbenchAnnotationOverlayMessage =
   | {
       version: 1
       type: 'cancel'
+    }
+  | {
+      version: 2
+      type: 'draft-changed' | 'record-current' | 'request-batch-submit' | 'cancel-current'
+      body: string
+    }
+  | {
+      version: 2
+      type: 'content-size'
+      height: number
     }
 
 function objectRecord(value: unknown): Record<string, unknown> | null {
@@ -206,6 +239,8 @@ export function parseNativeWorkbenchAnnotationOverlayShowRequest(
       'initialBody',
       'overlayCopyVersion',
       'copy',
+      'overlayEditorVersion',
+      'editorState',
     ],
     'overlay',
   )
@@ -222,6 +257,13 @@ export function parseNativeWorkbenchAnnotationOverlayShowRequest(
       copy: parseOverlayCopy(request.copy),
     }
   }
+  let editor: Pick<NativeWorkbenchAnnotationOverlayShowRequest, 'overlayEditorVersion' | 'editorState'> = {}
+  if (request.overlayEditorVersion !== undefined || request.editorState !== undefined) {
+    if (request.overlayEditorVersion !== 2 || request.editorState === undefined) {
+      throw new Error('The native Workbench annotation editor version is invalid.')
+    }
+    editor = { overlayEditorVersion: 2, editorState: parseNativeWorkbenchAnnotationEditorState(request.editorState) }
+  }
   return {
     version: request.version as NativeWorkbenchAnnotationProtocolVersion,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
@@ -231,6 +273,33 @@ export function parseNativeWorkbenchAnnotationOverlayShowRequest(
       ? ''
       : parseNativeWorkbenchAnnotationBody(request.initialBody),
     ...localizedCopy,
+    ...editor,
+  }
+}
+
+export function parseNativeWorkbenchAnnotationEditorState(value: unknown): NativeWorkbenchAnnotationEditorState {
+  const state = objectRecord(value)
+  if (!state || Object.keys(state).some(key => !['batchCount', 'busy', 'error', 'theme', 'action'].includes(key))
+    || !Number.isInteger(state.batchCount) || Number(state.batchCount) < 0 || Number(state.batchCount) > 16
+    || typeof state.busy !== 'boolean'
+    || (state.error !== undefined && (typeof state.error !== 'string' || state.error.length > 1000))
+    || (state.theme !== undefined && !['light', 'dark', 'system'].includes(String(state.theme)))
+    || (state.action !== undefined && state.action !== 'record' && state.action !== 'submit')) {
+    throw new Error('The native Workbench annotation editor state is invalid.')
+  }
+  return { batchCount: Number(state.batchCount), busy: state.busy,
+    ...(typeof state.error === 'string' ? { error: state.error } : {}),
+    ...(state.action !== undefined ? { action: state.action as 'record' | 'submit' } : {}),
+    ...(state.theme !== undefined ? { theme: state.theme as NativeWorkbenchAnnotationEditorState['theme'] } : {}) }
+}
+
+export function parseNativeWorkbenchAnnotationOverlayUpdateRequest(value: unknown): NativeWorkbenchAnnotationOverlayUpdateRequest {
+  const request = parseExactRequest(value, ['version', 'surfaceId', 'annotationId', 'editorState'], 'overlay update')
+  return {
+    version: request.version as NativeWorkbenchAnnotationProtocolVersion,
+    surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
+    annotationId: parseNativeWorkbenchAnnotationOpaqueId(request.annotationId, 'annotation'),
+    editorState: parseNativeWorkbenchAnnotationEditorState(request.editorState),
   }
 }
 
@@ -265,6 +334,23 @@ export function parseNativeWorkbenchAnnotationOverlayMessage(
 ): NativeWorkbenchAnnotationOverlayMessage {
   const message = objectRecord(value)
   const type = message?.type
+  if (message?.version === 2) {
+    if (type === 'content-size') {
+      if (Object.keys(message).some(key => !['version', 'type', 'height'].includes(key))
+        || typeof message.height !== 'number' || !Number.isFinite(message.height)
+        || message.height < 0 || message.height > 100_000) {
+        throw new Error('The trusted annotation overlay size is invalid.')
+      }
+      return { version: 2, type, height: Math.max(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
+        Math.min(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT, Math.ceil(message.height))) }
+    }
+    if (!['draft-changed', 'record-current', 'request-batch-submit', 'cancel-current'].includes(String(type))
+      || Object.keys(message).some(key => !['version', 'type', 'body'].includes(key))) {
+      throw new Error('The trusted annotation overlay action is invalid.')
+    }
+    return { version: 2, type: type as 'draft-changed' | 'record-current' | 'request-batch-submit' | 'cancel-current',
+      body: parseNativeWorkbenchAnnotationBody(message.body) }
+  }
   if (
     !message
     || message.version !== 1

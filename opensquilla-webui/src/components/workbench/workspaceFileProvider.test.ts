@@ -28,6 +28,52 @@ async function setup(read: WorkspaceReferences['read']) {
   return { item, runtime, state: () => state }
 }
 describe('workspace file runtime', () => {
+  it('offers one annotation entry for old reference paths and retains it disabled for unsupported clients', () => {
+    const htmlReference = { ...reference, id: 'page.html', locator: { ...reference.locator, relativePath: 'site/page.html' } }
+    const item = createWorkspaceFileItem('task', htmlReference)
+    const state = { active: true, hostAvailable: true, nativeSurface: false, runtimeState: {} }
+    const definition = createWorkspaceFileDefinition(null, null, key => key, { onAnnotate: vi.fn() })
+    expect(definition.getToolbarItems!(item, state)).toContainEqual({
+      kind: 'action', id: 'annotate', icon: 'pencil', label: 'workbench.annotationUnified.start', disabled: false,
+    })
+    const unavailable = createWorkspaceFileDefinition(null, null, key => key, { onAnnotate: vi.fn(), annotationAvailable: () => false })
+    expect(unavailable.getToolbarItems!(item, state).find(action => action.kind === 'action' && action.id === 'annotate')).toMatchObject({ disabled: true })
+    expect(definition.getToolbarItems!(createWorkspaceFileItem('task', reference), state).some(action => action.kind === 'action' && action.id === 'annotate')).toBe(false)
+  })
+  it('keeps server-denied annotation disabled even for a supported Office extension', () => {
+    const item = createResolvedWorkspaceFileItem('task', {
+      requestedPath: 'deck.pptx', path: 'deck.pptx', name: 'deck.pptx', mime: 'application/octet-stream',
+      size: 10, kind: 'download', workspaceBinding: 'binding-a',
+      annotationCapability: { supported: false, reasonCode: 'document_target_ambiguous' },
+    })
+    const definition = createWorkspaceFileDefinition(null, null, key => key, { onAnnotate: vi.fn() })
+    const toolbar = definition.getToolbarItems!(item, { active: true, hostAvailable: true, nativeSurface: false, runtimeState: {} })
+    expect(toolbar.find(action => action.kind === 'action' && action.id === 'annotate')).toMatchObject({ disabled: true })
+  })
+  it('suppresses repeated preparation and invalidates its callback when the file is suspended', async () => {
+    const item = createWorkspaceFileItem('task', { ...reference, id: 'page.html', locator: { ...reference.locator, relativePath: 'page.html' } })
+    let finish!: () => void
+    let stillCurrent!: () => boolean
+    const onAnnotate = vi.fn((_item: WorkbenchItem, isCurrent: () => boolean) => {
+      stillCurrent = isCurrent
+      return new Promise<void>(resolve => { finish = resolve })
+    })
+    const state: Record<string, unknown> = {}
+    const definition = createWorkspaceFileDefinition(null, null, key => key, { onAnnotate })
+    const runtime = await definition.createRuntime!(item, {
+      getRenderState: () => state, updateRenderState: patch => Object.assign(state, patch),
+      isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+    })
+    runtime.performAction!('annotate', item)
+    runtime.performAction!('annotate', item)
+    expect(onAnnotate).toHaveBeenCalledTimes(1)
+    expect(stillCurrent()).toBe(true)
+    expect(state.annotationPreparing).toBe(true)
+    runtime.suspend!(item)
+    expect(stillCurrent()).toBe(false)
+    finish(); await Promise.resolve()
+    expect(state.annotationPreparing).toBe(false)
+  })
   it('restores only bounded reading hints after release, rereading with child authority', async () => {
     const file: WorkspaceFile = { requestedPath: 'large.ts', path: 'large.ts', name: 'large.ts', mime: 'text/typescript',
       size: 1000, kind: 'text', workspaceBinding: 'binding-a', revision: 'rev-a', textPaging: true }

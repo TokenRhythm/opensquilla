@@ -130,6 +130,26 @@ it('keeps a fixed HTML lease on A with normal preview capabilities until explici
   } finally { await runtime.dispose?.('closed') }
 })
 
+it('shows only the unified annotation action for fixed HTML even when Web cannot annotate', () => {
+  const item = createArtifactPreviewWorkbenchItem({
+    artifact, nativeHtml: false, sessionKey: 'session-a', resourceIdentity: 'deliverable:artifact-1',
+  })
+  const definition = createArtifactWorkbenchDefinitions({
+    prepareAnnotation: vi.fn(async () => undefined),
+    editCurrentResource: vi.fn(async () => undefined),
+    baseOrigin: 'http://localhost', currentSessionId: () => 'session-a',
+    confirmRemoteResources: async () => true, pushToast: vi.fn(), t: key => key,
+    platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+  })[0]!
+  const items = definition.getToolbarItems!(item, {
+    active: true, hostAvailable: true, nativeSurface: false, runtimeState: {},
+  })
+  expect(items.some(action => action.id === 'edit-current')).toBe(false)
+  expect(items.find(action => action.id === 'prepare-annotation')).toMatchObject({
+    disabled: true, tooltip: 'workbench.artifactAnnotation.desktopEditingOnly',
+  })
+})
+
 function nativeResource() {
   return {
     artifact,
@@ -190,6 +210,7 @@ async function createAnnotationDraftHarness(
   atomicCloseRearm = false,
   workingDocumentId?: string,
   navigatedPage?: string,
+  overlayEditorV2 = false,
 ) {
   let currentHead = { ...artifact }
   const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
@@ -226,6 +247,9 @@ async function createAnnotationDraftHarness(
   const showOverlay = vi.fn(async (
     _request: Parameters<NonNullable<NativeWorkbenchApi['showArtifactAnnotationOverlay']>>[0],
   ): Promise<NativeWorkbenchSurfaceResult> => showOverlayResult)
+  const updateOverlay = vi.fn(async (
+    _request: Parameters<NonNullable<NativeWorkbenchApi['updateArtifactAnnotationOverlay']>>[0],
+  ): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
   const setSurfaceRect = vi.fn(async () => ({ ok: true as const }))
   const setAnnotationMode = vi.fn(async (
     _request: Parameters<NonNullable<NativeWorkbenchApi['setArtifactAnnotationMode']>>[0],
@@ -266,10 +290,12 @@ async function createAnnotationDraftHarness(
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1 as const,
+      ...(overlayEditorV2 ? { overlayEditorVersion: 2 as const } : {}),
       ...(atomicCloseRearm ? { atomicCloseRearm: true as const } : {}),
     })),
     setArtifactAnnotationMode: setAnnotationMode,
     showArtifactAnnotationOverlay: showOverlay,
+    ...(overlayEditorV2 ? { updateArtifactAnnotationOverlay: updateOverlay } : {}),
     closeArtifactAnnotationOverlay: closeOverlay,
     captureWorkbenchScreenshot: vi.fn(async () => ({
       targetRef: 'target-focused', mimeType: 'image/png' as const,
@@ -397,6 +423,7 @@ async function createAnnotationDraftHarness(
     },
     beginOverlayEdit,
     closeOverlay,
+    updateOverlay,
     completeOverlayEdit,
     createSurface,
     createAnnotation,
@@ -1167,6 +1194,77 @@ describe('artifact Workbench provider', () => {
       )
     },
   )
+
+  it('unlocks the native V2 editor after a failed record and retries the same draft', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    expect(harness.showOverlay).toHaveBeenCalledWith(expect.objectContaining({
+      overlayEditorVersion: 2, editorState: expect.objectContaining({ action: 'record' }),
+    }))
+    harness.updateAnnotation.mockRejectedValueOnce(new Error('Storage unavailable'))
+    const record = { version: 3 as const, surfaceId: harness.item.id, type: 'annotation-record-current' as const,
+      detail: { annotationId: harness.annotationId, body: 'Keep this until recording succeeds.' } }
+    await harness.runtime.handleNativeSurfaceEvent?.(record, harness.item)
+    expect(harness.closeOverlay).not.toHaveBeenCalled()
+    expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.updateFailed' }),
+    }))
+    await harness.runtime.handleNativeSurfaceEvent?.(record, harness.item)
+    expect(harness.updateAnnotation).toHaveBeenLastCalledWith(harness.annotationId, record.detail.body)
+    expect(harness.closeOverlay).toHaveBeenCalledOnce()
+    expect(harness.completeOverlayEdit).toHaveBeenCalledOnce()
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('keeps native V2 input locked between successful persistence and close acknowledgement', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    let acknowledgeClose!: (result: NativeWorkbenchSurfaceResult) => void
+    harness.closeOverlay.mockReturnValueOnce(new Promise(resolve => { acknowledgeClose = resolve }))
+    const recording = harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-record-current',
+      detail: { annotationId: harness.annotationId, body: 'Wait for close before more input.' },
+    }, harness.item)
+    await vi.waitFor(() => expect(harness.closeOverlay).toHaveBeenCalledOnce())
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId, editorState: expect.objectContaining({ busy: true }),
+    }))
+    acknowledgeClose({ ok: true })
+    await recording
+    expect(harness.completeOverlayEdit).toHaveBeenCalledOnce()
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('unlocks the native V2 editor after a failed close without completing the draft', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    harness.closeOverlay.mockResolvedValueOnce({ ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: true })
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-record-current',
+      detail: { annotationId: harness.annotationId, body: 'Retry closing this editor.' },
+    }, harness.item)
+    expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.closeFailed' }),
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('unlocks the native V2 editor after a failed cancel and retains ownership for retry', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    harness.discardAnnotation.mockRejectedValueOnce(new Error('Storage unavailable'))
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-cancel',
+      detail: { annotationId: harness.annotationId, body: 'Keep this if cancellation fails.', reason: 'user-cancelled' },
+    }, harness.item)
+    expect(harness.closeOverlay).not.toHaveBeenCalled()
+    expect(harness.releaseOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.discardFailed' }),
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
 
   it('keeps the trusted editor and draft ownership when atomic rearm fails', async () => {
     const harness = await createAnnotationDraftHarness({ ok: true }, true)
@@ -2950,7 +3048,7 @@ describe('artifact Workbench provider', () => {
     }
   })
 
-  it('uses the explicit v1 compatibility path when a v2-era Desktop lacks the lease broker', async () => {
+  it.each([false, true])('only allows the v1 single-file fallback outside explicit history (history=%s)', async (historical) => {
     const nativeApi: NativeWorkbenchApi = {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2] as Array<1 | 2>,
@@ -2965,6 +3063,7 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const previewItem = createArtifactPreviewWorkbenchItem({
       artifact: { ...artifact, id: 'art-fixture' },
+      historical,
       nativeHtml: true,
       sessionKey: 'session-a',
     })
@@ -2990,11 +3089,17 @@ describe('artifact Workbench provider', () => {
       reportError: vi.fn(),
     })
 
-    expect(renderState).toMatchObject({
-      compatibilityFallback: true,
-      previewBlocked: false,
-      previewMode: 'offline',
-    })
+    if (historical) {
+      expect(renderState.previewBlocked).toBe(true)
+      expect(renderState.compatibilityFallback).not.toBe(true)
+      expect(nativeApi.createSurface).not.toHaveBeenCalled()
+    } else {
+      expect(renderState).toMatchObject({
+        compatibilityFallback: true,
+        previewBlocked: false,
+        previewMode: 'offline',
+      })
+    }
   })
 
   it('clears a Web preview origin before revoking its lease on normal close', async () => {

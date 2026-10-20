@@ -24,9 +24,10 @@ vi.mock('./OfficePageNavigator.vue', async () => {
 const sessions: OfficePreviewOptions[] = []
 const cleanups: (() => void)[] = []
 let observeResize: ResizeObserverCallback
-const resize = vi.fn()
+const resize = vi.fn(), refreshAnchor = vi.fn()
 const setSelectionMode = vi.fn()
 const clearSelection = vi.fn()
+const locateSelection = vi.fn(async () => ({ status: 'location-only' as const, anchor: null }))
 const goTo = vi.fn()
 const fitPage = vi.fn(), fitWidth = vi.fn(), setScale = vi.fn()
 const title: OfficeSelection = { format: 'pptx', kind: 'element', slideIndex: 0, shapeId: '4', text: '中文标题', truncated: false }
@@ -45,7 +46,8 @@ beforeEach(() => {
     return { destroy: vi.fn(), previous: vi.fn(), next: vi.fn(), fitWidth, fitPage, goTo, setScale,
       getPageSize: () => ({ width: 960, height: 540 }), renderThumbnail: vi.fn(),
       getNotes: (index: number) => options.format === 'pptx' ? ['中文演讲者备注\n第二段 <script>不会执行</script>', '第二页备注'][index] || null : null,
-      zoomIn: vi.fn(), zoomOut: vi.fn(), resize, setSelectionMode, clearSelection }
+      zoomIn: vi.fn(), zoomOut: vi.fn(), resize, refreshAnchor, setSelectionMode, clearSelection,
+      clearTransientSelection: clearSelection, reselect: vi.fn(), locateSelection }
   })
   vi.stubGlobal('ResizeObserver', class {
     constructor(callback: ResizeObserverCallback) { observeResize = callback }
@@ -55,21 +57,64 @@ beforeEach(() => {
 })
 afterEach(() => { cleanups.splice(0).forEach(cleanup => cleanup()); vi.unstubAllGlobals(); vi.clearAllMocks() })
 
-async function mount(format: OfficePreviewFormat = 'pptx', annotationEnabled = true, readingState?: ResourceReadingState) {
+async function mount(format: OfficePreviewFormat = 'pptx', annotationEnabled = true, readingState?: ResourceReadingState, selectionMode?: boolean) {
   const host = document.createElement('div')
   document.body.append(host)
-  const state = reactive({ data: new ArrayBuffer(1), format, annotationEnabled, suspended: false, readingState })
-  const request = vi.fn()
-  const app = createApp({ render: () => h(OfficePreviewPanel, { ...state, onSelectionRequest: request }) })
+  const state = reactive({ data: new ArrayBuffer(1), format, annotationEnabled, suspended: false, readingState, selectionMode, selectionLocked: false,
+    selectionToLocate: undefined as { selection: OfficeSelection; revisionId?: string; stale?: boolean; requestId: string } | undefined })
+  const request = vi.fn(), commit = vi.fn(), anchor = vi.fn(), located = vi.fn()
+  const app = createApp({ render: () => h(OfficePreviewPanel, { ...state, onSelectionRequest: request,
+    onSelectionCommit: commit, onAnchorChange: anchor, onLocateResult: located }) })
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
   app.mount(host)
   cleanups.push(() => { app.unmount(); host.remove() })
   await flush()
   const button = () => host.querySelector<HTMLButtonElement>('.office-preview__request')!
-  return { host, state, request, button }
+  return { host, state, request, button, commit, anchor, located }
 }
 
 describe('Office request-change entry', () => {
+  it('locks the selected target without exiting annotation and refreshes after the guide moves the canvas', async () => {
+    const panel = await mount('docx', true, undefined, true)
+    sessions[0]!.onSelection(title)
+    panel.state.selectionMode = false
+    panel.state.selectionLocked = true
+    await flush()
+    expect(setSelectionMode).toHaveBeenLastCalledWith(false, true)
+    expect(refreshAnchor).toHaveBeenCalled()
+    expect(panel.host.querySelector('.office-preview__guide')).toBeNull()
+    setSelectionMode.mockClear()
+    panel.host.querySelector('section')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await flush()
+    expect(setSelectionMode).not.toHaveBeenCalled()
+    clearSelection.mockClear()
+    panel.host.querySelector<HTMLButtonElement>('.test-go-page')!.click()
+    await flush()
+    expect(clearSelection).not.toHaveBeenCalled()
+    panel.state.selectionLocked = false
+    await flush()
+    expect(setSelectionMode).toHaveBeenLastCalledWith(false)
+  })
+  it('uses the shared controlled entry and forwards geometry and locate status without a second button', async () => {
+    const panel = await mount('pptx', true, undefined, true)
+    expect(panel.button()).toBeNull()
+    expect(setSelectionMode).toHaveBeenLastCalledWith(true)
+    expect(panel.host.querySelector('.office-preview__hint')).toBeNull()
+    const anchor = { rect: { left: 10, top: 20, width: 120, height: 30 },
+      rects: [{ left: 10, top: 20, width: 120, height: 30 }],
+      viewport: { left: 0, top: 0, width: 600, height: 400 }, visible: true }
+    sessions[0]!.onSelectionCommitDetail?.({ selection: title, anchor })
+    sessions[0]!.onAnchorChange?.(anchor)
+    expect(panel.commit).toHaveBeenCalledExactlyOnceWith({ selection: title, anchor })
+    expect(panel.anchor).toHaveBeenLastCalledWith(anchor)
+    panel.state.selectionToLocate = { selection: title, revisionId: 'old-revision', stale: true, requestId: 'locate-1' }
+    await flush()
+    expect(locateSelection).toHaveBeenCalledWith(title, panel.state.selectionToLocate)
+    expect(panel.located).toHaveBeenCalledWith({ status: 'location-only', anchor: null, requestId: 'locate-1' })
+    panel.state.selectionMode = false
+    await flush()
+    expect(setSelectionMode).toHaveBeenLastCalledWith(false)
+  })
   it.each(['docx', 'pptx', 'xlsx'] as const)('restores %s page or sheet and zoom without reactivating selection', async format => {
     const panel = await mount(format, true, { page: 1, mode: 'manual', scale: 1.75, top: 88, left: 20, time: 0 })
     await flush(); await flush()

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 
+from opensquilla import __version__
 from opensquilla.cli.gateway_client import (
     GatewayClient,
     GatewayRPCError,
@@ -181,6 +182,18 @@ async def test_gateway_client_connect_uses_bounded_transport_limits(
         assert connect_frame["params"]["caps"] == [ANSWER_GENERATION_RESET_CAPABILITY] + (
             [STRUCTURED_USER_INPUT_CAPABILITY] if structured_user_input else []
         )
+        if structured_user_input:
+            from opensquilla.gateway.protocol import ClientInfo
+
+            info = ClientInfo.model_validate(connect_frame["params"]["client"], strict=True)
+            assert info.id == "opensquilla-cli"
+            assert info.mode == "tui"
+            assert info.version == __version__
+            assert info.platform == sys.platform
+            assert info.instance_id is None
+            assert info.model_identifier is None
+        else:
+            assert "client" not in connect_frame["params"]
     finally:
         await client.close()
 

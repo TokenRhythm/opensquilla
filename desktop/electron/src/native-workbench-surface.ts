@@ -17,9 +17,13 @@ import {
 import { randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { fileURLToPath } from 'node:url'
+import { placeAnnotationCard, type AnnotationSide } from './annotationPlacement.js'
 import {
   NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT,
   NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_WIDTH,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT,
   parseNativeWorkbenchAnnotationGeometry,
   parseNativeWorkbenchAnnotationOverlayMessage,
   parseNativeWorkbenchAnnotationSelection,
@@ -27,6 +31,7 @@ import {
   type NativeWorkbenchAnnotationModeRequest,
   type NativeWorkbenchAnnotationOverlayCloseRequest,
   type NativeWorkbenchAnnotationOverlayShowRequest,
+  type NativeWorkbenchAnnotationOverlayUpdateRequest,
   type NativeWorkbenchAnnotationSelection,
   type NativeWorkbenchAnnotationSelectionCandidate,
 } from './native-workbench-annotation-contract.js'
@@ -205,6 +210,9 @@ interface NativeWorkbenchAnnotationOverlayBinding {
   port: MessagePortMain
   record: NativeWorkbenchSurfaceRecord
   selectionId: string
+  editorVersion: 1 | 2
+  contentHeight: number
+  placementSide?: AnnotationSide
 }
 
 interface NativeWorkbenchAnnotationOverlayRecord {
@@ -570,6 +578,41 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
     @media (prefers-reduced-motion: reduce) {
       textarea, button { transition: none; }
     }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg-surface: #FFFFFF; --bg-surface-2: #F0F0F2; --bg-hover: #EAEAED;
+      --text: #1D1D1F; --text-muted: #5F6066; --text-dim: #85868D;
+      --border: #E6E6E9; --border-strong: #D5D5DA;
+      --accent: #BA4D0F; --accent-hover: #A5440C; --accent-foreground: #FFFFFF;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg-surface: #202022; --bg-surface-2: #28282B; --bg-hover: #353539;
+      --text: #F5F5F7; --text-muted: #B0B0B6; --text-dim: #87878E;
+      --border: #303034; --border-strong: #444448;
+      --accent: #F26A1B; --accent-hover: #FF7A2E; --accent-foreground: #160B02;
+    }
+    #annotation-error { margin: 0; color: #D85444; font-size: 11px; overflow-wrap: anywhere; }
+    [hidden] { display: none !important; }
+    :root[data-editor-version="2"] .annotation-card {
+      display: flex; flex-direction: column; gap: 7px; height: auto; min-height: 48px;
+      max-height: 100vh; overflow: auto; padding: 12px 12px 10px 15px;
+      border-radius: 10px; box-shadow: none;
+    }
+    :root[data-editor-version="2"] .annotation-card::before { inset: 12px auto 12px 0; }
+    :root[data-editor-version="2"] .annotation-header { display: none; }
+    :root[data-editor-version="2"] textarea {
+      flex: none; min-height: 20px; max-height: 180px; padding: 0; border: 0;
+      border-radius: 0; background: transparent; line-height: 20px; box-shadow: none;
+    }
+    :root[data-editor-version="2"] footer { flex: none; min-height: 28px; gap: 7px; }
+    :root[data-editor-version="2"] .annotation-card[data-expanded="false"] footer { display: none; }
+    :root[data-editor-version="2"] button { height: 28px; font-size: 11px; font-weight: 500; }
+    :root[data-editor-version="2"] #annotation-cancel { min-width: 0; padding: 0 5px; border: 0; }
+    :root[data-editor-version="2"] #annotation-submit {
+      min-width: 28px; width: 28px; padding: 0; border-radius: 7px; font-size: 19px;
+    }
+    :root[data-editor-version="2"] .annotation-shortcut-hint { line-height: 1.4; white-space: normal; }
   </style>
 </head>
 <body>
@@ -592,6 +635,7 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       <button id="annotation-cancel" type="button">Cancel</button>
       <button id="annotation-submit" type="submit">Add annotation</button>
     </footer>
+    <p id="annotation-error" role="alert" hidden></p>
   </form>
 </body>
 </html>`
@@ -1418,6 +1462,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'No active browser page is available.',
       }
@@ -1429,6 +1474,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'The isolated DOM inspector is unavailable.',
       }
@@ -1448,6 +1494,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: true,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'The trusted annotation editor is unavailable.',
       }
@@ -1458,6 +1505,7 @@ export class NativeWorkbenchSurfaceManager {
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1,
+      overlayEditorVersion: 2,
       atomicCloseRearm: true,
     }
   }
@@ -1714,6 +1762,8 @@ export class NativeWorkbenchSurfaceManager {
         port: channel.port1,
         record,
         selectionId: request.selectionId,
+        editorVersion: request.overlayEditorVersion === 2 ? 2 : 1,
+        contentHeight: NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
       }
       overlay.binding = binding
       channel.port1.on('message', event => {
@@ -1728,13 +1778,21 @@ export class NativeWorkbenchSurfaceManager {
       overlay.view.webContents.postMessage(
         NATIVE_WORKBENCH_ANNOTATION_OVERLAY_CHANNEL,
         {
-          version: 1,
+          version: binding.editorVersion,
           initialBody: request.initialBody,
           copy: request.copy || NATIVE_WORKBENCH_ANNOTATION_OVERLAY_DEFAULT_COPY,
+          ...(binding.editorVersion === 2 ? { editorState: request.editorState } : {}),
         },
         [channel.port2],
       )
       const bounds = this.annotationOverlayBounds(record, candidate)
+      // Inspect mode has ended, but the selected target remains visible while
+      // the trusted editor owns focus. Chromium tracks this node decoration
+      // through scroll/zoom without mutating the untrusted preview document.
+      await this.cdpCommand(record, 'Overlay.highlightNode', {
+        objectId: candidate.objectId,
+        highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
+      })
       this.presentAnnotationOverlay(
         overlay,
         bounds,
@@ -1762,6 +1820,26 @@ export class NativeWorkbenchSurfaceManager {
         retryable: true,
         message: errorMessage(error),
       }
+    }
+  }
+
+  updateArtifactAnnotationOverlay(request: NativeWorkbenchAnnotationOverlayUpdateRequest): NativeWorkbenchSurfaceResult {
+    const record = this.annotationRecordForUiRequest(request.surfaceId)
+    const overlay = record ? this.annotationOverlays.get(record.owner) : undefined
+    const binding = overlay?.binding
+    if (!record || !binding || binding.record !== record || binding.annotationId !== request.annotationId
+      || binding.editorVersion !== 2
+      || record.annotationCandidate?.selection.selectionId !== binding.selectionId
+      || record.annotationCandidate.documentGeneration !== record.annotationDocumentGeneration) {
+      return { ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: false,
+        message: 'The annotation editor changed before its state could be updated.' }
+    }
+    try {
+      binding.port.postMessage({ version: 2, type: 'editor-state', editorState: request.editorState })
+      return { ok: true }
+    } catch {
+      return { ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: true,
+        message: 'The annotation editor is unavailable.' }
     }
   }
 
@@ -3415,22 +3493,43 @@ export class NativeWorkbenchSurfaceManager {
       height: candidate.selection.rect.height * scaleY,
     }
     const gap = 8
+    const binding = this.annotationOverlays.get(record.owner)?.binding
+    const editorV2 = binding?.record === record && binding.editorVersion === 2
+    const width = editorV2 ? NATIVE_WORKBENCH_ANNOTATION_EDITOR_WIDTH : NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH
+    const height = editorV2 ? Math.max(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
+      Math.min(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT, binding.contentHeight)) : NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT
+    if (editorV2) {
+      const placement = placeAnnotationCard({
+        anchor: { left: selected.x, top: selected.y, width: selected.width, height: selected.height },
+        viewport: { left: surface.x, top: surface.y, width: surface.width, height: surface.height },
+        width,
+        height,
+        preferredSide: binding.placementSide,
+      })
+      binding.placementSide = placement.side
+      return {
+        x: Math.round(placement.left),
+        y: Math.round(placement.top),
+        width: Math.floor(placement.width),
+        height: Math.floor(placement.height),
+      }
+    }
     let x = selected.x + selected.width + gap
     let y = selected.y
-    if (x + NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH > surface.x + surface.width) {
-      x = selected.x - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH - gap
+    if (x + width > surface.x + surface.width) {
+      x = selected.x - width - gap
     }
-    if (x < surface.x) x = surface.x + surface.width - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH
-    if (y + NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT > surface.y + surface.height) {
-      y = selected.y + selected.height - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT
+    if (x < surface.x) x = surface.x + surface.width - width
+    if (y + height > surface.y + surface.height) {
+      y = selected.y + selected.height - height
     }
     return {
       x: Math.round(Math.max(surface.x, Math.min(x, surface.x + surface.width
-        - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH))),
+        - width))),
       y: Math.round(Math.max(surface.y, Math.min(y, surface.y + surface.height
-        - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT))),
-      width: Math.min(NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH, surface.width),
-      height: Math.min(NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT, surface.height),
+        - height))),
+      width: Math.min(width, surface.width),
+      height: Math.min(height, surface.height),
     }
   }
 
@@ -3537,8 +3636,17 @@ export class NativeWorkbenchSurfaceManager {
     let message
     try {
       message = parseNativeWorkbenchAnnotationOverlayMessage(value)
+      if (message.version !== binding.editorVersion) throw new Error('Unexpected annotation editor version.')
     } catch {
       this.failAnnotationOverlay(binding.record, binding.annotationId, 'invalid-overlay-message')
+      return
+    }
+    if (message.type === 'content-size') {
+      if (binding.contentHeight === message.height) return
+      binding.contentHeight = message.height
+      this.presentAnnotationOverlay(overlay,
+        this.annotationOverlayBounds(binding.record, binding.record.annotationCandidate!),
+        this.ownerCanShowSurfaces(binding.record.owner), true)
       return
     }
     if (message.type === 'draft-changed') {
@@ -3548,8 +3656,9 @@ export class NativeWorkbenchSurfaceManager {
       })
       return
     }
-    if (message.type === 'submit') {
-      this.emit(binding.record, 'annotation-submit', {
+    if (message.type === 'submit' || message.type === 'record-current' || message.type === 'request-batch-submit') {
+      this.emit(binding.record, message.type === 'submit' ? 'annotation-submit'
+        : message.type === 'record-current' ? 'annotation-record-current' : 'annotation-batch-submit', {
         annotationId: binding.annotationId,
         body: message.body,
       })
@@ -3557,6 +3666,7 @@ export class NativeWorkbenchSurfaceManager {
       this.emit(binding.record, 'annotation-cancel', {
         annotationId: binding.annotationId,
         reason: 'user-cancelled',
+        ...(message.type === 'cancel-current' ? { body: message.body } : {}),
       })
     }
     // Submit/cancel are intents, not acknowledgements that Gateway state was

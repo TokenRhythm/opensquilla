@@ -785,6 +785,7 @@ class ArtifactSessionRepository:
         self, *, session_key: str, session_id: str, name: str,
         initial_artifact: ArtifactBlobRef, actor: Actor, working_source: dict[str, str],
         validate_session: Callable[[Any], Awaitable[None]] | None = None,
+        kind: ArtifactKind = ArtifactKind.HTML,
     ) -> tuple[CommitResult, bool]:
         """Atomically bind source files and an internal baseline, without a deliverable origin."""
         async with self._transaction("register_working_source") as conn:
@@ -812,7 +813,7 @@ class ArtifactSessionRepository:
                 return CommitResult(document=document, revision=revision), False
             commit = await self._create_document_on_conn(
                 conn, session_key=session_key, session_id=session_id, name=name,
-                kind=ArtifactKind.HTML, initial_artifact=initial_artifact, actor=actor,
+                kind=kind, initial_artifact=initial_artifact, actor=actor,
                 document_id=self._id_factory("doc"), revision_id=self._id_factory("rev"),
                 created_at=self._clock(),
             )

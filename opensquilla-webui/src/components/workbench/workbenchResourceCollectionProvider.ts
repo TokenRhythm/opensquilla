@@ -1,6 +1,7 @@
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import {
   artifactPayloadFromWorkbenchResource,
+  canonicalWorkbenchResources,
   resourcesFromWorkbenchItem,
   workbenchResourceKey,
 } from '@/workbench/workbenchResourceItems'
@@ -177,7 +178,9 @@ export function createWorkbenchResourceCollectionDefinition(
     getHeader: item => ({
       title: options.t('workbench.resources.title'),
       subtitle: options.t('workbench.resources.count', {
-        count: options.resources?.(item).length ?? Number(item.payload.resourceCount || 0),
+        count: options.resources
+          ? canonicalWorkbenchResources(options.resources(item)).length
+          : Number(item.payload.resourceCount || 0),
       }),
       icon: 'folder',
     }),
@@ -209,7 +212,7 @@ export function createWorkbenchResourceCollectionDefinition(
         ? options.t('workbench.resources.currentWorkingFile')
         : resource.resource.type === 'deliverable' ? options.t('workbench.resources.publishedVersion') : '',
       retryLabel: options.t('workbench.resources.retry'),
-      resources: options.resources?.(item) ?? resourcesFromWorkbenchItem(item),
+      resources: canonicalWorkbenchResources(options.resources?.(item) ?? resourcesFromWorkbenchItem(item)),
       unavailableReason: (resource: WorkbenchResource) => options.t(
         workbenchResourceUnavailableReasonKey(resource.capabilities.reasonCode),
       ),

@@ -177,8 +177,13 @@ async function preparePage(page: Page) {
 }
 
 async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText = '', activeB = false,
-  historyAfterAdvance: 'canonical' | 'fallback' | 'read-error' = 'canonical') {
+  historyAfterAdvance: 'canonical' | 'fallback' | 'read-error' = 'canonical', router = false,
+  initialHistory: 'canonical' | 'fallback' = 'canonical') {
   await preparePage(page)
+  if (router) {
+    await page.emulateMedia({ reducedMotion: 'no-preference' })
+    await page.addInitScript(() => window.localStorage.setItem('opensquilla.routerVisualEffects', '1'))
+  }
   const startedAt = Date.now() - 10_000
   const sockets: WebSocketRoute[] = []
   const held: HeldRequest[] = []
@@ -200,6 +205,10 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
   let epoch = 0
   let terminal = false
   let advancedHistoryReads = 0
+  let degradedHistory = initialHistory === 'fallback'
+  const routerModels = ['synthetic/fast', 'synthetic/selected', 'synthetic/reasoning', 'synthetic/quality']
+  const routerEvents: Array<{ event: string; payload: Record<string, unknown> }> = []
+  const currentSequence = () => 7 + routerEvents.length
   const taskId = (key = SESSION_A) => `warm-live-task-${key === SESSION_B ? 'b-' : ''}${epoch}`
   page.on('pageerror', error => failures.push(error.message))
   const history = (key: string) => {
@@ -214,7 +223,7 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
     }, {
       role: 'user', text: `Prepare Python source ${epoch}`, message_id: `warm-user-${epoch}`, timestamp: startedAt,
       turn_context: { turn_id: taskId() },
-    }], { ...(historyAfterAdvance === 'fallback' && revision > 1
+    }], { ...(degradedHistory || (historyAfterAdvance === 'fallback' && revision > 1)
       ? { canonical_available: false, canonical_complete: false } : {}), turn_outcomes: terminal ? [{
       turn_id: taskId(), task_id: taskId(), status: 'failed', started_at: startedAt, finished_at: startedAt + 8000,
       outcome: { kind: 'failed', reason: '429', error_class: '429', failure_kind: 'rate_limited', retryable: true },
@@ -224,7 +233,7 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
     const active = (key === SESSION_A || activeB) && !terminal
     return {
       ...subscriptionPayload(key), epoch: key === SESSION_A ? epoch : 0,
-      current_stream_seq: active ? 7 : 0,
+      current_stream_seq: active ? currentSequence() : 0,
       run_status: active ? 'running' : 'idle',
       active_task: active ? { task_id: taskId(key), turn_id: taskId(key), status: 'running', started_at: startedAt } : null,
       tasks: active ? [{ task_id: taskId(key), status: 'running', started_at: startedAt }] : [],
@@ -241,7 +250,7 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
     })
     return sessionMessagesSnapshotPayload(key, {
       epoch: key === SESSION_A ? epoch : 0, task_id: active ? taskId(key) : null,
-      current_stream_seq: active ? 7 : 0, stream_generation: 'workspace-switch-generation',
+      current_stream_seq: active ? currentSequence() : 0, stream_generation: 'workspace-switch-generation',
       events: active ? [
         ev('provider_activity', 1, { activity_id: `provider-${epoch}`, phase: 'reasoning', reason: 'initial', started_at: startedAt }),
         ev('thinking_start', 2, { block_id: 'warm-thinking', block_index: 0, started_at: startedAt }),
@@ -252,6 +261,7 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
         ev('tool_input_preview', 7, { preview_id: `warm-draft-${epoch}`, attempt_id: `warm-attempt-${epoch}`,
           tool_use_id: 'warm-code', revision, state: 'generating', tool_name: 'execute_code', path: '',
           content: `print("draft revision ${revision}")`, truncated: false }),
+        ...(key === SESSION_A ? routerEvents : []),
       ] : [],
     })
   }
@@ -354,15 +364,51 @@ async function prepareWarmLiveRace(page: Page, modern = false, longHistoryText =
         ] })); return
       }
       if (method === 'artifacts.list') { socket.send(response(frame.id, { artifacts: [], has_more: false })); return }
+      if (router && method === 'config.get') {
+        socket.send(response(frame.id, {
+          squilla_router: {
+            enabled: true, rollout_phase: 'full', visual_mode: 'real_candidates',
+            tiers: Object.fromEntries(routerModels.map((model, index) => [`c${index}`, { model }])),
+          },
+          llm_ensemble: { enabled: false }, permissions: {}, skills: {},
+        }))
+        return
+      }
+      if (router && ['models.routing.get', 'sessions.routing.get'].includes(method)) {
+        socket.send(response(frame.id, { key, mode: 'router', revision: 0 }))
+        return
+      }
       socket.send(response(frame.id, basePayload(method)))
     })
   })
   return {
     sockets, requests, failures,
+    emitRouterDecision(winner = 1) {
+      const seq = currentSequence() + 1
+      const decision = {
+        event: 'session.event.router_decision',
+        payload: {
+          key: SESSION_A, session_key: SESSION_A, task_id: taskId(), turn_id: taskId(),
+          epoch, stream_generation: 'workspace-switch-generation', stream_seq: seq,
+          emitted_at: startedAt + seq * 100, tier: `c${winner}`, model: routerModels[winner],
+          source: 'classifier', routing_applied: true,
+          router_tier_snapshot: {
+            version: 1, request_kind: 'text',
+            tiers: routerModels.map((model, index) => ({ tier: `c${index}`, model, execution_kind: 'single_model' })),
+          },
+        },
+      }
+      routerEvents.push(decision)
+      sockets[0]!.send(eventFrame(decision.event, decision.payload))
+    },
     pending: (side: 'history' | 'live') => held.filter(item => side === 'history'
       ? item.frame.method === 'chat.history' : item.frame.method !== 'chat.history').length,
     hold: () => { holdHistory = true; holdLive = true },
     failLive: () => { rejectLive = true },
+    canonicalHistory: () => { degradedHistory = false },
+    dirtyCurrent: () => sockets[0]!.send(eventFrame('transport.flow.dirty', {
+      delivery_epoch: deliveryEpoch, dirty_keys: [SESSION_A], global_dirty: false,
+    })),
     rejectedLiveReads: () => rejectedLiveReads,
     deferSnapshots: () => { holdSnapshots = true },
     snapshotPending: () => held.filter(item => item.frame.method === readMethod).length,
@@ -439,6 +485,118 @@ async function expectWarmLiveFrames(page: Page, expandedCode = false, stopVisibl
   })
 }
 
+for (const first of ['history', 'live'] as const) {
+  test(`a running router winner stays visible without rescanning when ${first} restores first`, async ({ page }, testInfo) => {
+    const gateway = await prepareWarmLiveRace(page, false, '', false, 'canonical', true)
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    await expect(page.getByText('Warm A history revision 1', { exact: true })).toBeVisible()
+    await expect(page.locator('.chat-stop-btn')).toBeEnabled()
+    gateway.emitRouterDecision()
+    const strip = page.locator('.router-fx')
+    await expect(strip).toHaveCount(1)
+    await expect(strip).toHaveAttribute('data-phase', 'scanning')
+    await expect(strip).toHaveAttribute('data-phase', 'locked')
+    await expect(strip.locator('.router-fx-cell.win .nm')).toHaveAttribute('aria-label', 'selected')
+    await page.locator(`[data-session-key="${SESSION_B}"] .sidebar-history-item`).click()
+    await expect(page.getByText('Warm live B history', { exact: true })).toBeVisible()
+    gateway.hold()
+
+    await page.evaluate(() => {
+      type Sample = { stage: string; source: string; at: number; count: number; phase: string | null; winner: string | null }
+      const state = window as Window & {
+        routerSwitchSamples?: Sample[]
+        routerSwitchStage?: string
+        stopRouterSwitchRecording?: () => void
+      }
+      state.routerSwitchSamples = []
+      state.routerSwitchStage = 'held'
+      let active = true
+      let frame = 0
+      const sample = (source: string) => {
+        if (!active) return
+        const surface = document.querySelector('.chat-message-surface')
+        if (!surface?.textContent?.includes('Warm A history revision 1')) return
+        const strips = surface.querySelectorAll('.router-fx')
+        state.routerSwitchSamples!.push({
+          stage: state.routerSwitchStage!,
+          source,
+          at: performance.now(),
+          count: strips.length,
+          phase: strips[0]?.getAttribute('data-phase') ?? null,
+          winner: strips[0]?.querySelector('.router-fx-cell.win .nm')?.getAttribute('aria-label') ?? null,
+        })
+      }
+      const tick = () => { sample('frame'); if (active) frame = requestAnimationFrame(tick) }
+      const observer = new MutationObserver(() => sample('mutation'))
+      observer.observe(document.body, { subtree: true, childList: true, attributes: true })
+      frame = requestAnimationFrame(tick)
+      state.stopRouterSwitchRecording = () => {
+        sample('stop')
+        active = false
+        cancelAnimationFrame(frame)
+        observer.disconnect()
+      }
+    })
+    const sampleFrames = async (stage: string) => page.evaluate(async stageName => {
+      const state = window as Window & { routerSwitchStage?: string }
+      state.routerSwitchStage = stageName
+      for (let index = 0; index < 8; index++) {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+      }
+    }, stage)
+    try {
+      await page.locator(`[data-session-key="${SESSION_A}"] .sidebar-history-item`).click()
+      await expect.poll(() => gateway.pending('history')).toBeGreaterThan(0)
+      await expect.poll(() => gateway.pending('live')).toBeGreaterThan(0)
+      await expect(page.getByText('Warm A history revision 1', { exact: true })).toBeVisible()
+      await sampleFrames('held')
+      gateway.release(first)
+      await sampleFrames(`${first}-released`)
+      await page.evaluate(() => {
+        (window as Window & { routerSwitchStage?: string }).routerSwitchStage = 'both-released'
+      })
+      gateway.release(first === 'history' ? 'live' : 'history')
+      await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+      await sampleFrames('installed')
+      await page.evaluate(() => {
+        const state = window as Window & { stopRouterSwitchRecording?: () => void }
+        state.stopRouterSwitchRecording?.()
+      })
+
+      const samples = await page.evaluate(() => (
+        (window as Window & { routerSwitchSamples?: Array<{
+          stage: string; count: number; phase: string | null; winner: string | null
+        }> }).routerSwitchSamples ?? []
+      ))
+      expect(samples.length).toBeGreaterThan(16)
+      expect(samples.filter(sample => sample.count !== 1
+        || sample.phase === 'scanning' || sample.winner !== 'selected')).toEqual([])
+
+      // A genuinely new decision must retain the normal selection animation.
+      gateway.emitRouterDecision(2)
+      await expect(strip.last()).toHaveAttribute('data-phase', 'scanning')
+      await expect(strip.last()).toHaveAttribute('data-phase', 'locked')
+      await expect(strip.last().locator('.router-fx-cell.win .nm')).toHaveAttribute('aria-label', 'reasoning')
+      expect(gateway.sockets).toHaveLength(1)
+      expect(gateway.failures).toEqual([])
+    } finally {
+      const samples = await page.evaluate(() => {
+        const state = window as Window & {
+          stopRouterSwitchRecording?: () => void
+          routerSwitchSamples?: unknown[]
+        }
+        state.stopRouterSwitchRecording?.()
+        return state.routerSwitchSamples
+      })
+      const evidencePath = testInfo.outputPath('router-session-switch-frames.json')
+      await writeFile(evidencePath, JSON.stringify(samples, null, 2))
+      await testInfo.attach('router-session-switch-frames', {
+        path: evidencePath, contentType: 'application/json',
+      })
+    }
+  })
+}
+
 test('a newer delivery gap keeps the complete warm view and Stop until automatic snapshot recovery', async ({ page }, testInfo) => {
   const gateway = await prepareWarmLiveRace(page, true)
   const warnings: string[] = []
@@ -501,6 +659,133 @@ test('a newer delivery gap keeps the complete warm view and Stop until automatic
   expect(gateway.sockets).toHaveLength(1)
   expect(gateway.failures).toEqual([])
 })
+
+for (const initialHistory of ['canonical', 'fallback'] as const) {
+  test(`same-session recovery preserves ${initialHistory} live content, router and resized workbench`, async ({ page }, testInfo) => {
+    test.setTimeout(60_000)
+    const gateway = await prepareWarmLiveRace(page, true,
+      '| Item | Count |\n|---|---|\n| Alpha | 12 |\n| Beta | 24 |',
+      false, 'canonical', true, initialHistory)
+    const warnings: string[] = []
+    page.on('console', message => {
+      if (message.type() === 'warning') warnings.push(message.text())
+    })
+    await page.setViewportSize({ width: 1724, height: 916 })
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    const narration = page.getByText('Narration before draft revision 1', { exact: true })
+    await expect(narration).toBeVisible()
+    gateway.emitRouterDecision()
+    await expect(page.locator('.router-fx')).toHaveAttribute('data-phase', 'locked')
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(page.getByTestId('workbench-host')).toBeVisible()
+    const separator = await page.getByRole('separator', { name: 'Resize workbench', exact: true }).boundingBox()
+    if (!separator) throw new Error('Expected the workbench resize handle')
+    await page.mouse.move(separator.x + separator.width / 2, separator.y + 100)
+    await page.mouse.down()
+    await page.mouse.move(1000, separator.y + 100, { steps: 15 })
+    await page.mouse.up()
+    await expect(narration).toBeVisible()
+
+    type RecoveryFrame = {
+      live: boolean; reasoning: number; draft: boolean; narration: boolean
+      routerCount: number; phase: string | null; winner: string | null
+      workbenchSame: boolean; workbenchVisible: boolean; width: number
+      routerDocumentTop: number; routerOffset: number; liveOffset: number; liveHeight: number
+    }
+    type RecoveryRecorder = {
+      recoveryFrames: RecoveryFrame[]
+      stopRecoveryFrames: () => void
+    }
+    await page.evaluate(() => {
+      const state = window as unknown as RecoveryRecorder
+      const workbench = document.querySelector('[data-testid="workbench-host"]')
+      state.recoveryFrames = []
+      let recording = true
+      state.stopRecoveryFrames = () => { recording = false }
+      const sample = () => {
+        const surface = document.querySelector('.chat-message-surface')
+        const live = surface?.querySelector<HTMLElement>('.conversation-live-edge')
+        const currentWorkbench = document.querySelector<HTMLElement>('[data-testid="workbench-host"]')
+        const router = surface?.querySelector('.router-fx')
+        const thread = document.querySelector('.app-chat-pane .chat-thread')
+        // The surface itself uses display: contents and has no layout box.
+        const listTop = surface?.querySelector('.chat-message-list')?.getBoundingClientRect().top ?? 0
+        const routerTop = router?.getBoundingClientRect().top ?? 0
+        const liveBox = live?.getBoundingClientRect()
+        state.recoveryFrames.push({
+          live: Boolean(live?.getClientRects().length),
+          reasoning: surface?.querySelectorAll('[data-testid="reasoning-timeline"]').length ?? 0,
+          draft: Boolean(surface?.querySelector('[data-testid="tool-input-preview"]')),
+          narration: surface?.textContent?.includes('Narration before draft revision 1') === true,
+          routerCount: surface?.querySelectorAll('.router-fx').length ?? 0,
+          phase: router?.getAttribute('data-phase') ?? null,
+          winner: router?.querySelector('.router-fx-cell.win .nm')?.getAttribute('aria-label') ?? null,
+          workbenchSame: currentWorkbench === workbench,
+          workbenchVisible: Boolean(currentWorkbench?.getClientRects().length),
+          width: thread?.getBoundingClientRect().width ?? 0,
+          routerDocumentTop: routerTop - (thread?.getBoundingClientRect().top ?? 0) + (thread?.scrollTop ?? 0),
+          routerOffset: routerTop - listTop,
+          liveOffset: (liveBox?.top ?? 0) - listTop,
+          liveHeight: liveBox?.height ?? 0,
+        })
+        if (recording) requestAnimationFrame(sample)
+      }
+      requestAnimationFrame(sample)
+    })
+    try {
+      gateway.deferSnapshots()
+      gateway.dirtyCurrent()
+      await expect.poll(gateway.snapshotPending).toBeGreaterThan(0)
+      gateway.invalidateHeldSnapshot()
+      await expect.poll(() => warnings.some(text => text.includes('Snapshot invalidated by a newer delivery gap.'))).toBe(true)
+      await expect.poll(gateway.snapshotPending, { timeout: 15_000 }).toBeGreaterThan(0)
+      gateway.releaseSnapshots()
+      if (initialHistory === 'fallback') {
+        // Failed reconciliation must preserve the readable cold view even when
+        // no authoritative navigation snapshot has ever existed for it.
+        await expect.poll(() => warnings.some(text => text.includes('History reconciliation is incomplete.'))).toBe(true)
+        const reads = gateway.requests.filter(item => item.method === 'chat.history').length
+        await expect.poll(() => gateway.requests.filter(item => item.method === 'chat.history').length,
+          { timeout: 15_000 }).toBeGreaterThan(reads)
+        gateway.canonicalHistory()
+        gateway.dirtyCurrent()
+      }
+      await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+      await expect(narration).toBeVisible()
+      await page.evaluate(async () => {
+        for (let frame = 0; frame < 8; frame++) {
+          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+        }
+      })
+    } finally {
+      const frames = await page.evaluate(() => {
+        const state = window as unknown as RecoveryRecorder
+        state.stopRecoveryFrames()
+        return state.recoveryFrames
+      })
+      const evidencePath = testInfo.outputPath('same-session-recovery-frames.json')
+      await writeFile(evidencePath, JSON.stringify(frames, null, 2))
+      await testInfo.attach('same-session-recovery-frames', {
+        path: evidencePath, contentType: 'application/json',
+      })
+      expect(frames.length).toBeGreaterThan(8)
+      expect(frames.filter(frame => !frame.live || frame.reasoning !== 1 || !frame.draft || !frame.narration
+        || frame.routerCount !== 1 || frame.phase === 'scanning' || frame.winner !== 'selected'
+        || !frame.workbenchSame || !frame.workbenchVisible)).toEqual([])
+      const widths = frames.map(frame => frame.width)
+      expect(Math.max(...widths) - Math.min(...widths)).toBeLessThan(1)
+      // A recovery notice may change the header above the message list.
+      // Unchanged content inside that list must keep its layout throughout
+      // recovery, including the live tail whose collapse caused the jitter.
+      for (const field of ['routerOffset', 'liveOffset', 'liveHeight'] as const) {
+        const values = frames.map(frame => frame[field])
+        expect(Math.max(...values) - Math.min(...values), field).toBeLessThan(1)
+      }
+    }
+    expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
+    expect(gateway.failures).toEqual([])
+  })
+}
 
 for (const first of ['history', 'live'] as const) {
   test(`warm history and prepared code hand off together when ${first} resolves first`, async ({ page }) => {

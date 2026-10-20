@@ -14,6 +14,7 @@ import type {
   WorkbenchResource,
   WorkbenchResourceOpenResponse,
   WorkbenchResourceRef,
+  WorkbenchAnnotationRequest,
 } from '@/types/workbenchResources'
 import { workbenchResourceRefId } from '@/types/workbenchResources'
 import {
@@ -143,6 +144,7 @@ export function createWorkbenchIdempotencyKey(prefix: 'import' | 'publish'): str
 export const useWorkbenchResourcesStore = defineStore('workbenchResources', () => {
   const snapshots = ref<Record<string, WorkbenchResourceSnapshot>>({})
   const provider = shallowRef<WorkbenchResourceProvider | null>(null)
+  let providerLifetime = 0
   const requests = new Map<string, AbortController>()
   const imports = new Map<string, {
     provider: WorkbenchResourceProvider
@@ -288,6 +290,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
 
   function setProvider(next: WorkbenchResourceProvider | null) {
     if (provider.value === next) return
+    providerLifetime += 1
     abortAll()
     opens.clear()
     provider.value = next ? markRaw(next) : null
@@ -405,6 +408,21 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     return resolved
   }
 
+  /** Explicit navigation must not treat a stale cached projection as authority. */
+  async function resolveFresh(
+    sessionKey: string,
+    resource: WorkbenchResourceRef,
+    isCurrent: () => boolean = () => true,
+  ): Promise<WorkbenchResource | null> {
+    const currentProvider = provider.value
+    const lifetime = providerLifetime
+    if (!currentProvider || !isCurrent()) return null
+    const resolved = await currentProvider.get(sessionKey, resource)
+    if (provider.value !== currentProvider || lifetime !== providerLifetime || !isCurrent()) return null
+    if (resolved) upsertResource(sessionKey, resolved)
+    return resolved
+  }
+
   async function preview(
     sessionKey: string,
     resource: WorkbenchResourceRef,
@@ -514,6 +532,32 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     } finally {
       if (opens.get(operationKey)?.promise === promise) opens.delete(operationKey)
     }
+  }
+
+  async function prepareAnnotation(
+    sessionKey: string,
+    request: WorkbenchAnnotationRequest,
+  ): Promise<WorkbenchResourceOpenResponse | null> {
+    const currentProvider = provider.value
+    if (!currentProvider?.prepareAnnotation) return null
+    const operationKey = JSON.stringify([sessionKey, 'annotate',
+      request.resourceRef ? workbenchResourceKey(request.resourceRef) : request.workspaceFile,
+      request.expectedSha256 || ''])
+    const pending = opens.get(operationKey)
+    if (pending?.provider === currentProvider) return pending.promise
+    const idempotencyKey = mutationRequestIds.idFor(operationKey, 'workbench-annotate', request.idempotencyKey)
+    const payload: WorkbenchAnnotationRequest = request.resourceRef
+      ? { resourceRef: { ...request.resourceRef }, expectedSha256: request.expectedSha256, idempotencyKey }
+      : { workspaceFile: { ...request.workspaceFile }, idempotencyKey }
+    const promise = (async () => {
+      const result = await currentProvider.prepareAnnotation!(sessionKey, payload)
+      mutationRequestIds.release(operationKey, idempotencyKey)
+      if (result && provider.value === currentProvider) upsertResource(sessionKey, result.resource)
+      return result
+    })()
+    opens.set(operationKey, { provider: currentProvider, promise })
+    try { return await promise }
+    finally { if (opens.get(operationKey)?.promise === promise) opens.delete(operationKey) }
   }
 
   async function importDocument(
@@ -633,6 +677,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
   }
 
   function reset() {
+    providerLifetime += 1
     abortAll()
     opens.clear()
     mutationRequestIds.clear()
@@ -650,8 +695,10 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     find,
     navigationResources,
     resolve,
+    resolveFresh,
     preview,
     openCurrent,
+    prepareAnnotation,
     importDocument,
     publishDocument,
     clearSession,

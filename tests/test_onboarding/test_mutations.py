@@ -506,10 +506,10 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
     expected = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-flash",
-        "c2": "deepseek-v4-pro-0813",
-        "c3": "glm-5.3",
+        "c0": "qwen3.8-flash",
+        "c1": "deepseek-v4.1-flash-1017",
+        "c2": "glm-5.3",
+        "c3": "kimi-k3",
         "image_model": "kimi-k2.6",
     }
     for tier, model in expected.items():
@@ -517,7 +517,7 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
         assert res.config.squilla_router.tiers[tier]["model"] == model
     persisted = res.config.to_toml_dict()["squilla_router"]
     assert "tier_profile" not in persisted
-    assert persisted["tiers"]["c3"]["model"] == "glm-5.3"
+    assert persisted["tiers"]["c3"]["model"] == "kimi-k3"
     assert persisted["tiers"]["c3"]["ensemble_enabled"] is False
     assert persisted["tiers"]["c0"]["supports_image"] is False
     assert persisted["tiers"]["c2"]["supports_image"] is False
@@ -542,7 +542,7 @@ def test_provider_default_direct_model_does_not_follow_existing_router_tier():
 
     assert res.config.llm.model == "deepseek/deepseek-v4-pro"
     assert res.config.squilla_router.default_tier == "c2"
-    assert res.config.squilla_router.tiers["c2"]["model"] == "deepseek/deepseek-v4-pro-0813"
+    assert res.config.squilla_router.tiers["c2"]["model"] == "z-ai/glm-5.3"
 
 
 def test_upsert_channel_appends_new():

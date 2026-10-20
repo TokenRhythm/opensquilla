@@ -150,6 +150,9 @@ export function parseArtifactPreviewLease(
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid origin.', 502)
   }
   const workingDocumentId = raw.workingDocumentId
+  if (raw.snapshot !== undefined && typeof raw.snapshot !== 'boolean') {
+    throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid snapshot flag.', 502)
+  }
   if (raw.page_path !== undefined && !isPreviewPagePath(raw.page_path)) {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid page.', 502)
   }
@@ -177,6 +180,7 @@ export function parseArtifactPreviewLease(
       : 28_800,
     source: parseSource(raw.source),
     ...(typeof workingDocumentId === 'string' ? { workingDocumentId } : {}),
+    ...(raw.snapshot === true ? { snapshot: true } : {}),
   }
 }
 
@@ -231,11 +235,17 @@ export async function createArtifactPreviewLease(
   client: PlatformId,
   context: ArtifactPreviewLeaseContext,
 ): Promise<ArtifactPreviewLease> {
+  const snapshot = context.snapshot === true || artifact.workbenchOpenIntent === 'history'
   if (context.pagePath !== undefined && !isPreviewPagePath(context.pagePath)) {
     throw new ArtifactPreviewLeaseError('The preview page path is invalid.', 400, 'INVALID_REQUEST')
   }
   async function accept(value: unknown): Promise<ArtifactPreviewLease> {
     const lease = parseArtifactPreviewLease(value, context.baseOrigin)
+    if (snapshot && (lease.snapshot !== true || lease.workingDocumentId)) {
+      await revokeArtifactPreviewLease(http, lease.lease_id, context).catch(() => undefined)
+      throw new ArtifactPreviewLeaseError('This client cannot open an immutable historical preview.',
+        409, 'PREVIEW_SNAPSHOT_UNSUPPORTED')
+    }
     if (context.pagePath && (lease.page_path !== context.pagePath
       || previewPagePathFromUrl(lease.launch_url, lease) !== context.pagePath)) {
       // Older Gateways may ignore the additive target. Never silently open the homepage.
@@ -261,6 +271,7 @@ export async function createArtifactPreviewLease(
         mode,
         scopeId: context.sessionKey || '',
         ...(context.pagePath ? { pagePath: context.pagePath } : {}),
+        ...(snapshot ? { snapshot: true } : {}),
         ...(authToken ? { authToken } : {}),
       })
     } catch {
@@ -279,7 +290,7 @@ export async function createArtifactPreviewLease(
       artifactId,
       mode,
       client,
-      context,
+      { ...context, snapshot },
     )
     return await accept(payload)
   } catch (error) {

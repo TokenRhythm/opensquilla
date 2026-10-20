@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from starlette.websockets import WebSocketState
@@ -286,6 +286,240 @@ async def test_pending_resume_retry_preserves_replay_owner_and_batch_progress(
     assert conn.installed_snapshot_proof(receipt(payload)) == first.payload
     replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
     assert len(replayed) == 17
+
+
+async def ack_replay(conn, ids):
+    await asyncio.sleep(0.01)
+    end = max(ids)
+    if conn._session_flow_v2_enabled:
+        lane_epoch = conn._flow.deliveries[end].lane_epoch
+        update = await request(conn, "transport.sessionFlow.update.v2", {
+            "connection_epoch": conn._flow.epoch,
+            "consumed": [{"subscription_epoch": lane_epoch, "through_delivery_id": end}],
+            "staged_recovery": [], "discarded_lanes": [],
+        })
+    else:
+        update = await request(conn, "transport.flow.update", {
+            "delivery_epoch": conn._flow.epoch, "ack_delivery_id": end,
+        })
+    assert update.ok, update.error
+
+
+async def test_v2_replay_splits_large_frames_without_changing_logical_batch(v2_connection):
+    conn = v2_connection
+    key = "agent:main:byte-segments"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    for text in ("a", "b"):
+        get_session_streams().record(key, "session.event.text_delta", {"text": text * 150_000})
+    revision = conn._flow.dirty_revision(key)
+    first = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert first.ok, first.error
+    pending = conn._pending_replays[key]
+    assert (pending.batch_index, pending.batch_offset) == (0, 1)
+    assert len(pending.pending_delivery_ids) == 1
+    assert conn._flow.dirty_revision(key) == revision
+    first_ids = set(pending.pending_delivery_ids)
+    repeated = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert repeated.ok and repeated.payload == first.payload
+    assert pending.pending_delivery_ids == first_ids
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+    await ack_replay(conn, first_ids)
+    assert conn._pending_replays[key] is pending
+    assert pending.pending_delivery_ids.isdisjoint(first_ids)
+    assert (pending.batch_index, pending.batch_offset) == (1, 0)
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+    await ack_replay(conn, pending.pending_delivery_ids)
+    assert key not in conn._pending_replays
+    assert conn.installed_snapshot_proof(receipt(payload)) == first.payload
+    replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
+    assert [frame["payload"]["text"][0] for frame in replayed] == ["a", "b"]
+    assert [frame["meta"]["replay_batch"] for frame in replayed] == [
+        {"index": 0, "count": 1}, {"index": 0, "count": 1},
+    ]
+
+
+async def test_replay_queue_capacity_segments_before_publication(resumable_connection):
+    conn = resumable_connection
+    key = f"agent:main:queue-segments-{conn.conn_id}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    for text in ("first", "second", "third"):
+        get_session_streams().record(key, "session.event.text_delta", {"text": text})
+    # One physical event and one reserved resume/control response slot.
+    conn._outbox._maxsize = 2
+    response = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert response.ok, response.error
+    pending = conn._pending_replays[key]
+    for index in range(3):
+        assert len(pending.pending_delivery_ids) == 1
+        assert set(conn._flow.deliveries) == pending.pending_delivery_ids
+        assert conn.installed_snapshot_proof(receipt(payload)) is None
+        assert (pending.batch_index, pending.batch_offset) == (
+            (0, index + 1) if index < 2 else (1, 0)
+        )
+        await ack_replay(conn, pending.pending_delivery_ids)
+    assert key not in conn._pending_replays
+    assert conn.installed_snapshot_proof(receipt(payload)) == response.payload
+    replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
+    assert [frame["payload"]["text"] for frame in replayed] == ["first", "second", "third"]
+
+
+@pytest.mark.parametrize("recover_credit", [True, False])
+async def test_replay_owns_prefix_when_global_reservation_refuses_suffix(
+    resumable_connection, monkeypatch, recover_credit,
+):
+    conn = resumable_connection
+    key = f"agent:main:global-prefix-{conn.conn_id}-{recover_credit}"
+    subscribe(conn, key)
+    conn._mark_flow_dirty({"session_key": key})
+
+    def dirty_notices():
+        return [
+            frame for frame in conn.ws.frames
+            if frame.get("event") == "transport.flow.dirty"
+        ]
+
+    async def wait_for_dirty_notices(count):
+        while len(dirty_notices()) < count:
+            await asyncio.sleep(0)
+
+    # Consume the original notice before starting recovery, so an old notice
+    # cannot satisfy the assertion about a later terminal replay failure.
+    await asyncio.wait_for(wait_for_dirty_notices(1), 1)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    for text in ("first", "second", "third"):
+        get_session_streams().record(key, "session.event.text_delta", {"text": text})
+    budget = get_transport_budget()
+    reserve = budget.reserve
+    bulk_attempts = 0
+
+    def reserve_first_only(size, *, kind=None):
+        nonlocal bulk_attempts
+        if kind == "bulk":
+            bulk_attempts += 1
+            if bulk_attempts > 1:
+                return False
+        return reserve(size, kind=kind)
+
+    monkeypatch.setattr(budget, "reserve", reserve_first_only)
+    revision = conn._flow.dirty_revision(key)
+    response = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert response.ok, response.error
+    pending = conn._pending_replays[key]
+    assert len(pending.pending_delivery_ids) == 1
+    assert (pending.batch_index, pending.batch_offset) == (0, 1)
+    assert conn._flow.dirty_revision(key) == revision
+    assert set(conn._flow.deliveries) == pending.pending_delivery_ids
+    original_notice_count = len(dirty_notices())
+    if recover_credit:
+        monkeypatch.setattr(budget, "reserve", reserve)
+    await ack_replay(conn, pending.pending_delivery_ids)
+    if recover_credit:
+        assert conn._pending_replays[key] is pending
+        assert len(pending.pending_delivery_ids) == 2
+        await ack_replay(conn, pending.pending_delivery_ids)
+        assert conn.installed_snapshot_proof(receipt(payload)) == response.payload
+        replayed = [frame for frame in conn.ws.frames if (frame.get("meta") or {}).get("replayed")]
+        assert [frame["payload"]["text"] for frame in replayed] == ["first", "second", "third"]
+        assert len(dirty_notices()) == original_notice_count
+    else:
+        assert pending.transfer.closed
+        assert key in conn._flow.dirty
+        assert conn.installed_snapshot_proof(receipt(payload)) is None
+        await asyncio.wait_for(wait_for_dirty_notices(original_notice_count + 1), 1)
+        assert len(dirty_notices()) == original_notice_count + 1
+        assert key in dirty_notices()[-1]["payload"]["dirty_keys"]
+    assert key not in conn._pending_replays
+    assert not conn._flow.deliveries
+
+
+async def test_replay_initial_zero_credit_is_busy_and_retries_same_snapshot(
+    resumable_connection, monkeypatch,
+):
+    conn = resumable_connection
+    key = f"agent:main:initial-busy-{conn.conn_id}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    get_session_streams().record(key, "session.event.text_delta", {"text": "tail"})
+    budget = get_transport_budget()
+    reserve = budget.reserve
+    monkeypatch.setattr(
+        budget, "reserve",
+        lambda size, *, kind=None: False if kind == "bulk" else reserve(size, kind=kind),
+    )
+    next_id = conn._flow.next_id
+    revision = conn._flow.dirty_revision(key)
+    response = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert not response.ok and response.error.code == "SNAPSHOT_BUSY"
+    assert key not in conn._pending_replays and not conn._flow.deliveries
+    assert conn._flow.next_id == next_id
+    assert conn._flow.dirty_revision(key) == revision
+    transfer = conn.snapshot_registry().get(key, payload["sync_revision"], payload["snapshot_id"])
+    assert transfer is not None and not transfer.closed
+    monkeypatch.setattr(budget, "reserve", reserve)
+    response = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert response.ok, response.error
+    await ack_replay(conn, conn._pending_replays[key].pending_delivery_ids)
+    assert conn.installed_snapshot_proof(receipt(payload)) == response.payload
+
+
+async def test_replay_prevalidates_suffix_before_first_reservation(
+    resumable_connection, monkeypatch,
+):
+    from opensquilla.gateway import websocket
+
+    conn = resumable_connection
+    key = f"agent:main:encode-suffix-{conn.conn_id}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    for text in ("first", "invalid"):
+        get_session_streams().record(key, "session.event.text_delta", {"text": text})
+    original = websocket.encode_payload_for_protocol
+
+    def encode(value, *, protocol):
+        if isinstance(value, dict) and value.get("text") == "invalid":
+            raise ValueError("synthetic invalid second frame")
+        return original(value, protocol=protocol)
+
+    monkeypatch.setattr(websocket, "encode_payload_for_protocol", encode)
+    reserve = Mock(wraps=conn._flow._reserve)
+    monkeypatch.setattr(conn._flow, "_reserve", reserve)
+    next_id = conn._flow.next_id
+    reserved = conn._transport_bytes
+    response = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert not response.ok
+    assert key not in conn._pending_replays and not conn._flow.deliveries
+    assert conn._flow.next_id == next_id
+    reserve.assert_not_called()
+    assert conn._transport_bytes <= reserved
+    await asyncio.sleep(0)
+    assert not any(frame.get("meta", {}).get("replayed") for frame in conn.ws.frames)
+
+
+@pytest.mark.parametrize("size, accepted", [(300_000, True), (1_048_576, False)])
+async def test_v2_replay_singleton_respects_aggregate_not_lane_byte_limit(
+    v2_connection, size, accepted,
+):
+    conn = v2_connection
+    key = f"agent:main:singleton-{size}"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    get_session_streams().record(key, "session.event.text_delta", {"text": "x" * size})
+    response = await request(conn, "sessions.messages.resume", receipt(payload))
+    if accepted:
+        assert response.ok, response.error
+        await ack_replay(conn, conn._pending_replays[key].pending_delivery_ids)
+        assert conn.installed_snapshot_proof(receipt(payload)) == response.payload
+    else:
+        assert not response.ok and response.error.code == "SNAPSHOT_STALE"
+        assert key not in conn._pending_replays and not conn._flow.deliveries
 
 
 async def test_pending_resume_retry_does_not_bypass_new_dirty_barrier(resumable_connection):

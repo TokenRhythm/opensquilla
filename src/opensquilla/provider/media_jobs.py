@@ -52,8 +52,13 @@ def job_record(
     scope = current_usage_accounting_scope()
     if path is None:
         cache_key = (id(getattr(scope, "sink", None)), namespace, key)
-        if value is not None and (not create_only or cache_key not in _volatile):
-            _volatile[cache_key] = json.loads(json.dumps(value))
+        if value is not None:
+            stored = json.loads(json.dumps(value))
+            if create_only:
+                # Concurrent first derivations must return the same winning
+                # salt, just like the durable ON CONFLICT DO NOTHING path.
+                return _volatile.setdefault(cache_key, stored)
+            _volatile[cache_key] = stored
         return _volatile.get(cache_key)
     with sqlite3.connect(path, timeout=5) as conn:
         conn.execute(
@@ -104,9 +109,13 @@ def job_records(namespace: str) -> dict[str, dict[str, Any]]:
 
 
 def _key(provider: str, base_url: str, job_id: str, api_key: str = "") -> str:
+    return _key_from_fingerprint(provider, base_url, job_id, credential_fingerprint(api_key))
+
+
+def _key_from_fingerprint(provider: str, base_url: str, job_id: str, fingerprint: str) -> str:
     return hashlib.sha256(
         json.dumps(
-            [provider, base_url.rstrip("/"), credential_fingerprint(api_key), job_id]
+            [provider, base_url.rstrip("/"), fingerprint, job_id]
         ).encode()
     ).hexdigest()
 
@@ -117,8 +126,15 @@ def accounted_video_submission(provider: str):
     def decorate(function):
         @functools.wraps(function)
         async def wrapped(*args, **kwargs):
+            if current_usage_accounting_scope() is None:
+                return await function(*args, **kwargs)
             base_url = kwargs["api_root"]
             selected_provider = kwargs.get("provider", provider)
+            # Derive before creating a paid-call reservation: cancellation here
+            # must not leave a ledger start or dispatch a provider request.
+            fingerprint = await asyncio.to_thread(
+                credential_fingerprint, kwargs.get("api_key", ""),
+            )
             reservation = await reserve_direct_usage_call(
                 provider=selected_provider,
                 model=kwargs["model"],
@@ -128,8 +144,8 @@ def accounted_video_submission(provider: str):
             if reservation.call is None:
                 return await function(*args, **kwargs)
             callback = kwargs.get("on_job_accepted")
-            api_key = kwargs.get("api_key", "")
             accepted: dict[str, Any] | None = None
+            accepted_key: str | None = None
             duration = kwargs.get("duration")
             dimensions = {"operation": "video_generation", "mode": "text_to_video"}
             if kwargs.get("resolution"):
@@ -153,7 +169,7 @@ def accounted_video_submission(provider: str):
             )
 
             def remember(job_id: str):
-                nonlocal accepted
+                nonlocal accepted, accepted_key
                 accepted = {
                     "call": asdict(reservation.call),
                     "provider": selected_provider,
@@ -164,7 +180,10 @@ def accounted_video_submission(provider: str):
                     "revision_id": "initial",
                     "finalized": False,
                 }
-                job_record("usage", _key(selected_provider, base_url, job_id, api_key), accepted)
+                accepted_key = _key_from_fingerprint(
+                    selected_provider, base_url, job_id, fingerprint,
+                )
+                job_record("usage", accepted_key, accepted)
                 if callback is not None:
                     callback(job_id)
 
@@ -182,11 +201,8 @@ def accounted_video_submission(provider: str):
                         ),
                     )
                     accepted["finalized"] = True
-                    job_record(
-                        "usage",
-                        _key(selected_provider, base_url, accepted["job_id"], api_key),
-                        accepted,
-                    )
+                    assert accepted_key is not None
+                    job_record("usage", accepted_key, accepted)
 
         return wrapped
 
@@ -206,7 +222,7 @@ async def observe_video_job(
     scope = current_usage_accounting_scope()
     if scope is None:
         return
-    key = _key(provider, base_url, job_id, api_key)
+    key = await asyncio.to_thread(_key, provider, base_url, job_id, api_key)
     lock_key = (id(asyncio.get_running_loop()), str(_database()), key)
     lock = _observation_locks.setdefault(lock_key, asyncio.Lock())
     async with lock:
@@ -221,7 +237,8 @@ async def video_job_needs_settlement(
     storage = getattr(getattr(scope, "sink", None), "_storage", None)
     if storage is None or not hasattr(storage, "query_usage_settlements"):
         return False
-    record = job_record("usage", _key(provider, base_url, job_id, api_key))
+    key = await asyncio.to_thread(_key, provider, base_url, job_id, api_key)
+    record = job_record("usage", key)
     if record is None:
         return False
     rows = await storage.query_usage_settlements([record["call"]["event_id"]])

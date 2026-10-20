@@ -26,6 +26,7 @@ from opensquilla.gateway.page_context import resolve_page_context
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.office_format import OFFICE_MIMES
 from opensquilla.paths import native_io_path
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from tests.test_gateway.test_office_working_versions import office_env as office_env
@@ -49,6 +50,7 @@ async def resource_env(tmp_path):
         state_dir=str(tmp_path / "state"),
         config_path=None,
         workspace_dir=str(tmp_path / "workspace"),
+        sandbox=SandboxSettings(),
     )
     try:
         yield SimpleNamespace(

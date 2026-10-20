@@ -7,6 +7,7 @@ export interface ArtifactPreviewLeaseCreateRequest {
   mode: ArtifactPreviewLeaseMode
   authToken?: string
   pagePath?: string
+  snapshot?: boolean
 }
 
 export interface ArtifactPreviewLeaseControlRequest {
@@ -36,6 +37,7 @@ export interface ArtifactPreviewLeasePayload {
   idle_timeout_seconds: number
   source: ArtifactPreviewLeaseSource
   workingDocumentId?: string
+  snapshot?: boolean
 }
 
 export interface ArtifactPreviewLeaseRenewalPayload {
@@ -163,11 +165,12 @@ export function parseArtifactPreviewLeaseCreateRequest(
   const raw = objectRecord(value)
   if (
     !raw
-    || !exactKeys(raw, ['version', 'artifactId', 'scopeId', 'mode'], ['authToken', 'pagePath'])
+    || !exactKeys(raw, ['version', 'artifactId', 'scopeId', 'mode'], ['authToken', 'pagePath', 'snapshot'])
     || raw.version !== 1
     || typeof raw.version === 'boolean'
     || !ARTIFACT_ID_PATTERN.test(String(raw.artifactId ?? ''))
     || (raw.mode !== 'full' && raw.mode !== 'offline')
+    || (Object.hasOwn(raw, 'snapshot') && typeof raw.snapshot !== 'boolean')
   ) {
     throw new Error('The artifact preview lease request is invalid.')
   }
@@ -179,6 +182,7 @@ export function parseArtifactPreviewLeaseCreateRequest(
     mode: raw.mode,
     ...(authToken ? { authToken } : {}),
     ...(Object.hasOwn(raw, 'pagePath') ? { pagePath: parsePagePath(raw.pagePath) } : {}),
+    ...(raw.snapshot === true ? { snapshot: true } : {}),
   }
 }
 
@@ -289,12 +293,13 @@ function parseLeasePayload(
       'preview_origin',
       'idle_timeout_seconds',
       'source',
-    ], ['workingDocumentId', 'page_path'])
+    ], ['workingDocumentId', 'page_path', 'snapshot'])
     || raw.version !== 1
     || typeof raw.version === 'boolean'
     || !LEASE_ID_PATTERN.test(String(raw.lease_id ?? ''))
     || (raw.effective_mode !== 'full' && raw.effective_mode !== 'offline')
     || (requestedMode === 'offline' && raw.effective_mode !== 'offline')
+    || (Object.hasOwn(raw, 'snapshot') && typeof raw.snapshot !== 'boolean')
   ) throw new Error('The preview lease response is invalid.')
 
   const launchUrl = parseBoundedString(raw.launch_url, 'The preview launch address', 8192)
@@ -333,6 +338,7 @@ function parseLeasePayload(
         'The preview idle timeout',
       ),
       source: parseLeaseSource(raw.source),
+      ...(raw.snapshot === true ? { snapshot: true } : {}),
       ...(Object.hasOwn(raw, 'workingDocumentId')
         ? { workingDocumentId: parseBoundedString(raw.workingDocumentId, 'The working document', 512) }
         : {}),
@@ -524,7 +530,8 @@ export class ArtifactPreviewLeaseBroker {
       request.scopeId,
       request.authToken,
       JSON.stringify({ version: 1, mode: request.mode, client: 'desktop',
-        ...(request.pagePath ? { pagePath: request.pagePath } : {}) }),
+        ...(request.pagePath ? { pagePath: request.pagePath } : {}),
+        ...(request.snapshot ? { snapshot: true } : {}) }),
       payload => this.revokeLateCreation(
         payload, request.mode, gatewayOrigin, request.scopeId, request.authToken,
       ),
@@ -535,6 +542,13 @@ export class ArtifactPreviewLeaseBroker {
     }
     try {
       const parsed = parseLeasePayload(response.payload, request.mode)
+      if (request.snapshot && (parsed.payload.snapshot !== true || parsed.payload.workingDocumentId)) {
+        await this.queueRevocation({
+          leaseId: parsed.payload.lease_id, gatewayOrigin,
+          scopeId: request.scopeId, authToken: request.authToken,
+        }, revocationEpoch)
+        return failure(409, 'PREVIEW_SNAPSHOT_UNSUPPORTED', 'The Gateway cannot open an immutable historical preview.')
+      }
       if (request.pagePath && (parsed.payload.page_path !== request.pagePath
         || decodeURIComponent(new URL(parsed.payload.launch_url).pathname) !== `/${request.pagePath}`)) {
         await this.queueRevocation({

@@ -97,6 +97,12 @@ export interface ArtifactWorkbenchProviderOptions {
     completeOverlayEdit?(annotationId: string): void
     releaseOverlayEdit?(annotationId: string): void
     setActiveDocument(sessionKey: string, documentId: string): void
+    setActivePage?(sessionKey: string, pagePath?: string): void
+    list?(sessionKey: string, documentId: string): PromptAnnotation[]
+    get?(annotationId: string): PromptAnnotation | undefined
+    isQueued?(annotationId: string): boolean
+    replaceSelection?(annotationId: string, request: PromptAnnotationCreateRequest): Promise<PromptAnnotation>
+    restoreReplacement?(original: PromptAnnotation, replacementId: string): boolean
   }
   officePromptAnnotations?: ArtifactWorkbenchProviderOptions['promptAnnotations']
   baseOrigin: string
@@ -122,7 +128,10 @@ export interface ArtifactWorkbenchProviderOptions {
   }): Promise<void>
   platform: Platform
   previewLeasesEnabled?: boolean
+  viewRevision?(artifact: ArtifactPayload, item: WorkbenchItem): void
+  openLatest?(item: WorkbenchItem, isCurrent: () => boolean): Promise<unknown>
   editCurrentResource?(resource: WorkbenchResourceRef, item: WorkbenchItem, isCurrent: () => boolean): Promise<void>
+  prepareAnnotation?(item: WorkbenchItem, isCurrent: () => boolean, reselectAnnotationId?: string): Promise<void>
   pushToast(message: string, options?: {
     tone?: 'info' | 'ok' | 'warn' | 'danger'
     duration?: number
@@ -319,6 +328,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private annotationMode = false
   private annotationModeRestorePending = false
   private annotationOverlayCopyVersion: 0 | 1 = 0
+  private annotationOverlayEditorVersion: 0 | 2 = 0
+  private annotationEditingOriginal: { annotationId: string; body: string } | null = null
   private annotationAtomicCloseRearm = false
   private annotationPickerArmed = false
   private annotationModeOperation = 0
@@ -345,6 +356,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private annotationUpdateTimer: ReturnType<typeof setTimeout> | null = null
   private component: ArtifactPreviewPanelHandle | null = null
   private officeAnnotationId = ''
+  private officeAnnotationBody = ''
   private officeAnnotationPending = false
   private editingCurrent = false
   private blockedHeadRevisionId = ''
@@ -499,6 +511,12 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   async handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
     this.item = item
+    if (event.type === 'artifact-view-revision') {
+      if (!isFixedArtifactPreview(item) && event.payload && typeof event.payload === 'object') {
+        this.options.viewRevision?.(event.payload as ArtifactPayload, item)
+      }
+      return
+    }
     if (event.type === 'artifact-reading-state') {
       const previewReading = artifactReadingCheckpoint(event.payload)
       if (previewReading) {
@@ -509,6 +527,38 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     if (event.type === 'office-annotation-selected') {
       await this.createOfficeAnnotation(event)
+      return
+    }
+    if (event.type === 'office-annotation-anchor') {
+      const fallback = this.context.getRenderState().annotationFallback as Record<string, unknown> | null
+      if (fallback?.reason === 'office-selection') this.context.updateRenderState({
+        annotationFallback: { ...fallback, anchor: event.payload || null },
+      })
+      return
+    }
+    if (event.type === 'office-annotation-mode') {
+      const enabled = (event.payload as { enabled?: boolean } | undefined)?.enabled === true
+      this.context.updateRenderState({ officeSelectionMode: enabled, annotationMode: enabled })
+      return
+    }
+    if (event.type === 'office-annotation-located') {
+      const result = event.payload as { status?: string; anchor?: unknown; requestId?: number | string } | undefined
+      const requested = this.context.getRenderState().officeSelectionToLocate as { requestId?: number | string; annotationId?: string } | undefined
+      if (!requested || requested.requestId !== result?.requestId
+        || (this.officeAnnotationId && requested.annotationId !== this.officeAnnotationId)) return
+      if (result?.status !== 'exact') this.options.pushToast(this.options.t(
+        result?.status === 'stale' ? 'workbench.annotationUnified.stale'
+          : result?.status === 'location-only' ? 'workbench.annotationUnified.locationOnly'
+            : 'chat.promptAnnotations.focusUnavailable',
+      ), { tone: 'info' })
+      const fallback = this.context.getRenderState().annotationFallback as Record<string, unknown> | null
+      if (fallback) this.context.updateRenderState({ annotationFallback: {
+        ...fallback, anchor: result?.anchor || null, stale: result?.status === 'stale',
+      } })
+      return
+    }
+    if (event.type === 'artifact-annotation-summary') {
+      await this.handleAnnotationSummary(event.payload)
       return
     }
     if (this.officeAnnotationId && event.type.startsWith('artifact-annotation-fallback-')) {
@@ -603,7 +653,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       )
       return
     }
-    if (event.type === 'artifact-annotation-fallback-submit') {
+    if (event.type === 'artifact-annotation-fallback-submit' || event.type === 'artifact-annotation-fallback-batch-submit') {
       const payload = event.payload && typeof event.payload === 'object'
         ? event.payload as Record<string, unknown>
         : {}
@@ -665,6 +715,20 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       return
     }
     if (event.type === 'page-annotations-sent') {
+      const detail = event.payload as { draftIds?: string[]; documentId?: string } | undefined
+      const current = this.officeDocument() || this.currentDocument()
+      if (detail?.documentId && current?.document.documentId !== detail.documentId) return
+      if (this.annotationSelectionPending || this.officeAnnotationPending
+        || (this.annotationOverlayId && !detail?.draftIds?.includes(this.annotationOverlayId))
+        || (this.officeAnnotationId && !detail?.draftIds?.includes(this.officeAnnotationId))) {
+        this.context.updateRenderState({ annotationAckDeferredToNewDraft: JSON.stringify(detail?.draftIds || []) })
+        return
+      }
+      this.context.updateRenderState({ annotationAckDeferredToNewDraft: null })
+      if (this.officeDocument()) {
+        this.context.updateRenderState({ officeSelectionMode: false, annotationMode: false })
+        return
+      }
       this.annotationModeRestorePending = false
       const visibleMode = runtimeContextStateValue(
         this.context.getRenderState(),
@@ -778,7 +842,30 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         || actionId === 'toggle-remote-resources'
       )
     ) return
-    if (actionId === 'edit-current') {
+    if (actionId === 'open-latest' && this.options.openLatest) {
+      const generation = this.generation
+      const isCurrent = () => generation === this.generation && this.context.isItemOpen()
+      try { await this.options.openLatest(item, isCurrent) }
+      catch (error) { if (isCurrent()) this.context.reportError(error) }
+    } else if (actionId === 'prepare-annotation' && this.options.prepareAnnotation) {
+      if (this.editingCurrent) return
+      this.editingCurrent = true
+      const generation = this.generation
+      const isCurrent = () => generation === this.generation && this.context.isItemOpen()
+      this.context.updateRenderState({ openingCurrent: true })
+      try { await this.options.prepareAnnotation(item, isCurrent) }
+      catch (error) {
+        if (isCurrent()) {
+          const classified = classifyArtifactProductError(error)
+          const translated = this.options.t(classified.messageKey)
+          this.options.pushToast(translated === classified.messageKey ? classified.fallbackMessage : translated, { tone: 'danger' })
+        }
+      }
+      finally { this.editingCurrent = false; if (isCurrent()) this.context.updateRenderState({ openingCurrent: false }) }
+    } else if (actionId === 'begin-prepared-annotation') {
+      if (this.officeDocument()) this.context.updateRenderState({ officeSelectionMode: true, annotationMode: true })
+      else await this.setAnnotationMode(true)
+    } else if (actionId === 'edit-current') {
       const resource = artifactResourceRefFromWorkbenchItem(item)
       if (resource?.type !== 'deliverable' || !this.options.editCurrentResource || this.editingCurrent) return
       this.editingCurrent = true
@@ -798,6 +885,12 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         if (isCurrent()) this.context.updateRenderState({ openingCurrent: false })
       }
     } else if (actionId === 'toggle-annotation-mode') {
+      if (this.officeDocument()) {
+        const enabled = this.context.getRenderState().annotationMode === true
+        if (enabled && !await this.finishOfficeEditor()) return
+        this.context.updateRenderState({ officeSelectionMode: !enabled, annotationMode: !enabled })
+        return
+      }
       if (runtimeContextStateValue(
         this.context.getRenderState(),
         'annotationModeStopping',
@@ -1177,7 +1270,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         event.detail?.annotationId || '',
         event.detail?.body || '',
       )
-    } else if (event.type === 'annotation-submit') {
+    } else if (event.type === 'annotation-submit' || event.type === 'annotation-record-current' || event.type === 'annotation-batch-submit') {
       await this.handleAnnotationSubmit(
         event.detail?.annotationId || '',
         event.detail?.body || '',
@@ -1247,6 +1340,16 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         loading: event.detail?.loading === true,
         pageTitle: event.detail?.title || '',
       })
+      const current = this.currentDocument()
+      const page = this.lease ? previewPagePathFromUrl(event.detail?.url || '', this.lease) : undefined
+      if (current && page) {
+        const pagePath = page === this.lease?.entrypoint ? '' : page
+        this.context.updateRenderState({ annotationPagePath: pagePath })
+        if (this.context.isItemActive?.() !== false) {
+          this.options.promptAnnotations?.setActiveDocument(current.sessionKey, current.document.documentId)
+          this.options.promptAnnotations?.setActivePage?.(current.sessionKey, pagePath)
+        }
+      }
     } else if (event.type === 'permission-request') {
       const requestId = event.detail?.requestId || ''
       if (!requestId || !this.context.nativeWorkbenchApi?.respondToPermission) return
@@ -1358,6 +1461,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.suspendAnnotationPicker()
     const annotationId = this.annotationId()
     const replacement = this.annotationReplacement
+    const originalDraft = replacement?.discardOriginal ? promptAnnotations.get?.(replacement.annotationId) : undefined
+    let atomicReplacement = false
     let created: PromptAnnotation | null = null
     let overlayRequested = false
     let takeoverCommitted = false
@@ -1370,7 +1475,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
           annotationId: created.annotationId,
         }).catch(() => undefined)
       }
-      await promptAnnotations.discard(created?.annotationId || annotationId).catch(() => false)
+      if (atomicReplacement && originalDraft) promptAnnotations.restoreReplacement?.(originalDraft, annotationId)
+      else await promptAnnotations.discard(created?.annotationId || annotationId).catch(() => false)
       if (created && this.annotationOverlayId === created.annotationId) {
         this.clearAnnotationOverlayState()
       } else {
@@ -1381,7 +1487,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const commitReplacement = async () => {
       if (!replacement) return
       this.annotationReplacement = null
-      if (!replacement.discardOriginal) return
+      if (!replacement.discardOriginal || atomicReplacement) return
       try {
         await promptAnnotations.discard(replacement.annotationId)
       } catch {
@@ -1400,11 +1506,13 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         String(this.context.getRenderState().currentUrl || this.lease.launch_url), this.lease,
       ) : undefined
       if (this.lease && !pagePath) throw surfaceError('The selected preview page is unavailable')
-      created = await promptAnnotations.create({
+      const request: PromptAnnotationCreateRequest = {
         annotationId,
         sessionKey: current.sessionKey,
         documentId: current.document.documentId,
         documentName: current.document.name,
+        revisionId: current.document.headRevisionId,
+        sha256: String(this.options.artifactDocuments?.headArtifact(current.artifact, current.sessionKey).sha256 || current.artifact.sha256 || ''),
         ...(pagePath && pagePath !== this.lease?.entrypoint ? { pagePath } : {}),
         resourceId: /^(document|deliverable|attachment):/.test(String(this.item.payload.resourceIdentity || ''))
           ? String(this.item.payload.resourceIdentity)
@@ -1419,12 +1527,18 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
           ...(candidate.locatorHint ? { locatorHint: candidate.locatorHint } : {}),
         },
         ...(replacement ? { body: replacement.body } : {}),
-      })
+      }
+      atomicReplacement = !!(replacement?.discardOriginal && promptAnnotations.replaceSelection)
+      created = atomicReplacement
+        ? await promptAnnotations.replaceSelection!(replacement!.annotationId, request)
+        : await promptAnnotations.create(request)
       if (!created || !this.annotationSelectionFenceCurrent(fence)) {
         await abandonLateContinuation()
         return
       }
       promptAnnotations.setActiveDocument(current.sessionKey, current.document.documentId)
+      promptAnnotations.setActivePage?.(current.sessionKey, created.pagePath)
+      this.context.updateRenderState({ annotationPagePath: created.pagePath || '' })
       this.annotationOverlayAttempt += 1
       this.annotationOverlayId = created.annotationId
       this.annotationOverlayBody = created.body
@@ -1444,6 +1558,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
       overlayRequested = true
       const overlayRequest = {
+        ...(this.annotationOverlayEditorVersion === 2 ? {
+          overlayEditorVersion: 2 as const,
+          editorState: { batchCount: Math.min(16, (promptAnnotations.list?.(current.sessionKey, current.document.documentId) || []).length), busy: false, action: 'record' as const },
+        } : {}),
         version: this.nativeArtifactProtocolVersion(),
         surfaceId: fence.surfaceId,
         selectionId: candidate.selectionId,
@@ -1557,14 +1675,31 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     try {
       await this.options.promptAnnotations.update(annotationId, body)
+      if (annotationId === this.annotationOverlayId) this.updateAnnotationEditorState(Boolean(this.annotationOverlayOperation))
       return true
     } catch {
+      if (annotationId === this.annotationOverlayId) this.updateAnnotationEditorState(false,
+        this.options.t('workbench.artifactAnnotation.updateFailed'))
       this.options.pushToast(
         this.options.t('workbench.artifactAnnotation.updateFailed'),
         { tone: 'danger' },
       )
       return false
     }
+  }
+
+  private updateAnnotationEditorState(busy: boolean, error = '') {
+    this.context.updateRenderState({ annotationBusy: busy, annotationError: error })
+    if (this.annotationOverlayEditorVersion !== 2 || !this.annotationOverlayId) return
+    const current = this.currentDocument()
+    const batchCount = current ? (this.options.promptAnnotations?.list?.(
+      current.sessionKey, current.document.documentId,
+    ) || []).filter(draft => draft.body.trim() && !this.options.promptAnnotations?.isQueued?.(draft.annotationId)
+      && (draft.pagePath || '') === String(this.context.getRenderState().annotationPagePath || '')).length : 0
+    void this.context.nativeWorkbenchApi?.updateArtifactAnnotationOverlay?.({
+      version: this.nativeArtifactProtocolVersion(), surfaceId: this.item.id, annotationId: this.annotationOverlayId,
+      editorState: { batchCount: Math.min(16, batchCount), busy, error, action: 'record' },
+    }).catch(() => {})
   }
 
   private annotationOverlayFence(annotationId: string) {
@@ -1637,18 +1772,21 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   private showAnnotationCloseFailure() {
+    this.updateAnnotationEditorState(false, this.options.t('workbench.artifactAnnotation.closeFailed'))
     this.options.pushToast(
       this.options.t('workbench.artifactAnnotation.closeFailed'),
       { tone: 'danger', duration: 9000 },
     )
   }
 
-  private async handleAnnotationSubmit(annotationId: string, body: string) {
+  private async handleAnnotationSubmit(annotationId: string, body: string, allowEmpty = false) {
     const fence = this.annotationOverlayFence(annotationId)
-    if (!fence || !body.trim() || this.annotationOverlayOperation) return
+    if (!fence || (!allowEmpty && !body.trim()) || this.annotationOverlayOperation) return
     const operation = Symbol('annotation-submit')
     this.annotationOverlayOperation = operation
+    this.updateAnnotationEditorState(true)
     const atomicRearm = this.annotationAtomicCloseRearm && this.annotationMode
+      && !this.context.getRenderState().annotationFallback
     const modeOperation = this.annotationModeOperation
     let bodyFlushed = false
     try {
@@ -1696,6 +1834,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     } finally {
       if (this.annotationOverlayOperation === operation) {
         this.annotationOverlayOperation = null
+        this.updateAnnotationEditorState(false, String(this.context.getRenderState().annotationError || ''))
       }
       await this.reconcileDeferredAnnotationCancel(fence, bodyFlushed)
     }
@@ -1741,7 +1880,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     const operation = Symbol('annotation-cancel')
     this.annotationOverlayOperation = operation
+    this.updateAnnotationEditorState(true)
     const atomicRearm = this.annotationAtomicCloseRearm && this.annotationMode
+      && !this.context.getRenderState().annotationFallback
     const modeOperation = this.annotationModeOperation
     try {
       if (this.annotationUpdateTimer) {
@@ -1752,8 +1893,11 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         && this.annotationOverlayDiscarded.annotationId === fence.annotationId
       if (!alreadyDiscarded) {
         try {
-          await this.options.promptAnnotations?.discard(annotationId)
+          if (this.annotationEditingOriginal?.annotationId === annotationId) {
+            await this.options.promptAnnotations?.update(annotationId, this.annotationEditingOriginal.body)
+          } else await this.options.promptAnnotations?.discard(annotationId)
         } catch {
+          this.updateAnnotationEditorState(false, this.options.t('workbench.artifactAnnotation.discardFailed'))
           this.options.pushToast(
             this.options.t('workbench.artifactAnnotation.discardFailed'),
             { tone: 'danger', duration: 9000 },
@@ -1797,6 +1941,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     } finally {
       if (this.annotationOverlayOperation === operation) {
         this.annotationOverlayOperation = null
+        this.updateAnnotationEditorState(false, String(this.context.getRenderState().annotationError || ''))
       }
       await this.reconcileDeferredAnnotationCancel(fence)
     }
@@ -1854,8 +1999,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.annotationOverlayAttempt += 1
     this.annotationOverlayId = ''
     this.annotationOverlayBody = ''
+    this.annotationEditingOriginal = null
     this.options.promptAnnotations?.releaseOverlayEdit?.(annotationId)
-    this.context.updateRenderState({ annotationFallback: null })
+    this.context.updateRenderState({ annotationFallback: null, annotationBusy: false, annotationError: '' })
     return true
   }
 
@@ -1870,7 +2016,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         shortcut: newlineShortcut,
       }),
       cancelLabel: this.options.t('common.cancel'),
-      submitLabel: this.options.t('workbench.artifactAnnotation.submit'),
+      submitLabel: this.options.t('workbench.annotationUnified.recordToConversation'),
       emptyBodyMessage: this.options.t('workbench.artifactAnnotation.emptyBody'),
     }
   }
@@ -1905,6 +2051,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   async suspend() {
+    if (!await this.finishOfficeEditor()) return
     if (!this.rect) return
     await this.setSurfaceRect({ ...this.rect, visible: false })
   }
@@ -1920,6 +2067,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   async beforeClose(options?: WorkbenchBeforeCloseOptions): Promise<boolean> {
+    if (!await this.finishOfficeEditor()) return false
     if (this.annotationOverlayId) {
       if (!await this.flushAnnotationBody(
         this.annotationOverlayId,
@@ -1930,6 +2078,25 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
     }
     return await this.component?.beforeClose?.(options) ?? true
+  }
+
+  private async finishOfficeEditor(): Promise<boolean> {
+    const annotationId = this.officeAnnotationId
+    if (!annotationId) return true
+    try {
+      await this.options.officePromptAnnotations?.update(annotationId, this.officeAnnotationBody)
+      this.options.officePromptAnnotations?.completeOverlayEdit?.(annotationId)
+      if (this.officeAnnotationId === annotationId) {
+        this.officeAnnotationId = ''
+        this.officeAnnotationBody = ''
+        this.annotationEditingOriginal = null
+        this.context.updateRenderState({ annotationFallback: null, annotationError: '' })
+      }
+      return true
+    } catch {
+      this.context.updateRenderState({ annotationError: this.options.t('workbench.artifactAnnotation.updateFailed') })
+      return false
+    }
   }
 
   async dispose() {
@@ -2023,6 +2190,112 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     return { artifact: workspace.headArtifact, document: workspace.document, sessionKey }
   }
 
+  private async handleAnnotationSummary(payload: unknown) {
+    const raw = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+    const current = this.officeDocument() || this.currentDocument()
+    const actions = this.officeDocument() ? this.options.officePromptAnnotations : this.options.promptAnnotations
+    if (!current || !actions) return
+    const id = typeof raw.annotationId === 'string' ? raw.annotationId : ''
+    const draft = actions.get?.(id)
+    if (raw.type === 'submit') {
+      // The right-hand UI records into the ordinary composer; it never sends.
+      if (this.officeAnnotationId) {
+        if (!await this.finishOfficeEditor()) return
+        this.context.updateRenderState({ officeSelectionMode: true, annotationMode: true })
+      } else if (this.annotationOverlayId) {
+        await this.handleAnnotationSubmit(this.annotationOverlayId, this.annotationOverlayBody, true)
+      }
+      actions.setActiveDocument(current.sessionKey, current.document.documentId)
+      actions.setActivePage?.(current.sessionKey, String(this.context.getRenderState().annotationPagePath || ''))
+      return
+    }
+    if (!draft || actions.isQueued?.(id) || draft.documentId !== current.document.documentId
+      || draft.sessionKey !== current.sessionKey) return
+    if (raw.type === 'delete') {
+      if (id === this.annotationOverlayId) {
+        await this.handleAnnotationSubmit(id, this.annotationOverlayBody, true)
+        if (this.annotationOverlayId) return
+      }
+      await actions.discard(id)
+      if (id === this.officeAnnotationId) {
+        this.officeAnnotationId = ''
+        this.context.updateRenderState({ annotationFallback: null })
+      }
+      return
+    }
+    actions.setActiveDocument(current.sessionKey, current.document.documentId)
+    actions.setActivePage?.(current.sessionKey, draft.pagePath)
+    this.context.updateRenderState({ annotationPagePath: draft.pagePath || '' })
+    if (raw.type === 'reselect') {
+      if (this.officeAnnotationId) {
+        if (!await this.finishOfficeEditor()) return
+      } else if (this.annotationOverlayId) {
+        await this.handleAnnotationSubmit(this.annotationOverlayId, this.annotationOverlayBody, true)
+        if (this.annotationOverlayId) return
+      }
+      if (raw.prepared !== true && this.options.prepareAnnotation) {
+        if (this.editingCurrent) return
+        this.editingCurrent = true
+        const generation = this.generation
+        const isCurrent = () => generation === this.generation && this.context.isItemOpen()
+        this.context.updateRenderState({ openingCurrent: true })
+        try { await this.options.prepareAnnotation(this.item, isCurrent, id) }
+        catch (error) { if (isCurrent()) this.context.reportError(error) }
+        finally {
+          this.editingCurrent = false
+          if (isCurrent()) this.context.updateRenderState({ openingCurrent: false })
+        }
+        return
+      }
+      this.annotationReplacement = { annotationId: id, body: draft.body, discardOriginal: true }
+      if (draft.selection) this.context.updateRenderState({ officeSelectionMode: true, annotationMode: true })
+      else await this.setAnnotationMode(true)
+      return
+    }
+    const stale = draft.freshness === 'stale' || draft.revisionId !== current.document.headRevisionId
+      || draft.sha256 !== String(current.artifact.sha256 || '')
+    if (draft.selection) {
+      this.context.updateRenderState({
+        officeSelectionToLocate: { selection: draft.selection, revisionId: draft.revisionId, stale,
+          requestId: this.annotationId(), annotationId: id },
+      })
+      if (raw.type === 'edit') {
+        if (this.officeAnnotationId === id) return
+        if (!await this.finishOfficeEditor()) return
+        this.annotationEditingOriginal = { annotationId: id, body: draft.body }
+        this.officeAnnotationId = id
+        this.officeAnnotationBody = draft.body
+        actions.beginOverlayEdit?.(id, current.sessionKey)
+        this.context.updateRenderState({
+          annotationFallback: { annotationId: id, body: draft.body, reason: 'office-selection', label: draft.quote || draft.tagName, stale },
+          officeSelectionMode: false, annotationMode: true,
+        })
+      }
+    } else {
+      if (draft.targetRef && draft.locatorHint && !stale) {
+        await this.context.nativeWorkbenchApi?.focusWorkbenchAnnotation?.({
+          surfaceId: this.item.id, targetRef: draft.targetRef, locatorHint: draft.locatorHint,
+          ...(draft.pagePath ? { pagePath: draft.pagePath } : {}),
+        })
+      }
+      if (raw.type === 'edit') {
+        if (this.annotationOverlayId) {
+          await this.handleAnnotationSubmit(this.annotationOverlayId, this.annotationOverlayBody)
+          if (this.annotationOverlayId) return
+        }
+        this.annotationOverlayAttempt += 1
+        this.annotationOverlayId = id
+        this.annotationOverlayBody = draft.body
+        this.annotationEditingOriginal = { annotationId: id, body: draft.body }
+        actions.beginOverlayEdit?.(id, current.sessionKey)
+        await this.hideNativeSurfaceForAnnotationFallback()
+        this.context.updateRenderState({
+          annotationFallback: { annotationId: id, body: draft.body, label: draft.quote || draft.tagName, stale },
+        })
+      }
+    }
+  }
+
   private async createOfficeAnnotation(event: WorkbenchComponentEvent) {
     const current = this.officeDocument()
     const raw = event.payload && typeof event.payload === 'object' ? event.payload as Record<string, unknown> : {}
@@ -2034,10 +2307,12 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const annotations = this.options.officePromptAnnotations!
     const annotationId = this.annotationId()
     const generation = this.generation
+    const originalDraft = this.annotationReplacement?.discardOriginal
+      ? annotations.get?.(this.annotationReplacement.annotationId) : undefined
     this.officeAnnotationPending = true
     annotations.beginOverlayEdit?.(annotationId, current.sessionKey)
     try {
-      const created = await annotations.create({
+      const request: PromptAnnotationCreateRequest = {
         annotationId, sessionKey: current.sessionKey, documentId: current.document.documentId,
         documentName: current.document.name, resourceId: `document:${current.document.documentId}`,
         revisionId: current.document.headRevisionId, sha256: String(current.artifact.sha256 || ''),
@@ -2045,16 +2320,29 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         selection: { selectionId: annotationId, tagName: selection.kind, elementPath: '',
           selectionText: selection.text || selection.range || selection.name || selection.shapeId || '',
           locatorHint: selection.range || selection.shapeId || selection.paragraphIds?.join(', ') },
-      })
+        ...(this.annotationReplacement ? { body: this.annotationReplacement.body } : {}),
+      }
+      const replacement = this.annotationReplacement
+      const created = replacement?.discardOriginal && annotations.replaceSelection
+        ? await annotations.replaceSelection(replacement.annotationId, request)
+        : await annotations.create(request)
+      if (replacement) this.annotationReplacement = null
       const latest = this.officeDocument()
       if (generation !== this.generation || !this.context.isItemOpen()
         || !latest || latest.document.headRevisionId !== created.revisionId || latest.artifact.sha256 !== created.sha256) {
-        await annotations.discard(annotationId)
+        if (originalDraft && annotations.restoreReplacement) annotations.restoreReplacement(originalDraft, annotationId)
+        else await annotations.discard(annotationId)
         annotations.releaseOverlayEdit?.(annotationId)
         return
       }
       this.officeAnnotationId = annotationId
-      this.context.updateRenderState({ annotationFallback: { annotationId, body: created.body, reason: 'office-selection' } })
+      this.officeAnnotationBody = created.body
+      this.annotationEditingOriginal = null
+      this.context.updateRenderState({
+        annotationFallback: { annotationId, body: created.body, reason: 'office-selection', anchor: raw.anchor || null,
+          label: created.quote || created.tagName },
+        officeSelectionMode: false, annotationPagePath: '',
+      })
     } catch {
       annotations.releaseOverlayEdit?.(annotationId)
       this.options.pushToast(this.options.t('workbench.artifactAnnotation.updateFailed'), { tone: 'danger' })
@@ -2068,21 +2356,27 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const annotations = this.options.officePromptAnnotations!
     try {
       if (event.type === 'artifact-annotation-fallback-cancel') {
-        await annotations.discard(annotationId)
+        if (this.annotationEditingOriginal?.annotationId === annotationId) {
+          await annotations.update(annotationId, this.annotationEditingOriginal.body)
+          annotations.completeOverlayEdit?.(annotationId)
+        } else await annotations.discard(annotationId)
       } else {
         const body = typeof raw.body === 'string' ? raw.body : ''
+        this.officeAnnotationBody = body
         if (!promptAnnotationBodyWithinLimit(body)) return
-        if (event.type === 'artifact-annotation-fallback-submit' && !body.trim()) return
+        if (event.type !== 'artifact-annotation-fallback-update' && !body.trim()) return
         await annotations.update(annotationId, body)
         if (event.type === 'artifact-annotation-fallback-update') return
         annotations.completeOverlayEdit?.(annotationId)
       }
       if (this.officeAnnotationId === annotationId) {
         this.officeAnnotationId = ''
-        this.context.updateRenderState({ annotationFallback: null })
+        this.annotationEditingOriginal = null
+        this.context.updateRenderState({ annotationFallback: null, officeSelectionMode: true, annotationMode: true })
       }
     } catch {
       this.options.pushToast(this.options.t('workbench.artifactAnnotation.updateFailed'), { tone: 'danger' })
+      this.context.updateRenderState({ annotationError: this.options.t('workbench.artifactAnnotation.updateFailed') })
     }
   }
 
@@ -2097,7 +2391,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       || workspace.source !== 'document-api'
       || workspace.document.kind !== 'html'
     ) return null
-    return { artifact, document: workspace.document, sessionKey }
+    return { artifact: workspace.headArtifact, document: workspace.document, sessionKey }
   }
 
   private async refreshAnnotationCapability(expectedGeneration = this.generation) {
@@ -2138,6 +2432,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       const capability = await nativeApi.getArtifactAnnotationCapabilities()
       if (expectedGeneration !== this.generation || !this.createdSurface) return false
       this.annotationOverlayCopyVersion = capability.overlayCopyVersion === 1 ? 1 : 0
+      this.annotationOverlayEditorVersion = capability.overlayEditorVersion === 2 ? 2 : 0
       this.annotationAtomicCloseRearm = capability.atomicCloseRearm === true
       const available = (capability.version === 3 || capability.version === 4)
         && capability.available
@@ -2246,6 +2541,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         || !hasNativeLeaseBroker
       )
     ) {
+      if (originalArtifact.workbenchOpenIntent === 'history') {
+        throw new ArtifactPreviewLeaseError('This Desktop cannot open an immutable historical preview.',
+          409, 'PREVIEW_SNAPSHOT_UNSUPPORTED')
+      }
       if (originalArtifact.previewPagePath) {
         throw new ArtifactPreviewLeaseError('This Desktop cannot open the requested preview page.',
           409, 'PREVIEW_PAGE_UNSUPPORTED')
@@ -2276,6 +2575,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     } catch (error) {
       if (
         error instanceof ArtifactPreviewLeaseError
+        && originalArtifact.workbenchOpenIntent !== 'history'
         && !originalArtifact.previewPagePath
         && (
           (error.status === 404 && !error.code)
@@ -3010,11 +3310,22 @@ function artifactToolbarItems(
 ): readonly WorkbenchToolbarItem[] {
   const artifact = artifactFromWorkbenchItem(item)
   if (!artifact) return []
+  const format = artifactWorkbenchPreviewKind(artifact)
+  const clientSupportsAnnotation = format === 'html'
+    ? !!options.promptAnnotations && options.platform.capabilities.hasNativeWorkbenchSurfaces
+    : isOfficePreviewFormat(format) && !!options.officePromptAnnotations
+  const historical = item.payload.historical === true
+  const unified = !historical && !!options.prepareAnnotation && (format === 'html' || isOfficePreviewFormat(format))
   const items: WorkbenchToolbarItem[] = []
   if (isFixedArtifactPreview(item)) {
-    items.push({ kind: 'status', id: 'fixed-snapshot', icon: 'clock',
-      label: options.t('workbench.artifactDocument.fixedSnapshot'), text: options.t('workbench.artifactDocument.fixedSnapshot') })
-    if (artifactResourceRefFromWorkbenchItem(item)?.type === 'deliverable' && options.editCurrentResource) {
+    items.push({ kind: 'status', id: 'fixed-snapshot', tone: 'neutral',
+      label: options.t(historical ? 'workbench.artifactDocument.historicalVersion' : 'workbench.artifactDocument.fixedSnapshotHint'),
+      text: options.t(historical ? 'workbench.artifactDocument.historicalVersion' : 'workbench.artifactDocument.fixedSnapshot') })
+    if (historical && options.openLatest) {
+      items.push({ kind: 'action', id: 'open-latest', icon: 'externalLink',
+        label: options.t('workbench.artifactDocument.openLatest') })
+    } else if (!unified
+      && artifactResourceRefFromWorkbenchItem(item)?.type === 'deliverable' && options.editCurrentResource) {
       items.push({ kind: 'action', id: 'edit-current', icon: 'pencil',
         label: options.t('workbench.artifactDocument.continueEditing'),
         disabled: runtimeStateValue(state, 'openingCurrent', false) })
@@ -3039,7 +3350,17 @@ function artifactToolbarItems(
   ) === 'ready'
   const annotationAvailable = runtimeStateValue(state, 'annotationAvailable', false)
   const enabled = runtimeStateValue(state, 'annotationMode', false)
-  if (annotationAvailable && (nativeSurfaceReady || enabled)) {
+  if (unified) {
+    const supported = clientSupportsAnnotation
+    items.push({
+      kind: 'action', id: enabled ? 'toggle-annotation-mode' : 'prepare-annotation', icon: 'pencil',
+      label: options.t(enabled ? 'workbench.annotationUnified.stop' : 'workbench.annotationUnified.start'),
+      ...(!supported ? { tooltip: options.t(format === 'html' && !options.platform.capabilities.hasNativeWorkbenchSurfaces
+        ? 'workbench.artifactAnnotation.desktopEditingOnly' : 'workbench.annotationUnified.unavailable') } : {}),
+      disabled: !supported || runtimeStateValue(state, 'openingCurrent', false),
+      pressed: enabled,
+    })
+  } else if (annotationAvailable && (nativeSurfaceReady || enabled)) {
     const stopping = runtimeStateValue(state, 'annotationModeStopping', false)
     items.push({
       kind: 'action',
@@ -3262,6 +3583,28 @@ export function createArtifactWorkbenchDefinitions(
         ),
         publishing: runtimeStateValue(state, 'documentPublishing', false),
         annotationFallback: runtimeStateValue(state, 'annotationFallback', null),
+        annotationPagePath: runtimeStateValue(state, 'annotationPagePath', ''),
+        annotationBusy: runtimeStateValue(state, 'annotationBusy', false),
+        annotationError: runtimeStateValue(state, 'annotationError', ''),
+        officeSelectionMode: runtimeStateValue(state, 'officeSelectionMode', false),
+        officeSelectionToLocate: runtimeStateValue(state, 'officeSelectionToLocate', undefined),
+        annotationDrafts: (() => {
+          const artifact = artifactFromWorkbenchItem(item)
+          const sessionKey = artifactSessionKey(item, options)
+          const documentId = artifact && !isFixedArtifactPreview(item)
+            ? options.artifactDocuments?.snapshot(artifact, sessionKey).workspace?.document.documentId : undefined
+          const annotations = options.officePromptAnnotations || options.promptAnnotations
+          return documentId ? annotations?.list?.(sessionKey, documentId) || [] : []
+        })(),
+        queuedAnnotationIds: (() => {
+          const sessionKey = artifactSessionKey(item, options)
+          const artifact = artifactFromWorkbenchItem(item)
+          const documentId = artifact && !isFixedArtifactPreview(item)
+            ? options.artifactDocuments?.snapshot(artifact, sessionKey).workspace?.document.documentId : undefined
+          const annotations = options.officePromptAnnotations || options.promptAnnotations
+          return documentId ? (annotations?.list?.(sessionKey, documentId) || [])
+            .filter(draft => annotations?.isQueued?.(draft.annotationId)).map(draft => draft.annotationId) : []
+        })(),
         officeAnnotationEnabled: (() => {
           if (isFixedArtifactPreview(item)) return false
           const artifact = artifactFromWorkbenchItem(item)

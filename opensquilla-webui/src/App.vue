@@ -312,6 +312,9 @@
         :session-id="workbenchSessionKey"
         :session-loading="chatRouteHeader.model.sessionKey.value !== workbenchSessionKey
           || chatRouteHeader.model.sessionLoading.value"
+        :session-refreshing="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
+          && chatRouteHeader.model.sessionRefreshing.value"
+        :session-context="chatRouteHeader.model.sessionContext.value"
         :session-durable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey
           && chatRouteHeader.model.sessionDurable.value"
         :session-preparable="chatRouteHeader.model.sessionKey.value === workbenchSessionKey

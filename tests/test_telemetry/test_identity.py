@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -128,27 +129,44 @@ def test_device_identity_lookup_failure_never_uses_network_or_random_fallback(mo
         device_identity.get_device_id.cache_clear()
 
 
-def test_runtime_device_identity_is_gated_by_upload_policy(tmp_path, monkeypatch) -> None:
+async def test_runtime_device_identity_is_cached_and_gated_by_upload_policy(
+    tmp_path, monkeypatch,
+) -> None:
     from opensquilla.telemetry.consent import TelemetryScope
     from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
+    from tests.helpers.telemetry_runtime import runtime_config, turn_event
 
     calls = []
     monkeypatch.setattr(
         "opensquilla.telemetry.runtime.get_device_id", lambda: calls.append(1) or "a" * 64
     )
-    config = SimpleNamespace(state_dir=str(tmp_path), privacy=SimpleNamespace(
-        disable_network_observability=True,
-    ))
+    config = runtime_config(tmp_path, disabled=True)
     runtime = ScopedTelemetryRuntime(config=config, env={})
-    assert runtime.device_id_for(TelemetryScope.RELIABILITY) is None
-    assert runtime.device_id_for(TelemetryScope.GROWTH) is None
-    assert calls == []
-    config.privacy.disable_network_observability = False
-    assert runtime.device_id_for(TelemetryScope.RELIABILITY) == "a" * 64
-    assert calls == [1]
-    ci_runtime = ScopedTelemetryRuntime(config=config, env={"CI": "1"})
-    assert ci_runtime.device_id_for(TelemetryScope.RELIABILITY) is None
-    assert calls == [1]
+
+    async def no_network_start():
+        return None
+
+    monkeypatch.setattr(runtime, "start", no_network_start)
+    try:
+        assert runtime.device_id_for(TelemetryScope.RELIABILITY) is None
+        assert runtime.device_id_for(TelemetryScope.GROWTH) is None
+        runtime.record_background(turn_event())
+        await asyncio.gather(*tuple(runtime._record_tasks))
+        assert calls == []
+        config.privacy.disable_network_observability = False
+        assert runtime.device_id_for(TelemetryScope.RELIABILITY) is None
+        runtime.record_background(turn_event(2))
+        await asyncio.gather(*tuple(runtime._record_tasks))
+        assert runtime.device_id_for(TelemetryScope.RELIABILITY) == "a" * 64
+        assert calls == [1]
+        config.privacy.disable_network_observability = True
+        assert runtime.device_id_for(TelemetryScope.RELIABILITY) is None
+        ci_runtime = ScopedTelemetryRuntime(config=config, env={"CI": "1"})
+        assert ci_runtime.device_id_for(TelemetryScope.RELIABILITY) is None
+        assert calls == [1]
+        await ci_runtime.close(flush=False)
+    finally:
+        await runtime.close(flush=False)
 
 UUID_ONE = uuid.UUID("123e4567-e89b-42d3-a456-426614174000")
 UUID_TWO = uuid.UUID("123e4567-e89b-42d3-b456-426614174000")

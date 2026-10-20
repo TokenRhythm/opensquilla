@@ -25,6 +25,7 @@ from opensquilla.cli.chat.turn import TurnResult
 from opensquilla.cli.tui.adapters import slash_standalone as _standalone_slash_adapter
 from opensquilla.cli.tui.adapters.commands import is_exit_command
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
+from opensquilla.cli.tui.backend.runtime import TuiTelemetryDelivery
 from opensquilla.cli.ui import console, error_panel
 from opensquilla.engine.commands import Surface
 from opensquilla.permissions import configured_default_elevated
@@ -500,6 +501,7 @@ async def run_standalone_chat(
         session_context.sync_from_state()
         return True
 
+    surface_telemetry: TuiTelemetryDelivery | None = None
     try:
 
         async def _record_user_activity() -> None:
@@ -510,7 +512,7 @@ async def run_standalone_chat(
             if callable(record):
                 await record(surface=ClientSurface.TUI)
 
-        async def _record_surface_ready() -> None:
+        async def _record_surface_telemetry() -> None:
             from opensquilla.telemetry.contracts.common import (
                 ClientEntrypoint,
                 ClientSurface,
@@ -526,6 +528,12 @@ async def run_standalone_chat(
                     entrypoint=ClientEntrypoint.CHAT,
                     execution_mode=ExecutionMode.STANDALONE,
                 )
+
+        surface_telemetry = TuiTelemetryDelivery(_record_surface_telemetry)
+
+        async def _record_surface_ready() -> None:
+            assert surface_telemetry is not None
+            surface_telemetry.observe()
 
         repl_kwargs: dict[str, Any] = {
             "surface": Surface.CLI_STANDALONE,
@@ -545,4 +553,6 @@ async def run_standalone_chat(
             repl_kwargs["on_user_activity"] = _record_user_activity
         await deps.run_concurrent_repl(**repl_kwargs)
     finally:
+        if surface_telemetry is not None:
+            await surface_telemetry.close()
         await svc.close()

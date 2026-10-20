@@ -237,6 +237,8 @@ async def test_ordinary_progress_does_not_query_goal_storage(tmp_path, monkeypat
             {"key": SOURCE_KEY, "message": "Complete the ordinary task.",
              "clientRequestId": "ordinary-progress"}, stack.context,
         )
-        task = await stack.runtime.wait(sent["task_id"], timeout=3)
+        # This checks query behavior, not a three-second SQLite throughput
+        # budget. Match the Goal RPC fixture's bounded wait under Windows load.
+        task = await stack.runtime.wait(sent["task_id"], timeout=10)
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert checked == [True]

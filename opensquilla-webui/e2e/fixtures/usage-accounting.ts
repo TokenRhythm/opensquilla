@@ -11,9 +11,10 @@ import '@/themes/tokens'
 import '@/styles/control-visual-system.css'
 import '@/styles/apple-modern.css'
 
-// Production UsageView + v4 wire normalizer, synthetic in-memory transport.
-// This fixture never contacts a provider/Gateway or accesses a real profile.
+// Production UsageView + v4 wire normalizer. Optional SQLite mode uses a
+// loopback test wrapper around the real usage RPC dispatcher, never a real profile.
 const query = new URLSearchParams(location.search)
+const sqlite = query.get('source') === 'sqlite'
 const language = query.get('lang') === 'en' ? 'en' : 'zh-Hans'
 await loadLocaleMessages(language)
 i18n.global.locale.value = language
@@ -141,8 +142,18 @@ const payload = {
 const unused = async (): Promise<never> => { throw new Error('Unexpected fixture operation') }
 const observability = createV4Observability({
   ready: async () => {}, supports: () => true, markUnsupported: () => {},
-  request: async <T>(method: string) => {
+  request: async <T>(method: string, params?: unknown) => {
     if (method !== 'usage.query') throw new Error(`Unexpected fixture method: ${method}`)
+    if (sqlite) {
+      const response = await fetch('/__usage_gateway/rpc', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: 'usage-browser', method, params }),
+      })
+      if (!response.ok) throw new Error(`Usage fixture HTTP ${response.status}`)
+      const wire = await response.json()
+      if (!wire.ok) throw new Error(wire.error?.message || 'Usage RPC failed')
+      return wire.payload as T
+    }
     return structuredClone(payload) as T
   },
 }, { requestJson: unused, requestBinary: unused }, () => null)
@@ -152,7 +163,10 @@ const router = createRouter({ history: createMemoryHistory(), routes: [
   { path: '/', component: UsageView }, { path: '/chat', component: UsageView },
 ] })
 const Preview = defineComponent({ setup: () => () => h('main', { class: 'usage-fixture' }, [
-  h('p', '正式 UsageView 与 v4 适配器 · 内存模拟账目 · 不连接真实网关或供应商'),
+  h('p', sqlite
+    ? '正式 UsageView、v4 适配器与 Gateway usage RPC · 临时 SQLite · 不访问真实 profile 或供应商'
+    : '正式 UsageView 与 v4 适配器 · 内存模拟账目 · 不连接真实网关或供应商'),
+  h('output', { 'data-testid': 'usage-route' }, router.currentRoute.value.fullPath),
   h(KeepAlive, null, { default: () => h(UsageView) }),
 ]) })
 const app = createApp(Preview)

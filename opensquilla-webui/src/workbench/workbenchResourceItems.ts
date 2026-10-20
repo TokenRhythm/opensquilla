@@ -44,15 +44,28 @@ export function canonicalWorkbenchResources(
   resources: readonly WorkbenchResource[],
 ): WorkbenchResource[] {
   const userFacingResources = resources.filter(resource => !isInternalVisualizeResource(resource))
-  const documentIds = new Set(
-    userFacingResources
-      .filter(resource => resource.resource.type === 'document')
-      .map(resource => workbenchResourceRefId(resource.resource)),
-  )
-  return userFacingResources.filter((resource) => {
-    if (resource.resource.type === 'document') return true
-    const documentId = resource.relations.documentId || ''
-    return !documentId || !documentIds.has(documentId)
+  const identity = (resource: WorkbenchResource) => {
+    const documentId = resource.resource.type === 'document'
+      ? workbenchResourceRefId(resource.resource) : resource.relations.documentId
+    return documentId ? `document:${documentId}` : workbenchResourceKey(resource.resource)
+  }
+  const representatives = new Map<string, WorkbenchResource>()
+  for (const resource of userFacingResources) {
+    const key = identity(resource)
+    const previous = representatives.get(key)
+    // Prefer the current Document whenever the inventory includes it. When a
+    // projection contains only deliveries, preserve its newest-first ordering
+    // and still count their explicit Document lineage as one independent file.
+    if (!previous || (resource.resource.type === 'document' && previous.resource.type !== 'document')) {
+      representatives.set(key, resource)
+    }
+  }
+  const included = new Set<string>()
+  return userFacingResources.filter(resource => {
+    const key = identity(resource)
+    if (included.has(key) || representatives.get(key) !== resource) return false
+    included.add(key)
+    return true
   })
 }
 
@@ -126,6 +139,7 @@ export function artifactPayloadFromWorkbenchResource(
   return {
     ...(artifactId ? { id: artifactId } : {}),
     name: resource.name,
+    ...(resource.sourcePath ? { sourcePath: resource.sourcePath } : {}),
     mime: resource.mime,
     size: resource.size,
     sha256: resource.sha256,

@@ -38,6 +38,79 @@ const attachment: WorkbenchResource = {
 describe('workbench resources store', () => {
   beforeEach(() => setActivePinia(createPinia()))
 
+  it('does not fall back to cached resources when an authoritative open finds none', async () => {
+    const provider: WorkbenchResourceProvider = {
+      available: () => true, canImportDocuments: () => true,
+      list: vi.fn(async () => ({ resources: [attachment], totalCount: 1 })),
+      get: vi.fn(async () => null), importDocument: vi.fn(), publishDocument: vi.fn(),
+    }
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+    await store.load('session-a')
+    expect(await store.resolveFresh('session-a', attachment.resource)).toBeNull()
+    expect(store.find('session-a', attachment.resource)).toEqual(attachment)
+  })
+
+  it.each(['reset', 'provider', 'navigation'])('does not cache a late authoritative open after %s', async (boundary) => {
+    let complete!: (value: WorkbenchResource) => void
+    const provider: WorkbenchResourceProvider = {
+      available: () => true, canImportDocuments: () => true, list: vi.fn(),
+      get: vi.fn(() => new Promise<WorkbenchResource>(resolve => { complete = resolve })),
+      importDocument: vi.fn(), publishDocument: vi.fn(),
+    }
+    let current = true
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+    const opening = store.resolveFresh('session-a', attachment.resource, () => current)
+    if (boundary === 'reset') store.reset()
+    else if (boundary === 'provider') store.setProvider({ ...provider })
+    else current = false
+    complete(attachment)
+    expect(await opening).toBeNull()
+    expect(store.find('session-a', attachment.resource)).toBeNull()
+  })
+
+  it('single-flights annotation preparation and reuses its request identity after failure', async () => {
+    let complete!: (result: null) => void
+    const prepareAnnotation = vi.fn<NonNullable<WorkbenchResourceProvider['prepareAnnotation']>>()
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockImplementationOnce(() => new Promise(resolve => { complete = resolve }))
+    const provider: WorkbenchResourceProvider = {
+      available: () => true, canImportDocuments: () => true, list: vi.fn(), get: vi.fn(),
+      importDocument: vi.fn(), publishDocument: vi.fn(), prepareAnnotation,
+    }
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+    const request = { workspaceFile: { path: 'site/page.html', workspaceBinding: 'binding-a', expectedRevision: 'file-rev-a' } }
+    await expect(store.prepareAnnotation('session-a', request)).rejects.toThrow('network unavailable')
+    const firstId = prepareAnnotation.mock.calls[0]![1].idempotencyKey
+    expect(firstId).toBeTruthy()
+    const first = store.prepareAnnotation('session-a', request)
+    const second = store.prepareAnnotation('session-a', request)
+    expect(prepareAnnotation).toHaveBeenCalledTimes(2)
+    expect(prepareAnnotation.mock.calls[1]![1]).toEqual({ ...request, idempotencyKey: firstId })
+    complete(null)
+    expect(await first).toBeNull()
+    expect(await second).toBeNull()
+  })
+
+  it('does not apply an obsolete annotation preparation result after provider replacement', async () => {
+    let complete!: (result: Awaited<ReturnType<NonNullable<WorkbenchResourceProvider['prepareAnnotation']>>>) => void
+    const provider: WorkbenchResourceProvider = {
+      available: () => true, canImportDocuments: () => true, list: vi.fn(), get: vi.fn(),
+      importDocument: vi.fn(), publishDocument: vi.fn(),
+      prepareAnnotation: vi.fn<NonNullable<WorkbenchResourceProvider['prepareAnnotation']>>(() => new Promise(resolve => { complete = resolve })),
+    }
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+    const pending = store.prepareAnnotation('session-a', { resourceRef: attachment.resource })
+    store.setProvider({ ...provider })
+    complete({ disposition: 'readonly', resolution: { status: 'readonly' }, resource: attachment,
+      reasonCode: 'format_edit_not_supported', materialized: false })
+    await pending
+    expect(store.find('session-a', attachment.resource)).toBeNull()
+  })
+
   it('bounds inactive inventories without evicting a publication owner or its request identity', async () => {
     let finish!: () => void
     const provider: WorkbenchResourceProvider = {

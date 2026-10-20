@@ -8,12 +8,13 @@ import type {
   WorkspaceRoot,
 } from '@/modules/workspaceFiles'
 import { WorkspaceFilesChangedError, WorkspaceTextLimitError } from '@/modules/workspaceFiles'
+import type { WorkspaceFileReferenceV1 } from '@/types/references'
 import { HttpTransportError } from './privateHttpTransport'
 
 interface WorkspaceFileHttp {
   requestJson<T>(endpoint: string, options?:
     | { method?: 'GET'; sessionKey?: string; signal?: AbortSignal }
-    | { method: 'POST'; sessionKey?: string; json: { paths: string[] } | { path: string; workspaceBinding: string; expectedRevision: string; appId: string } | { workspaceBinding: string; appId: string; projectId?: string }; signal?: AbortSignal }
+    | { method: 'POST'; sessionKey?: string; json: { paths: string[]; reference?: WorkspaceFileReferenceV1 } | { path: string; workspaceBinding: string; expectedRevision: string; appId: string } | { workspaceBinding: string; appId: string; projectId?: string }; signal?: AbortSignal }
   ): Promise<T>
   requestBlob(endpoint: string, options: { sessionKey: string; signal?: AbortSignal }): Promise<Blob>
 }
@@ -46,6 +47,26 @@ function relativePath(value: unknown): value is string {
   return typeof value === 'string' && !!value && value.length <= 4096
     && !/[\\\x00-\x1f\x7f:]/.test(value) && !value.startsWith('/')
     && value.split('/').every(part => !!part && part !== '.' && part !== '..')
+}
+function annotationMetadata(item: Record<string, unknown>): Pick<WorkspaceFile, 'documentTarget' | 'annotationCapability'> {
+  const result: Pick<WorkspaceFile, 'documentTarget' | 'annotationCapability'> = {}
+  if (item.documentTarget !== undefined) {
+    const target = item.documentTarget as Record<string, unknown> | null
+    if (!target || typeof target.documentId !== 'string' || !target.documentId
+      || target.documentId.length > 512 || /[\x00-\x1f\x7f]/.test(target.documentId)
+      || (target.pagePath !== undefined && !relativePath(target.pagePath))) throw new Error('Invalid annotation document target')
+    result.documentTarget = { documentId: target.documentId, ...(target.pagePath ? { pagePath: target.pagePath as string } : {}) }
+  }
+  if (item.annotationCapability !== undefined) {
+    const capability = item.annotationCapability as Record<string, unknown> | null
+    if (!capability || typeof capability.supported !== 'boolean'
+      || (capability.reasonCode !== undefined && (typeof capability.reasonCode !== 'string' || capability.reasonCode.length > 128))) {
+      throw new Error('Invalid annotation capability')
+    }
+    result.annotationCapability = { supported: capability.supported,
+      ...(typeof capability.reasonCode === 'string' ? { reasonCode: capability.reasonCode } : {}) }
+  }
+  return result
 }
 
 function rootScope(scope: WorkspaceRootScope): { sessionKey?: string; projectId?: string } {
@@ -86,6 +107,36 @@ export function createV4WorkspaceFiles(http: WorkspaceFileHttp): WorkspaceFiles 
     requestJson: <T>(...args: Parameters<WorkspaceFileHttp['requestJson']>) => translate(transport.requestJson<T>(...args)),
     requestBlob: (...args) => translate(transport.requestBlob(...args)),
   }
+  async function resolveFiles(sessionKey: string, paths: string[], signal?: AbortSignal, reference?: WorkspaceFileReferenceV1): Promise<WorkspaceFile[]> {
+    if (!sessionKey || !paths.length) return []
+    const raw = await http.requestJson<unknown>('/api/v1/workspace-files/resolve', {
+      method: 'POST', sessionKey, json: { paths, ...(reference ? { reference } : {}) }, signal,
+    })
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid workspace files')
+    const result = raw as Record<string, unknown>
+    if (reference && result.referenceScopeValidated !== true) return []
+    if (!Array.isArray(result.files) || typeof result.workspaceBinding !== 'string'
+      || !result.workspaceBinding || result.workspaceBinding.length > 512) throw new Error('Invalid workspace files')
+    const requested = new Set(paths)
+    return result.files.map((value): WorkspaceFile => {
+      const item = value as Record<string, unknown>
+      if (!item || typeof item !== 'object' || typeof item.requestedPath !== 'string'
+        || !requested.has(item.requestedPath) || !relativePath(item.path)
+        || typeof item.name !== 'string' || item.name !== item.path.split('/').pop()
+        || typeof item.mime !== 'string' || !Number.isSafeInteger(item.size) || Number(item.size) < 0
+        || !['text', 'image', 'download'].includes(String(item.kind))) throw new Error('Invalid workspace file')
+      return {
+        requestedPath: item.requestedPath, path: item.path, name: item.name,
+        mime: item.mime, size: Number(item.size), workspaceBinding: result.workspaceBinding as string,
+        textPaging: item.textPaging === true,
+        nativeActions: item.nativeActions === true,
+        revision: revision(item.revision),
+        ...annotationMetadata(item),
+        resource: { kind: 'workspace-file', workspaceBinding: result.workspaceBinding as string, relativePath: item.path },
+        kind: item.kind === 'image' && !IMAGE_MIMES.has(item.mime) ? 'download' : item.kind as WorkspaceFile['kind'],
+      }
+    })
+  }
   return {
     async apps(sessionKey, signal) {
       const raw = await http.requestJson<unknown>('/api/v1/workspace-files/apps', { method: 'GET', sessionKey, signal })
@@ -120,33 +171,10 @@ export function createV4WorkspaceFiles(http: WorkspaceFileHttp): WorkspaceFiles 
       })
       if (!result || result.ok !== true || result.host !== 'gateway' || result.appId !== appId) throw new Error('Could not open the file')
     },
-    async resolve(sessionKey, paths, signal) {
-      if (!sessionKey || !paths.length) return []
-      const raw = await http.requestJson<unknown>('/api/v1/workspace-files/resolve', {
-        method: 'POST', sessionKey, json: { paths }, signal,
-      })
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid workspace files')
-      const result = raw as Record<string, unknown>
-      if (!Array.isArray(result.files) || typeof result.workspaceBinding !== 'string'
-        || !result.workspaceBinding || result.workspaceBinding.length > 512) throw new Error('Invalid workspace files')
-      const requested = new Set(paths)
-      return result.files.map((value): WorkspaceFile => {
-        const item = value as Record<string, unknown>
-        if (!item || typeof item !== 'object' || typeof item.requestedPath !== 'string'
-          || !requested.has(item.requestedPath) || !relativePath(item.path)
-          || typeof item.name !== 'string' || item.name !== item.path.split('/').pop()
-          || typeof item.mime !== 'string' || !Number.isSafeInteger(item.size) || Number(item.size) < 0
-          || !['text', 'image', 'download'].includes(String(item.kind))) throw new Error('Invalid workspace file')
-        return {
-          requestedPath: item.requestedPath, path: item.path, name: item.name,
-          mime: item.mime, size: Number(item.size), workspaceBinding: result.workspaceBinding as string,
-          textPaging: item.textPaging === true,
-          nativeActions: item.nativeActions === true,
-          revision: revision(item.revision),
-          resource: { kind: 'workspace-file', workspaceBinding: result.workspaceBinding as string, relativePath: item.path },
-          kind: item.kind === 'image' && !IMAGE_MIMES.has(item.mime) ? 'download' : item.kind as WorkspaceFile['kind'],
-        }
-      })
+    resolve: resolveFiles,
+    async resolveReference(sessionKey, reference, signal) {
+      if (!relativePath(reference.locator.relativePath)) throw new Error('Invalid workspace reference')
+      return resolveFiles(sessionKey, [reference.locator.relativePath], signal, reference)
     },
     async read(sessionKey, file, signal) {
       if (!sessionKey || !relativePath(file.path) || !file.workspaceBinding) throw new Error('Invalid workspace file')

@@ -26,6 +26,19 @@ const server = http.createServer(async (request, response) => {
   })
 
   response.setHeader('content-type', 'application/json')
+  if (['/api/v1/artifacts/art-history/preview-leases',
+    '/api/v1/artifacts/art-ignores-history/preview-leases'].includes(request.url)) {
+    assert.equal(JSON.parse(body).snapshot, true)
+    response.statusCode = 201
+    response.end(JSON.stringify({
+      version: 1, lease_id: leaseId, effective_mode: 'full',
+      launch_url: `${previewOrigin}/index.html`, entrypoint: 'index.html',
+      expires_at: expiresAt, preview_origin: previewOrigin, idle_timeout_seconds: 28_800,
+      ...(request.url.includes('art-history/') ? { snapshot: true } : {}),
+      source: { kind: 'bundle', collection_status: 'complete', file_count: 3, total_bytes: 42, warning_codes: [] },
+    }))
+    return
+  }
   if (['/api/v1/artifacts/art-subpage/preview-leases',
     '/api/v1/artifacts/art-ignores-page/preview-leases'].includes(request.url)) {
     const { pagePath } = JSON.parse(body)
@@ -148,6 +161,24 @@ try {
   const broker = new ArtifactPreviewLeaseBroker({
     getOwnedGatewayUrl: () => gatewayUrl,
   })
+
+  assert.throws(() => parseArtifactPreviewLeaseCreateRequest({
+    version: 1, artifactId: 'art-history', scopeId, mode: 'full', snapshot: 'true',
+  }))
+  const history = await broker.create({
+    version: 1, artifactId: 'art-history', scopeId, mode: 'full', snapshot: true,
+  })
+  assert.equal(history.ok, true, JSON.stringify(history))
+  assert.equal(history.payload.snapshot, true)
+  assert.equal(history.payload.source.file_count, 3)
+  await broker.revoke({ version: 1, leaseId, scopeId })
+  const ignoredHistory = await broker.create({
+    version: 1, artifactId: 'art-ignores-history', scopeId, mode: 'full', snapshot: true,
+  })
+  assert.equal(ignoredHistory.ok, false)
+  assert.equal(ignoredHistory.code, 'PREVIEW_SNAPSHOT_UNSUPPORTED')
+  assert.equal(requests.at(-1).method, 'DELETE')
+  requests.length = 0
 
   assert.deepEqual(parseArtifactPreviewLeaseCreateRequest({
     version: 1,

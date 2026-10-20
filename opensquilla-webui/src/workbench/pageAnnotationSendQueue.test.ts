@@ -3,6 +3,17 @@ import { describe, expect, it } from 'vitest'
 import { PageAnnotationSendQueue } from './pageAnnotationSendQueue'
 
 describe('PromptAnnotationAcceptanceQueue', () => {
+  it('does not deliver one document acceptance to another document in the same session', async () => {
+    const queue = new PageAnnotationSendQueue()
+    queue.enqueue({ sessionKey: 'session', documentId: 'A', draftIds: ['A1'] }, 0)
+    queue.enqueue({ sessionKey: 'session', documentId: 'B', draftIds: ['B1'] }, 0)
+    const delivered: string[] = []
+    await queue.flush([{ sessionKey: 'session', documentId: 'B' }], item => item.sessionKey,
+      (item, ids) => { delivered.push(`${item.documentId}:${ids.join(',')}`) }, 1, item => item.documentId)
+    expect(delivered).toEqual(['B:B1'])
+    expect(queue.size).toBe(1)
+  })
+
   it('retains an acceptance until a matching artifact item is mounted', async () => {
     const queue = new PageAnnotationSendQueue()
     queue.enqueue({

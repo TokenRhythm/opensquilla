@@ -319,6 +319,8 @@ def test_packaged_corrections_file_parses_with_expected_tables() -> None:
         "claude-haiku-4-5-20251001",
     }
     assert set(payload["openrouter"]) == {
+        "deepseek/deepseek-v4.1-flash-1017",
+        "moonshotai/kimi-k3",
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-4.6",
         "deepseek/deepseek-v4.1-flash",

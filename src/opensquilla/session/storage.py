@@ -137,6 +137,11 @@ from opensquilla.session.recovery_reads import (
     current_read_budget,
     recovery_read_scope,
 )
+from opensquilla.session.title_text import (
+    _SESSION_TITLE_CONTENT_SQL,
+    SESSION_TITLE_MAX_BODY_BYTES,
+    SESSION_TITLE_PREVIEW_CHARS,
+)
 from opensquilla.session.usage_attribution import (
     USAGE_ATTRIBUTION_SCHEMA,
     backfill_usage_attribution_on_conn,
@@ -175,6 +180,7 @@ from opensquilla.session.usage_metering_store import (
     read_settlements_on_conn,
     write_metering_on_conn,
 )
+from opensquilla.session.usage_titles import resolve_usage_titles_on_conn
 from opensquilla.turn_outcome_projection import (
     attach_fork_terminal_outcome_projection,
     turn_id_from_context,
@@ -686,21 +692,6 @@ def _serialized_read[**P, R](
 # changing the semantic session schema version used by upgrade compatibility.
 SCHEMA_VERSION = 26
 MAX_PENDING_CHAT_INPUTS = 5
-# Title/search enrichment only needs a bounded prefix.  Keep this separate
-# from the history wire preview because these helpers return plain strings and
-# otherwise can pull a full legacy body across the SQLite/Python boundary.
-SESSION_TITLE_PREVIEW_CHARS = 4 * 1024
-SESSION_TITLE_MAX_BODY_BYTES = 64 * 1024
-# 仅在 metadata 已筛出 <=64KiB 的候选后投影正文。先截 JSON 会丢掉图片
-# base64 后的 display_text，必须在 SQLite 内提取可见正文再限制返回长度。
-_SESSION_TITLE_CONTENT_SQL = f"""CASE WHEN json_valid(content) THEN CASE
-    WHEN json_type(content, '$.display_text') = 'text'
-      OR (json_type(content, '$.text') = 'text'
-          AND json_type(content, '$.attachments') = 'array')
-    THEN json_object('display_text',
-         substr({USER_DISPLAY_TEXT_SQL}, 1, {SESSION_TITLE_PREVIEW_CHARS}))
-    ELSE substr(content, 1, {SESSION_TITLE_PREVIEW_CHARS}) END
-    ELSE substr(content, 1, {SESSION_TITLE_PREVIEW_CHARS}) END"""
 # Read ordinary envelopes completely before applying display semantics. This
 # is a storage parse budget, separate from both title and wire preview limits.
 # Larger/unindexed rows retain a prefix and an explicit *actual* truncation bit;
@@ -2918,13 +2909,15 @@ class SessionStorage:
         await self._migrate_collaboration_columns()
         await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
-        await backfill_usage_attribution_on_conn(self._conn)
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_assistant_replay_column()
         await self._migrate_transcript_content_byte_length_column()
         await self._migrate_transcript_content_revision_column()
         await self._conn.execute(_CREATE_IDX_TRANSCRIPT_TITLE_CANDIDATES)
         await self._conn.execute(_CREATE_IDX_COMPACTED_TRANSCRIPT_TITLE_CANDIDATES)
+        # Usage-owner titles query transcript length metadata and candidate indexes.
+        # Install those dependencies before backfilling owners in legacy databases.
+        await backfill_usage_attribution_on_conn(self._conn)
         await self._migrate_transcript_turn_usage_column()
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
@@ -4793,11 +4786,13 @@ class SessionStorage:
         requested = set(session_epochs)
         unique_ids = list(dict.fromkeys(value for value, _ in session_epochs if value))
         resolved: dict[tuple[str, int], dict[str, str]] = {}
+        live_nodes: list[dict[str, Any]] = []
         for start in range(0, len(unique_ids), _SQLITE_VARIABLE_CHUNK_SIZE):
             chunk = unique_ids[start : start + _SQLITE_VARIABLE_CHUNK_SIZE]
             placeholders = ", ".join("?" for _ in chunk)
             async with self.conn.execute(
-                "SELECT session_id, epoch, session_key, display_name, derived_title FROM sessions "
+                "SELECT session_id, epoch, session_key, agent_id, display_name, derived_title, "
+                "subject FROM sessions "
                 f"WHERE session_id IN ({placeholders}) "  # noqa: S608
                 "ORDER BY session_id, session_key",
                 chunk,
@@ -4805,11 +4800,15 @@ class SessionStorage:
                 rows = await cur.fetchall()
             for row in rows:
                 identity = (str(row["session_id"]), int(row["epoch"]))
-                if identity in requested:
-                    resolved.setdefault(identity, {
+                if identity in requested and identity not in resolved:
+                    live_nodes.append(dict(row))
+                    resolved[identity] = {
                         "sessionKey": str(row["session_key"]),
-                        "title": str(row["display_name"] or row["derived_title"] or "")[:240],
-                    })
+                        "title": "",
+                    }
+        titles = await resolve_usage_titles_on_conn(self.conn, live_nodes)
+        for identity, title in titles.items():
+            resolved[identity]["title"] = title
         return resolved
 
     @_serialized_read

@@ -84,6 +84,7 @@ export function artifactWorkbenchItemId(
 
 export function createArtifactPreviewWorkbenchItem(options: {
   artifact: ArtifactPayload
+  historical?: boolean
   initialSection?: 'preview' | 'source'
   initialSectionRequestId?: number
   navigationArtifacts?: readonly ArtifactPayload[]
@@ -95,6 +96,7 @@ export function createArtifactPreviewWorkbenchItem(options: {
 }): WorkbenchItem {
   const {
     artifact,
+    historical = artifact.workbenchOpenIntent === 'history',
     initialSection = 'preview',
     initialSectionRequestId = 0,
     navigationArtifacts = [],
@@ -116,7 +118,10 @@ export function createArtifactPreviewWorkbenchItem(options: {
     // Native HTML surfaces have their own isolated lifecycle and stay mounted.
     retention: nativeHtml && kind === 'html' ? 'keep-alive' : 'dispose-on-suspend',
     payload: {
-      artifact,
+      artifact: historical ? { ...artifact, workbenchOpenIntent: 'history' } : artifact,
+      ...(historical ? { historical: true } : {}),
+      ...(typeof artifact.sourcePath === 'string' && artifact.sourcePath.trim()
+        ? { sourcePath: artifact.sourcePath.trim() } : {}),
       initialSection,
       initialSectionRequestId,
       navigationArtifacts: [...navigationArtifacts],
@@ -241,7 +246,24 @@ export function artifactResourceRefFromWorkbenchItem(item: WorkbenchItem): Workb
 
 /** Unscoped legacy previews stay read-only; this does not authorize a Deliverable operation. */
 export function isFixedArtifactPreview(item: WorkbenchItem): boolean {
-  return item.kind === 'artifact-preview' && artifactResourceRefFromWorkbenchItem(item)?.type !== 'document'
+  return item.kind === 'artifact-preview' && (
+    artifactIsHistoricalPreview(item) || artifactResourceRefFromWorkbenchItem(item)?.type !== 'document'
+  )
+}
+
+/** Display state is explicit: an immutable preview must never silently follow head. */
+export function artifactIsHistoricalPreview(item: WorkbenchItem): boolean {
+  return item.kind === 'artifact-preview' && (
+    item.payload.historical === true
+    || artifactFromWorkbenchItem(item)?.workbenchOpenIntent === 'history'
+  )
+}
+
+/** Only authorized relative paths supplied by the resource projection are shown. */
+export function artifactSourcePathFromWorkbenchItem(item: WorkbenchItem): string {
+  if (item.kind !== 'artifact-preview') return ''
+  const path = item.payload.sourcePath ?? artifactFromWorkbenchItem(item)?.sourcePath
+  return typeof path === 'string' ? path.trim() : ''
 }
 
 /** Use the immutable revision URL or the original ArtifactStore ID. */

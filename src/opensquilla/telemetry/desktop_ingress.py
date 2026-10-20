@@ -27,6 +27,7 @@ from opensquilla.telemetry.contracts import (
 )
 from opensquilla.telemetry.contracts.common import EventBase
 from opensquilla.telemetry.recorder import RecordStatus, TelemetryRecorder
+from opensquilla.telemetry.state_io import run_state_io
 
 EARLY_SPOOL_MAX_FILES = 512
 EARLY_SPOOL_MAX_BYTES = 4 * 1024 * 1024
@@ -58,6 +59,15 @@ class _ReadyCandidate:
     path: Path
     event_id: str
     modified_at: float
+
+
+@dataclass(frozen=True)
+class _PreparedCandidate:
+    processing: Path | None = None
+    raw: bytes | None = None
+    claimed: bool = False
+    rejected: bool = False
+    retried: bool = False
 
 
 class _RejectedIngressError(ValueError):
@@ -281,6 +291,89 @@ def _validate_claimed_event(
     return event
 
 
+def _discover_ready_candidates(
+    root: Path,
+    *,
+    scopes: tuple[TelemetryScope, ...],
+    now_timestamp: float,
+    stale_after_seconds: float,
+) -> tuple[list[_ReadyCandidate], int, int]:
+    """Perform one bounded filesystem discovery away from the application loop."""
+
+    root_metadata = _lstat(root)
+    if root_metadata is None:
+        return [], 0, 0
+    if not _is_real_directory(root):
+        return [], 0, 1
+
+    recovered_stale = 0
+    rejected = 0
+    candidates: list[_ReadyCandidate] = []
+    for scope in scopes:
+        scope_directory = root / scope.value
+        metadata = _lstat(scope_directory)
+        if metadata is None:
+            continue
+        if not _is_real_directory(scope_directory):
+            rejected += 1
+            continue
+        recovered, recovery_rejected = _recover_stale_processing(
+            scope_directory,
+            now_timestamp=now_timestamp,
+            stale_after_seconds=stale_after_seconds,
+        )
+        recovered_stale += recovered
+        rejected += recovery_rejected
+        scoped_candidates, collection_rejected = _collect_ready_candidates(
+            scope_directory,
+            scope,
+        )
+        candidates.extend(scoped_candidates)
+        rejected += collection_rejected
+
+    return candidates, recovered_stale, rejected
+
+
+def _prepare_ready_candidate(
+    candidate: _ReadyCandidate,
+    *,
+    now_timestamp: float,
+    retention_seconds: float,
+) -> _PreparedCandidate:
+    """Claim and read one candidate as a single filesystem operation."""
+
+    try:
+        claimed_value = _claim_ready(candidate)
+    except _RetryableIngressError:
+        return _PreparedCandidate(retried=True)
+    if claimed_value is None:
+        return _PreparedCandidate()
+    processing, metadata = claimed_value
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or now_timestamp - metadata.st_mtime > retention_seconds
+        or metadata.st_size > EARLY_SPOOL_MAX_BYTES
+    ):
+        _unlink_best_effort(processing)
+        return _PreparedCandidate(rejected=True)
+    if not _mark_processing_claim_current(processing, now_timestamp):
+        return _PreparedCandidate(
+            retried=_restore_processing_claim(processing, candidate.path, now_timestamp)
+        )
+    try:
+        raw = _read_claimed_file(processing)
+    except _RejectedIngressError:
+        _unlink_best_effort(processing)
+        return _PreparedCandidate(claimed=True, rejected=True)
+    except _RetryableIngressError:
+        return _PreparedCandidate(
+            claimed=True,
+            retried=_restore_processing_claim(processing, candidate.path, now_timestamp),
+        )
+    return _PreparedCandidate(processing=processing, raw=raw, claimed=True)
+
+
 async def drain_desktop_early_spool(
     spool_root: str | Path,
     *,
@@ -314,39 +407,15 @@ async def drain_desktop_early_spool(
         ):
             raise ValueError("desktop ingress recorder binding is invalid")
 
-    root = Path(spool_root).expanduser()
-    root_metadata = _lstat(root)
-    if root_metadata is None:
-        return DesktopIngressStats()
-    if not _is_real_directory(root):
-        return DesktopIngressStats(rejected=1)
-
     now_timestamp = current.timestamp()
-    recovered_stale = 0
-    rejected = 0
-    candidates: list[_ReadyCandidate] = []
-    for scope in recorders:
-        scope_directory = root / scope.value
-        metadata = _lstat(scope_directory)
-        if metadata is None:
-            continue
-        if not _is_real_directory(scope_directory):
-            rejected += 1
-            continue
-        recovered, recovery_rejected = _recover_stale_processing(
-            scope_directory,
+    candidates, recovered_stale, rejected = await run_state_io(
+        lambda: _discover_ready_candidates(
+            Path(spool_root).expanduser(),
+            scopes=tuple(recorders),
             now_timestamp=now_timestamp,
             stale_after_seconds=processing_stale_after.total_seconds(),
         )
-        recovered_stale += recovered
-        rejected += recovery_rejected
-        scoped_candidates, collection_rejected = _collect_ready_candidates(
-            scope_directory,
-            scope,
-        )
-        candidates.extend(scoped_candidates)
-        rejected += collection_rejected
-
+    )
     candidates.sort(key=lambda item: (item.modified_at, item.scope.value, item.path.name))
     discovered = min(len(candidates), max_events)
     claimed = 0
@@ -355,36 +424,23 @@ async def drain_desktop_early_spool(
     retention_seconds = retention.total_seconds()
 
     for candidate in candidates[:max_events]:
-        try:
-            claimed_value = _claim_ready(candidate)
-        except _RetryableIngressError:
-            retried += 1
+        prepared = await run_state_io(
+            lambda: _prepare_ready_candidate(
+                candidate,
+                now_timestamp=now_timestamp,
+                retention_seconds=retention_seconds,
+            )
+        )
+        claimed += prepared.claimed
+        rejected += prepared.rejected
+        retried += prepared.retried
+        processing = prepared.processing
+        if processing is None or prepared.raw is None:
             continue
-        if claimed_value is None:
-            continue
-        processing, metadata = claimed_value
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            _unlink_best_effort(processing)
-            rejected += 1
-            continue
-        if now_timestamp - metadata.st_mtime > retention_seconds:
-            _unlink_best_effort(processing)
-            rejected += 1
-            continue
-        if metadata.st_size > EARLY_SPOOL_MAX_BYTES:
-            _unlink_best_effort(processing)
-            rejected += 1
-            continue
-        if not _mark_processing_claim_current(processing, now_timestamp):
-            if _restore_processing_claim(processing, candidate.path, now_timestamp):
-                retried += 1
-            continue
-        claimed += 1
 
         try:
-            raw = _read_claimed_file(processing)
             event = _validate_claimed_event(
-                raw,
+                prepared.raw,
                 expected_scope=candidate.scope,
                 expected_event_id=candidate.event_id,
             )
@@ -399,34 +455,42 @@ async def drain_desktop_early_spool(
             if not consent.enabled:
                 raise _RetryableIngressError("telemetry uploads are paused")
         except _RejectedIngressError:
-            _unlink_best_effort(processing)
+            await run_state_io(lambda: _unlink_best_effort(processing))
             rejected += 1
             continue
         except _RetryableIngressError:
-            if _restore_processing_claim(processing, candidate.path, now_timestamp):
+            if await run_state_io(
+                lambda: _restore_processing_claim(processing, candidate.path, now_timestamp)
+            ):
                 retried += 1
             continue
 
         try:
             record_result = await recorders[candidate.scope].record(event)
         except Exception:
-            if _restore_processing_claim(processing, candidate.path, now_timestamp):
+            if await run_state_io(
+                lambda: _restore_processing_claim(processing, candidate.path, now_timestamp)
+            ):
                 retried += 1
             continue
         if record_result.status is RecordStatus.CONSENT_BLOCKED:
-            if _restore_processing_claim(processing, candidate.path, now_timestamp):
+            if await run_state_io(
+                lambda: _restore_processing_claim(processing, candidate.path, now_timestamp)
+            ):
                 retried += 1
             continue
         if record_result.status is RecordStatus.NOTICE_MISMATCH:
-            _unlink_best_effort(processing)
+            await run_state_io(lambda: _unlink_best_effort(processing))
             rejected += 1
             continue
         if record_result.status is RecordStatus.EVICTED:
-            if _restore_processing_claim(processing, candidate.path, now_timestamp):
+            if await run_state_io(
+                lambda: _restore_processing_claim(processing, candidate.path, now_timestamp)
+            ):
                 retried += 1
             continue
         enqueued += 1
-        _unlink_best_effort(processing)
+        await run_state_io(lambda: _unlink_best_effort(processing))
 
     return DesktopIngressStats(
         discovered=discovered,

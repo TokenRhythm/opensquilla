@@ -324,14 +324,37 @@ describe('useChatSessionViewCache first delivery proof', () => {
     h.scope.stop()
   })
 
-  it.each(['history', 'live'] as const)('does not bless a non-authoritative %s receipt when identity arrives', phase => {
+  it('keeps same-lease readable history on first proof without promoting it to a navigation snapshot', () => {
     const h = unprovenIdentityHarness()
-    h.cache.historyInstalled('A', phase !== 'history')
-    h.cache.liveInstalled('A', phase !== 'live')
+    h.cache.historyInstalled('A', false)
+    h.cache.liveInstalled('A')
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(true)
+    h.sessionKey.value = 'B'
+    h.messages.value = []
+    h.sessionKey.value = 'A'
+    expect(h.cache.showingPreview.value).toBe(false)
+    expect(h.cache.messages.value).toEqual([])
+    h.scope.stop()
+  })
+
+  it.each([false, true])('rejects readable history from a replaced or missing first-proof lease (missing=%s)', missing => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A', false)
+    h.replaceAuthority(missing ? null : {})
+    h.cache.liveInstalled('A')
     h.deliveryIdentity.value = 'gateway-one:owner'
     expect(h.cache.ready.value).toBe(false)
-    if (phase === 'history') h.cache.historyInstalled('A')
-    else h.cache.liveInstalled('A')
+    h.scope.stop()
+  })
+
+  it('does not bless an unconfirmed live receipt when identity arrives', () => {
+    const h = unprovenIdentityHarness()
+    h.cache.historyInstalled('A')
+    h.cache.liveInstalled('A', false)
+    h.deliveryIdentity.value = 'gateway-one:owner'
+    expect(h.cache.ready.value).toBe(false)
+    h.cache.liveInstalled('A')
     expect(h.cache.ready.value).toBe(true)
     h.scope.stop()
   })
@@ -391,6 +414,104 @@ function liveHarness(limits: { maxBytes?: number; maxSessions?: number } = {}) {
 }
 
 describe('useChatSessionViewCache complete presentation handoff', () => {
+  it('retains a readable degraded view through repeated same-session recovery without caching it for navigation', () => {
+    const h = liveHarness()
+    h.cache.historyInstalled('A', false)
+    expect(h.cache.ready.value).toBe(true)
+    h.cache.beginLiveRead('A')
+    expect(h.cache.ready.value).toBe(false)
+    expect(h.cache.showingPreview.value).toBe(true)
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+    expect(h.cache.restoredViewport.value).toBeUndefined()
+    h.messages.value = [row('partial')]
+    h.presentation.value.live.text = 'partial replay'
+    h.cache.liveInstalled('A', false)
+    h.cache.beginLiveRead('A')
+    expect(h.cache.messages.value).toEqual([row('a')])
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+    h.switchTo('B')
+    h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    expect(h.cache.messages.value).toEqual([])
+    expect(h.cache.presentation.value).toBeUndefined()
+    h.scope.stop()
+  })
+
+  it('uses the latest readable degraded view for recovery while preserving the older authoritative navigation snapshot', () => {
+    const h = liveHarness()
+    h.returnToA()
+    h.messages.value = [row('readable-history')]
+    h.presentation.value.live.text = 'readable live tail'
+    h.cache.historyInstalled('A', false)
+    h.cache.liveInstalled('A')
+    h.cache.beginLiveRead('A')
+    expect(h.cache.messages.value).toEqual([row('readable-history')])
+    expect(h.cache.presentation.value?.live.text).toBe('readable live tail')
+    h.switchTo('B')
+    h.switchTo('A')
+    expect(h.cache.messages.value).toEqual([row('a')])
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+    h.scope.stop()
+  })
+
+  it('releases a same-session degraded preview after confirmed recovery and can cache the repaired view', () => {
+    const h = liveHarness()
+    h.cache.historyInstalled('A', false)
+    h.cache.beginLiveRead('A')
+    h.messages.value = [row('repaired')]
+    h.presentation.value.live.text = 'repaired live'
+    h.cache.historyInstalled('A')
+    expect(h.cache.presentation.value?.live.text).toBe('A is writing')
+    h.cache.liveInstalled('A')
+    expect(h.cache.ready.value).toBe(true)
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.returnToA()
+    expect(h.cache.messages.value).toEqual([row('repaired')])
+    expect(h.cache.presentation.value?.live.text).toBe('repaired live')
+    h.scope.stop()
+  })
+
+  it.each(['epoch', 'identity', 'revoked', 'reset', 'terminal'] as const)(
+    'retires a same-session degraded preview on %s without recapturing it', cause => {
+      const h = liveHarness()
+      h.cache.historyInstalled('A', false)
+      h.cache.beginLiveRead('A')
+      expect(h.cache.showingPreview.value).toBe(true)
+      if (cause === 'epoch') h.cache.observeEpoch('A', 1)
+      else if (cause === 'identity') h.deliveryIdentity.value = 'gateway-two:owner'
+      else if (cause === 'revoked') h.deliveryIdentity.value = null
+      else if (cause === 'terminal') h.cache.retirePreview('A')
+      else h.cache.invalidate('A')
+      expect(h.cache.showingPreview.value).toBe(false)
+      h.cache.beginLiveRead('A')
+      expect(h.cache.showingPreview.value).toBe(false)
+      h.returnToA()
+      expect(h.cache.showingPreview.value).toBe(false)
+      h.scope.stop()
+    },
+  )
+
+  it('does not retain a degraded view with unconfirmed live state', () => {
+    const h = liveHarness()
+    h.switchTo('C')
+    h.messages.value = [row('fallback')]
+    h.cache.historyInstalled('C', false)
+    h.cache.liveInstalled('C', false)
+    expect(h.cache.ready.value).toBe(true)
+    h.cache.beginLiveRead('C')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it('bounds the temporary degraded preview with the same byte budget', () => {
+    const h = liveHarness({ maxBytes: 300 })
+    h.cache.historyInstalled('A', false)
+    h.presentation.value.live.text = '字'.repeat(200)
+    h.cache.beginLiveRead('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
   it('freezes the complete same-session view before recovery and never captures a partial reread', () => {
     const h = liveHarness()
     h.cache.beginLiveRead('A')

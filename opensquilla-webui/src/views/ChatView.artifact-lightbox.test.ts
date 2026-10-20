@@ -12,7 +12,7 @@ describe('ChatView artifact preview routing', () => {
     const openSource = chatViewSource.slice(openStart, openEnd)
 
     expect(countStart).toBeGreaterThan(-1)
-    expect(countSource).toContain('workbenchResourcesStore.navigationResources(sessionKey.value).length')
+    expect(countSource).toContain('canonicalWorkbenchResources(snapshot.resources).length')
     expect(countSource).toContain('sessionArtifacts.value.length')
     expect(openSource).toContain('if (headerDeliverableCount.value === 0) return')
     expect(openSource).not.toContain('if (sessionArtifacts.value.length === 0) return')

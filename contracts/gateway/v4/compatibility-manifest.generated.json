@@ -1398,19 +1398,19 @@
       "lifecycle": "stable",
       "name": "workbench.resources.get",
       "schema": "workbench/workbench-resources-get.schema.json",
-      "schemaSha256": "bbd8433f083a4d76b15eb2b74f97180a9f306424db7b548d34c855e92b7a88ce"
+      "schemaSha256": "6c550ddc8630eedfd348ad878d8cc114b979d5994f304d9f69b9278a4c129c58"
     },
     {
       "lifecycle": "stable",
       "name": "workbench.resources.list",
       "schema": "workbench/workbench-resources-list.schema.json",
-      "schemaSha256": "27d6dfaf751460502ff731c5704db913dae05778e341541a144e760b441d497f"
+      "schemaSha256": "46fe7ab8b7b3b6917938adf70d579ee978ac2f800e860eaf575c28e766fa7f3c"
     },
     {
       "lifecycle": "stable",
       "name": "workbench.resources.open",
       "schema": "workbench/workbench-resources-open.schema.json",
-      "schemaSha256": "c8a47141861ca3074aa1a008991dac6d8d5ac3df7809ac2bdba65187a82a5423"
+      "schemaSha256": "644b95a959deb117e28848c4fd8c7722e6ab091934a5a8d915ee9c033a889a24"
     },
     {
       "lifecycle": "stable",
@@ -1467,7 +1467,7 @@
     "generatorSha256": "8da26fdeaa0ad687cdcee71a91abc726f8a29360bc488a9d7a75a4195fbe2ea1",
     "methodCount": 215,
     "schemaCount": 225,
-    "schemaTreeSha256": "2ec8424c32100cc70b6b8c1e550c2f6f122c6f04f27baf7f82b26507645d002f",
+    "schemaTreeSha256": "4e48b494daaac19190ee5e2bbc5925469311e6b1088efa90401c22b9b93cf52c",
     "toolchains": {
       "legacyTypes": {
         "python": {

@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, reactive, ref, watch, type EffectScope } from 'vue'
 import { transpileModule, ScriptTarget } from '@typescript/typescript6'
 import type { ArtifactPayload } from '@/types/artifacts'
+import type { ArtifactRevision } from '@/types/artifactDocuments'
 import { artifactCategory, isInlineMediaArtifact, isOfficeArtifact } from '@/utils/chat/artifacts'
 import { artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
 import { createWorkbenchResourceRef } from '@/types/workbenchResources'
 import { workbenchResourceKey, artifactPayloadFromWorkbenchResource, resourceFromPreparedPreview } from '@/workbench/workbenchResourceItems'
+import { prepareCurrentDocumentPreview, resolveCurrentDocumentResource } from '@/workbench/currentDocumentOpening'
 import chatViewSource from './ChatView.vue?raw'
 
 // Run the actual two entry functions with controlled boundary services. This
@@ -36,21 +38,34 @@ function harness() {
   const artifact = { id: 'published-ppt', name: '计划.pptx', sha256: 'a'.repeat(64) }
   const resource = { resource: createWorkbenchResourceRef('deliverable', artifact.id),
     name: artifact.name, sha256: artifact.sha256, capabilities: { preview: true, edit: true }, relations: {} }
-  const revision = { revisionId: 'rev-current', documentId: 'doc-current', artifactId: 'art-current',
+  const revision: ArtifactRevision = { revisionId: 'rev-current', documentId: 'doc-current', artifactId: 'art-current',
     artifactSha256: 'b'.repeat(64), filename: artifact.name,
     mediaType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    byteSize: 456, downloadUrl: '/documents/doc-current?revisionId=rev-current' }
+    byteSize: 456, downloadUrl: '/documents/doc-current?revisionId=rev-current',
+    parentRevisionId: null, generation: 1, source: 'initial', actorKind: 'system',
+    actorId: 'test', changeSetId: null, copiedFromRevisionId: null, createdAt: null, schemaVersion: 1 }
   const document = { documentId: 'doc-current', headRevisionId: revision.revisionId }
   const current = { disposition: 'document', document, revision,
-    resource: { ...resource, resource: createWorkbenchResourceRef('document', document.documentId) } }
+    resource: { ...resource, resource: createWorkbenchResourceRef('document', document.documentId),
+      sha256: revision.artifactSha256,
+      relations: { documentId: document.documentId, headRevisionId: revision.revisionId } } }
+  const resolve = vi.fn(async (..._args: unknown[]): Promise<unknown> => resource)
   const services = {
-    resolve: vi.fn(async (): Promise<unknown> => resource),
+    resolve,
+    resolveFresh: vi.fn(async (session: string, ref: unknown): Promise<unknown> => resolve(session, ref)),
     openCurrent: vi.fn(async (): Promise<unknown> => current),
     importDocument: vi.fn(async () => ({ document, revision })),
     preview: vi.fn(async () => ({ resource, preview: { resource: resource.resource, launchUrl: '/original', mode: 'local-renderer' } })),
   }
   const openItem = vi.fn<(item: unknown) => boolean>(() => true), requestReveal = vi.fn(), legacy = vi.fn(() => true), pushToast = vi.fn()
   const workspacePreviewOpening = { open: vi.fn() }
+  const artifactDocumentsStore = {
+    snapshot: vi.fn(() => ({
+      loaded: true, loading: false, stale: false, error: null,
+      workspace: { source: 'document-api', document, headArtifact: artifactPayloadFromRevision(revision) },
+    })),
+    load: vi.fn(),
+  }
   const catalog = { get: vi.fn<(key: string, id: string) => Promise<ArtifactPayload | null>>(async () => null) }
   const dependencies = {
     sessionKey, currentEpoch, deliveryIdentity, gatewayAccess, watch,
@@ -66,6 +81,7 @@ function harness() {
     artifactCategory, isInlineMediaArtifact, isOfficeArtifact, artifactWorkbenchPreviewKind, isOfficePreviewFormat,
     artifactPayloadFromRevision, createWorkbenchResourceRef, workbenchResourceKey,
     artifactPayloadFromWorkbenchResource, resourceFromPreparedPreview,
+    prepareCurrentDocumentPreview, resolveCurrentDocumentResource, artifactDocumentsStore,
     classifyArtifactProductError: () => ({ messageKey: 'failure', fallbackMessage: 'Cannot open' }),
     workbenchResourceUnavailableReasonKey: () => 'unsupported', workbenchResourceActionReasonCode: () => 'unsupported',
     t: (key: string) => key, pushToast,
@@ -147,11 +163,12 @@ describe('chat Office card document opening', () => {
   })
 
   it.each(['docx', 'pptx', 'xlsx', 'html'])('opens historical %s with its original deliverable identity and hash', async extension => {
-    const h = harness(), artifact = { ...h.artifact, name: `计划.${extension}` }
+    const h = harness(), artifact = { ...h.artifact, name: `计划.${extension}`, workbenchOpenIntent: 'history' as const }
     expect(h.api.openArtifact(artifact)).toBe(true)
     await vi.waitFor(() => expect(h.openItem).toHaveBeenCalledTimes(1))
     expect(h.services.resolve).toHaveBeenCalledWith('session-a', createWorkbenchResourceRef('deliverable', artifact.id))
     expect(h.services.openCurrent).not.toHaveBeenCalled()
+    expect(h.services.resolveFresh).not.toHaveBeenCalled()
     expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({
       sessionKey: 'session-a', resourceIdentity: `deliverable:${artifact.id}`,
       artifact: expect.objectContaining({ id: artifact.id, sha256: 'a'.repeat(64) }),
@@ -162,6 +179,30 @@ describe('chat Office card document opening', () => {
     expect(h.legacy).not.toHaveBeenCalled()
     expect(h.services.importDocument).not.toHaveBeenCalled()
     expect(h.services.preview).not.toHaveBeenCalled()
+  })
+
+  it.each(['docx', 'pptx', 'xlsx', 'html'])('opens the latest related %s document by default without importing a copy', async extension => {
+    const h = harness(), artifact = { ...h.artifact, name: `计划.${extension}` }
+    h.services.resolve.mockResolvedValueOnce({
+      ...h.resource, relations: { documentId: h.current.document.documentId },
+    }).mockResolvedValueOnce(h.current.resource)
+    expect(h.api.openArtifact(artifact)).toBe(true)
+    await vi.waitFor(() => expect(h.openItem).toHaveBeenCalledOnce())
+    expect(h.services.resolveFresh).toHaveBeenNthCalledWith(
+      1, 'session-a', createWorkbenchResourceRef('deliverable', artifact.id), expect.any(Function),
+    )
+    expect(h.services.resolveFresh).toHaveBeenNthCalledWith(
+      2, 'session-a', createWorkbenchResourceRef('document', 'doc-current'), expect.any(Function),
+    )
+    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: 'session-a', resourceIdentity: 'document:doc-current', historical: false,
+      artifact: expect.objectContaining({
+        documentId: 'doc-current', revisionId: 'rev-current', sha256: 'b'.repeat(64),
+      }),
+    }))
+    expect(h.services.importDocument).not.toHaveBeenCalled()
+    expect(h.services.openCurrent).not.toHaveBeenCalled()
+    expect(h.legacy).not.toHaveBeenCalled()
   })
 
   it.each(['pdf', 'doc', 'ppt', 'xls'])('leaves %s on its existing preview route', extension => {
@@ -184,20 +225,26 @@ describe('chat Office card document opening', () => {
 
   it('keeps a related document from replacing a historical card and preserves the old API preview fallback', async () => {
     const h = harness()
-    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, documentId: 'doc-current' })
+    h.services.resolve.mockResolvedValueOnce({ ...h.resource, relations: { documentId: 'doc-current' } })
+    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, documentId: 'doc-current', workbenchOpenIntent: 'history' })
     expect(h.services.resolve).toHaveBeenCalledWith('session-a', createWorkbenchResourceRef('deliverable', h.artifact.id))
+    expect(h.services.resolveFresh).not.toHaveBeenCalled()
+    expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({
+      historical: true, resourceIdentity: `deliverable:${h.artifact.id}`,
+      artifact: expect.objectContaining({ id: h.artifact.id, sha256: h.artifact.sha256 }),
+    }))
     expect(h.services.openCurrent).not.toHaveBeenCalled()
     h.services.resolve.mockResolvedValueOnce(null); h.openItem.mockClear()
-    await h.api.openDeliverableWorkbenchResource(h.artifact)
+    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, workbenchOpenIntent: 'history' })
     expect(h.services.importDocument).not.toHaveBeenCalled()
     expect(h.openItem).not.toHaveBeenCalled()
-    expect(h.legacy).toHaveBeenCalledWith(h.artifact)
+    expect(h.legacy).toHaveBeenCalledWith({ ...h.artifact, workbenchOpenIntent: 'history' })
   })
 
   it('does not open or import a historical resource whose preview capability is unavailable', async () => {
     const h = harness()
     h.services.resolve.mockResolvedValueOnce({ ...h.resource, capabilities: { preview: false, edit: false } })
-    await h.api.openDeliverableWorkbenchResource(h.artifact)
+    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, workbenchOpenIntent: 'history' })
     expect(h.services.importDocument).not.toHaveBeenCalled()
     expect(h.services.openCurrent).not.toHaveBeenCalled()
     expect(h.services.preview).not.toHaveBeenCalled()
@@ -262,11 +309,11 @@ describe('chat Office card document opening', () => {
     const h = harness()
     let resolve!: (value: unknown) => void
     h.services.resolve.mockImplementationOnce(() => new Promise(done => { resolve = done }))
-    const first = h.api.openDeliverableWorkbenchResource(h.artifact)
+    const first = h.api.openDeliverableWorkbenchResource({ ...h.artifact, workbenchOpenIntent: 'history' })
     expect(h.services.resolve).toHaveBeenCalledOnce()
     const second = { ...h.resource, resource: createWorkbenchResourceRef('deliverable', 'second-ppt') }
     h.services.resolve.mockResolvedValueOnce(second)
-    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, id: 'second-ppt' })
+    await h.api.openDeliverableWorkbenchResource({ ...h.artifact, id: 'second-ppt', workbenchOpenIntent: 'history' })
     resolve(h.resource); await first
     expect(h.openItem).toHaveBeenCalledOnce()
     expect(h.openItem).toHaveBeenCalledWith(expect.objectContaining({ resourceIdentity: 'deliverable:second-ppt' }))

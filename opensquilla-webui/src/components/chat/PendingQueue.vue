@@ -132,6 +132,16 @@
             :aria-label="t('chrome.more')"
           >
             <button
+              v-if="item.pageContext"
+              type="button"
+              role="menuitem"
+              :disabled="!!item.deliveryState || !!item.steerAttempt || item.pendingPersistenceState === 'saving' || item.pendingPersistenceState === 'cancelling'"
+              @click="openMenuUiId = null; emit('restoreAnnotations', item.pendingUiId)"
+            >
+              <Icon name="pencil" :size="15" />
+              <span>{{ t('workbench.annotationUnified.restoreQueued') }}</span>
+            </button>
+            <button
               type="button"
               role="menuitem"
               :disabled="!!item.deliveryState || !!item.steerAttempt || !!item.pageContext || hasUneditableMaterial(item)"
@@ -223,6 +233,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   clear: []
   edit: [pendingUiId: string]
+  restoreAnnotations: [pendingUiId: string]
   remove: [pendingUiId: string]
   reorder: [fromIndex: number, toIndex: number]
   reorderEnd: []

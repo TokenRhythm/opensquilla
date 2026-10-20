@@ -638,6 +638,15 @@ export class WorkbenchRuntimeManager {
             ),
           }
         : {}),
+      ...(nativeApi.updateArtifactAnnotationOverlay
+        ? {
+            updateArtifactAnnotationOverlay: request => (
+              mayShow()
+                ? nativeApi.updateArtifactAnnotationOverlay!(request)
+                : Promise.resolve(ignored())
+            ),
+          }
+        : {}),
       ...(nativeApi.getWorkbenchBrowserTarget ? {
         getWorkbenchBrowserTarget: request => isCurrent()
           ? nativeApi.getWorkbenchBrowserTarget!(request)

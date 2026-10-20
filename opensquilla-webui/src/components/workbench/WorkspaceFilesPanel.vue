@@ -109,7 +109,7 @@ import { getIconSvg } from '@/utils/icons'
 import { copyTextWithFallback } from '@/utils/browser'
 import { workspaceFilesReadingState, workspaceReadingIdentity, workspaceReadingState, type WorkspaceFilesReadingState, type WorkspaceReadingState } from './workspaceReadingState'
 
-const props = withDefaults(defineProps<{ sessionKey: string; runtimeReady?: boolean; readingState?: WorkspaceFilesReadingState; runRestore?: (task: () => Promise<void>) => Promise<void> }>(), { runtimeReady: true })
+const props = withDefaults(defineProps<{ sessionKey: string; runtimeReady?: boolean; readingState?: WorkspaceFilesReadingState; runRestore?: (task: () => Promise<void>) => Promise<void>; openDocument?: (file: WorkspaceFile, isCurrent: () => boolean) => Promise<boolean> }>(), { runtimeReady: true })
 const emit = defineEmits<{ 'workbench-event': [event: { type: string; payload?: unknown }] }>()
 const { t } = useI18n()
 const files = inject(WORKSPACE_FILES_KEY, null)
@@ -360,6 +360,14 @@ async function activate(entry: WorkspaceDirectoryEntry, asSource = false, restor
     const match = matches.find(file => file.path === entry.path && file.workspaceBinding === binding.value)
     if (!match) throw new Error('File unavailable')
     resolvedFile.value = match
+    if (!restore && !asSource && !restoring && match.documentTarget && props.openDocument) {
+      if (await props.openDocument(match, () => isCurrentPreview(request))) {
+        previewState.loading = false
+        saveReading()
+        return
+      }
+      if (!isCurrentPreview(request)) return
+    }
     if (restore?.selectedIdentity === workspaceReadingIdentity(request.sessionKey, match)) {
       previewReading.value = restore.reading
       savedPreviewReading = restore.reading

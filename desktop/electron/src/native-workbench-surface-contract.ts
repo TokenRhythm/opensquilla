@@ -210,6 +210,8 @@ export type NativeWorkbenchSurfaceEventType =
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
+  | 'annotation-record-current'
+  | 'annotation-batch-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
 

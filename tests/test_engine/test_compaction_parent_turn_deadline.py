@@ -154,12 +154,30 @@ async def test_parent_deadline_cancels_inflight_preflight_without_auxiliary_fail
     deadline_turn, monkeypatch,
 ):
     case = deadline_turn
+    parent_deadline = time.monotonic() + 30
+    parent_timeout: asyncio.Timeout | None = None
+    real_timeout_at = asyncio.timeout_at
+
+    def capture_parent_timeout(deadline):
+        nonlocal parent_timeout
+        timer = real_timeout_at(deadline)
+        if deadline == parent_deadline and parent_timeout is None:
+            parent_timeout = timer
+        return timer
+
+    monkeypatch.setattr("opensquilla.engine.runtime._deadline_from_timeout",
+                        lambda _: parent_deadline)
+    monkeypatch.setattr(asyncio, "timeout_at", capture_parent_timeout)
 
     async def waiting_summary(self, messages, tools=None, config=None):
         summary = config.candidate_output_mode == "inert_artifact"
         case.calls.append(summary)
         assert summary
-        assert config.turn_deadline_at_monotonic is not None
+        assert config.turn_deadline_at_monotonic == parent_deadline
+        assert parent_timeout is not None
+        # Expire the real parent timer only after the summary is in flight.
+        # Cold storage/prompt preparation must not consume a 2s test assumption.
+        parent_timeout.reschedule(asyncio.get_running_loop().time())
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -168,7 +186,7 @@ async def test_parent_deadline_cancels_inflight_preflight_without_auxiliary_fail
         yield  # pragma: no cover - async stream shape
 
     monkeypatch.setattr(OpenAIProvider, "chat", waiting_summary)
-    async with asyncio.timeout(6):
+    async with asyncio.timeout(35):
         events = await _run(case)
     _assert_deadline(events)
     assert case.calls == [True]

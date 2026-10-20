@@ -269,15 +269,29 @@ class WorkbenchResourceListQuery:
 @dataclass(frozen=True, slots=True)
 class WorkbenchResourceOpen:
     session_key: str
-    resource: WorkbenchResourceRef
+    resource: WorkbenchResourceRef | None
     idempotency_key: str | None = None
     expected_sha256: str | None = None
     intent: str = "edit-current"
+    workspace_file: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
-        if self.intent != "edit-current":
+        if self.intent not in {"edit-current", "annotate"}:
             raise ValueError("unsupported resource open intent")
+        if (self.resource is None) == (self.workspace_file is None):
+            raise ValueError("resourceRef and workspaceFile are mutually exclusive")
+        if self.workspace_file is not None:
+            if self.intent != "annotate":
+                raise ValueError("workspaceFile requires annotate intent")
+            if set(self.workspace_file) != {"path", "workspaceBinding", "expectedRevision"}:
+                raise ValueError(
+                    "workspaceFile requires path, workspaceBinding and expectedRevision"
+                )
+            for key, value in self.workspace_file.items():
+                _identity(value, key)
+                if len(value) > 4096:
+                    raise ValueError("workspaceFile identity is too long")
         if self.idempotency_key is not None:
             _identity(self.idempotency_key, "idempotency key")
             if len(self.idempotency_key.encode("utf-8")) > 256:
@@ -527,6 +541,7 @@ class PreviewLeaseCreate:
     artifact_id: str
     mode: str
     client: str
+    snapshot: bool = False
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -539,6 +554,8 @@ class PreviewLeaseCreate:
             raise ValueError("preview mode must be full or offline")
         if self.client not in {"desktop", "web"}:
             raise ValueError("preview client must be desktop or web")
+        if type(self.snapshot) is not bool:
+            raise ValueError("preview snapshot must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,6 +583,7 @@ class PreviewLeaseGrant:
     source: Mapping[str, Any]
     expires_at: str
     working_document_id: str | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -784,6 +802,8 @@ class ResourceOpenResult(TypedDict, total=False):
     revision: RevisionProjection
     binding: BindingProjection
     receipt: ReceiptProjection
+    baselineUpdated: bool
+    previousRevisionId: str
 
 
 class PreviewCreateResult(TypedDict):

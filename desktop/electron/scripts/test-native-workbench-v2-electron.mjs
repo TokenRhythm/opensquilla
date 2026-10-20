@@ -3113,6 +3113,7 @@ try {
     picker: true,
     trustedOverlay: true,
     overlayCopyVersion: 1,
+    overlayEditorVersion: 2,
     atomicCloseRearm: true,
   })
   assert.equal(result.annotationPicker.ok, true)

@@ -51,6 +51,9 @@ let epoch = 0
 
 const source = computed(() => selected.value?.source === 'workspace-preview'
   && typeof selected.value.documentId === 'string')
+const hasDeliveredVersion = computed(() => !!selected.value?.id && !source.value
+  && selected.value.workbenchOpenIntent !== 'history'
+  && ['html', 'docx', 'pptx', 'xlsx'].includes(artifactWorkbenchPreviewKind(selected.value)))
 const readable = computed(() => source.value ? !!metadata.value : !!selected.value)
 const bundleTarget = computed(() => selected.value ? htmlBundleExportTarget(selected.value) : null)
 const canOpenCopy = computed(() => !source.value && !!platform.files.openArtifact
@@ -182,7 +185,7 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   }
 }
 
-async function perform(action: 'preview' | 'save' | 'export-zip' | 'path' | 'contents' | 'open' | 'reveal' | 'copy-open') {
+async function perform(action: 'preview' | 'history' | 'save' | 'export-zip' | 'path' | 'contents' | 'open' | 'reveal' | 'copy-open') {
   const artifact = selected.value
   if (!artifact || !workbench || !pending) return
   const isSource = source.value
@@ -213,6 +216,7 @@ async function perform(action: 'preview' | 'save' | 'export-zip' | 'path' | 'con
     }
     if (action === 'copy-open' && !canOpenCopy.value) return
     if (action === 'preview') { emit('open', artifact); return }
+    if (action === 'history') { emit('open', { ...artifact, workbenchOpenIntent: 'history' }); return }
     if (action === 'open' || action === 'reveal') {
       if (!request || !localInstance.value || !platform.files.sourceFileAction) return
       await platform.files.sourceFileAction({ gatewayInstanceId: localInstance.value,
@@ -307,6 +311,7 @@ defineExpose({ show, cancel })
       <div ref="menu" class="resource-actions-menu" role="menu" tabindex="-1" :aria-label="t('resourceActions.more')"
         :style="{ left: `${point.left}px`, top: `${point.top}px` }" @keydown="onKeydown" @contextmenu.prevent>
         <button v-if="previewable && !compact" role="menuitem" type="button" @click="perform('preview')">{{ t('resourceActions.preview') }}</button>
+        <button v-if="previewable && !compact && hasDeliveredVersion" role="menuitem" type="button" @click="perform('history')">{{ t('workbench.artifactDocument.viewDeliveredVersion') }}</button>
         <template v-if="localInstance && metadata">
           <button v-if="!compact" role="menuitem" type="button" @click="perform('open')">{{ t('resourceActions.openSource') }}</button>
           <button role="menuitem" type="button" @click="perform('reveal')">{{ revealLabel }}</button>

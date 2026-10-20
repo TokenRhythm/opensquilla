@@ -48,7 +48,11 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
   }
   const heldClarifications = new Map<string, { key: string; reply: (accepted: boolean) => void }>()
   const deniedFiles = new Set<string>()
-  const documents = new Map<string, { resource: Wire; document: Wire; revision: Wire; artifact: Wire }>()
+  const binaryReferences = new Set<string>()
+  const documents = new Map<string, { resource: Wire; document: Wire; revision: Wire; artifact: Wire; revisions: Wire[] }>()
+  const deliveries = new Map<string, { resource: Wire; artifact: Wire }>()
+  let resourceCatalogueEnabled = false
+  const workspaceDocuments = new Map<string, string>()
   const deferredResources = new Set<string>()
   const heldResourceResolves = new Map<string, () => void>()
   let includeOtherSession = false
@@ -323,22 +327,39 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
       }
       if (['workbench.resources.get', 'workbench.resources.open'].includes(frame.method)) {
         const ref = frame.params?.resourceRef as Wire
-        const id = String(ref?.documentId ?? ref?.artifactId ?? ref?.id)
+        const workspaceFile = frame.params?.workspaceFile as Wire | undefined
+        const id = workspaceFile
+          ? workspaceDocuments.get(`${key}:${workspaceFile.path}`) || ''
+          : String(ref?.documentId ?? ref?.artifactId ?? ref?.id)
+        const delivery = deliveries.get(`${key}:${id}`)
         const document = documents.get(`${key}:${id}`)
+          || documents.get(`${key}:${delivery?.artifact.documentId}`)
         if (!document) { respond({ resource: null }); return }
-        const reply = () => respond(frame.method === 'workbench.resources.get' ? { resource: document.resource }
-          : { disposition: 'document', resolution: { status: 'current' }, ...document, materialized: false })
+        const fixed = ref?.type === 'deliverable' ? { ...(delivery?.resource ?? document.resource),
+          resource: { type: 'deliverable', artifactId: id },
+          downloadUrl: `/api/v1/artifacts/${id}`,
+          relations: document.resource.relations,
+        } : document.resource
+        const reply = () => respond(frame.method === 'workbench.resources.get' ? { resource: fixed }
+          : { disposition: 'document', resolution: { status: 'current' }, ...document, materialized: false,
+              ...(frame.params?.intent === 'annotate' ? { baselineUpdated: false } : {}) })
         if (frame.method === 'workbench.resources.get' && deferredResources.has(`${key}:${id}`)) heldResourceResolves.set(`${key}:${id}`, reply)
         else reply()
         return
       }
       const canonicalDocument = documents.get(`${key}:${frame.params?.documentId}`)
       if (canonicalDocument && frame.method === 'artifacts.documents.get') { respond({ document: canonicalDocument.document }); return }
-      if (canonicalDocument && frame.method === 'artifacts.revisions.list') { respond({ revisions: [canonicalDocument.revision] }); return }
+      if (canonicalDocument && frame.method === 'artifacts.revisions.list') { respond({ revisions: canonicalDocument.revisions }); return }
       if (frame.method === 'artifacts.changes.list') { respond({ changeSets: [] }); return }
       if (frame.method === 'workspaces.references.read') {
         const reference = frame.params?.reference as Wire
         const locator = reference.locator as Wire
+        if (binaryReferences.has(`${key}:${locator.relativePath}`)) {
+          ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: {
+            code: 'FILE_UNAVAILABLE', message: 'Only UTF-8 source files can be previewed.',
+          } }))
+          return
+        }
         respond({ reference, relativePath: locator.relativePath, revision: (reference.state as Wire).revision,
           content: key === SIDE ? 'const sideReference = 1;' : 'const mainReference = 1;', totalLines: 1,
           startLine: locator.startLine, endLine: locator.endLine })
@@ -381,7 +402,11 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
         'sessions.messages.unsubscribe': { subscribed: false },
         'sessions.subscribe': { subscribed: true },
         'usage.status': { sessions: [] },
-        'workbench.resources.list': { resources: [], totalCount: 0, pageSize: 200, returnedCount: 0, hasMore: false, nextCursor: null },
+        'workbench.resources.list': (() => {
+          const resources = resourceCatalogueEnabled ? [...documents.values()]
+            .filter(item => item.document.sessionKey === key).map(item => item.resource) : []
+          return { resources, totalCount: resources.length, pageSize: 200, returnedCount: resources.length, hasMore: false, nextCursor: null }
+        })(),
       }
       respond(payloads[frame.method] ?? {})
     })
@@ -389,21 +414,34 @@ export async function installGateway(page: Page, eventBeforeAck = false, routing
   return { requests, errors, consoleWarnings, emit, finish, approvalResolutions, fileRequests, snapshotInstalls,
     failApproval: (id: string, fail: boolean) => fail ? failedApprovals.add(id) : failedApprovals.delete(id),
     denyFile: (key: string, path: string, deny: boolean) => deny ? deniedFiles.add(`${key}:${path}`) : deniedFiles.delete(`${key}:${path}`),
+    markBinaryReference: (key: string, path: string) => binaryReferences.add(`${key}:${path}`),
     enableOtherSession: () => {
       includeOtherSession = true
       get(OTHER).history = [{ role: 'assistant', text: '[Other resource](other.ts)', id: 'other-answer', timestamp: NOW }]
     },
-    registerDocument: (key: string, documentId: string, name: string) => {
-      const revisionId = `rev-${documentId}`, artifactId = `art-${documentId}`
-      const document = { documentId, headRevisionId: revisionId, name, sessionKey: key, kind: 'html',
-        latestDownloadUrl: `/api/v1/artifact-documents/${documentId}`, capabilities: { download: true, preview: true, revisions: true, source: false } }
-      const revision = { revisionId, documentId, artifactId, filename: name, mediaType: 'text/html', byteSize: 4096,
-        artifactSha256: 'b'.repeat(64), downloadUrl: `/api/v1/artifact-documents/${documentId}?revisionId=${revisionId}` }
-      const resource = { resource: { type: 'document', documentId }, name, mime: 'text/html', sha256: 'b'.repeat(64), size: 4096,
-        downloadUrl: document.latestDownloadUrl, capabilities: { preview: true, download: true, edit: false },
+    enableResourceCatalogue: () => { resourceCatalogueEnabled = true },
+    registerDocument: (key: string, documentId: string, name: string,
+      metadata: { format?: string; mime?: string; sha256?: string; size?: number; annotation?: boolean; workspacePath?: string;
+        revisionId?: string; artifactId?: string } = {}) => {
+      const revisionId = metadata.revisionId ?? `rev-${documentId}`, artifactId = metadata.artifactId ?? `art-${documentId}`
+      const revisions = documents.get(`${key}:${documentId}`)?.revisions ?? []
+      const mime = metadata.mime ?? 'text/html', size = metadata.size ?? 4096, sha256 = metadata.sha256 ?? 'b'.repeat(64)
+      const document = { documentId, headRevisionId: revisionId, name, sessionKey: key, kind: metadata.format ?? 'html',
+        latestDownloadUrl: `/api/v1/artifact-documents/${documentId}`, capabilities: { download: true, preview: true, revisions: true, source: false,
+          ...(metadata.annotation ? { selectionContext: true, agentEdit: true } : {}) } }
+      const revision = { revisionId, documentId, artifactId, filename: name, mediaType: mime, byteSize: size,
+        artifactSha256: sha256, generation: revisions.length + 1,
+        downloadUrl: `/api/v1/artifact-documents/${documentId}?revisionId=${revisionId}` }
+      const resource = { resource: { type: 'document', documentId }, name, mime, sha256, size,
+        ...(metadata.workspacePath ? { sourcePath: metadata.workspacePath } : {}),
+        downloadUrl: document.latestDownloadUrl, capabilities: { preview: true, download: true, edit: metadata.annotation === true,
+          ...(metadata.annotation ? { selectionContext: true, agentEdit: true } : {}) },
         relations: { documentId, headRevisionId: revisionId, headArtifactId: artifactId } }
-      const artifact = { id: artifactId, documentId, name, mime: 'text/html', size: 4096, download_url: revision.downloadUrl }
-      documents.set(`${key}:${documentId}`, { document, revision, resource, artifact })
+      const artifact = { id: artifactId, documentId, name, mime, size, sha256, download_url: revision.downloadUrl }
+      documents.set(`${key}:${documentId}`, { document, revision, resource, artifact,
+        revisions: [revision, ...revisions.filter(item => item.revisionId !== revisionId)] })
+      deliveries.set(`${key}:${artifactId}`, { resource, artifact })
+      if (metadata.workspacePath) workspaceDocuments.set(`${key}:${metadata.workspacePath}`, documentId)
       return artifact
     },
     deferResource: (key: string, id: string) => deferredResources.add(`${key}:${id}`),

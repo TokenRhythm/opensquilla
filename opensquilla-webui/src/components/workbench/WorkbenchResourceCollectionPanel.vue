@@ -28,6 +28,9 @@
               </span>
               <span class="resource-collection__copy">
                 <strong>{{ resource.name }}</strong>
+                <small v-if="resource.sourcePath" class="resource-collection__source-path" :title="resource.sourcePath">
+                  {{ resource.sourcePath }}
+                </small>
                 <small v-if="versionLabel?.(resource)">{{ versionLabel?.(resource) }}</small>
                 <small>{{ resourceMeta(resource) }}</small>
                 <small v-if="isBusy(resource)" role="status">
@@ -86,7 +89,7 @@ import type {
 import { workbenchResourceRefId } from '@/types/workbenchResources'
 import type { IconName } from '@/utils/icons'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
-import { isInternalVisualizeResource } from '@/workbench/workbenchResourceItems'
+import { canonicalWorkbenchResources } from '@/workbench/workbenchResourceItems'
 
 const props = defineProps<{
   busyKey?: string
@@ -123,9 +126,7 @@ watch(() => [props.readingTop, props.loading, props.resources] as const, async (
 })
 onBeforeUnmount(saveReading)
 
-const visibleResources = computed(() => props.resources.filter(resource => (
-  !isInternalVisualizeResource(resource)
-)))
+const visibleResources = computed(() => canonicalWorkbenchResources(props.resources))
 
 const groups = computed(() => (
   (['files', 'links'] as const).map(type => ({

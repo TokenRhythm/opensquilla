@@ -31,7 +31,10 @@ function readDrafts(): Record<string, PromptAnnotation> {
       const { screenshotAttachment: _capture, ...annotation } = item as PromptAnnotation & {
         screenshotAttachment?: unknown
       }
-      return [annotation.annotationId, annotation]
+      return [annotation.annotationId, {
+        ...annotation,
+        ...(!annotation.revisionId || !annotation.sha256 ? { freshness: 'stale' as const } : {}),
+      }]
     }))
   } catch {
     return {}
@@ -45,7 +48,9 @@ function snapshotOf(annotation: PromptAnnotation, sentOrder: number): PromptAnno
     documentName: annotation.documentName,
     revisionId: annotation.revisionId,
     sha256: annotation.sha256,
-    selection: annotation.selection ? normalizeOfficeSelection(annotation.selection) || undefined : undefined,
+    // Recorded evidence is immutable send input. Renderer projection belongs
+    // only at creation; repeating it here can silently truncate restored input.
+    selection: annotation.selection === undefined ? undefined : JSON.parse(JSON.stringify(annotation.selection)),
     body: annotation.body,
     tagName: annotation.tagName,
     quote: annotation.quote,
@@ -64,6 +69,14 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
   const annotations = ref<Record<string, PromptAnnotation>>(readDrafts())
   const overlayOwnerSessions = ref<Record<string, string>>({})
   const activeDocumentBySession = ref<Record<string, string>>({})
+  const activePageBySession = ref<Record<string, string | undefined>>({})
+  const queuedDraftIdsBySession = ref<Record<string, string[]>>({})
+  function isQueued(annotationId: string) {
+    return Object.values(queuedDraftIdsBySession.value).some(ids => ids.includes(annotationId))
+  }
+  function setQueuedDraftIds(sessionKey: string, ids: readonly string[]) {
+    queuedDraftIdsBySession.value[sessionKey] = [...new Set(ids)]
+  }
   const drafts = computed(() => Object.values(annotations.value).filter(item => item.status === 'draft'))
 
   function commit(next: Record<string, PromptAnnotation>) {
@@ -76,27 +89,49 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     return drafts.value.filter(item => item.sessionKey === sessionKey)
   }
   function setActiveDocument(sessionKey: string, documentId: string) {
+    if (activeDocumentBySession.value[sessionKey] !== documentId) delete activePageBySession.value[sessionKey]
     activeDocumentBySession.value[sessionKey] = documentId
+  }
+  function setActivePage(sessionKey: string, pagePath?: string) {
+    activePageBySession.value[sessionKey] = pagePath || ''
+  }
+  function validateDocumentVersion(sessionKey: string, documentId: string, revisionId: string, sha256: string) {
+    const next = { ...annotations.value }
+    let changed = false
+    for (const draft of draftsForSession(sessionKey)) {
+      if (draft.documentId !== documentId || isQueued(draft.annotationId)) continue
+      const freshness = draft.revisionId === revisionId && draft.sha256 === sha256 ? 'fresh' : 'stale'
+      if (draft.freshness !== freshness) { next[draft.annotationId] = { ...draft, freshness }; changed = true }
+    }
+    if (changed) commit(next)
   }
   function activeDraftsForSession(sessionKey: string, allowed?: (item: PromptAnnotation) => boolean) {
     const items = draftsForSession(sessionKey).filter(item => !allowed || allowed(item))
     const activeId = activeDocumentBySession.value[sessionKey]
     const documentId = (allowed && !items.some(item => item.documentId === activeId)
       ? undefined : activeId) || items[items.length - 1]?.documentId
-    return items.filter(item => (
-      item.documentId === documentId && !overlayOwnerSessions.value[item.annotationId]
+    const documentItems = items.filter(item => (
+      item.documentId === documentId && !overlayOwnerSessions.value[item.annotationId] && !isQueued(item.annotationId)
     ))
+    const page = activePageBySession.value[sessionKey] ?? documentItems[documentItems.length - 1]?.pagePath ?? ''
+    return documentItems.filter(item => item.selection || (item.pagePath || '') === page)
   }
   function sendableDraftsForSession(sessionKey: string, allowed?: (item: PromptAnnotation) => boolean) {
     return activeDraftsForSession(sessionKey, allowed).filter(item => (
-      item.body.trim() && promptAnnotationBodyWithinLimit(item.body)
+      item.freshness !== 'stale' && item.body.trim() && promptAnnotationBodyWithinLimit(item.body)
     ))
   }
-  function sendBlockedReason(sessionKey: string, allowed?: (item: PromptAnnotation) => boolean): 'editing' | 'too-long' | null {
+  function sendBlockedReason(sessionKey: string, allowed?: (item: PromptAnnotation) => boolean): 'editing' | 'too-long' | 'stale' | null {
+    const documentId = activeDocumentBySession.value[sessionKey]
+    const pagePath = activePageBySession.value[sessionKey]
     if (Object.entries(overlayOwnerSessions.value).some(([id, owner]) => (
       owner === sessionKey && (!allowed || !annotations.value[id] || allowed(annotations.value[id]))
+      && (!documentId || !annotations.value[id] || annotations.value[id].documentId === documentId)
+      && (pagePath === undefined || !annotations.value[id] || annotations.value[id].selection
+        || (annotations.value[id].pagePath || '') === pagePath)
     ))) return 'editing'
     const items = activeDraftsForSession(sessionKey, allowed)
+    if (items.some(item => item.freshness === 'stale' && item.body.trim())) return 'stale'
     return items.some(item => !promptAnnotationBodyWithinLimit(item.body)) ? 'too-long' : null
   }
   function beginOverlayEdit(annotationId: string, sessionKey: string) {
@@ -111,7 +146,7 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
   async function load(sessionKey: string, _options: { force?: boolean } = {}) {
     return draftsForSession(sessionKey)
   }
-  async function create(request: PromptAnnotationCreateRequest): Promise<PromptAnnotation> {
+  function buildDraft(request: PromptAnnotationCreateRequest): PromptAnnotation {
     if (!request.selection.targetRef && !request.resourceId && !request.selection.resourceId) {
       throw new Error('The selected page is unavailable.')
     }
@@ -120,9 +155,6 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
       throw new Error('The selected document version is unavailable.')
     }
     if (!promptAnnotationBodyWithinLimit(request.body || '')) throw new Error('The annotation is too long.')
-    if (draftsForSession(request.sessionKey).length >= PROMPT_ANNOTATION_MAX_COUNT) {
-      throw new Error('The annotation limit has been reached.')
-    }
     const item: PromptAnnotation = {
       annotationId: request.annotationId, sessionKey: request.sessionKey,
       documentId: request.documentId, documentName: request.documentName || 'artifact',
@@ -137,11 +169,22 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
       targetText: request.selection.selectionText || '',
       createdAt: Date.now(), updatedAt: Date.now(),
     }
+    return item
+  }
+  async function create(request: PromptAnnotationCreateRequest): Promise<PromptAnnotation> {
+    if (draftsForSession(request.sessionKey).filter(item => !isQueued(item.annotationId)
+      && item.documentId === request.documentId
+      && (request.officeSelection || (item.pagePath || '') === (request.pagePath || ''))).length >= PROMPT_ANNOTATION_MAX_COUNT) {
+      throw new Error('The annotation limit has been reached.')
+    }
+    const item = buildDraft(request)
     commit({ ...annotations.value, [item.annotationId]: item })
     setActiveDocument(item.sessionKey, item.documentId)
+    setActivePage(item.sessionKey, item.pagePath)
     return item
   }
   async function update(annotationId: string, body: string) {
+    if (isQueued(annotationId)) throw new Error('Cancel the queued annotation before editing it.')
     if (!promptAnnotationBodyWithinLimit(body)) throw new Error('The annotation is too long.')
     const current = annotations.value[annotationId]
     if (!current) return null
@@ -150,6 +193,7 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     return updated
   }
   async function discard(annotationId: string) {
+    if (isQueued(annotationId)) throw new Error('Cancel the queued annotation before editing it.')
     if (!annotations.value[annotationId]) return false
     const next = { ...annotations.value }
     delete next[annotationId]
@@ -157,10 +201,57 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     releaseOverlayEdit(annotationId)
     return true
   }
+  async function replaceSelection(annotationId: string, request: PromptAnnotationCreateRequest) {
+    const current = annotations.value[annotationId]
+    if (!current || isQueued(annotationId) || current.sessionKey !== request.sessionKey
+      || current.documentId !== request.documentId || annotationId === request.annotationId) {
+      throw new Error('The annotation is unavailable for reselection.')
+    }
+    const replacement = { ...buildDraft({ ...request, body: current.body }), createdAt: current.createdAt }
+    const next = Object.fromEntries(Object.entries(annotations.value).map(([id, value]) =>
+      id === annotationId ? [replacement.annotationId, replacement] : [id, value]))
+    commit(next)
+    releaseOverlayEdit(annotationId)
+    return replacement
+  }
+  function restoreReplacement(original: PromptAnnotation, replacementId: string) {
+    const replacement = annotations.value[replacementId]
+    if (!replacement || annotations.value[original.annotationId] || isQueued(replacementId)
+      || replacement.sessionKey !== original.sessionKey || replacement.documentId !== original.documentId
+      || replacement.body !== original.body) return false
+    const next = { ...annotations.value }
+    delete next[replacementId]
+    next[original.annotationId] = original
+    commit(next)
+    releaseOverlayEdit(replacementId)
+    return true
+  }
+  function restoreSnapshots(sessionKey: string, snapshots: readonly PromptAnnotationSnapshot[], retiredIds: readonly string[] = []) {
+    const next = { ...annotations.value }
+    for (const id of retiredIds) {
+      if (next[id]?.sessionKey === sessionKey) delete next[id]
+    }
+    const ids: string[] = []
+    for (const snapshot of snapshots) {
+      const id = crypto.randomUUID()
+      next[id] = {
+        ...snapshot, annotationId: id, sessionKey, status: 'draft',
+        createdAt: Date.now(), updatedAt: Date.now(),
+      }
+      ids.push(id)
+    }
+    commit(next)
+    retiredIds.forEach(releaseOverlayEdit)
+    if (snapshots[0]) {
+      setActiveDocument(sessionKey, snapshots[0].documentId)
+      setActivePage(sessionKey, snapshots[0].pagePath)
+    }
+    return ids
+  }
   async function prepareForSend(ids: readonly string[]) {
     return ids.length > 0 && ids.length <= PROMPT_ANNOTATION_MAX_COUNT && ids.every(id => {
       const item = annotations.value[id]
-      return item && !overlayOwnerSessions.value[id]
+      return item && item.freshness !== 'stale' && !overlayOwnerSessions.value[id]
         && item.body.trim() && promptAnnotationBodyWithinLimit(item.body)
     })
   }
@@ -170,6 +261,15 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
         item && !overlayOwnerSessions.value[item.annotationId],
       ))
       .map(snapshotOf)
+  }
+  function invalidateSnapshots(snapshots: readonly PromptAnnotationSnapshot[]) {
+    const next = { ...annotations.value }
+    for (const snapshot of snapshots) {
+      const current = next[snapshot.annotationId]
+      if (current && current.documentId === snapshot.documentId && current.revisionId === snapshot.revisionId
+        && current.sha256 === snapshot.sha256) next[snapshot.annotationId] = { ...current, freshness: 'stale' }
+    }
+    commit(next)
   }
   function acknowledgeSent(snapshots: readonly PromptAnnotationSnapshot[]) {
     const next = { ...annotations.value }
@@ -182,6 +282,10 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
         && current.resourceId === snapshot.resourceId
         && current.revisionId === snapshot.revisionId
         && current.sha256 === snapshot.sha256
+        && current.documentId === snapshot.documentId
+        && current.locatorHint === snapshot.locatorHint
+        && current.quote === snapshot.quote
+        && current.targetText === snapshot.targetText
         && JSON.stringify(current.selection) === JSON.stringify(snapshot.selection)
         && current.pagePath === snapshot.pagePath) {
         delete next[snapshot.annotationId]
@@ -201,7 +305,7 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     // A retired send can restore missing local copies, never replace a newer edit.
     if (snapshots.some((item, index) => {
       const current = annotations.value[item.annotationId]
-      return overlayOwnerSessions.value[item.annotationId] || (current && (
+      return overlayOwnerSessions.value[item.annotationId] || isQueued(item.annotationId) || (current && (
         current.sessionKey !== sessionKey
         || JSON.stringify(snapshotOf(current, index)) !== JSON.stringify(snapshotOf({
           ...item, sessionKey, status: 'draft', createdAt: null, updatedAt: null,
@@ -216,6 +320,7 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     }
     commit(next)
     setActiveDocument(sessionKey, snapshots[0]!.documentId)
+    setActivePage(sessionKey, snapshots[0]!.pagePath)
     return true
   }
   function clearSession(sessionKey: string) {
@@ -230,9 +335,13 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     annotations.value = readDrafts()
     overlayOwnerSessions.value = {}
     activeDocumentBySession.value = {}
+    activePageBySession.value = {}
+    queuedDraftIdsBySession.value = {}
   }
   return { annotations, drafts, overlayOwnerSessions, activeDocumentBySession, draftsForSession,
-    setActiveDocument, activeDraftsForSession, sendableDraftsForSession, sendBlockedReason,
+    setActiveDocument, validateDocumentVersion, invalidateSnapshots, activeDraftsForSession, sendableDraftsForSession, sendBlockedReason,
     beginOverlayEdit, releaseOverlayEdit, completeOverlayEdit, load, create, update, discard,
-    prepareForSend, snapshotsForIds, acknowledgeSent, restoreUnsent, clearSession, reset }
+    prepareForSend, snapshotsForIds, acknowledgeSent, restoreUnsent, clearSession, reset,
+    replaceSelection, restoreSnapshots, isQueued, setQueuedDraftIds, queuedDraftIdsBySession,
+    setActivePage, activePageBySession, restoreReplacement }
 })

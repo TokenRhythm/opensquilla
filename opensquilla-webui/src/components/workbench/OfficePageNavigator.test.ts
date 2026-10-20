@@ -15,6 +15,7 @@ function thumbnail(label = 'page'): OfficePageThumbnail { return { blob: new Blo
 function session(render = vi.fn(async (_index: number, _signal?: AbortSignal) => thumbnail())): OfficePreviewSession {
   return { renderThumbnail: render, getPageSize: () => ({ width: 600, height: 800 }), getNotes: () => null,
     destroy: vi.fn(), clearSelection: vi.fn(), setSelectionMode: vi.fn(), goTo: vi.fn(), next: vi.fn(), previous: vi.fn(),
+    clearTransientSelection: vi.fn(), reselect: vi.fn(), locateSelection: vi.fn(async () => ({ status: 'unavailable' as const, anchor: null })),
     fitPage: vi.fn(), fitWidth: vi.fn(), zoomIn: vi.fn(), zoomOut: vi.fn(), resize: vi.fn() }
 }
 async function settle() { for (let index = 0; index < 40; index++) { await Promise.resolve(); await nextTick() } }

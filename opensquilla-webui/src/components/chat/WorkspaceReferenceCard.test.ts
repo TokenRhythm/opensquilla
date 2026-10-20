@@ -10,6 +10,7 @@ import WorkspaceReferenceCard from './WorkspaceReferenceCard.vue'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
 import { workspaceFileSessionKey } from '@/workbench/workspaceFileItems'
+import { WORKSPACE_FILES_KEY, type WorkspaceFiles } from '@/modules/workspaceFiles'
 
 const reference: WorkspaceFileReferenceV1 = {
   version: 1, kind: 'workspace_file', id: 'src/math.py', label: 'src/math.py:2-4',
@@ -17,7 +18,7 @@ const reference: WorkspaceFileReferenceV1 = {
   state: { available: true, revision: 'file_1234567890abcdef' }, capabilities: { open: true, copy: true },
 }
 const apps: App[] = []
-async function mount(read: WorkspaceReferences['read']) {
+async function mount(read: WorkspaceReferences['read'], files?: WorkspaceFiles) {
   const el = document.createElement('div')
   document.body.append(el)
   const pinia = createPinia()
@@ -28,6 +29,7 @@ async function mount(read: WorkspaceReferences['read']) {
   })
   apps.push(app)
   app.use(pinia).use(i18n).provide(WORKSPACE_REFERENCES_KEY, { read })
+  if (files) app.provide(WORKSPACE_FILES_KEY, files)
   app.provide(GATEWAY_ACCESS_KEY, {
     get isAvailable() { return gateway.available },
     get isLocalOwner() { return gateway.owner },
@@ -43,6 +45,57 @@ const settle = async () => { await new Promise(resolve => setTimeout(resolve, 0)
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.innerHTML = '' })
 
 describe('WorkspaceReferenceCard', () => {
+  it.each(['html', 'docx', 'pptx', 'xlsx'])('opens an authorized unregistered %s reference as a file for later annotation preparation', async format => {
+    const path = `unregistered/report.${format}`
+    const file = { requestedPath: path, path, name: `report.${format}`,
+      mime: format === 'html' ? 'text/html' : 'application/octet-stream',
+      kind: 'download' as const, size: 100, workspaceBinding: 'binding-a',
+      annotationCapability: { supported: true } }
+    const read = vi.fn()
+    const resolveReference = vi.fn(async () => [file])
+    const resolve = vi.fn()
+    const { el, store, currentReference } = await mount(read, { resolveReference, resolve, read: vi.fn() })
+    currentReference.value = { ...reference, locator: { relativePath: path } }
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.workspace-reference__open')!.click()
+    await settle()
+    expect(store.activeItem?.payload.file).toEqual(file)
+    expect(resolveReference).toHaveBeenCalledWith('task', currentReference.value, expect.any(AbortSignal))
+    expect(resolve).not.toHaveBeenCalled()
+    expect(read).not.toHaveBeenCalled()
+  })
+
+  it('opens an authorized Office document without trying to decode it as text', async () => {
+    const read = vi.fn()
+    const resolveReference = vi.fn(async () => [{
+      requestedPath: 'reports/report.docx', path: 'reports/report.docx', name: 'report.docx',
+      mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      kind: 'download' as const, size: 100, workspaceBinding: 'binding-a',
+      documentTarget: { documentId: 'doc_a' },
+    }])
+    const { el, store, currentReference } = await mount(read, { resolveReference, resolve: vi.fn(), read: vi.fn() })
+    currentReference.value = { ...reference, locator: { relativePath: 'reports/report.docx' } }
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.workspace-reference__open')!.click()
+    await settle()
+    expect(resolveReference).toHaveBeenCalledWith('task', currentReference.value, expect.any(AbortSignal))
+    expect(read).not.toHaveBeenCalled()
+    expect(store.activeItem?.payload.file).toMatchObject({ documentTarget: { documentId: 'doc_a' } })
+  })
+
+  it('does not fall back to text when current-document resolution rejects reference authority', async () => {
+    const read = vi.fn()
+    const resolveReference = vi.fn(async () => { throw new WorkspaceReferenceError('WORKSPACE_MISMATCH') })
+    const { el, store, currentReference } = await mount(read, { resolveReference, resolve: vi.fn(), read: vi.fn() })
+    currentReference.value = { ...reference, locator: { relativePath: 'reports/report.docx' } }
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.workspace-reference__open')!.click()
+    await settle()
+    expect(read).not.toHaveBeenCalled()
+    expect(store.items).toHaveLength(0)
+    expect(el.querySelector('[role="status"]')).not.toBeNull()
+  })
+
   it('opens main and child references in one visible workbench while keeping their read authorities distinct', async () => {
     const el = document.createElement('div')
     document.body.append(el)

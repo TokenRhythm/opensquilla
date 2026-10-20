@@ -6,10 +6,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import en from '@/locales/en.json'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
 import { useWorkbenchStore } from '@/workbench/store'
+import { WorkbenchRuntimeManager } from '@/workbench/runtime'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { artifactDocumentWorkspaceKey, useArtifactDocumentsStore } from '@/stores/artifactDocuments'
+import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
 import { artifactFromWorkbenchItem, artifactWorkbenchItemId, createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
-import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
+import { artifactPayloadFromRevision, createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
 import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import type { ArtifactPayload } from '@/types/artifacts'
@@ -78,7 +80,8 @@ function opened(artifact = target): WorkbenchResourceOpenResponse {
   const workspace = createLegacyArtifactWorkspace(artifact, 'session-a')
   return {
     disposition: 'document', resolution: { status: 'current' }, materialized: false,
-    resource: { ...resource(artifact), resource: { type: 'document', documentId: 'canonical-doc' } },
+    resource: { ...resource(artifact), resource: { type: 'document', documentId: 'canonical-doc' },
+      relations: { documentId: 'canonical-doc', headRevisionId: 'revision-head', headArtifactId: 'canonical-head' } },
     document: { ...workspace.document, documentId: 'canonical-doc', headRevisionId: 'revision-head', capabilities: { ...workspace.document.capabilities, ...capabilities } },
     revision: { ...workspace.revisions[0]!, documentId: 'canonical-doc', revisionId: 'revision-head', artifactId: 'canonical-head' },
   }
@@ -97,11 +100,14 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
     scope: { type: 'session', id: 'session-a' } as const }
   store.openItem(item)
   const resources = useWorkbenchResourcesStore(pinia)
-  const resolve = vi.spyOn(resources, 'resolve').mockResolvedValue(resource(nextArtifact))
+  const resolve = vi.spyOn(resources, 'resolveFresh').mockResolvedValue(resource(nextArtifact))
+  const resolveLegacy = vi.spyOn(resources, 'resolve').mockResolvedValue(resource(nextArtifact))
   const openCurrent = vi.spyOn(resources, 'openCurrent').mockResolvedValue(opened(nextArtifact))
+  const prepareAnnotation = vi.spyOn(resources, 'prepareAnnotation').mockResolvedValue(opened(nextArtifact))
   const host = document.createElement('div'); document.body.append(host)
   const fetchArtifact = vi.fn().mockResolvedValue({ ok: true, blob: new Blob(['download']) })
-  const app = createApp(AppWorkbench, { sessionId: 'session-a', routeActive: true, workbenchResourcesEnabled: options.resourcesEnabled ?? true })
+  const app = createApp(AppWorkbench, { sessionId: 'session-a', routeActive: true,
+    officePromptAnnotationsEnabled: true, workbenchResourcesEnabled: options.resourcesEnabled ?? true })
   app.use(pinia)
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
   app.provide(ARTIFACT_WORKBENCH_KEY, {
@@ -118,10 +124,31 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
     await flush()
   }
   const continueEditing = async () => {
-    host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.artifactDocument.continueEditing}"]`)!.click()
+    host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.annotationUnified.start}"]`)!.click()
     await flush()
   }
-  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), item, resolve, openCurrent, select, choose, continueEditing, fetchArtifact }
+  return { host, store, resources, documents: useArtifactDocumentsStore(pinia), annotations: useArtifactPromptAnnotationsStore(pinia), item, resolve, resolveLegacy,
+    openCurrent, prepareAnnotation, select, choose, continueEditing, fetchArtifact }
+}
+function installPreparedWorkspace(
+  h: Awaited<ReturnType<typeof mount>>,
+  response = opened(),
+  options: { revisionId?: string; sha256?: string; stale?: boolean } = {},
+) {
+  if (response.disposition !== 'document') throw new Error('Expected document fixture')
+  const revision = { ...response.revision,
+    ...(options.revisionId ? { revisionId: options.revisionId } : {}),
+    ...(options.sha256 ? { artifactSha256: options.sha256 } : {}) }
+  const artifact = artifactPayloadFromRevision(revision)
+  const workspace = { ...createLegacyArtifactWorkspace(artifact, 'session-a'), source: 'document-api' as const,
+    document: { ...response.document, headRevisionId: revision.revisionId }, headArtifact: artifact }
+  vi.spyOn(h.documents, 'load').mockImplementation(async (requested, sessionKey) => {
+    const key = artifactDocumentWorkspaceKey(requested, sessionKey)
+    h.documents.snapshots[key] = { key, loaded: true, loading: false,
+      stale: options.stale === true, error: options.stale ? 'Disconnected' : null, workspace }
+    return workspace
+  })
+  return workspace
 }
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
@@ -129,6 +156,7 @@ afterEach(() => {
   vi.restoreAllMocks(); pushToast.mockClear()
   previewHarness.enabled = false
   previewHarness.runtime = false
+  localStorage.clear()
 })
 
 describe('AppWorkbench artifact navigation', () => {
@@ -171,7 +199,7 @@ describe('AppWorkbench artifact navigation', () => {
       h.host.querySelector<HTMLButtonElement>(`[aria-label="Download ${artifact.name}"]`)!.click()
       await flush()
       await vi.waitFor(() => expect(h.fetchArtifact).toHaveBeenCalledWith(expect.objectContaining({ id: artifact.id }), { sessionKey: resourceSessionKey }))
-      expect(h.resolve).toHaveBeenCalledWith(resourceSessionKey, listed.resource)
+      expect(h.resolveLegacy).toHaveBeenCalledWith(resourceSessionKey, listed.resource)
       expect(h.store.activeItemId).toBe(collection.id)
 
       const imported = vi.spyOn(h.resources, 'importDocument')
@@ -189,11 +217,15 @@ describe('AppWorkbench artifact navigation', () => {
     },
   )
 
-  it.each(['document', 'attachment'] as const)('keeps the existing current-open and retry behavior for a listed %s', async type => {
+  it.each(['document', 'attachment'] as const)('uses read-only discovery and retry to open a listed %s', async type => {
     previewHarness.enabled = true
     previewHarness.runtime = true
     const h = await mount()
-    const listed: WorkbenchResource = { ...resource(), resource: createWorkbenchResourceRef(type, 'listed-current') }
+    const resolved = opened()
+    if (resolved.disposition !== 'document') throw new Error('Expected document fixture')
+    const listed: WorkbenchResource = { ...resource(),
+      resource: createWorkbenchResourceRef(type, type === 'document' ? 'canonical-doc' : 'listed-current'),
+      relations: { documentId: 'canonical-doc' } }
     h.resources.snapshots['session-a'] = {
       sessionKey: 'session-a', available: true, loading: false, loaded: true,
       error: null, resources: [listed], totalCount: 1,
@@ -205,15 +237,23 @@ describe('AppWorkbench artifact navigation', () => {
     await vi.waitFor(() => expect(load).toHaveBeenCalledWith('session-a'))
     expect(h.host.querySelector('.resource-collection__open')?.textContent).toContain(type === 'document'
       ? en.workbench.resources.currentWorkingFile : target.name)
-    h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+    const artifact = { ...target, id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head' }
+    const workspace = createLegacyArtifactWorkspace(artifact, 'session-a')
+    const key = artifactDocumentWorkspaceKey(artifact, 'session-a')
+    h.documents.snapshots[key] = { key, loaded: true, loading: false, stale: false, error: null,
+      workspace: { ...workspace, source: 'document-api', document: resolved.document, headArtifact: artifact } }
+    h.resolve.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+      .mockImplementation(async (_session, ref) => ref.type === 'document' ? resolved.resource : listed)
     h.host.querySelector<HTMLButtonElement>('.resource-collection__open')!.click()
     await flush()
-    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledWith('session-a', listed))
+    await vi.waitFor(() => expect(h.resolve).toHaveBeenCalledWith('session-a', listed.resource, expect.any(Function)))
     expect(h.host.querySelector('[role="alert"]')?.textContent).toContain(en.workbench.artifactErrors.permissionDenied)
     expect(h.store.activeItemId).toBe(collection.id)
     h.host.querySelector<HTMLButtonElement>(`[aria-label="${en.workbench.resources.retry}"]`)!.click()
     await flush()
-    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(h.store.activeItem?.payload.resourceIdentity).toBe('document:canonical-doc'))
+    expect(h.openCurrent).not.toHaveBeenCalled()
+    expect(h.prepareAnnotation).not.toHaveBeenCalled()
     expect(artifactFromWorkbenchItem(h.store.activeItem!)).toMatchObject({
       id: 'canonical-head', documentId: 'canonical-doc', revisionId: 'revision-head',
     })
@@ -224,7 +264,7 @@ describe('AppWorkbench artifact navigation', () => {
       const child = 'agent:main:sidechat:child'
       const h = await mount({ target: artifact, resourceSessionKey: child })
       await h.choose()
-      expect(h.resolve).toHaveBeenCalledWith(child, { type: 'deliverable', id: artifact.id, artifactId: artifact.id })
+      expect(h.resolve).toHaveBeenCalledWith(child, { type: 'deliverable', id: artifact.id, artifactId: artifact.id }, expect.any(Function))
       expect(h.openCurrent).not.toHaveBeenCalled()
       const active = h.store.activeItem!
       expect(active.scope).toEqual({ type: 'session', id: 'session-a' })
@@ -245,22 +285,25 @@ describe('AppWorkbench artifact navigation', () => {
     expect(h.store.activeItem?.payload.sessionKey).toBe(child)
   })
 
-  it('keeps side preview scope after importing an editable delivery', async () => {
+  it('keeps side preview scope when preparing an unlinked delivery for annotation', async () => {
     previewHarness.enabled = true
     previewHarness.runtime = true
     const child = 'agent:main:sidechat:child'
     const h = await mount({ resourceSessionKey: child })
     const result = opened()
     if (result.disposition !== 'document') throw new Error('Expected document fixture')
-    h.openCurrent.mockResolvedValueOnce(null)
     const imported = vi.spyOn(h.resources, 'importDocument').mockResolvedValue({
       document: result.document, revision: result.revision,
     } as Awaited<ReturnType<typeof h.resources.importDocument>>)
     await h.choose()
     expect(imported).not.toHaveBeenCalled()
     expect(h.openCurrent).not.toHaveBeenCalled()
+    installPreparedWorkspace(h, result)
     await h.continueEditing()
-    await vi.waitFor(() => expect(imported).toHaveBeenCalledWith(child, resource()))
+    await vi.waitFor(() => expect(h.prepareAnnotation).toHaveBeenCalledWith(child, {
+      resourceRef: createWorkbenchResourceRef('deliverable', String(target.id)),
+    }))
+    expect(imported).not.toHaveBeenCalled()
     expect(h.store.activeItem?.payload.sessionKey).toBe(child)
     expect(h.store.activeItem?.scope).toEqual({ type: 'session', id: 'session-a' })
   })
@@ -363,7 +406,7 @@ describe('AppWorkbench artifact navigation', () => {
   ])('opens the fixed $name snapshot through canonical resource resolution', async artifact => {
     const h = await mount({ target: artifact })
     await h.choose()
-    expect(h.resolve).toHaveBeenCalledWith('session-a', { type: 'deliverable', id: artifact.id, artifactId: artifact.id })
+    expect(h.resolve).toHaveBeenCalledWith('session-a', { type: 'deliverable', id: artifact.id, artifactId: artifact.id }, expect.any(Function))
     expect(h.openCurrent).not.toHaveBeenCalled()
     const active = h.store.items.find(item => item.id === h.store.activeItemId)!
     expect(artifactFromWorkbenchItem(active)).toMatchObject({ id: artifact.id })
@@ -379,13 +422,13 @@ describe('AppWorkbench artifact navigation', () => {
     expect(pushToast).toHaveBeenCalledWith(en.workbench.artifactErrors.permissionDenied, expect.objectContaining({ tone: 'danger' }))
   })
 
-  it('keeps the fixed snapshot visible when Continue editing is denied', async () => {
+  it('keeps the fixed snapshot visible when annotation preparation is denied', async () => {
     previewHarness.enabled = true
     previewHarness.runtime = true
     const h = await mount()
     await h.choose()
     const snapshotId = h.store.activeItemId
-    h.openCurrent.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+    h.prepareAnnotation.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
     await h.continueEditing()
     await vi.waitFor(() => expect(pushToast).toHaveBeenCalledWith(en.workbench.artifactErrors.permissionDenied,
       expect.objectContaining({ tone: 'danger' })))
@@ -422,24 +465,24 @@ describe('AppWorkbench artifact navigation', () => {
     await h.choose()
     const originId = h.store.activeItemId!
     const pending = deferred<WorkbenchResourceOpenResponse | null>()
-    h.openCurrent.mockReturnValueOnce(pending.promise)
+    h.prepareAnnotation.mockReturnValueOnce(pending.promise)
     await h.continueEditing()
-    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(h.prepareAnnotation).toHaveBeenCalledTimes(1))
     h.store.closeItem(originId)
     pending.resolve(opened()); await flush()
     expect(h.store.items.map(item => item.id)).toEqual([h.item.id])
   })
 
-  it.each([false, true])('does not take focus after switching tabs during Continue editing (return=%s)', async returns => {
+  it.each([false, true])('does not take focus after switching tabs during annotation preparation (return=%s)', async returns => {
     previewHarness.enabled = true
     previewHarness.runtime = true
     const h = await mount()
     await h.choose()
     const originId = h.store.activeItemId!
     const pending = deferred<WorkbenchResourceOpenResponse | null>()
-    h.openCurrent.mockReturnValueOnce(pending.promise)
+    h.prepareAnnotation.mockReturnValueOnce(pending.promise)
     await h.continueEditing()
-    await vi.waitFor(() => expect(h.openCurrent).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(h.prepareAnnotation).toHaveBeenCalledOnce())
     h.store.activateItem(h.item.id)
     if (returns) h.store.activateItem(originId)
     pending.resolve(opened()); await flush()
@@ -447,15 +490,87 @@ describe('AppWorkbench artifact navigation', () => {
     expect(h.store.activeItemId).toBe(returns ? originId : h.item.id)
   })
 
-  it.each(['resolve', 'open'] as const)(
-    'reports a delayed Continue editing %s error while the originating tab stays active', async stage => {
+  it('does not arm an already prepared document after leaving and returning during preview readiness', async () => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
+    const h = await mount()
+    await h.choose()
+    installPreparedWorkspace(h)
+    const ready = deferred<void>()
+    const runtimeFlush = vi.spyOn(WorkbenchRuntimeManager.prototype, 'flush').mockReturnValueOnce(ready.promise)
+    const performAction = vi.spyOn(WorkbenchRuntimeManager.prototype, 'performAction')
+    await h.continueEditing()
+    await vi.waitFor(() => expect(runtimeFlush).toHaveBeenCalled())
+    const preparedId = h.store.activeItemId!
+    expect(h.store.activeItem?.payload.resourceIdentity).toBe('document:canonical-doc')
+    h.store.activateItem(h.item.id)
+    h.store.activateItem(preparedId)
+    ready.resolve()
+    await flush()
+    expect(performAction.mock.calls.some(([, action]) => action === 'begin-prepared-annotation')).toBe(false)
+  })
+
+  it.each([
+    { revisionId: 'revision-next', sha256: 'b'.repeat(64) },
+    { revisionId: 'revision-head', sha256: 'b'.repeat(64) },
+  ])('keeps drafts on the loaded baseline and stops selection when preparation races with $revisionId/$sha256', async loadedHead => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
+    const h = await mount()
+    await h.choose()
+    const originId = h.store.activeItemId
+    const prepared = opened()
+    if (prepared.disposition !== 'document') throw new Error('Expected document fixture')
+    prepared.revision.artifactSha256 = 'a'.repeat(64)
+    h.prepareAnnotation.mockResolvedValueOnce(prepared)
+    installPreparedWorkspace(h, prepared, loadedHead)
+    const draft = { sessionKey: 'session-a', documentId: prepared.document.documentId,
+      documentName: target.name, body: 'Keep this requested change',
+      selection: { selectionId: 'selected', targetRef: 'target', tagName: 'p', elementPath: 'p' } }
+    await h.annotations.create({ ...draft, annotationId: 'prepared-draft',
+      revisionId: prepared.revision.revisionId, sha256: prepared.revision.artifactSha256 })
+    await h.annotations.create({ ...draft, annotationId: 'current-draft',
+      revisionId: loadedHead.revisionId, sha256: loadedHead.sha256 })
+    const performAction = vi.spyOn(WorkbenchRuntimeManager.prototype, 'performAction')
+
+    await h.continueEditing()
+
+    await vi.waitFor(() => expect(pushToast).toHaveBeenCalledWith(en.workbench.artifactErrors.documentChanged,
+      expect.objectContaining({ tone: 'danger' })))
+    expect(h.store.activeItemId).toBe(originId)
+    expect(performAction.mock.calls.some(([, action]) => action === 'begin-prepared-annotation')).toBe(false)
+    expect(h.annotations.annotations['prepared-draft']).toMatchObject({ freshness: 'stale', body: draft.body })
+    expect(h.annotations.annotations['current-draft']).toMatchObject({ freshness: 'fresh', body: draft.body })
+    expect(h.annotations.sendableDraftsForSession('session-a').map(item => item.annotationId)).toEqual(['current-draft'])
+  })
+
+  it('does not revalidate drafts or start selection using a preserved cache after a failed preview refresh', async () => {
+    previewHarness.enabled = true
+    previewHarness.runtime = true
+    const h = await mount()
+    await h.choose()
+    const originId = h.store.activeItemId
+    installPreparedWorkspace(h, opened(), { stale: true })
+    const validateDrafts = vi.spyOn(h.annotations, 'validateDocumentVersion')
+    const performAction = vi.spyOn(WorkbenchRuntimeManager.prototype, 'performAction')
+
+    await h.continueEditing()
+
+    await vi.waitFor(() => expect(pushToast).toHaveBeenCalledWith(en.workbench.artifactErrors.documentUnavailable,
+      expect.objectContaining({ tone: 'danger' })))
+    expect(h.store.activeItemId).toBe(originId)
+    expect(validateDrafts).not.toHaveBeenCalled()
+    expect(performAction.mock.calls.some(([, action]) => action === 'begin-prepared-annotation')).toBe(false)
+  })
+
+  it('reports a delayed annotation preparation error while the originating tab stays active', async () => {
       previewHarness.enabled = true
       previewHarness.runtime = true
       const h = await mount()
       await h.choose()
       const originId = h.store.activeItemId!
       const pending = deferred<never>()
-      const operation = stage === 'resolve' ? h.resolve : h.openCurrent
+      const operation = h.prepareAnnotation
       operation.mockReturnValueOnce(pending.promise)
       const priorCalls = operation.mock.calls.length
       await h.continueEditing()
@@ -468,15 +583,15 @@ describe('AppWorkbench artifact navigation', () => {
     },
   )
 
-  it.each((['resolve', 'open'] as const).flatMap(stage => [false, true].map(returns => ({ stage, returns }))))(
-    'ignores a delayed Continue editing $stage error after a tab switch (return=$returns)', async ({ stage, returns }) => {
+  it.each([false, true])(
+    'ignores a delayed annotation preparation error after a tab switch (return=%s)', async returns => {
       previewHarness.enabled = true
       previewHarness.runtime = true
       const h = await mount()
       await h.choose()
       const originId = h.store.activeItemId!
       const pending = deferred<never>()
-      const operation = stage === 'resolve' ? h.resolve : h.openCurrent
+      const operation = h.prepareAnnotation
       operation.mockReturnValueOnce(pending.promise)
       const priorCalls = operation.mock.calls.length
       await h.continueEditing()

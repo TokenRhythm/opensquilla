@@ -1,6 +1,13 @@
 import { expect, test, type Locator } from '@playwright/test'
 import { readFile } from 'node:fs/promises'
 
+function csvRecords(csv: string) {
+  const values = csv.split('\n').map(line => [...line.matchAll(/"((?:[^"]|"")*)"(?:,|$)/g)]
+    .map(match => match[1].replace(/""/g, '"')))
+  const [headers, ...rows] = values
+  return rows.map(row => Object.fromEntries(headers.map((header, index) => [header, row[index]])))
+}
+
 async function expectAlignedDetails(details: Locator) {
   const columns = ['share', 'tokens', 'cost', 'source'] as const
   const geometry = await details.locator('.usage-expand__row').evaluateAll((rows, names) => rows.map(row => {
@@ -130,10 +137,7 @@ test('existing Usage table rolls descendant calls into one parent without duplic
   await page.getByRole('button', { name: '导出', exact: true }).click()
   const download = await downloadEvent
   const csv = await readFile((await download.path())!, 'utf8')
-  const values = csv.split('\n').map(line => [...line.matchAll(/"((?:[^"]|"")*)"(?:,|$)/g)]
-    .map(match => match[1].replace(/""/g, '"')))
-  const [headers, ...csvRows] = values
-  const records = csvRows.map(row => Object.fromEntries(headers.map((header, index) => [header, row[index]])))
+  const records = csvRecords(csv)
   expect(records).toHaveLength(3) // summary + two parent tasks, never the five session projections
   const summaryRecord = records.find(row => row.row_type === 'summary')!
   expect(summaryRecord.cost_usd_exact).toBe('0.440716845878136201')
@@ -154,5 +158,83 @@ test('existing Usage table rolls descendant calls into one parent without duplic
   await expect(search.locator('.usage-expand__source')).toBeHidden()
   await page.screenshot({ path: '../.tmp/usage-browser/narrow.png', fullPage: true })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+  expect(errors).toEqual([])
+})
+
+test('production Usage RPC reads temporary SQLite titles, generation fences, task links and CSV totals', async ({ page }) => {
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  await page.routeWebSocket(/.*/, () => {})
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.setViewportSize({ width: 1473, height: 1000 })
+  const queryResponse = page.waitForResponse(response =>
+    response.url().endsWith('/__usage_gateway/rpc') && response.request().method() === 'POST')
+  await page.goto('/e2e/fixtures/usage-accounting.html?source=sqlite')
+  const wire = await (await queryResponse).json()
+  expect(wire.ok).toBe(true)
+  expect(wire.payload.source).toBe('usage_ledger')
+  expect(wire.payload.totals.costNanos).toBe(1_700_000_000)
+  expect(wire.payload.totals.taskCount).toBe(5)
+  expect(wire.payload.taskGroups).toHaveLength(5)
+  const old = wire.payload.taskGroups.find((group: { rootSessionId: string; rootSessionEpoch: number }) =>
+    group.rootSessionId === 'reused' && group.rootSessionEpoch === 0)
+  expect(old.title).toBe('')
+  expect(old.sessionKey).toBeNull()
+  expect(old.totals.costNanos).toBe(400_000_000)
+
+  const rows = page.locator('.usage-sessions tbody > tr:not(.usage-expand-row)')
+  await expect(rows).toHaveCount(5)
+  const costs = new Map([
+    ['制作我的世界复刻游戏', '$0.3000'],
+    ['整理发布检查清单', '$0.2000'],
+    ['手动命名任务', '$0.3000'],
+    ['新一代独立任务', '$0.5000'],
+    ['未命名任务', '$0.4000'],
+  ])
+  for (const [title, cost] of costs) {
+    const row = rows.filter({ has: page.locator('td:first-child', { hasText: title }) })
+    await expect(row).toHaveCount(1)
+    await expect(row.locator('td').first()).toHaveText(title)
+    await expect(row.locator('[data-label="Cost"]')).toHaveText(cost)
+    await expect(row.locator('.usage-sess-link')).toHaveCount(title === '未命名任务' ? 0 : 1)
+  }
+  await expect(page.locator('.usage-sessions tbody')).not.toContainText('WebChat')
+  await expect(page.locator('.usage-sessions tbody')).not.toContainText('不应覆盖手动名称')
+  await expect(page.locator('.usage-sessions tbody')).not.toContainText('不应成为额外账单的子任务')
+  await expect(page.locator('#usage-metrics .control-stat__value').nth(1)).toHaveText('$1.7000')
+  await expect(page.locator('#usage-metrics .control-stat__value').nth(2)).toHaveText('5')
+  await page.screenshot({ path: '../.tmp/usage-browser/sqlite-titles.png', fullPage: true })
+
+  const downloadEvent = page.waitForEvent('download')
+  await page.getByRole('button', { name: '导出', exact: true }).click()
+  const download = await downloadEvent
+  const records = csvRecords(await readFile((await download.path())!, 'utf8'))
+  expect(records).toHaveLength(6)
+  const summary = records.find(row => row.row_type === 'summary')!
+  expect(Number(summary.cost_usd)).toBe(1.7)
+  expect(summary.task_count).toBe('5')
+  const tasks = records.filter(row => row.row_type === 'task')
+  expect(tasks.reduce((sum, row) => sum + Number(row.cost_usd), 0)).toBeCloseTo(1.7, 9)
+  expect(tasks.find(row => row.session_id === 'derived')?.session).toBe('制作我的世界复刻游戏')
+  expect(tasks.find(row => row.session_id === 'transcript')?.session).toBe('整理发布检查清单')
+  expect(tasks.find(row => row.session_id === 'manual')?.session).toBe('手动命名任务')
+  const generations = tasks.filter(row => row.session_id === 'reused')
+  expect(generations).toHaveLength(2)
+  expect(generations.find(row => row.session_epoch === '1')?.session).toBe('新一代独立任务')
+  expect(generations.find(row => row.session_epoch === '0')?.session).not.toBe('新一代独立任务')
+  expect(generations.find(row => row.session_epoch === '0')?.cost_usd).toBe('0.400000')
+
+  // Exercise the production row -> useUsageData.openSession -> router path.
+  // The fixture observes the target route; it deliberately does not boot ChatView.
+  for (const [title, key] of [
+    ['制作我的世界复刻游戏', 'derived'], ['整理发布检查清单', 'transcript'],
+    ['手动命名任务', 'manual'], ['新一代独立任务', 'reused'],
+  ]) {
+    await rows.getByRole('link').filter({ hasText: title }).click()
+    await expect.poll(async () => {
+      const target = new URL((await page.getByTestId('usage-route').textContent())!, 'http://fixture')
+      return { path: target.pathname, session: target.searchParams.get('session') }
+    }).toEqual({ path: '/chat', session: `agent:main:webchat:${key}` })
+  }
   expect(errors).toEqual([])
 })

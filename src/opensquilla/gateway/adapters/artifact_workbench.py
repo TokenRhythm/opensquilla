@@ -215,13 +215,22 @@ class GatewayArtifactWorkbenchAdapter:
                 WorkbenchResourceQuery(self._text("sessionKey"), self._resource_ref())
             )
         elif method == "workbench.resources.open":
+            workspace_file = self._params.get("workspaceFile")
+            if workspace_file is not None:
+                if (
+                    self._params.get("resourceRef") is not None
+                    or self._params.get("resource") is not None
+                ):
+                    raise ValueError("resourceRef and workspaceFile are mutually exclusive")
+                workspace_file = dict(self._as_mapping(workspace_file, "workspaceFile"))
             result = await WorkbenchResourceApplication(cast(WorkbenchResourcePort, port)).open(
                 WorkbenchResourceOpen(
                     self._text("sessionKey"),
-                    self._resource_ref(),
+                    self._resource_ref() if workspace_file is None else None,
                     self._optional_idempotency_key(),
                     self._optional_text("expectedSha256"),
                     self._optional_text("intent") or "edit-current",
+                    workspace_file,
                 )
             )
         elif method == "workbench.previews.create":

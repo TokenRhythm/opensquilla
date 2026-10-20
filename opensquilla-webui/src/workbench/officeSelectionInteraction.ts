@@ -1,10 +1,20 @@
 import type { OfficeSelection } from '@/types/officeSelection'
 
 export interface OfficeSelectionLabels { text: string; element: string; range: string }
+export interface OfficeViewportRect { left: number; top: number; width: number; height: number }
+/** Transient screen geometry. Never persist this in OfficeSelection or pageContext. */
+export interface OfficeSelectionAnchor {
+  rect: OfficeViewportRect
+  rects: OfficeViewportRect[]
+  viewport: OfficeViewportRect
+  visible: boolean
+}
+export interface OfficeSelectionCommit { selection: OfficeSelection; anchor: OfficeSelectionAnchor | null }
 export interface OfficeHitTarget {
   kind: keyof OfficeSelectionLabels
   /** CSS pixels in browser viewport coordinates; never a write-back locator. */
   rect: { left: number; top: number; width: number; height: number }
+  rects?: OfficeViewportRect[]
   selection?: OfficeSelection
 }
 export interface OfficeSelectionInteractionOptions {
@@ -15,6 +25,9 @@ export interface OfficeSelectionInteractionOptions {
   clearNativeSelection(): void
   onSelection(value: OfficeSelection | null): void
   onSelectionCommit?(value: OfficeSelection): void
+  onSelectionCommitDetail?(value: OfficeSelectionCommit): void
+  onAnchorChange?(anchor: OfficeSelectionAnchor | null): void
+  resolveAnchor?(selection: OfficeSelection, hit?: OfficeHitTarget): Promise<OfficeSelectionAnchor | null>
 }
 
 /** Owns only annotation feedback. Normal text copying and sheet navigation remain native. */
@@ -41,10 +54,11 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
   selected.style.cssText = 'position:absolute;display:none;box-sizing:border-box;border:2px solid var(--accent);pointer-events:none;'
   layer.append(hover, selected)
   container.append(layer)
-  let enabled = false, destroyed = false, generation = 0, selectionGeneration = 0, frame = 0, busy = false
+  let enabled = false, locked = false, destroyed = false, generation = 0, selectionGeneration = 0, frame = 0, busy = false
   let pointer: { x: number; y: number } | null = null
   let press: { x: number; y: number } | null = null
   let current: OfficeSelection | null = null
+  let committed = false, anchorGeneration = 0
   type Gesture = { kind: 'pointer'; pointerId: number; committed: boolean; released: boolean; hit: Promise<OfficeHitTarget | null> }
     | { kind: 'keyboard'; key: string; committed: boolean; released: boolean }
   let gesture: Gesture | null = null
@@ -65,6 +79,9 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
     press = null
     selected.style.display = 'none'
     current = null
+    committed = false
+    anchorGeneration += 1
+    options.onAnchorChange?.(null)
     const selection = document.getSelection()
     if (selection && ((selection.anchorNode && container.contains(selection.anchorNode))
       || (selection.focusNode && container.contains(selection.focusNode)))) selection.removeAllRanges()
@@ -76,13 +93,31 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
     if (commitFrame) window.cancelAnimationFrame(commitFrame)
     commitFrame = 0
   }
-  function commitSelection(owner: Gesture, value: OfficeSelection) {
+  async function commitSelection(owner: Gesture, value: OfficeSelection, hit?: OfficeHitTarget) {
     if (!enabled || destroyed || gesture !== owner || owner.committed) return
     // Mark first: opening the input can synchronously clear or destroy this preview.
     owner.committed = true
     current = value
+    committed = true
     options.onSelection(value)
+    const run = ++anchorGeneration
+    const resolving = options.resolveAnchor?.(value, hit).catch(() => null)
     if (enabled && !destroyed && gesture === owner) options.onSelectionCommit?.(value)
+    const anchor = await resolving ?? null
+    if (enabled && !destroyed && gesture === owner && run === anchorGeneration) {
+      if (anchor?.visible) draw(selected, { kind: value.kind, rect: anchor.rect })
+      options.onAnchorChange?.(anchor)
+      options.onSelectionCommitDetail?.({ selection: value, anchor })
+    }
+  }
+  async function refreshAnchor() {
+    if ((!enabled && !locked) || destroyed || !current || !committed) return
+    const value = current, run = ++anchorGeneration
+    const anchor = await options.resolveAnchor?.(value).catch(() => null) ?? null
+    if (destroyed || (!enabled && !locked) || current !== value || run !== anchorGeneration) return
+    if (anchor?.visible) draw(selected, { kind: value.kind, rect: anchor.rect })
+    else selected.style.display = 'none'
+    options.onAnchorChange?.(anchor)
   }
   function scheduleNativeCommit(owner: Gesture) {
     if (commitFrame || owner.committed || gesture !== owner) return
@@ -98,7 +133,7 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
           if (owner.kind === 'pointer' && !(await owner.hit)) return
           if (!enabled || destroyed || gesture !== owner || owner.committed) return
           const value = options.readNativeSelection()
-          if (value && value.kind !== 'element') commitSelection(owner, value)
+          if (value && value.kind !== 'element') void commitSelection(owner, value)
         } catch { /* A selection lost during navigation is not an annotation. */ }
       })() })
     })
@@ -161,6 +196,9 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
     invalidateHover()
     selected.style.display = 'none'
     current = null
+    committed = false
+    anchorGeneration += 1
+    options.onAnchorChange?.(null)
     options.onSelection(null)
     press = { x: event.clientX, y: event.clientY }
   }
@@ -196,6 +234,8 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
     cancelGesture()
     invalidateHover()
     selected.style.display = 'none'
+    committed = false
+    anchorGeneration += 1
     gesture = { kind: 'keyboard', key, committed: false, released: false }
   }
   function onKeyUp(event: KeyboardEvent) {
@@ -217,13 +257,16 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
       const hit = await owner.hit
       if (!enabled || destroyed || run !== selectionGeneration || gesture !== owner || owner.committed || !hit?.selection) return
       draw(selected, hit)
-      commitSelection(owner, hit.selection)
+      void commitSelection(owner, hit.selection, hit)
     } catch { /* A missed object leaves the current selection empty. */ }
   }
   function onScroll(event: Event) {
     const target = event.target
-    if (enabled && (target === window || (target instanceof Node
-      && (container.contains(target) || target.contains(container))))) invalidateFeedback()
+    if ((enabled || locked) && (target === window || (target instanceof Node
+      && (container.contains(target) || target.contains(container))))) {
+      invalidateFeedback()
+      void refreshAnchor()
+    }
   }
   function onLeave() { invalidateHover() }
   container.addEventListener('pointermove', onPointerMove)
@@ -235,18 +278,44 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
   window.addEventListener('pointerup', onPointerUp, true)
   window.addEventListener('pointercancel', onPointerCancel, true)
   window.addEventListener('scroll', onScroll, true)
+  window.addEventListener('resize', onResize)
+  function onResize() { invalidateFeedback(); void refreshAnchor() }
   return {
     get enabled() { return enabled && !destroyed },
-    setSelectionMode(value: boolean) {
-      if (destroyed || enabled === value) return
+    get locked() { return locked && !destroyed },
+    get tracking() { return (enabled || locked) && !destroyed },
+    setSelectionMode(value: boolean, preserveCommitted = false) {
+      if (destroyed || (enabled === value && locked === preserveCommitted)) return
       enabled = value
-      clearSelection()
+      locked = preserveCommitted
+      if (locked) {
+        // Stop picking without disposing the target being edited. Geometry and
+        // highlighting continue to track its viewport while the input owns focus.
+        selectionGeneration += 1
+        cancelGesture()
+        invalidateHover()
+        press = null
+        void refreshAnchor()
+      } else clearSelection()
     },
     clearSelection,
+    clearTransientSelection: clearSelection,
+    refreshAnchor,
+    showSelection(value: OfficeSelection, anchor: OfficeSelectionAnchor | null) {
+      if (destroyed) return
+      cancelGesture()
+      current = value
+      committed = true
+      anchorGeneration += 1
+      if (anchor?.visible) draw(selected, { kind: value.kind, rect: anchor.rect })
+      else selected.style.display = 'none'
+      options.onSelection(value)
+      options.onAnchorChange?.(anchor)
+    },
     invalidateFeedback,
     nativeSelection(value: OfficeSelection | null) {
       if (!enabled || destroyed) return
-      if (value || current?.kind !== 'element') {
+      if (!committed && (value || current?.kind !== 'element')) {
         current = value
         selected.style.display = 'none'
         options.onSelection(value)
@@ -255,6 +324,7 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
     destroy() {
       if (destroyed) return
       enabled = false
+      locked = false
       clearSelection()
       destroyed = true
       container.removeEventListener('pointermove', onPointerMove)
@@ -266,6 +336,7 @@ export function createOfficeSelectionInteraction(options: OfficeSelectionInterac
       window.removeEventListener('pointerup', onPointerUp, true)
       window.removeEventListener('pointercancel', onPointerCancel, true)
       window.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('resize', onResize)
       layer.remove()
       if (adjustedPosition) container.style.position = originalPosition
     },

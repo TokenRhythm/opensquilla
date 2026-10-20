@@ -650,6 +650,19 @@ describe('router card recovery projection', () => {
     }).renderedMessages
   }
 
+  it.each([false, true])('preserves wire replay=%s as display provenance without settling the turn', replayed => {
+    const h = setup()
+    try {
+      h.api.handlers.onWireEventFixture('session.event.router_decision', decision(10), { replayed })
+      expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
+      const card = h.messages.value.find(message => message.role === 'router')!
+      expect(card.routerReplayed === true).toBe(replayed)
+      expect(card.routerSettled).toBeUndefined()
+      expect(card.restoredFromHistory).toBeUndefined()
+      expect(h.queueRouterDecision).toHaveBeenCalledWith(expect.any(Object), undefined, replayed)
+    } finally { h.stop() }
+  })
+
   it('keeps the provisional row mounted when it acquires real event and call identities', () => {
     const h = setup()
     const emit = h.api.handlers.onWireEventFixture
@@ -770,7 +783,7 @@ describe('router card recovery projection', () => {
     } finally { h.stop() }
   })
 
-  it('keeps buffered replay attempts isolated while an in-place recovery installs its snapshot', () => {
+  it.each([false, true])('keeps buffered replay attempts isolated with wire replay=%s during snapshot recovery', replayed => {
     const h = setup(true)
     const emit = h.api.handlers.onWireEventFixture
     const firstText = { ...envelope(12), text: 'first', model_call_id: '1.0', iteration: 1 }
@@ -790,7 +803,7 @@ describe('router card recovery projection', () => {
       emit('session.event.router_control_replay', envelope(20))
       emit('session.event.ensemble_progress', progress(21, 'second'))
       emit('session.event.text_delta', { ...envelope(22), text: 'second', model_call_id: '2.0', iteration: 2 })
-      emit('session.event.router_decision', decision(23))
+      emit('session.event.router_decision', decision(23), { replayed })
 
       expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
       expect(h.lastStreamSeq.value).toBe(12)
@@ -802,6 +815,7 @@ describe('router card recovery projection', () => {
       expect(cards.map(card => card.messageId)).toEqual([`router-${key}-10`, `router-${key}-23`])
       expect(cards.map(card => card.ensemble?.models.map(model => model.model))).toEqual([['first'], ['second']])
       expect(cards.map(card => card.routerModelCallId)).toEqual(['1.0', '2.0'])
+      expect(cards.map(card => card.routerReplayed === true)).toEqual([true, replayed])
       expect(h.lastStreamSeq.value).toBe(23)
       expect(rendered.value.filter(message => message.isRouterStrip)).toHaveLength(2)
       expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
@@ -1693,9 +1707,10 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       expect(queueRouterDecision).toHaveBeenCalledOnce()
-      const [payload, identityStreamSeq] = queueRouterDecision.mock.calls[0]!
+      const [payload, identityStreamSeq, replayed] = queueRouterDecision.mock.calls[0]!
       expect(payload).not.toHaveProperty('stream_seq')
       expect(identityStreamSeq).toBe(17)
+      expect(replayed).toBe(true)
       expect(lastStreamSeq.value).toBe(900)
     } finally {
       stop()

@@ -64,6 +64,20 @@ afterEach(() => {
 })
 
 describe('WorkbenchResourceCollectionPanel', () => {
+  it('shows authorized source paths for independent same-name files and opens the chosen identity', () => {
+    const original = { ...resource('document'), name: 'report.docx', sourcePath: 'preview-gallery/report.docx' }
+    const copy = { ...original, resource: createWorkbenchResourceRef('document', 'copy'), sourcePath: 'unregistered/report.docx' }
+    const onWorkbenchEvent = vi.fn()
+    const mounted = mount([original, copy], { onWorkbenchEvent })
+    const rows = [...mounted.element.querySelectorAll('.resource-collection__item')]
+    expect(rows).toHaveLength(2)
+    expect(rows[0]?.textContent).toContain('preview-gallery/report.docx')
+    expect(rows[1]?.textContent).toContain('unregistered/report.docx')
+    rows[1]!.querySelector<HTMLButtonElement>('.resource-collection__open')!.click()
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'resource-open', payload: copy })
+    mounted.app.unmount()
+  })
+
   it('uses one row action and does not expose a separate import pencil', () => {
     const legacySummaryOnly = resource('attachment')
     legacySummaryOnly.capabilities.manualEdit = false
