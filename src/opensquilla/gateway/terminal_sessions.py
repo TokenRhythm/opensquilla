@@ -116,10 +116,15 @@ class TerminalManager:
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_connections: set[str] = set()
         self._closing_connections: OrderedDict[str, None] = OrderedDict()
+        self._closed_creating: set[str] = set()
         self._creating: dict[str, int] = {}
         self._closing = False
 
     def _remember_closing_connection(self, conn_id: str) -> None:
+        # A native spawn may outlive the bounded connection history. Retain its
+        # close fence until every in-flight create releases its admission slot.
+        if conn_id in self._creating:
+            self._closed_creating.add(conn_id)
         self._closing_connections[conn_id] = None
         self._closing_connections.move_to_end(conn_id)
         while len(self._closing_connections) > MAX_CLOSED_TERMINALS:
@@ -190,6 +195,7 @@ class TerminalManager:
         pending = self._creating.get(conn_id, 0)
         if pending <= 1:
             self._creating.pop(conn_id, None)
+            self._closed_creating.discard(conn_id)
         else:
             self._creating[conn_id] = pending - 1
 
@@ -207,7 +213,11 @@ class TerminalManager:
         output_flow_control: bool = False,
     ) -> dict[str, Any]:
         async with self._lock:
-            if self._closing or conn_id in self._closing_connections:
+            if (
+                self._closing
+                or conn_id in self._closing_connections
+                or conn_id in self._closed_creating
+            ):
                 raise TerminalSessionError(
                     "TERMINAL_CLOSED", "Gateway terminal sessions are shutting down"
                 )
@@ -326,7 +336,11 @@ class TerminalManager:
                 # Recheck after the potentially slow native spawn. A
                 # concurrent create cannot use the race to exceed the
                 # per-connection bound.
-                if self._closing or conn_id in self._closing_connections:
+                if (
+                    self._closing
+                    or conn_id in self._closing_connections
+                    or conn_id in self._closed_creating
+                ):
                     raise TerminalSessionError(
                         "TERMINAL_CLOSED", "Gateway terminal sessions are shutting down"
                     )
