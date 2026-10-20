@@ -39,7 +39,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const requests: Observed[] = []
   const held: HeldPiece[] = []
   const staged: Array<{ connection: number; delivery: number }> = []
-  const snapshots = new Map<string, { id: string; bytes: Buffer; subscribed: boolean }>()
+  const snapshots = new Map<string, { id: string; bytes: Buffer; subscribed: boolean; streamSeq: number }>()
   const rejectedResumes: Observed[] = []
   const heldSubscriptions: Observed[] = []
   const hydratedPlanRevisions: string[] = []
@@ -47,6 +47,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const liveFrames: string[] = []
   let activeTurn: { socket: WebSocketRoute; key: string; task: string } | null = null
   let streamSequence = 0
+  let otherStateSequence = 0
   let lastTask: Record<string, unknown> | null = null
   let faultActive = mode === 'lost-subscribe'
   const emitTurn = (event: string, payload: Record<string, unknown>) => {
@@ -112,6 +113,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
         let snapshot = snapshots.get(owner)
         if (!snapshot) {
           const large = mode === 'progressing' && key === SESSION
+          const snapshotSeq = large ? 1 : key === SESSION ? streamSequence : otherStateSequence
           const value = sessionMessagesSnapshotPayload(key, {
             stream_generation: GENERATION,
             // A complete JSON snapshot requires eight physical 192 KiB pieces.
@@ -121,11 +123,11 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
               stream_seq: 1, text: 'x'.repeat(7 * PIECE),
             } }] : [],
             task_id: large ? 'synthetic-progress-task' : null,
-            current_stream_seq: large ? 1 : 0,
+            current_stream_seq: snapshotSeq,
           })
           snapshot = {
             id: `synthetic-snapshot-${snapshots.size + 1}`,
-            bytes: Buffer.from(JSON.stringify(value)), subscribed: subscriptions.has(key),
+            bytes: Buffer.from(JSON.stringify(value)), subscribed: subscriptions.has(key), streamSeq: snapshotSeq,
           }
           snapshots.set(owner, snapshot)
         }
@@ -136,7 +138,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
           segment_index: index, segment_count: Math.ceil(snapshot.bytes.length / PIECE),
           byte_length: snapshot.bytes.length, encoding: 'base64-json-utf8',
           data: snapshot.bytes.subarray(index * PIECE, (index + 1) * PIECE).toString('base64'),
-          stream_generation: GENERATION, current_stream_seq: mode === 'progressing' && key === SESSION ? 1 : 0,
+          stream_generation: GENERATION, current_stream_seq: snapshot.streamSeq,
           task_id: mode === 'progressing' && key === SESSION ? 'synthetic-progress-task' : null,
           session_id: null, session_epoch: null,
           delivery: { delivery_epoch: epoch, delivery_id: delivery },
@@ -227,9 +229,20 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
     })
   })
   const tick = () => sockets.forEach(socket => socket.send(JSON.stringify({
-    type: 'event', event: 'tick', payload: { time_ms: Date.now() }, seq: 1,
+    type: 'event', event: 'tick', payload: { time_ms: Date.now() },
   })))
-  return { sockets, requests, held, staged, tick, rejectedResumes, heldSubscriptions, hydratedPlanRevisions,
+  const stateChanged = (key = SESSION, options: { seq?: number; replayed?: boolean } = {}) => {
+    const seq = options.seq ?? (key === SESSION ? ++streamSequence : ++otherStateSequence)
+    sockets.at(-1)!.send(JSON.stringify({
+      type: 'event', event: 'session.event.state_change', payload: {
+        key, session_key: key, stream_generation: GENERATION, stream_seq: seq,
+        from_state: 'running', to_state: 'idle',
+      },
+      ...(options.replayed ? { meta: { replayed: true } } : {}),
+    }))
+    return seq
+  }
+  return { sockets, requests, held, staged, tick, stateChanged, rejectedResumes, heldSubscriptions, hydratedPlanRevisions,
     beginReply: () => emitTurn('session.event.text_delta', { text: REPLY }),
     finishReply: () => {
       if (!activeTurn) throw new Error('No explicit user turn to finish')
@@ -343,6 +356,136 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   expect(page.url()).toBe(originalUrl)
   expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
   expect(gateway.sockets).toHaveLength(1)
+})
+
+test('recovers an exhausted session read after a current session event without resending the draft', async ({ page }) => {
+  test.setTimeout(60_000)
+  const gateway = await prepare(page, 'lost-subscribe')
+  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+  await expect.poll(() => calls(gateway.requests, READ).length, { timeout: 15_000 }).toBe(1)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  const notice = page.getByTestId('chat-session-recovery-status')
+  await input.fill(DRAFT)
+  const editor = await input.elementHandle()
+  const originalUrl = page.url()
+
+  // Exhaust the production incident budget while ping/pong keeps this same
+  // socket healthy. None of the original subscribe/history requests succeeds.
+  await advance(page, 125_000)
+  await expect(send).toBeDisabled()
+  await expect(notice).toHaveAttribute('data-recovery-state', 'live-degraded')
+  const readMethods = new Set([
+    READ, RESUME, 'sessions.messages.subscribe', 'sessions.messages.hydrate', 'chat.history',
+  ])
+  const sessionReads = () => gateway.requests.filter(request => readMethods.has(request.method))
+  const exhaustedReads = sessionReads().length
+  expect(gateway.sockets).toHaveLength(1)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+
+  // A genuinely new event permits one failed probe. It must stop again,
+  // including when that same event or a replayed newer event arrives later.
+  const failedWakeSeq = gateway.stateChanged()
+  // Admission still honors the exhausted incident's existing backoff.
+  await advance(page, 25_000)
+  const failedWakeReads = sessionReads().length
+  expect(failedWakeReads).toBeGreaterThan(exhaustedReads)
+  await expect(send).toBeDisabled()
+  for (let index = 0; index < 3; index++) {
+    gateway.stateChanged(SESSION, { seq: failedWakeSeq })
+    gateway.stateChanged(SESSION, { replayed: true })
+    gateway.tick()
+    await advance(page, 5_000)
+  }
+  expect(sessionReads()).toHaveLength(failedWakeReads)
+
+  // Service recovery alone is silent. Ordinary ticks and another session's
+  // lifecycle events must not turn the exhausted episode into perpetual reads.
+  gateway.releaseFault()
+  for (let index = 0; index < 6; index++) {
+    gateway.tick()
+    gateway.stateChanged(OTHER)
+    await advance(page, 5_000)
+  }
+  expect(sessionReads()).toHaveLength(failedWakeReads)
+  await expect(send).toBeDisabled()
+  await expectComposerValue(input, DRAFT)
+
+  gateway.stateChanged()
+  for (let seconds = 0; seconds < 10 && !await send.isEnabled(); seconds++) {
+    await advance(page, 1_000)
+  }
+  await expect(send).toBeEnabled()
+  await expect(notice).toHaveCount(0)
+  expect(sessionReads().length).toBeGreaterThan(failedWakeReads)
+  await expectComposerValue(input, DRAFT)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  expect(gateway.sockets).toHaveLength(1)
+  expect(page.url()).toBe(originalUrl)
+  expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
+  expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
+
+  const recoveredReads = sessionReads().length
+  gateway.tick()
+  gateway.stateChanged(OTHER)
+  await advance(page, 15_000)
+  expect(sessionReads()).toHaveLength(recoveredReads)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await expectComposerValue(input, DRAFT)
+
+  await input.press('Enter')
+  await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+  expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({
+    sessionKey: SESSION, message: DRAFT,
+  })
+  await expectComposerValue(input, '')
+  gateway.beginReply()
+  gateway.finishReply()
+  await advance(page, 10_000)
+  const reply = page.locator('.msg-ai-text').filter({ hasText: REPLY })
+  await expect(reply).toHaveCount(1)
+  await expect(reply).toHaveText(REPLY)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+  expect(gateway.sockets).toHaveLength(1)
+})
+
+test('recovers an exhausted session read after transport wake confirmation on the same socket', async ({ page }) => {
+  test.setTimeout(60_000)
+  const gateway = await prepare(page, 'lost-subscribe')
+  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+  await expect.poll(() => calls(gateway.requests, READ).length, { timeout: 15_000 }).toBe(1)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  await input.fill(DRAFT)
+  const editor = await input.elementHandle()
+  const originalUrl = page.url()
+  await advance(page, 125_000)
+  await expect(send).toBeDisabled()
+  const readsBeforeWake = calls(gateway.requests, READ).length
+  expect(gateway.sockets).toHaveLength(1)
+
+  gateway.releaseFault()
+  // Existing visibility recovery performs its nonce probe and returns from
+  // checking to connected. No Check click or replacement WebSocket is needed.
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+  for (let seconds = 0; seconds < 25 && !await send.isEnabled(); seconds++) {
+    await advance(page, 1_000)
+  }
+  await expect(send).toBeEnabled()
+  await expect(page.getByTestId('chat-session-recovery-status')).toHaveCount(0)
+  expect(calls(gateway.requests, READ).length).toBeGreaterThan(readsBeforeWake)
+  expect(gateway.sockets).toHaveLength(1)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await expectComposerValue(input, DRAFT)
+  expect(page.url()).toBe(originalUrl)
+  expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
+  expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
+
+  const recoveredReads = calls(gateway.requests, READ).length
+  await advance(page, 15_000)
+  expect(calls(gateway.requests, READ)).toHaveLength(recoveredReads)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await expectComposerValue(input, DRAFT)
 })
 
 test('stays degraded beyond the foreground deadline and does not resurrect a dismissed notice', async ({ page }) => {

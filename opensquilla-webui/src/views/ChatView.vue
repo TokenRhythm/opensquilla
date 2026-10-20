@@ -3024,6 +3024,7 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   connectionState: gatewayConnectionState,
   metadataRecoveryError: chatSessionSubscription.metadataRecoveryError,
   retryMetadata: () => retrySessionMetadata(),
+  metadataReady: presentationMetadataReady,
   incidentScope: () => deliveryIdentity.value ?? '',
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
@@ -4836,6 +4837,7 @@ watch([sessionKey, isStreaming], ([key, streaming], [previousKey, wasStreaming])
 const stallWatchdog = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: streamIdleTimeoutMs })
 const { stallActive, stallSeconds } = stallWatchdog
 
+let recoveryWakePosition: { owner: string; generation: string; seq: number } | null = null
 const chatRpcSubscriptions = useChatRpcSubscriptions({
   // The private v4 adapter emits one semantic message. Feed that projection to
   // both business consumers without exposing protocol names in the view.
@@ -4850,7 +4852,23 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
       )
     }
     const previousEpoch = currentEpoch.value
+    const previousStreamSeq = lastStreamSeq.value
     const result = rpcEventHandlers.consumeConversationEvent(message)
+    if (message.kind === 'conversation' && message.event.kind === 'known'
+      && message.event.sessionKey === sessionKey.value
+      && !message.event.meta.replayed
+      && (message.event.semanticKind === 'state-changed' || message.event.semanticKind === 'turn-committed')) {
+      const event = message.event
+      if (event.payload.epoch !== undefined && event.payload.epoch < currentEpoch.value) return result
+      const owner = JSON.stringify([deliveryIdentity.value, sessionKey.value, currentEpoch.value])
+      const seenSeq = recoveryWakePosition?.owner === owner
+        && recoveryWakePosition.generation === event.streamGeneration ? recoveryWakePosition.seq : 0
+      if (event.streamGeneration && (!streamGeneration.value || event.streamGeneration === streamGeneration.value)
+        && event.streamSeq !== null && event.streamSeq > Math.max(previousStreamSeq, seenSeq)) {
+        recoveryWakePosition = { owner, generation: event.streamGeneration, seq: event.streamSeq }
+        chatSessionBootstrap.recoverAfterServiceWake()
+      }
+    }
     if (currentEpoch.value !== previousEpoch) {
       const viewGeneration = sessionViewCache.generation.value
       sessionViewCache.observeEpoch(sessionKey.value, currentEpoch.value)

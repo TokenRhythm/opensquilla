@@ -33,8 +33,9 @@ interface ActiveBootstrapState {
   leaseReady: Promise<SessionReadLease>
   criticalRequestsQueued: Promise<void>
   readonly incident: RecoveryIncident
-  readonly scope: string
+  scope: string
   acceptedScope?: string
+  wakeDeadlineAt?: number
   history: PhaseRuntime<SessionPhaseResult>
   live: PhaseRuntime<SessionSubscriptionOutcome>
 }
@@ -80,6 +81,7 @@ export interface UseChatSessionBootstrapOptions {
   retryMetadata?: () => Promise<unknown>
   /** Deferred task metadata can fail independently of a healthy live ACK. */
   metadataRecoveryError?: Readonly<Ref<unknown>>
+  metadataReady?: Readonly<Ref<boolean>>
   cancelHistory: () => void
   cancelSubscription: () => void
 }
@@ -151,10 +153,13 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   async function waitForAdmission(run: ActiveBootstrap): Promise<void> {
     while (run.incident.notBefore > Date.now()) {
       if (!await waitBeforeRetry(new SessionReadFailure('busy', 'Session recovery is waiting.', true,
-        run.incident.notBefore - Date.now()), run, run.incident.deadlineAt)) throw exhausted()
+        run.incident.notBefore - Date.now()), run, recoveryDeadline(run))) throw exhausted()
     }
     if (!isCurrent(run)) throw new SessionReadFailure('aborted', 'Session recovery owner changed.', false)
-    if (Date.now() >= run.incident.deadlineAt) throw exhausted()
+    if (Date.now() >= recoveryDeadline(run)) throw exhausted()
+  }
+  function recoveryDeadline(run: ActiveBootstrap): number {
+    return run.wakeDeadlineAt ?? run.incident.deadlineAt
   }
   function dismissRecoveryNotice() {
     const incident = incidentFor(options.sessionKey.value)
@@ -269,7 +274,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       }
       try {
         if (!run.lease) await run.leaseReady
-        if (retryFirst && (run.incident.notBefore > Date.now() || Date.now() >= run.incident.deadlineAt)) await waitForAdmission(run)
+        if (retryFirst && (run.incident.notBefore > Date.now() || Date.now() >= recoveryDeadline(run))) await waitForAdmission(run)
       } catch (error) { return { ok: false, error } }
       while (phase.attempts < maxAttempts && isCurrent(run)) {
         if (Date.now() >= phase.deadlineAt) break
@@ -343,7 +348,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       let result: SessionSubscriptionOutcome
       try {
         if (!run.lease) await run.leaseReady
-        if (run.incident.notBefore > Date.now() || Date.now() >= run.incident.deadlineAt) await waitForAdmission(run)
+        if (run.incident.notBefore > Date.now() || Date.now() >= recoveryDeadline(run)) await waitForAdmission(run)
         const controller = new AbortController()
         const cancel = () => controller.abort()
         run.controller.signal.addEventListener('abort', cancel, { once: true })
@@ -354,7 +359,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
             reconcile && options.reconcileSession ? options.reconcileSession(context) : options.subscribeSession(context),
             new Promise<SessionSubscriptionOutcome>((_resolve, reject) => {
               timer = setTimeout(() => { controller.abort(); reject(exhausted()) },
-                Math.max(0, run.incident.deadlineAt - Date.now()))
+                Math.max(0, recoveryDeadline(run) - Date.now()))
             }),
           ])
         } finally {
@@ -408,6 +413,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     includeHistory: boolean,
     liveDeadlineAt?: number,
     retainedIncident?: RecoveryIncident,
+    wakeDeadlineAt?: number,
   ): ActiveBootstrap {
     options.cancelHistory()
     options.cancelSubscription()
@@ -417,20 +423,22 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       incident.liveRecovered = false
     }
     if (liveDeadlineAt !== undefined) incident.deadlineAt = Math.min(incident.deadlineAt, liveDeadlineAt)
+    const deadlineAt = wakeDeadlineAt ?? incident.deadlineAt
     const run = ownership.start(key, includeHistory, (token): ActiveBootstrapState => ({
       lease: null,
       leaseReady: Promise.resolve(null as unknown as SessionReadLease),
       criticalRequestsQueued: Promise.resolve(),
       incident,
       scope: options.incidentScope?.() ?? '',
-      history: historyRuntime(Math.min(incident.deadlineAt,
+      wakeDeadlineAt,
+      history: historyRuntime(Math.min(deadlineAt,
         Math.max(token.deadlineAt, incident.notBefore + SESSION_BOOTSTRAP_BUDGET_MS))),
-      live: liveRuntime(incident.deadlineAt),
+      live: liveRuntime(deadlineAt),
     }))
     active = run
     const open = () => {
       if (!isCurrent(run)) throw new SessionReadFailure('aborted', 'Session recovery owner changed.', false)
-      if (Date.now() >= incident.deadlineAt) throw exhausted()
+      if (Date.now() >= recoveryDeadline(run)) throw exhausted()
       return run.lease = options.sessionReadLifecycle.open({
         sessionKey: key,
         ...(options.isProvisionalDraft?.() ? { provisionalDraft: true } : {}),
@@ -462,7 +470,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     // eager latest-history frame. Both projections consume that same lease.
     run.live.promise = runLivePhase(run)
     run.history.promise = includeHistory
-      ? runHistoryPhase(run, false)
+      ? runHistoryPhase(run, false, run.wakeDeadlineAt === undefined ? 2 : 1)
       : Promise.resolve(EMPTY_HISTORY_RESULT)
     if (!includeHistory) historyPhase.value = 'ready'
     return publicRun(run)
@@ -513,6 +521,11 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   function retryHistory(explicit = true): Promise<SessionPhaseResult> {
     const key = options.sessionKey.value
     const run = active
+    if (!explicit && run?.wakeDeadlineAt !== undefined) return run.history.promise
+    if (explicit && run?.wakeDeadlineAt !== undefined) {
+      if (run.live.running || run.history.running) return run.history.promise
+      run.wakeDeadlineAt = undefined
+    }
     if (
       !run
       || run.key !== key
@@ -531,8 +544,10 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
 
   function retryLive(explicit = false): Promise<SessionSubscriptionOutcome> {
     const run = active
+    if (!explicit && run?.wakeDeadlineAt !== undefined) return run.live.promise
     if (explicit && run && isCurrent(run)) {
       if (run.live.running) return run.live.promise
+      run.wakeDeadlineAt = undefined
       beginRecovery(run.key, true, true)
       if (run.live.result?.error && !shouldRetrySessionPhase(run.live.result.error)) {
         const previousHistoryPhase = historyPhase.value
@@ -623,6 +638,29 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     return publicRun(run)
   }
 
+  function recoverAfterServiceWake(): SessionBootstrapRun | undefined {
+    const run = active
+    if (!run || run.key !== options.sessionKey.value || run.controller.signal.aborted
+      || ownership.shouldDeferConnectionState(run.key)
+      || options.connectionState?.value !== 'connected'
+      || Date.now() < run.incident.deadlineAt
+      || run.live.running || run.history.running || metadataRetryRunning) return
+    const recoverable = (error: unknown) => shouldRetrySessionPhase(error)
+      || (error instanceof SessionReadFailure && error.kind === 'budget-exhausted')
+    if (run.live.result?.sessionMissing
+      || (run.live.result?.error && !recoverable(run.live.result.error))
+      || (run.history.result?.error && !recoverable(run.history.result.error))
+      || (!recoverable(run.live.result?.error)
+      && !recoverable(run.history.result?.error)
+      && !shouldRetrySessionPhase(options.metadataRecoveryError?.value))) return
+    // One read, bounded independently of the expired episode. Repeated signals
+    // join it; failure retains backoff and has no automatic follow-up.
+    const includeHistory = run.includeHistory && historyPhase.value !== 'ready'
+    const deadlineAt = Math.max(Date.now(), run.incident.notBefore) + SESSION_PHASE_ATTEMPT_BUDGET_MS
+    return installRun(createRun(run.key, includeHistory, undefined, run.incident, deadlineAt), includeHistory)
+  }
+
+  let lastConnectionState = options.connectionState?.value
   function handleConnectionState(
     state: string,
     includeHistory = true,
@@ -645,6 +683,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
             deferred: true,
           }
     }
+    const reconnected = state === 'connected' && lastConnectionState !== 'connected'
+    lastConnectionState = state
     if (state === 'disconnected') {
       const key = options.sessionKey.value
       if (!key) return
@@ -662,13 +702,17 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       return startSessionBootstrap({ includeHistory, force: true })
     }
     if (state !== 'connected' || !options.sessionKey.value) return
+    if (reconnected) {
+      const recovered = recoverAfterServiceWake()
+      if (recovered) return recovered
+    }
 
     const run = active
     if (!run || run.key !== options.sessionKey.value || run.controller.signal.aborted) {
       return startSessionBootstrap({ includeHistory, force: true })
     }
     const scope = options.incidentScope?.() ?? ''
-    if ((run.scope && run.scope !== scope)
+    if (run.scope !== scope
       || (run.acceptedScope !== undefined && run.acceptedScope !== scope)) {
       // A late first identity (or a changed authority) invalidates the old
       // proof even while the socket stays connected. An unfinished recovery
@@ -678,10 +722,21 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         if (incident === run.incident) incidents.delete(identity)
       }
       incidents.set(incidentKey(run.key), run.incident)
+      if (!run.scope && run.acceptedScope === undefined && scope) {
+        // Bind the first identity to the in-flight read without opening another
+        // lease or splitting its deadline, server wait, and dismissal state.
+        run.scope = scope
+        return publicRun(run)
+      }
       return installRun(createRun(run.key, includeHistory, undefined,
-        run.incident.liveRecovered ? undefined : run.incident), includeHistory)
+        run.wakeDeadlineAt === undefined && run.incident.liveRecovered ? undefined : run.incident,
+        run.wakeDeadlineAt), includeHistory)
     }
+    if (run.wakeDeadlineAt !== undefined && isCurrent(run)) return publicRun(run)
     if (run.lease && !leaseIsCurrent(run)) {
+      if (run.wakeDeadlineAt !== undefined) {
+        return installRun(createRun(run.key, includeHistory, undefined, run.incident, run.wakeDeadlineAt), includeHistory)
+      }
       return startSessionBootstrap({ includeHistory, force: true })
     }
     if (run.live.running) {
@@ -705,16 +760,18 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   let recordedMetadataError: unknown
   const stopRecoveryWatch = options.connectionState ? watch(
     [options.sessionKey, options.connectionState, historyPhase, livePhase, liveAttemptCompletion,
-      () => options.metadataRecoveryError?.value, () => options.incidentScope?.()],
-    () => {
+      () => options.metadataRecoveryError?.value, () => options.incidentScope?.(),
+      () => options.metadataReady?.value],
+    (_values, previous) => {
       clearRecoveryTimer()
       const run = active
       if (!run || options.connectionState?.value !== 'connected') return
+      if (previous[1] !== 'connected' && recoverAfterServiceWake()) return
       const scope = options.incidentScope?.() ?? ''
-      if ((run.scope && run.scope !== scope)
+      if (run.scope !== scope
         || (run.acceptedScope !== undefined && run.acceptedScope !== scope)) {
         handleConnectionState('connected', run.includeHistory)
-        return
+        if (active !== run) return
       }
       if (!isCurrent(run)) return
       const historyFailed = historyPhase.value === 'error'
@@ -724,19 +781,24 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       const liveFailed = (livePhase.value === 'degraded'
         && !run.live.result?.sessionMissing
         && shouldRetrySessionPhase(run.live.result?.error))
-      if (!historyFailed && !liveFailed && !metadataFailed) {
-        if (historyPhase.value === 'ready' && livePhase.value === 'ready') {
-          run.incident.recovered = true
-          recordedMetadataError = undefined
-        }
-        return
-      }
-      if (metadataRetryRunning) return
-      if (metadataFailed && options.metadataRecoveryError?.value !== recordedMetadataError) {
-        beginRecovery(run.key)
+      if (metadataFailed && !metadataRetryRunning && options.metadataRecoveryError?.value !== recordedMetadataError) {
+        if (run.wakeDeadlineAt === undefined) beginRecovery(run.key)
         recordedMetadataError = options.metadataRecoveryError?.value
         noteRecoveryFailure(run.incident, recordedMetadataError)
       }
+      if (!historyFailed && !liveFailed && !metadataFailed) {
+        if (historyPhase.value === 'ready' && livePhase.value === 'ready'
+          && options.metadataReady?.value !== false && !options.metadataRecoveryError?.value) {
+          run.incident.recovered = true
+          recordedMetadataError = undefined
+          // A wake is only a hint. Repeated hints cannot renew the automatic
+          // allowance until all required reads have actually recovered.
+          run.wakeDeadlineAt = undefined
+        }
+        return
+      }
+      if (run.wakeDeadlineAt !== undefined) return
+      if (metadataRetryRunning) return
       if (Date.now() >= run.incident.deadlineAt) return
       const delayMs = Math.min(run.incident.deadlineAt - Date.now(),
         Math.max(0, run.incident.notBefore - Date.now()))
@@ -786,6 +848,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     setSessionHandoffTarget,
     isSessionBootstrapCurrent,
     currentSessionBootstrap,
+    recoverAfterServiceWake,
     isLiveReady,
     ensureLiveReady: async (key = options.sessionKey.value): Promise<boolean> => {
       if (key !== options.sessionKey.value) return false
