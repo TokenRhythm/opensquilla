@@ -2,12 +2,14 @@ $ErrorActionPreference = 'Stop'
 
 # Read-only observation of common build workers. Never print command lines,
 # terminate processes, or infer that the rest of the host is idle.
-$processes = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='node.exe'")
+$processes = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='node.exe' OR Name='7za.exe' OR Name='7z.exe' OR Name='makensis.exe' OR Name='app-builder.exe'")
 $builders = @(
     foreach ($process in $processes) {
         $command = $process.CommandLine
         if (-not $command) { continue }
-        $kind = if ($command -match '(?i)pyinstaller') {
+        $kind = if ($process.Name -match '^(?i:7za|7z|makensis|app-builder)\.exe$') {
+            'archive-or-package-build'
+        } elseif ($command -match '(?i)pyinstaller') {
             'pyinstaller'
         } elseif ($command -match '(?i)build-gateway\.mjs|build-webui-dist\.mjs') {
             'application-build'

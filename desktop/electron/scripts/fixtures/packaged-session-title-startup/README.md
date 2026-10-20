@@ -20,7 +20,8 @@ benchmarks before collecting timings.
 Before formal timing, run a separate diagnostic pair for each fixture mix with
 both executables. This exercises the freshly built packages and supplies
 independent work counts; those diagnostic launches never enter timing results.
-Formal timing checks common Python/Node build workers before each launch and
+Formal timing checks common Python/Node build workers and native archive/package
+workers (7-Zip, NSIS and app-builder) before each launch and
 after its startup boundaries. A detected build fails the entire timing run.
 These read-only checks run outside the measured interval and do not terminate
 other tasks. They do not establish that all background host load is absent.
