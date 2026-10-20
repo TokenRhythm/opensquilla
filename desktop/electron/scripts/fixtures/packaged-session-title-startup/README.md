@@ -23,6 +23,10 @@ independent work counts; those diagnostic launches never enter timing results.
 Formal timing checks common Python/Node build workers and native archive/package
 workers (7-Zip, NSIS and app-builder) before each launch and
 after its startup boundaries. A detected build fails the entire timing run.
+With `--wait-for-builds`, a failed pre-launch check waits and retries every 30
+seconds, outside the measured interval. A build detected after startup still
+fails the entire run; measured samples are never discarded or replaced in place.
+Every check and any pause remain in the report.
 These read-only checks run outside the measured interval and do not terminate
 other tasks. They do not establish that all background host load is absent.
 

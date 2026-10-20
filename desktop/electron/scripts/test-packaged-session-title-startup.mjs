@@ -4,6 +4,7 @@
 //   --python <python.exe> --workdir <new-short-directory> --output <new-report.json>
 //   [--pairs 6] [--verify-backfill] [--max-regression-ms 250] [--max-regression-ratio .05]
 //   [--read-diagnostics --named 45 --unnamed 5] (separate work-count evidence, not timing)
+//   [--wait-for-builds] (wait outside timing when preflight detects a build)
 // These are fresh-process launches with uncontrolled/warm OS caches, never a
 // claim about machine-cold cache. Run without concurrent builds or benchmarks.
 import assert from 'node:assert/strict'
@@ -39,6 +40,7 @@ const option = (name, fallback) => process.argv.includes(name) ? requiredOption(
 const pairs = Number(option('--pairs', '6'))
 const verifyBackfill = process.argv.includes('--verify-backfill')
 const readDiagnostics = process.argv.includes('--read-diagnostics')
+const waitForBuilds = process.argv.includes('--wait-for-builds')
 const named = Number(option('--named', '50'))
 const unnamed = Number(option('--unnamed', '0'))
 const maxRegressionMs = Number(option('--max-regression-ms', '250'))
@@ -70,6 +72,7 @@ const report = {
   readDiagnostics,
   timingEligible: !readDiagnostics && pairs > 0,
   buildDetection: 'Common build workers checked before launch and after startup; not full host isolation',
+  waitForBuilds,
   hostBuildChecks: [],
   thresholds: { maxRegressionMs, maxRegressionRatio },
   executables: {},
@@ -124,12 +127,18 @@ function protocolGuard(action) {
 }
 async function assertNoConcurrentBuilds(label, pair, phase, boundary) {
   if (!report.timingEligible) return
-  const state = JSON.parse(execFileSync('pwsh.exe', [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-File', join(fixture, 'inspect-build-processes.ps1'),
-  ], { encoding: 'utf8', windowsHide: true }))
-  report.hostBuildChecks.push({ label, pair, phase, boundary, ...state })
-  await persist()
-  assert.equal(state.clear, true, `Concurrent build detected at ${boundary}; timing run cannot pass`)
+  for (;;) {
+    const state = JSON.parse(execFileSync('pwsh.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-File', join(fixture, 'inspect-build-processes.ps1'),
+    ], { encoding: 'utf8', windowsHide: true }))
+    report.hostBuildChecks.push({ label, pair, phase, boundary, ...state })
+    await persist()
+    if (state.clear) return
+    assert.ok(waitForBuilds && boundary === 'before-launch',
+      `Concurrent build detected at ${boundary}; timing run cannot pass`)
+    console.log(JSON.stringify({ waitingForBuilds: true, label, pair, phase, observedAt: state.observedAt }))
+    await delay(30_000)
+  }
 }
 async function prepareProfile(root, seedPath) {
   const userData = join(root, 'u')
