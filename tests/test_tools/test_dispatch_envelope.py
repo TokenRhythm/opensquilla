@@ -2133,7 +2133,9 @@ async def test_dispatch_clamps_web_fetch_max_chars_before_handler() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dispatch_allows_transient_search_retry_but_retains_repeat_budget():
+async def test_dispatch_allows_transient_search_retry_but_retains_repeat_budget(
+    search_guard_runtime,
+):
     from opensquilla.search.canonical import run_canonical_web_search
     from opensquilla.search.types import SearchOptions, SearchProviderError, SearchResult
 
@@ -2148,7 +2150,9 @@ async def test_dispatch_allows_transient_search_retry_but_retains_repeat_budget(
 
     async def search(query, **kwargs):
         return json.dumps(await run_canonical_web_search(
-            SearchOptions(query=query, provider="tavily"), provider_factory=lambda name: Provider(),
+            SearchOptions(query=query, provider="tavily"),
+            runtime=search_guard_runtime,
+            provider_factory=lambda name: Provider(),
         ))
 
     registry = ToolRegistry()
@@ -3181,6 +3185,8 @@ async def test_dispatch_marks_explicit_web_search_failure_and_replays_terminal_o
     assert replay_payload["reason"] == "terminal_search_failure_replay"
     assert replay_payload["error_kind"] == "auth"
     assert replay_payload["retry_allowed"] is False
+    assert "Changing the query" in replay_payload["user_message"]
+    assert "Change the query" not in replay_payload["user_message"]
 
     diagnostic = next(
         payload
@@ -3420,6 +3426,294 @@ async def test_dispatch_terminal_search_ledger_isolated_by_turn_key() -> None:
     assert next_turn.execution_status["reason"] == "search_blocked"
 
 
+@pytest.fixture
+def search_guard_runtime():
+    from opensquilla.search.runtime_config import (
+        ResolvedSearchRuntime,
+        SearchProviderRuntimeConfig,
+        SearchRuntimeConfig,
+    )
+
+    providers = {
+        name: SearchProviderRuntimeConfig(
+            provider_id=name,
+            active_provider="duckduckgo",
+            runtime_supported=True,
+            requires_api_key=name != "duckduckgo",
+            env_key="",
+            capabilities=frozenset({"web", "freshness", "domain_filter"}),
+            credential_source="none" if name == "duckduckgo" else "configured",
+            api_key="" if name == "duckduckgo" else "synthetic-key",
+        )
+        for name in ("duckduckgo", "brave", "tavily")
+    }
+    return ResolvedSearchRuntime(SearchRuntimeConfig(), providers)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_duckduckgo_challenge_blocks_changed_queries_across_tools(
+    search_guard_runtime,
+    monkeypatch,
+) -> None:
+    from dataclasses import replace
+
+    from opensquilla.search import canonical, runtime_config
+    from opensquilla.search import registry as search_registry
+    from opensquilla.search.turn_state import current_search_turn_state
+    from opensquilla.search.types import SearchProviderError
+    from opensquilla.tools.builtin import web
+    from opensquilla.tools.registry import get_default_registry
+
+    upstream_calls: list[str] = []
+    fetch_calls: list[str] = []
+    runtime = replace(
+        search_guard_runtime,
+        providers={"duckduckgo": search_guard_runtime.providers["duckduckgo"]},
+    )
+
+    class Provider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def search(self, query: str, max_results: int):
+            upstream_calls.append(self.name)
+            raise SearchProviderError("duckduckgo", "blocked", "Synthetic upstream challenge")
+
+    monkeypatch.setattr(canonical, "get_resolved_search_runtime", lambda: runtime)
+    monkeypatch.setattr(canonical, "_SEARCH_CACHE", {})
+    monkeypatch.setattr(runtime_config, "get_resolved_search_runtime", lambda: runtime)
+    monkeypatch.setattr(
+        runtime_config.ResolvedSearchRuntime, "build_provider", lambda self, name: Provider(name)
+    )
+    monkeypatch.setattr(search_registry, "get_provider", lambda name, **kwargs: Provider(name))
+    monkeypatch.setattr(web, "_active_provider", "duckduckgo")
+
+    async def fetch(url: str, **kwargs) -> str:
+        fetch_calls.append(url)
+        return json.dumps({"ok": True, "content": "Known public page"})
+
+    registry = ToolRegistry()
+    for tool_name in ("web_search", "web_discover"):
+        registered = get_default_registry().get(tool_name)
+        assert registered is not None
+        registry.register(
+            replace(registered.spec, sandbox=replace(registered.spec.sandbox, enforce=False)),
+            registered.handler,
+        )
+    registry.register(
+        ToolSpec(name="web_fetch", description="Fetch", parameters={"url": {"type": "string"}}),
+        fetch,
+    )
+    handler = build_tool_handler(
+        registry, ToolContext(tool_run_budget_key="synthetic-provider-health-turn")
+    )
+    first = await handler(
+        ToolCall("search-first", "web_search", {"query": "reference release"})
+    )
+    equivalent = await handler(
+        ToolCall("search-equivalent", "web_search", {"query": " reference release "})
+    )
+    changed = await handler(
+        ToolCall(
+            "search-changed",
+            "web_search",
+            {
+                "query": "reference update",
+                "mode": "news",
+                "recency": "day",
+                "include_domains": ["example.test"],
+                "provider": "duckduckgo",
+            },
+        )
+    )
+    discovered = await handler(
+        ToolCall("search-discover", "web_discover", {"query": "reference documentation"})
+    )
+    fetched = await handler(
+        ToolCall("search-fetch", "web_fetch", {"url": "https://example.test/"})
+    )
+
+    assert first.is_error and equivalent.is_error and changed.is_error and discovered.is_error
+    assert json.loads(equivalent.content)["error_kind"] == "blocked"
+    assert "Do not retry" in json.loads(equivalent.content)["error"]
+    assert json.loads(changed.content)["error_kind"] == "blocked"
+    assert json.loads(discovered.content)["retry_allowed"] is False
+    assert fetched.is_error is False
+    assert upstream_calls == ["duckduckgo"]
+    assert fetch_calls == ["https://example.test/"]
+    assert current_search_turn_state.get() is None
+
+    token = current_tool_context.set(
+        ToolContext(tool_run_budget_key="synthetic-next-provider-turn")
+    )
+    try:
+        next_turn = await handler(
+            ToolCall("search-next-turn", "web_search", {"query": "reference release"})
+        )
+    finally:
+        current_tool_context.reset(token)
+    assert next_turn.is_error is True
+    assert upstream_calls == ["duckduckgo", "duckduckgo"]
+    assert current_search_turn_state.get() is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_parallel_duckduckgo_queries_stop_after_first_challenge(
+    search_guard_runtime,
+) -> None:
+    from opensquilla.search.canonical import run_canonical_web_search
+    from opensquilla.search.turn_state import current_search_turn_state
+    from opensquilla.search.types import SearchOptions, SearchProviderError
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    waiting = asyncio.Event()
+    upstream_calls: list[str] = []
+
+    class Provider:
+        name = "duckduckgo"
+
+        async def search(self, query: str, max_results: int):
+            upstream_calls.append(query)
+            started.set()
+            await release.wait()
+            raise SearchProviderError("duckduckgo", "blocked", "Synthetic upstream challenge")
+
+    async def search(query: str, **kwargs) -> str:
+        if query == "second reference query":
+            waiting.set()
+        return json.dumps(
+            await run_canonical_web_search(
+                SearchOptions(query=query, provider="duckduckgo"),
+                runtime=search_guard_runtime,
+                provider_factory=lambda name: Provider(),
+            )
+        )
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(name="web_search", description="Search", parameters={"query": {"type": "string"}}),
+        search,
+    )
+    handler = build_tool_handler(
+        registry, ToolContext(tool_run_budget_key="synthetic-concurrent-provider-turn")
+    )
+    first = asyncio.create_task(
+        handler(ToolCall("first-search", "web_search", {"query": "first reference query"}))
+    )
+    await started.wait()
+    second = asyncio.create_task(
+        handler(ToolCall("second-search", "web_search", {"query": "second reference query"}))
+    )
+    await waiting.wait()
+    release.set()
+    results = await asyncio.gather(first, second)
+
+    assert upstream_calls == ["first reference query"]
+    assert all(result.is_error for result in results)
+    assert all(json.loads(result.content)["error_kind"] == "blocked" for result in results)
+    assert current_search_turn_state.get() is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_allows_configured_alternative_and_skips_blocked_duckduckgo_fallback(
+    search_guard_runtime,
+) -> None:
+    from dataclasses import replace
+
+    from opensquilla.search.canonical import run_canonical_web_search
+    from opensquilla.search.types import SearchOptions, SearchProviderError, SearchResult
+
+    runtime = replace(
+        search_guard_runtime,
+        config=replace(search_guard_runtime.config, fallback_policy="network"),
+    )
+    upstream_calls: list[str] = []
+
+    class Provider:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def search(self, query: str, max_results: int):
+            upstream_calls.append(self.name)
+            if self.name == "duckduckgo":
+                raise SearchProviderError("duckduckgo", "blocked", "Synthetic upstream challenge")
+            if query == "reference release":
+                return [SearchResult("Example", "https://example.test/", "Available result")]
+            raise SearchProviderError("brave", "timeout", "Synthetic timeout", retryable=True)
+
+    async def search(query: str, provider: str, **kwargs) -> str:
+        return json.dumps(
+            await run_canonical_web_search(
+                SearchOptions(query=query, provider=provider),
+                runtime=runtime,
+                provider_factory=Provider,
+            )
+        )
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="web_search",
+            description="Search",
+            parameters={"query": {"type": "string"}, "provider": {"type": "string"}},
+        ),
+        search,
+    )
+    handler = build_tool_handler(
+        registry, ToolContext(tool_run_budget_key="synthetic-fallback-provider-turn")
+    )
+    first = await handler(
+        ToolCall(
+            "blocked-first", "web_search", {"query": "reference release", "provider": "duckduckgo"}
+        )
+    )
+    alternate = await handler(
+        ToolCall(
+            "configured-alternate",
+            "web_search",
+            {"query": "reference release", "provider": "brave"},
+        )
+    )
+    fallback = await handler(
+        ToolCall(
+            "blocked-fallback", "web_search", {"query": "reference guide", "provider": "brave"}
+        )
+    )
+
+    assert first.is_error and fallback.is_error
+    assert alternate.is_error is False
+    assert json.loads(alternate.content)["ok"] is True
+    assert upstream_calls == ["duckduckgo", "brave", "brave"]
+    assert json.loads(fallback.content)["error_kind"] == "blocked"
+    assert json.loads(fallback.content)["retry_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_resets_search_state_after_exception() -> None:
+    from opensquilla.search.turn_state import SearchTurnState, current_search_turn_state
+
+    outer_state = SearchTurnState()
+    states: list[SearchTurnState | None] = []
+
+    async def boom() -> str:
+        states.append(current_search_turn_state.get())
+        raise ValueError("Synthetic failure")
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(name="boom", description="Fail", parameters={}), boom)
+    handler = build_tool_handler(registry, ToolContext(tool_run_budget_key="synthetic-state-reset"))
+    token = current_search_turn_state.set(outer_state)
+    try:
+        result = await handler(ToolCall("state-exception", "boom", {}))
+        assert result.is_error is True
+        assert current_search_turn_state.get() is outer_state
+    finally:
+        current_search_turn_state.reset(token)
+    assert len(states) == 1
+    assert states[0] is not None and states[0] is not outer_state
+
+
 @pytest.mark.asyncio
 async def test_repeated_reads_return_real_results_without_runtime_notices(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_REPEATED_CALL_NOTICE", "1")
@@ -3448,3 +3742,67 @@ async def test_repeated_reads_return_real_results_without_runtime_notices(monkey
     assert calls == ["data.json"] * 3
     assert [result.content for result in results] == contents
     assert all(not result.is_error for result in results)
+
+
+async def test_unattended_finalizer_keeps_loop_responsive_during_stale_claim_cleanup(
+    tmp_path, monkeypatch,
+):
+    import sqlite3
+    import threading
+    from contextlib import closing
+
+    from opensquilla.application.approval_queue import ApprovalQueue
+    from opensquilla.tools.policy.finalize import finalize
+
+    path = tmp_path / "finalizer.sqlite"
+    queue = ApprovalQueue(db_path=str(path))
+    approval_id = queue.request("exec", {"reviewer": "user", "humanActionable": True})
+    queue._conn.execute(
+        "UPDATE approval_queue SET claim_token = 'expired', claim_started_at = 0"
+    )
+    locked, release, started = threading.Event(), threading.Event(), threading.Event()
+    forced_release = threading.Event()
+    loop_thread = threading.get_ident()
+    sql_threads = []
+
+    def trace(sql):
+        sql_threads.append(threading.get_ident())
+        if sql.startswith("BEGIN IMMEDIATE"):
+            started.set()
+
+    def hold_writer():
+        with closing(sqlite3.connect(path)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            locked.set()
+            if not release.wait(3):
+                forced_release.set()
+            connection.rollback()
+
+    queue._conn.set_trace_callback(trace)
+    monkeypatch.setattr("opensquilla.gateway.approval_queue.get_approval_queue", lambda: queue)
+    holder = threading.Thread(target=hold_writer)
+    holder.start()
+    task = None
+    try:
+        assert await asyncio.to_thread(locked.wait, 3)
+        task = asyncio.create_task(finalize(
+            call=ToolCall(tool_use_id="probe", tool_name="exec_command", arguments={}),
+            ctx=ToolContext(
+                caller_kind=CallerKind.CRON, interaction_mode=InteractionMode.UNATTENDED,
+            ),
+            raw_result={"status": "approval_required", "approval_id": approval_id},
+            exception=None, artifact_start=0, budget_tracker=None, registered=None,
+        ))
+        assert await asyncio.to_thread(started.wait, 3)
+        assert not forced_release.is_set()
+        assert not task.done()
+        release.set()
+        result = await task
+        assert result.execution_status["reason"] == "approval_pending"
+        assert sql_threads and loop_thread not in sql_threads
+    finally:
+        release.set()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(holder.join, 3)
+        queue.close()

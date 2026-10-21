@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -76,7 +77,10 @@ async def test_frozen_code_gate_and_backend_receive_the_same_code(
     )
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(code_exec, "gate_action", gate)
-    monkeypatch.setattr(code_exec, "consume_backend_denial_retry", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        code_exec, "consume_backend_denial_retry_async",
+        AsyncMock(side_effect=lambda *_a, **_k: None),
+    )
     monkeypatch.setattr(code_exec, "_run_backend_with_managed_network_if_needed", backend)
     token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path), run_mode="safe"))
     try:

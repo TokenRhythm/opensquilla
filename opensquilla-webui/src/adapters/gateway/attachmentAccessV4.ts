@@ -1,10 +1,13 @@
 import type { DisplayAttachment } from '@/types/chat'
+import { downloadRetainedAttachment } from './attachmentDownloadV4'
 import { isImageAttachmentMime } from '@/utils/chat/attachments'
 import type {
   ArtifactAccessRequest,
   ArtifactContentAccess,
   AttachmentUploadReceipt,
+  AttachmentTextPreview,
 } from '@/modules/artifactWorkbench'
+import { boundedTextPreview } from '@/utils/chat/toolContentPreview'
 import {
   HttpTransportError,
 } from './privateHttpTransport'
@@ -17,6 +20,8 @@ import {
 } from './boundedBinaryBody'
 import {
   artifactHttpAttachmentUrl,
+  attachmentReferenceHttpPath,
+  attachmentPreviewHttpPath,
   bindAttachmentBinaryRequest,
   runtimeAttachmentHttpBaseOrigin,
   uploadArtifactAttachment,
@@ -158,7 +163,9 @@ export async function fetchDisplayAttachmentBlob(
   }
 
   const baseOrigin = resolveBaseOrigin(options.baseOrigin)
-  const request = bindAttachmentBinaryRequest(http, attachment.download_url, { baseOrigin })
+  const referencePath = !attachment.download_url && options.sessionKey?.trim()
+    ? attachmentReferenceHttpPath(attachment.sha256_ref, attachment.fileSnapshotRef) : ''
+  const request = bindAttachmentBinaryRequest(http, attachment.download_url || referencePath, { baseOrigin })
   if (!request) {
     return {
       ok: false,
@@ -238,14 +245,54 @@ function runtimeOptions(request: ArtifactAccessRequest = {}): AttachmentDownload
   }
 }
 
+/** JSON escaping can expand a 256 KiB text prefix up to sixfold. */
+const PREVIEW_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
+
+export async function readDisplayAttachmentPreview(
+  http: Pick<AttachmentHttpTransport, 'requestBinary'>,
+  attachment: DisplayAttachment,
+  options: AttachmentDownloadOptions = {},
+): Promise<AttachmentTextPreview> {
+  assertBinaryReadActive(options.signal)
+  const path = attachmentPreviewHttpPath(attachment.sha256_ref, attachment.fileSnapshotRef)
+  const request = path && options.sessionKey?.trim()
+    ? bindAttachmentBinaryRequest(http, path, { baseOrigin: resolveBaseOrigin(options.baseOrigin) }) : null
+  if (!request) throw new Error('Attachment preview is unavailable.')
+  // A bounded preview uses the Gateway deadline, including its response body.
+  // Full downloads above keep their separate, explicitly unbounded lifetime.
+  const response = await request.execute({ sessionKey: options.sessionKey, signal: options.signal })
+  // Never fall back to blob()/json(): a dishonest or absent Content-Length must
+  // not cause an unbounded body allocation before its size can be checked.
+  const stream = response.stream()
+  if (!stream) throw new Error('Attachment preview streaming is unavailable.')
+  const body = await readBinaryBlob({ metadata: response.metadata, stream: () => stream,
+    blob: async () => { throw new Error('Unbounded preview reads are disabled.') } },
+  { signal: options.signal, maxBytes: PREVIEW_RESPONSE_MAX_BYTES })
+  assertBinaryReadActive(options.signal)
+  const raw: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await body.arrayBuffer()))
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid attachment preview.')
+  const value = raw as Record<string, unknown>
+  if (typeof value.content !== 'string' || typeof value.truncated !== 'boolean'
+    || !Number.isSafeInteger(value.totalBytes) || (value.totalBytes as number) < 0) {
+    throw new Error('Invalid attachment preview.')
+  }
+  const preview = boundedTextPreview(value.content)
+  const receivedBytes = new TextEncoder().encode(value.content).byteLength
+  if (receivedBytes > (value.totalBytes as number)
+    || (!value.truncated && receivedBytes !== value.totalBytes)) throw new Error('Incomplete attachment preview.')
+  return { content: preview.content, truncated: value.truncated || preview.truncated, totalBytes: value.totalBytes as number }
+}
+
 export function createV4AttachmentContentAccess(http: AttachmentHttpTransport): Pick<
   ArtifactContentAccess,
-  'fetchAttachment' | 'uploadAttachment'
+  'fetchAttachment' | 'readAttachmentPreview' | 'downloadAttachment' | 'uploadAttachment'
 > {
   return {
     fetchAttachment: (attachment, request) => (
       fetchDisplayAttachmentBlob(http, attachment, runtimeOptions(request))
     ),
+    readAttachmentPreview: (attachment, request) => readDisplayAttachmentPreview(http, attachment, runtimeOptions(request)),
+    downloadAttachment: (attachment, request) => downloadRetainedAttachment(http, attachment, request),
     async uploadAttachment(file, mime) {
       const form = new FormData()
       form.append('file', file, file.name)

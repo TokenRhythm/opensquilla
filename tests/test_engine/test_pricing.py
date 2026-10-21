@@ -314,7 +314,6 @@ def test_local_embedding_model_does_not_fetch_openrouter_pricing(
         ("glm-5-turbo", 1.20, 4.0),
         ("glm-5.1", 1.40, 4.40),
         ("kimi-k2.6", 0.95, 4.0),
-        ("kimi-k2.7-code", 0.95, 4.0),
         ("gemini-3.1-flash-lite", 0.25, 1.50),
         ("gemini-3.5-flash", 1.50, 9.0),
         ("gemini-3.1-pro-preview", 2.0, 12.0),
@@ -360,13 +359,11 @@ def test_volcengine_seed_2_static_prices_match_under_32k_online_inference_pricin
 @pytest.mark.parametrize(
     ("model", "input_per_m", "output_per_m"),
     [
-        ("gpt-4.1", 2.0, 8.0),
         ("glm-4.5", 0.115, 0.287),
-        ("kimi-k2.6", 0.95, 4.0),
         ("MiniMax-M2.7", 0.118, 0.99),
     ],
 )
-def test_direct_openai_zhipu_kimi_and_minimax_prices_do_not_fall_back_to_default(
+def test_additional_zhipu_and_minimax_prices_do_not_fall_back_to_default(
     monkeypatch: pytest.MonkeyPatch,
     model: str,
     input_per_m: float,

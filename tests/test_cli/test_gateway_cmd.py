@@ -357,6 +357,8 @@ def test_gateway_start_failure_reaches_collector_without_exception_content(
 async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
     tmp_path, monkeypatch, reuse_existing_sink
 ) -> None:
+    import sqlite3
+
     from opensquilla.gateway.config import GatewayConfig
     from opensquilla.telemetry import runtime as telemetry_runtime
     from opensquilla.telemetry.consent import TelemetryScope, resolve_scope_consent
@@ -394,6 +396,8 @@ async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
         )
         await original.start()
         await asyncio.wait_for(entered.wait(), timeout=1)
+        upload_task = original._upload_task
+        assert upload_task is not None
         created = []
 
         def new_runtime(**kwargs):
@@ -415,8 +419,28 @@ async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
                 timeout=0.5,
             )
             assert not cancelled.is_set()
+            assert not upload_task.done()
         finally:
-            await asyncio.wait_for(original.close(), timeout=1)
+            scoped_runtimes = tuple(original._scopes.values())
+            outboxes = tuple(scoped.outbox for scoped in scoped_runtimes)
+            connections = tuple(outbox._connection for outbox in outboxes)
+            # Drain owned SQLite work after checking the startup-failure deadline.
+            await original.close()
+            assert original._closed and not original.opened_scopes
+            assert upload_task.cancelled() and not original._record_tasks
+            assert all(scoped.uploader._closed for scoped in scoped_runtimes)
+            assert outboxes
+            assert all(outbox._closed for outbox in outboxes)
+            for connection in connections:
+                worker = getattr(connection, "_thread", None)
+                if worker is not None:
+                    assert connection._connection is None and not connection._running
+                    await asyncio.to_thread(worker.join)
+                    assert not worker.is_alive()
+                else:
+                    with pytest.raises((sqlite3.ProgrammingError, ValueError)):
+                        await connection.execute("SELECT 1")
+        assert not client.is_closed
 
     assert cancelled.is_set()
     assert len(created) == (0 if reuse_existing_sink else 1)
@@ -424,6 +448,12 @@ async def test_gateway_start_failure_does_not_wait_on_another_runtime_send_lock(
     outbox = await TelemetryOutbox.open(config.state_dir, TelemetryScope.RELIABILITY)
     try:
         assert (await outbox.stats()).pending_events == (2 if reuse_existing_sink else 1)
+        rows = await outbox._fetchall("SELECT payload FROM telemetry_outbox")
+        outcomes = sorted(json.loads(row["payload"])["outcome"] for row in rows)
+        expected = [ResultOutcome.SUCCESS.value]
+        if reuse_existing_sink:
+            expected.append(ResultOutcome.FAIL.value)
+        assert outcomes == sorted(expected)
     finally:
         await outbox.close()
 
@@ -478,7 +508,9 @@ async def test_gateway_early_failure_timeout_closes_owned_upload_without_retry(
                 started_at=gateway_cmd.time.monotonic(),
                 failure=OSError("synthetic-private-path"),
             ),
-            timeout=10,
+            # Cold SQLite schema creation can be delayed by Windows shard
+            # load; keep the guard bounded without making the assertion flaky.
+            timeout=30 if sys.platform == "win32" else 10,
         )
 
     assert len(requests) == 1
@@ -1647,12 +1679,21 @@ class _ShutdownProbeServer:
     or "http" through ``app.state.request_shutdown`` (the HTTP endpoint path).
     """
 
-    def __init__(self, *, fire: str | None = None, via: str = "signal") -> None:
+    def __init__(
+        self,
+        *,
+        fire: str | None = None,
+        via: str = "signal",
+        startup_ready: bool = False,
+    ) -> None:
         self.closed: list[str] = []
         self._fire = fire
         self._via = via
         self._on_signal = None
-        self.app = SimpleNamespace(state=SimpleNamespace())
+        state = SimpleNamespace()
+        if startup_ready:
+            state.gateway_start_ready_event = asyncio.Event()
+        self.app = SimpleNamespace(state=state)
         self._task: asyncio.Task | None = None
 
     def spawn(self) -> None:
@@ -1660,6 +1701,10 @@ class _ShutdownProbeServer:
         self._task = asyncio.ensure_future(self._serve())
 
     async def _serve(self) -> None:
+        startup_ready_event = getattr(self.app.state, "gateway_start_ready_event", None)
+        if isinstance(startup_ready_event, asyncio.Event):
+            startup_ready_event.set()
+            await asyncio.sleep(0)
         if self._fire is not None:
             await asyncio.sleep(0.01)
             if self._via == "http":
@@ -1717,10 +1762,13 @@ def test_gateway_run_records_launch_for_owning_surface(
     calls: list[dict[str, object]] = []
 
     async def record_launch(**kwargs: object) -> bool:
+        assert server.app.state.gateway_start_ready_event.is_set()
         calls.append(kwargs)
         return True
 
-    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    server = _ShutdownProbeServer(
+        fire="api_shutdown", via="http", startup_ready=True
+    )
     server._services = SimpleNamespace(
         growth_event_sink=SimpleNamespace(record_client_launch=record_launch)
     )
@@ -1913,15 +1961,76 @@ def test_gateway_shutdown_watchdog_can_be_disarmed_or_force_exit(monkeypatch) ->
         fired.set()
 
     monkeypatch.setattr(gateway_cmd, "_force_process_exit", force_exit)
-    disarmed = gateway_cmd._GatewayShutdownWatchdog(timeout=0.01, exit_code=0)
-    disarmed.start()
-    disarmed.disarm()
-    assert fired.wait(0.05) is False
+    monkeypatch.setattr(gateway_cmd, "time", SimpleNamespace(monotonic=lambda: 0.0))
+    disarmed = gateway_cmd._GatewayShutdownWatchdog(timeout=1.0, exit_code=0)
+    entered_wait = gateway_cmd.threading.Event()
+    original_wait = disarmed._changed.wait
 
-    armed = gateway_cmd._GatewayShutdownWatchdog(timeout=0.01, exit_code=1)
+    def observe_wait(timeout: float | None = None) -> bool:
+        entered_wait.set()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(disarmed._changed, "wait", observe_wait)
+    disarmed.start()
+    try:
+        assert entered_wait.wait(1.0) is True
+        assert not fired.is_set()
+        disarmed.disarm()
+    finally:
+        disarmed.disarm()
+        disarmed._thread.join()
+    assert exits == []
+
+    armed = gateway_cmd._GatewayShutdownWatchdog(timeout=0, exit_code=1)
     armed.start()
-    assert fired.wait(1.0) is True
-    assert exits == [1]
+    try:
+        assert fired.wait(1.0) is True
+        assert exits == [1]
+    finally:
+        armed.disarm()
+        armed._thread.join()
+
+
+def test_desktop_incomplete_shutdown_keeps_root_for_parent_force_stop(tmp_path, monkeypatch):
+    from opensquilla.gateway.shutdown import ShutdownRequest
+
+    config = tmp_path / "gw.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    reached_parent_window = []
+
+    class _IncompleteDesktopServer(_ShutdownProbeServer):
+        async def close(self, reason):
+            await super().close(reason)
+            current = asyncio.current_task()
+
+            def parent_stops_process():
+                reached_parent_window.append(True)
+                current.cancel()
+
+            asyncio.get_running_loop().call_later(0.03, parent_stops_process)
+            return SimpleNamespace(clean=False)
+
+    server = _IncompleteDesktopServer(fire="desktop_quit", via="http")
+    server.app.state.shutdown_request = ShutdownRequest("quit", gateway_cmd.time.monotonic() + 1)
+    exits = []
+    timeouts = []
+    original_watchdog = gateway_cmd._GatewayShutdownWatchdog
+
+    def watchdog(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return original_watchdog(**kwargs)
+
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_force_process_exit", exits.append)
+    monkeypatch.setattr(gateway_cmd, "_GatewayShutdownWatchdog", watchdog)
+    with pytest.raises(asyncio.CancelledError):
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config)
+        )
+    assert reached_parent_window == [True]
+    assert exits == []
+    assert 5 < timeouts[0] <= 6
 
 
 # ---------------------------------------------------------------------------

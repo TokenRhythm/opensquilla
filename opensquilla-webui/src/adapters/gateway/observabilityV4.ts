@@ -1,38 +1,13 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
-  STATUS_METHOD,
-  type Result as RuntimeStatusResult,
-} from '@/contracts/generated/v4/runtimeStatus'
-import { validateResult as validateRuntimeStatusResult } from '@/contracts/generated/v4/runtimeStatusValidators.mjs'
-import {
-  ROUTER_SELFLEARNING_STATUS_METHOD,
-  type Result as RouterSelflearningStatusResult,
-} from '@/contracts/generated/v4/routerSelflearningStatus'
-import { validateResult as validateRouterSelflearningStatusResult } from '@/contracts/generated/v4/routerSelflearningStatusValidators.mjs'
-import {
-  DOCTOR_STATUS_METHOD,
-  type Result as DoctorStatusResult,
-} from '@/contracts/generated/v4/doctorStatus'
-import { validateResult as validateDoctorStatusResult } from '@/contracts/generated/v4/doctorStatusValidators.mjs'
-import {
-  LOGS_STATUS_METHOD,
-  type Result as LogsStatusResult,
-} from '@/contracts/generated/v4/logsStatus'
-import { validateResult as validateLogsStatusResult } from '@/contracts/generated/v4/logsStatusValidators.mjs'
-import {
   LOGS_TAIL_METHOD,
   type Result as LogsTailResult,
 } from '@/contracts/generated/v4/logsTail'
 import { validateResult as validateLogsTailResult } from '@/contracts/generated/v4/logsTailValidators.mjs'
 import { createV4UsageReporting } from './usageReportingV4'
+import type { SupportBundleUnavailableReason } from '@/modules/gatewayAccess'
 import type {
-  GatewayLogBatch,
-  GatewayLogEntry,
-  GatewayLogStatus,
-  GatewayStatus,
   Observability,
-  ReadinessReport,
-  SelfLearningStatus,
   UpdateNotice,
 } from '@/modules/observability'
 
@@ -59,17 +34,6 @@ interface HttpTransport {
   }>
 }
 
-const callOptions = (signal?: AbortSignal): RpcCallOptions => ({
-  timeoutMs: 15_000,
-  timeoutAction: 'reject',
-  abortAction: 'reject',
-  ...(signal ? { signal } : {}),
-})
-
-function invalid(method: string): Error {
-  return new Error(`${method} returned an invalid response`)
-}
-
 function updateNotice(value: unknown): UpdateNotice | null | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
   const raw = value as Record<string, unknown>
@@ -90,70 +54,30 @@ function updateNotice(value: unknown): UpdateNotice | null | undefined {
   }
 }
 
-export function createV4Observability(rpc: RpcTransport, http: HttpTransport): Observability {
+export function createV4Observability(
+  rpc: RpcTransport,
+  http: HttpTransport,
+  supportBundleUnavailableReason: () => SupportBundleUnavailableReason,
+): Observability {
   const usageReporting = createV4UsageReporting(rpc)
   return {
-    async gatewayStatus(options) {
-      await rpc.ready({ signal: options?.signal })
-      const result = await rpc.request<RuntimeStatusResult>(
-        STATUS_METHOD,
-        {},
-        callOptions(options?.signal),
-      )
-      if (!validateRuntimeStatusResult(result)) throw invalid(STATUS_METHOD)
-      return result as GatewayStatus
-    },
-    async selfLearningStatus(options) {
-      await rpc.ready({ signal: options?.signal })
-      const result = await rpc.request<RouterSelflearningStatusResult>(
-        ROUTER_SELFLEARNING_STATUS_METHOD,
-        {},
-        callOptions(options?.signal),
-      )
-      if (!validateRouterSelflearningStatusResult(result)) {
-        throw invalid(ROUTER_SELFLEARNING_STATUS_METHOD)
-      }
-      return result as SelfLearningStatus
-    },
     usage(range, options = {}) {
       return usageReporting.snapshot(range, options)
     },
-    async readiness(options) {
-      await rpc.ready({ signal: options.signal })
-      const result = await rpc.request<DoctorStatusResult>(
-        DOCTOR_STATUS_METHOD,
-        { agentId: options.agentId || 'main', deep: options.deep },
-        callOptions(options.signal),
-      )
-      if (!validateDoctorStatusResult(result)) throw invalid(DOCTOR_STATUS_METHOD)
-      return result as ReadinessReport
-    },
-    async logStatus(options) {
-      await rpc.ready({ signal: options?.signal })
-      const result = await rpc.request<LogsStatusResult>(
-        LOGS_STATUS_METHOD,
-        {},
-        callOptions(options?.signal),
-      )
-      if (!validateLogsStatusResult(result)) throw invalid(LOGS_STATUS_METHOD)
-      return result as GatewayLogStatus
-    },
     async tailLogs(options) {
-      await rpc.ready({ signal: options.signal })
-      const raw = await rpc.request<LogsTailResult>(
+      await rpc.ready({ signal: options?.signal })
+      const result = await rpc.request<LogsTailResult>(
         LOGS_TAIL_METHOD,
+        { cursor: 0, limit: 200, level: null },
         {
-          cursor: options.cursor,
-          limit: options.limit ?? 500,
-          level: options.level ?? null,
+          timeoutMs: 15_000,
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+          ...(options?.signal ? { signal: options.signal } : {}),
         },
-        callOptions(options.signal),
       )
-      if (!validateLogsTailResult(raw)) throw invalid(LOGS_TAIL_METHOD)
-      return {
-        entries: raw.lines as GatewayLogEntry[],
-        cursor: raw.cursor,
-      } satisfies GatewayLogBatch
+      if (!validateLogsTailResult(result)) throw new Error(`${LOGS_TAIL_METHOD} returned an invalid response`)
+      return { entries: result.lines, truncated: result.has_more }
     },
     async updateNotice(options) {
       try {
@@ -167,6 +91,10 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
       }
     },
     async downloadSupportBundle(options) {
+      // Recheck the same capability used by the UI immediately before HTTP.
+      // A Gateway switch must not send its new token to the page's old origin.
+      const unavailable = supportBundleUnavailableReason()
+      if (unavailable !== null) throw new Error(`Support bundle unavailable: ${unavailable}`)
       const response = await http.requestBinary('/api/v1/diagnostics/bundle', {
         method: 'POST',
         json: {

@@ -524,7 +524,6 @@ describe('catalog parity', () => {
       'setup.ensemble.',
       'chat.routerFx.',
       'chat.msgMeta.',
-      'chat.routeFeedback.',
     ]
     const ensembleKeys = new Set([
       'setup.provider.activateEnsembleOnPreserved',

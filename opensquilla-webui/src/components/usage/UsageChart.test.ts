@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { createApp, nextTick } from 'vue'
+import { createApp, h, nextTick, reactive } from 'vue'
 import { afterEach, describe, expect, it } from 'vitest'
 import i18n from '@/i18n'
 import type { ChartRow } from '@/types/usage'
@@ -32,6 +32,73 @@ function rowByLabel(root: HTMLElement, label: string): HTMLElement {
 }
 
 describe('UsageChart endpoint rendering', () => {
+  it.each([
+    ['balanced', 50, 50],
+    ['mostly-input', 90, 10],
+    ['input-only', 100, 0],
+    ['output-only', 0, 100],
+  ] as const)('stacks %s input and output without hiding either portion', async (label, input, output) => {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(UsageChart, {
+      chartMode: 'tokens', range: '7', caption: '',
+      rows: [{ ...chartRow(label, input + output), inputPct: input, outputPct: output }],
+    })
+    app.use(i18n)
+    app.mount(root)
+    mounted.push(app)
+    await nextTick()
+
+    const row = rowByLabel(root, label)
+    const inputSegment = row.querySelector<HTMLElement>('.usage-bar-row__fill--input')!
+    const outputSegment = row.querySelector<HTMLElement>('.usage-bar-row__fill--output')
+    expect(parseFloat(inputSegment.style.width)).toBe(input)
+    if (output === 0) {
+      expect(outputSegment).toBeNull()
+    } else {
+      const outputStart = parseFloat(outputSegment!.style.left)
+      const outputWidth = parseFloat(outputSegment!.style.width)
+      expect(outputStart).toBe(parseFloat(inputSegment.style.width))
+      expect(outputWidth).toBe(output)
+      expect(outputStart + outputWidth).toBe(100)
+    }
+  })
+
+  it('keeps native filter buttons and exposes the selected metric and range after activation', async () => {
+    i18n.global.locale.value = 'en'
+    const state = reactive({ chartMode: 'tokens' as 'tokens' | 'cost', range: '7' })
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp({
+      setup: () => () => h(UsageChart, {
+        ...state, caption: '', rows: [],
+        'onUpdate:chartMode': mode => { state.chartMode = mode },
+        onSetRange: range => { state.range = range },
+      }),
+    })
+    app.use(i18n)
+    app.mount(root)
+    mounted.push(app)
+    await nextTick()
+
+    const groups = root.querySelectorAll('[role="group"]')
+    expect(groups.length).toBe(2)
+    expect(root.querySelector('[role="tab"]')).toBeNull()
+    const metricButtons = groups[0]!.querySelectorAll<HTMLButtonElement>('button')
+    const rangeButtons = groups[1]!.querySelectorAll<HTMLButtonElement>('button')
+    expect(Array.from(metricButtons, button => button.getAttribute('aria-pressed'))).toEqual(['true', 'false'])
+    expect(Array.from(rangeButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'true', 'false', 'false'])
+
+    metricButtons[1]!.focus()
+    expect(document.activeElement).toBe(metricButtons[1])
+    metricButtons[1]!.click()
+    rangeButtons[2]!.click()
+    await nextTick()
+    expect(state).toEqual({ chartMode: 'cost', range: '14' })
+    expect(Array.from(metricButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'true'])
+    expect(Array.from(rangeButtons, button => button.getAttribute('aria-pressed'))).toEqual(['false', 'false', 'true', 'false'])
+  })
+
   it('omits endpoint caps while preserving row values and widths', async () => {
     i18n.global.locale.value = 'en'
     const root = document.createElement('div')

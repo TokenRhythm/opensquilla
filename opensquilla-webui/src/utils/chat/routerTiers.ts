@@ -21,6 +21,18 @@ export function normalizeRouterTier(value: unknown): string {
   return normalizeRouterTextTier(raw) || raw.toLowerCase()
 }
 
+/** Normalize legacy keys while preserving explicit canonical tier values. */
+export function normalizeRouterTierMapping<T>(source: Readonly<Record<string, T>>): Record<string, T> {
+  const normalized: Record<string, T> = Object.create(null)
+  for (const [rawTier, value] of Object.entries(source)) {
+    const tier = normalizeRouterTier(rawTier)
+    if (tier && (!Object.prototype.hasOwnProperty.call(normalized, tier) || rawTier.trim().toLowerCase() === tier)) {
+      normalized[tier] = value
+    }
+  }
+  return normalized
+}
+
 export function routerTierIndex(value: unknown): number {
   const tier = normalizeRouterTextTier(value)
   return tier ? TEXT_TIERS.indexOf(tier as (typeof TEXT_TIERS)[number]) : -1

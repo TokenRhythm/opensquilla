@@ -6,6 +6,12 @@ import {
   type WebSocketRoute,
 } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-task-ownership'
@@ -106,7 +112,7 @@ async function installOwnershipGateway(page: Page) {
         return
       }
       if (method === 'chat.history') {
-        ws.send(response(frame.id, { messages: [], has_more: false, canonical_complete: true }))
+        ws.send(response(frame.id, chatHistoryPayload()))
         return
       }
       if (
@@ -114,17 +120,20 @@ async function installOwnershipGateway(page: Page) {
         || method === 'sessions.messages.hydrate'
         || method === 'sessions.messages.snapshot'
       ) {
-        ws.send(response(frame.id, {
-          subscribed: true,
-          hydration_complete: true,
-          replay_complete: true,
+        const live = {
           current_stream_seq: streamSeq,
           stream_generation: 'task-ownership-generation',
           run_status: 'running',
           active_task: { task_id: TASK_A, status: 'running' },
           queued_task_ids: [],
           tasks: [{ task_id: TASK_A, status: 'running' }],
-        }))
+        }
+        const payload = method === 'sessions.messages.subscribe'
+          ? sessionMessagesSubscribePayload(SESSION_KEY, live)
+          : method === 'sessions.messages.hydrate'
+            ? sessionMessagesHydratePayload(SESSION_KEY, live)
+            : sessionMessagesSnapshotPayload(SESSION_KEY, { ...live, task_id: TASK_A })
+        ws.send(response(frame.id, payload))
         return
       }
       if (method === 'chat.abort') {
@@ -189,7 +198,7 @@ test.describe('P1-A task ownership and exact Stop release gate', () => {
     const gateway = await installOwnershipGateway(page)
 
     await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_KEY)}`)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     const stop = page.getByRole('button', { name: 'Stop current response' })
     await expect(stop).toBeVisible({ timeout: 10_000 })
 

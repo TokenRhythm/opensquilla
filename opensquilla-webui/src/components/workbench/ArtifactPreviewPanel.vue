@@ -13,7 +13,8 @@
         <span class="artifact-preview__meta">{{ artifactFileSubtitle(artifact) }}</span>
       </span>
       <span class="artifact-preview__actions">
-        <ResourceActionsMenu :artifact="artifact" :session-key="sessionKey" :previewable="false" trigger />
+        <ResourceActionsMenu :artifact="actionArtifact" :session-key="sessionKey" :previewable="false"
+          :require-same-origin="!!artifact.revision_download_url" trigger />
         <button
           v-if="preview.kind.value !== 'unsupported'"
           type="button"
@@ -46,15 +47,6 @@
       </span>
     </header>
 
-    <p
-      v-if="preview.state.value === 'missing-resource'
-        || preview.state.value === 'ready-with-warnings'"
-      class="artifact-preview__notice"
-      role="status"
-    >
-      <Icon name="info" :size="14" />
-      <span>{{ t('workbench.artifactPreview.missingResources') }}</span>
-    </p>
     <p
       v-if="showOfflineWebLimits"
       class="artifact-preview__notice"
@@ -97,8 +89,7 @@
         <span class="artifact-preview__status-actions">
           <button
             v-if="
-              !pdfViewerUnavailable
-                && (preview.state.value !== 'unsupported' || preview.errorCode.value !== 'unsupported')
+              preview.state.value !== 'unsupported' || preview.errorCode.value !== 'unsupported'
             "
             type="button"
             class="btn btn--ghost"
@@ -119,43 +110,40 @@
       </div>
 
       <template v-else-if="isRenderable">
+        <OfficePreviewPanel
+          v-if="officeFormat && preview.binary?.value"
+          ref="officePanel"
+          :data="preview.binary.value"
+          :format="officeFormat"
+          :annotation-enabled="officeAnnotationEnabled"
+          :revision-id="typeof artifact.revisionId === 'string' ? artifact.revisionId : undefined"
+          :selection-to-locate="officeSelectionToLocate"
+          :selection-mode="officeSelectionMode"
+          :selection-locked="officeSelectionLocked"
+          :suspended="suspended"
+          :reading-state="readingState"
+          @reading-state="saveReading"
+          @loading="officeRenderState = 'loading'"
+          @thumbnail="emit('workbench-event', { type: 'preview-thumbnail', payload: $event })"
+          @ready="officeRenderState = 'ready'"
+          @error="officeRenderState = 'error'"
+          @selection-commit="value => emit('workbench-event', { type: 'office-annotation-selected', payload: {
+            ...value, revisionId: artifact.revisionId, sha256: artifact.sha256,
+          } })"
+          @anchor-change="anchor => emit('workbench-event', { type: 'office-annotation-anchor', payload: anchor })"
+          @locate-result="result => emit('workbench-event', { type: 'office-annotation-located', payload: result })"
+          @selection-mode-change="enabled => emit('workbench-event', { type: 'office-annotation-mode', payload: { enabled } })"
+        />
         <img
-          v-if="preview.kind.value === 'image'"
+          v-else-if="preview.kind.value === 'image'"
           class="artifact-preview__image"
           :src="preview.objectUrl.value"
           :alt="artifactFileTitle(artifact)"
           decoding="async"
         />
-        <div
-          v-else-if="preview.kind.value === 'pdf'"
-          class="artifact-preview__pdf-stack"
-        >
-          <iframe
-            ref="previewFrameRef"
-            class="artifact-preview__frame artifact-preview__frame--pdf"
-            :src="pdfFrameUrl"
-            :title="t('chat.previewOf', { title: artifactFileTitle(artifact) })"
-            tabindex="0"
-            referrerpolicy="no-referrer"
-          />
-          <!-- The browser-owned PDF viewer cannot run our HTML Escape bridge.
-               This focus-revealed exit follows the frame in DOM order so a
-               keyboard user can leave the viewer and collapse the dialog. -->
-          <button
-            type="button"
-            class="btn artifact-preview__frame-exit"
-            @click="requestWorkbenchCollapse"
-          >
-            {{ t('workbench.collapse') }}
-          </button>
-        </div>
-        <div
-          v-else-if="preview.kind.value === 'markdown'"
-          class="artifact-preview__markdown chat-markdown"
-        >
-          <!-- eslint-disable-next-line vue/no-v-html -- output is DOMPurify-sanitized in the resource controller -->
-          <div v-html="preview.markdownHtml.value" />
-        </div>
+        <PdfResourcePreview v-else-if="preview.kind.value === 'pdf' && preview.binary?.value"
+          :data="preview.binary.value" :name="artifactFileTitle(artifact)" :reading-state="readingState"
+          @reading-state="saveReading" />
         <pre
           v-else-if="preview.kind.value === 'text'"
           class="artifact-preview__text"
@@ -164,7 +152,7 @@
           v-else-if="preview.kind.value === 'html' && !nativeHtml"
           :key="htmlFrameGeneration"
           ref="previewFrameRef"
-          class="artifact-preview__frame artifact-preview__frame--html"
+          class="artifact-preview__frame artifact-preview__frame--html html-preview-frame"
           :src="preview.objectUrl.value"
           :title="t('chat.previewOf', { title: artifactFileTitle(artifact) })"
           tabindex="0"
@@ -184,28 +172,45 @@
           </span>
         </div>
       </template>
+      <!-- Source visits suspend requests, not the readable Markdown document.
+           Keep loaded images, enhanced diagrams and the scroll container alive. -->
+      <div
+        v-if="preview.kind.value === 'markdown' && preview.markdownHtml.value"
+        v-show="isRenderable"
+        class="artifact-preview__markdown chat-markdown"
+      >
+        <!-- eslint-disable-next-line vue/no-v-html -- output is DOMPurify-sanitized in the resource controller -->
+        <div ref="markdownPreviewEl" v-html="preview.markdownHtml.value" />
+      </div>
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
+import OfficePreviewPanel from './OfficePreviewPanel.vue'
+import { artifactReadingIdentity, type ResourceReadingState } from './resourceReadingState'
+const PdfResourcePreview = defineAsyncComponent(() => import('./PdfResourcePreview.vue'))
+import { artifactPreviewActionTarget } from './artifactActionTarget'
 import {
   ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewResourceState,
   type NativeHtmlArtifactResource,
 } from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
+import type { OfficeSelection } from '@/types/officeSelection'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 import {
   artifactFileSubtitle,
   artifactFileTitle,
   artifactIconName,
 } from '@/utils/chat/artifacts'
-import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import { applyMarkdownImageResources, createMarkdownImageResolver } from '@/utils/workbench/markdownImageResources'
+import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE, artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
+import { useMarkdownEnhancements } from '@/composables/chat/useMarkdownEnhancements'
 
 const props = withDefaults(defineProps<{
   artifact: ArtifactPayload
@@ -218,10 +223,15 @@ const props = withDefaults(defineProps<{
   previewLaunchUrl?: string
   previewMode?: 'full' | 'offline'
   previewNetworkAllowed?: boolean
-  previewSandboxProfile?: 'default' | 'opaque-offline'
+  previewSandboxProfile?: 'default' | 'opaque-offline' | 'none'
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
+  officeAnnotationEnabled?: boolean
+  officeSelectionMode?: boolean
+  officeSelectionLocked?: boolean
+  officeSelectionToLocate?: { selection: OfficeSelection; revisionId?: string; stale?: boolean; requestId: string | number }
+  readingState?: ResourceReadingState
 }>(), {
   baseOrigin: '',
   nativeHtml: false,
@@ -236,6 +246,8 @@ const props = withDefaults(defineProps<{
   sessionKey: '',
   showHeader: true,
   suspended: false,
+  officeAnnotationEnabled: false,
+  officeSelectionMode: undefined,
 })
 
 const emit = defineEmits<{
@@ -247,10 +259,12 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const actionArtifact = computed(() => artifactPreviewActionTarget(props.artifact))
 const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
+const markdownPreviewEl = ref<HTMLDivElement | null>(null)
 let loadedFrame: HTMLIFrameElement | null = null
 
 function onHtmlFrameLoad(event: Event) {
@@ -263,6 +277,9 @@ function onHtmlFrameLoad(event: Event) {
 
 const preview = artifactWorkbench.previews.createResource({
   artifact: () => props.artifact,
+  resolveMarkdownImage: artifactWorkbench.resources
+    ? createMarkdownImageResolver(artifactWorkbench.resources, () => props.artifact, () => props.sessionKey)
+    : undefined,
   htmlCollectionStatus: () => props.previewCollectionStatus,
   htmlLaunchUrl: () => props.previewLaunchUrl,
   htmlLeaseState: () => props.previewBlocked
@@ -275,23 +292,52 @@ const preview = artifactWorkbench.previews.createResource({
   },
   sessionKey: () => props.sessionKey,
 })
+const officeFormat = computed(() => isOfficePreviewFormat(preview.kind.value) ? preview.kind.value : null)
+const officePanel = ref<InstanceType<typeof OfficePreviewPanel> | null>(null)
+const officeRenderState = ref<ArtifactPreviewResourceState>('loading')
+const readingSources = new WeakMap<ArrayBuffer, string>()
+watch(() => preview.binary?.value, data => {
+  officeRenderState.value = 'loading'
+  if (data) readingSources.set(data, artifactReadingIdentity(props.artifact, props.sessionKey))
+}, { flush: 'sync' })
+function saveReading(reading: ResourceReadingState, data: ArrayBuffer) {
+  const identity = readingSources.get(data)
+  if (!identity || identity !== artifactReadingIdentity(props.artifact, props.sessionKey)) return
+  emit('workbench-event', { type: 'artifact-reading-state', payload: { identity, reading } })
+}
+const reportedPreviewState = computed(() => officeFormat.value && preview.state.value === 'ready'
+  ? officeRenderState.value : preview.state.value)
+
+useMarkdownEnhancements(markdownPreviewEl, { version: () => preview.markdownHtml.value })
+
+watch([markdownPreviewEl, () => preview.markdownImages?.value], ([root, resources]) => {
+  if (root && resources) applyMarkdownImageResources(root, resources)
+}, { flush: 'post' })
 
 const resourceSignature = computed(() => [
   props.artifact.id || '',
+  props.artifact.revisionId || '',
+  props.artifact.sha256 || '',
   props.artifact.download_url || '',
+  props.artifact.revision_download_url || '',
   props.artifact.name || '',
   props.artifact.mime || '',
   props.artifact.size || '',
   props.sessionKey,
   props.baseOrigin,
-  props.nativeHtml ? 'native' : 'web',
-  props.previewBlocked ? 'blocked' : 'unblocked',
-  props.previewCollectionStatus,
-  props.previewErrorMessage,
-  props.previewLaunchUrl,
-  props.previewMode,
-  props.previewNetworkAllowed ? 'network' : 'no-network',
-  props.previewSandboxProfile,
+  // Preview preferences may arrive after the reader mounts. They affect HTML
+  // execution/leases, not PDF/Office bytes; including them for every kind
+  // cancels and downloads the same binary again when offline becomes full.
+  ...(artifactWorkbenchPreviewKind(props.artifact) === 'html' ? [
+    props.nativeHtml ? 'native' : 'web',
+    props.previewBlocked ? 'blocked' : 'unblocked',
+    props.previewCollectionStatus,
+    props.previewErrorMessage,
+    props.previewLaunchUrl,
+    props.previewMode,
+    props.previewNetworkAllowed ? 'network' : 'no-network',
+    props.previewSandboxProfile,
+  ] : []),
 ].join('\u0000'))
 
 let loadedResourceSignature: string | null = null
@@ -308,6 +354,10 @@ async function syncPreviewResource(
     return
   }
 
+  // A panel first opened on Source starts loading only on its first resume.
+  // Track that revision before awaiting its optional image requests as well.
+  const initiallyResuming = returningFromSuspend && loadedResourceSignature === null
+  if (initiallyResuming) loadedResourceSignature = signature
   if (returningFromSuspend) await preview.resume()
   if (
     generation !== resourceSyncGeneration
@@ -315,18 +365,18 @@ async function syncPreviewResource(
     || resourceSignature.value !== signature
   ) return
 
-  // A panel opened directly on Source has never loaded preview bytes. Its
-  // first resume performs that initial load, so recording the signature here
-  // avoids fetching the same revision twice.
-  if (returningFromSuspend && loadedResourceSignature === null) {
-    loadedResourceSignature = signature
-    return
-  }
+  // The first resume already loaded its recorded revision; do not fetch it twice.
+  if (initiallyResuming) return
 
   // Vue's watch tuple remembers signatures even while the panel is hidden.
   // Keep a separate identity for the bytes actually loaded by the preview so
   // resuming after a Source save cannot revive an older native lease or Blob.
-  if (loadedResourceSignature !== signature) await preview.reload()
+  if (loadedResourceSignature !== signature) {
+    // Optional Markdown images can outlive the main document load. Record the
+    // revision when it starts so a Source edit during that work still reloads.
+    loadedResourceSignature = signature
+    await preview.reload()
+  }
   else if (!returningFromSuspend) await preview.resume()
   if (
     generation === resourceSyncGeneration
@@ -354,7 +404,7 @@ watch(
 )
 
 watch(
-  preview.state,
+  reportedPreviewState,
   state => {
     emit('state-change', state)
     emit('workbench-event', { type: 'preview-state-change', payload: state })
@@ -366,26 +416,15 @@ function emitArtifactEvent(
   type: 'artifact-download' | 'artifact-external-open',
   legacyType: 'download' | 'external-open',
 ) {
-  if (legacyType === 'download') emit('download', props.artifact)
-  else emit('external-open', props.artifact)
-  emit('workbench-event', { type, payload: props.artifact })
+  const target = actionArtifact.value
+  if (legacyType === 'download') emit('download', target)
+  else emit('external-open', target)
+  emit('workbench-event', { type, payload: target })
 }
 
-// `pdfViewerEnabled` only describes the browser's inline PDF capability. It
-// is still useful as an early guard for WebViews/Electron builds that have the
-// PDF plugin disabled, where an iframe otherwise renders as an unexplained
-// empty dark surface.
-const pdfViewerUnavailable = computed(() => {
-  if (preview.kind.value !== 'pdf') return false
-  if (typeof navigator === 'undefined' || !('pdfViewerEnabled' in navigator)) return false
-  return (navigator as Navigator & { pdfViewerEnabled?: boolean }).pdfViewerEnabled === false
-})
-
-const isRenderable = computed(() =>
-  !pdfViewerUnavailable.value
-  && (preview.state.value === 'ready'
+const isRenderable = computed(() => preview.state.value === 'ready'
   || preview.state.value === 'ready-with-warnings'
-  || preview.state.value === 'missing-resource'))
+  || preview.state.value === 'missing-resource')
 
 const opaqueOfflinePreview = computed(() =>
   props.previewSandboxProfile === 'opaque-offline'
@@ -407,11 +446,6 @@ const htmlSandbox = computed(() => fullHtmlPreview.value
 const htmlPermissions = computed(() => fullHtmlPreview.value
   ? 'camera; microphone; geolocation; clipboard-read; clipboard-write; fullscreen; display-capture'
   : '')
-
-const pdfFrameUrl = computed(() => {
-  const url = preview.objectUrl.value
-  return url ? `${url}#zoom=page-width&view=FitH` : ''
-})
 
 function onPreviewFrameMessage(event: MessageEvent) {
   if (
@@ -443,14 +477,12 @@ onBeforeUnmount(() => {
 })
 
 const isFailureState = computed(() =>
-  pdfViewerUnavailable.value
-  || preview.state.value === 'crashed'
+  preview.state.value === 'crashed'
   || preview.state.value === 'error'
   || preview.state.value === 'offline'
   || preview.state.value === 'unsupported')
 
 const failureTitle = computed(() => {
-  if (pdfViewerUnavailable.value) return t('workbench.artifactPreview.unsupported')
   if (preview.state.value === 'offline') return t('workbench.artifactPreview.offline')
   if (preview.state.value === 'crashed') return t('workbench.artifactPreview.crashed')
   if (preview.errorCode.value === 'too-large') return t('workbench.artifactPreview.tooLarge')
@@ -462,7 +494,6 @@ const failureTitle = computed(() => {
 })
 
 const failureDetail = computed(() => {
-  if (pdfViewerUnavailable.value) return t('workbench.artifactPreview.pdfViewerUnavailable')
   if (preview.errorCode.value === 'preview-blocked' && props.previewErrorMessage) {
     return props.previewErrorMessage
   }
@@ -491,9 +522,13 @@ defineExpose({
   kind: preview.kind,
   reload: reloadPreview,
   state: preview.state,
+  clearTransientSelection: () => officePanel.value?.clearTransientSelection(),
+  reselect: () => officePanel.value?.reselect(),
+  setSelectionMode: (enabled: boolean) => officePanel.value?.setSelectionMode(enabled),
 })
 </script>
 
+<style scoped src="@/styles/html-preview-frame.css"></style>
 <style scoped>
 .artifact-preview {
   display: flex;
@@ -651,50 +686,6 @@ defineExpose({
   width: 100%;
 }
 
-.artifact-preview__frame--pdf {
-  background: var(--bg);
-}
-
-.artifact-preview__pdf-stack {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-height: 0;
-  min-width: 0;
-  width: 100%;
-}
-
-.artifact-preview__pdf-stack .artifact-preview__frame--pdf {
-  height: auto;
-}
-
-.artifact-preview__frame-exit {
-  align-self: flex-end;
-  block-size: 1px;
-  border: 0;
-  clip-path: inset(50%);
-  inline-size: 1px;
-  margin: 0;
-  opacity: 0;
-  overflow: hidden;
-  padding: 0;
-  transition:
-    opacity var(--dur-fast) var(--ease-standard);
-}
-
-.artifact-preview__frame-exit:focus,
-.artifact-preview__frame-exit:focus-visible {
-  block-size: auto;
-  border: 1px solid transparent;
-  clip-path: none;
-  inline-size: auto;
-  margin: 8px 12px;
-  opacity: 1;
-  overflow: visible;
-  padding: 7px 14px;
-}
-
-.artifact-preview__frame--html,
 .artifact-preview__native-slot {
   background: var(--bg-surface);
 }
@@ -717,6 +708,11 @@ defineExpose({
   max-width: 820px;
   padding: 24px 28px 64px;
   width: 100%;
+}
+
+.artifact-preview__markdown :deep([data-markdown-image] img) {
+  max-width: 100%;
+  height: auto;
 }
 
 .artifact-preview__text {
@@ -746,9 +742,6 @@ defineExpose({
     transform: none;
   }
 
-  .artifact-preview__frame-exit {
-    transition: none;
-  }
 }
 
 @media (max-width: 600px) {

@@ -20,7 +20,7 @@ vi.mock('@/composables/setup/useSetupCatalog', async () => {
 })
 vi.mock('@/components/settings/SettingsAdvancedPanel.vue', () => ({
   default: {
-    emits: ['open-agent-configuration', 'open-data-maintenance'],
+    emits: ['open-data-maintenance'],
     template: '<button type="button" data-testid="activate-data-maintenance" @click="$emit(\'open-data-maintenance\')">Open data maintenance</button>',
   },
 }))
@@ -77,9 +77,6 @@ async function mountDialog(path: '/settings/advanced' | '/settings/dataMigration
     capabilitiesPanel: ref({}),
     hasSetupAction: ref(false),
     actionItems: ref([]),
-    fixCommands: ref([]),
-    handoffCommands: ref([]),
-    recipeCommands: ref([]),
     configSummary: ref([]),
     configPath: ref(''),
     dirtySections: ref([]),

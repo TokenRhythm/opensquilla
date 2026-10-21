@@ -25,15 +25,25 @@ _WINDOWS_ASSIGNMENTS_PATH_KEY: Final = "_windows_test_assignments_path"
 _LOADED_WINDOWS_ASSIGNMENTS_KEY: Final = "_loaded_windows_test_assignments"
 _WINDOWS_PARTITIONS_CONFIG_KEY: Final = "windows_test_partitions"
 _WINDOWS_PARTITIONS_PATH_KEY: Final = "_windows_test_partitions_path"
+_WINDOWS_GATEWAY_SPLIT_SHARDS: Final[frozenset[str]] = frozenset(
+    f"gateway-sqlite-{partition}" for partition in range(9, 12)
+)
 _MACOS_RECOVERY_TEST_INPUTS_KEY: Final = "macos_recovery_test_inputs"
 _MERGE_CRITICAL_INPUTS_KEY: Final = "_merge_critical_inputs"
+WINDOWS_PROFILES_SHARDS: Final[tuple[str, ...]] = (
+    "profiles-onboarding-flow",
+    "profiles-onboarding-first-chat",
+    "profiles-profile-consolidation-flow",
+    "profiles-primary-repair-accessibility",
+    "profiles-profile-import-flow",
+    "profiles-desktop-cleanup-flow",
+)
 
 _DOC_EXACT: Final = {
     "CHANGELOG.md",
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
-    "META_SKILL_GUIDE.md",
     "MIGRATION.md",
     "README.md",
     "SECURITY.md",
@@ -72,6 +82,25 @@ _WINDOWS_NSIS_INPUTS: Final = (
     "desktop/electron/scripts/gateway-integrity.mjs",
     "scripts/release_dependency_inventory.py",
     "scripts/build_wheelhouse_zip.py",
+)
+# Ordinary dependency changes need install/start smoke coverage. Changes to the
+# installer, its verification harness, or historical data handling retain every
+# released-uninstaller fault case. Unknown changes still use full_fallback.
+_WINDOWS_NSIS_FULL_INPUTS: Final = (
+    *_WINDOWS_NSIS_INPUTS,
+    "desktop/electron/package.json",
+    "desktop/electron/package-lock.json",
+    "desktop/electron/electron-builder.*",
+    "desktop/electron/scripts/*installer*",
+    "desktop/electron/scripts/build-signed-windows.cjs",
+    "desktop/electron/src/*update*",
+    ".github/scripts/verify-release-windows*",
+    "migrations/**",
+    "src/opensquilla/migration/**",
+    "src/opensquilla/persistence/**",
+    "src/opensquilla/recovery/**",
+    "src/opensquilla/uninstall/**",
+    "src/opensquilla/profile*",
 )
 _TUI_DEPENDENCY_EXACT: Final = {
     "packages/opensquilla-tui-host/pyproject.toml",
@@ -172,11 +201,9 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
@@ -193,25 +220,24 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_engine/test_skill_install_settlement.py",
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
+        "tests/test_skills/test_install_operation_io.py",
         "tests/test_skills/test_staging_io_worker.py",
         "tests/test_skill_install_source.py",
         "tests/test_skills_hub_streaming.py",
         "tests/test_skills_hub_streaming_faults.py",
         "tests/test_skills/test_hub_management_service.py",
+        "tests/test_skills/test_hub_rollback_serialization.py",
         "tests/test_skills/test_hub_scanner.py",
         "tests/test_skills/test_hub_transaction_recovery.py",
         "tests/test_skills/test_hub_transaction_process_gates.py",
         "tests/test_gateway/test_rpc_skills_install_visibility.py",
         "tests/test_gateway/test_rpc_skills_exact_identity.py",
-        "tests/test_gateway/test_rpc_skills_coding_gate.py",
         "tests/test_gateway/test_rpc_skills_reload.py",
         "tests/test_gateway/test_skill_catalog_adapter.py",
         "tests/test_gateway/test_skill_catalog_application.py",
         "tests/test_gateway/test_skill_management_adapter.py",
         "tests/test_gateway/test_skill_management_application.py",
         "tests/test_gateway/test_skill_management_service_injection.py",
-        "tests/test_gateway/test_skill_proposal_review_adapter.py",
-        "tests/test_gateway/test_skill_proposal_review_application.py",
         "tests/test_tools/test_skill_view_resources.py",
         "tests/test_scripts/test_bench_skill_integrity.py",
         "tests/test_cli/test_cli_product_completeness.py",
@@ -226,27 +252,22 @@ _SKILL_HUB_SOURCE_EXACT: Final = frozenset(
         "src/opensquilla/cli/gateway_client.py",
         "src/opensquilla/cli/main.py",
         "src/opensquilla/cli/skills_cmd.py",
-        "src/opensquilla/cli/skills_meta_cmd.py",
         "src/opensquilla/application/skill_catalog.py",
         "src/opensquilla/application/skill_management.py",
         "src/opensquilla/engine/runtime.py",
         "src/opensquilla/engine/agent.py",
         "src/opensquilla/application/skill_source.py",
-        "src/opensquilla/application/skill_proposal_review.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/adapters/skill_catalog.py",
         "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
         "src/opensquilla/gateway/adapters/skill_management.py",
         "src/opensquilla/gateway/adapters/skill_management_contract.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
         "src/opensquilla/gateway/boot.py",
         "src/opensquilla/gateway/config.py",
         "src/opensquilla/gateway/protocol.py",
         "src/opensquilla/gateway/rpc/__init__.py",
         "src/opensquilla/gateway/rpc/registry.py",
         "src/opensquilla/gateway/rpc_skills.py",
-        "src/opensquilla/gateway/rpc_proposals.py",
         "src/opensquilla/gateway/scopes.py",
         "src/opensquilla/gateway/websocket.py",
         "src/opensquilla/tools/builtin/skill_tools.py",
@@ -260,7 +281,6 @@ _SKILL_HUB_TEST_PREFIXES: Final = (
     "tests/test_gateway/test_rpc_skills_",
     "tests/test_gateway/test_skill_catalog_",
     "tests/test_gateway/test_skill_management_",
-    "tests/test_gateway/test_skill_proposal_review_",
     "tests/test_skills/test_hub_",
     "tests/test_skills/test_loader_",
     "tests/test_skills_hub_",
@@ -350,38 +370,8 @@ _MANAGED_TOOLCHAIN_SHARED_TARGETS: Final = {
     "tests/test_skills/test_toolchain_runtime_integration.py",
     "tests/test_skills/test_toolchain_state_scope.py",
 }
-_MANAGED_TOOLCHAIN_SOURCE_TARGETS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
-    (
-        "src/opensquilla/skills/bundled/meta-paper-write/",
-        (
-            "tests/test_skills/test_meta_paper*.py",
-            "tests/test_skills/test_paper_*.py",
-        ),
-    ),
-    (
-        "src/opensquilla/skills/bundled/paper-",
-        (
-            "tests/test_skills/test_meta_paper*.py",
-            "tests/test_skills/test_paper_*.py",
-        ),
-    ),
-    (
-        "src/opensquilla/skills/bundled/meta-short-drama/",
-        ("tests/test_skills/test_meta_short_drama*.py",),
-    ),
-    (
-        "src/opensquilla/skills/bundled/subtitle-burner/",
-        ("tests/test_skills/test_subtitle_burner.py",),
-    ),
-    ("src/opensquilla/skills/bundled/video-still-animator/", ()),
-)
 _MANAGED_TOOLCHAIN_TEST_PREFIXES: Final = (
     "tests/test_skills/test_toolchain_",
-    "tests/test_skills/test_meta_paper",
-    "tests/test_skills/test_paper_",
-    "tests/test_skills/test_meta_short_drama",
-    "tests/test_skills/test_subtitle_burner",
-    "tests/test_skills/test_video_still_animator",
 )
 _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
     (
@@ -409,7 +399,7 @@ _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]]
     (("src/opensquilla/scheduler/",), ("tests/test_scheduler",)),
     (
         ("src/opensquilla/skills/",),
-        ("tests/test_meta_skill*.py", "tests/test_skills", "tests/test_skills*.py"),
+        ("tests/test_skills", "tests/test_skills*.py"),
     ),
     (
         ("src/opensquilla/cli/",),
@@ -432,27 +422,43 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
     "frontend-artifact": (("ubuntu-latest", "artifact"),),
     "frontend-validation": (
         ("ubuntu-latest", "validation"),
+        *(("ubuntu-latest", f"unit-{shard}") for shard in range(1, 5)),
+        ("ubuntu-latest", "contract-production"),
         ("ubuntu-latest", "contract-verification"),
-        ("windows-latest", "contract-determinism"),
+        ("windows-latest", "contract-production"),
+        ("windows-latest", "contract-verification"),
         ("ubuntu-latest", "contract-compare"),
     ),
     "wheel-webui-roundtrip": (("ubuntu-latest", "package"),),
-    "webui-chat-recovery": (("ubuntu-22.04", "chromium"),),
+    "webui-chat-recovery": (
+        *(("ubuntu-22.04", f"general-{shard}") for shard in range(1, 5)),
+        ("ubuntu-22.04", "clipboard"),
+        ("ubuntu-22.04", "virtualization"),
+    ),
+    "webui-capacity": (("ubuntu-22.04", "chromium-capacity"),),
     "tui": (("ubuntu-latest", "default"),),
     "desktop-static": (("ubuntu-latest", "default"),),
+    "desktop-recovery-e2e": (
+        *((os_name, f"native-{probe}")
+          for os_name in ("ubuntu-latest", "macos-latest", "windows-latest")
+          for probe in ("pty", "mcp", "frozen")),
+        ("ubuntu-latest", "native-docker"),
+    ),
     "python-targeted": (("ubuntu-latest", "targeted"),),
+    "python-stress": (("ubuntu-latest", "stress"),),
     "macos-recovery": (("macos-latest", "recovery"),),
     "release-packaging": (("ubuntu-latest", "default"),),
     "windows-nsis-regression": (
         ("windows-2022", "build"),
+        ("windows-2022", "windows-webui-build"),
+        ("windows-2022", "windows-package-contracts"),
+        *(("windows-2022", f"packaged-security-{check}")
+          for check in ("dependency-audit", "gateway-smoke", "first-interaction")),
         ("windows-2022", "wheelhouse-core"),
         ("windows-2022", "wheelhouse-recommended"),
-        *(("windows-2022", f"{baseline}-{path}-{scenario}")
-          for baseline in ("0.5.3", "0.5.4")
-          for path in ("default", "custom")
-          for scenario in ("baseline", "readlock", "longpath")),
-        ("windows-2022", "fresh-default-fresh"),
-        ("windows-2022", "fresh-custom-fresh"),
+        *(("windows-2022", f"candidate-{probe}")
+          for probe in ("startup-compat-gateway", "startup-compat-desktop",
+                        "ownership", "migration", "session")),
     ),
     "skill-hub": (
         ("ubuntu-latest", "default"),
@@ -460,12 +466,15 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
         ("windows-latest", "default"),
     ),
     "managed-toolchain": (
-        ("ubuntu-24.04", "linux-x64"),
-        ("ubuntu-24.04-arm", "linux-arm64"),
-        ("ubuntu-24.04", "linux-musl-x64"),
-        ("macos-15", "darwin-arm64"),
-        ("macos-15-intel", "darwin-x64"),
-        ("windows-2022", "windows-x64"),
+        *((os_name, f"{platform_name}-{component}")
+          for os_name, platform_name in (
+              ("ubuntu-24.04", "linux-x64"),
+              ("ubuntu-24.04-arm", "linux-arm64"),
+              ("macos-15", "darwin-arm64"),
+              ("macos-15-intel", "darwin-x64"),
+              ("windows-2022", "windows-x64"),
+          ) for component in ("paper-tex", "media-ffmpeg")),
+        ("ubuntu-24.04", "linux-musl-x64-paper-tex"),
     ),
 }
 
@@ -484,11 +493,6 @@ def _managed_toolchain_targets(path: str) -> set[str] | None:
         or path.startswith(_MANAGED_TOOLCHAIN_TEST_PREFIXES)
     ):
         targets = set(_MANAGED_TOOLCHAIN_SHARED_TARGETS)
-    for prefix, domain_targets in _MANAGED_TOOLCHAIN_SOURCE_TARGETS:
-        if path.startswith(prefix):
-            targets = set(_MANAGED_TOOLCHAIN_SHARED_TARGETS)
-            targets.update(domain_targets)
-            break
     if targets is not None and path.startswith("tests/"):
         targets.add(path)
     return targets
@@ -614,8 +618,9 @@ def _load_windows_test_partitions(
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise PlanError("unsupported Windows test partition schema")
     partitions = value.get("partitions")
-    if not isinstance(partitions, dict) or set(partitions) != allowed_shards:
-        raise PlanError("Windows test partitions must define every physical shard exactly once")
+    shared_shards = allowed_shards - _WINDOWS_GATEWAY_SPLIT_SHARDS
+    if not isinstance(partitions, dict) or set(partitions) != shared_shards:
+        raise PlanError("Windows test partitions must define every shared shard exactly once")
     physical: dict[str, str] = {}
     for shard, raw_paths in partitions.items():
         paths = _require_string_list(raw_paths, f"Windows partition {shard!r}")
@@ -638,9 +643,37 @@ def _load_windows_test_partitions(
             if family is not None and shard.rsplit("-", 1)[0] != family:
                 raise PlanError(f"Windows test partition changed family ownership: {test_path}")
             physical[test_path] = str(shard)
+    overrides = value.get("windows_overrides")
+    if (
+        not _WINDOWS_GATEWAY_SPLIT_SHARDS <= allowed_shards
+        or not isinstance(overrides, dict)
+        or set(overrides) != _WINDOWS_GATEWAY_SPLIT_SHARDS
+    ):
+        raise PlanError("Windows overrides must define gateway-sqlite-9 through 11 exactly once")
+    moved: set[str] = set()
+    for shard, raw_paths in overrides.items():
+        paths = _require_string_list(raw_paths, f"Windows override {shard!r}")
+        if paths != sorted(set(paths)):
+            raise PlanError(f"Windows override paths must be unique and sorted: {shard}")
+        for test_path in paths:
+            if test_path in moved:
+                raise PlanError(f"duplicate Windows override: {test_path}")
+            if physical.get(test_path) != "gateway-sqlite-5":
+                raise PlanError(
+                    f"Windows override must retain gateway-sqlite-5 ownership: {test_path}"
+                )
+            moved.add(test_path)
+            physical[test_path] = shard
+    partitions_by_family: dict[str, list[str]] = {}
+    # Keep the shared fallback stable: only explicitly reviewed files move.
+    for shard in sorted(shared_shards):
+        partitions_by_family.setdefault(shard.rsplit("-", 1)[0], []).append(shard)
     return {
         test_path: physical.get(test_path)
-        or f"{family}-{int(hashlib.sha256(test_path.encode('utf-8')).hexdigest(), 16) % 2 + 1}"
+        or partitions_by_family[family][
+            int(hashlib.sha256(test_path.encode("utf-8")).hexdigest(), 16)
+            % len(partitions_by_family[family])
+        ]
         for test_path, family in assignments.items()
     }
 
@@ -688,7 +721,18 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         if key in seen_cells:
             raise PlanError("full_desktop_matrix contains duplicate cells")
         seen_cells.add(key)
+    split_profiles = {("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS}
+    if ("windows-latest", "profiles") in seen_cells:
+        if not split_profiles <= seen_cells:
+            raise PlanError("Windows profiles owner requires all six independent flow cells")
+    elif split_profiles & seen_cells:
+        raise PlanError("Windows profiles flow cells require their browser/router owner")
 
+    python_families = _require_string_list(
+        value.get("python_shard_families"), "python_shard_families"
+    )
+    if not python_families or len(set(python_families)) != len(python_families):
+        raise PlanError("python_shard_families must contain unique responsibility families")
     python_matrix = value.get("full_python_matrix")
     if not isinstance(python_matrix, dict) or set(python_matrix) != {
         "ubuntu",
@@ -702,14 +746,30 @@ def load_config(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         )
         if not shards:
             raise PlanError(f"full_python_matrix {platform_name} must not be empty")
-
-    expected_windows = {
-        f"{family}-{partition}"
-        for family in python_matrix["ubuntu"]
-        for partition in (1, 2)
-    }
-    if set(python_matrix["windows"]) != expected_windows:
-        raise PlanError("Windows matrix must define two physical shards per Python family")
+        if len(set(shards)) != len(shards):
+            raise PlanError(f"full_python_matrix {platform_name} contains duplicate cells")
+        by_family: dict[str, set[int]] = {family: set() for family in python_families}
+        for shard in shards:
+            family, separator, partition = shard.rpartition("-")
+            if (
+                not separator or family not in by_family or not partition.isdecimal()
+                or partition.startswith("0")
+            ):
+                raise PlanError(f"invalid physical Python shard: {shard!r}")
+            by_family[family].add(int(partition))
+        if any(
+            not partitions or partitions != set(range(1, len(partitions) + 1))
+            for partitions in by_family.values()
+        ):
+            raise PlanError(
+                f"full_python_matrix {platform_name} must partition every responsibility family"
+            )
+    ubuntu_shards = set(python_matrix["ubuntu"])
+    if (
+        ubuntu_shards & _WINDOWS_GATEWAY_SPLIT_SHARDS
+        or set(python_matrix["windows"]) != ubuntu_shards | _WINDOWS_GATEWAY_SPLIT_SHARDS
+    ):
+        raise PlanError("full_python_matrix must retain the three Windows-only Gateway partitions")
 
     assignments_path = value.get(_WINDOWS_ASSIGNMENTS_CONFIG_KEY)
     if (
@@ -1025,7 +1085,7 @@ def _windows_test_assignments(config: Mapping[str, Any]) -> Mapping[str, str]:
         raise PlanError("Windows test assignment path was not loaded with the contract")
     assignments = _load_windows_test_assignments(
         assignments_path,
-        allowed_shards=set(config["full_python_matrix"]["ubuntu"]),
+        allowed_shards=set(config["python_shard_families"]),
     )
     partitions_path = config.get(_WINDOWS_PARTITIONS_PATH_KEY)
     if not isinstance(partitions_path, Path):
@@ -1525,10 +1585,21 @@ def _validate_execution_input_patterns(
     if not files:
         raise PlanError(f"cannot validate suite execution_inputs in empty repository {repo}")
 
+    file_set = set(files)
+    # Literal inputs are membership checks, not full repository glob scans.
+    # Share wildcard answers across suites within this validation only; later
+    # calls must observe newly added/deleted files and changed configuration.
+    matches: dict[str, bool] = {}
     unmatched: list[tuple[str, str]] = []
     for suite_id, raw_suite in sorted(config["suites"].items()):
         for pattern in raw_suite["execution_inputs"]:
-            if not any(_matches_input(path, pattern) for path in files):
+            if pattern not in matches:
+                matches[pattern] = (
+                    any(_matches_input(path, pattern) for path in files)
+                    if any(character in pattern for character in "*?[")
+                    else pattern in file_set
+                )
+            if not matches[pattern]:
                 unmatched.append((suite_id, pattern))
     if unmatched:
         details = ", ".join(
@@ -1594,12 +1665,30 @@ def suite_execution_digests(
     return result
 
 
+def windows_nsis_upgrade_cells(profile: str) -> list[dict[str, str]]:
+    """Return the installed-package cases for a validated acceptance profile."""
+    if profile not in {"smoke", "full"}:
+        raise ValueError(f"unknown Windows NSIS acceptance profile: {profile}")
+    baselines = ("0.5.3", "0.5.4") if profile == "full" else ("0.5.4",)
+    scenarios = ("baseline", "readlock", "longpath") if profile == "full" else ("baseline",)
+    return [
+        {"baseline": baseline, "install-path": path, "scenario": scenario}
+        for baseline in baselines
+        for path in ("default", "custom")
+        for scenario in scenarios
+    ] + [
+        {"baseline": "fresh", "install-path": path, "scenario": "fresh"}
+        for path in ("default", "custom")
+    ]
+
+
 def _execution_matrices(
     required_suites: Sequence[str],
     desktop_cells: set[tuple[str, str]],
     targeted_windows_shards: set[str],
     windows_full_matrix: bool,
     config: Mapping[str, Any],
+    windows_nsis_profile: str = "full",
 ) -> tuple[dict[str, list[str]], list[dict[str, str]]]:
     """Return canonical Python and all-platform execution matrices."""
 
@@ -1608,8 +1697,11 @@ def _execution_matrices(
     for shard in targeted_windows_shards:
         if shard in config["full_python_matrix"]["windows"]:
             physical_windows_shards.add(shard)
-        elif shard in config["full_python_matrix"]["ubuntu"]:
-            physical_windows_shards.update(f"{shard}-{partition}" for partition in (1, 2))
+        elif shard in config["python_shard_families"]:
+            physical_windows_shards.update(
+                physical for physical in config["full_python_matrix"]["windows"]
+                if physical.rsplit("-", 1)[0] == shard
+            )
         else:
             raise PlanError(f"unknown Windows execution shard: {shard}")
     python_matrix = {
@@ -1632,6 +1724,12 @@ def _execution_matrices(
     for suite_id in suites:
         for os_name, shard in _FIXED_PLATFORM_MATRIX.get(suite_id, ()):
             cells.add((suite_id, os_name, shard))
+    if "windows-nsis-regression" in suites:
+        cells.update(
+            ("windows-nsis-regression", "windows-2022",
+             f"{cell['baseline']}-{cell['install-path']}-{cell['scenario']}")
+            for cell in windows_nsis_upgrade_cells(windows_nsis_profile)
+        )
     if "desktop-recovery-e2e" in suites:
         cells.update(
             ("desktop-recovery-e2e", os_name, shard)
@@ -1647,6 +1745,11 @@ def _execution_matrices(
             ("windows-high-risk", "windows-latest", shard)
             for shard in python_matrix["windows"]
         )
+        if "desktop-installer-contracts-1" in python_matrix["windows"]:
+            cells.update(
+                ("windows-high-risk", "windows-latest", f"bundle-{partition}")
+                for partition in range(1, 5)
+            )
     missing = sorted(
         suites
         - set(_FIXED_PLATFORM_MATRIX)
@@ -1725,6 +1828,12 @@ def plan_changes(
     test_reverse_dependencies: dict[str, frozenset[str]] | None = None
     test_dependency_analysis_failed = False
     full_fallback = False
+    windows_nsis_full = any(
+        fnmatch.fnmatchcase(path, pattern)
+        for path in paths for pattern in _WINDOWS_NSIS_FULL_INPUTS
+    )
+    if windows_nsis_full:
+        suites.add("windows-nsis-regression")
     all_docs = bool(paths) and not invalid_paths
     merge_critical_inputs = config.get(_MERGE_CRITICAL_INPUTS_KEY)
     if not isinstance(merge_critical_inputs, frozenset):
@@ -2131,6 +2240,37 @@ def plan_changes(
         suites.discard("python-targeted")
         targets = {"tests"}
 
+    # Keep capacity checks out of ordinary shards/preflights, but require them
+    # for their runtime dependencies and every complete offline Python plan.
+    # Unknown paths and CI-policy changes still select full_suites above.
+    if "python-full" in suites or any(
+        path.startswith((
+            "src/opensquilla/gateway/", "src/opensquilla/session/",
+            "src/opensquilla/persistence/", "src/opensquilla/recovery/",
+            "src/opensquilla/safety/", "src/opensquilla/config/",
+            "src/opensquilla/contracts/",
+        )) or path in {
+            "src/opensquilla/provider/types.py",
+            "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+        }
+        for path in paths
+    ):
+        suites.add("python-stress")
+
+    # These synthetic renderer workloads depend on the WebUI and its fixtures.
+    # Backend/desktop-only recovery changes still run the ordinary browser
+    # contracts, including the 1,000-row pagination case, without repeating the
+    # 34,000-event flood and 3,000-row capacity case. Full/dependency plans stay
+    # conservative. Both browser phases share one runner and verified artifact.
+    if "webui-chat-recovery" in suites and (
+        full_fallback or any(
+            path.startswith("opensquilla-webui/")
+            or _dependency_domain(path) == "python"
+            for path in paths
+        )
+    ):
+        suites.add("webui-capacity")
+
     # Browser, Electron, and wheel consumers use the verified WebUI artifact.
     # Keep this dependency closure in the planner so a selected consumer can
     # never be skipped merely because its producer was omitted.
@@ -2139,17 +2279,25 @@ def plan_changes(
             "webui-chat-recovery",
             "desktop-recovery-e2e",
             "wheel-webui-roundtrip",
+            "windows-nsis-regression",
         }
     ):
         suites.add("frontend-artifact")
 
     required_suites = sorted(suites)
+    # Windows keeps the browser/router contracts in their original owner;
+    # each audited Electron script gets its own hosted runner. Preserve every
+    # internal launch/restart/recovery sequence inside the unchanged scripts.
+    if ("windows-latest", "profiles") in desktop_cells:
+        desktop_cells.update(("windows-latest", shard) for shard in WINDOWS_PROFILES_SHARDS)
+    windows_nsis_profile = "full" if full_fallback or windows_nsis_full else "smoke"
     python_matrix, platform_matrix = _execution_matrices(
         required_suites,
         desktop_cells,
         targeted_windows_shards,
         windows_full_matrix,
         config,
+        windows_nsis_profile,
     )
     digests = suite_execution_digests(
         required_suites, repo=repo, config=config, ref=ref
@@ -2162,6 +2310,7 @@ def plan_changes(
         ],
         "python_matrix": python_matrix,
         "platform_matrix": platform_matrix,
+        "windows_nsis_profile": windows_nsis_profile,
         "python_targets": sorted(targets),
         "full_fallback": full_fallback,
         "reason_codes": sorted(reasons),

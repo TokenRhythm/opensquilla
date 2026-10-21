@@ -21,6 +21,7 @@ interface FixtureOptions {
   source?: 'build' | 'large' | 'html'
   theme?: 'dark' | 'light'
   pageError?: boolean
+  html?: string
 }
 
 function sourceLines(content: string) {
@@ -35,7 +36,7 @@ function sourceLines(content: string) {
 async function install(page: Page, options: FixtureOptions = {}) {
   const { deferred = false, source, theme = 'dark' } = options
   const sourcePath = source === 'html' ? 'outputs/source.html' : source === 'large' ? 'outputs/large.py' : '_img/build.py'
-  const sourceContent = source === 'html' ? HTML : source === 'large' ? LARGE : BUILD
+  const sourceContent = source === 'html' ? options.html ?? HTML : source === 'large' ? LARGE : BUILD
   const contentFor = (path: string) => path === sourcePath ? sourceContent : SVG
   let release!: () => void
   const wait = new Promise<void>(resolve => { release = resolve })
@@ -133,7 +134,7 @@ async function install(page: Page, options: FixtureOptions = {}) {
   return { resolves, reads, pages, searches, release }
 }
 
-test('opens table SVG as text and a Markdown PNG path as an image through authenticated file access', async ({ page }) => {
+test('opens SVG and PNG links through the shared isolated image preview with authenticated file access', async ({ page }) => {
   const state = await install(page)
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
   const answer = page.locator('.msg-ai').filter({ hasText: 'Generated files fixture.' })
@@ -143,27 +144,54 @@ test('opens table SVG as text and a Markdown PNG path as an image through authen
   await answer.getByRole('link', { name: 'Open outputs/中文 图.svg', exact: true }).click()
   const source = page.getByTestId('workspace-file-panel')
   await expect(source).toBeVisible()
-  await expect(source.locator('pre')).toContainText(SVG)
-  await expect(source.locator('svg[onload], iframe, object, img')).toHaveCount(0)
+  await expect(source.locator('.resource-preview img')).toBeVisible()
+  await expect(source.locator('svg[onload], iframe, object')).toHaveCount(0)
   expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).svgExecuted)).toBeUndefined()
+  await source.getByRole('button', { name: 'Source', exact: true }).click()
+  await expect(source.locator('pre')).toContainText(SVG)
   await page.screenshot({ path: 'output/playwright/workspace-file-svg-source.png', fullPage: true })
   await answer.locator('.workspace-file-action-trigger').first().click()
   await expect(page.getByRole('menu')).toContainText('Copy relative path')
   await page.screenshot({ path: 'output/playwright/workspace-file-svg-menu.png', fullPage: true })
   await page.keyboard.press('Escape')
   await answer.getByRole('link', { name: 'Open outputs/中文 图.png', exact: true }).click()
-  const image = page.getByRole('dialog', { name: '中文 图.png', exact: true }).locator('img')
+  const image = page.getByTestId('workspace-file-panel').locator('.resource-preview img')
   await expect(image).toBeVisible()
   await expect(image).toHaveAttribute('src', /^blob:/)
   await page.screenshot({ path: 'output/playwright/workspace-file-image.png', fullPage: true })
   expect(state.pages).toEqual([
     { sessionKey: SESSION, path: 'outputs/中文 图.svg', binding: 'binding-A', startLine: 1, endLine: 200 },
   ])
-  expect(state.reads).toEqual([{ sessionKey: SESSION, path: 'outputs/中文 图.png', binding: 'binding-A' }])
+  expect(state.reads).toEqual([
+    { sessionKey: SESSION, path: 'outputs/中文 图.svg', binding: 'binding-A' },
+    { sessionKey: SESSION, path: 'outputs/中文 图.png', binding: 'binding-A' },
+  ])
   await expect(answer.locator('a[href^="file:"]')).toHaveCount(0)
 })
 
 for (const theme of ['dark', 'light'] as const) {
+  for (const authored of [false, true]) {
+    test(`HTML uses a readable canvas without changing authored styles (${theme}, authored=${authored})`, async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 900 })
+      const html = authored
+        ? '<html style="color-scheme:dark"><body style="background:#17314f;color:#f4f4f4"><h1>Authored document</h1></body></html>'
+        : '<html><body><h1>Plain document</h1><p>Default black text remains readable.</p></body></html>'
+      await install(page, { source: 'html', theme, html })
+      await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+      await page.getByRole('link', { name: 'Open outputs/source.html', exact: true }).click()
+      const frame = page.getByTestId('workspace-file-panel').locator('iframe')
+      await expect(frame).toBeVisible()
+      await expect(frame).toHaveCSS('background-color', 'rgb(255, 255, 255)')
+      await expect(frame).toHaveCSS('color-scheme', 'normal')
+      const body = frame.contentFrame().locator('body')
+      await expect(body).toContainText(authored ? 'Authored document' : 'Plain document')
+      await expect(body).toHaveCSS('color', authored ? 'rgb(244, 244, 244)' : 'rgb(0, 0, 0)')
+      await expect(body).toHaveCSS('background-color', authored ? 'rgb(23, 49, 79)' : 'rgba(0, 0, 0, 0)')
+      if (authored) await expect(frame.contentFrame().locator('html')).toHaveCSS('color-scheme', 'dark')
+      await page.screenshot({ path: `output/playwright/html-document-canvas-${theme}-${authored ? 'authored' : 'default'}.png`, fullPage: true })
+    })
+  }
+
   test(`opens an inline _img/build.py path in the read-only source Workbench (${theme})`, async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 })
     const state = await install(page, { source: 'build', theme })
@@ -182,12 +210,16 @@ for (const theme of ['dark', 'light'] as const) {
     await link.click()
     const source = page.getByTestId('workspace-file-panel')
     await expect(source).toBeVisible()
-    await expect(page.getByText('build.py', { exact: true }).last()).toBeVisible()
+    await expect(page.getByRole('tab', { name: '_img/build.py', exact: true })).toBeVisible()
     await expect(source.locator('.workspace-file__number').first()).toHaveText('1')
     await expect(source.locator('pre')).toContainText('#!/usr/bin/env python3')
     await expect(source.locator('pre')).toContainText("IMG_DIR = '_img/opt'")
     await expect(source.locator('pre')).toContainText('print("build fixture")')
-    await expect(page.getByText(/Read-only source/).last()).toBeVisible()
+    // Source remains a selectable, keyboard-focusable read-only view, not an editor.
+    await expect(source.locator('pre')).toHaveAttribute('aria-label', '_img/build.py')
+    await expect(source.locator('pre')).toHaveAttribute('tabindex', '0')
+    expect(await source.locator('pre').evaluate(element => element instanceof HTMLElement && element.isContentEditable)).toBe(false)
+    await expect(source.locator('textarea, [contenteditable="true"]')).toHaveCount(0)
     await page.screenshot({ path: `output/playwright/workspace-file-source${suffix}.png`, fullPage: true })
     await link.click({ button: 'right' })
     const menu = page.getByRole('menu')
@@ -225,19 +257,21 @@ test('loads bounded pages, jumps and searches beyond the first page, and copies 
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
   await page.getByRole('link', { name: 'Open outputs/large.py', exact: true }).click()
   const source = page.getByTestId('workspace-file-panel')
-  await expect(source.locator('.workspace-file__range')).toHaveText('Lines 1–200 of 450')
+  const range = source.locator('.workspace-file__footer [role="status"]')
+  await expect(range).toHaveText('Lines 1–200 of 450')
   await expect(source.locator('[data-line="201"]')).toHaveCount(0)
   expect(state.reads).toEqual([])
   await source.getByRole('button', { name: 'Show more lines', exact: true }).click()
-  await expect(source.locator('.workspace-file__range')).toHaveText('Lines 201–400 of 450')
+  await expect(range).toHaveText('Lines 201–400 of 450')
   await expect(source.locator('[data-line="201"]')).toContainText('fixture line 201')
+  await source.getByRole('button', { name: 'Search source', exact: true }).click()
   await source.getByRole('spinbutton', { name: 'Jump to line' }).fill('429')
   await source.getByRole('spinbutton', { name: 'Jump to line' }).press('Enter')
-  await expect(source.locator('.workspace-file__range')).toHaveText('Lines 401–450 of 450')
+  await expect(range).toHaveText('Lines 401–450 of 450')
   await expect(source.locator('[data-line="429"]')).toContainText('distant-needle')
   await source.getByRole('spinbutton', { name: 'Jump to line' }).fill('1')
   await source.getByRole('spinbutton', { name: 'Jump to line' }).press('Enter')
-  await expect(source.locator('.workspace-file__range')).toHaveText('Lines 1–200 of 450')
+  await expect(range).toHaveText('Lines 1–200 of 450')
   await source.getByRole('searchbox', { name: 'Search source' }).fill('distant-needle')
   await source.getByRole('searchbox', { name: 'Search source' }).press('Enter')
   await expect(source.locator('[data-line="429"]')).toContainText('distant-needle')
@@ -246,22 +280,31 @@ test('loads bounded pages, jumps and searches beyond the first page, and copies 
     [1, 200], [201, 400], [401, 600], [1, 200], [401, 600],
   ])
   expect(state.reads).toEqual([])
-  await source.getByRole('button', { name: 'Copy file contents', exact: true }).click()
-  await expect(source.getByRole('button', { name: 'Copied', exact: true })).toBeVisible()
-  expect(await page.evaluate(() => (window as unknown as { workspaceCopied?: string }).workspaceCopied)).toBe(LARGE)
+  const copy = source.getByRole('button', { name: 'Copy file contents', exact: true })
+  const copyIcon = await copy.innerHTML()
+  await copy.click()
+  await expect(copy).toHaveAttribute('title', 'Copy file contents')
+  await expect.poll(() => page.evaluate(() => (window as unknown as { workspaceCopied?: string }).workspaceCopied)).toBe(LARGE)
+  await expect.poll(() => copy.innerHTML()).not.toBe(copyIcon)
+  await expect(copy).toHaveAttribute('aria-label', 'Copy file contents')
   expect(state.reads).toEqual([{ sessionKey: SESSION, path: 'outputs/large.py', binding: 'binding-A' }])
 })
 
-test('ordinary workspace HTML stays source text without running its script', async ({ page }) => {
+test('ordinary workspace HTML previews in isolation and still exposes its complete source', async ({ page }) => {
   const state = await install(page, { source: 'html' })
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
   await page.getByRole('link', { name: 'Open outputs/source.html', exact: true }).click()
   const source = page.getByTestId('workspace-file-panel')
+  await expect(source.locator('iframe')).toBeVisible()
+  await expect(source.locator('iframe')).toHaveAttribute('sandbox', 'allow-scripts')
+  await expect(source.locator('iframe').contentFrame().locator('body')).toContainText('safe source')
+  expect(await source.locator('iframe').contentFrame().locator('body').evaluate(() => (window as unknown as Record<string, unknown>).htmlExecuted)).toBe(true)
+  await source.getByRole('button', { name: 'Source', exact: true }).click()
   await expect(source.locator('pre')).toContainText('<script>window.htmlExecuted=true</script>')
   await expect(source.locator('script, iframe, object')).toHaveCount(0)
   expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).htmlExecuted)).toBeUndefined()
   expect(state.pages).toHaveLength(1)
-  expect(state.reads).toEqual([])
+  expect(state.reads).toEqual([{ sessionKey: SESSION, path: 'outputs/source.html', binding: 'binding-A' }])
 })
 
 test('a changed file shows a source error without falling back to a complete read', async ({ page }) => {

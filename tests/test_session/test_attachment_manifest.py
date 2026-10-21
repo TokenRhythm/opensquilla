@@ -24,6 +24,7 @@ from opensquilla.session.attachment_manifest import (
     legacy_attachment_id,
     manifest_context_state,
     merge_attachment_occurrences,
+    normalize_attachment_mime,
     normalize_attachment_name,
     preserve_attachment_occurrence_ids,
 )
@@ -124,6 +125,17 @@ def test_normalize_attachment_name_keeps_only_basename(
     expected: str,
 ) -> None:
     assert normalize_attachment_name(raw_name) == expected
+
+
+def test_attachment_display_metadata_remains_utf8_bounded() -> None:
+    name = normalize_attachment_name("C:\\source\\" + "测" * 100 + ".zip")
+    mime = normalize_attachment_mime("APPLICATION/X-" + "M" * 200 + "; charset=utf-8")
+
+    assert "source" not in name
+    assert len(name.encode("utf-8")) <= 160
+    assert mime.startswith("application/x-")
+    assert len(mime.encode("utf-8")) <= 120
+    assert ";" not in mime
 
 
 def test_extracts_inline_ref_and_missing_occurrences_without_bytes_in_payload() -> None:

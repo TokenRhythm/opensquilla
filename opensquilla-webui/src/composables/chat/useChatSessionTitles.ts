@@ -34,6 +34,35 @@ export function isSensibleChatTitle(value: string): boolean {
   return !!title && !looksLikeRawSessionId(title)
 }
 
+export function resolveOptimisticChatTitle(
+  key: string,
+  headerSessionKey: string,
+  optimisticTitle: string,
+  headerTitle: string,
+  allowHeaderTitle: boolean,
+  labels: {
+    currentTask: string
+    newChat: string
+    chatWithSuffix: (suffix: string) => string
+  },
+): string {
+  if (!key || headerSessionKey !== key) return labels.currentTask
+
+  const directTitle = optimisticTitle.trim()
+  const title = headerTitle.trim()
+  const suffix = key.split(':').pop() || ''
+  const genericTitles = new Set([
+    labels.newChat,
+    labels.chatWithSuffix(suffix),
+    labels.currentTask,
+  ])
+  if (allowHeaderTitle && isSensibleChatTitle(title) && !genericTitles.has(title)) {
+    return title
+  }
+  if (isSensibleChatTitle(directTitle)) return directTitle
+  return labels.currentTask
+}
+
 interface ChatSessionTitleItem {
   key: string
   title: string

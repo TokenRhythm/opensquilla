@@ -38,6 +38,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     payload: ConversationRoutingDecision
     decision: NormalizedRouterDecision
     messageId: string
+    replayed: boolean
   } | null>(null)
   let localRouterMessageSeq = 0
   let localReplaySeq = 0
@@ -253,11 +254,16 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     payload: ConversationRoutingDecision,
     decision: NormalizedRouterDecision,
     messageId: string,
+    replayed: boolean,
   ) {
     if (!decision) return
     const turnId = payloadTurnId(payload)
     const acceptedDecision = freezeAcceptedRoutingMode(decision, turnId)
-    if (options.messages.value.some(message => message.messageId === messageId)) return
+    const existing = options.messages.value.find(message => message.messageId === messageId)
+    if (existing) {
+      if (replayed) existing.routerReplayed = true
+      return
+    }
 
     if (turnId) {
       for (let i = options.messages.value.length - 1; i >= 0; i--) {
@@ -274,6 +280,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
           message.routerDecision = acceptedDecision
           message.messageId = messageId
           message.turnId = turnId
+          if (replayed) message.routerReplayed = true
           routerMessageAttempts.delete(provisionalMessageId)
           rememberRouterMessage(message, false)
           scrollToBottomIfFollowing()
@@ -289,6 +296,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       routerDecision: acceptedDecision,
       provenanceKind: 'router_decision',
       messageId,
+      ...(replayed ? { routerReplayed: true } : {}),
       ...(turnId ? { turnId } : {}),
     }
     rememberRouterMessage(message, false)
@@ -296,7 +304,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     scrollToBottomIfFollowing()
   }
 
-  function queueRouterDecision(payload: ConversationRoutingDecision, identityStreamSeq?: number) {
+  function queueRouterDecision(payload: ConversationRoutingDecision, identityStreamSeq?: number, replayed = false) {
     syncRouterSession()
     if (payload.key && payload.key !== options.sessionKey.value) return
     const normalizedDecision = normalizeRouterDecision(payload)
@@ -310,8 +318,11 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       options.setStreamActivity(model ? `Router selected · ${model}` : 'Router selected')
     }
     const messageId = routerDecisionMessageId(payload, identityStreamSeq)
-    pendingRouterDecision.value = { payload, decision, messageId }
-    appendRouterDecision(payload, decision, messageId)
+    const wasReplayed = replayed
+      || (pendingRouterDecision.value?.messageId === messageId && pendingRouterDecision.value.replayed)
+      || options.messages.value.some(message => message.messageId === messageId && message.routerReplayed === true)
+    pendingRouterDecision.value = { payload, decision, messageId, replayed: wasReplayed }
+    appendRouterDecision(payload, decision, messageId, wasReplayed)
   }
 
   function flushPendingRouterDecision() {
@@ -319,7 +330,7 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const pending = pendingRouterDecision.value
     if (!pending) return
     pendingRouterDecision.value = null
-    appendRouterDecision(pending.payload, pending.decision, pending.messageId)
+    appendRouterDecision(pending.payload, pending.decision, pending.messageId, pending.replayed)
   }
 
   function clearPendingRouterDecision() {

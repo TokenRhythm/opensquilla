@@ -8,10 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NotRequired, Protocol, TypedDict
 
+from opensquilla.contracts.content_material import (
+    ContentExportError as ContentExportError,
+)
+from opensquilla.contracts.content_material import (
+    ContentMaterial as ContentMaterial,
+)
+
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
-def _identity(value: str, label: str) -> str:
+def _identity(value: object, label: str) -> str:
     normalized = value.strip() if isinstance(value, str) else ""
     if not normalized:
         raise ValueError(f"{label} is required")
@@ -262,15 +269,29 @@ class WorkbenchResourceListQuery:
 @dataclass(frozen=True, slots=True)
 class WorkbenchResourceOpen:
     session_key: str
-    resource: WorkbenchResourceRef
+    resource: WorkbenchResourceRef | None
     idempotency_key: str | None = None
     expected_sha256: str | None = None
     intent: str = "edit-current"
+    workspace_file: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
-        if self.intent != "edit-current":
+        if self.intent not in {"edit-current", "annotate"}:
             raise ValueError("unsupported resource open intent")
+        if (self.resource is None) == (self.workspace_file is None):
+            raise ValueError("resourceRef and workspaceFile are mutually exclusive")
+        if self.workspace_file is not None:
+            if self.intent != "annotate":
+                raise ValueError("workspaceFile requires annotate intent")
+            if set(self.workspace_file) != {"path", "workspaceBinding", "expectedRevision"}:
+                raise ValueError(
+                    "workspaceFile requires path, workspaceBinding and expectedRevision"
+                )
+            for key, value in self.workspace_file.items():
+                _identity(value, key)
+                if len(value) > 4096:
+                    raise ValueError("workspaceFile identity is too long")
         if self.idempotency_key is not None:
             _identity(self.idempotency_key, "idempotency key")
             if len(self.idempotency_key.encode("utf-8")) > 256:
@@ -393,10 +414,13 @@ class ArtifactContentQuery:
     session_key: str
     artifact_id: str
     thumbnail: bool = False
+    format: str = "content"
 
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
         _identity(self.artifact_id, "artifact id")
+        if self.format not in {"content", "zip"} or (self.thumbnail and self.format == "zip"):
+            raise ValueError("invalid artifact content format")
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,9 +428,12 @@ class DocumentContentQuery:
     session_key: str
     document_id: str
     revision_id: str | None = None
+    format: str = "content"
 
     def __post_init__(self) -> None:
         DocumentIdentity(self.session_key, self.document_id)
+        if self.format not in {"content", "zip"}:
+            raise ValueError("invalid document content format")
         if self.revision_id is not None:
             _identity(self.revision_id, "revision id")
 
@@ -415,11 +442,29 @@ class DocumentContentQuery:
 class AttachmentContentQuery:
     session_key: str
     sha256: str
+    message_id: str | None = None
+    attachment_index: int | None = None
+    revision: str | None = None
+    source: str | None = None
 
     def __post_init__(self) -> None:
         _identity(self.session_key, "session key")
-        if len(self.sha256) != 64:
+        if len(self.sha256) != 64 or any(char not in "0123456789abcdef" for char in self.sha256):
             raise ValueError("attachment digest must be a SHA-256 value")
+        if any(
+            value is not None
+            for value in (self.message_id, self.attachment_index, self.revision, self.source)
+        ):
+            _identity(self.message_id, "attachment message id")
+            _identity(self.revision, "attachment revision")
+            if self.source not in {"active", "compacted"}:
+                raise ValueError("attachment source is invalid")
+            if (
+                not isinstance(self.attachment_index, int)
+                or isinstance(self.attachment_index, bool)
+                or not 0 <= self.attachment_index < 16
+            ):
+                raise ValueError("attachment index is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,11 +472,14 @@ class WorkingFileQuery:
     session_key: str
     document_id: str
     page_path: str | None = None
+    format: str = "content"
 
     def __post_init__(self) -> None:
         from opensquilla.html_format import is_html_preview_path
 
         DocumentIdentity(self.session_key, self.document_id)
+        if self.format not in {"content", "zip"}:
+            raise ValueError("invalid working file format")
         if self.page_path is not None and not is_html_preview_path(self.page_path):
             raise ValueError("Invalid working page path")
 
@@ -444,13 +492,6 @@ class WorkingFileMaterial:
     path: Path
     media_type: str
     data: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class ContentMaterial:
-    path: Path
-    media_type: str
-    filename: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,6 +541,7 @@ class PreviewLeaseCreate:
     artifact_id: str
     mode: str
     client: str
+    snapshot: bool = False
 
     def __post_init__(self) -> None:
         for value, label in (
@@ -512,6 +554,8 @@ class PreviewLeaseCreate:
             raise ValueError("preview mode must be full or offline")
         if self.client not in {"desktop", "web"}:
             raise ValueError("preview client must be desktop or web")
+        if type(self.snapshot) is not bool:
+            raise ValueError("preview snapshot must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,6 +583,7 @@ class PreviewLeaseGrant:
     source: Mapping[str, Any]
     expires_at: str
     working_document_id: str | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -645,6 +690,12 @@ class ResourceProjection(TypedDict, total=False):
     mime: str | None
     size: int | None
     sha256: str | None
+    # Optional presentation semantics.  Internal inline Visualize documents
+    # remain addressable for recovery/download but are omitted from the Files
+    # inventory by the Workbench adapter.
+    source: str
+    visibility: str
+    presentation: str
 
 
 class BindingProjection(TypedDict, total=False):
@@ -751,6 +802,8 @@ class ResourceOpenResult(TypedDict, total=False):
     revision: RevisionProjection
     binding: BindingProjection
     receipt: ReceiptProjection
+    baselineUpdated: bool
+    previousRevisionId: str
 
 
 class PreviewCreateResult(TypedDict):
@@ -858,7 +911,9 @@ class ArtifactContentPort(Protocol):
 
     async def attachment_content(self, query: AttachmentContentQuery) -> ContentMaterial: ...
 
-    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial: ...
+    async def working_file(
+        self, query: WorkingFileQuery,
+    ) -> WorkingFileMaterial | ContentMaterial: ...
 
 
 class AttachmentStagingPort(Protocol):
@@ -1035,7 +1090,7 @@ class ArtifactContentApplication:
     async def attachment(self, query: AttachmentContentQuery) -> ContentMaterial:
         return await self._port.attachment_content(query)
 
-    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial:
+    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial | ContentMaterial:
         return await self._port.working_file(query)
 
 

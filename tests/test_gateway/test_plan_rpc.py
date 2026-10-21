@@ -291,6 +291,9 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert paused.active_task_id is None
 
 
+# Keep the real SQLite/artifact lifecycle and its bounded waits intact, but
+# isolate it from other CI workers competing for disk and executor time.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", ["paused", "cancelled"])
 async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
@@ -298,6 +301,7 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
     monkeypatch: pytest.MonkeyPatch,
     interruption: str,
 ) -> None:
+    from opensquilla.artifacts import ArtifactStore
     from opensquilla.tools.builtin.artifacts import publish_artifact
     from opensquilla.tools.types import ToolContext, current_tool_context
 
@@ -307,6 +311,8 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
     report.write_text("Synthetic verified report.\n", encoding="utf-8")
     entered = asyncio.Event()
     wait_for_cancel = asyncio.Event()
+    delivery_entered = asyncio.Event()
+    publication_complete = asyncio.Event()
     contexts: list[ToolContext] = []
     published: list[dict[str, Any]] = []
 
@@ -336,6 +342,7 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
             if interruption == "paused":
                 raise RuntimeError("Synthetic provider failure")
             return
+        delivery_entered.set()
         if interruption != "cancelled":
             resumed = await stack.storage.get_plan_run(str(context.plan_run_id))
             assert resumed is not None
@@ -345,6 +352,7 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
         # operation; publication must not stand in for unfinished work.
         assert report.read_text(encoding="utf-8") == "Synthetic verified report.\n"
         published.append(await publish(context))
+        publication_complete.set()
 
     monkeypatch.setattr(
         "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
@@ -396,6 +404,13 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
             )
             assert second["planRun"]["runId"] == run_id
 
+        # Activation, real artifact publication, and durable terminal settlement
+        # each perform filesystem/SQLite work. Bound the actual phases separately:
+        # a shared two-second deadline can report a false timeout while a turn
+        # still makes progress on Windows. These three waits remain bounded to six
+        # seconds in total; publication alone is not proof of terminal success.
+        await asyncio.wait_for(delivery_entered.wait(), timeout=2.0)
+        await asyncio.wait_for(publication_complete.wait(), timeout=2.0)
         terminal = await stack.runtime.wait(second["turn_id"], timeout=2.0)
         assert terminal.status == AgentTaskStatus.SUCCEEDED
         assert len(contexts) == 2
@@ -403,6 +418,10 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
         assert len(published) == 1
         assert published[0]["status"] == "published"
         assert published[0]["artifact"]["name"] == "report.txt"
+        _, delivered_bytes, _ = ArtifactStore(tmp_path / "media").read_verified_material(
+            published[0]["artifact"]["id"], session_id="plan-recovery-artifact",
+        )
+        assert delivered_bytes == report.read_bytes()
         final = await stack.storage.get_plan_run(run_id)
         assert final is not None
         if interruption == "cancelled":
@@ -415,12 +434,12 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
 
 
 @pytest.mark.asyncio
-async def test_question_answer_submit_implement_and_first_checkpoint_chain(
+async def test_question_answer_submit_implement_and_progress_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage_ref: SessionStorage | None = None
-    checkpointed: list[str] = []
+    progress_recorded: list[str] = []
 
     async def handler(run: TaskRun) -> None:
         assert storage_ref is not None
@@ -429,16 +448,24 @@ async def test_question_answer_submit_implement_and_first_checkpoint_chain(
         assert current is not None
         assert current.status == "running"
         assert current.current_step_id is None
-        from opensquilla.tools.builtin.plan_control import plan_run_checkpoint
+        from opensquilla.tools.builtin.plan_control import update_plan
         from opensquilla.tools.types import current_tool_context
 
         token = current_tool_context.set(run.envelope.tool_context(is_owner=True))
         try:
-            await plan_run_checkpoint("inspect", "completed")
+            result = json.loads(await update_plan([
+                {"step": "Inspect the accepted state", "status": "completed"},
+                {"step": "Verify the implementation", "status": "pending"},
+            ]))
+            assert result["status"] == "accepted"
+            assert result["progress"]["steps"] == [
+                {"step": "Inspect the accepted state", "status": "completed"},
+                {"step": "Verify the implementation", "status": "pending"},
+            ]
         finally:
             current_tool_context.reset(token)
         advanced = await storage_ref.get_plan_run(run_id)
-        checkpointed.append(str(advanced.current_step_id))
+        progress_recorded.append(str(advanced.current_step_id))
 
     monkeypatch.setattr(
         "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
@@ -542,7 +569,7 @@ async def test_question_answer_submit_implement_and_first_checkpoint_chain(
         )
         await stack.runtime.wait(response["turn_id"], timeout=2.0)
 
-        assert checkpointed == ["None"]
+        assert progress_recorded == ["None"]
         run = await stack.storage.get_plan_run(response["planRun"]["runId"])
         assert run is not None
         assert run.status == "completed"
@@ -672,11 +699,11 @@ async def test_concurrent_plan_implement_returns_typed_conflict_and_one_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    entered = asyncio.Event()
     release = asyncio.Event()
+    handled: list[str] = []
 
-    async def handler(_run: TaskRun) -> None:
-        entered.set()
+    async def handler(run: TaskRun) -> None:
+        handled.append(run.task_id)
         await release.wait()
 
     monkeypatch.setattr(
@@ -719,9 +746,13 @@ async def test_concurrent_plan_implement_returns_typed_conflict_and_one_run(
         tasks = await stack.storage.list_agent_tasks(SOURCE_KEY)
         assert len(tasks) == 1
 
-        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        # Admission and activation persist real SQLite state before the handler
+        # starts. Wait for the completed turn with a bounded integration budget
+        # so loaded workers can finish those writes and finalization.
         release.set()
-        await stack.runtime.wait(accepted[0]["turn_id"], timeout=2.0)
+        terminal = await stack.runtime.wait(accepted[0]["turn_id"], timeout=15.0)
+        assert terminal.status == AgentTaskStatus.SUCCEEDED
+        assert handled == [accepted[0]["turn_id"]]
 
 
 @pytest.mark.asyncio
@@ -991,6 +1022,9 @@ async def test_new_task_copies_independent_plan_lineages(
         } == {first.revision_id, second.revision_id}
 
 
+# This exercises real SQLite activation before its bounded handler-entry wait.
+# Run it without other CI workers competing for disk and executor time.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_explicit_implement_mode_is_pinned_at_queued_execution_boundary(
     tmp_path: Path,

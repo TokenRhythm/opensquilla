@@ -143,6 +143,7 @@ class _AgentConfigAuxiliaries:
     tool_result_store_retention_seconds: int
     # Inert compatibility slot for older bootstrap integrations.
     finalize_evidence_gate: bool = False
+    compaction_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -732,11 +733,7 @@ class AgentBootstrapStage:
         # ``bootstrap_workspace_dir`` (written by ``_run_pipeline`` from
         # the call-site's ToolContext/agent-resolved value — see
         # runtime.py initial_metadata). This makes AgentConfig.workspace_dir
-        # the single authoritative source for downstream code (meta_invoke
-        # handler, sub-Agent factory, etc.). Without this, the bootstrap
-        # stage left workspace_dir=None, the meta_invoke fallback chain
-        # collapsed to ContextVar lookups, and sub-Agents ended up using
-        # the process default workspace instead of the configured one.
+        # the authoritative workspace for tools and child agents.
         agent_config = AgentConfig(
             max_iterations=budgets.max_iterations,
             system_prompt=inp.final_prompt,
@@ -781,6 +778,7 @@ class AgentBootstrapStage:
             ),
             compaction_profile=aux.compaction_profile,
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
+            compaction_timeout_seconds=aux.compaction_timeout_seconds,
             compaction_total_timeout_seconds=aux.compaction_total_timeout_seconds,
             compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
             model_capabilities=catalog.capabilities,

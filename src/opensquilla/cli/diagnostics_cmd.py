@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,7 +14,7 @@ from opensquilla.cli.gateway_rpc import run_gateway_sync
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import console
 
-diagnostics_app = typer.Typer(help="Manage runtime diagnostics logging.")
+diagnostics_app = typer.Typer(help="Inspect runtime diagnostics and packaged capabilities.")
 
 
 def _print_status(payload: dict[str, Any]) -> None:
@@ -88,3 +90,122 @@ def diagnostics_off(
         print_json(payload)
         return
     _print_status(payload)
+
+
+_DEFAULT_SMOKE_IMPORTS = (
+    "joblib",
+    "sklearn",
+    "lightgbm",
+    "tokenizers",
+    "tiktoken",
+    "onnxruntime",
+    "mcp",
+)
+
+
+def _smoke_import_modules(modules: list[str] | tuple[str, ...]) -> dict[str, object]:
+    ok: list[str] = []
+    missing: dict[str, str] = {}
+    for module in modules:
+        try:
+            importlib.import_module(module)
+            ok.append(module)
+        except Exception as exc:
+            missing[module] = f"{type(exc).__name__}: {exc}"
+    return {"ok": ok, "missing": missing, "success": not missing}
+
+
+def _smoke_router_runtime() -> dict[str, object]:
+    import asyncio
+
+    router_module = importlib.import_module("opensquilla.squilla_router.v4_phase3")
+    strategy_cls = getattr(router_module, "V4Phase3Strategy")
+
+    async def _run() -> dict[str, object]:
+        strategy = strategy_cls(require_router_runtime=True)
+        tier, confidence, source, metadata = await strategy.classify(
+            "Summarize this short note.",
+            valid_tiers=["c0", "c1", "c2", "c3"],
+        )
+        success = source == "v4_phase3" and bool(strategy._available)
+        return {
+            "success": success,
+            "available": bool(strategy._available),
+            "tier": tier,
+            "confidence": confidence,
+            "source": source,
+            "route_class": metadata.get("route_class"),
+            "model_version": metadata.get("model_version"),
+        }
+
+    return asyncio.run(_run())
+
+
+@diagnostics_app.command("smoke-imports")
+def smoke_imports(
+    module: list[str] | None = typer.Option(
+        None,
+        "--module",
+        help="Module to import; defaults to desktop packaged runtime capability smoke set.",
+    ),
+) -> None:
+    """Import optional desktop capability modules and exit non-zero on gaps."""
+    modules = module or list(_DEFAULT_SMOKE_IMPORTS)
+    result = _smoke_import_modules(modules)
+    typer.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if not result["success"]:
+        raise typer.Exit(1)
+
+
+@diagnostics_app.command("smoke-router")
+def smoke_router() -> None:
+    """Initialize the bundled V4 router and run one deterministic classification."""
+    try:
+        result = _smoke_router_runtime()
+    except Exception as exc:
+        result = {
+            "success": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    typer.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if not result.get("success"):
+        raise typer.Exit(1)
+
+
+def _smoke_tokenizer_runtime() -> dict[str, object]:
+    from unittest.mock import patch
+
+    import tiktoken
+
+    from opensquilla.token_estimation import estimate_tokens_with_source
+
+    # read_file_cached reads a verified cache file directly. Deny its fallback
+    # fetch before constructing the encoding, so this probe cannot warm itself
+    # from the network and conceal a missing packaged asset.
+    with patch("tiktoken.load.read_file", side_effect=RuntimeError("offline tokenizer cache miss")):
+        encoding = tiktoken.get_encoding("cl100k_base")
+        text = "OpenSquilla offline tokenizer verification. 离线编码验证。"
+        tokens = encoding.encode(text, disallowed_special=())
+        count, source = estimate_tokens_with_source(text)
+    return {
+        "success": bool(tokens)
+        and encoding.decode(tokens) == text
+        and count == len(tokens)
+        and source == "tiktoken_cl100k_base",
+        "encoding": encoding.name,
+        "token_count": len(tokens),
+        "estimate_source": source,
+        "offline": True,
+    }
+
+
+@diagnostics_app.command("smoke-tokenizer")
+def smoke_tokenizer() -> None:
+    """Resolve and use the packaged tokenizer without downloading encoding data."""
+    try:
+        result = _smoke_tokenizer_runtime()
+    except Exception as exc:
+        result = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+    typer.echo(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    if not result.get("success"):
+        raise typer.Exit(1)

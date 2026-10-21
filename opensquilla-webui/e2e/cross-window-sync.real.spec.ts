@@ -13,7 +13,7 @@ test('real Gateway synchronizes an observer user turn and both sidebar terminal 
   watchErrors(sender)
   await context.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   await sender.goto(`${isolatedRealGateway.controlUrl}chat/new`)
-  await expect(sender.locator('.conn-pill.connected')).toBeVisible({ timeout: 20_000 })
+  await expect(sender.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 20_000 })
 
   const firstPrompt = 'Complete a shared turn before testing observer synchronization.'
   const secondPrompt = 'This new user message must appear in the observing window before completion.'
@@ -35,7 +35,7 @@ test('real Gateway synchronizes an observer user turn and both sidebar terminal 
   const observer = await context.newPage()
   watchErrors(observer)
   await observer.goto(sessionUrl)
-  await expect(observer.locator('.conn-pill.connected')).toBeVisible({ timeout: 20_000 })
+  await expect(observer.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 20_000 })
   await expect(observer.locator('.msg-user').filter({ hasText: firstPrompt })).toHaveCount(1)
   const pages = [sender, observer]
   const runningIndicator = (page: typeof sender) => page.locator(

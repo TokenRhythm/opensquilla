@@ -12,10 +12,12 @@ import { join } from 'node:path'
 
 import {
   DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL,
+  DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
   canonicalDesktopGatewayIdentityPayload,
   canonicalDesktopGatewayShutdownPayload,
   desktopGatewayAuthToken,
   desktopGatewayIdentityProof,
+  desktopGatewayLifecycleProof,
   desktopGatewayOwnershipMatchesLaunch,
   desktopGatewayOwnershipRecordPath,
   desktopGatewayShutdownProof,
@@ -26,9 +28,13 @@ import {
   loadDesktopGatewayOwnershipRecord,
   posixPsLstartIdentity,
   requestVerifiedDesktopGatewayShutdown,
+  requestVerifiedDesktopGatewayQuit,
+  readVerifiedDesktopGatewayActivity,
   sameDesktopGatewayOwnershipInstance,
   verifyDesktopGatewayOwnership,
+  verifyDesktopGatewayOwnershipDetailed,
   verifyDesktopGatewayLaunchOwnership,
+  verifyDesktopGatewayLaunchOwnershipDetailed,
   waitForDesktopGatewayOwnershipRelease,
 } from '../dist/desktop-gateway-ownership.js'
 import {
@@ -89,6 +95,112 @@ assert.equal(
   '68b2c749e4d727fbbc92cffa8b4e6bbe1e7c7c0ad4175a1671f903d0be2eb5d9',
   'identity and shutdown proofs use separate cross-language domains',
 )
+assert.equal(
+  desktopGatewayLifecycleProof(record, challenge, 'shutdown', {
+    mode: 'quit', remaining_ms: 5000,
+  }),
+  'd8efe03e8bd6959e27c5a91814a904ef6c8042509b904f9a358f01d91a94eeca',
+  'lifecycle mode, budget, version, and instance share the Python signed vector',
+)
+const activity = { running: 1, queued: 2, waiting: 3, reservations: 1, auxiliary: 4 }
+assert.equal(
+  desktopGatewayLifecycleProof(record, challenge, 'status_ack', { activity }),
+  '8189bd193141c8602b4aee1b9eb6a668b7f8288f97996d509c7b63b726e0c1d5',
+  'nested activity counts use the same canonical ordering as Python',
+)
+
+function lifecycleReply(action, fields, overrides = {}) {
+  return {
+    ...fields,
+    lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+    action: `${action}_ack`,
+    challenge,
+    proof: desktopGatewayLifecycleProof(record, challenge, `${action}_ack`, fields),
+    ...overrides,
+  }
+}
+
+assert.deepEqual(await readVerifiedDesktopGatewayActivity(record, {
+  challenge,
+  fetchImpl: async (url, init) => {
+    assert.equal(String(url), 'http://127.0.0.1:18791/api/desktop/lifecycle')
+    const body = JSON.parse(String(init.body))
+    assert.equal(body.action, 'status')
+    assert.equal(body.mode, undefined)
+    assert.equal(body.remaining_ms, undefined)
+    assert.equal(body.proof, desktopGatewayLifecycleProof(record, challenge, 'status'))
+    return Response.json(lifecycleReply('status', { activity }))
+  },
+}), { kind: 'ok', activeCount: 11, activity })
+
+assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+  challenge, remainingMs: 5000,
+  fetchImpl: async (url, init) => {
+    assert.equal(String(url), 'http://127.0.0.1:18791/api/desktop/lifecycle')
+    assert.deepEqual(JSON.parse(String(init.body)), {
+      mode: 'quit', remaining_ms: 5000,
+      lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+      action: 'shutdown', challenge,
+      proof: 'd8efe03e8bd6959e27c5a91814a904ef6c8042509b904f9a358f01d91a94eeca',
+    })
+    return Response.json(lifecycleReply('shutdown', {
+      accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250,
+    }), { status: 202 })
+  },
+}), { kind: 'quit_accepted', remainingMs: 1250, totalRemainingMs: 6250 })
+
+for (const [status, kind] of [[404, 'unsupported'], [405, 'unsupported'], [403, 'rejected'],
+  [400, 'rejected'], [503, 'rejected']]) {
+  let requests = 0
+  assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+    challenge, remainingMs: 5000,
+    fetchImpl: async (url) => {
+      requests += 1
+      assert.match(String(url), /\/api\/desktop\/lifecycle$/)
+      return Response.json({}, { status })
+    },
+  }), { kind })
+  assert.equal(requests, 1, 'unsupported and rejected requests never trigger implicit legacy drain')
+}
+for (const reply of [
+  {},
+  lifecycleReply('shutdown', { accepted_mode: 'drain', remaining_ms: 1250, total_remaining_ms: 6250 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 5001, total_remaining_ms: 10000 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: -1, total_remaining_ms: 6250 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 10001 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 1249 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250 }, { proof: '0'.repeat(64) }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250 }, { challenge: nonce }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250 }, { total_remaining_ms: 5000 }),
+  lifecycleReply('status', { activity }),
+]) {
+  assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+    challenge, remainingMs: 5000,
+    fetchImpl: async () => Response.json(reply, { status: 202 }),
+  }), { kind: 'rejected' })
+}
+assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+  challenge, remainingMs: 5000,
+  fetchImpl: async () => Response.json(lifecycleReply('shutdown', {
+    accepted_mode: 'quit', remaining_ms: 0, total_remaining_ms: 200,
+  }), { status: 202 }),
+}), { kind: 'quit_accepted', remainingMs: 0, totalRemainingMs: 200 })
+for (const badActivity of [
+  { ...activity, queued: -1 },
+  { ...activity, waiting: '3' },
+  { ...activity, reservations: 0.5 },
+  { running: 1 },
+]) {
+  assert.deepEqual(await readVerifiedDesktopGatewayActivity(record, {
+    challenge,
+    fetchImpl: async () => Response.json(lifecycleReply('status', { activity: badActivity })),
+  }), { kind: 'rejected' })
+}
+assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+  challenge, remainingMs: 5000,
+  fetchImpl: async () => { throw new Error('connection closed') },
+}), { kind: 'unreachable' })
 assert.equal(
   desktopGatewayOwnershipMatchesLaunch({ ...record, pid: 9999 }, {
     instanceNonce: nonce,
@@ -152,6 +264,55 @@ assert.equal(
     false,
     'a matching record without a successful identity challenge fails closed',
   )
+}
+
+// Failure diagnostics distinguish actionable boundaries without serializing
+// credentials or response values. Existing callers retain a boolean result.
+{
+  const goodIdentity = { ...unsignedIdentity, proof: desktopGatewayIdentityProof(nonce, unsignedIdentity) }
+  const cases = [
+    ['verified', 'verified', async () => new Response(JSON.stringify(goodIdentity))],
+    ['http', 'http_status', async () => new Response('private-response-body', { status: 503 })],
+    ['payload', 'invalid_json', async () => new Response('{private-response-body')],
+    ['payload', 'invalid_payload', async () => new Response(JSON.stringify({ ...goodIdentity, unexpected: 'private-response-body' }))],
+    ['fields', 'identity_mismatch', async () => new Response(JSON.stringify({ ...goodIdentity, pid: 9999 }))],
+    ['proof', 'proof_mismatch', async () => new Response(JSON.stringify({ ...goodIdentity, proof: '0'.repeat(64) }))],
+    ['request', 'request_failed', async () => { throw new DOMException('private-request-error', 'TimeoutError') }],
+    ['request', 'request_failed', async () => { throw new TypeError('private-request-error') }],
+  ]
+  for (const [stage, reason, fetchImpl] of cases) {
+    const result = await verifyDesktopGatewayOwnershipDetailed(record, { challenge, fetchImpl })
+    assert.equal(result.stage, stage)
+    assert.equal(result.reason, reason)
+    assert.equal(result.ok, stage === 'verified')
+    assert.equal(await verifyDesktopGatewayOwnership(record, { challenge, fetchImpl }), result.ok)
+    assert.ok(Number.isFinite(result.elapsedMs) && result.elapsedMs >= 0)
+    const encoded = JSON.stringify(result)
+    for (const secret of [nonce, challenge, record.profile_fingerprint, record.start_identity, goodIdentity.proof, 'private-response-body', 'private-request-error']) {
+      assert.equal(encoded.includes(secret), false, `diagnostic must not disclose ${secret.slice(0, 8)}`)
+    }
+    if (stage === 'http') assert.equal(result.statusCode, 503)
+    if (stage === 'fields') assert.deepEqual(result.mismatchFields, ['pid'])
+    if (reason === 'request_failed') assert.ok(['timeout', 'network_error'].includes(result.errorType))
+  }
+
+  const authority = { instanceNonce: nonce, profileFingerprint: record.profile_fingerprint, port: record.port }
+  for (const status of ['missing', 'invalid']) {
+    const result = await verifyDesktopGatewayLaunchOwnershipDetailed('/private-profile-path', authority, {
+      load: () => ({ status, record: null }),
+      verify: async () => assert.fail('untrusted records must never be challenged'),
+    })
+    assert.equal(result.stage, 'record')
+    assert.equal(result.reason, `record_${status}`)
+    assert.equal(JSON.stringify(result).includes('/private-profile-path'), false)
+  }
+  const mismatch = await verifyDesktopGatewayLaunchOwnershipDetailed('/private-profile-path', authority, {
+    load: () => ({ status: 'valid', record: { ...record, instance_nonce: 'x'.repeat(43) } }),
+    verify: async () => assert.fail('a foreign launch must never be challenged'),
+  })
+  assert.equal(mismatch.reason, 'launch_mismatch')
+  assert.deepEqual(mismatch.mismatchFields, ['instance_nonce'])
+  assert.equal(JSON.stringify(mismatch).includes('x'.repeat(43)), false)
 }
 
 const root = mkdtempSync(join(tmpdir(), 'opensquilla-desktop-gateway-owner-'))
@@ -394,11 +555,42 @@ assert.equal(desktopProcessStartIdentity(1.5), null)
 
 // --- readiness verification budget: one deadline per exact record instance ---
 
+// A child may have written its record while migrations still hold the profile
+// lock.  The identity challenge must retry within one bounded budget and
+// converge once the listener is actually serving; a transient foreign health
+// response is never used as a substitute for that proof.
+{
+  let now = 0
+  let verifyCalls = 0
+  const coordinator = new DesktopGatewayOwnershipVerificationCoordinator({
+    identityReadyTimeoutMs: 100,
+    pollIntervalMs: 10,
+    now: () => now,
+    wait: async timeoutMs => { now += timeoutMs },
+    verify: async () => {
+      verifyCalls += 1
+      return verifyCalls >= 3
+    },
+    load: () => ({ status: 'valid', record }),
+    processMayStillBeAlive: () => true,
+    processStartIdentity: () => null,
+    startIdentityConflicts: () => false,
+  })
+  assert.equal(
+    await coordinator.verifyWhenReady('/profile/migrating', record),
+    true,
+    'identity challenge retries through child migration delay and converges',
+  )
+  assert.equal(verifyCalls, 3)
+  assert.equal(now, 20)
+}
+
 {
   let now = 0
   let verifyCalls = 0
   let livenessCalls = 0
   let startIdentityCalls = 0
+  const diagnostics = []
   const coordinator = new DesktopGatewayOwnershipVerificationCoordinator({
     identityReadyTimeoutMs: 100,
     pollIntervalMs: 25,
@@ -420,6 +612,7 @@ assert.equal(desktopProcessStartIdentity(1.5), null)
       return null
     },
     startIdentityConflicts: () => false,
+    onVerificationFailed: (_record, diagnostic, exitReason) => diagnostics.push({ diagnostic, exitReason }),
   })
 
   assert.equal(await coordinator.verifyWhenReady('/profile/owner', record), false)
@@ -429,6 +622,8 @@ assert.equal(desktopProcessStartIdentity(1.5), null)
   assert.equal(verifyCalls, 7, 'later phases still perform one fresh identity challenge')
   assert.equal(livenessCalls, 7, 'every failed challenge gets a fresh process liveness probe')
   assert.equal(startIdentityCalls, 3, 'later phases still perform a fresh liveness check')
+  assert.equal(diagnostics.length, 3, 'one diagnostic per terminal verification, not per poll')
+  assert.ok(diagnostics.every(item => item.exitReason === 'deadline' && item.diagnostic.ok === false))
 }
 
 {

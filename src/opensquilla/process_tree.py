@@ -29,13 +29,21 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+import weakref
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
+from opensquilla._windows_owned_launch import (
+    _WINDOWS_HELPER_STRIP_ENV,
+    _pop_windows_env,
+)
+from opensquilla._windows_owned_launch import (
+    _windows_target_env_from_helper as _windows_target_env_from_helper,
+)
 from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.private_paths import (
     _WindowsPrivateDaclVerificationError,
@@ -51,13 +59,24 @@ _CONTROL_READY_TIMEOUT_SECONDS = 2.0
 _WINDOWS_FROZEN_READY_TIMEOUT_SECONDS = 5.0
 _WINDOWS_FROZEN_READY_RETRY_DELAY_SECONDS = 0.25
 _WINDOWS_FROZEN_READY_ATTEMPTS = 2
+_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_DEFAULT = 2
+_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_MAX = 8
+_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_ENV = (
+    "OPENSQUILLA_WINDOWS_PROCESS_LAUNCH_CONCURRENCY"
+)
+_WINDOWS_LAUNCH_DIAGNOSTICS_ENV = "OPENSQUILLA_STALL_DIAGNOSTICS"
 _POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
+_POSIX_ANCHOR_ARMED = b"B"
 _POSIX_ANCHOR_EMPTY = b"E"
+_POSIX_ANCHOR_EMPTY_INCOMPLETE = b"U"
 _POSIX_ANCHOR_CAPTURED = b"C"
 _POSIX_ANCHOR_INCOMPLETE = b"I"
 _POSIX_ANCHOR_KILL_CAPTURED = b"D"
 _POSIX_ANCHOR_KILL_INCOMPLETE = b"J"
+_POSIX_ANCHOR_PRE_EOF_CAPTURE = b"S"
+_POSIX_ANCHOR_PRE_EOF_CAPTURED = b"V"
+_POSIX_ANCHOR_PRE_EOF_INCOMPLETE = b"F"
 _POSIX_ANCHOR_RELEASE = b"R"
 _POSIX_ANCHOR_TERMINATE = b"T"
 _POSIX_ANCHOR_KILL = b"K"
@@ -66,7 +85,6 @@ _POSIX_TARGET_RELEASE = b"X"
 _WINDOWS_LAUNCH_GATE_PREFIX = "Local\\OpenSquillaTaskLaunch-"
 _WINDOWS_JOB_PREFIX = "Local\\OpenSquillaTaskJob-"
 _WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-_WINDOWS_HELPER_STRIP_ENV = "OPENSQUILLA_INTERNAL_PROCESS_TREE_STRIP_ENV"
 _WINDOWS_HELPER_RUNTIME_ENV_KEYS = ("SystemRoot", "WINDIR", "ComSpec")
 _OWNER_SCHEMA_VERSION = 1
 _OWNER_DATABASE_FILENAME = "task-process-owners.sqlite3"
@@ -81,18 +99,140 @@ _OWNER_DATABASE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
 _POSIX_DESCENDANT_CAPTURE_LIMIT = 1024
-_DARWIN_PROC_PIDTBSDINFO = 3
+_DARWIN_PROC_PIDT_BSDINFOWITHUNIQID = 18
+
+_windows_launch_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, tuple[asyncio.Semaphore, int]
+] = weakref.WeakKeyDictionary()
+_windows_launch_semaphores_lock = threading.Lock()
+
+
+def _windows_process_launch_limit() -> int:
+    """Return the bounded Windows helper-launch admission limit."""
+
+    raw = os.environ.get(_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_ENV, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = _WINDOWS_PROCESS_LAUNCH_CONCURRENCY_DEFAULT
+    return min(max(value, 1), _WINDOWS_PROCESS_LAUNCH_CONCURRENCY_MAX)
+
+
+def _windows_launch_diagnostics_enabled() -> bool:
+    return os.environ.get(_WINDOWS_LAUNCH_DIAGNOSTICS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_windows_launch_failure(
+    *,
+    phase: str,
+    phase_started: float,
+    launch_started: float,
+    process: Any | None,
+    launcher: str,
+    error: BaseException,
+) -> None:
+    """Record bounded failure facts before cleanup, never command or exception text."""
+
+    # Diagnostics must not replace the original failure or prevent cleanup.
+    with contextlib.suppress(Exception):
+        now = time.perf_counter()
+        exceptions: list[dict[str, Any]] = []
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and len(exceptions) < 4 and id(current) not in seen:
+            seen.add(id(current))
+            item: dict[str, Any] = {"exception_type": type(current).__name__[:80]}
+            for key in ("errno", "winerror"):
+                value = getattr(current, key, None)
+                if type(value) is int:
+                    item[key] = value
+            exceptions.append(item)
+            following = current.__cause__
+            if following is None and not current.__suppress_context__:
+                following = current.__context__
+            current = following
+
+        pid = getattr(process, "pid", None)
+        returncode = None
+        returncode_observed = False
+        observation_error = None
+        try:
+            if process is not None:
+                if launcher == "async":
+                    returncode = process.returncode
+                    returncode_observed = True
+                elif launcher == "popen":
+                    returncode = process.poll()
+                    returncode_observed = True
+                # A PTY/custom factory's poll can change native reader state.
+                # Do not call it or infer liveness from its PID.
+        except Exception as exc:
+            observation_error = type(exc).__name__[:80]
+        metadata: dict[str, Any] = {
+            "event": "windows_process_tree_launch_failed",
+            "phase": phase,
+            "phase_elapsed_ms": round((now - phase_started) * 1000),
+            "launch_elapsed_ms": round((now - launch_started) * 1000),
+            "source": "frozen" if getattr(sys, "frozen", False) else "source",
+            "mode": launcher,
+            "wrapper_pid": pid if type(pid) is int else None,
+            "wrapper_returncode": returncode if type(returncode) is int else None,
+            "wrapper_returncode_observed": returncode_observed,
+            "entry": exceptions,
+        }
+        if observation_error is not None:
+            metadata["fields"] = {
+                "kind": "wrapper_observation",
+                "exception_type": observation_error,
+            }
+        log.warning(
+            "windows_process_tree_launch_failed",
+            extra={"_opensquilla_log_metadata": metadata},
+        )
+
+
+def _windows_launch_failure_message(phase: str, error: BaseException) -> str:
+    message = "Windows controlled process launch failed closed"
+    if phase == "helper_ready" and isinstance(error, TimeoutError):
+        message += " (phase=helper_ready, cause=TimeoutError)"
+    return message
+
+
+def _windows_launch_semaphore() -> tuple[asyncio.Semaphore, int]:
+    """Get one admission gate per event loop, without cross-loop sharing."""
+
+    loop = asyncio.get_running_loop()
+    with _windows_launch_semaphores_lock:
+        admission = _windows_launch_semaphores.get(loop)
+        if admission is None:
+            limit = _windows_process_launch_limit()
+            admission = (asyncio.Semaphore(limit), limit)
+            _windows_launch_semaphores[loop] = admission
+    return admission
 
 
 def _process_tree_child_argv(*args: str) -> tuple[str, ...]:
     """Build the source or frozen argv for one process-tree helper."""
 
-    prefix = (
-        (sys.executable, "--internal-child", "process-tree")
-        if getattr(sys, "frozen", False)
-        else (sys.executable, "-m", "opensquilla.process_tree")
-    )
-    return (*prefix, *args)
+    if getattr(sys, "frozen", False):
+        return (sys.executable, "--internal-child", "process-tree", *args)
+    module = "opensquilla.process_tree"
+    if args and args[0] == "--windows-owned-launch":
+        module = "opensquilla._windows_owned_launch"
+        helper_path = Path(__file__).with_name("_windows_owned_launch.py").absolute()
+        # The stdlib-only helper does not need site hooks or package discovery.
+        # Keep the current interpreter and leave the target's argv/env intact.
+        # -B is explicit because -I ignores PYTHONDONTWRITEBYTECODE.
+        with contextlib.suppress(OSError):
+            if helper_path.is_file():
+                return (sys.executable, "-I", "-S", "-B", str(helper_path), *args)
+        # Zip imports and sourceless installations can still use module dispatch.
+    return (sys.executable, "-m", module, *args)
 
 
 def _wait_for_windows_helper_ready(gate: Any) -> None:
@@ -129,6 +269,7 @@ class _TaskProcessScope:
     task_digest: str
     parent_session_digest: str | None = None
     parent_task_digest: str | None = None
+    desktop_launch_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +279,9 @@ class _PosixProcessInfo:
     pgid: int
     uid: int
     start_identity: str
+    unique_id: int | None = None
+    parent_unique_id: int | None = None
+    is_zombie: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,6 +324,21 @@ class _DarwinProcBsdInfo(ctypes.Structure):
         ("pbi_start_tvsec", ctypes.c_uint64),
         ("pbi_start_tvusec", ctypes.c_uint64),
     ]
+
+
+class _DarwinProcUniqueInfo(ctypes.Structure):
+    _fields_ = [
+        ("uuid", ctypes.c_uint8 * 16),
+        ("unique_id", ctypes.c_uint64),
+        ("parent_unique_id", ctypes.c_uint64),
+        ("id_version", ctypes.c_int32),
+        ("original_parent_version", ctypes.c_int32),
+        ("reserved", ctypes.c_uint64 * 2),
+    ]
+
+
+class _DarwinProcBsdUniqueInfo(ctypes.Structure):
+    _fields_ = [("bsd", _DarwinProcBsdInfo), ("unique", _DarwinProcUniqueInfo)]
 
 
 _CURRENT_TASK_PROCESS_SCOPE: contextvars.ContextVar[_TaskProcessScope | None] = (
@@ -240,7 +399,9 @@ def task_process_scope(
 
 
 def _current_task_process_scope() -> _TaskProcessScope | None:
-    return _CURRENT_TASK_PROCESS_SCOPE.get()
+    from opensquilla.desktop_process_cleanup import desktop_process_scope
+
+    return desktop_process_scope(_CURRENT_TASK_PROCESS_SCOPE.get())
 
 
 @dataclass(frozen=True)
@@ -336,6 +497,7 @@ def _prepare_private_directory(path: Path) -> None:
                 directory=True,
                 expected_device=int(metadata.st_dev),
                 expected_inode=int(metadata.st_ino),
+                skip_if_private_directory=True,
             )
             current = os.lstat(path)
             if (
@@ -621,6 +783,9 @@ def _connect_owner_database(
             "CREATE INDEX IF NOT EXISTS idx_task_process_owners_parent "
             "ON task_process_owners(parent_task_digest)"
         )
+        from opensquilla.desktop_process_cleanup import prepare_launch_registry
+
+        prepare_launch_registry(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS task_process_owner_claims (
@@ -787,29 +952,41 @@ def _darwin_libproc() -> Any | None:
     return library
 
 
-def _darwin_process_info(pid: int, library: Any | None = None) -> _PosixProcessInfo | None:
+def _darwin_process_info(
+    pid: int, library: Any | None = None, *, include_zombies: bool = False,
+) -> _PosixProcessInfo | None:
     library = library or _darwin_libproc()
     if library is None:
         return None
-    raw = _DarwinProcBsdInfo()
+    raw = _DarwinProcBsdUniqueInfo()
     size = ctypes.sizeof(raw)
     if library.proc_pidinfo(
         int(pid),
-        _DARWIN_PROC_PIDTBSDINFO,
-        0,
+        _DARWIN_PROC_PIDT_BSDINFOWITHUNIQID,
+        # arg=0 also hides processes in exit() before they become zombies.
+        # Keep their identity verifiable until exit, then filter SZOMB below.
+        1,
         ctypes.byref(raw),
         size,
     ) != size:
         return None
+    if raw.bsd.pbi_pid != pid or not raw.unique.unique_id:
+        return None
+    is_zombie = raw.bsd.pbi_status == 5  # SZOMB: awaiting collection by parent
+    if is_zombie and not include_zombies:
+        return None
     return _PosixProcessInfo(
-        pid=int(raw.pbi_pid),
-        ppid=int(raw.pbi_ppid),
-        pgid=int(raw.pbi_pgid),
-        uid=int(raw.pbi_uid),
+        pid=int(raw.bsd.pbi_pid),
+        ppid=int(raw.bsd.pbi_ppid),
+        pgid=int(raw.bsd.pbi_pgid),
+        uid=int(raw.bsd.pbi_uid),
         start_identity=(
-            f"darwin-libproc-start:{int(raw.pbi_start_tvsec)}:"
-            f"{int(raw.pbi_start_tvusec)}"
+            f"darwin-libproc-start:{int(raw.bsd.pbi_start_tvsec)}:"
+            f"{int(raw.bsd.pbi_start_tvusec)}"
         ),
+        unique_id=int(raw.unique.unique_id),
+        parent_unique_id=int(raw.unique.parent_unique_id),
+        is_zombie=is_zombie,
     )
 
 
@@ -898,6 +1075,27 @@ def _captured_posix_process_matches(
     )
 
 
+def _posix_pid_definitively_gone(pid: int) -> bool:
+    """Prove execution ended, including an unreaped Darwin zombie.
+
+    This does not prove the PID has been released for reuse. Missing metadata
+    alone never proves exit, nor does a stopped (SSTOP) process.
+    """
+    if sys.platform == "darwin":
+        info = _darwin_process_info(pid, include_zombies=True)
+        if info is not None and info.is_zombie:
+            return True
+    # Probe last: the process can be reaped between the metadata query and
+    # this check, even when it was still present during the first lookup.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
 @lru_cache(maxsize=1)
 def _linux_pidfd_libc() -> Any:
     # Some portable Python builds omit pidfd APIs despite a capable host libc.
@@ -940,6 +1138,7 @@ def _capture_posix_group_descendants(
     anchor_pid: int,
     *,
     include_anchor_children: bool = False,
+    darwin_lineage: dict[int, int] | None = None,
 ) -> _PosixDescendantCapture:
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
         return _PosixDescendantCapture((), True)
@@ -949,25 +1148,62 @@ def _capture_posix_group_descendants(
     anchor = snapshot.get(anchor_pid)
     if anchor is None or anchor.pgid != pgid or anchor.uid != os.geteuid():
         return _PosixDescendantCapture((), False)
-    roots = (anchor,) if include_anchor_children else tuple(
+    group_roots = tuple(
         info for info in snapshot.values() if info.pgid == pgid and info.pid != anchor_pid
     )
+    darwin_anchor_capture = include_anchor_children and sys.platform == "darwin"
+    if darwin_anchor_capture:
+        # Preserve group roots that were reparented before this snapshot.
+        owned_group_roots = tuple(info for info in group_roots if info.uid == anchor.uid)
+        roots = (anchor, *owned_group_roots)
+    else:
+        roots = (anchor,) if include_anchor_children else group_roots
     if not roots:
         # Natural completion can leave only the still-owned anchor before a
         # stop arrives. Confirm the empty group independently; an unavailable
         # snapshot or a surviving member must still fail closed. The anchor
         # retains its consecutive-empty checks before releasing ownership.
         return _PosixDescendantCapture((), _posix_group_members(pgid) == (anchor_pid,))
-    children: dict[int, list[_PosixProcessInfo]] = {}
+    track_lineage = sys.platform == "darwin" and darwin_lineage is not None
+    children: dict[int | None, list[_PosixProcessInfo]] = {}
     for info in snapshot.values():
-        children.setdefault(info.ppid, []).append(info)
+        parent_key = info.parent_unique_id if track_lineage else info.ppid
+        children.setdefault(parent_key, []).append(info)
     seen = {root.pid for root in roots}
-    pending = [(root.pid, 0) for root in roots]
-    candidates: list[tuple[_PosixProcessInfo, int]] = []
-    complete = True
+    if len(seen) > _POSIX_DESCENDANT_CAPTURE_LIMIT:
+        return _PosixDescendantCapture((), False)
+    pending = [(root.unique_id if track_lineage else root.pid, 0) for root in roots]
+    candidates: list[tuple[_PosixProcessInfo, int]] = (
+        [(root, 1) for root in owned_group_roots] if darwin_anchor_capture else []
+    )
+    complete = not darwin_anchor_capture or len(owned_group_roots) == len(group_roots)
+    if track_lineage:
+        assert darwin_lineage is not None
+        # The kernel keeps the parent's unique ID across reparenting. Unlike
+        # PPID, this still identifies ordinary setsid children after the target
+        # exits. Retain observed identities for subsequent cleanup snapshots.
+        # This is not arbitrary daemon containment: an unobserved intermediate
+        # may disappear, and exec after reparenting rewrites parent_unique_id.
+        for info in snapshot.values():
+            depth = darwin_lineage.get(info.unique_id) if info.unique_id is not None else None
+            if depth is None and info.parent_unique_id in darwin_lineage:
+                depth = darwin_lineage[info.parent_unique_id] + 1
+            if depth is None or info.pid in seen:
+                continue
+            if info.uid != anchor.uid:
+                complete = False
+                continue
+            seen.add(info.pid)
+            pending.append((info.unique_id, depth))
+            candidates.append((info, depth))
     while pending:
-        parent_pid, parent_depth = pending.pop(0)
-        for child in children.get(parent_pid, ()):
+        if len(seen) > _POSIX_DESCENDANT_CAPTURE_LIMIT:
+            return _PosixDescendantCapture((), False)
+        parent_key, parent_depth = pending.pop(0)
+        if parent_key is None:
+            complete = False
+            continue
+        for child in children.get(parent_key, ()):
             if child.pid in seen:
                 continue
             seen.add(child.pid)
@@ -977,13 +1213,33 @@ def _capture_posix_group_descendants(
                 complete = False
                 continue
             depth = parent_depth + 1
-            pending.append((child.pid, depth))
+            pending.append((child.unique_id if track_lineage else child.pid, depth))
             if include_anchor_children or child.pgid != pgid:
                 candidates.append((child, depth))
     captured: list[_CapturedPosixProcess] = []
     for candidate, depth in sorted(candidates, key=lambda item: item[1]):
+        if track_lineage:
+            assert darwin_lineage is not None
+            if candidate.unique_id is None:
+                complete = False
+                continue
+            # The snapshot already proved this relationship. Retain it even
+            # if the parent exits before the live recheck: later snapshots may
+            # still find its children. A reused PID is never captured below.
+            if candidate.unique_id not in darwin_lineage:
+                if len(darwin_lineage) >= _POSIX_DESCENDANT_CAPTURE_LIMIT:
+                    complete = False
+                else:
+                    darwin_lineage[candidate.unique_id] = depth
         current = _posix_process_info(candidate.pid)
-        if current is None or current.start_identity != candidate.start_identity:
+        if current is None:
+            if not _posix_pid_definitively_gone(candidate.pid):
+                complete = False
+            continue
+        if (
+            current.start_identity != candidate.start_identity
+            or (track_lineage and current.unique_id != candidate.unique_id)
+        ):
             continue
         if current.uid != candidate.uid:
             complete = False
@@ -1029,11 +1285,15 @@ def _signal_captured_posix_processes(
         try:
             if process.pidfd is not None:
                 _linux_pidfd_send_signal(process.pidfd, sig)
-            elif _captured_posix_process_matches(
-                _posix_process_info(process.pid),
-                process,
-            ):
-                os.kill(process.pid, sig)
+            else:
+                current_info = _posix_process_info(process.pid)
+                if current_info is None:
+                    # A failed identity lookup does not authorize a bare-PID
+                    # signal, but a still-existing PID cannot prove cleanup.
+                    if not _posix_pid_definitively_gone(process.pid):
+                        complete = False
+                elif _captured_posix_process_matches(current_info, process):
+                    os.kill(process.pid, sig)
         except ProcessLookupError:
             continue
         except OSError:
@@ -1058,12 +1318,53 @@ def _captured_posix_processes_alive(
         if process.pidfd is not None:
             if process.pidfd not in exited_pidfds:
                 return True
-        elif _captured_posix_process_matches(
-            _posix_process_info(process.pid),
-            process,
-        ):
-            return True
+        else:
+            current_info = _posix_process_info(process.pid)
+            if current_info is None:
+                if not _posix_pid_definitively_gone(process.pid):
+                    return True
+                continue
+            if _captured_posix_process_matches(current_info, process):
+                return True
     return False
+
+
+def _merge_live_posix_captures(
+    previous: tuple[_CapturedPosixProcess, ...],
+    current: tuple[_CapturedPosixProcess, ...],
+) -> tuple[tuple[_CapturedPosixProcess, ...], bool]:
+    """Keep still-live identities when an explicit EOF refreshes the snapshot."""
+    retained: list[_CapturedPosixProcess] = []
+    identities: set[tuple[int, int, str]] = set()
+    complete = True
+    for process in previous:
+        if process.pidfd is not None:
+            definitively_exited = not _captured_posix_processes_alive((process,))
+        else:
+            current_info = _posix_process_info(process.pid)
+            if current_info is None:
+                definitively_exited = _posix_pid_definitively_gone(process.pid)
+                if not definitively_exited:
+                    complete = False
+            else:
+                definitively_exited = not _captured_posix_process_matches(
+                    current_info, process,
+                )
+        if definitively_exited:
+            _close_captured_posix_processes((process,))
+            continue
+        retained.append(process)
+        identities.add((process.pid, process.uid, process.start_identity))
+    for process in current:
+        identity = (process.pid, process.uid, process.start_identity)
+        if identity in identities or len(retained) >= _POSIX_DESCENDANT_CAPTURE_LIMIT:
+            _close_captured_posix_processes((process,))
+            if identity not in identities:
+                complete = False
+            continue
+        retained.append(process)
+        identities.add(identity)
+    return tuple(retained), complete
 
 
 def _close_captured_posix_processes(
@@ -1148,6 +1449,10 @@ def _insert_owner_record(
                 path,
                 timeout_seconds=_OWNER_DATABASE_INSERT_TIMEOUT_SECONDS,
             ) as connection:
+                from opensquilla.desktop_process_cleanup import register_launch_owner
+
+                connection.execute("BEGIN IMMEDIATE")
+                register_launch_owner(connection, scope, record)
                 connection.execute(
                     """
                     INSERT INTO task_process_owners (
@@ -1168,6 +1473,7 @@ def _insert_owner_record(
                         record.controller_start_identity,
                     ),
                 )
+                connection.execute("COMMIT")
             return _PersistedOwnerRef(database_path=path, record=record)
         except (OSError, sqlite3.Error, _OwnerRegistryFileChangedError) as exc:
             if delay is None or not _is_transient_owner_registry_write_error(exc):
@@ -1179,11 +1485,16 @@ def _insert_owner_record(
     raise AssertionError("owner database insert retry loop did not terminate")
 
 
-def _delete_owner_record(reference: _PersistedOwnerRef) -> None:
+def _delete_owner_record(
+    reference: _PersistedOwnerRef, *, cleanup_complete: bool = False,
+) -> None:
     record = reference.record
     try:
         with _connect_owner_database(reference.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            from opensquilla.desktop_process_cleanup import settle_launch_owner
+
+            settle_launch_owner(connection, reference.record.owner_id, cleanup_complete)
             connection.execute(
                 "DELETE FROM task_process_owners "
                 "WHERE owner_id = ? AND controller_pid = ? "
@@ -1263,7 +1574,9 @@ def _release_owner_claim(claim: _PersistedOwnerClaim) -> None:
         log.warning("process_tree_owner_claim_release_failed")
 
 
-def _load_owner_records(state_dir: str | Path) -> tuple[_PersistedOwnerRef, ...]:
+def _load_owner_records(
+    state_dir: str | Path, *, require_complete: bool = False,
+) -> tuple[_PersistedOwnerRef, ...]:
     path = _owner_database_path(state_dir)
     if not path.exists():
         return ()
@@ -1276,6 +1589,8 @@ def _load_owner_records(state_dir: str | Path) -> tuple[_PersistedOwnerRef, ...]
             ).fetchall()
     except (OSError, sqlite3.Error):
         log.warning("process_tree_owner_registry_read_failed")
+        if require_complete:
+            raise
         return ()
     records: list[_PersistedOwnerRef] = []
     for row in rows:
@@ -1283,9 +1598,13 @@ def _load_owner_records(state_dir: str | Path) -> tuple[_PersistedOwnerRef, ...]
             schema_version = int(row["schema_version"])
         except (TypeError, ValueError):
             log.warning("process_tree_owner_record_invalid")
+            if require_complete:
+                raise ProcessTreeOwnershipError("Task process owner record is invalid")
             continue
         if schema_version != _OWNER_SCHEMA_VERSION:
             log.warning("process_tree_owner_record_schema_unsupported")
+            if require_complete:
+                raise ProcessTreeOwnershipError("Task process owner schema is unsupported")
             continue
         try:
             record = _PersistedOwnerRecord(
@@ -1308,9 +1627,13 @@ def _load_owner_records(state_dir: str | Path) -> tuple[_PersistedOwnerRef, ...]
             )
         except (TypeError, ValueError):
             log.warning("process_tree_owner_record_invalid")
+            if require_complete:
+                raise ProcessTreeOwnershipError("Task process owner record is invalid")
             continue
         if not _valid_owner_record(record):
             log.warning("process_tree_owner_record_invalid")
+            if require_complete:
+                raise ProcessTreeOwnershipError("Task process owner record is invalid")
             continue
         records.append(_PersistedOwnerRef(database_path=path, record=record))
     return tuple(records)
@@ -1643,6 +1966,7 @@ class _WindowsLaunchGate:
 class _PosixLaunchGate:
     read_fd: int
     write_fd: int
+    release_attempted: bool = False
 
     @classmethod
     def create(cls) -> _PosixLaunchGate:
@@ -1661,6 +1985,7 @@ class _PosixLaunchGate:
     def release(self) -> None:
         if self.write_fd < 0:
             raise ProcessTreeOwnershipError("POSIX controlled launch gate is closed")
+        self.release_attempted = True
         os.write(self.write_fd, _POSIX_TARGET_RELEASE)
         os.close(self.write_fd)
         self.write_fd = -1
@@ -1685,6 +2010,7 @@ class _PosixGroupAnchor:
     _monitor_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _term_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
     _kill_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
+    _capture_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
     _kill_reported: bool = field(default=False, repr=False)
 
     @property
@@ -1714,6 +2040,16 @@ class _PosixGroupAnchor:
             raise ProcessTreeOwnershipError("POSIX ownership anchor has incomplete control pipes")
         stdin.write(_POSIX_ANCHOR_ARM)
         await stdin.drain()
+        try:
+            marker = await asyncio.wait_for(
+                stdout.readexactly(1), timeout=_CONTROL_READY_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.IncompleteReadError) as exc:
+            raise ProcessTreeOwnershipError(
+                "POSIX ownership anchor did not authorize launch"
+            ) from exc
+        if marker != _POSIX_ANCHOR_ARMED:
+            raise ProcessTreeOwnershipError("POSIX ownership anchor refused target launch")
         self._monitor_task = asyncio.create_task(self._watch_empty(stdout))
 
     def bind(self, owner: ProcessTreeOwner) -> None:
@@ -1741,19 +2077,42 @@ class _PosixGroupAnchor:
                 self._kill_reported = True
                 self._kill_reports.put_nowait(True)
                 continue
+            if marker == _POSIX_ANCHOR_PRE_EOF_CAPTURED:
+                self._capture_reports.put_nowait(True)
+                continue
+            if marker == _POSIX_ANCHOR_PRE_EOF_INCOMPLETE:
+                self.cleanup_incomplete = True
+                self._capture_reports.put_nowait(False)
+                continue
             if marker == _POSIX_ANCHOR_EMPTY:
                 self.empty = True
                 # Natural completion can win the race with a stop request.
                 # EMPTY is authoritative even if no signal ACK will follow.
                 self._term_reports.put_nowait(True)
                 self._kill_reports.put_nowait(True)
+                self._capture_reports.put_nowait(False)
                 owner = self._owner
                 if owner is not None:
-                    await owner._close_empty_posix_owner()
+                    try:
+                        await owner._close_empty_posix_owner()
+                    except BaseException:
+                        # EMPTY proves the target tree has finished. Reap the
+                        # released anchor and close its pipes before propagating.
+                        with contextlib.suppress(Exception):
+                            await _finish_launch_cleanup_step(self.process.wait, [])
+                        raise
+            elif marker == _POSIX_ANCHOR_EMPTY_INCOMPLETE:
+                # No tracked process remains, but a failed census means that
+                # the anchor cannot prove that every descendant was tracked.
+                self.cleanup_incomplete = True
+                self._term_reports.put_nowait(False)
+                self._kill_reports.put_nowait(False)
+                self.release()
             elif not self._kill_reported:
                 self.cleanup_incomplete = True
                 self._term_reports.put_nowait(False)
                 self._kill_reports.put_nowait(False)
+            self._capture_reports.put_nowait(False)
             break
         with contextlib.suppress(Exception):
             await self.process.wait()
@@ -1765,6 +2124,34 @@ class _PosixGroupAnchor:
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             stdin.write(_POSIX_ANCHOR_RELEASE)
         stdin.close()
+
+    async def request_capture_before_eof(self) -> bool:
+        """Ask the live anchor to retain its descendants without signalling them."""
+        if self.cleanup_incomplete:
+            return False
+        stdin = getattr(self.process, "stdin", None)
+        if (
+            stdin is None or stdin.is_closing() or not self.alive
+            or self._monitor_task is None or self._monitor_task.done()
+        ):
+            self.cleanup_incomplete = True
+            return False
+        while not self._capture_reports.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._capture_reports.get_nowait()
+        try:
+            stdin.write(_POSIX_ANCHOR_PRE_EOF_CAPTURE)
+            await stdin.drain()
+            return await asyncio.wait_for(
+                self._capture_reports.get(), timeout=_CONTROL_READY_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            # A late ACK must never satisfy a later EOF request.
+            self.cleanup_incomplete = True
+            raise
+        except (OSError, ValueError, TimeoutError):
+            self.cleanup_incomplete = True
+            return False
 
     async def request_signal(self, command: bytes) -> bool:
         stdin = getattr(self.process, "stdin", None)
@@ -1829,6 +2216,7 @@ class ProcessTreeOwner:
     _closed: bool = False
     _terminate_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _completion_monitor: asyncio.Task[None] | None = field(default=None, repr=False)
+    _owner_deletion: asyncio.Future[None] | None = field(default=None, repr=False)
 
     @property
     def durable(self) -> bool:
@@ -1865,26 +2253,48 @@ class ProcessTreeOwner:
         self.persisted_owner = None
         return persisted_owner
 
-    async def _mark_closed(self) -> None:
+    async def _mark_closed(self, *, cleanup_complete: bool = True) -> None:
         persisted_owner = self._take_persisted_owner()
         if persisted_owner is not None:
-            await asyncio.to_thread(_delete_owner_record, persisted_owner)
+            self._owner_deletion = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    contextvars.copy_context().run, _delete_owner_record,
+                    persisted_owner, cleanup_complete=cleanup_complete,
+                ),
+            )
+        if self._owner_deletion is not None:
+            cancellations: list[asyncio.CancelledError] = []
+            await _finish_launch_cleanup_step(
+                partial(asyncio.shield, self._owner_deletion), cancellations,
+            )
+            if cancellations:
+                raise cancellations[0]
 
     async def _close_empty_posix_owner(self) -> None:
-        if self._closed or self.posix_anchor is None:
+        if self.posix_anchor is None:
             return
-        await self._mark_closed()
-        self.posix_anchor.release()
+        try:
+            await self._mark_closed()
+        finally:
+            self.posix_anchor.release()
 
     def start_completion_monitor(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self.posix_anchor is not None:
+            anchor = self.posix_anchor
+            if anchor._monitor_task is None:
+                anchor._monitor_task = loop.create_task(
+                    anchor._watch_empty(anchor.process.stdout)
+                )
+            return
         if (
             not isinstance(self.windows_job, _WindowsJob)
             or self._completion_monitor is not None
         ):
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
             return
         self._completion_monitor = loop.create_task(self._watch_windows_job_empty())
 
@@ -1903,40 +2313,51 @@ class ProcessTreeOwner:
             await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
         return True
 
+    async def capture_before_eof(self) -> bool:
+        """Confirm an identity-bound descendant snapshot before PTY EOF."""
+        async with self._terminate_lock:
+            if not self.is_active() or self.posix_anchor is None:
+                return False
+            return await self.posix_anchor.request_capture_before_eof()
+
     async def terminate(self, *, graceful_timeout: float, kill_timeout: float) -> bool:
         """Idempotently terminate this owner, bounded by the supplied timeouts."""
 
         async with self._terminate_lock:
             if not self.is_active():
-                await self._mark_closed()
+                complete = True
                 if self.posix_anchor is not None:
                     await self.posix_anchor.settle(kill_timeout)
-                    return not self.posix_anchor.cleanup_incomplete
-                return True
+                    complete = not self.posix_anchor.cleanup_incomplete
+                await self._mark_closed(cleanup_complete=complete)
+                return complete
             if self.pgid is not None:
                 assert self.posix_anchor is not None
                 if not await self.posix_anchor.request_signal(_POSIX_ANCHOR_TERMINATE):
                     if not self.is_active():
-                        await self._mark_closed()
                         await self.posix_anchor.settle(kill_timeout)
-                        return not self.posix_anchor.cleanup_incomplete
+                        complete = not self.posix_anchor.cleanup_incomplete
+                        await self._mark_closed(cleanup_complete=complete)
+                        return complete
                     return False
                 if await self._wait_inactive(graceful_timeout):
-                    await self._mark_closed()
-                    if self.posix_anchor is not None:
-                        await self.posix_anchor.settle(kill_timeout)
-                    return not self.posix_anchor.cleanup_incomplete
+                    await self.posix_anchor.settle(kill_timeout)
+                    complete = not self.posix_anchor.cleanup_incomplete
+                    await self._mark_closed(cleanup_complete=complete)
+                    return complete
                 if not await self.posix_anchor.request_signal(_POSIX_ANCHOR_KILL):
                     if not self.is_active():
-                        await self._mark_closed()
                         await self.posix_anchor.settle(kill_timeout)
-                        return not self.posix_anchor.cleanup_incomplete
+                        complete = not self.posix_anchor.cleanup_incomplete
+                        await self._mark_closed(cleanup_complete=complete)
+                        return complete
                     return False
                 stopped = await self._wait_inactive(kill_timeout)
                 if stopped:
-                    await self._mark_closed()
-                    if self.posix_anchor is not None:
-                        await self.posix_anchor.settle(kill_timeout)
+                    await self.posix_anchor.settle(kill_timeout)
+                    await self._mark_closed(
+                        cleanup_complete=not self.posix_anchor.cleanup_incomplete,
+                    )
                 return stopped and not self.posix_anchor.cleanup_incomplete
             if self.windows_job is not None:
                 try:
@@ -2089,70 +2510,94 @@ def _windows_helper_env(target_env: Mapping[str, str] | None) -> dict[str, str]:
     return helper_env
 
 
-def _pop_windows_env(env: dict[str, str], key: str) -> str | None:
-    folded = key.casefold()
-    for candidate in tuple(env):
-        if candidate.casefold() == folded:
-            return env.pop(candidate)
-    return None
+async def _finish_launch_cleanup_step[Result](
+    operation: Callable[[], Awaitable[Result]],
+    cancellations: list[asyncio.CancelledError],
+) -> Result:
+    """Keep cleanup in the launch task, retaining cancellation until it finishes."""
 
-
-def _windows_target_env_from_helper(helper_env: Mapping[str, str]) -> dict[str, str]:
-    """Recover the caller-requested env after the helper has booted."""
-
-    target_env = {str(key): str(value) for key, value in dict(helper_env).items()}
-    injected = _pop_windows_env(target_env, _WINDOWS_HELPER_STRIP_ENV) or ""
-    for key in injected.split(";"):
-        if key:
-            _pop_windows_env(target_env, key)
-    return target_env
+    while True:
+        try:
+            return await operation()
+        except asyncio.CancelledError as exc:
+            if not cancellations:
+                cancellations.append(exc)
 
 
 async def _cleanup_failed_posix_launch(
     *,
     gate: _PosixLaunchGate,
-    persisted_owner: _PersistedOwnerRef | None,
+    registration: asyncio.Future[_PersistedOwnerRef] | None,
     process: Any | None,
     anchor: _PosixGroupAnchor,
-) -> None:
+) -> asyncio.CancelledError | None:
+    cancellations: list[asyncio.CancelledError] = []
+    persisted_owner = None
+    if registration is not None:
+        with contextlib.suppress(BaseException):
+            persisted_owner = await _finish_launch_cleanup_step(
+                partial(asyncio.shield, registration), cancellations,
+            )
     with contextlib.suppress(BaseException):
         gate.close()
     if process is not None:
         with contextlib.suppress(BaseException):
-            await _stop_failed_async_process(process)
+            await _finish_launch_cleanup_step(
+                partial(_stop_failed_async_process, process), cancellations,
+            )
     with contextlib.suppress(BaseException):
-        await _stop_unarmed_posix_anchor(anchor)
+        await _finish_launch_cleanup_step(
+            partial(_stop_unarmed_posix_anchor, anchor), cancellations,
+        )
     if persisted_owner is not None:
+        # A cancelled pre-release launch never ran user code. Both controlled
+        # children must still be observed stopped before recording success.
+        complete = (
+            not getattr(gate, "release_attempted", True)
+            and (process is None or getattr(process, "returncode", None) is not None)
+            and getattr(anchor.process, "returncode", None) is not None
+        )
+        delete = (
+            partial(_delete_owner_record, cleanup_complete=True)
+            if complete else _delete_owner_record
+        )
         with contextlib.suppress(BaseException):
-            await asyncio.to_thread(_delete_owner_record, persisted_owner)
+            deletion = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(contextvars.copy_context().run, delete, persisted_owner),
+            )
+            await _finish_launch_cleanup_step(partial(asyncio.shield, deletion), cancellations)
+    return cancellations[0] if cancellations else None
 
 
 async def _cleanup_failed_windows_launch(
     *,
-    persisted_owner: _PersistedOwnerRef | None,
+    registration: asyncio.Future[_PersistedOwnerRef] | None,
     process: Any | None,
     job: _WindowsJob,
-) -> None:
+) -> asyncio.CancelledError | None:
+    cancellations: list[asyncio.CancelledError] = []
+    persisted_owner = None
+    if registration is not None:
+        with contextlib.suppress(BaseException):
+            persisted_owner = await _finish_launch_cleanup_step(
+                partial(asyncio.shield, registration), cancellations,
+            )
     if process is not None:
         with contextlib.suppress(BaseException):
-            await _stop_failed_async_process(process)
+            await _finish_launch_cleanup_step(
+                partial(_stop_failed_async_process, process), cancellations,
+            )
     with contextlib.suppress(BaseException):
         job.close()
     if persisted_owner is not None:
         with contextlib.suppress(BaseException):
-            await asyncio.to_thread(_delete_owner_record, persisted_owner)
-
-
-async def _await_cleanup_before_cancellation(cleanup: asyncio.Task[None]) -> None:
-    """Finish an isolated cleanup task despite repeated caller cancellation."""
-
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            continue
-    with contextlib.suppress(BaseException):
-        cleanup.result()
+            deletion = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(contextvars.copy_context().run, _delete_owner_record, persisted_owner),
+            )
+            await _finish_launch_cleanup_step(partial(asyncio.shield, deletion), cancellations)
+    return cancellations[0] if cancellations else None
 
 
 async def _create_owned_posix_subprocess(
@@ -2169,17 +2614,25 @@ async def _create_owned_posix_subprocess(
     )
     anchor = await _create_posix_anchor(owner_id, control_path=control_path)
     persisted_owner: _PersistedOwnerRef | None = None
+    registration: asyncio.Future[_PersistedOwnerRef] | None = None
     gate = _PosixLaunchGate.create()
     status_read_fd, status_write_fd = os.pipe()
     process: Any | None = None
     try:
         if task_scope is not None:
-            persisted_owner = _insert_owner_record(
-                task_scope,
-                owner_id=owner_id,
-                platform=_platform_kind(),
-                controller_pid=int(anchor.process.pid),
+            registration = asyncio.get_running_loop().run_in_executor(
+                None, partial(
+                    contextvars.copy_context().run,
+                    _insert_owner_record,
+                    task_scope,
+                    owner_id=owner_id,
+                    platform=_platform_kind(),
+                    controller_pid=int(anchor.process.pid),
+                )
             )
+            # An executor Future survives asyncio.run cancelling all Tasks.
+            # Cleanup must observe the writer before retiring its exact row.
+            persisted_owner = await asyncio.shield(registration)
         child_kwargs = dict(kwargs)
         child_kwargs.pop("start_new_session", None)
         child_kwargs.pop("process_group", None)
@@ -2223,18 +2676,16 @@ async def _create_owned_posix_subprocess(
             raise _PosixTargetExecError(error_number, argv[0])
         return process
     except BaseException as exc:
-        cleanup = asyncio.create_task(
-            _cleanup_failed_posix_launch(
-                gate=gate,
-                persisted_owner=persisted_owner,
-                process=process,
-                anchor=anchor,
-            )
+        cancellation = await _cleanup_failed_posix_launch(
+            gate=gate,
+            registration=registration,
+            process=process,
+            anchor=anchor,
         )
         if isinstance(exc, asyncio.CancelledError):
-            await _await_cleanup_before_cancellation(cleanup)
             raise
-        await cleanup
+        if cancellation is not None:
+            raise cancellation
         if isinstance(exc, _PosixTargetExecError):
             raise OSError(
                 exc.error_number,
@@ -2262,72 +2713,158 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
     task_scope = _current_task_process_scope()
 
     if os.name == "nt":
-        gate = _WindowsLaunchGate.create()
-        job = (
-            _WindowsJob.create(f"{_WINDOWS_JOB_PREFIX}{owner_id}")
-            if task_scope is not None
-            else _WindowsJob.create()
+        # CreateProcess and the helper/Job handshake are intentionally kept on
+        # the Proactor loop: moving them to a worker would break asyncio pipe
+        # ownership and cancellation.  Admission control only prevents a
+        # burst of launches from stacking those synchronous Windows phases.
+        semaphore, launch_limit = _windows_launch_semaphore()
+        diagnostics = _windows_launch_diagnostics_enabled()
+        launch_started = time.perf_counter()
+        admission_started = launch_started
+        timings: dict[str, int] = {}
+        await semaphore.acquire()
+        timings["admission_wait_ms"] = round(
+            (time.perf_counter() - admission_started) * 1000
         )
-        child_kwargs = dict(kwargs)
-        child_kwargs.pop("start_new_session", None)
-        child_kwargs["creationflags"] = (
-            int(child_kwargs.get("creationflags", 0))
-            | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
-        )
-        child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-        helper_argv = _process_tree_child_argv(
-            "--windows-owned-launch",
-            gate.gate_name,
-            gate.ready_name,
-            "--",
-            *argv,
-        )
+        gate: _WindowsLaunchGate | None = None
+        job: _WindowsJob | None = None
         windows_process: Any | None = None
         persisted_owner = None
+        registration = None
+        launch_succeeded = False
         try:
-            windows_process = await asyncio.create_subprocess_exec(
-                *helper_argv,
-                **child_kwargs,
+            phase_started = time.perf_counter()
+            gate = _WindowsLaunchGate.create()
+            timings["gate_create_ms"] = round((time.perf_counter() - phase_started) * 1000)
+            phase_started = time.perf_counter()
+            job = (
+                _WindowsJob.create(f"{_WINDOWS_JOB_PREFIX}{owner_id}")
+                if task_scope is not None
+                else _WindowsJob.create()
             )
-            job.assign_pid(int(windows_process.pid))
-            await asyncio.to_thread(
-                _wait_for_windows_helper_ready,
-                gate,
+            timings["job_create_ms"] = round((time.perf_counter() - phase_started) * 1000)
+            child_kwargs = dict(kwargs)
+            child_kwargs.pop("start_new_session", None)
+            child_kwargs["creationflags"] = (
+                int(child_kwargs.get("creationflags", 0))
+                | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
             )
-            if task_scope is not None:
-                persisted_owner = _insert_owner_record(
-                    task_scope,
-                    owner_id=owner_id,
-                    platform="windows",
-                    controller_pid=int(windows_process.pid),
+            child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
+            helper_argv = _process_tree_child_argv(
+                "--windows-owned-launch",
+                gate.gate_name,
+                gate.ready_name,
+                "--",
+                *argv,
+            )
+            try:
+                phase = "helper_spawn"
+                phase_started = time.perf_counter()
+                windows_process = await asyncio.create_subprocess_exec(
+                    *helper_argv,
+                    **child_kwargs,
                 )
-            owner = ProcessTreeOwner(
-                process=windows_process,
-                pid=int(windows_process.pid),
-                windows_job=job,
-                persisted_owner=persisted_owner,
-            )
-            _attach_owner(windows_process, owner)
-            gate.release()
-            owner.start_completion_monitor()
-            return windows_process
-        except BaseException as exc:
-            cleanup = asyncio.create_task(
-                _cleanup_failed_windows_launch(
+                timings["helper_spawn_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                phase = "job_assign"
+                phase_started = time.perf_counter()
+                job.assign_pid(int(windows_process.pid))
+                timings["job_assign_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                phase = "helper_ready"
+                phase_started = time.perf_counter()
+                await asyncio.to_thread(
+                    _wait_for_windows_helper_ready,
+                    gate,
+                )
+                timings["helper_ready_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                if task_scope is not None:
+                    phase = "owner_register"
+                    phase_started = time.perf_counter()
+                    registration = asyncio.get_running_loop().run_in_executor(
+                        None, partial(
+                            contextvars.copy_context().run,
+                            _insert_owner_record,
+                            task_scope,
+                            owner_id=owner_id,
+                            platform="windows",
+                            controller_pid=int(windows_process.pid),
+                        )
+                    )
+                    persisted_owner = await asyncio.shield(registration)
+                    timings["owner_register_ms"] = round(
+                        (time.perf_counter() - phase_started) * 1000
+                    )
+                phase = "owner_attach"
+                phase_started = time.perf_counter()
+                if gate is None or job is None:
+                    raise ProcessTreeOwnershipError(
+                        "Windows controlled process launch lost ownership state"
+                    )
+                owner = ProcessTreeOwner(
+                    process=windows_process,
+                    pid=int(windows_process.pid),
+                    windows_job=job,
                     persisted_owner=persisted_owner,
+                )
+                _attach_owner(windows_process, owner)
+                phase = "gate_release"
+                phase_started = time.perf_counter()
+                gate.release()
+                timings["gate_release_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                phase = "completion_monitor"
+                phase_started = time.perf_counter()
+                owner.start_completion_monitor()
+                launch_succeeded = True
+                return windows_process
+            except BaseException as exc:
+                if diagnostics:
+                    _log_windows_launch_failure(
+                        phase=phase,
+                        phase_started=phase_started,
+                        launch_started=launch_started,
+                        process=windows_process,
+                        launcher="async",
+                        error=exc,
+                    )
+                if job is None:
+                    raise ProcessTreeOwnershipError(
+                        "Windows controlled process launch lost Job ownership"
+                    ) from exc
+                cancellation = await _cleanup_failed_windows_launch(
+                    registration=registration,
                     process=windows_process,
                     job=job,
                 )
-            )
-            if isinstance(exc, asyncio.CancelledError):
-                await _await_cleanup_before_cancellation(cleanup)
-                raise
-            await cleanup
-            raise ProcessTreeOwnershipError(
-                "Windows controlled process launch failed closed"
-            ) from exc
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                if cancellation is not None:
+                    raise cancellation
+                raise ProcessTreeOwnershipError(
+                    _windows_launch_failure_message(phase, exc)
+                ) from exc
         finally:
-            gate.close()
+            if gate is not None:
+                gate.close()
+            semaphore.release()
+            if diagnostics:
+                timings["total_ms"] = round((time.perf_counter() - launch_started) * 1000)
+                timings["concurrency_limit"] = launch_limit
+                timings["succeeded"] = int(launch_succeeded)
+                with contextlib.suppress(Exception):
+                    log.info(
+                        "windows_process_tree_launch_timing",
+                        extra={"_opensquilla_log_metadata": {
+                            "event": "windows_process_tree_launch_timing",
+                            "timings": timings,
+                        }},
+                    )
 
     raise ProcessTreeOwnershipError(f"unsupported process-tree platform: {os.name}")
 
@@ -2363,12 +2900,15 @@ def create_owned_popen(
     argv: list[str] | tuple[str, ...],
     *,
     process_factory: Callable[..., Any] | None = None,
+    cancel_event: threading.Event | None = None,
     **kwargs: Any,
 ) -> Any:
     """Synchronous Windows controlled-helper launcher for blocking pipe I/O."""
 
     if os.name != "nt":
         raise ProcessTreeOwnershipError("synchronous owned launcher is Windows-only")
+    diagnostics = _windows_launch_diagnostics_enabled()
+    launch_started = time.perf_counter()
     owner_id = uuid.uuid4().hex
     task_scope = _current_task_process_scope()
     gate = _WindowsLaunchGate.create()
@@ -2393,23 +2933,35 @@ def create_owned_popen(
     )
     process: Any | None = None
     persisted_owner: _PersistedOwnerRef | None = None
+    phase = "helper_spawn" if process_factory is None else "factory_spawn"
+    phase_started = time.perf_counter()
     try:
         if process_factory is None:
             process = subprocess.Popen(helper_argv, **child_kwargs)
+            phase = "job_assign"
+            phase_started = time.perf_counter()
             job.assign_pid(int(process.pid))
         else:
             # Native PTY wrappers can fail while constructing their reader,
             # after the process starts but before returning a Python handle.
             # The factory assigns the still-gated helper before that boundary.
             process = process_factory(helper_argv, owner_job=job, **child_kwargs)
+        phase = "helper_ready"
+        phase_started = time.perf_counter()
         _wait_for_windows_helper_ready(gate)
         if task_scope is not None:
+            phase = "owner_register"
+            phase_started = time.perf_counter()
             persisted_owner = _insert_owner_record(
                 task_scope,
                 owner_id=owner_id,
                 platform="windows",
                 controller_pid=int(process.pid),
             )
+        phase = "owner_attach"
+        phase_started = time.perf_counter()
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessTreeOwnershipError("Windows process launch cancelled before release")
         owner = ProcessTreeOwner(
             process=process,
             pid=int(process.pid),
@@ -2417,25 +2969,40 @@ def create_owned_popen(
             persisted_owner=persisted_owner,
         )
         _attach_owner(process, owner)
+        phase = "gate_release"
+        phase_started = time.perf_counter()
         gate.release()
+        phase = "completion_monitor"
+        phase_started = time.perf_counter()
         owner.start_completion_monitor()
         return process
     except BaseException as exc:
-        if persisted_owner is not None:
-            _delete_owner_record(persisted_owner)
-        if process is not None and process.poll() is None:
-            with contextlib.suppress(OSError):
-                process.terminate()
-            try:
-                process.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
+        if diagnostics:
+            _log_windows_launch_failure(
+                phase=phase,
+                phase_started=phase_started,
+                launch_started=launch_started,
+                process=process,
+                launcher="popen" if process_factory is None else "factory",
+                error=exc,
+            )
+        try:
+            if process is not None and process.poll() is None:
                 with contextlib.suppress(OSError):
-                    process.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=1.0)
-        job.close()
+                    process.terminate()
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError):
+                        process.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=1.0)
+        finally:
+            job.close()
+            if persisted_owner is not None:
+                _delete_owner_record(persisted_owner)
         raise ProcessTreeOwnershipError(
-            "Windows controlled process launch failed closed"
+            _windows_launch_failure_message(phase, exc)
         ) from exc
     finally:
         gate.close()
@@ -2506,12 +3073,33 @@ class _PtyAnchorProcess:
             self.stdout.close()
 
 
+def _stop_failed_posix_pty_control(control: _PtyAnchorProcess) -> None:
+    """Keep a lost launch ACK from orphaning an unpersisted PTY target."""
+    deadline = time.monotonic() + _CONTROL_READY_TIMEOUT_SECONDS
+    with contextlib.suppress(BrokenPipeError, OSError):
+        control.stdin.write(_POSIX_ANCHOR_TERMINATE + _POSIX_ANCHOR_KILL)
+    descriptor = control.stdout.file.fileno()
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        readable, _, _ = select.select([descriptor], [], [], remaining)
+        if not readable:
+            break
+        marker = os.read(descriptor, 1)
+        if not marker:
+            break
+        if marker in {_POSIX_ANCHOR_EMPTY, _POSIX_ANCHOR_EMPTY_INCOMPLETE}:
+            with contextlib.suppress(BrokenPipeError, OSError):
+                control.stdin.write(_POSIX_ANCHOR_RELEASE)
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        control.process.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+
 def create_owned_posix_pty(
-    argv: list[str], process_factory: Callable[..., Any], **kwargs: Any,
+    argv: list[str], process_factory: Callable[..., Any], *,
+    cancel_event: threading.Event | None = None, **kwargs: Any,
 ) -> Any:
     """Run the existing group anchor as PTY leader, with private control pipes."""
 
-    loop = asyncio.get_running_loop()
     owner_id = uuid.uuid4().hex
     scope = _current_task_process_scope()
     database_path = _owner_database_path(scope.state_dir) if scope is not None else None
@@ -2524,6 +3112,7 @@ def create_owned_posix_pty(
     status_read, status_write = os.pipe()
     process = None
     persisted_owner = None
+    control: _PtyAnchorProcess | None = None
     try:
         # ptyprocess preserves pass_fds when closing descriptors, but unlike
         # subprocess.Popen it does not clear their close-on-exec flag.
@@ -2548,6 +3137,8 @@ def create_owned_posix_pty(
                 scope, owner_id=owner_id, platform=_platform_kind(),
                 controller_pid=int(process.pid),
             )
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessTreeOwnershipError("PTY process launch cancelled before release")
         control = _PtyAnchorProcess(
             process, _PtyControlPipe(control_write, "wb"), _PtyControlPipe(status_read, "rb"),
         )
@@ -2559,14 +3150,30 @@ def create_owned_posix_pty(
         )
         anchor.bind(owner)
         _attach_owner(process, owner)
-        anchor._monitor_task = loop.create_task(anchor._watch_empty(control.stdout))
+        # Consume the launch acknowledgement before giving the asynchronous
+        # monitor ownership of this pipe. Cancellation must never release a PTY.
         control.stdin.write(_POSIX_ANCHOR_ARM)
+        status_fd = control.stdout.file.fileno()
+        readable, _, _ = select.select([status_fd], [], [], _CONTROL_READY_TIMEOUT_SECONDS)
+        if not readable or os.read(status_fd, 1) != _POSIX_ANCHOR_ARMED:
+            raise ProcessTreeOwnershipError("PTY group anchor refused target launch")
+        owner.start_completion_monitor()
         return process
     except BaseException:
-        if process is not None:
-            process.terminate()
         if persisted_owner is not None:
-            _delete_owner_record(persisted_owner)
+            # An ACK can be lost after the target starts. Use the durable
+            # controller before retiring its identity or closing control pipes.
+            with contextlib.suppress(Exception):
+                if _terminate_persisted_posix_owner_sync(persisted_owner) and process is not None:
+                    process.wait()
+        elif control is not None:
+            with contextlib.suppress(Exception):
+                _stop_failed_posix_pty_control(control)
+        elif process is not None:
+            process.terminate()
+        if control is not None:
+            control.stdin.close()
+            control.stdout.close()
         raise
     finally:
         for fd in (control_read, control_write, status_read, status_write):
@@ -2663,6 +3270,13 @@ def _run_posix_group_anchor(
     target: subprocess.Popen[bytes] | None = None
     target_cleanup_at: float | None = None
     adopt_children = target_argv is not None and sys.platform.startswith("linux")
+    darwin_lineage: dict[int, int] | None = (
+        {} if sys.platform == "darwin" else None
+    )
+    if darwin_lineage is not None:
+        # Keep an immediately exiting target queryable until this sole reaper
+        # has captured its identity. An inherited SIG_IGN would auto-reap it.
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     if adopt_children:
         # Keep setsid/double-fork children attributable after the PTY shell exits.
         # This changes only the private PTY anchor, never the Gateway or pipe owners.
@@ -2683,18 +3297,31 @@ def _run_posix_group_anchor(
     captured: tuple[_CapturedPosixProcess, ...] = ()
     capture_attempted = False
     cleanup_complete = True
+    readers: list[Any]
+    connection: socket.socket | None
 
-    def prepare_capture() -> bytes:
+    def prepare_capture(*, refresh: bool = False) -> bytes:
         nonlocal captured, capture_attempted, cleanup_complete
-        if not capture_attempted or adopt_children:
+        if refresh or not capture_attempted or adopt_children:
             try:
                 result = _capture_posix_group_descendants(
-                    pgid, own_pid, include_anchor_children=adopt_children,
+                    pgid, own_pid,
+                    include_anchor_children=(
+                        adopt_children or darwin_lineage is not None
+                        or (refresh and sys.platform == "darwin")
+                    ),
+                    darwin_lineage=darwin_lineage,
                 )
             except Exception:
                 result = _PosixDescendantCapture((), False)
-            _close_captured_posix_processes(captured)
-            captured = result.processes
+            if refresh and capture_attempted and not adopt_children:
+                captured, retained_complete = _merge_live_posix_captures(
+                    captured, result.processes,
+                )
+                cleanup_complete = cleanup_complete and retained_complete
+            else:
+                _close_captured_posix_processes(captured)
+                captured = result.processes
             capture_attempted = True
             cleanup_complete = cleanup_complete and result.complete
         return _POSIX_ANCHOR_CAPTURED if cleanup_complete else _POSIX_ANCHOR_INCOMPLETE
@@ -2715,7 +3342,9 @@ def _run_posix_group_anchor(
 
     def signal_owned(command: bytes) -> bytes:
         nonlocal cleanup_complete
-        prepare_capture()
+        prepare_capture(
+            refresh=command == _POSIX_ANCHOR_KILL or darwin_lineage is not None,
+        )
         if command == _POSIX_ANCHOR_TERMINATE:
             try:
                 os.killpg(pgid, signal.SIGTERM)
@@ -2749,13 +3378,79 @@ def _run_posix_group_anchor(
             server.listen(2)
         output_pipe.write(_POSIX_ANCHOR_READY)
         output_pipe.flush()
-        if input_pipe.read(1) != _POSIX_ANCHOR_ARM:
-            return 125
-        if target_argv is not None:
+        # The Gateway can stall before ARM or after EMPTY. Keep the independent
+        # cleanup socket available at both boundaries without releasing a target.
+        startup_cancelled = False
+        while True:
+            readers = [input_pipe.fileno(), *([server] if server is not None else [])]
+            ready, _, _ = select.select(readers, [], [], _POLL_INTERVAL_SECONDS)
+            if server is not None and server in ready:
+                connection, _address = server.accept()
+                with connection:
+                    connection.settimeout(0.2)
+                    try:
+                        command = connection.recv(1)
+                    except OSError:
+                        command = b""
+                    if command in {_POSIX_ANCHOR_TERMINATE, _POSIX_ANCHOR_KILL}:
+                        marker = signal_owned(command)
+                        with contextlib.suppress(OSError):
+                            connection.sendall(marker)
+                        # Neither the PTY target nor the pipe target's release gate
+                        # may become runnable after an independent quit request.
+                        if command == _POSIX_ANCHOR_KILL:
+                            os.killpg(pgid, signal.SIGKILL)
+                        startup_cancelled = True
+                        break
+            if input_pipe.fileno() in ready:
+                if input_pipe.read(1) != _POSIX_ANCHOR_ARM:
+                    return 125
+                if darwin_lineage is not None and target_argv is None:
+                    # The pipe helper is already in this group, blocked behind
+                    # its launch gate. Record its identity before ARMED lets
+                    # the caller release it; asyncio may reap it immediately
+                    # after exec. Failure must keep user code behind the gate.
+                    # No whole-machine snapshot is needed on the startup path.
+                    group_members = _darwin_group_members(pgid)
+                    if (
+                        group_members is None
+                        or own_pid not in group_members
+                        or len(group_members) > _POSIX_DESCENDANT_CAPTURE_LIMIT
+                    ):
+                        return 125
+                    for member_pid in group_members:
+                        if member_pid == own_pid:
+                            continue
+                        member = _darwin_process_info(member_pid)
+                        if (
+                            member is None or member.pgid != pgid
+                            or member.uid != os.geteuid() or member.unique_id is None
+                        ):
+                            return 125
+                        darwin_lineage[member.unique_id] = 1
+                    # ARM also supports an empty anchor while its controller
+                    # is blocked. A live gated helper cannot leave this group;
+                    # if it already exited, releasing its gate fails closed.
+                output_pipe.write(_POSIX_ANCHOR_ARMED)
+                output_pipe.flush()
+                break
+        if target_argv is not None and not startup_cancelled:
             def restore_signals() -> None:
                 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                     signal.signal(sig, signal.SIG_DFL)
             target = subprocess.Popen(target_argv, preexec_fn=restore_signals)
+            if darwin_lineage is not None:
+                # arg=1 includes unreaped zombies, so even a target that exits
+                # before Popen returns cannot outrun this identity capture.
+                # Do this before any poll()/wait(), without an extra launcher.
+                target_info = _darwin_process_info(target.pid, include_zombies=True)
+                if (
+                    target_info is not None and target_info.ppid == own_pid
+                    and target_info.uid == os.geteuid() and target_info.unique_id is not None
+                ):
+                    darwin_lineage[target_info.unique_id] = 1
+                else:
+                    cleanup_complete = False
         stdin_fd = input_pipe.fileno()
         os.set_blocking(stdin_fd, False)
         stdin_open = True
@@ -2781,7 +3476,17 @@ def _run_posix_group_anchor(
             members = _posix_group_members(pgid)
             if adopt_children and (target_exited or target_cleanup_at is not None):
                 prepare_capture()
+            elif darwin_lineage is not None and (
+                target_exited or target_cleanup_at is not None
+                or (target is None and members == (own_pid,))
+            ):
+                # A pipe target can leave the group (or exit) while its setsid
+                # children remain alive. Keep ownership until explicit cleanup,
+                # just as for pipe descendants still in the original group.
+                prepare_capture(refresh=True)
             captured_alive = children_present or _captured_posix_processes_alive(captured)
+            if sys.platform == "darwin" and target is not None and not target_exited:
+                captured_alive = True
             if (target_exited or target_cleanup_at is not None) and (
                 members != (own_pid,) or captured_alive
             ):
@@ -2800,18 +3505,42 @@ def _run_posix_group_anchor(
             )
             if empty_confirmations >= _POSIX_EMPTY_CONFIRMATIONS_REQUIRED:
                 try:
-                    output_pipe.write(_POSIX_ANCHOR_EMPTY)
+                    output_pipe.write(
+                        _POSIX_ANCHOR_EMPTY
+                        if cleanup_complete else _POSIX_ANCHOR_EMPTY_INCOMPLETE
+                    )
                     output_pipe.flush()
                 except (BrokenPipeError, OSError):
-                    return 0
+                    return 0 if cleanup_complete else 125
                 if not stdin_open:
-                    return 0
-                os.set_blocking(stdin_fd, True)
-                if os.read(stdin_fd, 1) != _POSIX_ANCHOR_RELEASE:
-                    return 125
-                return int(target.returncode or 0) if target is not None else 0
+                    return 0 if cleanup_complete else 125
+                while True:
+                    readers = [stdin_fd, *([server] if server is not None else [])]
+                    ready, _, _ = select.select(readers, [], [], _POLL_INTERVAL_SECONDS)
+                    if server is not None and server in ready:
+                        connection, _address = server.accept()
+                        with connection:
+                            connection.settimeout(0.2)
+                            try:
+                                command = connection.recv(1)
+                            except OSError:
+                                command = b""
+                            if command in {_POSIX_ANCHOR_TERMINATE, _POSIX_ANCHOR_KILL}:
+                                marker = (
+                                    _POSIX_ANCHOR_CAPTURED
+                                    if cleanup_complete else _POSIX_ANCHOR_INCOMPLETE
+                                )
+                                with contextlib.suppress(OSError):
+                                    connection.sendall(marker)
+                                return 0 if cleanup_complete else 125
+                    if stdin_fd in ready:
+                        if os.read(stdin_fd, 1) != _POSIX_ANCHOR_RELEASE:
+                            return 125
+                        if not cleanup_complete:
+                            return 125
+                        return int(target.returncode or 0) if target is not None else 0
             pipe_command = b""
-            readers: list[Any] = [stdin_fd] if stdin_open else []
+            readers = [stdin_fd] if stdin_open else []
             if server is not None:
                 readers.append(server)
             try:
@@ -2828,7 +3557,27 @@ def _run_posix_group_anchor(
                 pipe_command = os.read(stdin_fd, 1)
                 if not pipe_command:
                     stdin_open = False
-            if pipe_command == _POSIX_ANCHOR_TERMINATE:
+            if pipe_command == _POSIX_ANCHOR_PRE_EOF_CAPTURE:
+                # EOF can orphan a setsid child before a later tree snapshot.
+                # Capture while the PTY target is still alive.
+                if target is None or target.poll() is not None:
+                    marker = _POSIX_ANCHOR_INCOMPLETE
+                else:
+                    marker = prepare_capture(refresh=True)
+                    if target.poll() is not None or not any(
+                        process.pid == target.pid for process in captured
+                    ):
+                        marker = _POSIX_ANCHOR_INCOMPLETE
+                if marker != _POSIX_ANCHOR_CAPTURED:
+                    cleanup_complete = False
+                report_capture(
+                    pipe_command,
+                    _POSIX_ANCHOR_PRE_EOF_CAPTURED
+                    if marker == _POSIX_ANCHOR_CAPTURED
+                    else _POSIX_ANCHOR_PRE_EOF_INCOMPLETE,
+                )
+                poll_delay = _POLL_INTERVAL_SECONDS
+            elif pipe_command == _POSIX_ANCHOR_TERMINATE:
                 signal_owned(pipe_command)
                 if adopt_children:
                     target_cleanup_at = time.monotonic() + 0.2
@@ -2849,7 +3598,7 @@ def _run_posix_group_anchor(
                     poll_delay = _POLL_INTERVAL_SECONDS
                 else:
                     return 0
-            connection: socket.socket | None = None
+            connection = None
             if server is not None and server in readable:
                 connection, _address = server.accept()
             if connection is not None:
@@ -2924,45 +3673,19 @@ def _run_windows_owned_launch(
     ready_name: str,
     argv: list[str],
 ) -> int:
-    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
-    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.OpenEventW.restype = wintypes.HANDLE
-    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
-    kernel32.SetEvent.restype = wintypes.BOOL
-    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    synchronize = 0x00100000
-    event_modify_state = 0x0002
-    infinite = 0xFFFFFFFF
-    wait_failed = 0xFFFFFFFF
-    gate = kernel32.OpenEventW(synchronize, False, gate_name)
-    if not gate:
-        raise _windows_error()
-    ready = kernel32.OpenEventW(event_modify_state, False, ready_name)
-    if not ready:
-        kernel32.CloseHandle(gate)
-        raise _windows_error()
-    try:
-        if not kernel32.SetEvent(ready):
-            raise _windows_error()
-        if kernel32.WaitForSingleObject(gate, infinite) == wait_failed:
-            raise _windows_error()
-    finally:
-        kernel32.CloseHandle(ready)
-        kernel32.CloseHandle(gate)
-    if not argv:
-        return 127
-    try:
-        process = subprocess.Popen(
-            argv,
-            env=_windows_target_env_from_helper(os.environ),
-        )
-    except OSError:
-        print("OpenSquilla controlled launch failed", file=sys.stderr)
-        return 127
-    return int(process.wait())
+    from opensquilla._windows_owned_launch import _run_windows_owned_launch as run
+
+    return run(gate_name, ready_name, argv)
+
+
+def _posix_anchor_argv_matches(argv: list[str], owner_id: str) -> bool:
+    for prefix in (("-m", "opensquilla.process_tree"), ("--internal-child", "process-tree")):
+        for index in range(len(argv) - 3):
+            if tuple(argv[index:index + 2]) == prefix and argv[index + 2:index + 4] == [
+                "--posix-group-anchor", owner_id,
+            ]:
+                return True
+    return False
 
 
 def _posix_anchor_command_matches(record: _PersistedOwnerRecord) -> bool:
@@ -2973,11 +3696,7 @@ def _posix_anchor_command_matches(record: _PersistedOwnerRecord) -> bool:
         except OSError:
             return False
         decoded = [value.decode("utf-8", errors="replace") for value in argv if value]
-        return (
-            "opensquilla.process_tree" in decoded
-            and "--posix-group-anchor" in decoded
-            and record.owner_id in decoded
-        )
+        return _posix_anchor_argv_matches(decoded, record.owner_id)
     try:
         command = "/bin/ps" if Path("/bin/ps").is_file() else "ps"
         result = subprocess.run(
@@ -2991,13 +3710,15 @@ def _posix_anchor_command_matches(record: _PersistedOwnerRecord) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    command_line = result.stdout.strip()
-    return (
-        result.returncode == 0
-        and "opensquilla.process_tree" in command_line
-        and "--posix-group-anchor" in command_line
-        and record.owner_id in command_line.split()
+    if result.returncode != 0:
+        return False
+    # ps renders argv without shell quoting. Executable/target paths may contain
+    # unmatched quotes, so only match the fixed helper marker and exact owner ID.
+    marker = (
+        r"(?<!\S)(?:-m\s+opensquilla\.process_tree|--internal-child\s+process-tree)"
+        r"\s+--posix-group-anchor\s+" + re.escape(record.owner_id) + r"(?=\s|$)"
     )
+    return re.search(marker, result.stdout) is not None
 
 
 def _controller_identity_matches(record: _PersistedOwnerRecord) -> bool:
@@ -3076,11 +3797,12 @@ def _terminate_persisted_posix_owner_sync(reference: _PersistedOwnerRef) -> bool
     if _posix_controller_matches(record):
         log.warning("process_tree_persisted_posix_stop_timeout")
         return False
-    _delete_owner_record(reference)
-    return capture_marker in {
+    complete = capture_marker in {
         _POSIX_ANCHOR_CAPTURED,
         _POSIX_ANCHOR_LEGACY_TERMINATED,
     }
+    _delete_owner_record(reference, cleanup_complete=complete)
+    return complete
 
 
 def _terminate_persisted_windows_owner_sync(reference: _PersistedOwnerRef) -> bool:
@@ -3115,7 +3837,7 @@ def _terminate_persisted_windows_owner_sync(reference: _PersistedOwnerRef) -> bo
     finally:
         job.close()
     if stopped:
-        _delete_owner_record(reference)
+        _delete_owner_record(reference, cleanup_complete=True)
     else:
         log.warning("process_tree_persisted_windows_stop_timeout")
     return stopped
@@ -3211,6 +3933,24 @@ async def cancel_persisted_processes_for_task(
     return await _terminate_owner_records(owned)
 
 
+async def has_persisted_processes_for_task(
+    state_dir: str | Path | None,
+    session_key: str,
+    task_id: str,
+) -> bool:
+    """Check for unsettled exact task owners, raising when absence is unverifiable."""
+    normalized_session = _normalize_owner_value(session_key)
+    normalized_task = _normalize_owner_value(task_id)
+    if state_dir is None or normalized_session is None or normalized_task is None:
+        return False
+    records = await asyncio.to_thread(_load_owner_records, state_dir, require_complete=True)
+    return bool(_task_owned_records(
+        records,
+        session_digest=_owner_digest("session", normalized_session),
+        task_digest=_owner_digest("task", normalized_task),
+    ))
+
+
 async def cancel_persisted_processes_for_session(
     state_dir: str | Path | None,
     session_key: str,
@@ -3243,6 +3983,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run one fixed process-tree helper mode."""
 
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--desktop-quit-cleanup"]:
+        from opensquilla.desktop_process_cleanup import cleanup_main
+
+        return cleanup_main()
     if (
         len(args) >= 3
         and args[0] == "--posix-group-anchor"

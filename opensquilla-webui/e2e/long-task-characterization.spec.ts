@@ -226,7 +226,7 @@ test.describe('f7 long-task performance characterization', () => {
     })()
 
     await page.goto('/control/chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.chat-thread')).toBeVisible()
     await expect.poll(() => subscriptionDelivered).toBe(true)
     await expect.poll(() => historyDelivered).toBe(true)

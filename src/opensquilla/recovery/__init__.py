@@ -28,6 +28,7 @@ from opensquilla.recovery.engine import (
     guard_desktop_profile,
     guarded_desktop_profile,
     inspect_profile,
+    inspect_startup_profile,
     profile_replacement_transaction_unfinished,
     reconcile_profile,
 )
@@ -108,6 +109,7 @@ __all__ = [
     "guard_desktop_profile",
     "guarded_desktop_profile",
     "inspect_profile",
+    "inspect_startup_profile",
     "effective_state_roots",
     "native_move_no_replace",
     "move_profile_no_replace",

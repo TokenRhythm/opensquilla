@@ -185,11 +185,6 @@ def test_explicit_full_run_mode_disables_sandbox_booleans() -> None:
     assert config_run_mode(config) == RunMode.FULL
 
 
-def test_removed_windows_restricted_token_backend_config_is_rejected() -> None:
-    with pytest.raises(ValueError, match="windows_restricted_token.*windows_default"):
-        SandboxSettings(backend="windows_restricted_token")
-
-
 def test_configured_default_elevated_only_returns_full() -> None:
     from opensquilla.permissions import configured_default_elevated, configured_default_run_mode
 

@@ -6,10 +6,16 @@ import type { GatewayModelRoutingMode } from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { ArtifactProductFailure } from '@/utils/artifactProductErrors'
+import type { ProjectInitTurnCommand } from '@/types/turnCommand'
 
 /** Options shared by turn commands without exposing transport details. */
 export interface TurnCommandRequestOptions {
   signal?: AbortSignal
+  /** Fence a request against a connection/profile change after the caller's identity check. */
+  expectedGeneration?: number
+  /** Recheck local permission immediately before first admission, after durable waits.
+   * Receipt lookup and already accepted delivery must not consult this guard. */
+  beforeDispatch?: () => boolean
 }
 
 export type TurnCommandFailureKind =
@@ -66,6 +72,8 @@ export interface TurnSendAttachment {
  */
 export interface TurnSendParams {
   message: string
+  turnCommand?: ProjectInitTurnCommand
+  localPathReferences?: string[]
   sessionKey: string
   /** Stable idempotency key for one logical send attempt. */
   clientRequestId?: string
@@ -89,6 +97,8 @@ export interface TurnSendParams {
   workspaceFiles?: WorkspaceFileReference[]
   /** Explicit admission mode used by ordinary and queued sends. */
   queueMode?: string
+  /** Optional service dependencies inferred from selected producer skills. */
+  requiredServices?: string[]
   [key: string]: unknown
 }
 
@@ -130,6 +140,7 @@ export interface PendingInputDispatchRequest {
 export interface TurnSteerRequest {
   key: string
   message: string
+  localPathReferences?: string[]
   expectedTurnId: string
   clientRequestId: string
   clientMessageId: string
@@ -187,6 +198,15 @@ export type TurnSendRequest =
   | { kind: 'new-turn'; params: TurnSendParams }
   | { kind: 'pending-input'; params: PendingInputDispatchRequest }
 
+/** Only these durable operations have a read-only acceptance lookup. */
+export type TurnReceiptRequest =
+  | { kind: 'send'; request: TurnSendRequest }
+  | { kind: 'steer'; request: TurnSteerRequest }
+
+export type TurnReceiptResult =
+  | { status: 'found'; response: TurnSendResponse | TurnSteerResponse }
+  | { status: 'not-found' | 'unsupported' }
+
 export interface TurnCancelRequest {
   sessionKey: string
   source?: string
@@ -216,6 +236,12 @@ export type TurnCommandCapability = 'same-turn-steer' | 'durable-steer' | 'expli
  * Module; generated wire types remain confined to the Adapter.
  */
 export interface TurnCommands {
+  /** Missing support keeps unknown delivery pending; it never permits resubmission. */
+  lookupReceipt?(
+    request: TurnReceiptRequest,
+    options?: TurnCommandRequestOptions,
+  ): Promise<TurnReceiptResult>
+  supportsReceiptLookup?(): boolean
   send(
     request: TurnSendRequest,
     options?: TurnCommandRequestOptions,

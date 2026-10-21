@@ -1,7 +1,7 @@
 """RouterDecisionWriter — persistence facade for per-turn router decisions.
 
 One row per routed user message into the yoyo-owned ``router_decisions``
-table (V017). Mirrors the ``MetaRunWriter`` contract:
+table (V017). Writer contract:
 
 Connection contract:
     * ``check_same_thread=False`` — allows cross-thread access.
@@ -34,6 +34,8 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from opensquilla.persistence.sqlite_diagnostics import register_connection
 
 log = logging.getLogger(__name__)
 
@@ -489,9 +491,7 @@ class RouterDecisionWriter:
     def get_decision(self, decision_id: str) -> dict[str, Any] | None:
         """Return one sanitized decision row by id, or ``None``.
 
-        Reverse-lookup surface for feedback attribution
-        (``router.feedback.submit`` resolves ``decisionId`` to the
-        ``(session_key, turn_index, executed_kind)`` the sidecar needs).
+        Supports diagnostics that correlate a turn with its routing decision.
         Same privacy posture and best-effort error handling as
         :meth:`list_decisions`.
         """
@@ -541,4 +541,6 @@ def open_router_decision_writer(
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA busy_timeout = 5000")
-    return RouterDecisionWriter(conn, retention_days=retention_days)
+    writer = RouterDecisionWriter(conn, retention_days=retention_days)
+    register_connection(db_path, "router_writer", writer, attribute="_conn")
+    return writer

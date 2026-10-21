@@ -52,7 +52,13 @@ from .error_redaction import (
     redacted_httpx_error,
 )
 from .extra_body import merge_extra_body, normalize_extra_body
-from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+    structured_provider_error_code,
+)
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
 from .model_catalog import shared_catalog
 from .model_identity import (
@@ -73,6 +79,7 @@ from .reasoning_dialects import (
 )
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    fit_payload_generation_budget,
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
@@ -217,7 +224,7 @@ _OPENAI_STREAM_USAGE_ONLY_KEYS = frozenset(
 _OPENAI_STREAM_NOOP_CHOICE_KEYS = frozenset(
     {"index", "delta", "finish_reason", "native_finish_reason"}
 )
-_OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role"})
+_OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role", "tool_calls"})
 _EPHEMERAL_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 _DASHSCOPE_MAX_CACHE_MARKERS = 4
 _DASHSCOPE_CACHE_MARKER_ROLES = {"system", "user", "assistant", "tool"}
@@ -289,6 +296,8 @@ def _is_inert_post_terminal_stream_frame(
     if delta.get("content") not in (None, ""):
         return False
     if delta.get("role") not in (None, "assistant"):
+        return False
+    if _has_native_tool_payload(delta.get("tool_calls")):
         return False
 
     repeated_finish = choice.get("finish_reason")
@@ -1811,8 +1820,9 @@ def _billing_result(
             if usage.billed_cost_present
             else None
         )
-        # Keep OpenRouter's historical positive-only billed-cost contract.
-        if amount is not None and amount > 0:
+        # A present, valid zero is a confirmed receipt (e.g. a free model).
+        # Missing and malformed cost fields must still remain unconfirmed.
+        if amount is not None and amount >= 0:
             amount_nanos = _money_to_nanos(amount)
             if amount_nanos is None:
                 return 0.0, "none", None
@@ -3208,6 +3218,30 @@ class OpenAIProvider:
     final_request_admission_guaranteed = True
     provider_name = "openai"
 
+    async def _build_http_client(
+        self,
+        *,
+        timeout: Any,
+    ) -> httpx.AsyncClient:
+        """Construct HTTPX away from the Gateway event loop.
+
+        HTTPX builds proxy/TLS state synchronously in ``AsyncClient.__init__``.
+        On Windows, certificate-store or proxy initialization can therefore
+        stop the Gateway loop before the first await (a shape consistent with
+        the 103-second field stall; the live incident's exact stack is still
+        being captured).  Constructing the whole client in the worker keeps
+        that synchronous work off the event-loop thread and also preserves the
+        normal HTTPX ownership/close lifecycle.
+        """
+
+        return await asyncio.to_thread(
+            httpx.AsyncClient,
+            timeout=timeout,
+            trust_env=_trust_env(),
+            proxy=self._proxy,
+            follow_redirects=False,
+        )
+
     def __init__(
         self,
         api_key: str,
@@ -3352,6 +3386,8 @@ class OpenAIProvider:
             model=self._model,
             api_key=self._api_key,
             base_url=self._base_url,
+            org_id=self._org_id or "",
+            retry_after_scope_known=True,
         )
 
     def _api_url(self, path: str) -> str:
@@ -3421,6 +3457,7 @@ class OpenAIProvider:
         int | None,
         str | None,
         _ReasoningReplayStats,
+        dict[str, Any],
     ]:
         wire_cfg = _prompt_json_schema_config(cfg, policy=self._compat)
         caps = cfg.model_capabilities
@@ -3666,6 +3703,7 @@ class OpenAIProvider:
             has_tools=bool(tools),
         )
         merge_extra_body(payload, self._extra_body)
+        payload, generation_budget_proof = fit_payload_generation_budget(payload, cfg)
         fallback_reason = (
             "native_is_error_unavailable"
             if any(message.get("role") == "tool" for message in openai_messages)
@@ -3676,6 +3714,7 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             reasoning_replay_stats,
+            generation_budget_proof,
         )
 
     def project_final_request(
@@ -3694,13 +3733,14 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             _reasoning_replay_stats,
+            generation_budget_proof,
         ) = self._build_payload(
             messages,
             tools,
             cfg,
         )
         protected_result_indexes = protected_tool_result_indexes(messages)
-        return project_final_request_payload(
+        projection = project_final_request_payload(
             payload,
             projection_adapter=self._provider_kind,
             proof_budget=provider_request_character_budget(payload, cfg),
@@ -3711,6 +3751,8 @@ class OpenAIProvider:
             message_limit=message_limit,
             protected_tool_result_indexes=protected_result_indexes,
         )
+        projection.proof.update(generation_budget_proof)
+        return projection
 
     def chat(
         self,
@@ -3774,6 +3816,7 @@ class OpenAIProvider:
             wire_active_user_index,
             fallback_reason,
             reasoning_replay_stats,
+            generation_budget_proof,
         ) = self._build_payload(
             messages,
             tools,
@@ -3830,6 +3873,8 @@ class OpenAIProvider:
             active_user_message_index=wire_active_user_index,
             protected_tool_result_indexes=protected_result_indexes,
         )
+        if budget_decision.proof is not None:
+            budget_decision.proof.update(generation_budget_proof)
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
             log.warning("provider.request_budget_exhausted", **proof)
@@ -3859,6 +3904,7 @@ class OpenAIProvider:
                 protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
+            exc.proof.update(generation_budget_proof)
             log.warning("provider.request_budget_exhausted", **exc.proof)
             yield ErrorEvent(
                 message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
@@ -4068,16 +4114,14 @@ class OpenAIProvider:
             return released
 
         try:
-            async with httpx.AsyncClient(
+            client = await self._build_http_client(
                 timeout=(
                     _stream_timeout(cfg.timeout)
                     if stream_timeout_fallback
                     else cfg.timeout
-                ),
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-                follow_redirects=False,
-            ) as client:
+                )
+            )
+            async with client:
                 headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
                 headers.update(
                     tokenrhythm_install_id_headers(
@@ -4177,6 +4221,10 @@ class OpenAIProvider:
                             yield ErrorEvent(
                                 message=message,
                                 code=str(response.status_code),
+                                http_status=safe_http_status(response.status_code),
+                                provider_code=structured_provider_error_code(
+                                    response.text
+                                ),
                                 retry_after_s=retry_after_from_headers(
                                     response.status_code,
                                     getattr(response, "headers", None),
@@ -4201,6 +4249,8 @@ class OpenAIProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            http_status=safe_http_status(response.status_code),
+                            provider_code=structured_provider_error_code(response.text),
                             retry_after_s=retry_after_from_headers(
                                 response.status_code,
                                 getattr(response, "headers", None),
@@ -5750,12 +5800,8 @@ class OpenAIProvider:
         )
 
         try:
-            async with httpx.AsyncClient(
-                timeout=cfg.timeout,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-                follow_redirects=False,
-            ) as client:
+            client = await self._build_http_client(timeout=cfg.timeout)
+            async with client:
                 # ``AsyncClient.__aenter__`` is an await boundary. Refresh at
                 # the final send point so a privacy toggle that lands while
                 # the fallback client is opening cannot forward a stale id.
@@ -5841,6 +5887,8 @@ class OpenAIProvider:
             yield ErrorEvent(
                 message=safe_message,
                 code=str(response.status_code),
+                http_status=safe_http_status(response.status_code),
+                provider_code=structured_provider_error_code(response.text),
                 retry_after_s=retry_after_from_headers(
                     response.status_code,
                     getattr(response, "headers", None),
@@ -6548,12 +6596,8 @@ class OpenAIProvider:
         raw_message = ""
         raw_state = ""
         try:
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-                follow_redirects=False,
-            ) as client:
+            client = await self._build_http_client(timeout=10.0)
+            async with client:
                 headers.update(
                     tokenrhythm_install_id_headers(
                         self._provider_kind,

@@ -1,12 +1,15 @@
 import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import i18n from '@/i18n'
-import { useToasts } from '@/composables/useToasts'
+import { useToasts, type ToastAction } from '@/composables/useToasts'
 import type { CronJob } from '@/types/cron'
 import type { CronScheduler, CronSubscription } from '@/modules/cronScheduler'
+import { CronReadUnavailableError } from '@/modules/cronScheduler'
 import { humanCountdown, humanTime } from '@/utils/cron/time'
-import { wasCronFinishNotified } from '@/utils/cron/notifications'
+import { notifyCronRunFinished } from '@/utils/cron/notifications'
 
-export function useCronJobs(scheduler: CronScheduler) {
+export function useCronJobs(scheduler: CronScheduler, options: {
+  openJob?: (jobId: string) => ReturnType<ToastAction['onClick']>
+} = {}) {
   const { pushToast } = useToasts()
   const t = i18n.global.t
   const searchText = ref('')
@@ -19,6 +22,7 @@ export function useCronJobs(scheduler: CronScheduler) {
   const cronData = ref<readonly CronJob[] | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  const waitingForCapacity = ref(false)
 
   const jobs = computed<CronJob[]>(() => {
     return cronData.value ? [...cronData.value] : []
@@ -28,6 +32,12 @@ export function useCronJobs(scheduler: CronScheduler) {
   let tickInterval: ReturnType<typeof setInterval> | null = null
   let reloadTimer: ReturnType<typeof setTimeout> | null = null
   let runFinishedSubscription: CronSubscription | null = null
+  let active = true
+  let generation = 0
+  let refreshWork: Promise<void> | null = null
+  let readController: AbortController | null = null
+  let reloadNeeded = false
+  let retryDelay = 1000
 
   const enabledCount = computed(() => jobs.value.filter(j => j.enabled).length)
   const pausedCount = computed(() => jobs.value.length - enabledCount.value)
@@ -87,33 +97,65 @@ export function useCronJobs(scheduler: CronScheduler) {
     })
   })
 
-  async function refresh(): Promise<void> {
+  function refresh(): Promise<void> {
+    if (!active) return Promise.resolve()
+    if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
+    if (refreshWork) { reloadNeeded = true; return refreshWork }
+    const currentGeneration = generation
+    const controller = new AbortController()
+    readController = controller
+    const current = () => active && generation === currentGeneration && !controller.signal.aborted
     loading.value = true
     error.value = null
-    try {
-      cronData.value = await scheduler.listJobs()
-    } catch (err) {
-      error.value = t('cronSkills.jobs.errLoad', {
-        error: err instanceof Error ? err.message : String(err),
-      })
-    } finally {
-      loading.value = false
-    }
+    const work = Promise.resolve().then(async () => {
+      if (!current()) return
+      try {
+        const data = await scheduler.listJobs({ signal: controller.signal })
+        if (!current()) return
+        cronData.value = data
+        waitingForCapacity.value = false
+        retryDelay = 1000
+      } catch (err) {
+        if (!current()) return
+        if (err instanceof CronReadUnavailableError) {
+          waitingForCapacity.value = true
+          const delay = Math.max(retryDelay, err.retryAfterMs)
+          retryDelay = Math.min(retryDelay * 2, 10_000)
+          reloadTimer = setTimeout(() => { reloadTimer = null; void refresh() }, delay)
+        } else {
+          waitingForCapacity.value = false
+          error.value = `${t('cronSkills.jobs.errLoad')}: ${err instanceof Error ? err.message : String(err)}`
+        }
+      } finally {
+        if (current()) {
+          refreshWork = null
+          readController = null
+          loading.value = false
+          const again = reloadNeeded && !waitingForCapacity.value && !error.value
+          reloadNeeded = false
+          if (again) void refresh()
+        }
+      }
+    })
+    refreshWork = work
+    return work
   }
 
-  const loadData = refresh
+  const loadData = () => refresh()
 
   function scheduleReload() {
-    void refresh()
-    if (reloadTimer) clearTimeout(reloadTimer)
-    reloadTimer = setTimeout(() => { void refresh() }, 750)
+    if (!active) return
+    if (reloadTimer) return
+    if (refreshWork) reloadNeeded = true
+    else void refresh()
   }
 
   async function recoverAfterConnectionRecycle(): Promise<void> {
-    try {
-      cronData.value = await scheduler.listJobs()
+    await refresh()
+    if (!active) return
+    if (!error.value && !waitingForCapacity.value) {
       pushToast(t('cronSkills.jobs.toastConnectionRecovered'), { tone: 'info' })
-    } catch {
+    } else {
       pushToast(t('cronSkills.jobs.toastConnectionRetry'), { tone: 'warn' })
     }
   }
@@ -134,7 +176,6 @@ export function useCronJobs(scheduler: CronScheduler) {
   async function toggleJob(job: CronJob) {
     try {
       await scheduler.setEnabled(job.id, !job.enabled)
-      pushToast(job.enabled ? t('cronSkills.jobs.toastPaused') : t('cronSkills.jobs.toastResumed'), { tone: 'ok' })
       void refresh()
     } catch (err) {
       pushToast(t('cronSkills.jobs.toastUpdateFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
@@ -146,19 +187,42 @@ export function useCronJobs(scheduler: CronScheduler) {
   }
 
   async function runJob(id: string) {
+    if (runningJobIds.value.has(id)) return
     runningJobIds.value = new Set(runningJobIds.value).add(id)
     try {
       const res = await scheduler.runNow(id)
-      if (!res?.runId || !wasCronFinishNotified(res.runId)) {
-        if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
-        else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
-      }
+      const job = jobs.value.find(candidate => candidate.id === id)
+      if (!res?.runId && (res?.success === false || res?.error)) {
+        // A rejected manual request has no completed execution to inspect.
+        // Keep its explanation instead of presenting it as a finished run.
+        pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error || res.reason || res.status || '' }), {
+          tone: 'danger',
+          action: options.openJob ? {
+            label: t('cronSkills.jobs.toastViewTask'), onClick: () => options.openJob!(id),
+          } : undefined,
+        })
+      } else notifyCronRunFinished({
+        jobId: id,
+        jobName: job?.name,
+        runId: res?.runId,
+        success: res?.success === false || !!res?.error ? false : res?.success,
+        // Reminder delivery belongs to its explicit event (which may carry a
+        // session target). A successful RPC must not consume that reminder.
+        summary: res?.reply,
+      }, { t, pushToast, openJob: options.openJob })
+      scheduleReload()
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       if (isConnectionRecycleError(message)) {
         await recoverAfterConnectionRecycle()
       } else {
-        pushToast(t('cronSkills.jobs.toastRunFailed', { error: message }), { tone: 'danger' })
+        pushToast(t('cronSkills.jobs.toastRunFailed', { error: message }), {
+          tone: 'danger',
+          action: options.openJob ? {
+            label: t('cronSkills.jobs.toastViewTask'),
+            onClick: () => options.openJob!(id),
+          } : undefined,
+        })
       }
     } finally {
       const next = new Set(runningJobIds.value)
@@ -169,19 +233,22 @@ export function useCronJobs(scheduler: CronScheduler) {
 
   async function removeJob(id: string) {
     await scheduler.remove(id)
-    pushToast(t('cronSkills.jobs.toastDeleted'), { tone: 'ok' })
     void refresh()
   }
 
   // CronView is kept-alive (route meta.keepAlive), so the clock tick, the cron
   // subscription, and the run-finished listener are bound on activation and
   // released on deactivation — they must not keep firing while the view is
-  // cached off-screen. onActivated also runs on first display; loadData() runs
-  // the silent background refresh on every (re)entry so a revisit is never
-  // stale (the initial loading skeleton is driven by useRequest's own onMounted
-  // execute(), so this silent refresh never flashes a spinner). onUnmounted is a
-  // final safety net for the rare case the KeepAlive cache evicts this instance.
+  // cached off-screen. Every activation gets a fresh read owner, so a late
+  // response from the previous visit cannot overwrite the current snapshot.
   function teardownLive() {
+    active = false
+    generation += 1
+    readController?.abort()
+    readController = null
+    refreshWork = null
+    reloadNeeded = false
+    loading.value = false
     if (tickInterval) { clearInterval(tickInterval); tickInterval = null }
     if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
     runFinishedSubscription?.close()
@@ -189,6 +256,8 @@ export function useCronJobs(scheduler: CronScheduler) {
   }
 
   onActivated(() => {
+    active = true
+    retryDelay = 1000
     void loadData()
     tickInterval = setInterval(() => { now.value = Date.now() }, 1000)
     runFinishedSubscription = scheduler.subscribe(onRunFinished)
@@ -202,6 +271,7 @@ export function useCronJobs(scheduler: CronScheduler) {
     hasLoaded,
     loading,
     error,
+    waitingForCapacity,
     searchText,
     viewMode,
     runningJobIds,

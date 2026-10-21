@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.context_budget import soft_input_tokens
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.gateway import compaction_target
 from opensquilla.gateway.compaction_target import GatewayConsumerBudget
@@ -67,45 +68,71 @@ def _resolve(project, *, window: int = 262_144, output: int = 131_072, **kwargs)
     )
 
 
-@pytest.mark.parametrize("window,output", [
-    (262_144, 131_072), (256_000, 16_000), (1_000_000, 384_000),
-])
+@pytest.mark.parametrize(
+    "window,output",
+    [
+        (262_144, 131_072),
+        (256_000, 16_000),
+        (1_000_000, 384_000),
+    ],
+)
 @pytest.mark.parametrize("persisted", [False, True])
 def test_manual_and_automatic_entrypoints_share_identical_envelope_budget(
-    monkeypatch: pytest.MonkeyPatch, window: int, output: int, persisted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    window: int,
+    output: int,
+    persisted: bool,
 ) -> None:
     provider, config, tools, _media, messages, project = _envelope(window, output)
-    agent = Agent(provider=provider, config=AgentConfig(
-        context_window_tokens=window, max_tokens=output,
-    ))
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=window,
+            max_tokens=output,
+        ),
+    )
     # Each entrypoint normally assembles a different request. Normalize only
     # that envelope here, so any divergence in their budget policy is visible.
     monkeypatch.setattr(
-        agent, "_project_compaction_consumer_request",
+        agent,
+        "_project_compaction_consumer_request",
         lambda **kwargs: project(kwargs["replay_summary"], kwargs["kept_entries"]),
     )
     monkeypatch.setattr(compaction_target, "_manual_consumer_messages", messages)
     monkeypatch.setattr(
-        compaction_target, "project_provider_final_request",
+        compaction_target,
+        "project_provider_final_request",
         lambda target, request, _tools, _config: target.project_final_request(
-            request, tools, config,
+            request,
+            tools,
+            config,
         ),
     )
 
     automatic = agent.resolve_compaction_budget(
         consumer_provider=provider,
-        active_user_message="Continue the task.", active_user_in_history=persisted,
-        bound_user_message_id=None, attachment_messages=None,
-        context_window_tokens=window, max_output_tokens=output,
+        active_user_message="Continue the task.",
+        active_user_in_history=persisted,
+        bound_user_message_id=None,
+        attachment_messages=None,
+        context_window_tokens=window,
+        max_output_tokens=output,
         consumer_model_id=MODEL,
     )
-    manual = compaction_target.build_gateway_compaction_budget(GatewayConsumerBudget(
-        provider=provider, provider_id="openai", model=MODEL,
-        context_window_tokens=window, physical_context_window_tokens=window,
-        max_output_tokens=output, provider_request_max_chars=window * 4,
-        provider_request_max_chars_explicit_cap=0,
-        next_request_reserve_tokens=0, next_request_reserve_chars=0,
-    ))
+    manual = compaction_target.build_gateway_compaction_budget(
+        GatewayConsumerBudget(
+            provider=provider,
+            provider_id="openai",
+            model=MODEL,
+            context_window_tokens=window,
+            physical_context_window_tokens=window,
+            max_output_tokens=output,
+            provider_request_max_chars=window * 4,
+            provider_request_max_chars_explicit_cap=0,
+            next_request_reserve_tokens=0,
+            next_request_reserve_chars=0,
+        )
+    )
 
     assert manual == automatic
     assert manual.consumer_admission_fingerprint == automatic.consumer_admission_fingerprint
@@ -114,27 +141,35 @@ def test_manual_and_automatic_entrypoints_share_identical_envelope_budget(
     assert manual.history_capacity_tokens > 0
 
 
-@pytest.mark.parametrize("window,output", [
-    (262_144, 131_072), (256_000, 16_000), (1_000_000, 384_000),
-])
-def test_provider_generation_reserve_is_subtracted_once(window: int, output: int) -> None:
+@pytest.mark.parametrize(
+    "window,output",
+    [
+        (262_144, 131_072),
+        (256_000, 16_000),
+        (1_000_000, 384_000),
+    ],
+)
+def test_soft_watermark_is_independent_of_the_output_ceiling(window: int, output: int) -> None:
     *_rest, project = _envelope(window, output)
     projection = project(TEMPLATE, [])
     budget = _resolve(project, window=window, output=output)
-    # The provider proof has already removed generation plus its 20k physical
-    # reserve and 4096 token proof margin for these large windows.
-    expected = window - output - 20_000 - 4_096 - projection.proof["estimated_tokens"]
-    assert projection.proof["raw_proof_token_budget"] == window - output - 20_000
+    # Hard proof reserves output once; scheduling keeps a stable soft reserve
+    # and applies its ratio to the complete input before removing the envelope.
+    fixed_tokens = projection.proof["estimated_tokens"]
+    expected = soft_input_tokens(window) - fixed_tokens
+    assert projection.proof["raw_proof_token_budget"] == window - output
     assert budget.generation_reserve_tokens == output
     assert budget.history_capacity_tokens == expected
-    assert budget.auto_trigger_tokens == int(expected * 0.85)
-    assert budget.retained_tail_tokens == expected // 5
+    assert budget.auto_trigger_tokens == int(soft_input_tokens(window) * 0.85) - fixed_tokens
+    assert budget.retained_tail_tokens == max(0, expected - budget.summary_output_tokens)
 
 
 def test_adapter_reasoning_cap_is_reserved_once() -> None:
     provider = AnthropicProvider(api_key="synthetic-key", model="claude-3-7-sonnet-latest")
     config = ChatConfig(
-        max_tokens=1_024, thinking=True, thinking_budget_tokens=10_000,
+        max_tokens=1_024,
+        thinking=True,
+        thinking_budget_tokens=10_000,
         provider_context_window_tokens=64_000,
         provider_request_max_chars_explicit_cap=0,
     )
@@ -146,9 +181,9 @@ def test_adapter_reasoning_cap_is_reserved_once() -> None:
     budget = _resolve(project, window=64_000, output=1_024)
     assert projection.payload["max_tokens"] == 14_096
     assert budget.generation_reserve_tokens == 14_096
-    assert projection.proof["raw_proof_token_budget"] == 64_000 - 20_000 - 14_096
+    assert projection.proof["raw_proof_token_budget"] == 64_000 - 14_096
     assert budget.history_capacity_tokens == (
-        projection.proof["effective_proof_token_budget"] - projection.proof["estimated_tokens"]
+        soft_input_tokens(64_000) - projection.proof["estimated_tokens"]
     )
     assert budget.consumer_admission("Complete portable checkpoint.", []) is True
 
@@ -158,14 +193,21 @@ def test_actual_tools_and_media_reduce_capacity_and_change_fingerprint(extra: st
     _provider, _config, tools, media, _messages, project = _envelope()
     baseline = _resolve(project)
     if extra == "tools":
-        tools.append(ToolDefinition(
-            name="inspect", description="Detailed tool contract. " * 500,
-            input_schema=ToolInputSchema(),
-        ))
+        tools.append(
+            ToolDefinition(
+                name="inspect",
+                description="Detailed tool contract. " * 500,
+                input_schema=ToolInputSchema(),
+            )
+        )
     else:
-        media.append(ContentBlockImage(
-            source_type="url", media_type="image/png", data="https://example.test/image.png",
-        ))
+        media.append(
+            ContentBlockImage(
+                source_type="url",
+                media_type="image/png",
+                data="https://example.test/image.png",
+            )
+        )
     expanded = _resolve(project)
 
     assert expanded.history_capacity_tokens < baseline.history_capacity_tokens
@@ -177,7 +219,7 @@ def test_actual_tools_and_media_reduce_capacity_and_change_fingerprint(extra: st
 
 def test_explicit_character_cap_remains_independent_of_large_physical_window() -> None:
     *_rest, project = _envelope(1_000_000, 384_000, char_cap=8_000)
-    budget = _resolve(project, window=1_000_000, output=384_000)
+    budget = _resolve(project, window=1_000_000, output=384_000, request_character_limit=8_000)
 
     assert budget.history_capacity_tokens > 500_000
     assert 0 < budget.history_capacity_chars < 8_000
@@ -199,8 +241,9 @@ def test_explicit_history_limit_only_narrows_available_capacity() -> None:
     assert larger.physical_context_window_tokens == baseline.physical_context_window_tokens
 
 
-def test_exhausted_physical_window_never_manufactures_history_capacity() -> None:
-    *_rest, project = _envelope(64_000, 128_000)
+def test_exhausted_fixed_envelope_never_manufactures_history_capacity() -> None:
+    _provider, config, *_rest, project = _envelope(64_000, 128_000)
+    config.system = "mandatory " * 100_000
     budget = _resolve(project, window=64_000, output=128_000)
 
     assert budget.history_capacity_tokens == 0
@@ -250,31 +293,70 @@ def test_unknown_next_envelope_reserve_is_applied_once() -> None:
     assert reserved.consumer_admission_fingerprint != baseline.consumer_admission_fingerprint
 
 
+def test_candidate_uses_its_own_adjusted_output_cap_not_the_small_template_limit() -> None:
+    _provider, config, *_rest, project = _envelope(200_000, 128_000)
+    budget = _resolve(project, window=200_000, output=128_000)
+    summary = "x " * 80_000
+    template = project(TEMPLATE, [])
+    candidate = project(summary, [])
+
+    assert candidate.proof["estimated_tokens"] > template.proof["effective_proof_token_budget"]
+    assert candidate.fits
+    assert 94_000 < candidate.payload["max_tokens"] < 128_000
+    assert budget.consumer_admission(summary, [])
+    assert config.max_tokens == 128_000
+    # A later small request still has the full output allowance and the same
+    # compaction watermark; neither decision feeds back into the other.
+    assert project(TEMPLATE, []).payload["max_tokens"] == 128_000
+    assert _resolve(project, window=200_000, output=128_000).auto_trigger_tokens == (
+        budget.auto_trigger_tokens
+    )
+
+
+def test_environment_character_cap_limits_soft_planning(monkeypatch: pytest.MonkeyPatch) -> None:
+    *_rest, project = _envelope()
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_REQUEST_PROOF_MAX_CHARS", "8000")
+    budget = _resolve(project)
+    assert 0 < budget.history_capacity_chars < 8_000
+    assert budget.consumer_admission("Checkpoint", [])
+    assert not budget.consumer_admission("x" * 8_000, [])
+
+
 def test_history_cap_includes_the_persisted_current_prompt() -> None:
     provider = OpenAIProvider(api_key="synthetic-key", model=MODEL)
-    agent = Agent(provider=provider, config=AgentConfig(
-        context_window_tokens=64_000, max_tokens=1_024,
-    ))
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=64_000,
+            max_tokens=1_024,
+        ),
+    )
     prompt = "a b c d e f g h " * 800
     active = {"role": "user", "content": prompt, "message_id": "active"}
 
     def budget(persisted: bool, limit: int | None = None):
         return agent.resolve_compaction_budget(
-            consumer_provider=provider, active_user_message=prompt,
+            consumer_provider=provider,
+            active_user_message=prompt,
             active_user_in_history=persisted,
             bound_user_message_id="active" if persisted else None,
             attachment_messages=None,
-            context_window_tokens=64_000, max_output_tokens=1_024,
+            context_window_tokens=64_000,
+            max_output_tokens=1_024,
             history_limit_tokens=limit,
         )
 
     persisted = budget(True)
     pending = budget(False)
-    assert agent.preflight_history_capacity(
-        active_user_message=prompt, active_user_in_history=True,
-        consumer_provider=provider, context_window_tokens=64_000,
+    # The legacy hard-capacity helper is not the automatic soft watermark.
+    hard_tokens, _hard_chars = agent.preflight_history_capacity(
+        active_user_message=prompt,
+        active_user_in_history=True,
+        consumer_provider=provider,
+        context_window_tokens=64_000,
         consumer_max_output_tokens=1_024,
-    ) == (persisted.history_capacity_tokens, persisted.history_capacity_chars)
+    )
+    assert hard_tokens > persisted.history_capacity_tokens
     assert persisted.history_capacity_tokens > pending.history_capacity_tokens + 6_000
     # Identical provider requests fit both allocations of the active row.
     assert persisted.consumer_admission("Complete checkpoint.", [active])
@@ -287,23 +369,38 @@ def test_history_cap_includes_the_persisted_current_prompt() -> None:
 
 def test_persisted_native_media_stays_in_complete_admission_and_stale_identity() -> None:
     provider = OpenAIProvider(api_key="synthetic-key", model=MODEL)
-    agent = Agent(provider=provider, config=AgentConfig(
-        context_window_tokens=64_000, max_tokens=1_024,
-    ))
-    media = ContentBlockImage(
-        source_type="url", media_type="image/png", data="https://example.test/active.png",
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=64_000,
+            max_tokens=1_024,
+        ),
     )
-    attachment_messages = [Message(role="user", content=[
-        ContentBlockText(text="Inspect this image."), media,
-    ])]
+    media = ContentBlockImage(
+        source_type="url",
+        media_type="image/png",
+        data="https://example.test/active.png",
+    )
+    attachment_messages = [
+        Message(
+            role="user",
+            content=[
+                ContentBlockText(text="Inspect this image."),
+                media,
+            ],
+        )
+    ]
     active = {"role": "user", "content": "Inspect this image.", "message_id": "active"}
 
     def budget(limit: int | None = None):
         return agent.resolve_compaction_budget(
-            consumer_provider=provider, active_user_message="Inspect this image.",
-            active_user_in_history=True, bound_user_message_id="active",
+            consumer_provider=provider,
+            active_user_message="Inspect this image.",
+            active_user_in_history=True,
+            bound_user_message_id="active",
             attachment_messages=attachment_messages,
-            context_window_tokens=64_000, max_output_tokens=1_024,
+            context_window_tokens=64_000,
+            max_output_tokens=1_024,
             history_limit_tokens=limit,
         )
 

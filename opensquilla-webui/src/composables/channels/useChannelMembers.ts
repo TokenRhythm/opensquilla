@@ -193,32 +193,37 @@ export function useChannelMembers(
     })
     if (!confirmed) return
     await withPendingKey(pendingActions, actionKey(pairing, pairing.status === 'revoked' ? 'reapprove' : 'approve'), async () => {
-      error.value = ''
+      if (activeName.value === name) error.value = ''
       try {
         const res = await channelAdministration.approvePairing(
           name,
           pairing.pairingId,
           asAdmin,
         )
+        if (activeName.value === name) {
+          // Approval is committed even when the separate admin grant fails.
+          // Keep that fact if the follow-up list read is unavailable.
+          pairings.value = pairings.value.map(item => item.pairingId === pairing.pairingId
+            ? { ...item, status: 'approved' } : item)
+        }
         // The backend commits the approval even when the admin grant fails
         // (adminGranted:false + warnings) — surface that instead of falsely
         // announcing an admin success.
         if (asAdmin && res?.adminGranted === false) {
-          announcement.value = t('console.channels.pairings.approveSuccess', { sender })
-          pushToast(announcement.value, { tone: 'ok' })
-          pushToast(
-            t('console.channels.pairings.adminGrantFailedAfterApprove', { sender }),
-            { tone: 'danger' },
-          )
+          const message = t('console.channels.pairings.adminGrantFailedAfterApprove', { sender })
+          if (activeName.value === name) announcement.value = message
+          pushToast(message, { tone: 'warn' })
         } else {
-          announcement.value = asAdmin
+          const message = asAdmin
             ? t('console.channels.pairings.approveAdminSuccess', { sender })
             : t('console.channels.pairings.approveSuccess', { sender })
-          pushToast(announcement.value, { tone: 'ok' })
+          if (activeName.value === name) announcement.value = message
         }
-        await load(name)
+        if (activeName.value === name) await load(name)
       } catch (err) {
-        error.value = t('console.channels.pairings.approveFailed', { sender, error: errorMessage(err) })
+        if (activeName.value === name) {
+          error.value = t('console.channels.pairings.approveFailed', { sender, error: errorMessage(err) })
+        }
       }
     })
   }
@@ -246,7 +251,6 @@ export function useChannelMembers(
         announcement.value = admin
           ? t('console.channels.pairings.adminGrantedSuccess', { sender })
           : t('console.channels.pairings.adminRemovedSuccess', { sender })
-        pushToast(announcement.value, { tone: 'ok' })
         await load(name)
       } catch (err) {
         error.value = t('console.channels.pairings.adminUpdateFailed', { sender, error: errorMessage(err) })
@@ -275,7 +279,6 @@ export function useChannelMembers(
       try {
         await channelAdministration.setAdmin(name, senderId, false)
         announcement.value = t('console.channels.pairings.adminRemovedSuccess', { sender: senderId })
-        pushToast(announcement.value, { tone: 'ok' })
         await load(name)
       } catch (err) {
         error.value = t('console.channels.pairings.adminUpdateFailed', { sender: senderId, error: errorMessage(err) })
@@ -297,7 +300,6 @@ export function useChannelMembers(
       try {
         await channelAdministration.revokePairing(name, pairing.pairingId)
         announcement.value = t('console.channels.pairings.revokeSuccess', { sender })
-        pushToast(announcement.value, { tone: 'ok' })
         await load(name)
       } catch (err) {
         error.value = t('console.channels.pairings.revokeFailed', { sender, error: errorMessage(err) })

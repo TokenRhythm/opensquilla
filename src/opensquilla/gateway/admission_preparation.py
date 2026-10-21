@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -212,15 +213,20 @@ async def prepare_route(
 
     workspace_dir = run_context.workspace or workspace_dir
     page_context_text = None
+    office_candidate = None
+    annotation_selection = None
     if command.page_context is not None:
         from opensquilla.gateway.page_context import render_page_context
 
         resolved_context = await page_context_resolver(
             command.page_context,
+            candidate_id=turn_id,
             session_key=key,
             session_id=session_id,
             workspace=workspace_dir,
         )
+        office_candidate = resolved_context.pop("_officeCandidate", None)
+        annotation_selection = resolved_context.pop("_annotationSelection", None)
         page_context_text = render_page_context(resolved_context)
     host_execute_allowed = principal_has_host_execute(principal)
     session_epoch = int(getattr(session, "epoch", 0) or 0)
@@ -236,6 +242,7 @@ async def prepare_route(
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
+            required_services=command.required_services,
         )
         route_envelope.metadata["structured_user_input"] = connection_supports_user_input(conn_id)
     else:
@@ -251,6 +258,7 @@ async def prepare_route(
             session_epoch=session_epoch,
             principal_is_owner=principal.is_owner,
             principal_host_execute=host_execute_allowed,
+            required_services=command.required_services,
         )
     apply_run_context_route_metadata(
         route_envelope,
@@ -258,6 +266,10 @@ async def prepare_route(
         principal_is_owner=principal.is_owner,
     )
     route_envelope.metadata["sandbox_mode_resolution"] = mode_resolution.to_payload()
+    if office_candidate is not None:
+        route_envelope.metadata["office_candidate"] = office_candidate
+    if annotation_selection is not None:
+        route_envelope.metadata["annotation_selection"] = annotation_selection
     if command.selected_skills:
         route_envelope.metadata["selected_skills"] = list(command.selected_skills)
     if guest_profile is not None:
@@ -355,7 +367,7 @@ async def prepare_route(
             host_execute_allowed=host_execute_allowed, workspace_dir=run_context.workspace,
             workspace_strict=bool(getattr(config, "workspace_strict", True)),
         )
-        pin_sandbox_policy(tool_context, config)
+        await asyncio.to_thread(pin_sandbox_policy, tool_context, config)
         try:
             await validate_workspace_files(
                 command.workspace_files, session=session, storage=storage,

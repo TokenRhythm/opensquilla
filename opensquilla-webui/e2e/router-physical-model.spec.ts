@@ -277,7 +277,7 @@ async function installGateway(page: Page, { legacy = false, fusion = false } = {
 
 async function startTurn(page: Page) {
   await page.goto('/control/chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
   await page.locator('.chat-textarea').fill('Exercise the synthetic fallback chain.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect(page.locator('.router-fx')).toHaveCount(1)
@@ -318,12 +318,12 @@ test('tracks candidate fallback and retry, then out-of-pool success and terminal
   await expect(strip.locator('.router-fx-cell.win .nm')).toHaveAttribute('aria-label', PRIMARY)
   gateway.activity(CANDIDATE, 'provider_overloaded', 'fallback')
   await expectExecuting(strip, CANDIDATE)
-  await expect(page.locator('.assistant-activity')).toContainText('Switching to backup model')
+  await expect(page.locator('.assistant-activity')).toContainText('Trying a backup model')
   gateway.activity(CANDIDATE)
   await expectExecuting(strip, CANDIDATE)
   gateway.activity(CANDIDATE, 'rate_limited', 'retry_wait')
   await expectExecuting(strip, CANDIDATE)
-  await expect(page.locator('.assistant-activity')).toContainText('Rate limited')
+  await expect(page.locator('.assistant-activity')).toContainText('Model temporarily rate limited, waiting to retry')
   gateway.activity(CANDIDATE, 'transport_transient', 'retrying')
   await expectExecuting(strip, CANDIDATE)
   await expect(page.locator('.assistant-activity')).toContainText('Retrying')

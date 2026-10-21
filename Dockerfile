@@ -16,8 +16,6 @@
 
 FROM --platform=$BUILDPLATFORM node:22.12.0-bookworm-slim AS webui-builder
 
-ARG OPENSQUILLA_FORBID_PERSONAL_BGM=0
-
 WORKDIR /build/opensquilla-webui
 
 # Cache dependency installation independently from application source. Vite
@@ -28,10 +26,11 @@ WORKDIR /build/opensquilla-webui
 COPY opensquilla-webui/package.json opensquilla-webui/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
 COPY opensquilla-webui/ ./
-RUN npm run build:artifact \
-    && if [ "${OPENSQUILLA_FORBID_PERSONAL_BGM}" = "1" ]; then \
-        npm run verify:release-dist; \
-    fi
+# The artifact prebuild verifies the checked-in Visualize guidance against the
+# pinned upstream package. Keep that source beside the WebUI in this isolated
+# builder stage; the final image already receives the complete Python source.
+COPY src/opensquilla/skills/bundled/visualize/ /build/src/opensquilla/skills/bundled/visualize/
+RUN npm run build:artifact
 
 
 FROM python:3.13-slim-bookworm
@@ -59,7 +58,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy minimal build context — everything else is in .dockerignore.
-COPY pyproject.toml README.md README.release.md ./
+COPY pyproject.toml uv.lock README.md README.release.md ./
 COPY hatch_build.py ./
 COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py
 COPY scripts/freeze_migration_registry.py ./scripts/freeze_migration_registry.py
@@ -99,8 +98,12 @@ if missing or pointers:
     )
 PY
 
-RUN pip install ".[recommended]" \
-    && rm -rf hatch_build.py scripts opensquilla-webui
+RUN --mount=from=ghcr.io/astral-sh/uv:0.12.15,source=/uv,target=/usr/local/bin/uv \
+    uv export --frozen --no-dev --extra recommended --no-emit-project \
+        --output-file /tmp/opensquilla-requirements.txt \
+    && pip install --require-hashes --requirement /tmp/opensquilla-requirements.txt \
+    && pip install --no-deps ".[recommended]" \
+    && rm -rf hatch_build.py scripts opensquilla-webui uv.lock /tmp/opensquilla-requirements.txt
 
 # Persisted state root. The gateway writes config, state, logs, and the
 # workspace under OPENSQUILLA_STATE_DIR — mounting a volume here (see

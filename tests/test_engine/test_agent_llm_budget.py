@@ -22,6 +22,7 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
+from opensquilla.engine.agent import _LiveTurnCheckpointMessage, _LiveTurnContinuationMessage
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.types import CompactionEvent
@@ -66,7 +67,9 @@ RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
 def _inline_template_capacity(
     agent: Agent, provider: Any, *, window: int, output: int, char_cap: int,
 ) -> tuple[int, int]:
-    """Measure the inline replay envelope, whose summary is a message prefix."""
+    """Measure soft planning capacity; final candidates still need hard proof."""
+    from opensquilla.context_budget import soft_input_tokens
+
     messages = agent._provider_request_messages_for_count_projection(
         [Message(role="user", content="[Context summary]\n[candidate checkpoint]"),
          Message(role="assistant", content="Understood. Continuing from summary.")],
@@ -82,9 +85,13 @@ def _inline_template_capacity(
             provider_request_proof_max_chars=char_cap,
         ),
     )
+    soft_tokens = soft_input_tokens(window)
+    soft_chars = soft_tokens * 4
+    if char_cap > 0:
+        soft_chars = min(soft_chars, projection.proof["effective_proof_budget"])
     return (
-        projection.proof["effective_proof_token_budget"] - projection.proof["estimated_tokens"],
-        projection.proof["effective_proof_budget"] - projection.proof["estimated_chars"],
+        soft_tokens - projection.proof["estimated_tokens"],
+        soft_chars - projection.proof["estimated_chars"],
     )
 
 
@@ -286,7 +293,7 @@ class _FinalAdmissionContextOverflowProvider(_ContextOverflowProvider):
 class _HangingRetryAfterOverflowProvider(_ContextOverflowProvider):
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
-            yield ProviderError(message="context length exceeded", code="400")
+            yield ProviderError(message="context length exceeded", code="400", http_status=400)
             return
         await asyncio.Event().wait()
         yield ProviderText(text="unreachable")
@@ -543,9 +550,10 @@ def test_raw_attachment_capacity_reserves_actual_anthropic_generation_budget(
     assert len(observed) == 1
     # Anthropic raises the wire output cap to thinking + 4,096. Both input
     # dimensions must reserve that cap once, before proof headroom and fixed
-    # request content are subtracted.
+    # request content are subtracted. The soft planning reserve is not another
+    # deduction from this physical request proof.
     assert observed[0]["generation_budget"] == 14_096
-    assert observed[0]["token_budget"] == 128_000 - 14_096 - 20_000
+    assert observed[0]["token_budget"] == 128_000 - 14_096
     assert observed[0]["proof_budget"] == 4 * observed[0]["token_budget"]
     assert 0 < capacity < observed[0]["token_budget"] - 4_096
 
@@ -1443,6 +1451,48 @@ async def test_agent_stops_when_turn_estimated_cost_budget_is_exceeded() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("budget, expected_exceeded", [(0.001, True), (1.0, False)])
+async def test_turn_budget_uses_default_heuristic_without_reporting_a_quoted_cost(
+    monkeypatch: pytest.MonkeyPatch, budget: float, expected_exceeded: bool,
+) -> None:
+    from opensquilla.engine.pricing import resolve_model_price
+    from opensquilla.engine.usage_accounting import normalize_provider_usage
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog", lambda: ModelCatalog(),
+    )
+    model = "unquoted-budget-test"
+    assert resolve_model_price(model, "fake").source == "default"
+    provider = _NoBilledCostUsageProvider(input_tokens=1000, output_tokens=1000)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(provider_id="fake", model_id=model, max_turn_cost_usd=budget),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    errors = [
+        event for event in events
+        if event.kind == "error" and event.code == "turn_cost_budget_exceeded"
+    ]
+    assert bool(errors) is expected_exceeded
+    if errors:
+        assert "estimated cost basis" in errors[0].message
+    assert len(provider.calls) == 1
+    done = next(event for event in events if event.kind == "done")
+    assert done.cost_usd == 0.0
+    assert done.cost_source == "unavailable"
+    assert done.missing_cost_entries == 1
+    usage = normalize_provider_usage(
+        ProviderDone(input_tokens=1000, output_tokens=1000),
+        default_provider="fake", default_model=model, completed_at_ms=0,
+    )
+    assert usage.cost_source == "unavailable"
+    assert usage.estimated_cost_nanos == 0
+
+
+@pytest.mark.asyncio
 async def test_agent_labels_turn_cost_budget_error_as_mixed_when_billed_and_estimated() -> None:
     # Turn mixes a real billed cost (call 1) with an estimated cost (call 2,
     # cost-blind) — the gate's basis label must reflect both contributions.
@@ -1475,16 +1525,16 @@ async def test_agent_labels_turn_cost_budget_error_as_mixed_when_billed_and_esti
 async def test_agent_turn_cost_budget_prices_each_unbilled_ensemble_member(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.engine.pricing import PriceEntry
+    from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 
     calls: list[tuple[str, str]] = []
 
-    def resolve(model_id: str, provider: str = "") -> Any:
+    def resolve(model_id: str, provider: str = "") -> ResolvedModelPrice:
         calls.append((model_id, provider))
         input_per_m = {("m1", "p1"): 100.0, ("m2", "p2"): 200.0}[
             (model_id, provider)
         ]
-        return SimpleNamespace(
+        return ResolvedModelPrice(
             entry=PriceEntry(input_per_m=input_per_m, output_per_m=0.0),
             source="test",
         )
@@ -1537,14 +1587,14 @@ async def test_agent_turn_cost_budget_prices_each_unbilled_ensemble_member(
 async def test_agent_turn_cost_budget_combines_billed_and_unbilled_ensemble_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.engine.pricing import PriceEntry
+    from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 
     calls: list[tuple[str, str]] = []
 
-    def resolve(model_id: str, provider: str = "") -> Any:
+    def resolve(model_id: str, provider: str = "") -> ResolvedModelPrice:
         calls.append((model_id, provider))
         assert (model_id, provider) == ("m2", "p2")
-        return SimpleNamespace(
+        return ResolvedModelPrice(
             entry=PriceEntry(input_per_m=400.0, output_per_m=0.0),
             source="test",
         )
@@ -1597,14 +1647,14 @@ async def test_agent_turn_cost_budget_combines_billed_and_unbilled_ensemble_memb
 async def test_agent_turn_cost_budget_stops_retry_after_ensemble_error_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.engine.pricing import PriceEntry
+    from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 
     calls: list[tuple[str, str]] = []
 
-    def resolve(model_id: str, provider: str = "") -> Any:
+    def resolve(model_id: str, provider: str = "") -> ResolvedModelPrice:
         calls.append((model_id, provider))
         assert (model_id, provider) == ("m1", "p1")
-        return SimpleNamespace(
+        return ResolvedModelPrice(
             entry=PriceEntry(input_per_m=300.0, output_per_m=0.0),
             source="test",
         )
@@ -2054,8 +2104,10 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("success_after", [None, 1])
 async def test_narrow_routed_window_never_durably_compacts_base_session(
     monkeypatch: pytest.MonkeyPatch,
+    success_after: int | None,
 ) -> None:
     async def _unexpected_compaction(_request: Any) -> CompactionResult:
         raise AssertionError(
@@ -2066,7 +2118,7 @@ async def test_narrow_routed_window_never_durably_compacts_base_session(
         "opensquilla.engine.agent.compact_context",
         _unexpected_compaction,
     )
-    provider = _ContextOverflowProvider()
+    provider = _ContextOverflowProvider(success_after=success_after)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -2089,14 +2141,16 @@ async def test_narrow_routed_window_never_durably_compacts_base_session(
 
     events = [event async for event in agent.run_turn("current request")]
 
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2
+    assert _provider_payload_is_smaller(provider.calls[0], provider.calls[1])
     assert not any(isinstance(event, CompactionEvent) for event in events)
-    assert agent.history_snapshot() == history
-    assert any(
-        isinstance(event, ErrorEvent)
-        and event.code == "provider_request_too_large"
-        for event in events
-    )
+    assert agent.history_snapshot()[:len(history)] == history
+    if success_after is None:
+        assert any(isinstance(event, ErrorEvent) for event in events)
+        assert agent.history_snapshot() == history
+    else:
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        assert any(event.kind == "done" for event in events)
 
 
 @pytest.mark.asyncio
@@ -2221,6 +2275,7 @@ async def test_inline_compaction_install_wait_obeys_absolute_deadline(
     assert any(
         isinstance(event, ErrorEvent)
         and event.code == "compaction_deadline_exceeded"
+        and event.http_status is None
         for event in events
     )
     terminal = [
@@ -2431,9 +2486,16 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
         return await compact_core(request)
 
     monkeypatch.setattr("opensquilla.engine.agent.compact_context", capture_request)
+    # Token pressure must exceed the physical window even after the adapter
+    # fits the output cap. The old ASCII fixture fits under dynamic output.
+    background = (
+        "甲乙丙丁戊己庚辛壬癸" * 400
+        if pressure == "tokens"
+        else "Completed ordinary background. " * 150
+    )
     messages = [
         Message(role="user" if index % 2 == 0 else "assistant",
-                content="Completed ordinary background. " * 150)
+                content=background)
         for index in range(4)
     ]
     current = Message(role="user", content="Continue the active task exactly")
@@ -2461,6 +2523,7 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
         assert proof["estimated_tokens"] < proof["effective_proof_token_budget"] * 0.85
     else:
         assert proof["estimated_chars"] < proof["effective_proof_budget"] * 0.85
+        assert proof["estimated_tokens"] > agent.config.context_window_tokens
 
     outcome = await agent._check_context_overflow(
         messages,
@@ -2481,6 +2544,24 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
     assert outcome.removed_count == 4
     assert outcome.messages[-1] is current
     assert messages[-1] is current and len(messages) == 5
+    final_projection = provider.project_final_request(
+        agent._provider_request_messages_for_count_projection(
+            outcome.messages,
+            request_context_message=agent._request_context_message(
+                agent.config.request_context_prompt,
+            ),
+            request_context_insert_index=len(outcome.messages),
+            runtime_context_message=agent._freeze_preflight_runtime_context_message(),
+            runtime_context_insert_index=len(outcome.messages),
+        ),
+        agent.tool_definitions,
+        agent._provider_admission_chat_config(
+            "", context_window_tokens=agent.config.context_window_tokens,
+            max_output_tokens=8192,
+            provider_request_proof_max_chars=agent.config.provider_request_proof_max_chars,
+        ),
+    )
+    assert final_projection.fits
 
 
 @pytest.mark.asyncio
@@ -2579,7 +2660,7 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
         current_user,
         *rounds,
     ]
-    canonical_snapshot = list(messages)
+    canonical_snapshot = [message.model_copy(deep=True) for message in messages]
     agent = Agent(
         provider=_ContextOverflowProvider(),
         config=AgentConfig(
@@ -2596,8 +2677,29 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
 
     assert outcome is not None
     assert outcome.ephemeral_only is True
-    assert outcome.messages[2] is current_user
-    assert outcome.messages[-4:] == rounds[-4:]
+    assert outcome.messages[0] is current_user
+    assert sum(message is current_user for message in outcome.messages) == 1
+    assert outcome.protected_turn_start_index == 0
+    assert len(outcome.messages) == 3
+    checkpoint = outcome.messages[1]
+    assert isinstance(checkpoint, _LiveTurnCheckpointMessage)
+    assert checkpoint.role == "assistant"
+    assert "completed work summary" in str(checkpoint.content)
+    assert isinstance(outcome.messages[2], _LiveTurnContinuationMessage)
+    assert outcome.messages[2].role == "user"
+    assert outcome.messages[2].content != current_user.content
+    receipts = checkpoint._compaction_tool_receipts
+    assert [receipt["tool_call_id"] for receipt in receipts] == [
+        f"live-{index}" for index in range(3)
+    ]
+    assert [receipt["name"] for receipt in receipts] == ["read_file"] * 3
+    assert [receipt["arguments"] for receipt in receipts] == [
+        {"path": f"part-{index}.txt"} for index in range(3)
+    ]
+    assert all(receipt["result_received"] for receipt in receipts)
+    assert all(receipt["execution_status"]["status"] == "unknown" for receipt in receipts)
+    assert compact_requests[0].forced_prefix_cut == len(rounds) + 2
+    assert all(message not in outcome.messages for message in rounds)
     assert messages == canonical_snapshot
     assert compact_requests
     assert compact_requests[0].config.protect_semantic_tail is False
@@ -2997,6 +3099,8 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
         assert request.context_window_tokens == request.config.budget.history_capacity_tokens
         assert request.context_window_chars == request.config.budget.history_capacity_chars
         cut = int(request.forced_prefix_cut)
+        assert request.consumer_admission("first completed tool round", request.entries[cut:])
+        assert not request.consumer_admission("oversized checkpoint " * 1_000, [])
         return CompactionResult(
             summary="first completed tool round",
             kept_entries=request.entries[cut:],
@@ -3036,14 +3140,18 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
     )
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert len(provider.calls) == 5
-    assert len(compact_requests) == 2
+    assert len(compact_requests) == 1
     assert all(request.config.budget is not None for request in compact_requests)
-    # Completed-prefix capacity also reserves the active prompt and raw tool
-    # tail. A protected tail already above the physical cap has no room for a
-    # checkpoint; the existing local request window remains the recovery path.
-    assert all(request.context_window_tokens < 2_750 for request in compact_requests)
-    assert all(request.context_window_chars < 11_000 for request in compact_requests)
+    # Planning subtracts the actual fixed envelope from the soft input window.
+    # Its target is separate from the smaller consumer's final physical proof,
+    # which must reject oversized summaries and admit the eventual send.
+    assert all(0 < request.context_window_tokens < 8_750 for request in compact_requests)
+    assert all(0 < request.context_window_chars < 35_000 for request in compact_requests)
     assert all(request.forced_prefix_cut is not None for request in compact_requests)
+    final_projection = provider.project_final_request(provider.calls[-1])
+    assert final_projection.fits
+    assert final_projection.proof["estimated_tokens"] <= 2_750
+    assert final_projection.proof["estimated_chars"] <= 11_000
 
 
 @pytest.mark.asyncio

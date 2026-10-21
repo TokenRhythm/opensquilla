@@ -46,6 +46,7 @@ from opensquilla.provider.selector import (  # noqa: E402
     ProviderConfig,
     SelectorConfig,
 )
+from opensquilla.session.context_view import format_compaction_summary_context  # noqa: E402
 from opensquilla.session.manager import SessionManager  # noqa: E402
 from opensquilla.session.storage import SessionStorage  # noqa: E402
 from opensquilla.session.terminal_reply import safe_provider_failure_code  # noqa: E402
@@ -91,7 +92,7 @@ COMPACTION_VARIANTS = (
     "long_reasoning",
 )
 COMPACTION_CALL_LIMITS = {
-    "basic": 3, "chunked": 4, "tools": 4, "replay_off": 4, "model_switch": 3,
+    "basic": 3, "chunked": 6, "tools": 4, "replay_off": 4, "model_switch": 3,
     "repeated": 7, "truncated": 3, "long_reasoning": 3,
 }
 COMPACTION_FIRST_PROMPT = (
@@ -652,10 +653,11 @@ def _config(
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
     config.memory.dream.enabled = False
-    config.meta_skill.enabled = False
     config.heartbeat.enabled = False
     config.agent_max_iterations = 5
-    config.agent_max_provider_retries = 0
+    # Exercise the normal finite retry policy, including length continuation.
+    # Historical frozen baselines explicitly set zero and remain unchanged.
+    config.agent_max_provider_retries = None
     config.agent_runtime_timeout_seconds = 180
     config.agent_request_timeout_seconds = 90
     return config
@@ -1217,9 +1219,13 @@ async def _run_compaction_case(
     fact_checks: list[dict[str, Any]] = []
     recall_checks: list[dict[str, Any]] = []
     pressure_checks: list[dict[str, Any]] = []
+    coverage_diagnostics: list[dict[str, Any]] = []
+    summary_replay_checks: list[dict[str, Any]] = []
     observer.replay_checks["critical_fact_checks"] = fact_checks
     observer.replay_checks["memory_recall_checks"] = recall_checks
     observer.replay_checks["pressure_checks"] = pressure_checks
+    observer.replay_checks["summary_coverage_diagnostics"] = coverage_diagnostics
+    observer.replay_checks["summary_replay_checks"] = summary_replay_checks
     catalog = _Catalog()
     catalog_loaded = False
     if provider == "openrouter" and observer.transport is None:
@@ -1261,7 +1267,7 @@ async def _run_compaction_case(
     # Match the ordinary fixture's estimated source pressure when the optional
     # tokenizer is unavailable (this prose estimates about 86 rather than 30
     # tokens per repetition). Physical request limits remain unchanged.
-    seed_repetitions = 16 if conservative_estimate else 45
+    seed_repetitions = 1 if conservative_estimate else 3
     seed_padding = " log 17;" if options.native_pressure else COMPACTION_PADDING
     if variant == "chunked":
         # Exceed the normal preflight threshold and one summary chunk, without
@@ -1314,15 +1320,31 @@ async def _run_compaction_case(
             + ledger
         )
     first_prompt = "SYNTHETIC_COMPACTION_ENTRY_5_USER\n" + first_prompt
-    # Keep one whole current turn large enough to occupy the recent-tail target;
-    # the preceding generated fact/tool round must genuinely enter the summary.
-    # Conservative estimation also charges more for the ledger and fixed
-    # instructions. Keep this protocol fixture's protected request sendable;
-    # native-pressure fixtures retain their original workload.
-    long_tail = variant == "long_reasoning" and (
-        not conservative_estimate or options.native_pressure
-    )
-    tail_padding = " log 17;" * (1800 if long_tail else 1000)
+    if not options.native_pressure:
+        # A low trigger ratio alone no longer replaces every completed round.
+        # Give the generated-fact round real pressure: together with the next
+        # current turn it cannot remain raw, while its summary request fits the
+        # same physical deployment. Keep earlier background small for one-call
+        # protocol cases; the chunked variant retains its larger source above.
+        padding_unit = " log 17;"
+        padding_tokens = max(1, estimate_tokens_with_source(padding_unit)[0])
+        completed_round_tokens = (
+            13_000 if variant == "truncated" else 12_000 if variant == "long_reasoning" else 8000
+        )
+        first_prompt += "\nDisposable completed background:\n" + padding_unit * (
+            completed_round_tokens // padding_tokens
+        )
+    # Make consecutive raw rounds exceed the consumer capacity, while keeping
+    # one protected current turn sendable even with conservative estimation.
+    # This forces the generated fact/tool round into the minimum safe prefix
+    # without depending on a fixed count or percentage of retained history.
+    tail_repetitions = 1400 if variant == "repeated" else 1000
+    if options.native_pressure:
+        # Native-window acceptance exercises real capacity pressure, including
+        # more than one complete old round. The current turn remains sendable
+        # on its own, rather than relying only on an early trigger threshold.
+        tail_repetitions = max(1, int(capacity * 0.4 / estimate_tokens(seed_padding)))
+    tail_padding = " log 17;" * tail_repetitions
     tail_prompt = (
         "SYNTHETIC_COMPACTION_ENTRY_6_USER\n"
         f"{COMPACTION_TAIL_MARKER}\n{tail_padding}\n"
@@ -1382,9 +1404,6 @@ async def _run_compaction_case(
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(observer.observe())
-        stack.enter_context(patch.dict(
-            os.environ, {"OPENSQUILLA_COMPACTION_PROMPT_LAYOUT": options.layout}
-        ))
         stack.callback(add_compaction_listener(observe_compaction_event))
         for turn, prompt in enumerate(prompts):
             storage = SessionStorage(str(db))
@@ -1547,7 +1566,7 @@ async def _run_compaction_case(
                             comparison_snapshot_out, db,
                             settings={
                                 "provider": provider, "model": model, "thinking": thinking,
-                                "layout": options.layout, "task_profile": options.task_profile,
+                                "layout": "suffix", "task_profile": options.task_profile,
                                 "context_window_tokens": options.context_window_tokens or 20_000,
                                 "max_output_tokens": options.max_output_tokens or 4096,
                                 "preflight_ratio": options.preflight_ratio or 0.85,
@@ -1582,8 +1601,11 @@ async def _run_compaction_case(
                         _require(observed["no_summary_committed"], "truncated_summary_committed")
                     break
                 expected_summary_calls = (
-                    {2} if variant == "chunked" else {1, 2} if options.native_pressure else {1}
+                    range(1, limit) if variant == "chunked" or options.native_pressure else {1}
                 )
+                # Bounded summary input can handle the oversized fixture in one
+                # call. Still check source/recall, then report chunked_summary
+                # as not covered unless multiple calls actually occurred.
                 _require(
                     compact is not None
                     and len(summary_calls) in expected_summary_calls
@@ -1595,8 +1617,15 @@ async def _run_compaction_case(
                 _require(len(summaries) == turn, "single_compaction_not_persisted")
                 latest = summaries[-1]
                 _require(latest.summary_source == "llm", "compaction_used_fallback")
+                coverage_diagnostics.append({"turn": turn, "status": latest.coverage_status})
+                # Extracted string matches are diagnostics, not semantic admission.
+                # Keep their misses visible, then independently verify the archived
+                # source, actual replay and task facts below. Do not turn a reported
+                # diagnostic miss into either an early abort or a quality pass.
                 _require(
-                    latest.coverage_status in {"pass", "pass_with_backfill", "unknown"},
+                    latest.coverage_status in {
+                        "pass", "pass_with_backfill", "unknown", "fail_reported",
+                    },
                     "compaction_coverage_failed",
                 )
                 summary_text = latest.summary_text
@@ -1617,8 +1646,7 @@ async def _run_compaction_case(
                 )
                 compact_messages = compact.request.get("messages", [])
                 compact_history = json.dumps([
-                    (call.request.get("messages", [])[:-1] if options.layout == "suffix"
-                     else call.request.get("messages", [])) for call in summary_calls
+                    call.request.get("messages", [])[:-1] for call in summary_calls
                 ])
                 removed_ids = before_active.keys() - active.keys()
                 source_entry_markers = {
@@ -1661,20 +1689,29 @@ async def _run_compaction_case(
                     )
                 resumed = stage_calls[-1]
                 resumed_input = json.dumps(resumed.request, ensure_ascii=False)
+                replay_wrapper = format_compaction_summary_context([summary_text], max_chars=None)
+                replay_contents = [
+                    message["content"] for message in resumed.request.get("messages", [])
+                    if isinstance(message.get("content"), str)
+                ]
+                # Stored complete checkpoints retain their final newline. The
+                # actual replay formatter removes outer whitespace; require its
+                # entire wrapper once in one message, not arbitrary normalized
+                # prose or a match assembled across message boundaries.
+                summary_replay_checks.append({
+                    "turn": turn,
+                    "exact_text_count": sum(text.count(summary_text) for text in replay_contents),
+                    "formatted_wrapper_count": sum(
+                        text.count(replay_wrapper) for text in replay_contents
+                    ) if replay_wrapper else 0,
+                })
                 _require(
-                    summary_text
-                    in "\n".join(
-                        message.get("content") or ""
-                        for message in resumed.request.get("messages", [])
-                        if isinstance(message.get("content"), str)
-                    ),
+                    bool(replay_wrapper)
+                    and any(replay_wrapper in text for text in replay_contents),
                     "persisted_summary_not_in_next_request",
                 )
-                _require(sum(
-                    message["content"].count(summary_text)
-                    for message in resumed.request.get("messages", [])
-                    if isinstance(message.get("content"), str)
-                ) == 1, "persisted_summary_replayed_more_than_once")
+                _require(summary_replay_checks[-1]["formatted_wrapper_count"] == 1,
+                         "persisted_summary_replayed_more_than_once")
                 _require(
                     COMPACTION_TAIL_MARKER in resumed_input, "current_tail_not_in_next_request"
                 )
@@ -1746,8 +1783,6 @@ async def _run_compaction_case(
                     "max_tokens",
                     "max_completion_tokens",
                 ):
-                    if options.layout == "prefix" and name != "model":
-                        continue
                     _require(
                         all(call.request.get(name) == resumed.request.get(name)
                             for call in summary_calls),
@@ -1765,10 +1800,9 @@ async def _run_compaction_case(
                     if left != right:
                         break
                     common += 1
-                if options.layout == "suffix" and turn == 1 and variant not in {
-                    "model_switch", "replay_off",
-                }:
-                    _require(common > 1, "parent_history_prefix_not_reused")
+                # Summary-purpose system instructions intentionally differ
+                # from the ordinary business prompt. Prefix reuse is measured,
+                # not required; removed source content is proven above.
                 # Rebased recorded-history JSON grows within one message. Count
                 # characters separately; whole-message equality is not token equality.
                 parent_json = json.dumps(parent.request.get("messages", []), ensure_ascii=False)
@@ -1794,7 +1828,7 @@ async def _run_compaction_case(
                         True,
                     )
                 )
-                if tools_enabled and options.layout == "suffix":
+                if tools_enabled:
                     observed["tool_roundtrip"] = (
                         tool_values == [7]
                         and _compaction_tool_history_representation(compact) != "invalid"
@@ -1828,7 +1862,7 @@ async def _run_compaction_case(
                     ) and compact.request.get("model") == resumed.request.get("model")
                     _require(observed["model_switch"], "compaction_used_previous_model")
                 if variant == "chunked":
-                    observed["chunked_summary"] = len(summary_calls) == latest.chunk_count == 2
+                    observed["chunked_summary"] = len(summary_calls) == latest.chunk_count > 1
                     observed["single_preflight"] = started_phases == ["preflight"]
                 if variant == "long_reasoning":
                     reasoning = _usage_report([compact])["reasoning_tokens_by_call"][0]
@@ -1865,7 +1899,8 @@ async def _run_compaction_case(
         "model": model,
         "scenario": "compaction",
         "compaction_variant": variant,
-        "layout": options.layout,
+        "layout": "suffix",
+        "requested_layout": options.layout,
         "task_profile": options.task_profile,
         "context_window_tokens": config.llm.context_window_tokens,
         "max_output_tokens": config.llm.max_tokens,
@@ -1879,6 +1914,8 @@ async def _run_compaction_case(
         ),
         **physical_window,
         "critical_fact_checks": fact_checks,
+        "summary_coverage_diagnostics": coverage_diagnostics,
+        "summary_replay_checks": summary_replay_checks,
         "pressure_checks": pressure_checks,
         "source_fixture_sha256": hashlib.sha256(
             json.dumps(sorted(original.values())).encode()
@@ -2071,7 +2108,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--thinking", choices=THINKING_CHOICES, default="low")
     parser.add_argument("--compaction-variant", choices=COMPACTION_VARIANTS, default="basic")
     parser.add_argument("--compaction-next-model")
-    parser.add_argument("--layout", choices=("prefix", "suffix"), default="suffix")
+    parser.add_argument(
+        "--layout", choices=("prefix", "suffix"), default="suffix",
+        help="Legacy comparison label; both values exercise the current suffix implementation.",
+    )
     parser.add_argument("--context-window", type=int)
     parser.add_argument("--max-output", type=int)
     parser.add_argument("--preflight-ratio", type=float)
@@ -2212,7 +2252,6 @@ def main(argv: list[str] | None = None) -> int:
         "OPENSQUILLA_USER_STATE_DIR": str(root / "user-state"),
         "OPENSQUILLA_LIVE_DISABLE_DOTENV": "1",
         "OPENSQUILLA_OPENROUTER_LIVE_PRICING": "0",
-        "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT": args.layout,
         **relay_environment,
     }
     if os.name == "nt":

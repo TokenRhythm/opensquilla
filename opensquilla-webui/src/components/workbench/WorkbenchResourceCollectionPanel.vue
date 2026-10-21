@@ -1,6 +1,10 @@
 <template>
-  <section class="resource-collection" :aria-label="label">
-    <p v-if="resources.length === 0" class="resource-collection__empty">
+  <section ref="scroll" class="resource-collection" :aria-label="label" @scroll.passive="saveReading" @wheel.passive="interacted = true" @pointerdown="interacted = true" @keydown="interacted = true">
+    <p v-if="loading && visibleResources.length === 0" class="resource-collection__empty" role="status">{{ preparingLabel }}</p>
+    <p v-else-if="error" class="resource-collection__empty" role="alert">
+      {{ error }} <button type="button" @click="emit('workbenchEvent', { type: 'collection-refresh' })">{{ retryLabel }}</button>
+    </p>
+    <p v-else-if="visibleResources.length === 0" class="resource-collection__empty">
       {{ emptyLabel }}
     </p>
     <template v-for="group in groups" v-else :key="group.type">
@@ -24,6 +28,10 @@
               </span>
               <span class="resource-collection__copy">
                 <strong>{{ resource.name }}</strong>
+                <small v-if="resource.sourcePath" class="resource-collection__source-path" :title="resource.sourcePath">
+                  {{ resource.sourcePath }}
+                </small>
+                <small v-if="versionLabel?.(resource)">{{ versionLabel?.(resource) }}</small>
                 <small>{{ resourceMeta(resource) }}</small>
                 <small v-if="isBusy(resource)" role="status">
                   {{ preparingLabel }}
@@ -73,7 +81,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import Icon from '@/components/Icon.vue'
 import type {
   WorkbenchResource,
@@ -81,9 +89,13 @@ import type {
 import { workbenchResourceRefId } from '@/types/workbenchResources'
 import type { IconName } from '@/utils/icons'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
+import { canonicalWorkbenchResources } from '@/workbench/workbenchResourceItems'
 
 const props = defineProps<{
   busyKey?: string
+  loading?: boolean
+  error?: string
+  readingTop?: number
   downloadLabel: (resource: WorkbenchResource) => string
   emptyLabel: string
   groupLabels: { files: string; links: string }
@@ -94,21 +106,38 @@ const props = defineProps<{
   preparingLabel: string
   retryLabel: string
   resources: readonly WorkbenchResource[]
+  versionLabel?: (resource: WorkbenchResource) => string
   unavailableReason: (resource: WorkbenchResource) => string
 }>()
 
 const emit = defineEmits<{
   workbenchEvent: [event: WorkbenchComponentEvent]
 }>()
+const scroll = ref<HTMLElement | null>(null)
+const interacted = ref(false)
+function saveReading() {
+  if (props.loading || !props.resources.length) return
+  if (scroll.value) emit('workbenchEvent', { type: 'collection-reading-state', payload: scroll.value.scrollTop })
+}
+onMounted(() => { if (scroll.value) scroll.value.scrollTop = props.readingTop ?? 0 })
+watch(() => [props.readingTop, props.loading, props.resources] as const, async ([top]) => {
+  await nextTick()
+  if (!interacted.value && scroll.value) scroll.value.scrollTop = top ?? 0
+})
+onBeforeUnmount(saveReading)
+
+const visibleResources = computed(() => canonicalWorkbenchResources(props.resources))
 
 const groups = computed(() => (
   (['files', 'links'] as const).map(type => ({
     type,
     label: props.groupLabels[type],
-    resources: props.resources.filter(resource => (
-      type === 'links'
-        ? resource.resource.type === 'url'
-        : resource.resource.type !== 'url'
+    resources: visibleResources.value.filter(resource => (
+      (
+        type === 'links'
+          ? resource.resource.type === 'url'
+          : resource.resource.type !== 'url'
+      )
     )),
   }))
 ))

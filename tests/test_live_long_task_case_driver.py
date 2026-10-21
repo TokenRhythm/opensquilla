@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sqlite3
+import threading
+from contextlib import closing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +19,78 @@ from scripts.long_task_fault_proxy import (
     FaultRequestRecord,
     FaultScenario,
 )
+
+
+@pytest.fixture
+def prepared_gateway_database(
+    monkeypatch: pytest.MonkeyPatch,
+    _migrated_db_template: Path,
+) -> None:
+    original_init = driver.GatewayProcess.__init__
+    original_start = driver.GatewayProcess.start
+
+    def initialize(self, *args, **kwargs) -> None:
+        original_init(self, *args, **kwargs)
+        # Retry and fallback cases need a current schema, not fresh migration
+        # work on every isolated subprocess. The shared source is closed; only
+        # this Gateway's private copy receives runtime writes.
+        try:
+            # OPENSQUILLA_STATE_DIR sets the home; GatewayConfig appends state.
+            runtime_state = self.state_dir / "state"
+            runtime_state.mkdir(mode=0o700)
+            shutil.copy2(_migrated_db_template, runtime_state / "sessions.db")
+        except BaseException:
+            self.cleanup()
+            raise
+
+    def start(self) -> None:
+        original_start(self)
+        # Prove the child consumed the prepared path, not merely that an unused
+        # current-schema file exists beside a newly migrated runtime database.
+        migrations = [
+            event for event in self._startup_service_events()
+            if event["event"] == "build_services.migrations_ready"
+        ]
+        assert migrations and all(event.get("count") == 0 for event in migrations)
+
+    monkeypatch.setattr(driver.GatewayProcess, "__init__", initialize)
+    monkeypatch.setattr(driver.GatewayProcess, "start", start)
+
+
+def test_prepared_gateway_databases_skip_fresh_migrations_and_isolate_writes(
+    prepared_gateway_database: None,
+    _migrated_db_template: Path,
+) -> None:
+    from opensquilla.persistence.migrator import apply_pending
+
+    case = driver.LiveCase(
+        "prepared-startup-synthetic-1", "deepseek", "deepseek-v4-flash", "fault_503", 1,
+        None, driver.CaseBudget(60_000, 1, 4, 1_000),
+    )
+    gateways = []
+    template_bytes = _migrated_db_template.read_bytes()
+    try:
+        for _ in range(2):
+            gateways.append(driver.GatewayProcess(case, secret_values=()))
+        databases = [gateway.state_dir / "state" / "sessions.db" for gateway in gateways]
+        for database in databases:
+            assert database.exists()
+            assert not database.samefile(_migrated_db_template)
+            assert apply_pending(str(database), driver.REPO_ROOT / "migrations") == []
+        assert not databases[0].samefile(databases[1])
+        with closing(sqlite3.connect(databases[0])) as connection:
+            connection.execute("CREATE TABLE fixture_private_write(value INTEGER)")
+            connection.execute("INSERT INTO fixture_private_write VALUES (1)")
+            connection.commit()
+        for untouched in (databases[1], _migrated_db_template):
+            with closing(sqlite3.connect(untouched)) as connection:
+                assert connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name = 'fixture_private_write'"
+                ).fetchall() == []
+        assert _migrated_db_template.read_bytes() == template_bytes
+    finally:
+        for gateway in gateways:
+            gateway.cleanup()
 
 
 def _case_directory(tmp_path: Path) -> Path:
@@ -332,17 +408,272 @@ def test_gateway_restart_keeps_the_first_launch_port(
     assert launch_ports[1] == launch_ports[0]
 
 
+def test_gateway_health_ignores_ambient_proxy_and_global_opener(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = startup_gateway
+    health_requests: list[str] = []
+    proxy_requests: list[str] = []
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - HTTP server callback.
+            health_requests.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args) -> None:
+            pass
+
+    class ProxyHandler(HealthHandler):
+        def do_GET(self) -> None:  # noqa: N802 - HTTP server callback.
+            proxy_requests.append(self.path)
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    with (
+        ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler) as health_server,
+        ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler) as proxy_server,
+    ):
+        threads = [
+            threading.Thread(target=server.serve_forever, daemon=True)
+            for server in (health_server, proxy_server)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            gateway.port = health_server.server_port
+            proxy_url = f"http://127.0.0.1:{proxy_server.server_port}"
+            monkeypatch.setenv("http_proxy", proxy_url)
+            monkeypatch.setenv("HTTP_PROXY", proxy_url)
+            monkeypatch.setenv("no_proxy", "")
+            monkeypatch.setenv("NO_PROXY", "")
+            # Keep system bypass settings out of this synthetic environment.
+            monkeypatch.setattr(driver.urllib.request, "proxy_bypass", lambda _host: False)
+            monkeypatch.setattr(driver.urllib.request, "_opener", None)
+            with pytest.raises(driver.urllib.error.HTTPError) as caught:
+                driver.urllib.request.urlopen(f"{gateway.http_url}/health", timeout=1)
+            caught.value.close()
+            assert caught.value.code == 503
+            assert len(proxy_requests) == 1
+            assert health_requests == []
+
+            monkeypatch.setattr(
+                driver.subprocess, "Popen", lambda *_args, **_kwargs: SimpleNamespace(
+                    poll=lambda: None,
+                ),
+            )
+            gateway.start()
+
+            assert gateway._has_reached_health is True
+            assert health_requests == ["/health"]
+            assert len(proxy_requests) == 1
+        finally:
+            for server in (health_server, proxy_server):
+                server.shutdown()
+            for thread in threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+
+
+def test_initial_github_windows_healthless_ownership_timeout_restarts_once(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = startup_gateway
+    now = [0.0]
+    launched_ports: list[int] = []
+    processes = []
+
+    class Process:
+        def __init__(self) -> None:
+            self.pid = 1200 + len(processes)
+            self.running = True
+            self.killed = False
+
+        def poll(self):
+            return None if self.running else -9
+
+        def kill(self) -> None:
+            self.killed = True
+            self.running = False
+
+        def wait(self, *, timeout):
+            self.running = False
+            return -9
+
+    class HealthyResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def launch(command, **_kwargs):
+        launched_ports.append(int(command[command.index("--port") + 1]))
+        process = Process()
+        processes.append(process)
+        if len(processes) == 1:
+            log = gateway.root / "gateway.stdout.log"
+            with log.open("a", encoding="utf-8") as stream:
+                for phase in ("config", "ownership"):
+                    stream.write(json.dumps({
+                        "event": "gateway.startup_phase",
+                        "phase": phase,
+                        "status": "ready",
+                        "duration_ms": 1,
+                        "startup_elapsed_ms": 2,
+                    }) + "\n")
+        return process
+
+    def health(*_args, **_kwargs):
+        if len(processes) == 1:
+            raise driver.urllib.error.URLError("synthetic initial cold-start stall")
+        return HealthyResponse()
+
+    monkeypatch.setattr(driver, "_GITHUB_WINDOWS_CI", True)
+    monkeypatch.setattr(driver, "_free_port", lambda: 41001)
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        driver.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(gateway, "_open_health", health)
+    monkeypatch.setattr(
+        driver, "time",
+        SimpleNamespace(monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(
+            0, now[0] + seconds,
+        )),
+    )
+
+    gateway.start()
+
+    assert launched_ports == [41001, 41001]
+    assert processes[0].killed is True
+    assert gateway.proc is processes[1]
+    assert gateway.port == 41001
+    assert gateway._has_reached_health is True
+    assert gateway._startup_recovery_used is True
+
+
+@pytest.mark.parametrize("runtime_imported", [False, True])
+def test_initial_github_windows_healthless_ownership_restart_is_bounded_to_once(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch, runtime_imported: bool,
+) -> None:
+    gateway = startup_gateway
+    now = [0.0]
+    launched_ports: list[int] = []
+
+    class Process:
+        def __init__(self) -> None:
+            self.pid = 1300 + len(launched_ports)
+            self.running = True
+
+        def poll(self):
+            return None if self.running else -9
+
+        def kill(self) -> None:
+            self.running = False
+
+        def wait(self, *, timeout):
+            self.running = False
+            return -9
+
+    def launch(command, **_kwargs):
+        launched_ports.append(int(command[command.index("--port") + 1]))
+        log = gateway.root / "gateway.stdout.log"
+        with log.open("a", encoding="utf-8") as stream:
+            phases = ["config", "ownership"]
+            if runtime_imported:
+                phases.append("runtime_import")
+            for phase in phases:
+                stream.write(json.dumps({
+                    "event": "gateway.startup_phase",
+                    "phase": phase,
+                    "status": "ready",
+                    "duration_ms": 1,
+                    "startup_elapsed_ms": 2,
+                }) + "\n")
+        return Process()
+
+    monkeypatch.setattr(driver, "_GITHUB_WINDOWS_CI", True)
+    monkeypatch.setattr(driver, "_free_port", lambda: 42001)
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        driver.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        gateway, "_open_health",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            driver.urllib.error.URLError("synthetic repeated cold-start stall"),
+        ),
+    )
+    monkeypatch.setattr(
+        driver, "time",
+        SimpleNamespace(monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(
+            0, now[0] + seconds,
+        )),
+    )
+
+    with pytest.raises(driver.DriverConfigurationError) as caught:
+        gateway.start()
+
+    assert launched_ports == ([42001] if runtime_imported else [42001, 42001])
+    assert gateway._startup_recovery_used is (not runtime_imported)
+    evidence = json.loads(str(caught.value).split("; startup=", 1)[1])
+    assert evidence["elapsed_ms"] == 45_000
+    assert evidence["health"]["attempts"] == 180
+    assert evidence["health"]["failures"] == {"url_error": 180}
+
+
+@pytest.mark.parametrize(
+    ("github_windows_ci", "has_reached_health", "exit_code", "health_status", "phases"),
+    [
+        (False, False, None, None, {"config", "ownership"}),
+        (True, True, None, None, {"config", "ownership"}),
+        (True, False, 1, None, {"config", "ownership"}),
+        (True, False, None, 503, {"config", "ownership"}),
+        (True, False, None, None, {"config", "ownership", "services"}),
+    ],
+)
+def test_initial_github_windows_startup_recovery_fails_closed_outside_exact_signature(
+    startup_gateway,
+    monkeypatch: pytest.MonkeyPatch,
+    github_windows_ci: bool,
+    has_reached_health: bool,
+    exit_code: int | None,
+    health_status: int | None,
+    phases: set[str],
+) -> None:
+    gateway = startup_gateway
+    gateway._has_reached_health = has_reached_health
+    monkeypatch.setattr(driver, "_GITHUB_WINDOWS_CI", github_windows_ci)
+    monkeypatch.setattr(
+        gateway,
+        "_startup_phases",
+        lambda: {phase: {} for phase in phases},
+    )
+
+    assert gateway._can_recover_initial_windows_startup(
+        exit_code=exit_code,
+        last_health_status=health_status,
+    ) is False
+
+
 @pytest.mark.parametrize("exit_code", [17, None])
+@pytest.mark.parametrize("phase_name", ["runtime_import", "services"])
 @pytest.mark.parametrize("prefix", [
     "", "2026-09-18T13:00:00+00:00 [INFO] opensquilla.gateway.boot: ",
 ])
 def test_gateway_startup_failure_keeps_safe_phase_evidence(
     startup_gateway, monkeypatch: pytest.MonkeyPatch, exit_code: int | None, prefix: str,
+    phase_name: str,
 ) -> None:
     gateway = startup_gateway
     secret = "synthetic-secret-must-never-appear"
     phase = {
-        "event": "gateway.startup_phase", "phase": "services", "status": "ready",
+        "event": "gateway.startup_phase", "phase": phase_name, "status": "ready",
         "duration_ms": 12, "startup_elapsed_ms": 34,
         "message": secret, "path": str(gateway.root),
     }
@@ -361,7 +692,7 @@ def test_gateway_startup_failure_keeps_safe_phase_evidence(
 
     monkeypatch.setattr(driver.subprocess, "Popen", launch)
     monkeypatch.setattr(driver, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=advance))
-    monkeypatch.setattr(driver.urllib.request, "urlopen", unavailable)
+    monkeypatch.setattr(gateway, "_open_health", unavailable)
     with pytest.raises(driver.DriverConfigurationError) as caught:
         gateway.start()
     message = str(caught.value)
@@ -372,10 +703,88 @@ def test_gateway_startup_failure_keeps_safe_phase_evidence(
         "elapsed_ms": 0 if exit_code is not None else 45_000,
         "exit_code": exit_code,
         "last_health_status": None if exit_code is not None else 503,
-        "phases": {"services": {
+        "phases": {phase_name: {
             "status": "ready", "duration_ms": 12, "startup_elapsed_ms": 34,
         }},
+        "service_events": [],
+        "health": {
+            "attempts": 0 if exit_code is not None else 180,
+            "failures": {} if exit_code is not None else {"http_error": 180},
+            "last_failure": None if exit_code is not None else "http_error",
+            "probe_elapsed_ms": 0, "last_probe_elapsed_ms": 0,
+        },
     }
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_gateway_timeout_distinguishes_service_wait_from_failed_health_probes(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch, ready: bool,
+) -> None:
+    gateway = startup_gateway
+    now = [0.0]
+    launches = []
+    secret = "synthetic-health-error-must-not-appear"
+    phase = "gateway_ready" if ready else "runtime_import"
+
+    def launch(*_args, **_kwargs):
+        launches.append(True)
+        records = [
+            {"event": "gateway.startup_phase", "phase": phase, "status": "ready",
+             "duration_ms": 10, "startup_elapsed_ms": 34_327 if ready else 860},
+            {"event": "build_services.migrations_started", "path": str(gateway.root)},
+        ]
+        if ready:
+            records.append({"event": "build_services.migrations_ready", "count": 48,
+                            "duration_ms": 32_000, "error": secret})
+        (gateway.root / "gateway.stderr.log").write_text(
+            "\n".join(json.dumps(record) for record in records), encoding="utf-8",
+        )
+        return SimpleNamespace(poll=lambda: None)
+
+    probes = []
+
+    def unavailable():
+        probes.append(True)
+        now[0] += 0.75
+        errors = (
+            driver.urllib.error.URLError(ConnectionRefusedError(secret)),
+            TimeoutError(secret),
+            driver.urllib.error.URLError(secret),
+        )
+        raise errors[(len(probes) - 1) % len(errors)]
+
+    monkeypatch.setattr(driver, "_GITHUB_WINDOWS_CI", True)
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    monkeypatch.setattr(gateway, "_open_health", unavailable)
+    monkeypatch.setattr(driver, "time", SimpleNamespace(
+        monotonic=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    ))
+    with pytest.raises(driver.DriverConfigurationError) as caught:
+        gateway.start()
+    evidence = json.loads(str(caught.value).split("; startup=", 1)[1])
+    assert evidence["elapsed_ms"] == 45_000
+    assert evidence["exit_code"] is None
+    assert evidence["last_health_status"] is None
+    assert evidence["health"] == {
+        "attempts": 45,
+        "failures": {"connection_refused": 15, "timeout": 15, "url_error": 15},
+        "last_failure": "url_error", "probe_elapsed_ms": 33_750,
+        "last_probe_elapsed_ms": 750,
+    }
+    assert set(evidence["phases"]) == {phase}
+    expected_events = [{"stream": "stderr", "event": "build_services.migrations_started"}]
+    if ready:
+        expected_events.append({
+            "stream": "stderr", "event": "build_services.migrations_ready",
+            "count": 48, "duration_ms": 32_000,
+        })
+    assert evidence["service_events"] == expected_events
+    assert len(launches) == 1
+    assert gateway._has_reached_health is False
+    assert gateway._startup_recovery_used is False
+    assert secret not in str(caught.value)
+    assert str(gateway.root) not in str(caught.value)
 
 
 @pytest.mark.parametrize("log_name", ["gateway.stdout.log", "gateway.stderr.log"])
@@ -387,15 +796,21 @@ def test_gateway_startup_failure_excludes_previous_attempt_phases(
         "event": "gateway.startup_phase", "phase": "gateway_ready", "status": "ready",
         "duration_ms": 12, "startup_elapsed_ms": 34_000,
     }
+    previous_service = {"event": "build_services.migrations_ready", "count": 48,
+                        "duration_ms": 34_000}
+    current_service = {"event": "build_services.migrations_started"}
     current = {
         **previous, "phase": "config", "duration_ms": 3, "startup_elapsed_ms": 4,
     }
     log = gateway.root / log_name
-    log.write_text(json.dumps(previous) + "\n", encoding="utf-8")
+    log.write_text(
+        json.dumps(previous) + "\n" + json.dumps(previous_service) + "\n", encoding="utf-8",
+    )
 
     def launch(*_args, **_kwargs):
         with log.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(current) + "\n")
+            stream.write(json.dumps(current_service) + "\n")
         return SimpleNamespace(poll=lambda: 17)
 
     monkeypatch.setattr(driver.subprocess, "Popen", launch)
@@ -407,10 +822,56 @@ def test_gateway_startup_failure_excludes_previous_attempt_phases(
     assert evidence["phases"] == {
         "config": {"status": "ready", "duration_ms": 3, "startup_elapsed_ms": 4},
     }
+    assert evidence["service_events"] == [{
+        "stream": "stdout" if log_name == "gateway.stdout.log" else "stderr",
+        **current_service,
+    }]
     # Both attempts remain available for the mandatory secret scan in cleanup.
     assert [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] == [
-        previous, current,
+        previous, previous_service, current, current_service,
     ]
+
+
+@pytest.mark.parametrize("prefix", [
+    "", "2026-09-18T13:00:00+00:00 [INFO] opensquilla.gateway.boot: ",
+])
+def test_gateway_service_diagnostics_bound_and_filter_raw_logs(startup_gateway, prefix) -> None:
+    gateway = startup_gateway
+    secret = "synthetic-untrusted-diagnostic"
+    valid = {"event": "build_services.memory_ready", "duration_ms": 12, "agents": 1,
+             "path": str(gateway.root), "error": secret, "nonce": secret, "signature": secret}
+    hostile = [
+        {**valid, "event": secret}, {**valid, "event": ["build_services.memory_ready"]},
+        *({**valid, "duration_ms": value}
+          for value in (secret, True, None, -1, 3_600_001, float("nan"), {})),
+        {**valid, "agents": False}, {**valid, "count": secret},
+    ]
+    records = [
+        {**valid, "duration_ms": index} for index in range(driver._STARTUP_SERVICE_EVENT_LIMIT + 2)
+    ]
+    log = gateway.root / "gateway.stdout.log"
+    log.write_text(
+        json.dumps({"event": "build_services.migrations_ready", "count": 48}) + "\n"
+        + "padding" * driver._STARTUP_LOG_TAIL_BYTES + "\n"
+        + "not-json\n[1,2,3]\n"
+        + "\n".join(prefix + json.dumps(record) for record in [*records, *hostile]),
+        encoding="utf-8",
+    )
+    error = gateway._startup_failure(
+        "Gateway did not become healthy", driver.time.monotonic(), None, None,
+    )
+    evidence = json.loads(str(error).split("; startup=", 1)[1])
+    assert evidence["service_events"] == [
+        {"stream": "stdout", "event": "build_services.memory_ready",
+         "duration_ms": index, "agents": 1}
+        for index in range(2, driver._STARTUP_SERVICE_EVENT_LIMIT + 2)
+    ]
+    assert evidence["phases"] == {}
+    assert secret not in str(error)
+    assert str(gateway.root) not in str(error)
+    assert len(str(error)) < 5_000
+    log.unlink()
+    assert gateway._startup_service_events() == []
 
 
 def test_gateway_startup_diagnostics_bound_and_filter_raw_logs(startup_gateway) -> None:
@@ -1099,6 +1560,7 @@ def test_runtime_failure_preserves_physical_usage_and_cost_budget_evidence(
 @pytest.mark.ci_serial
 def test_fault_case_executes_through_isolated_gateway_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
+    prepared_gateway_database: None,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
     case = driver.LiveCase(
@@ -1131,6 +1593,7 @@ def test_fault_case_executes_through_isolated_gateway_without_real_provider(
 @pytest.mark.ci_serial
 def test_fault_429_case_proves_retry_after_was_not_violated(
     monkeypatch: pytest.MonkeyPatch,
+    prepared_gateway_database: None,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
     request_records: list[FaultRequestRecord] = []
@@ -1201,6 +1664,7 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
 @pytest.mark.ci_serial
 def test_fallback_case_proves_activity_precedes_backup_request_without_real_provider(
     monkeypatch: pytest.MonkeyPatch,
+    prepared_gateway_database: None,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-not-a-real-key")

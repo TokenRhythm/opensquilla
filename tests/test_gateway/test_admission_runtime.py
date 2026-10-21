@@ -8,13 +8,18 @@ import pytest
 
 from opensquilla.application.admission_errors import (
     AdmissionQueueFullError,
+    AdmissionResourceBusyError,
     AdmissionShuttingDownError,
 )
 from opensquilla.gateway.admission_input import decode_admit_turn
 from opensquilla.gateway.admission_runtime import GatewayAdmissionRuntime
 from opensquilla.gateway.attachment_ingest import AttachmentResolutionError
 from opensquilla.gateway.rpc import RpcHandlerError
-from opensquilla.gateway.task_runtime import TaskQueueFullError, TaskRuntimeShuttingDownError
+from opensquilla.gateway.task_runtime import (
+    TaskQueueFullError,
+    TaskResidentBusyError,
+    TaskRuntimeShuttingDownError,
+)
 from opensquilla.session.models import SessionIntent
 
 
@@ -57,7 +62,7 @@ def test_admission_normalization_preserves_frozen_legacy_source_classification(t
 
 
 @pytest.mark.parametrize("operation", ["reserve_turn", "start_turn"])
-@pytest.mark.parametrize("failure_kind", ["queue", "shutdown"])
+@pytest.mark.parametrize("failure_kind", ["queue", "resident", "shutdown"])
 async def test_runtime_rejection_keeps_typed_identity_for_application_rollback(
     tmp_path, monkeypatch, operation, failure_kind
 ):
@@ -65,12 +70,18 @@ async def test_runtime_rejection_keeps_typed_identity_for_application_rollback(
     failure = (
         TaskQueueFullError(session_key=key, max_pending=3)
         if failure_kind == "queue"
+        else TaskResidentBusyError(session_key=key, max_resident=256)
+        if failure_kind == "resident"
         else TaskRuntimeShuttingDownError(session_key=key)
     )
     helper = AsyncMock(side_effect=failure)
     monkeypatch.setattr(f"opensquilla.gateway.admission_runtime.{operation}_via_runtime", helper)
     ports = _ports(tmp_path)
-    expected = AdmissionQueueFullError if failure_kind == "queue" else AdmissionShuttingDownError
+    expected = (
+        AdmissionQueueFullError if failure_kind == "queue"
+        else AdmissionResourceBusyError if failure_kind == "resident"
+        else AdmissionShuttingDownError
+    )
     with pytest.raises(expected) as caught:
         await getattr(ports, operation)(
             object(),
@@ -88,6 +99,8 @@ async def test_runtime_rejection_keeps_typed_identity_for_application_rollback(
     assert caught.value.__cause__ is failure
     if failure_kind == "queue":
         assert caught.value.max_pending == 3
+    if failure_kind == "resident":
+        assert caught.value.max_resident == 256
     assert helper.await_count == 1
 
 
@@ -184,64 +197,6 @@ async def test_direct_turn_uses_prepared_authority_and_existing_runner(
     assert run.await_args.kwargs["turn_id"] == "turn-one"
     assert run.await_args.kwargs["no_memory_capture"] is True
     assert run.await_args.kwargs["session_intent"] is SessionIntent.CONTINUE
-
-
-@pytest.mark.parametrize(
-    ("message", "semantic_message", "kind", "name", "correlation"),
-    [
-        ("/meta sample -- request", "/meta sample -- request", "manual", "sample", "request:one"),
-        (
-            "/meta-replay " + "a" * 32,
-            "/meta-replay " + "a" * 32,
-            "replay",
-            None,
-            "nonce:" + "a" * 32,
-        ),
-        ("/meta sample", "/meta other", None, None, None),
-        ("/meta-replay invalid", "/meta sample", None, None, None),
-    ],
-)
-def test_meta_control_projection_preserves_exact_native_grammar(
-    tmp_path, message, semantic_message, kind, name, correlation
-):
-    result = _ports(tmp_path).parse_meta_control(
-        message, semantic_message, client_request_id="one"
-    )
-    if kind is None:
-        assert result is None
-    else:
-        assert result.kind == kind
-        assert result.name == name
-        assert result.correlation_id == correlation
-
-
-def test_meta_marker_primitives_preserve_identity_rollback_and_consumption(tmp_path, monkeypatch):
-    from opensquilla.engine.steps import meta_command
-
-    monkeypatch.setattr(meta_command, "_pending_meta_launch", {})
-    monkeypatch.setattr(meta_command, "_consumed_meta_launch", {})
-    ports = _ports(tmp_path)
-    key = "agent:main:webchat:marker-primitives"
-    request = {"client_request_id": "one"}
-    assert meta_command.pending_meta_launch_put(key, "sample", **request) == "stamped"
-    assert meta_command.pending_meta_launch_put(key, "other", client_request_id="two") == "stamped"
-    assert ports.peek_meta_launch(key, **request) == "sample"
-    assert ports.peek_meta_launch(key, client_request_id="missing") is None
-    assert ports.cancel_accepted_meta_launch(key, **request) is False
-    assert ports.promote_meta_launch(
-        key, message="ordinary", semantic_message="ordinary", **request
-    ) is None
-    launch = {"message": "/meta sample", "semantic_message": "/meta sample"}
-    assert ports.promote_meta_launch(key, **launch, **request) == "promoted"
-    assert ports.promote_meta_launch(key, **launch, **request) == "accepted"
-    assert ports.restage_meta_launch(key, **request) is True
-    assert ports.restage_meta_launch(key, **request) is False
-    assert ports.promote_meta_launch(key, **launch, **request) == "promoted"
-    assert ports.cancel_accepted_meta_launch(key, **request) is True
-    assert ports.cancel_accepted_meta_launch(key, **request) is False
-    assert ports.peek_meta_launch(key, **request) is None
-    assert meta_command.pending_meta_launch_put(key, "sample", **request) == "replayed"
-    assert ports.peek_meta_launch(key, client_request_id="two") == "other"
 
 
 async def test_collect_admission_releases_native_guard_before_rejection_mapping(tmp_path):

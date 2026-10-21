@@ -171,6 +171,25 @@ beforeEach(() => {
 })
 
 describe('SetupModelStrategyPanel', () => {
+  it('confirms the keyboard-highlighted fixed provider with Space and restores trigger focus', async () => {
+    const onUpdateFixedProvider = vi.fn()
+    const { app, el } = await mountPanel({ activeStrategy: 'single' }, { onUpdateFixedProvider })
+    try {
+      const trigger = el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-fixed-provider-trigger"]')!
+      trigger.focus()
+      trigger.click()
+      await nextTick()
+      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+      const space = new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true })
+      trigger.dispatchEvent(space)
+      await nextTick()
+      expect(space.defaultPrevented).toBe(true)
+      expect(onUpdateFixedProvider).toHaveBeenCalledExactlyOnceWith('deepseek')
+      expect(trigger.getAttribute('aria-expanded')).toBe('false')
+      expect(document.activeElement).toBe(trigger)
+    } finally { app.unmount() }
+  })
+
   it('renders an ordered set of native routing choices with clear guidance', async () => {
     const { app, el } = await mountPanel()
 
@@ -1751,8 +1770,8 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('.setup-model-strategy__candidate-provider')).toBeNull()
     el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-add-candidate-trigger"]')?.click()
     await nextTick()
-    const provider = el.querySelector<HTMLSelectElement>('.setup-model-strategy__candidate-provider')
-    expect(provider?.value).toBe('deepseek')
+    const provider = el.querySelector<HTMLButtonElement>('.setup-model-strategy__candidate-provider [role="combobox"]')
+    expect(provider?.textContent).toContain('DeepSeek')
 
     app.unmount()
   })

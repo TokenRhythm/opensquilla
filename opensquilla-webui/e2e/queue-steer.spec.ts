@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 
 import {
   chatHistoryPayload,
@@ -32,7 +33,7 @@ type RpcError = {
   retryable?: boolean
 }
 
-type CapturedSteer = {
+type CapturedRequest = {
   params: Record<string, unknown>
   reject: (error: RpcError) => void
   resolve: (payload: Record<string, unknown>) => void
@@ -46,7 +47,8 @@ type MockGateway = {
   hydrateCalls: number
   holdHistory: boolean
   heldHistory: Array<() => void>
-  steerRequests: CapturedSteer[]
+  steerRequests: CapturedRequest[]
+  receiptRequests: CapturedRequest[]
 }
 
 function successResponse(id: string | number | undefined, payload: unknown) {
@@ -89,6 +91,7 @@ async function installMockGateway(
     capabilityFromHydration?: boolean
     legacyHistory?: boolean
     routerEnabled?: boolean
+    receiptLookup?: boolean
   } = {},
 ): Promise<MockGateway> {
   const state: MockGateway = {
@@ -100,6 +103,7 @@ async function installMockGateway(
     holdHistory: false,
     heldHistory: [],
     steerRequests: [],
+    receiptRequests: [],
   }
 
   await page.route('**/api/approvals', route => route.fulfill({
@@ -127,7 +131,7 @@ async function installMockGateway(
       if (method === 'connect') {
         ws.send(helloOkResponse({
           policy: { concurrent_history_reads: true },
-          features: { methods: ['sessions.steer.v2'] },
+          features: { methods: ['sessions.steer.v2', ...(options.receiptLookup ? ['turns.receipt.get'] : [])] },
           auth: {
             principal: {
               role: 'operator', isOwner: true, authenticated: true, authState: 'authenticated',
@@ -174,8 +178,9 @@ async function installMockGateway(
         return
       }
 
-      if (method === 'sessions.steer.v2') {
-        state.steerRequests.push({
+      if (method === 'sessions.steer.v2' || method === 'turns.receipt.get') {
+        const requests = method === 'sessions.steer.v2' ? state.steerRequests : state.receiptRequests
+        requests.push({
           params: { ...(frame.params || {}) },
           reject: error => ws.send(errorResponse(frame.id, error)),
           resolve: payload => ws.send(successResponse(frame.id, payload)),
@@ -238,7 +243,7 @@ async function installMockGateway(
 
 async function openRunningSession(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   await expect(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })).toBeEditable()
   await expect(page.getByRole('button', { name: /^(Stop .*response|停止.*回复)$/ })).toBeVisible()
   await expect(page.getByText(ORIGINAL_TEXT, { exact: true })).toBeVisible()
@@ -262,7 +267,7 @@ async function queueAndSteer(page: Page, state: MockGateway, text: string) {
 }
 
 function acceptedSteer(
-  request: CapturedSteer,
+  request: CapturedRequest,
   disposition: 'applied' | 'promoted',
 ): Record<string, unknown> {
   const promoted = disposition === 'promoted'
@@ -283,6 +288,64 @@ function acceptedSteer(
 }
 
 test.describe('Queue/Steer composer semantics', () => {
+  for (const theme of ['dark', 'light', 'miami']) {
+    for (const floating of [true, false]) {
+      test(`composer menu covers queued cards in ${theme} with floating=${floating}`, async ({ page }, testInfo) => {
+        await page.setViewportSize({ width: 1100, height: 850 })
+        await page.addInitScript(({ theme, floating }) => {
+          localStorage.setItem('opensquilla-locale', 'en')
+          localStorage.setItem('opensquilla-theme', theme)
+          localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: floating }))
+        }, { theme, floating })
+        const state = await installMockGateway(page)
+        await openRunningSession(page)
+        const composer = page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })
+        for (const text of ['Queued first', 'Queued second', 'Queued third']) {
+          await composer.fill(text)
+          await composer.press('Enter')
+          await expect(page.locator('.chat-pending-card').filter({ hasText: text })).toBeVisible()
+        }
+        await page.locator('.chat-plus-btn').click()
+        const menu = page.locator('.composer-add-menu')
+        await expect(menu).toBeVisible()
+        // Inspect actual painting/hit-testing, not the numerical z-index of a
+        // child trapped inside its parent's backdrop-filter stacking context.
+        const overlap = () => menu.evaluate(menu => {
+          const bounds = menu.getBoundingClientRect()
+          return [...document.querySelectorAll('.chat-pending-card')].flatMap(card => {
+            const rect = card.getBoundingClientRect()
+            const left = Math.max(bounds.left, rect.left) + 4
+            const right = Math.min(bounds.right, rect.right) - 4
+            const top = Math.max(bounds.top, rect.top) + 4
+            const bottom = Math.min(bounds.bottom, rect.bottom) - 4
+            if (left >= right || top >= bottom) return []
+            return [0.1, 0.5, 0.9].map(fraction => {
+              const hit = document.elementFromPoint(left + (right - left) * fraction, (top + bottom) / 2)
+              return { covered: Boolean(hit && menu.contains(hit)), hit: hit?.className }
+            })
+          })
+        })
+        await expect.poll(async () => (await overlap()).length).toBeGreaterThan(0)
+        const hits = await overlap()
+        await page.screenshot({ path: testInfo.outputPath('queue-add-menu.png') })
+        expect(hits.every(hit => hit.covered), JSON.stringify(hits)).toBe(true)
+        await page.keyboard.press('Escape')
+        await expect(menu).toHaveCount(0)
+        // The queue's own upward menu must remain usable after its layer moves.
+        await page.locator('.chat-pending-more-wrap').last().getByRole('button').click()
+        await expect(page.locator('.chat-pending-menu')).toBeVisible()
+        expect(await page.locator('.chat-pending-menu').evaluate(menu => {
+          const rect = menu.getBoundingClientRect()
+          const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+          return Boolean(hit && menu.contains(hit))
+        })).toBe(true)
+        expect(state.chatSendCalls).toBe(0)
+        expect(state.steerRequests).toHaveLength(0)
+        await expect(page.locator('.chat-pending-card')).toHaveCount(3)
+      })
+    }
+  }
+
   for (const legacyHistory of [false, true]) {
     const title = legacyHistory
       ? 'preserves the router and first segment when legacy history refreshes after a steer'
@@ -476,8 +539,8 @@ test.describe('Queue/Steer composer semantics', () => {
     })
   }
 
-  test('STORAGE_BUSY and an unknown response retain one exact-id Retry', async ({ page }) => {
-    const state = await installMockGateway(page)
+  test('STORAGE_BUSY retries the exact request and an unknown response checks its receipt', async ({ page }) => {
+    const state = await installMockGateway(page, { receiptLookup: true })
     await openRunningSession(page)
 
     const steerText = 'Apply this adjustment to the active turn'
@@ -510,8 +573,8 @@ test.describe('Queue/Steer composer semantics', () => {
     await expect(card.getByRole('button', { name: RETRY_UNKNOWN_NAME })).toBeEnabled()
     await expect(userBubble).toHaveCount(0)
 
+    await expect.poll(() => state.receiptRequests.length).toBe(1)
     await card.getByRole('button', { name: RETRY_UNKNOWN_NAME }).click()
-    await expect.poll(() => state.steerRequests.length).toBe(3)
     const attempts = state.steerRequests
     expect(attempts[0]!.params).toMatchObject({
       key: SESSION_KEY,
@@ -521,13 +584,34 @@ test.describe('Queue/Steer composer semantics', () => {
       client_message_id: expect.any(String),
     })
     expect(attempts[1]!.params).toEqual(attempts[0]!.params)
-    expect(attempts[2]!.params).toEqual(attempts[0]!.params)
-    attempts[2]!.resolve(acceptedSteer(attempts[2]!, 'applied'))
+    expect(state.receiptRequests[0]!.params).toEqual({
+      operation: 'sessions.steer.v2', originalRequest: attempts[0]!.params,
+    })
+    // The acceptance was committed before its ACK was lost. Checking it must
+    // join the owner's read-only lookup, never execute the Steer a third time.
+    state.receiptRequests[0]!.resolve({
+      status: 'found', accepted: true, requestFingerprint: `sha256:${'a'.repeat(64)}`,
+      receipt: {
+        requestSessionKey: SESSION_KEY, sessionKey: SESSION_KEY, sessionId: 'synthetic-steer-session',
+        clientRequestId: attempts[0]!.params.client_request_id, messageId: 'message-e2e-steer',
+        sessionEpoch: 1, taskId: TURN_ID, taskStatus: 'running',
+        steer: {
+          key: SESSION_KEY, session_key: SESSION_KEY, session_id: 'synthetic-steer-session',
+          task_id: TURN_ID, turn_id: TURN_ID,
+          client_request_id: attempts[0]!.params.client_request_id,
+          client_message_id: attempts[0]!.params.client_message_id,
+          user_message_id: 'message-e2e-steer', surface_id: null, disposition: 'applied',
+          status: 'accepted', accepted: true, replayed: true, revision: 2, fallback_safe: false,
+        },
+      },
+    })
 
     await expect(card).toHaveCount(0)
     await expect(userBubble).toHaveCount(1)
     await expect(userBubble.locator('.msg-user-steer-status--applied')).toHaveText(/^(Steer|引导)$/)
-    await expect(composer).toHaveValue(unrelatedDraft)
+    await expectComposerValue(composer, unrelatedDraft)
+    expect(state.steerRequests).toHaveLength(2)
+    expect(state.receiptRequests).toHaveLength(1)
     expect(state.chatSendCalls).toBe(0)
   })
 
@@ -554,7 +638,9 @@ test.describe('Queue/Steer composer semantics', () => {
     })
     await expect.poll(() => state.historyCalls).toBeGreaterThan(historyCallsBeforeTerminal)
     await expect(userBubble).toHaveCount(0)
-    await expect(page.getByRole('button', { name: /^(Stop .*response|停止.*回复)$/ })).toHaveCount(0)
+    // The original turn ended, but the in-flight Steer may still be promoted.
+    // Its request-bound Stop must remain available until acceptance resolves.
+    await expect(page.getByRole('button', { name: /^(Stop .*response|停止.*回复)$/ })).toBeEnabled()
 
     const request = state.steerRequests[0]!
     request.resolve(acceptedSteer(request, 'promoted'))
@@ -633,7 +719,7 @@ test.describe('Queue/Steer composer semantics', () => {
     await expect(card).toContainText(steerText)
     await expect(card.getByRole('button', { name: STEER_ACTION_NAME })).toBeEnabled()
     await expect(card.getByRole('button', { name: /Retry|重试/ })).toHaveCount(0)
-    await expect(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME })).toHaveValue('')
+    await expectComposerValue(page.getByRole('textbox', { name: MESSAGE_TEXTBOX_NAME }), '')
     expect(state.chatSendCalls).toBe(0)
   })
 })

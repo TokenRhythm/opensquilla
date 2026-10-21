@@ -52,10 +52,10 @@ def test_system_prompt_routes_profile_to_user_md() -> None:
 
     assert "USER.md" in prompt
     assert "name, preferred address, pronouns, timezone" in prompt
-    assert "Do not use `memory_save` for `USER.md`" in prompt
-    assert "MEMORY.md` for durable non-profile facts" in prompt
+    assert "do not create a task-local profile or memory file as a substitute" in prompt
+    assert "Profile and memory files belong to configured Agent sources" in prompt
     assert "`MEMORY.md` + `memory/**/*.md`" in prompt
-    assert "relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file" in prompt
+    assert "use ordinary file tools to create or edit" not in prompt
     assert "decisions, dates, people, preferences, or todos" not in prompt
     assert "prior work, decisions, dated history, todos" in prompt
 
@@ -120,12 +120,18 @@ def test_system_prompt_routes_exact_transcript_search_to_session_search() -> Non
 def test_system_prompt_routes_agent_identity_away_from_memory_md() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),
-        tools=["memory_search", "memory_get", "write_file", "edit_file", "apply_patch"],
+        tools=["memory_search", "memory_get", "write_file", "memory_save"],
     )
 
-    assert "Agent identity: `IDENTITY.md`" in prompt
-    assert "Agent persona: `SOUL.md`" in prompt
-    assert "Do not put assistant rename/persona requests into `MEMORY.md`" in prompt
+    assert "USER.md holds the stable user profile" in prompt
+    assert "IDENTITY.md holds assistant identity" in prompt
+    assert "SOUL.md holds persona guidance" in prompt
+    assert (
+        "when the configured source path is known and current file permissions allow it" in prompt
+    )
+    assert "Do not infer the source path from the task workspace" in prompt
+    assert "agent_file" not in prompt
+    assert "Do not use memory_save for USER.md, IDENTITY.md, or SOUL.md" in prompt
 
 
 def test_system_prompt_only_documents_canonical_tool_names() -> None:
@@ -138,6 +144,17 @@ def test_system_prompt_only_documents_canonical_tool_names() -> None:
     assert "generate_image" not in prompt
     assert "spawn_subagent" not in prompt
     assert "send_message" not in prompt
+
+
+def test_system_prompt_conditions_video_guidance_on_tool_availability() -> None:
+    profile = AgentProfile(agent_id="main", prompt_mode="full")
+    available = assemble_system_prompt(profile, tools=["video_generate", "video_status"])
+    unavailable = assemble_system_prompt(profile, tools=["image_generate"])
+
+    assert "call `video_generate`" in available
+    assert "use `video_status`" in available
+    assert "Video generation is unavailable" not in available
+    assert "Video generation is unavailable" in unavailable
 
 
 def test_system_prompt_requires_tool_preambles_and_conversation_language() -> None:
@@ -174,89 +191,9 @@ def test_system_prompt_describes_managed_execution_run_mode() -> None:
     assert install_guidance in prompt
 
 
-def test_headless_repo_coding_scaffold_edit_prompt_matches_visible_tools() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
-        tools=[
-            "exec_command",
-            "read_file",
-            "edit_file",
-            "write_file",
-            "grep_search",
-            "glob_search",
-            "list_dir",
-            "git_status",
-            "git_diff",
-            "retrieve_tool_result",
-        ],
-    )
-
-    assert "## Repository Coding Scaffold" in prompt
-    assert "`grep_search`" in prompt
-    assert "`glob_search`" in prompt
-    assert "`list_dir`" in prompt
-    assert "`read_file`" in prompt
-    assert "`edit_file`" in prompt
-    assert "`write_file`" in prompt
-    assert "`apply_patch`" not in prompt
-    assert "`exec_command`" in prompt
-    assert "`git_status`" in prompt
-    assert "`git_diff`" in prompt
-    assert "## Product Identity" not in prompt
-    assert "read_source" not in prompt
-    assert "edit_source" not in prompt
-    assert "source_symbols" not in prompt
-
-
-def test_headless_repo_coding_scaffold_patch_prompt_matches_visible_tools() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
-        tools=[
-            "exec_command",
-            "read_file",
-            "edit_file",
-            "write_file",
-            "apply_patch",
-            "grep_search",
-            "glob_search",
-            "list_dir",
-            "git_status",
-            "git_diff",
-            "retrieve_tool_result",
-        ],
-    )
-
-    assert "## Repository Coding Scaffold" in prompt
-    assert "`grep_search`" in prompt
-    assert "`glob_search`" in prompt
-    assert "`list_dir`" in prompt
-    assert "`read_file`" in prompt
-    assert "`edit_file`" in prompt
-    assert "`write_file`" in prompt
-    assert "`apply_patch`" in prompt
-    assert "`exec_command`" in prompt
-    assert "`git_status`" in prompt
-    assert "`git_diff`" in prompt
-    assert "## Product Identity" not in prompt
-    assert "read_source" not in prompt
-    assert "edit_source" not in prompt
-    assert "source_symbols" not in prompt
-
-
-def test_headless_repo_coding_scaffold_omits_hidden_git_tool_guidance() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
-        tools=["exec_command", "read_file", "edit_file", "write_file"],
-    )
-
-    assert "## Repository Coding Scaffold" in prompt
-    assert "Use `git_status` to inspect the final repository state" not in prompt
-    assert "Use `git_diff` to inspect the final source diff" not in prompt
-
-
 def test_patch_evidence_protocol_absent_by_default() -> None:
-    scaffold_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
+    minimal_prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="minimal"),
         tools=["exec_command", "read_file", "edit_file", "git_diff"],
     )
     full_prompt = assemble_system_prompt(
@@ -264,12 +201,12 @@ def test_patch_evidence_protocol_absent_by_default() -> None:
         tools=["exec_command", "read_file", "edit_file", "git_diff"],
     )
 
-    assert "## Patch Evidence Protocol" not in scaffold_prompt
+    assert "## Patch Evidence Protocol" not in minimal_prompt
     assert "## Patch Evidence Protocol" not in full_prompt
 
 
 @pytest.mark.parametrize(
-    "mode", ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"]
+    "mode", ["full", "minimal", "none"]
 )
 @pytest.mark.parametrize("tools", [None, ["exec_command", "read_file", "git_diff"]])
 def test_retired_patch_protocol_does_not_change_prompt(mode, tools) -> None:
@@ -289,7 +226,7 @@ def test_patch_evidence_protocol_requires_tools() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(
             agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
+            prompt_mode="full",
             patch_evidence_protocol=True,
         ),
         tools=None,
@@ -299,7 +236,7 @@ def test_patch_evidence_protocol_requires_tools() -> None:
 
 
 @pytest.mark.parametrize(
-    "mode", ["full", "minimal", "headless_source_edit", "headless_repo_coding_scaffold"]
+    "mode", ["full", "minimal"]
 )
 def test_retired_finalize_evidence_gate_cannot_change_prompt(mode: str) -> None:
     options = {"tools": ["exec_command", "read_file", "edit_file"]}
@@ -309,7 +246,7 @@ def test_retired_finalize_evidence_gate_cannot_change_prompt(mode: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "mode", ["full", "minimal", "headless_source_edit", "headless_repo_coding_scaffold"]
+    "mode", ["full", "minimal"]
 )
 def test_tool_prompts_include_autonomous_recovery_contract(mode: str) -> None:
     prompt = assemble_system_prompt(
@@ -332,7 +269,7 @@ def test_autonomous_recovery_contract_requires_tools_and_prompt(mode, tools) -> 
 
 
 @pytest.mark.parametrize(
-    "mode", ["full", "minimal", "headless_source_edit", "headless_repo_coding_scaffold"]
+    "mode", ["full", "minimal"]
 )
 def test_managed_process_guidance_distinguishes_exit_from_readiness(mode: str) -> None:
     profile = AgentProfile(agent_id="main", prompt_mode=mode)
@@ -400,12 +337,13 @@ def test_system_prompt_guides_generated_file_delivery() -> None:
 
     assert "## Generated File Delivery" in prompt
     assert "Do not paste full file source" in prompt
-    assert "call `publish_artifact` for the final file" in prompt
+    assert "prepare the final workspace file and its required local materials" in prompt
     assert "complete workspace-relative paths, including subdirectories" in prompt
     assert "Exact local paths in inline code also work" in prompt
     assert "Follow the tool's delivery instructions for the current surface" in prompt
     assert "Do not invent artifact download URLs" in prompt
-    assert "do not call `publish_artifact` again" in prompt
+    assert "do not register it again" in prompt
+    assert "do not claim native channel delivery without a confirmed delivery receipt" in prompt
     assert "If `publish_artifact` reports" in prompt
     assert "registered, published, or delivered" not in prompt
     assert "Publication does not end the turn" in prompt
@@ -415,7 +353,7 @@ def test_system_prompt_guides_generated_file_delivery() -> None:
 
 @pytest.mark.parametrize("tools", [None, ["write_file", "open_workspace_preview"]])
 @pytest.mark.parametrize(
-    "mode", ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"],
+    "mode", ["full", "minimal", "none"],
 )
 def test_result_focused_response_guidance_is_scoped_to_full_mode(mode, tools) -> None:
     prompt = assemble_system_prompt(AgentProfile(agent_id="main", prompt_mode=mode), tools=tools)
@@ -432,21 +370,43 @@ def test_result_focused_response_guidance_is_scoped_to_full_mode(mode, tools) ->
 
 
 @pytest.mark.parametrize("preview_available", [True, False])
+@pytest.mark.parametrize("mode", ["full", "minimal", "none"])
 def test_preview_file_reference_guidance_requires_preview_capability(
-    preview_available: bool,
+    preview_available: bool, mode: str,
 ) -> None:
     tools = ["write_file", "publish_artifact"]
     if preview_available:
         tools.append("open_workspace_preview")
     prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full"), tools=tools,
+        AgentProfile(agent_id="main", prompt_mode=mode), tools=tools,
     )
     guidance = "mention its returned entrypoint as a standalone inline-code path"
-    assert prompt.count(guidance) == int(preview_available)
-    if preview_available:
+    assert prompt.count(guidance) == int(preview_available and mode == "full")
+    if preview_available and mode == "full":
+        assert "workbench preview registration (the default, non-inline presentation)" in prompt
         assert "do not invent a file or download URL" in prompt
         assert "Do not publish an HTML deliverable unless the user explicitly asks" in prompt
         assert "same-named files" in prompt
+
+
+@pytest.mark.parametrize("mode", ["full", "minimal", "none"])
+@pytest.mark.parametrize("tools", [
+    [], ["write_file"], ["show_widget"], ["edit_widget"],
+    ["open_workspace_preview"], ["show_widget", "open_workspace_preview"],
+])
+def test_inline_visual_marker_format_requires_visible_capability(mode, tools) -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=mode), tools=tools,
+    )
+    enabled = mode != "none" and bool(
+        {"show_widget", "edit_widget", "open_workspace_preview"}.intersection(tools)
+    )
+    guidance = "Wrap the exact returned `marker` in single backticks"
+    assert prompt.count(guidance) == int(enabled)
+    if enabled:
+        assert "place it in its own paragraph" in prompt
+        assert "blank lines before and after it" in prompt
+        assert "Do not substitute an entrypoint path or invent marker IDs" in prompt
 
 
 def test_preview_output_format_has_one_owner_and_tool_keeps_readiness_boundary() -> None:
@@ -459,10 +419,16 @@ def test_preview_output_format_has_one_owner_and_tool_keeps_readiness_boundary()
     html_skill = Path("src/opensquilla/skills/bundled/html-coder/SKILL.md").read_text(
         encoding="utf-8",
     )
+    visualize_skill = Path("src/opensquilla/skills/bundled/visualize/SKILL.md").read_text(
+        encoding="utf-8",
+    )
 
     # Reply formatting belongs to the system prompt; the tool owns its contract
     # and the skill owns the site-building recipe, not duplicate delivery prose.
     assert "inline-code" not in description
+    assert "returns a marker rather than an entrypoint" in description
+    assert "system prompt's inline visual delivery format" in description
+    assert "system prompt's inline visual delivery format" in visualize_skill
     assert "inline-code" not in html_skill
     assert "immutable delivery snapshot" not in html_skill
     assert "publish_artifact" not in html_skill
@@ -518,59 +484,9 @@ def test_template_no_longer_renders_duplicate_skills_section() -> None:
     assert "Available skills:" not in prompt
 
 
-def test_headless_source_edit_prompt_is_source_edit_focused() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_source_edit"),
-        tools=[
-            "read_source",
-            "edit_source",
-            "create_source",
-            "write_scratch",
-            "source_symbols",
-            "grep_search",
-            "glob_search",
-            "read_file",
-            "list_dir",
-            "exec_command",
-            "git_diff",
-            "git_status",
-            "retrieve_tool_result",
-        ],
-        runtime_info={
-            "workspace_dir": "/testbed",
-            "os": "Linux",
-            "shell": "/bin/bash",
-        },
-    )
-
-    assert "## Source Edit Contract" in prompt
-    assert "Use `grep_search`, `glob_search`, and `source_symbols`" in prompt
-    assert "Use `read_source`" in prompt
-    assert "Use `edit_source`" in prompt
-    assert "Use `create_source`" in prompt
-    assert "Use `write_scratch`" in prompt
-    assert "Use `exec_command` mainly for tests" in prompt
-    assert "Inspect the final source diff with `git_diff`" in prompt
-    assert "Working directory: /testbed" in prompt
-    assert "## Product Identity" not in prompt
-    assert "## Tool Call Style" not in prompt
-    assert "## OpenSquilla CLI Quick Reference" not in prompt
-    assert "## Runtime" not in prompt
-
-
-def test_headless_source_edit_prompt_omits_hidden_git_diff_guidance() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_source_edit"),
-        tools=["read_source", "edit_source", "exec_command"],
-    )
-
-    assert "## Source Edit Contract" in prompt
-    assert "Inspect the final source diff with `git_diff`" not in prompt
-
-
 @pytest.mark.parametrize(
     "prompt_mode",
-    ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"],
+    ["full", "minimal", "none"],
 )
 @pytest.mark.parametrize("tools", [None, ["exec_command", "apply_patch"]])
 @pytest.mark.parametrize(

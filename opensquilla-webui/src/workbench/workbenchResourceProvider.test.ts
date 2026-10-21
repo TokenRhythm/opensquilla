@@ -4,8 +4,58 @@ import {
   createRpcWorkbenchResourceProvider,
   WORKBENCH_RESOURCE_RPC_METHODS,
 } from '@/adapters/gateway/workbenchResourcesV4'
+import { normalizeWorkbenchResource } from './workbenchResourceProvider'
 
 describe('workbench resource provider', () => {
+  it('retains only workspace-relative source labels and never uses them as identities', () => {
+    const raw = {
+      resource: { type: 'document', documentId: 'doc-a' },
+      name: 'report.docx', mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      capabilities: {}, relations: { documentId: 'doc-a' },
+    }
+    expect(normalizeWorkbenchResource({ ...raw, sourcePath: 'copy/report.docx' }))
+      .toMatchObject({ sourcePath: 'copy/report.docx', resource: { documentId: 'doc-a' } })
+    for (const sourcePath of [
+      'C:/private/report.docx', '/private/report.docx', '../report.docx',
+      'copy/../report.docx', 'copy\\report.docx', 'copy//report.docx', 'copy/\u0000report.docx',
+      'x'.repeat(4097),
+    ]) {
+      expect(normalizeWorkbenchResource({ ...raw, sourcePath })).not.toHaveProperty('sourcePath')
+    }
+  })
+
+  it('prepares annotation against one identity and preserves the updated baseline and page', async () => {
+    const call = vi.fn(async () => ({
+      disposition: 'document', resolution: { status: 'current' }, materialized: false,
+      baselineUpdated: true, previousRevisionId: 'rev-old',
+      resource: {
+        resource: { type: 'document', documentId: 'doc-a' }, name: 'page.html', mime: 'text/html',
+        capabilities: { preview: true, download: true, edit: true, publish: true }, relations: {},
+      },
+      document: { documentId: 'doc-a', sessionKey: 'session-a', name: 'page.html', format: 'html',
+        headRevisionId: 'rev-a', capabilities: { preview: true, sourceEdit: true, versionHistory: true } },
+      revision: { revisionId: 'rev-a', documentId: 'doc-a', artifactId: 'internal-a',
+        sha256: 'a'.repeat(64), name: 'page.html', mime: 'text/html' },
+      pageContext: { resourceId: 'document:doc-a', revisionId: 'rev-a', pagePath: 'pages/chart.html' },
+    }))
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
+    const workspaceFile = { path: 'site/pages/chart.html', workspaceBinding: 'binding-a', expectedRevision: 'file-rev-a' }
+    await expect(provider.prepareAnnotation!('session-a', { workspaceFile, idempotencyKey: 'prepare-a' }))
+      .resolves.toMatchObject({ baselineUpdated: true, previousRevisionId: 'rev-old',
+        pageContext: { resourceId: 'document:doc-a', revisionId: 'rev-a', pagePath: 'pages/chart.html' } })
+    expect(call).toHaveBeenLastCalledWith(WORKBENCH_RESOURCE_RPC_METHODS.open, {
+      sessionKey: 'session-a', intent: 'annotate', workspaceFile, idempotencyKey: 'prepare-a',
+    }, expect.any(Object))
+    await provider.prepareAnnotation!('session-a', { resourceRef: { type: 'document', documentId: 'doc-a' }, expectedSha256: 'b'.repeat(64) })
+    expect(call).toHaveBeenLastCalledWith(WORKBENCH_RESOURCE_RPC_METHODS.open, {
+      sessionKey: 'session-a', intent: 'annotate', resourceRef: { type: 'document', documentId: 'doc-a', id: 'doc-a' },
+      expectedSha256: 'b'.repeat(64),
+    }, expect.any(Object))
+    await expect(provider.prepareAnnotation!('session-a', {
+      resourceRef: { type: 'document', documentId: 'doc-a' }, workspaceFile,
+    } as never)).rejects.toThrow('Choose one annotation resource.')
+    expect(call).toHaveBeenCalledTimes(2)
+  })
   it('keeps selection and Agent editing independent from preview and legacy edit', async () => {
     const call = vi.fn(async () => ({
       resources: [{
@@ -157,6 +207,28 @@ describe('workbench resource provider', () => {
       WORKBENCH_RESOURCE_RPC_METHODS.list,
       { sessionKey: 'session-a', limit: 1, cursor: 'next-page' },
       expect.any(Object),
+    )
+  })
+
+  it('returns just one resource page for bounded secondary readers without changing the wire request', async () => {
+    const call = vi.fn(async () => ({
+      resources: [{
+        resource: { type: 'deliverable', artifactId: 'chart' },
+        name: 'chart.svg', mime: 'image/svg+xml',
+        capabilities: { preview: true, download: true, edit: false, publish: false },
+        relations: {},
+      }],
+      totalCount: 500, hasMore: true, nextCursor: 'next-page',
+    }))
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
+    const controller = new AbortController()
+    const result = await provider.list('session-a', { types: ['deliverable'], limit: 200, signal: controller.signal, singlePage: true })
+    expect(result.resources).toHaveLength(1)
+    expect(result).toMatchObject({ totalCount: 500, hasMore: true, nextCursor: 'next-page' })
+    expect(call).toHaveBeenCalledExactlyOnceWith(
+      WORKBENCH_RESOURCE_RPC_METHODS.list,
+      { sessionKey: 'session-a', types: ['deliverable'], limit: 200 },
+      expect.objectContaining({ signal: controller.signal }),
     )
   })
 
@@ -436,6 +508,21 @@ describe('workbench resource provider', () => {
       },
       expect.any(Object),
     )
+  })
+
+  it.each(['docx', 'pptx', 'xlsx'])('accepts a pinned local %s renderer without claiming HTML origin isolation', async format => {
+    const response = { resource: { resource: { type: 'attachment', id: 'att-office' },
+      name: `sample.${format}`, mime: 'application/octet-stream', sha256: 'a'.repeat(64),
+      downloadUrl: '/api/v1/attachments/office', capabilities: { preview: true, download: true, edit: false, publish: false }, relations: {} },
+      preview: { protocolVersion: 1, mode: 'local-renderer', resource: { type: 'attachment', id: 'att-office' },
+        sandboxProfile: 'none', network: false, adapter: { id: 'silurus-office', version: '0.88.0', format } } }
+    const call = vi.fn(async () => response)
+    const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
+    const result = await provider.createPreview?.('session-a', { type: 'attachment', id: 'att-office' })
+    expect(result?.preview).toMatchObject({ mode: 'local-renderer', sandboxProfile: 'none', network: false,
+      adapter: { id: 'silurus-office', version: '0.88.0', format } })
+    response.preview.adapter.version = 'unknown'
+    await expect(provider.createPreview?.('session-a', { type: 'attachment', id: 'att-office' })).rejects.toThrow()
   })
 
   it('publishes one immutable revision', async () => {

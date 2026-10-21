@@ -77,7 +77,6 @@ async def test_commit_maps_every_field_once_without_copying_native_material():
         plan_revision=revision,
         plan_run=run,
         merge_into_task=True,
-        meta_control_intent_id="meta-demo",
         workspace_guard=guard,
         expected_collaboration_revision=8,
         expected_active_plan_revision_id="active-demo",

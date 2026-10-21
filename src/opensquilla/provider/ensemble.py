@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import copy
 import json
+import math
 import random
 import time
 import uuid
@@ -29,6 +30,13 @@ from opensquilla.contracts.turn_execution import (
     RecoveryContext,
     StickyExecutionRole,
     TurnExecutionContext,
+)
+from opensquilla.provider.retry_after import (
+    RetryAfterDeferredError,
+    mark_retry_after_physical_start,
+    provider_retry_after_cooldowns,
+    provider_retry_after_scope,
+    record_provider_retry_after,
 )
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
@@ -473,6 +481,8 @@ async def _provider_stream_with_lifecycle(
     reset_deadline_on_event: bool,
     on_request_start: Callable[[], Awaitable[None]] | None = None,
     request_activity: ProviderActivityEvent | None = None,
+    physical_provider: object | None = None,
+    physical_config: ChatConfig | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Run one provider stream under the turn-local admission lease.
 
@@ -484,6 +494,29 @@ async def _provider_stream_with_lifecycle(
     including cancellation and provider exceptions.
     """
 
+    if physical_provider is not None:
+        try:
+            async for delay in provider_retry_after_cooldowns().wait(
+                physical_provider,
+                scope=provider_retry_after_scope(physical_provider),
+                deadline_at_monotonic=(
+                    physical_config.turn_deadline_at_monotonic
+                    if physical_config is not None else None
+                ),
+            ):
+                yield ProviderActivityEvent(
+                    model=str(getattr(physical_provider, "active_model_id", "") or ""),
+                    phase="retry_wait",
+                    reason=provider_retry_after_cooldowns().reason(
+                        physical_provider, scope=provider_retry_after_scope(physical_provider),
+                    ),
+                    retry_after_ms=math.ceil(delay * 1000),
+                )
+        except RetryAfterDeferredError as exc:
+            yield ErrorEvent(
+                message=exc.message, code=exc.code, retry_after_s=exc.remaining_seconds,
+            )
+            return
     lease = None
     request_started = False
     saw_terminal = False
@@ -527,6 +560,7 @@ async def _provider_stream_with_lifecycle(
 
     heartbeat_stream: AsyncGenerator[StreamEvent, None] | None = None
     try:
+        mark_retry_after_physical_start()
         stream = stream_factory()
         heartbeat_stream = _stream_with_heartbeats(
             stream,
@@ -538,6 +572,8 @@ async def _provider_stream_with_lifecycle(
             request_activity=request_activity,
         )
         async for event in heartbeat_stream:
+            if physical_provider is not None:
+                record_provider_retry_after(physical_provider, event)
             if execution_context is not None and not isinstance(
                 event,
                 ProviderGenerationResetEvent,
@@ -624,6 +660,7 @@ def _generation_reset(
     terminal_text_snapshot: str | None = None,
     terminal_error_message: str = "",
     terminal_error_code: str = "",
+    terminal_http_status: int | None = None,
     model_usage_breakdown: list[dict[str, Any]] | None = None,
     usage_missing_count: int = 0,
     ensemble_trace: dict[str, Any] | None = None,
@@ -638,6 +675,7 @@ def _generation_reset(
         terminal_text_snapshot=terminal_text_snapshot,
         terminal_error_message=terminal_error_message,
         terminal_error_code=terminal_error_code,
+        terminal_http_status=terminal_http_status,
         model_usage_breakdown=list(model_usage_breakdown or ()),
         usage_missing_count=max(0, int(usage_missing_count or 0)),
         ensemble_trace=(dict(ensemble_trace) if ensemble_trace is not None else None),
@@ -708,6 +746,8 @@ class _CandidateResult:
     ttft_ms: int | None = None
     error: str = ""
     error_code: str = ""
+    error_http_status: int | None = None
+    error_provider_code: str = ""
     message_limit_proof: ProviderMessageLimitProof | None = None
     execution: dict[str, Any] = field(default_factory=dict)
     usage_reported: bool = False
@@ -1436,6 +1476,38 @@ def _uniform_request_budget_error(
     )
 
 
+def _uniform_native_context_error(
+    candidates: Sequence[_CandidateResult],
+) -> ErrorEvent | None:
+    """Expose agreed native capacity failures to the existing Agent recovery."""
+
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if (
+            not candidate.request_started
+            or candidate.ok
+            or not candidate.error
+            or candidate.text.strip()
+        ):
+            return None
+        status = candidate.error_http_status
+        if status is None and candidate.error_code.isdigit():
+            status = int(candidate.error_code)
+        if classify_provider_error(
+            provider_name=candidate.provider,
+            status_code=status,
+            raw_code=candidate.error_provider_code or candidate.error_code,
+            message=candidate.error,
+        ) is not ProviderFailureKind.CONTEXT_OVERFLOW:
+            return None
+    first = candidates[0]
+    return ErrorEvent(
+        message=first.error, code=first.error_code,
+        http_status=first.error_http_status, provider_code=first.error_provider_code,
+    )
+
+
 def _done_usage_row(
     event: DoneEvent,
     *,
@@ -1494,6 +1566,7 @@ class EnsembleProvider:
     """G8 fusion provider: proposer candidates first, one aggregator stream after."""
 
     accounts_physical_usage = True
+    owns_retry_after_admission = True
     final_request_admission_guaranteed = True
     # Agent must pass the turn context through to this provider instead of
     # opening a second outer lease for the whole ensemble envelope.  The
@@ -1893,9 +1966,37 @@ class EnsembleProvider:
         return aggregator_cfg
 
     def compaction_chat_config(self, config: ChatConfig) -> ChatConfig:
-        """Bind summary generation to the aggregator without invoking proposers."""
+        """Bind a summary to the current answer leg without invoking proposers."""
 
-        return self._aggregator_chat_config(config, ())
+        return self.current_response_deployment(config)[2]
+
+    def current_response_deployment(
+        self, config: ChatConfig,
+    ) -> tuple[LLMProvider | None, ProviderConfig | None, ChatConfig]:
+        """Snapshot the physical responder already selected for this turn.
+
+        Resolving this tuple never starts a request or activates a fallback.
+        Compaction and its consumer proof must both use the sticky fixed leg
+        after takeover, rather than silently returning to the aggregator.
+        """
+        if self._fixed_takeover_active:
+            role: Literal["fixed_aggregator", "fixed_direct"] = (
+                "fixed_aggregator"
+                if self._fixed_takeover_role == "fixed_aggregator" else "fixed_direct"
+            )
+            member = self._fallback_request_budget_member
+            return (
+                self._fixed_provider,
+                member.provider_config if member is not None else None,
+                self._fixed_chat_config(config, role=role) or config,
+            )
+        if not self.aggregator.ready:
+            return None, None, config
+        return (
+            self._primary_provider if self._primary_takeover_active else None,
+            self.aggregator.provider_config,
+            self._aggregator_chat_config(config, ()),
+        )
 
     def _fixed_chat_config(
         self,
@@ -2740,6 +2841,7 @@ class EnsembleProvider:
                 model=model,
             ),
             execution_context=execution_context,
+            physical_provider=provider, physical_config=request_config,
             role=role,
             logical_call_index=logical_index,
             attempt_index=0,
@@ -3440,6 +3542,8 @@ class EnsembleProvider:
         candidate.ttft_ms = attempt.ttft_ms
         candidate.error = attempt.error
         candidate.error_code = attempt.error_code
+        candidate.error_http_status = attempt.error_http_status
+        candidate.error_provider_code = attempt.error_provider_code
         candidate.message_limit_proof = attempt.message_limit_proof
         candidate.execution = dict(attempt.execution)
         candidate.model = attempt.model
@@ -3550,6 +3654,7 @@ class EnsembleProvider:
                 model=member.provider_config.model,
             ),
             execution_context=execution_context,
+            physical_provider=provider, physical_config=chat_cfg,
             role=StickyExecutionRole.PROPOSER,
             logical_call_index=result.index,
             attempt_index=attempt_index,
@@ -3604,6 +3709,11 @@ class EnsembleProvider:
                 )
                 result.error_code = redact_upstream_error_code(
                     event.code,
+                    api_key=member.provider_config.api_key,
+                )
+                result.error_http_status = event.http_status
+                result.error_provider_code = redact_upstream_error_code(
+                    event.provider_code,
                     api_key=member.provider_config.api_key,
                 )
                 result.message_limit_proof = event.message_limit_proof
@@ -4002,6 +4112,7 @@ class EnsembleProvider:
                         model=self.aggregator.provider_config.model,
                     ),
                     execution_context=execution_context,
+                    physical_provider=provider, physical_config=config,
                     role=StickyExecutionRole.PRIMARY_AGGREGATOR,
                     logical_call_index=logical_call_index,
                     attempt_index=attempt,
@@ -4559,6 +4670,7 @@ class EnsembleProvider:
         logical_call_index: int = 0,
         phase: str = "ensemble_fixed_wait",
         message: str | None = None,
+        from_model: str = "",
     ) -> AsyncIterator[StreamEvent]:
         """Run one fixed logical call with one transient retry at most."""
 
@@ -4688,6 +4800,7 @@ class EnsembleProvider:
                         model=physical_model,
                     ),
                     execution_context=execution_context,
+                    physical_provider=provider, physical_config=config,
                     role=role,
                     logical_call_index=logical_call_index,
                     attempt_index=fixed_attempt - 1,
@@ -4700,6 +4813,7 @@ class EnsembleProvider:
                     request_activity=ProviderActivityEvent(
                         model=physical_model,
                         phase="fallback" if fixed_attempt == 1 else "retrying",
+                        from_model=from_model if fixed_attempt == 1 else "",
                         reason="unknown" if fixed_attempt == 1 else "transport_transient",
                         retry_attempt=fixed_attempt - 1,
                         retry_limit=1,
@@ -5033,6 +5147,7 @@ class EnsembleProvider:
                 terminal_text_snapshot=ENSEMBLE_FIXED_TERMINAL_MESSAGE,
                 terminal_error_message=terminal_report.message,
                 terminal_error_code=terminal_report.code,
+                terminal_http_status=terminal_report.http_status,
                 model_usage_breakdown=terminal_report.model_usage_breakdown,
                 usage_missing_count=terminal_report.usage_missing_count,
                 ensemble_trace=trace,
@@ -5081,6 +5196,7 @@ class EnsembleProvider:
             )
 
         request_budget_error = _uniform_request_budget_error(candidates)
+        native_context_error = _uniform_native_context_error(candidates)
         if self.all_failed_policy != "fallback_single":
             message_limit_proof = _uniform_message_limit_proof(candidates)
             if request_budget_error is not None:
@@ -5102,6 +5218,8 @@ class EnsembleProvider:
                         message_limit_proof=message_limit_proof,
                     )
                 )
+            elif native_context_error is not None:
+                yield proposer_error(native_context_error)
             else:
                 yield proposer_error(ErrorEvent(message=reason, code=code))
             return
@@ -5166,6 +5284,8 @@ class EnsembleProvider:
                         message_limit_proof=message_limit_proof,
                     )
                 )
+            elif native_context_error is not None:
+                yield proposer_error(native_context_error)
             else:
                 yield proposer_error(ErrorEvent(message=reason, code=code))
             return
@@ -5346,6 +5466,9 @@ class EnsembleProvider:
         )
         async for event in self._stream_fixed_attempts(
             provider=self.fallback_provider,
+            # Aggregation has one observed physical source; a failed proposer
+            # fan-out has none. Sticky continuations do not inherit this hop.
+            from_model=self._active_model_id,
             fixed_messages=fixed_messages,
             tools=tools,
             config=fallback_config or ChatConfig(),

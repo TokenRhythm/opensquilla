@@ -108,7 +108,8 @@ async def _open_intent_stack(db_path: Path) -> AsyncIterator[_IntentStack]:
         for reservations in list(runtime._reservations_by_session.values()):
             for reservation in list(reservations):
                 await runtime.abort_reservation(reservation)
-        await runtime.shutdown(cancel=True, timeout=2.0)
+        # Settle durable activation writes before closing their storage connection.
+        await runtime.shutdown(cancel=True, timeout=15.0)
         await storage.close()
 
 
@@ -959,37 +960,31 @@ async def test_reset_cannot_overtake_a_committed_continue_before_activation(
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
     async with _open_intent_stack(tmp_path / "sessions.db") as stack:
-        old_session_id, _old_epoch, _old_message_id = await _seed_reset_state(stack)
-        continue_activation_entered = asyncio.Event()
-        release_continue_activation = asyncio.Event()
-        reset_waiting_for_admission = asyncio.Event()
-        continue_task_id: str | None = None
-        admission_calls = 0
+        old_session_id, old_epoch, _old_message_id = await _seed_reset_state(stack)
+        continue_claim_entered = asyncio.Event()
+        release_continue_claim = asyncio.Event()
+        reset_activation_entered = asyncio.Event()
+        release_reset_activation = asyncio.Event()
         original_activate = stack.runtime.activate
-        original_admission = stack.runtime.collect_admission
+        original_claim = stack.runtime._claim_activation_permit
 
-        async def _pause_continue_activation(
+        async def _pause_continue_claim(task: Any) -> None:
+            if task.message == "continue before reset":
+                continue_claim_entered.set()
+                await release_continue_claim.wait()
+            await original_claim(task)
+
+        async def _pause_reset_activation(
             reservation: Any,
             **kwargs: Any,
         ) -> Any:
-            nonlocal continue_task_id
-            if reservation.runtime_task.message == "continue before reset":
-                continue_task_id = reservation.task_id
-                continue_activation_entered.set()
-                await release_continue_activation.wait()
+            if reservation.runtime_task.message == "reset turn":
+                reset_activation_entered.set()
+                await release_reset_activation.wait()
             return await original_activate(reservation, **kwargs)
 
-        @asynccontextmanager
-        async def _observe_admission(session_key: str) -> AsyncIterator[None]:
-            nonlocal admission_calls
-            admission_calls += 1
-            if admission_calls == 2:
-                reset_waiting_for_admission.set()
-            async with original_admission(session_key):
-                yield
-
-        monkeypatch.setattr(stack.runtime, "activate", _pause_continue_activation)
-        monkeypatch.setattr(stack.runtime, "collect_admission", _observe_admission)
+        monkeypatch.setattr(stack.runtime, "_claim_activation_permit", _pause_continue_claim)
+        monkeypatch.setattr(stack.runtime, "activate", _pause_reset_activation)
 
         continue_request = asyncio.create_task(
             get_dispatcher().dispatch(
@@ -1006,9 +1001,10 @@ async def test_reset_cannot_overtake_a_committed_continue_before_activation(
         )
         reset_request: asyncio.Task[Any] | None = None
         try:
-            await asyncio.wait_for(continue_activation_entered.wait(), timeout=2.0)
-            assert continue_task_id is not None
-            assert await stack.storage.get_agent_task(continue_task_id) is not None
+            continue_response = await asyncio.wait_for(continue_request, timeout=2.0)
+            assert continue_response.ok is True
+            continue_task_id = str(continue_response.payload["task_id"])
+            await asyncio.wait_for(continue_claim_entered.wait(), timeout=2.0)
 
             reset_request = asyncio.create_task(
                 get_dispatcher().dispatch(
@@ -1023,36 +1019,54 @@ async def test_reset_cannot_overtake_a_committed_continue_before_activation(
                     stack.context,
                 )
             )
-            await asyncio.wait_for(reset_waiting_for_admission.wait(), timeout=2.0)
+            await asyncio.wait_for(reset_activation_entered.wait(), timeout=2.0)
 
-            assert reset_request.done() is False
-            before_reset = await stack.storage.get_session(SESSION_KEY)
-            assert before_reset is not None
-            assert before_reset.session_id == old_session_id
-            assert [
-                entry.content
-                for entry in await stack.storage.get_transcript(old_session_id)
-            ] == ["old transcript", "continue before reset"]
+            reset = await stack.storage.get_session(SESSION_KEY)
+            assert reset is not None
+            assert reset.session_id != old_session_id
+            assert reset.epoch == old_epoch + 1
+            pending_continue = await stack.storage.get_agent_task(continue_task_id)
+            assert pending_continue is not None
+            assert pending_continue.details is not None
+            assert pending_continue.details["activation_invalidation"] == {
+                "kind": "session_reset",
+                "replaced_session_id": old_session_id,
+                "replaced_session_epoch": old_epoch,
+                "replacement_session_id": reset.session_id,
+                "replacement_session_epoch": reset.epoch,
+            }
+
+            release_continue_claim.set()
+            continue_terminal = await stack.runtime.wait(continue_task_id, timeout=2.0)
+            assert str(continue_terminal.status) == "cancelled"
+            assert continue_terminal.terminal_reason == "cancelled"
+            assert continue_terminal.error_class is None
+            assert continue_terminal.error_message is None
+            settled_continue = await stack.storage.get_agent_task(continue_task_id)
+            assert settled_continue is not None
+            assert settled_continue.details is not None
+            assert settled_continue.details["cancellation"] == {
+                "source": "sessions_reset",
+                "reason": "session_reset",
+            }
+            assert "activation_invalidation" not in settled_continue.details
+            assert await stack.storage.get_activation_permit(continue_task_id) is None
+            assert stack.handler_runs == []
         finally:
-            release_continue_activation.set()
+            release_continue_claim.set()
+            release_reset_activation.set()
 
         assert reset_request is not None
-        continue_response, reset_response = await asyncio.wait_for(
-            asyncio.gather(continue_request, reset_request),
-            timeout=4.0,
-        )
-
-        assert continue_response.ok is True
+        reset_response = await asyncio.wait_for(reset_request, timeout=4.0)
         assert reset_response.ok is True
-        assert continue_task_id is not None
-        continue_terminal = await stack.runtime.wait(continue_task_id, timeout=2.0)
-        assert str(continue_terminal.status) == "cancelled"
-        reset = await stack.storage.get_session(SESSION_KEY)
-        assert reset is not None
-        assert reset.session_id != old_session_id
-        assert [
-            entry.content for entry in await stack.storage.get_transcript(reset.session_id)
-        ] == ["reset turn"]
+        # Activation persists task state before handler entry. Check completed
+        # execution without imposing a two-second deadline on those disk writes.
+        stack.release_handler.set()
+        reset_terminal = await stack.runtime.wait(
+            str(reset_response.payload["task_id"]), timeout=15.0,
+        )
+        assert str(reset_terminal.status) == "succeeded"
+        assert [run.message for run in stack.handler_runs] == ["reset turn"]
 
 
 @pytest.mark.asyncio

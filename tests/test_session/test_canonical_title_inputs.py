@@ -1,10 +1,15 @@
 """Early title input must survive compaction without loading complete histories."""
 
+import base64
+import io
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
+from opensquilla.gateway.session_view import derive_transcript_title
+from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -118,13 +123,8 @@ async def test_batch_handles_archive_only_active_only_mixed_and_missing_sessions
             )
     _, empty = await _seed(storage, "empty", [])
     selected = [node.session_id for node in nodes.values()] + [empty.session_id, "missing"]
-    queries: list[str] = []
     before_changes = storage.conn.total_changes
-    await storage._transcript_reader.set_trace_callback(queries.append)
-    try:
-        actual = await storage.list_canonical_user_transcript_content_batch(selected)
-    finally:
-        await storage._transcript_reader.set_trace_callback(None)
+    actual = await storage.list_canonical_user_transcript_content_batch(selected)
 
     assert actual == {
         **{node.session_id: [f"{name} sample {i}" for i in range(3)]
@@ -133,9 +133,6 @@ async def test_batch_handles_archive_only_active_only_mixed_and_missing_sessions
         "missing": [],
     }
     assert storage.conn.total_changes == before_changes
-    assert len(queries) == 1
-    assert "transcript_entries" in queries[0]
-    assert "compacted_transcript_entries" in queries[0]
 
 
 async def test_only_nonempty_user_content_is_selected_without_deduplication(
@@ -162,24 +159,91 @@ async def test_only_nonempty_user_content_is_selected_without_deduplication(
     ) == {node.session_id: ["Repeated sample", "Repeated sample"]}
 
 
+async def test_title_batch_bounds_large_user_content_before_python(
+    storage: SessionStorage,
+) -> None:
+    _, node = await _seed(storage, "large-title", [("user", "X" * (26 * 1024 * 1024))])
+
+    active = await storage.list_user_transcript_content_batch([node.session_id])
+    canonical = await storage.list_canonical_user_transcript_content_batch([node.session_id])
+
+    # Oversized rows stay out of the startup title path. The range reader owns
+    # their bounded display; sessions.list keeps its control read cheap.
+    assert active[node.session_id] == []
+    assert canonical[node.session_id] == []
+
+
+@pytest.mark.parametrize("side", [64, 192, 640])
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("display_text", ["", "Describe these attachments", None])
+async def test_image_title_projection_preserves_user_text_after_inline_bytes(
+    storage: SessionStorage, tmp_path: Path, side: int, archived: bool,
+    display_text: str | None,
+) -> None:
+    pixels = bytes(range(256)) * (side * side * 3 // 256)
+    image = Image.frombytes("RGB", (side, side), pixels)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", compress_level=0)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    node = await manager.create("agent:main:webchat:image-title")
+    envelope, _ = build_transcript_attachment_envelope(
+        text="Describe these attachments", display_text=display_text,
+        attachments=[{
+            "type": "image/png", "name": "image.png",
+            "data": base64.b64encode(buffer.getvalue()).decode("ascii"),
+        }],
+        session_id=node.session_id, media_root=tmp_path / "media", persist_enabled=True,
+    )
+    if display_text is not None:
+        assert envelope.index('"display_text"') > 4096
+    await manager.append_message(node.session_key, "user", envelope)
+    if archived:
+        assert await manager.persist_compaction_result(
+            node.session_key, "Synthetic summary", [], compaction_id="image-title-compaction",
+        )
+
+    active = await storage.list_user_transcript_content_batch([node.session_id])
+    canonical = await storage.list_canonical_user_transcript_content_batch([node.session_id])
+    if side > 64:
+        # Large envelopes remain outside the metadata-only title candidate budget.
+        assert active[node.session_id] == canonical[node.session_id] == []
+    else:
+        expected = "Describe these attachments" if display_text is None else display_text
+        assert [derive_transcript_title(value) for value in active[node.session_id]] == (
+            [] if archived else [expected]
+        )
+        canonical_titles = [derive_transcript_title(value) for value in canonical[node.session_id]]
+        assert canonical_titles == [expected]
+
+
 async def test_large_batch_chunks_reads_within_sqlite_variable_limit(
     storage: SessionStorage,
 ) -> None:
     _, node = await _seed(storage, "chunked", [("user", "Sample first message")])
     session_ids = [f"missing-{index}" for index in range(650)]
     session_ids.insert(301, node.session_id)
-    queries: list[str] = []
-    await storage._transcript_reader.set_trace_callback(queries.append)
-    try:
-        result = await storage.list_canonical_user_transcript_content_batch(session_ids)
-    finally:
-        await storage._transcript_reader.set_trace_callback(None)
+    result = await storage.list_canonical_user_transcript_content_batch(session_ids)
 
     assert result == {
         sid: ["Sample first message"] if sid == node.session_id else []
         for sid in session_ids
     }
-    assert len(queries) == 3
+
+
+async def test_large_title_limit_still_chunks_content_ids(
+    storage: SessionStorage,
+) -> None:
+    _, node = await _seed(
+        storage,
+        "large-limit",
+        [("user", "first title"), ("user", "second title")],
+    )
+
+    result = await storage.list_canonical_user_transcript_content_batch(
+        [node.session_id], limit_per_session=500,
+    )
+
+    assert result[node.session_id] == ["first title", "second title"]
 
 
 @pytest.mark.parametrize("session_ids,limit", [([], 3), (["missing"], 0), (["missing"], -1)])

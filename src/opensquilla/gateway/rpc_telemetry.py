@@ -19,6 +19,7 @@ from opensquilla.gateway.telemetry_connections import (
     is_registered_tui_connection,
     register_tui_connection,
 )
+from opensquilla.onboarding.image_generation_state import preserve_image_routing_provenance
 from opensquilla.telemetry.consent import (
     CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
     CURRENT_RELIABILITY_NOTICE_VERSION,
@@ -125,6 +126,7 @@ def _commit_record(
 
     candidate = GatewayConfig.model_validate(payload)
     explicit_paths = legacy_paths | {"privacy.disable_network_observability"}
+    preserve_image_routing_provenance(ctx.config, candidate, explicit_paths)
     inherit_then_clear_explicit(ctx.config, candidate, explicit_paths)
     candidate._mark_env_absorbed_secrets(payload)
     candidate.inherit_persist_provenance(ctx.config)

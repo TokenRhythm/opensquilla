@@ -36,6 +36,7 @@ function harness(size = 8) {
   }))
   const consume = vi.fn(async () => {})
   const credit = vi.fn(async () => {})
+  const installed = vi.fn()
   const request = vi.fn(async (method: string, params: Record<string, unknown> = {}, options?: TransportCallOptions) => {
     requests.push({ method, params })
     options?.onSent?.(1)
@@ -48,14 +49,27 @@ function harness(size = 8) {
     generation: 1, supports: () => true,
     request: <T = unknown>(method: string, params?: Record<string, unknown>, options?: TransportCallOptions) => request(method, params, options) as Promise<T>,
     acknowledgeDelivery: credit, waitForConsumption: consume, recoveryVersion: () => invalidation,
+    snapshotInstalled: installed,
   }
   const newTransfer = () => createV4SessionSnapshotTransfer(rpc, 'alpha', controller.signal, 1)
   const transfer = newTransfer()
-  return { transfer, newTransfer, read, resume, respond, consume, credit, requests, controller, invalidate: () => { invalidation = '1' } }
+  return { transfer, newTransfer, read, resume, respond, consume, credit, installed, requests, controller, invalidate: () => { invalidation = '1' } }
 }
 
 afterEach(() => vi.useRealTimers())
 describe('persistent recovery transfer', () => {
+  it('keeps a proven installation terminal if optional local credit bookkeeping throws', async () => {
+    const h = harness()
+    h.installed.mockImplementation(() => { throw new Error('local bookkeeping failed') })
+    const staged = await h.transfer.read()
+    await expect(staged.confirmInstalled()).resolves.toBeUndefined()
+    expect(h.transfer.installed).toBe(true)
+    expect(h.installed).toHaveBeenCalledWith('alpha', '0')
+    await staged.confirmInstalled()
+    expect(h.installed).toHaveBeenCalledOnce()
+    h.transfer.release()
+  })
+
   it.each(['SNAPSHOT_STALE', 'SNAPSHOT_EXPIRED'])(
     'retires a first read rejected with %s and admits a fresh sync revision', async code => {
       const h = harness()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -15,10 +16,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,7 @@ from opensquilla.process_tree import (
     create_owned_subprocess_exec,
     create_owned_subprocess_shell,
 )
+from opensquilla.runtime_preparation import prepare_runtime as _prepare_shell_runtime
 from opensquilla.sandbox.backend.bubblewrap import (
     BubblewrapBackend,
     LinuxProxyBridgeHost,
@@ -77,7 +81,7 @@ from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
@@ -100,7 +104,7 @@ from opensquilla.sandbox.integration import (
     SandboxRuntime,
     active_file_system_profile,
     active_sandbox_policy,
-    consume_backend_denial_retry,
+    consume_backend_denial_retry_async,
     escalate_backend_denial,
     escalate_unavailable_backend_in_managed_mode,
     gate_action,
@@ -201,7 +205,6 @@ _EXEC_TOOL_TIMEOUT_PADDING = _APPROVAL_RETRY_WAIT_SECONDS + 5.0
 _DEFAULT_BACKGROUND_TIMEOUT = 1800.0
 _MAX_BACKGROUND_TIMEOUT = 5400.0
 _DEFAULT_PROCESS_WAIT_TIMEOUT = 600.0
-_CODING_PROCESS_WAIT_TIMEOUT = 5400.0
 _MAX_PROCESS_WAIT_TIMEOUT = 5400.0
 _PROCESS_WAIT_TIMEOUT_PADDING = 5.0
 _BACKGROUND_TERMINATE_TIMEOUT = 1.0
@@ -917,7 +920,7 @@ async def _gate_recursive_delete(
             ),
         )
     context = current_tool_context.get()
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         pending.action,
         approval_id=approval_id,
         session_key=getattr(context, "session_key", None),
@@ -962,7 +965,7 @@ async def _gate_recursive_delete(
                 without_backup=True,
             ),
         )
-        second_gate = gate_elevated_action(
+        second_gate = await gate_elevated_action_async(
             override_pending.action,
             approval_id=None,
             session_key=getattr(context, "session_key", None),
@@ -1026,7 +1029,7 @@ async def _gate_recursive_delete(
     )
 
 
-def _gate_safe_command_approval(
+async def _gate_safe_command_approval(
     command: str,
     *,
     cwd: str | None,
@@ -1046,7 +1049,7 @@ def _gate_safe_command_approval(
         display=ApprovalDisplay(kind="run_command", target=command),
     )
     context = current_tool_context.get()
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         action,
         approval_id=approval_id,
         session_key=getattr(context, "session_key", None),
@@ -1067,21 +1070,6 @@ def _base_shell_environment() -> dict[str, str]:
     else:
         environment = _runtime_shell_environment(dict(os.environ))
 
-    # Carry the live turn's gate and authoritative config path into a code-task
-    # CLI child. ``gateway run --config`` does not mutate the parent process
-    # environment, so rediscovery in the child can otherwise select the wrong
-    # profile. These runtime-only values are removed before the nested coding
-    # Agent starts and are never serialized into telemetry.
-    if ctx is not None:
-        environment["OPENSQUILLA_CODING_MODE_ACTIVE"] = (
-            "1" if bool(getattr(ctx, "coding_mode", False)) else "0"
-        )
-        config = getattr(ctx, "sandbox_gateway_config", None)
-        config_path = str(getattr(config, "config_path", "") or "").strip()
-        if config_path:
-            environment["OPENSQUILLA_CODING_MODE_CONFIG_PATH"] = config_path
-        else:
-            environment.pop("OPENSQUILLA_CODING_MODE_CONFIG_PATH", None)
     return environment
 
 
@@ -1565,7 +1553,6 @@ class _BgSession:
     local_urls: list[str] = field(default_factory=list)
     output_capture: BoundedOutputCapture = field(default_factory=BoundedOutputCapture)
     output_lines: list[str] = field(default_factory=list)
-    code_task_marker: dict[str, str] | None = None
     done: bool = False
     timed_out: bool = False
     killed: bool = False
@@ -5887,9 +5874,6 @@ def _resolve_background_timeout(timeout: float | int | None) -> float:
 
 
 def _process_wait_default() -> float:
-    ctx = current_tool_context.get()
-    if ctx is not None and getattr(ctx, "coding_mode", False):
-        return _CODING_PROCESS_WAIT_TIMEOUT
     return _DEFAULT_PROCESS_WAIT_TIMEOUT
 
 
@@ -5905,7 +5889,10 @@ def _resolve_process_wait_timeout(timeout: float | int | None) -> float:
 
 
 def _effective_workdir(workdir: str | None) -> str | None:
+    from opensquilla.tools.path_policy import resolve_bound_workspace
+
     ctx = current_tool_context.get()
+    workspace = resolve_bound_workspace(ctx.workspace_dir if ctx is not None else None)
     if workdir:
         translated = (
             _windows_translate_posix_tmp_path(workdir)
@@ -5914,11 +5901,11 @@ def _effective_workdir(workdir: str | None) -> str | None:
         )
         reject_foreign_host_path(translated, platform=os.name)
         raw = Path(translated).expanduser()
-        if not raw.is_absolute() and ctx and ctx.workspace_dir:
-            return str((Path(ctx.workspace_dir).expanduser().resolve() / raw).resolve())
+        if not raw.is_absolute() and workspace is not None:
+            return str((workspace / raw).resolve())
         return str(raw.resolve())
-    if ctx and ctx.workspace_dir:
-        return str(Path(ctx.workspace_dir).expanduser().resolve())
+    if workspace is not None:
+        return str(workspace)
     return None
 
 
@@ -6079,7 +6066,7 @@ def _shell_elevation_action(
     )
 
 
-def _gate_shell_elevation(
+async def _gate_shell_elevation(
     action: ElevationAction,
     *,
     approval_id: str | None,
@@ -6091,7 +6078,7 @@ def _gate_shell_elevation(
             "message": "A precise justification is required for elevated execution.",
         }
     ctx = current_tool_context.get()
-    gate = gate_elevated_action(
+    gate = await gate_elevated_action_async(
         action,
         approval_id=approval_id,
         session_key=ctx.session_key if ctx is not None else None,
@@ -6151,63 +6138,11 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
     )
     if runtime_failure is not None:
         payload["runtime_failure"] = runtime_failure
-    code_task = _code_task_status_payload(session)
-    if code_task:
-        payload["code_task"] = code_task
     return payload
 
 
-def _code_task_status_payload(session: _BgSession) -> dict[str, object] | None:
-    if "code-task" not in session.command:
-        return None
-    output = _bg_rendered_output(session)
-    marker = session.code_task_marker or _parse_code_task_marker(output)
-    if marker is None:
-        return None
-    status_path = Path(marker["status_path"]).expanduser()
-    payload: dict[str, object] = dict(marker)
-    if status_path.is_file():
-        try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            status = {}
-        if isinstance(status, dict):
-            for key in (
-                "phase",
-                "updated",
-                "pid",
-                "current_command",
-                "last_output_at",
-                "quiet_for_seconds",
-                "state",
-                "verified",
-                "error",
-                "final_failure_reason",
-                "installer_path",
-                "log_paths",
-            ):
-                if key in status:
-                    payload[key] = status[key]
-    return payload
 
 
-def _parse_code_task_marker(output: str) -> dict[str, str] | None:
-    for line in output.splitlines():
-        if "[code-task] run started:" not in line or "status=" not in line:
-            continue
-        status_tail = line.split("status=", 1)[1]
-        status_end = status_tail.find("status.json")
-        if status_end < 0:
-            continue
-        status_path = status_tail[: status_end + len("status.json")]
-        payload = {"status_path": status_path}
-        run_match = re.search(r"run_id=([^\s]+)", line)
-        if run_match:
-            payload["run_id"] = run_match.group(1)
-        if "artifact_dir=" in line and " status=" in line:
-            payload["artifact_dir"] = line.split("artifact_dir=", 1)[1].split(" status=", 1)[0]
-        return payload
-    return None
 
 
 def _local_server_urls_from_command(command: str) -> list[str]:
@@ -6505,8 +6440,6 @@ def _finalize_bg_session(session: _BgSession) -> None:
 
 
 async def _finalize_bg_session_async(session: _BgSession) -> None:
-    if "code-task" in session.command and session.code_task_marker is None:
-        session.code_task_marker = _parse_code_task_marker(_bg_rendered_output(session))
     await session.output_capture.finish_async()
     session.output_capture.release_preview()
     _finalize_bg_session(session)
@@ -6877,6 +6810,53 @@ def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
     return create_owned_popen(_windows_direct_powershell_argv(command), **kwargs)
 
 
+async def _start_blocking_host_process(launch: Callable[..., Any]) -> Any:
+    """Keep launch I/O off-loop without abandoning a process on cancellation."""
+
+    # Unlike a to_thread Task, this Future survives asyncio.run cancelling all
+    # Tasks. Keep the caller's pipes open until the worker has finished with them.
+    cancel_event = threading.Event()
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, partial(contextvars.copy_context().run, launch, cancel_event=cancel_event),
+    )
+    try:
+        result = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            result = worker.result()
+        except PtyBackendError as exc:
+            result = exc.handle
+        except Exception:
+            result = None
+        if result is not None:
+            proc = result.raw if isinstance(result, PtyHandle) else result
+            owner = capture_process_tree_owner(proc, isolated=True)
+            owner.start_completion_monitor()
+            # Retain cleanup in this task: shutdown must not cancel a detached
+            # cleanup Task before it retires the exact process and owner row.
+            while True:
+                try:
+                    if isinstance(result, PtyHandle):
+                        await terminate_pty(result)
+                    else:
+                        await _terminate_exec_process_tree(proc, owner)
+                    break
+                except asyncio.CancelledError:
+                    continue
+        raise
+    proc = result.raw if isinstance(result, PtyHandle) else result
+    capture_process_tree_owner(proc, isolated=True).start_completion_monitor()
+    return result
+
+
 def _terminate_windows_host_shell_process(
     proc: Any,
     process_tree: ProcessTreeOwner,
@@ -6959,10 +6939,11 @@ async def _run_windows_host_shell_command_with_stdin(
             with os.fdopen(write_fd, "wb", buffering=0) as writer:
                 output_reader = _NonblockingOutputPipe(reader.fileno())
                 creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                proc = _create_windows_host_shell_process(
+                proc = await _start_blocking_host_process(partial(
+                    _create_windows_host_shell_process,
                     command, stdin=subprocess.PIPE, stdout=writer, stderr=subprocess.STDOUT,
                     cwd=cwd, env=env, creationflags=creationflags,
-                )
+                ))
             if on_process_started is not None:
                 on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=os.name == "nt")
@@ -7107,13 +7088,17 @@ async def _run_full_host_shell_command(
     """Execute directly on the host without sandbox policy or safety preflight."""
 
     runtime = get_runtime()
-    merged_env = _base_shell_environment()
+    # Resolve runtimes once, after caller overrides. The shared base helper
+    # already resolves them for Safe/Guest callers.
+    merged_env = dict(os.environ)
     if env:
         merged_env.update(env)
-    merged_env = _managed_skill_environment(
-        _runtime_shell_environment(
-            merged_env,
-            require_bundled=_guest_requires_managed_runtime(),
+    merged_env = await _prepare_shell_runtime(
+        lambda: _managed_skill_environment(
+            _runtime_shell_environment(
+                merged_env,
+                require_bundled=_guest_requires_managed_runtime(),
+            )
         )
     )
     apply_utf8_child_env(merged_env)
@@ -7375,13 +7360,15 @@ async def exec_command(
         sensitive_block = _sensitive_shell_block("exec_command", command, workdir=cwd, stdin=stdin)
     if sensitive_block is not None:
         return sensitive_block
-    merged_env = _base_shell_environment()
+    merged_env = await _prepare_shell_runtime(_base_shell_environment)
     if env:
         merged_env.update(env)
-    merged_env = _managed_skill_environment(
-        _runtime_shell_environment(
-            merged_env,
-            require_bundled=_guest_requires_managed_runtime(),
+    merged_env = await _prepare_shell_runtime(
+        lambda: _managed_skill_environment(
+            _runtime_shell_environment(
+                merged_env,
+                require_bundled=_guest_requires_managed_runtime(),
+            )
         )
     )
     apply_utf8_child_env(merged_env)
@@ -7409,7 +7396,7 @@ async def exec_command(
     if recursive_delete is not None:
         return recursive_delete
     if result.needs_approval:
-        command_approval = _gate_safe_command_approval(
+        command_approval = await _gate_safe_command_approval(
             command,
             cwd=cwd,
             reason=result.reason or "This high-risk command requires approval.",
@@ -7430,7 +7417,7 @@ async def exec_command(
         if hard_block is not None:
             return json.dumps(hard_block, ensure_ascii=False)
     if not host_execution and sandbox_permissions == "require_escalated":
-        elevation = _gate_shell_elevation(
+        elevation = await _gate_shell_elevation(
             _shell_elevation_action(
                 tool_name="exec_command",
                 action_kind="shell.exec",
@@ -7558,7 +7545,7 @@ async def exec_command(
             host_execution = True
             backend_retry_granted = True
         else:
-            retry_gate = consume_backend_denial_retry(
+            retry_gate = await consume_backend_denial_retry_async(
                 approval_id,
                 request,
                 policy,
@@ -7577,7 +7564,9 @@ async def exec_command(
                 backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
                 backend_policy = request.policy
                 backend_policy = _policy_with_active_tool_mounts(backend_policy)
-                backend_policy = _policy_with_managed_toolchain_mounts(backend_policy)
+                backend_policy = await _prepare_shell_runtime(
+                    partial(_policy_with_managed_toolchain_mounts, backend_policy)
+                )
                 backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
                 backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
                 backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
@@ -7739,11 +7728,18 @@ async def _start_host_background_process(
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
-    base_env = dict(env) if env is not None else _base_shell_environment()
-    host_env = _managed_skill_environment(
-        _runtime_shell_environment(
-            base_env,
-            require_bundled=_guest_requires_managed_runtime(),
+    if env is not None:
+        base_env = dict(env)
+    elif full_host_access_active():
+        base_env = dict(os.environ)
+    else:
+        base_env = await _prepare_shell_runtime(_base_shell_environment)
+    host_env = await _prepare_shell_runtime(
+        lambda: _managed_skill_environment(
+            _runtime_shell_environment(
+                base_env,
+                require_bundled=_guest_requires_managed_runtime(),
+            )
         )
     )
     apply_utf8_child_env(host_env)
@@ -7758,10 +7754,15 @@ async def _start_host_background_process(
     actual_io_mode = io_mode
     if io_mode == "pty":
         try:
-            pty_handle = spawn_pty(command, cwd=cwd, env=host_env)
+            pty_handle = await _start_blocking_host_process(partial(
+                spawn_pty, command, cwd=cwd, env=host_env,
+            ))
         except PtyBackendError as exc:
             if exc.started:
                 if exc.handle is not None:
+                    capture_process_tree_owner(
+                        exc.handle.raw, isolated=True,
+                    ).start_completion_monitor()
                     with contextlib.suppress(Exception):
                         await terminate_pty(exc.handle)
                     with contextlib.suppress(Exception):
@@ -7846,6 +7847,15 @@ async def _start_host_background_process(
     async def _collect_host() -> None:
         process_exited = asyncio.Event()
         output_task = asyncio.create_task(_read_bg_output(session, process_exited))
+        failure: BaseException | None = None
+
+        def retain_failure(stage: str, exc: BaseException) -> None:
+            nonlocal failure
+            if failure is None:
+                failure = exc
+            else:
+                failure.add_note(f"{stage} also failed: {type(exc).__name__}: {exc}")
+
         try:
             completed = (
                 await _wait_exec_process(proc, effective_timeout)
@@ -7860,14 +7870,25 @@ async def _start_host_background_process(
                 # EOF/leader exit must not strand descendants that inherited
                 # the terminal. Keep ownership until the full tree is empty.
                 await terminate_pty(pty_handle, close_reader=False)
+        except BaseException as exc:
+            retain_failure("process collection", exc)
         finally:
             process_exited.set()
             try:
                 await output_task
-            finally:
+            except BaseException as exc:
+                retain_failure("output drain", exc)
+            try:
                 if pty_handle is not None:
                     await asyncio.to_thread(pty_handle.close_reader)
+            except BaseException as exc:
+                retain_failure("PTY reader close", exc)
+            try:
                 await _finalize_bg_session_async(session)
+            except BaseException as exc:
+                retain_failure("session finalization", exc)
+        if failure is not None:
+            raise failure
 
     session.collector_task = asyncio.create_task(_collect_host())
     return _background_process_result(session)
@@ -8002,10 +8023,10 @@ async def background_process(
         sensitive_block = _sensitive_shell_block("background_process", command, workdir=cwd)
     if sensitive_block is not None:
         return sensitive_block
-    merged_env = _base_shell_environment()
+    merged_env = await _prepare_shell_runtime(_base_shell_environment)
     if env:
         merged_env.update(env)
-    merged_env = _managed_skill_environment(merged_env)
+    merged_env = await _prepare_shell_runtime(partial(_managed_skill_environment, merged_env))
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(merged_env)
     runtime_unavailable = _shell_runtime_preflight(
@@ -8030,7 +8051,7 @@ async def background_process(
     if recursive_delete is not None:
         return recursive_delete
     if result.needs_approval:
-        command_approval = _gate_safe_command_approval(
+        command_approval = await _gate_safe_command_approval(
             command,
             cwd=cwd,
             reason=result.reason or "This high-risk command requires approval.",
@@ -8054,7 +8075,7 @@ async def background_process(
         if hard_block is not None:
             return json.dumps(hard_block, ensure_ascii=False)
     if not host_execution and sandbox_permissions == "require_escalated":
-        elevation = _gate_shell_elevation(
+        elevation = await _gate_shell_elevation(
             _shell_elevation_action(
                 tool_name="background_process",
                 action_kind="shell.background",
@@ -8150,7 +8171,7 @@ async def background_process(
                 io_mode=io_mode,
                 notify_on_exit=notify_on_exit,
             )
-        retry_gate = consume_backend_denial_retry(
+        retry_gate = await consume_backend_denial_retry_async(
             approval_id,
             request,
             policy,
@@ -8165,7 +8186,9 @@ async def background_process(
             backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
             backend_policy = policy
             backend_policy = _policy_with_active_tool_mounts(backend_policy)
-            backend_policy = _policy_with_managed_toolchain_mounts(backend_policy)
+            backend_policy = await _prepare_shell_runtime(
+                partial(_policy_with_managed_toolchain_mounts, backend_policy)
+            )
             backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
             backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
             backend_policy = _trusted_managed_network_policy(backend_policy, runtime)

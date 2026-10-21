@@ -12,14 +12,13 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 
 from opensquilla.application.admission_views import (
     ActivationTask,
     AdmissionAcceptance,
     AdmissionCommit,
     AdmissionGuestCleanup,
-    AdmissionMetaControl,
     AdmissionPlanRevision,
     AdmissionPlanRun,
     AdmissionProjectOrigin,
@@ -29,7 +28,6 @@ from opensquilla.application.admission_views import (
     AdmissionStorageCapabilities,
     AdmissionTaskRecord,
     AdmissionWorkspaceSelection,
-    MetaAdmissionControl,
     PreparedAdmissionIntent,
     PreparedTranscriptMessage,
     SessionIdentity,
@@ -263,13 +261,6 @@ class AdmissionStorage(Protocol):
 
     async def get_active_plan_run(self, key: str) -> AdmissionPlanRun | None: ...
 
-    async def get_meta_control_intent(
-        self,
-        *,
-        session_key: str,
-        control_kind: str,
-        correlation_id: str,
-    ) -> AdmissionMetaControl | None: ...
 
     async def get_agent_task(self, task_id: str) -> ActivationTask | None: ...
 
@@ -416,6 +407,9 @@ class AdmissionSessions(Protocol):
 
 
 class AdmissionPrimitives(Protocol):
+    # Optional-service descriptors are metadata owned by Gateway boot.
+    startup_services: dict[str, dict[str, Any]] | None
+
     @property
     def sessions(self) -> AdmissionSessions | None: ...
 
@@ -569,6 +563,7 @@ class AdmissionPrimitives(Protocol):
         page_context: dict[str, Any] | None = None,
         workspace_files: list[dict[str, Any]] | None = None,
         selected_skills: list[dict[str, str]] | None = None,
+        local_path_references: list[str] | None = None,
     ) -> tuple[str, Sequence[object]]: ...
 
     def fork_title_allocation(
@@ -623,14 +618,17 @@ class AdmissionPrimitives(Protocol):
     ) -> None: ...
 
 
-    def schedule_auto_title(
+    def install_auto_title(
         self,
+        route: AdmissionRouteEnvelope,
         session_key: str,
         message: str,
         *,
         enabled: bool,
-        session_id: str | None = None,
-        root_turn_id: str | None = None,
+        session_id: str,
+        session_epoch: int,
+        root_turn_id: str,
+        reservation: AdmissionReservation | None = None,
     ) -> None: ...
 
     async def publish_collaboration(
@@ -656,26 +654,3 @@ class AdmissionPrimitives(Protocol):
         turn_id: str,
         accepted_run_mode_override: object | None,
     ) -> AdmissionHandle: ...
-
-    def parse_meta_control(
-        self,
-        message: str,
-        semantic_message: str,
-        *,
-        client_request_id: str,
-    ) -> MetaAdmissionControl | None: ...
-
-    def peek_meta_launch(self, key: str, *, client_request_id: str) -> str | None: ...
-
-    def promote_meta_launch(
-        self,
-        key: str,
-        *,
-        client_request_id: str,
-        message: str,
-        semantic_message: str,
-    ) -> Literal["promoted", "accepted"] | None: ...
-
-    def restage_meta_launch(self, key: str, *, client_request_id: str) -> bool: ...
-
-    def cancel_accepted_meta_launch(self, key: str, *, client_request_id: str) -> bool: ...

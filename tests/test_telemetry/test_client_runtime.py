@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,20 +14,22 @@ import pytest
 from opensquilla.telemetry import runtime as runtime_module
 from opensquilla.telemetry.consent import (
     CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
-    CURRENT_RELIABILITY_NOTICE_VERSION,
     TelemetryScope,
-    resolve_scope_consent,
 )
 from opensquilla.telemetry.contracts import TELEMETRY_EVENT_ADAPTER
-from opensquilla.telemetry.coordination import scope_consent_coordinator_for
-from opensquilla.telemetry.outbox import TelemetryOutbox
+from opensquilla.telemetry.outbox import OutboxPriority, TelemetryOutbox
 from opensquilla.telemetry.recorder import RecordStatus
 from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
 from opensquilla.telemetry.uploader import TelemetryUploader
+from tests.helpers.telemetry_runtime import runtime_config as _config
+from tests.helpers.telemetry_runtime import turn_event as _turn_event
+from tests.helpers.telemetry_shutdown_process import run_shutdown_probe
 
 
 @pytest.fixture(autouse=True)
 async def offline_uploads(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(runtime_module, "get_device_id", lambda: None)
+
     async def unavailable(_request):
         return httpx.Response(503)
 
@@ -45,14 +49,35 @@ async def offline_uploads(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def expire_shutdown_deadline(monkeypatch: pytest.MonkeyPatch):
+async def expire_shutdown_deadline(monkeypatch: pytest.MonkeyPatch):
+    # This fixture tests cancellation consequences, NOT deadline arithmetic or
+    # real timer delivery. Those remain covered by test_shutdown_deadlines and
+    # the isolated real-timer/SQLite probes below.
     contexts: list[tuple[float, asyncio.Timeout]] = []
     installed = asyncio.Event()
+    real_loop = asyncio.get_running_loop()
+    shutdown_now = real_loop.time()
+
+    class ShutdownClockLoop:
+        def time(self) -> float:
+            return shutdown_now
+
+        def __getattr__(self, name):
+            return getattr(real_loop, name)
+
+    # close() also checks time before entering timeout_at. Control both views
+    # of the deadline so preemption cannot skip the cancellation under test.
+    # The real event loop, SQLite workers and wait_for watchdogs keep running.
+    shutdown_loop = ShutdownClockLoop()
+
+    def controlled_get_running_loop():
+        running_loop = asyncio.get_running_loop()
+        return shutdown_loop if running_loop is real_loop else running_loop
 
     def controlled_timeout_at(deadline: float) -> asyncio.Timeout:
         assert math.isfinite(deadline)
         assert deadline <= (
-            asyncio.get_running_loop().time() + runtime_module.SHUTDOWN_UPLOAD_TIMEOUT_SECONDS
+            shutdown_now + runtime_module.SHUTDOWN_UPLOAD_TIMEOUT_SECONDS
         )
         # Drive the real asyncio cancellation after the intended upload state
         # is reached, independently of SQLite or worker scheduling latency.
@@ -64,13 +89,16 @@ def expire_shutdown_deadline(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         runtime_module,
         "asyncio",
-        SimpleNamespace(**(vars(asyncio) | {"timeout_at": controlled_timeout_at})),
+        SimpleNamespace(**(vars(asyncio) | {
+            "get_running_loop": controlled_get_running_loop,
+            "timeout_at": controlled_timeout_at,
+        })),
     )
 
     async def expire(
         runtime: ScopedTelemetryRuntime, *, cancel: bool = True,
     ) -> tuple[asyncio.Timeout, ...]:
-        await asyncio.wait_for(installed.wait(), timeout=1)
+        await asyncio.wait_for(installed.wait(), timeout=10)
         assert contexts, "shutdown must install a bounded upload timeout"
         assert all(deadline == runtime._shutdown_deadline for deadline, _ in contexts)
         timeouts = tuple(timeout for _, timeout in contexts)
@@ -92,47 +120,6 @@ def _accepted_response(request: httpx.Request) -> httpx.Response:
             "accepted": len(payload["events"]),
             "duplicates": 0,
         },
-    )
-
-
-def _config(state_dir: Path, *, disabled: bool = False):
-    config = SimpleNamespace(
-        state_dir=str(state_dir),
-        privacy=SimpleNamespace(
-            disable_network_observability=disabled,
-        ),
-    )
-    scope_consent_coordinator_for(
-        config,
-        state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
-    )
-    return config
-
-
-def _turn_event(number: int = 1):
-    return TELEMETRY_EVENT_ADAPTER.validate_json(
-        json.dumps(
-            {
-                "event_name": "turn_result",
-                "event_version": 1,
-                "event_id": f"00000000-0000-4000-8000-{number:012d}",
-                "occurred_at_utc": "2026-09-02T01:02:03.456Z",
-                "source": "gateway",
-                "app_version": "1.2.3",
-                "platform": "linux",
-                "outcome": "success",
-                "error_code": None,
-                "duration_ms": 120,
-                "consent_scope": "reliability",
-                "notice_version": CURRENT_RELIABILITY_NOTICE_VERSION,
-                "sample_rate": 1.0,
-                "app_session_id": "00000000-0000-4000-8000-000000000900",
-                "ttft_ms": 40,
-                "stall_count": 0,
-                "stall_threshold_ms": 15_000,
-            }
-        ),
-        strict=True,
     )
 
 
@@ -243,6 +230,238 @@ async def test_background_record_failure_does_not_escape(tmp_path: Path) -> None
     runtime.record_background(_turn_event())
 
 
+async def test_background_burst_bounds_pending_work_and_preserves_higher_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_module, "BACKGROUND_RECORD_QUEUE_LIMIT", 4)
+    monkeypatch.setattr(runtime_module, "BACKGROUND_RECORD_BATCH_SIZE", 2)
+    monkeypatch.setattr(runtime_module, "get_device_id", lambda: None)
+    batches = []
+    enqueue_many = TelemetryOutbox.enqueue_many
+
+    async def capture_batch(outbox, events):
+        batches.append(len(events))
+        return await enqueue_many(outbox, events)
+
+    monkeypatch.setattr(TelemetryOutbox, "enqueue_many", capture_batch)
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    for number in range(1, 9):
+        runtime.record_background(_turn_event(number))
+    runtime.record_background(_turn_event(9), priority=OutboxPriority.HIGH)
+    assert len(runtime._record_queue) == 4
+    assert len(runtime._record_tasks) == 1
+    await runtime.close(flush=False)
+    assert batches == [2, 2]
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        batch = await outbox.claim_batch()
+        assert batch is not None
+        assert {event.event_id for event in batch.events} == {
+            str(_turn_event(number).event_id) for number in (2, 3, 4, 9)
+        }
+    finally:
+        await outbox.close()
+
+
+async def test_background_coalesces_across_callbacks_and_close_wakes_pending_flush(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_module, "BACKGROUND_RECORD_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr(runtime_module, "get_device_id", lambda: None)
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    waiting = asyncio.Event()
+    flush_wait = runtime._record_flush.wait
+    batches = []
+    enqueue_many = TelemetryOutbox.enqueue_many
+
+    async def capture_wait():
+        waiting.set()
+        await flush_wait()
+
+    async def capture_batch(outbox, events):
+        batches.append(len(events))
+        return await enqueue_many(outbox, events)
+
+    monkeypatch.setattr(runtime._record_flush, "wait", capture_wait)
+    monkeypatch.setattr(TelemetryOutbox, "enqueue_many", capture_batch)
+    runtime.record_background(_turn_event(1))
+    await asyncio.wait_for(waiting.wait(), timeout=5)
+    assert runtime.opened_scopes == frozenset()
+    runtime.record_background(_turn_event(2))
+    await asyncio.wait_for(runtime.close(flush=False), timeout=5)
+    assert batches == [2]
+
+
+async def test_hundred_background_events_use_four_commits_and_one_spool_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_module, "get_device_id", lambda: None)
+    commits = 0
+    scans = 0
+    open_outbox = TelemetryOutbox.open.__func__
+
+    async def capture_open(cls, *args, **kwargs):
+        outbox = await open_outbox(cls, *args, **kwargs)
+        commit = outbox._connection.commit
+
+        async def capture_commit():
+            nonlocal commits
+            commits += 1
+            await commit()
+
+        monkeypatch.setattr(outbox._connection, "commit", capture_commit)
+        return outbox
+
+    async def scan_spool():
+        nonlocal scans
+        scans += 1
+
+    async def no_upload(_scope):
+        return None
+
+    monkeypatch.setattr(TelemetryOutbox, "open", classmethod(capture_open))
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    monkeypatch.setattr(runtime, "_drain_desktop_spool", scan_spool)
+    monkeypatch.setattr(runtime, "upload_once", no_upload)
+    for number in range(1, 101):
+        runtime.record_background(_turn_event(number))
+    await asyncio.wait_for(asyncio.gather(*tuple(runtime._record_tasks)), timeout=10)
+    assert commits == 4
+    assert scans == 1
+    await runtime.close(flush=False)
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        assert (await outbox.stats()).pending_events == 100
+    finally:
+        await outbox.close()
+
+
+async def test_awaited_gateway_start_preserves_device_attribution_off_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.telemetry.contracts.common import ResultOutcome
+    from opensquilla.telemetry.reliability_sink import ReliabilityEventSink
+
+    main_thread = threading.get_ident()
+    resolver_threads = []
+
+    def resolve_identity():
+        resolver_threads.append(threading.get_ident())
+        return "b" * 64
+
+    monkeypatch.setattr(runtime_module, "get_device_id", resolve_identity)
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    sink = ReliabilityEventSink(runtime)
+    await sink.record_gateway_start(
+        outcome=ResultOutcome.SUCCESS, error_code=None, failure_stage=None, duration_ms=1,
+    )
+    assert len(resolver_threads) == 1 and resolver_threads[0] != main_thread
+    await runtime.close(flush=False)
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        batch = await outbox.claim_batch()
+        assert batch is not None
+        assert json.loads(batch.events[0].payload)["device_id"] == "b" * 64
+    finally:
+        await outbox.close()
+
+
+async def test_background_records_captured_before_disable_are_not_reauthorized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+
+    def forbidden_identity():
+        raise AssertionError("obsolete observations must not resolve device identity")
+
+    monkeypatch.setattr(runtime_module, "get_device_id", forbidden_identity)
+    config = _config(tmp_path)
+    runtime = ScopedTelemetryRuntime(config=config, env={})
+    coordinator = scope_consent_coordinator_for(config)
+    runtime.record_background(_turn_event(1))
+    runtime.record_background(_turn_event(2))
+    async with coordinator.transition(TelemetryScope.RELIABILITY):
+        config.privacy.disable_network_observability = True
+    async with coordinator.transition(TelemetryScope.RELIABILITY):
+        config.privacy.disable_network_observability = False
+    await runtime.close(flush=False)
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        assert (await outbox.stats()).pending_events == 0
+    finally:
+        await outbox.close()
+
+
+async def test_background_identity_resolution_leaves_application_loop_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    resolver_threads = []
+    synthetic_device_id = "a" * 64
+
+    def delayed_identity():
+        resolver_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(5)
+        return synthetic_device_id
+
+    monkeypatch.setattr(runtime_module, "get_device_id", delayed_identity)
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    try:
+        assert runtime.device_id_for(TelemetryScope.RELIABILITY) is None
+        runtime.record_background(_turn_event())
+        assert resolver_threads == []
+        assert await asyncio.to_thread(entered.wait, 5)
+        # Resolving identity in a worker must allow unrelated callbacks to run.
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        assert resolver_threads != [threading.get_ident()]
+    finally:
+        release.set()
+        await runtime.close(flush=False)
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        batch = await outbox.claim_batch()
+        assert batch is not None
+        assert json.loads(batch.events[0].payload)["device_id"] == synthetic_device_id
+    finally:
+        await outbox.close()
+
+
+async def test_background_batch_conflict_does_not_discard_valid_peers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_module, "get_device_id", lambda: None)
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    await runtime.record(_turn_event(1))
+    runtime.record_background(_turn_event(1).model_copy(update={"duration_ms": 999}))
+    runtime.record_background(_turn_event(2))
+    await runtime.close(flush=False)
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    try:
+        assert (await outbox.stats()).pending_events == 2
+    finally:
+        await outbox.close()
+
+
+async def test_desktop_checkpoint_failure_does_not_skip_remaining_batch_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpointed = []
+
+    def checkpoint(_state_dir, event):
+        checkpointed.append(str(event.event_id))
+        if len(checkpointed) == 1:
+            raise OSError("Synthetic first checkpoint failure")
+
+    monkeypatch.setattr(runtime_module, "record_desktop_turn", checkpoint)
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    runtime.record_background(_turn_event(1))
+    runtime.record_background(_turn_event(2))
+    await runtime.close(flush=False)
+    assert checkpointed == [str(_turn_event(number).event_id) for number in (1, 2)]
+
+
 async def test_background_record_from_worker_returns_to_owner_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -328,9 +547,18 @@ async def test_default_upload_policy_drains_desktop_growth_into_isolated_outbox(
         upload_interval_seconds=60,
         env={},
     )
+    imported = asyncio.Event()
+    run_cycle = runtime._run_upload_cycle
+
+    async def import_cycle():
+        await run_cycle()
+        imported.set()
+
+    monkeypatch.setattr(runtime, "_run_upload_cycle", import_cycle)
 
     await runtime.start()
     try:
+        await asyncio.wait_for(imported.wait(), timeout=5)
         scoped = runtime._scopes[TelemetryScope.GROWTH]
         assert (await scoped.outbox.stats()).pending_events == 1
         assert not ready.exists()
@@ -458,10 +686,10 @@ async def test_close_drains_accepted_local_record_without_starting_upload(
     starts = 0
     record = runtime.record
 
-    async def slow_record(event, *, priority=None):
+    async def slow_record(event, **kwargs):
         entered.set()
         await release.wait()
-        result = await record(event, priority=priority)
+        result = await record(event, **kwargs)
         recorded.set()
         return result
 
@@ -514,6 +742,29 @@ async def test_close_during_start_does_not_leave_an_upload_task(
     assert runtime._record_tasks == set()
 
 
+async def test_start_returns_before_desktop_spool_io_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_spool():
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(runtime, "_drain_desktop_spool", slow_spool)
+    try:
+        await asyncio.wait_for(runtime.start(), timeout=1)
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert runtime._upload_task is not None
+        assert not release.is_set()
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        await runtime.close(flush=False)
+
+
 async def test_close_uploads_records_created_after_empty_startup_cycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_uploads
 ) -> None:
@@ -548,9 +799,10 @@ async def test_close_uploads_records_created_after_empty_startup_cycle(
 
 @pytest.mark.parametrize("start_upload", [False, True], ids=["final-flush", "in-flight"])
 @pytest.mark.parametrize("cancel_close", [False, True], ids=["deadline", "caller-cancel"])
+@pytest.mark.parametrize("pause_before_guard", [False, True], ids=["ready", "preempted"])
 async def test_close_cancels_stalled_upload_and_preserves_unacknowledged_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_uploads, cancel_close: bool,
-    start_upload: bool, expire_shutdown_deadline,
+    start_upload: bool, pause_before_guard: bool, expire_shutdown_deadline,
 ) -> None:
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -572,6 +824,18 @@ async def test_close_cancels_stalled_upload_and_preserves_unacknowledged_event(
             await asyncio.wait_for(entered.wait(), timeout=1)
         assert (runtime._upload_task is not None) is start_upload
         monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
+        if pause_before_guard:
+            prepare_shutdown = runtime.prepare_shutdown
+
+            def preempted_shutdown():
+                prepare_shutdown()
+                # Model OS preemption after creating the guard but before it
+                # can run. This is fault injection, not a readiness wait.
+                started = time.monotonic()
+                time.sleep(0.1)
+                assert time.monotonic() - started > 0.05
+
+            monkeypatch.setattr(runtime, "prepare_shutdown", preempted_shutdown)
         closing = asyncio.create_task(runtime.close())
         if not start_upload:
             await asyncio.wait_for(entered.wait(), timeout=1)
@@ -738,77 +1002,44 @@ async def test_close_closes_scopes_initialized_by_an_already_running_cycle(
         )
 
 
-async def test_close_releases_stalled_send_lock_before_draining_accepted_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_uploads
+@pytest.mark.ci_serial
+def test_close_releases_stalled_send_lock_before_draining_accepted_record(tmp_path: Path) -> None:
+    result = run_shutdown_probe(tmp_path, mode="close")
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "TELEMETRY_PROBE_PASSED" in result.output
+
+
+@pytest.mark.ci_serial
+def test_prepare_shutdown_releases_send_lock_and_keeps_producer_records_open(
+    tmp_path: Path,
 ) -> None:
-    entered = asyncio.Event()
-    cancelled = asyncio.Event()
-
-    async def stalled(_request):
-        entered.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    offline_uploads.handler = stalled
-    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), upload_interval_seconds=60)
-    await runtime.record(_turn_event(1))
-    await runtime.start()
-    await asyncio.wait_for(entered.wait(), timeout=1)
-    # SEND and ENQUEUE share a consent lock. This accepted record must remain
-    # durable even when it cannot acquire that lock until the send is cancelled.
-    runtime.record_background(_turn_event(2))
-    await asyncio.sleep(0)
-    monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
-    await asyncio.wait_for(runtime.close(), timeout=1)
-
-    assert cancelled.is_set()
-    assert len(offline_uploads.requests) == 1
-    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
-    try:
-        stats = await outbox.stats()
-        assert stats.pending_events == 2
-        assert stats.leased_events == 1
-    finally:
-        await outbox.close()
+    result = run_shutdown_probe(tmp_path, mode="prepare")
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "TELEMETRY_PROBE_PASSED" in result.output
 
 
-async def test_prepare_shutdown_releases_send_lock_and_keeps_producer_records_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_uploads
-) -> None:
-    entered = asyncio.Event()
-    cancelled = asyncio.Event()
+@pytest.mark.ci_serial
+@pytest.mark.parametrize(
+    ("fault", "failure"),
+    [("no-cancel", "upload-cancelled did not become ready"),
+     ("drop-record", "accepted records were lost")],
+)
+def test_shutdown_probe_rejects_broken_contracts(tmp_path: Path, fault: str, failure: str) -> None:
+    result = run_shutdown_probe(tmp_path, fault=fault)
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert failure in result.output
+    assert "TELEMETRY_PROBE_PASSED" not in result.output
 
-    async def stalled(_request):
-        entered.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
 
-    offline_uploads.handler = stalled
-    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), upload_interval_seconds=60)
-    await runtime.record(_turn_event(1))
-    await runtime.start()
-    await asyncio.wait_for(entered.wait(), timeout=1)
-    monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
-    runtime.prepare_shutdown()
-    runtime.prepare_shutdown()
-    # Producer shutdown can wait for this direct write before runtime.close.
-    assert (await asyncio.wait_for(runtime.record(_turn_event(2)), timeout=1)).status is (
-        RecordStatus.RECORDED
-    )
-    runtime.record_background(_turn_event(3))
-    await asyncio.wait_for(runtime.close(), timeout=1)
-
-    assert cancelled.is_set()
-    assert len(offline_uploads.requests) == 1
-    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
-    try:
-        assert (await outbox.stats()).pending_events == 3
-    finally:
-        await outbox.close()
+@pytest.mark.ci_serial
+def test_shutdown_probe_bounds_noncooperative_cleanup(tmp_path: Path) -> None:
+    result = run_shutdown_probe(tmp_path, fault="cleanup-hang", execution_seconds=2)
+    assert result.timed_out == "execution/cleanup", result.output
+    assert result.returncode != 0
+    assert "phase=cleanup-blocked" in result.output
 
 
 async def test_close_uploads_other_scope_while_inflight_request_stalls(
@@ -1012,3 +1243,53 @@ async def test_runtime_reliability_producers_reach_strict_collector_on_exit(
         assert (await outbox.stats()).pending_events == 0
     finally:
         await outbox.close()
+
+
+@pytest.mark.parametrize("blocked_path", ["root", "scope"])
+async def test_desktop_spool_directory_checks_keep_agent_loop_responsive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_path: str,
+) -> None:
+    runtime = ScopedTelemetryRuntime(config=_config(tmp_path), env={})
+    root = runtime_module.desktop_early_spool_root(tmp_path)
+    scope_directory = root / TelemetryScope.RELIABILITY.value
+    scope_directory.mkdir(parents=True)
+    target = root if blocked_path == "root" else scope_directory
+    entered = threading.Event()
+    release = threading.Event()
+    owner_thread = threading.get_ident()
+    real_lstat = Path.lstat
+
+    def blocked_lstat(path: Path, *args, **kwargs):
+        if path == target:
+            entered.set()
+            assert threading.get_ident() != owner_thread
+            assert release.wait(timeout=5), "filesystem worker was not released"
+        return real_lstat(path, *args, **kwargs)
+
+    initialized_scopes = []
+
+    async def initialize_scope(scope):
+        assert threading.get_ident() == owner_thread
+        initialized_scopes.append(scope)
+        return None
+
+    monkeypatch.setattr(Path, "lstat", blocked_lstat)
+    monkeypatch.setattr(runtime, "_scope_runtime", initialize_scope)
+    draining = asyncio.create_task(runtime._drain_desktop_spool())
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        agent_steps = []
+        for step in range(3):
+            await asyncio.sleep(0)
+            agent_steps.append(step)
+        assert agent_steps == [0, 1, 2]
+        assert not draining.done()
+        assert initialized_scopes == []
+    finally:
+        release.set()
+        await draining
+        await runtime.close(flush=False)
+
+    assert initialized_scopes == [TelemetryScope.RELIABILITY]

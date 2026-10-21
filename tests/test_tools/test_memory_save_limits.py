@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from opensquilla.tools.builtin.memory_tools import create_memory_tools
 from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.types import ToolError
 
 
 class _Store:
@@ -55,3 +58,24 @@ async def test_max_files_cap_ignores_non_memory_markdown(tmp_path):
     result = await memory_save(content="durable fact", path="memory/2026-07-09.md")
     assert "Saved to memory/2026-07-09.md" in result
     assert (workspace / "memory" / "2026-07-09.md").exists()
+
+
+async def test_max_files_cap_rejects_creation_without_deleting_existing_notes(tmp_path):
+    workspace = tmp_path / "project"
+    notes = workspace / "memory"
+    notes.mkdir(parents=True)
+    originals = {"oldest.md": "keep oldest", "newer.md": "keep newer"}
+    for name, content in originals.items():
+        (notes / name).write_text(content, encoding="utf-8")
+    memory_save = _make_memory_save(str(workspace), max_files=2)
+
+    with pytest.raises(ToolError, match="max file count reached"):
+        await memory_save(content="new fact", path="memory/another.md")
+
+    assert {path.name: path.read_text(encoding="utf-8") for path in notes.iterdir()} == originals
+
+    # The limit is admission control, not FIFO retention. Explicit changes to an
+    # existing target remain allowed and never evict a different note.
+    await memory_save(content="replacement", path="memory/newer.md", mode="replace")
+    assert (notes / "oldest.md").read_text(encoding="utf-8") == "keep oldest"
+    assert (notes / "newer.md").read_text(encoding="utf-8") == "replacement"

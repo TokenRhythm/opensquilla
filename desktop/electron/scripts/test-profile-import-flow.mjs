@@ -14,6 +14,10 @@ import {
   desktopShutdownEvidenceSince,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
+import {
+  captureElectronProcessIdentity,
+  electronProcessSnapshot,
+} from './packaged-first-send-cleanup.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -254,6 +258,7 @@ function launchEnvironment(isolatedHome, port) {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
+    APPDATA: join(isolatedHome, 'AppData', 'Roaming'),
     LOCALAPPDATA: join(isolatedHome, 'LocalAppData'),
     TEMP: join(isolatedHome, 'Temp'),
     TMP: join(isolatedHome, 'Temp'),
@@ -280,12 +285,15 @@ function launchEnvironment(isolatedHome, port) {
 }
 
 async function launchDesktop(userData, isolatedHome, port) {
+  await mkdir(join(isolatedHome, 'AppData', 'Roaming'), { recursive: true })
   await mkdir(join(isolatedHome, 'LocalAppData'), { recursive: true })
   await mkdir(join(isolatedHome, 'Temp'), { recursive: true })
-  return await electron.launch({
+  const launched = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome, port),
   })
+  activeAppIdentity = await captureElectronProcessIdentity(launched)
+  return launched
 }
 
 async function onboardingPage(app) {
@@ -361,24 +369,80 @@ const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-profile-im
 let app = null
 let fakeProvider = null
 let activeAppUserData = null
+let activeAppIdentity = null
+let runError = null
 
 async function closeActiveApp(phase, { failOnError = true } = {}) {
   if (!app) return
   const targetApp = app
   const profileUserData = activeAppUserData
-  app = null
-  activeAppUserData = null
+  const identity = activeAppIdentity
   const desktopLogPath = join(profileUserData, 'logs', 'desktop.log')
   const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
   const shutdown = await closeElectronWithDeadline({
     app: targetApp,
     phase,
     timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+    diagnostics: async () => {
+      const currentLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+      const appended = typeof desktopLogCheckpoint === 'string'
+        && currentLog?.startsWith(desktopLogCheckpoint)
+        ? currentLog.slice(desktopLogCheckpoint.length) : ''
+      const filterEvents = log => (log ?? '').split(/\r?\n/).flatMap(line => {
+        let record
+        try { record = JSON.parse(line) } catch { return [] }
+        if (!['before_quit', 'desktop_exit_phase', 'quit_gateway_shutdown_requested',
+          'quit_gateway_exit', 'gateway_exited', 'quit_gateway_drain_failed',
+          'quit_gateway_still_running', 'quit_deferred_for_profile_writer',
+          'quit_deferred_for_update_drain', 'quit_gateway_activity_checked',
+          'quit_confirmation_required', 'quit_confirmed', 'quit_cancelled_by_user',
+          'quit_confirmation_failed', 'quit_confirmation_window_failed',
+          'gateway_starting', 'gateway_child_spawned', 'gateway_ready',
+          'gateway_stop_requested', 'gateway_child_exited', 'gateway_stop_join_complete',
+          'quit_gateway_process_cleanup', 'stopped_gateway_process_cleanup_failed'].includes(record?.event)) return []
+        return [{
+          event: record.event,
+          at: typeof record.at === 'string' && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(record.at) ? record.at : null,
+          phase: ['running', 'deferred', 'draining', 'committed'].includes(record.to) ? record.to : null,
+          accepted: typeof record.accepted === 'boolean' ? record.accepted : null,
+          exited: typeof record.exited === 'boolean' ? record.exited : null,
+          hardTerminated: typeof record.hardTerminated === 'boolean' ? record.hardTerminated : null,
+          activeWriters: Number.isSafeInteger(record.activeWriters) ? record.activeWriters : null,
+          pid: Number.isSafeInteger(record.pid) && record.pid > 0 ? record.pid : null,
+          kind: ['ok', 'unreachable', 'unsupported', 'rejected'].includes(record.kind) ? record.kind : null,
+          activeCount: Number.isSafeInteger(record.activeCount) && record.activeCount >= 0 ? record.activeCount : null,
+          ownershipMatched: typeof record.ownershipMatched === 'boolean' ? record.ownershipMatched : null,
+          retainedScope: typeof record.retainedScope === 'boolean' ? record.retainedScope : null,
+          gatewayStatus: ['starting', 'ready', 'stopped', 'error'].includes(record.gatewayStatus) ? record.gatewayStatus : null,
+          activity: ['active', 'unknown'].includes(record.activity) ? record.activity : null,
+          complete: typeof record.complete === 'boolean' ? record.complete : null,
+          code: Number.isSafeInteger(record.code) ? record.code : null,
+          signal: ['SIGTERM', 'SIGKILL', 'SIGINT'].includes(record.signal) ? record.signal : null,
+        }]
+      })
+      const exitEvents = filterEvents(appended).slice(-50)
+      const recentLifecycleEvents = filterEvents(desktopLogCheckpoint).slice(-24)
+      const snapshot = electronProcessSnapshot(identity)
+      const processes = Object.fromEntries(['wrapper', 'electron'].flatMap(role => [
+        [`${role}Pid`, Number.isSafeInteger(snapshot[`${role}Pid`]) ? snapshot[`${role}Pid`] : null],
+        [`${role}PidExists`, typeof snapshot[`${role}PidExists`] === 'boolean' ? snapshot[`${role}PidExists`] : null],
+      ]))
+      return { processes, exitEvents, recentLifecycleEvents,
+        ...desktopShutdownEvidenceSince(desktopLogCheckpoint, currentLog) }
+    },
   })
+  const processes = electronProcessSnapshot(identity)
+  const ownershipReleased = shutdown.closed || (shutdown.forcedExitSucceeded && shutdown.processTreeReaped
+    && processes.electronPidExists === false)
+  if (ownershipReleased) {
+    app = null
+    activeAppUserData = null
+    activeAppIdentity = null
+  }
   if (!shutdown.error) return
   const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
   const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
-  if (canAcceptWindowsElectronShutdownFallback({
+  if (ownershipReleased && canAcceptWindowsElectronShutdownFallback({
     shutdown,
     ...shutdownEvidence,
   })) {
@@ -389,6 +453,7 @@ async function closeActiveApp(phase, { failOnError = true } = {}) {
     return
   }
   if (failOnError) throw shutdown.error
+  return shutdown.error
 }
 
 try {
@@ -559,12 +624,29 @@ try {
   await app.evaluate(({ dialog }) => {
     dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false })
   })
-  await settingsControl.evaluate(({ previewId }) => {
-    void window.opensquillaDesktop.migrationRun({ previewId, overwrite: true })
-    return true
-  }, { previewId: settingsPreview.previewId })
+  // Migration may remain pending until onboarding completes. Observe its
+  // outcome without awaiting it or extending the onboarding deadline.
+  let migrationRunOutcome = { status: 'pending' }
+  void settingsControl.evaluate(({ previewId }) => (
+    window.opensquillaDesktop.migrationRun({ previewId, overwrite: true })
+  ), { previewId: settingsPreview.previewId }).then(
+    (result) => { migrationRunOutcome = { status: 'resolved', result } },
+    (error) => { migrationRunOutcome = { status: 'rejected', error: error.message || String(error) } },
+  )
 
-  const requiredKeyOnboarding = await onboardingPage(app)
+  let requiredKeyOnboarding
+  try {
+    requiredKeyOnboarding = await onboardingPage(app)
+  } catch (error) {
+    const savedResult = await readFile(
+      join(settingsUserData, 'migration-last-result.json'), 'utf8',
+    ).catch(() => null)
+    throw new Error(
+      `${error.message}; migrationRun: ${JSON.stringify(migrationRunOutcome)}; `
+      + `saved migration result: ${savedResult || 'unavailable'}`,
+      { cause: error },
+    )
+  }
   await requiredKeyOnboarding.locator('[data-screen="1"].active').waitFor({
     state: 'visible',
     timeout: 90_000,
@@ -694,8 +776,30 @@ try {
     previousCredentialBackedUp: true,
     primaryOnly: true,
   }, null, 2))
+} catch (error) {
+  runError = error
+  throw error
 } finally {
-  await closeActiveApp('profile-import-final-shutdown', { failOnError: false })
-  if (fakeProvider) await fakeProvider.close().catch(() => {})
-  await rm(root, { recursive: true, force: true })
+  const cleanupErrors = []
+  try {
+    const shutdownError = await closeActiveApp('profile-import-final-shutdown', { failOnError: false })
+    if (shutdownError) cleanupErrors.push(shutdownError)
+  } catch (error) { cleanupErrors.push(error) }
+  if (fakeProvider) {
+    try { await fakeProvider.close() } catch (error) { cleanupErrors.push(error) }
+  }
+  if (app) {
+    cleanupErrors.push(new Error('Profile import Electron cleanup remains unverified; retaining its isolated profile.'))
+  } else {
+    try { await rm(root, { recursive: true, force: true }) } catch (error) { cleanupErrors.push(error) }
+  }
+  if (cleanupErrors.length > 0) {
+    if (!runError) throw cleanupErrors[0]
+    console.error(JSON.stringify({ event: 'profile_import_cleanup_failed',
+      retainedProfile: app !== null,
+      errors: cleanupErrors.map(error => ({ code: [
+        'EBUSY', 'EACCES', 'EPERM', 'ENOTEMPTY', 'ENOENT', 'DESKTOP_E2E_SHUTDOWN_TIMEOUT',
+      ].includes(error?.code) ? error.code : null })),
+    }))
+  }
 }

@@ -3,13 +3,13 @@
     "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "lookup",
-    "tool_use_id": "call_0",
+    "tool_use_id": "call_00000000000000000000000000000000",
     "type": "ToolUseStartEvent"
   },
   {
     "generation_epoch": null,
     "json_fragment": "{\"q\": \"cache\"}",
-    "tool_use_id": "call_0",
+    "tool_use_id": "call_00000000000000000000000000000000",
     "type": "ToolUseDeltaEvent"
   },
   {
@@ -19,7 +19,7 @@
     "generation_epoch": null,
     "synthetic_from_text": false,
     "tool_name": "lookup",
-    "tool_use_id": "call_0",
+    "tool_use_id": "call_00000000000000000000000000000000",
     "type": "ToolUseEndEvent"
   },
   {

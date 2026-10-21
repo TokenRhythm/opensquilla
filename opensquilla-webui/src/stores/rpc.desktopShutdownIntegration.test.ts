@@ -77,7 +77,7 @@ function hello(socket: Socket) {
     snapshot: {}, policy: {},
     auth: { principal: {
       role: 'operator',
-      scopes: ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.proposals', 'operator.read', 'operator.write'],
+      scopes: ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write'],
       capabilities: ['host.execute', 'host.read', 'task.read', 'task.submit'],
       isOwner: true, authenticated: false, authState: 'authenticated', tokenPublicId: null,
     } },

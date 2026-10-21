@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { lstat, readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, join, resolve, sep } from 'node:path'
@@ -15,7 +16,13 @@ const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const sourceMainPath = join(packageRoot, 'src', 'main.ts')
 const compiledMainPath = join(packageRoot, 'dist', 'main.js')
 const packageJsonPath = join(packageRoot, 'package.json')
-const desktopOutputDir = join(repoRoot, 'dist', 'desktop-electron')
+// Allow packaged verification to run from a short Windows staging root. The
+// normal output remains the repository dist directory; the override prevents
+// MAX_PATH from turning a valid candidate into a false packaged-runtime
+// failure when this worktree is deeply nested.
+const desktopOutputDir = process.env.OPEN_SQUILLA_PACKAGE_OUTPUT
+  ? resolve(process.env.OPEN_SQUILLA_PACKAGE_OUTPUT)
+  : join(repoRoot, 'dist', 'desktop-electron')
 const controlUiVerifierPath = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 
 const failures = []
@@ -278,14 +285,26 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
     }
   }
 
+  // Require the bundled asset itself: a warm user TEMP cache must not conceal
+  // an incomplete package when the tokenizer smoke runs below.
+  const tokenizerAssets = files.filter((path) => path.endsWith(join(
+    'tiktoken-cache', '9b5ad71b2ce5302211f9c61530b329a4922fc6a4',
+  )))
+  if (tokenizerAssets.length !== 1) {
+    fail(`${label} must contain exactly one bundled cl100k_base encoding asset`)
+  } else if (createHash('sha256').update(await readFile(tokenizerAssets[0])).digest('hex')
+    !== '223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7') {
+    fail(`${label} bundled cl100k_base encoding checksum mismatch`)
+  }
+
   const binary = requireGatewayBinary(root, label, platform)
   if (executeCommands) {
     if (!binary) return
+    verifyGatewayCommand(binary, label, ['--_desktop-tool-search-probe'])
     verifyGatewayCommand(binary, label, ['--help'])
-    verifyGatewayCommand(binary, label, ['code-task', '--help'])
-    verifyGatewayCommand(binary, label, ['code-task', 'stage-task-file'], { input: 'desktop package smoke\n' })
-    verifyGatewayCommand(binary, label, ['code-task', 'smoke-imports'], { timeout: 120000 })
-    verifyGatewayCommand(binary, label, ['code-task', 'smoke-router'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-imports'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-tokenizer'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-router'], { timeout: 120000 })
   }
 
   if (platform === 'darwin') {

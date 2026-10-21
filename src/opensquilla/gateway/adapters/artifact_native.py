@@ -91,6 +91,8 @@ def _prune_artifact_open_cache(root: Path) -> None:
 
 
 def _materialize_artifact_for_open(material: ContentMaterial) -> Path:
+    if material.path is None:
+        raise OSError("artifact content has no file path")
     root = _artifact_open_cache_dir()
     _prune_artifact_open_cache(root)
     name = _safe_open_filename(material.filename or "artifact")

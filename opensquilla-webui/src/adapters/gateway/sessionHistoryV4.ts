@@ -1,4 +1,6 @@
+import { providerHttpStatus } from '@/utils/chat/providerRecovery'
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
@@ -15,9 +17,11 @@ import {
 } from '@/contracts/generated/v4/chatHistoryValidators.mjs'
 import {
   type SessionReadCompactionSummary,
+  type SessionReadContentRef,
   type SessionReadHistoryPage,
   type SessionReadJsonObject,
   type SessionReadMessage,
+  type SessionReadPayloadPreview,
   type SessionReadPortHistoryRequest,
   type SessionReadTurnContext,
   type SessionReadTurnOutcome,
@@ -136,12 +140,67 @@ const MESSAGE_FIELDS = new Set([
   'artifacts', 'tool_calls', 'toolCalls', 'timeline', 'attachments',
   'prompt_annotations', 'promptAnnotations', 'page_context', 'pageContext', 'provenance_kind',
   'selectedSkills', 'selected_skills',
+  'localPathReferences', 'local_path_references',
   'provenance_source_session_key', 'provenance_source_tool', 'turn_context',
   'turnContext', 'usage', 'turn_usage', 'turnUsage', 'model', 'model_id',
   'input', 'input_tokens', 'inputTokens', 'output', 'output_tokens', 'outputTokens',
+  'contentRef', 'content_ref',
+  'contentUnavailableReason', 'content_unavailable_reason',
+  'contentPreviewComplete', 'content_preview_complete', 'contentRevision', 'content_revision',
+  'contentMetadataPending', 'content_metadata_pending',
+  'historyPayloadPreview',
 ])
 
-function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMessage {
+function projectPayloadPreview(value: unknown): SessionReadPayloadPreview | undefined {
+  const raw = objectValue(value)
+  if (!raw) return undefined
+  const length = (value: unknown): value is number => typeof value === 'number'
+    && Number.isSafeInteger(value) && value >= 0
+  return Object.freeze({
+    ...(raw.detailsTruncated === true ? { detailsTruncated: true } : {}),
+    ...(length(raw.reasoningUtf16Length) ? { reasoningUtf16Length: raw.reasoningUtf16Length } : {}),
+    ...(Array.isArray(raw.textUtf16Lengths) && raw.textUtf16Lengths.length <= 2048
+      && raw.textUtf16Lengths.every(length)
+      ? { textUtf16Lengths: Object.freeze([...raw.textUtf16Lengths]) } : {}),
+  })
+}
+
+function projectContentRef(value: unknown): SessionReadContentRef | undefined {
+  const raw = objectValue(value)
+  if (!raw) return undefined
+  const version = numberValue(raw.version)
+  const sessionKey = textValue(raw.sessionKey, raw.session_key)
+  const sessionId = textValue(raw.sessionId, raw.session_id)
+  const messageId = textValue(raw.messageId, raw.message_id)
+  const source = textValue(raw.source)
+  const view = textValue(raw.view)
+  const revision = textValue(raw.revision)
+  const sha256 = textValue(raw.sha256)
+  if (
+    version !== 1
+    || !sessionKey
+    || !sessionId
+    || !messageId
+    || (source !== null && source !== 'active' && source !== 'compacted')
+    || (view !== null && view !== 'raw' && view !== 'display')
+  ) return undefined
+  const byteLength = numberValue(raw.byteLength, raw.byte_length)
+  return Object.freeze({
+    version: 1,
+    sessionKey,
+    sessionId,
+    messageId,
+    ...(source ? { source } : {}),
+    ...(view ? { view } : {}),
+    ...(byteLength !== null ? { byteLength } : {}),
+    ...(revision ? { revision } : {}),
+    ...(sha256 ? { sha256 } : {}),
+  })
+}
+
+/** Shared only after the calling adapter validates its generated wire Contract. */
+export function projectHistoryMessage(validated: unknown, index: number): SessionReadMessage {
+  const value = validated as ChatHistoryMessage
   const raw = value as Record<string, unknown>
   const messageId = textValue(value.message_id)
   const transcriptId = textValue(value.transcript_id)
@@ -149,12 +208,21 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
   const routing = objectValue(raw.router_decision ?? raw.routerDecision)
   const reasoning = raw.reasoning_content ?? raw.reasoningContent
   const timestamp = value.timestamp ?? value.ts
+  const ref = projectContentRef(raw.contentRef ?? raw.content_ref)
+  const previewComplete = booleanValue(raw.contentPreviewComplete, raw.content_preview_complete) ?? undefined
+  const reason = textValue(raw.contentUnavailableReason, raw.content_unavailable_reason)
+  const pending = booleanValue(raw.contentMetadataPending, raw.content_metadata_pending) === true
+    || reason === 'content_metadata_pending'
+  const contentUnavailableReason = pending ? 'content_metadata_pending'
+    : reason === 'display_projection_too_large' || reason === 'content_reference_unavailable'
+      ? reason : undefined
   return Object.freeze({
     id: textValue(value.id, messageId, transcriptId) ?? `history:${index}`,
     messageId,
     transcriptId,
     role: textValue(value.role)?.toLowerCase() ?? 'unknown',
     text: typeof value.text === 'string' ? value.text : '',
+    localPathReferences: copyLocalPathReferences(raw.localPathReferences ?? raw.local_path_references, value.text),
     createdAt: typeof timestamp === 'string' || typeof timestamp === 'number'
       ? timestamp
       : null,
@@ -195,6 +263,13 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
       usageRaw?.outputTokens,
       usageRaw?.output,
     ),
+    contentRef: ref,
+    previewComplete,
+    historyPayloadPreview: projectPayloadPreview(raw.historyPayloadPreview),
+    contentRevision: textValue(raw.contentRevision, raw.content_revision) ?? ref?.revision,
+    contentAvailability: pending ? 'preparing' : contentUnavailableReason ? 'unavailable'
+      : previewComplete !== undefined || ref ? 'ready' : undefined,
+    contentUnavailableReason,
     additional: additionalFields(raw, MESSAGE_FIELDS),
   })
 }
@@ -205,7 +280,8 @@ const COMPACTION_FIELDS = new Set([
   'covered_through_id', 'created_at',
 ])
 
-function projectCompaction(value: CompactionSummary): SessionReadCompactionSummary {
+export function projectHistoryCompaction(validated: unknown): SessionReadCompactionSummary {
+  const value = validated as CompactionSummary
   const raw = value as Record<string, unknown>
   return Object.freeze({
     id: textValue(value.id),
@@ -229,10 +305,11 @@ const TURN_OUTCOME_FIELDS = new Set([
   'activitySnapshot', 'usage', 'turn_usage', 'turnUsage', 'usage_call_index',
   'usageCallIndex', 'no_prior_provider_dispatch', 'noPriorProviderDispatch',
   'replay_safe', 'replaySafe', 'retry_after_ms', 'retryAfterMs',
-  'user_message_id', 'userMessageId', 'terminal_message', 'terminalMessage',
+  'user_message_id', 'userMessageId', 'terminal_message', 'terminalMessage', 'http_status',
 ])
 
-function projectTurnOutcome(value: TurnOutcome): SessionReadTurnOutcome {
+export function projectHistoryTurnOutcome(validated: unknown): SessionReadTurnOutcome {
+  const value = validated as TurnOutcome
   const raw = value as Record<string, unknown>
   const terminalMessage = raw.terminal_message ?? raw.terminalMessage
   return Object.freeze({
@@ -243,6 +320,7 @@ function projectTurnOutcome(value: TurnOutcome): SessionReadTurnOutcome {
     finishedAt: numberValue(value.finished_at),
     outcome: projectObject(value.outcome) ?? Object.freeze({}),
     errorClass: textValue(raw.error_class, raw.errorClass, raw.code),
+    ...(Object.prototype.hasOwnProperty.call(raw, 'http_status') ? { httpStatus: providerHttpStatus(raw.http_status) ?? null } : {}),
     retryable: booleanValue(raw.retryable),
     activitySnapshot: projectObject(raw.activity_snapshot ?? raw.activitySnapshot),
     usage: projectObject(raw.turn_usage ?? raw.turnUsage ?? raw.usage),
@@ -277,7 +355,7 @@ function projectV4SessionHistory(
   proof: CanonicalProofPresence,
 ): SessionReadHistoryPage {
   return Object.freeze({
-    messages: Object.freeze(value.messages.map(projectMessage)),
+    messages: Object.freeze(value.messages.map(projectHistoryMessage)),
     hasMore: value.has_more,
     oldestCursor: value.oldest_cursor,
     newestCursor: value.newest_cursor,
@@ -286,8 +364,8 @@ function projectV4SessionHistory(
     pageSize: value.page_size,
     canonicalAvailable: proof.canonicalAvailable,
     canonicalComplete: proof.canonicalComplete,
-    compactionSummaries: Object.freeze(value.compaction_summaries.map(projectCompaction)),
-    turnOutcomes: Object.freeze(value.turn_outcomes.map(projectTurnOutcome)),
+    compactionSummaries: Object.freeze(value.compaction_summaries.map(projectHistoryCompaction)),
+    turnOutcomes: Object.freeze(value.turn_outcomes.map(projectHistoryTurnOutcome)),
     additional: additionalFields(value as Record<string, unknown>, HISTORY_FIELDS),
   })
 }

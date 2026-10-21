@@ -19,12 +19,15 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
 
   const setStatusFilter = vi.fn()
   const loadData = vi.fn(async () => loadDataResult)
-  const scrollIntoView = vi.fn()
   const rpcCall = vi.fn(async (_method: string) => reloadResult)
   const ready = vi.fn(async () => {})
   const pushToast = vi.fn()
+  const uninstallSkill = vi.fn(async (_name: string, _installId: string) => true)
   const routeState = ref<{ query: { skill?: string } }>({ query: {} })
   const allSkills = ref<Array<{ name: string; active?: boolean; install_id?: string }>>([])
+  const catalogLoading = ref(false)
+  const catalogHasLoaded = ref(true)
+  const catalogError = ref<string | null>(null)
   const detail = vi.fn(async (skill: { name: string }) => ({ ...skill, content: 'Synthetic content' }))
   const push = vi.fn(async () => undefined)
   const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [{ name: 'synthetic-target', instanceId: 'skill:synthetic', digest: 'a'.repeat(64), kind: 'skill', disabled: false, ready: true }] }))
@@ -36,26 +39,17 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
       return () => h('span')
     },
   })
-  const emptyStub = (name: string) => defineComponent({
-    name,
-    setup(_, { slots }) {
-      return () => h('div', { 'data-testid': name }, slots.default?.())
-    },
-  })
-
   vi.doMock('@/components/Icon.vue', () => ({ default: iconStub }))
-  vi.doMock('@/components/ControlSwitch.vue', () => ({ default: emptyStub('control-switch') }))
-  vi.doMock('@/components/skills/AutoEnabledSkills.vue', () => ({
-    default: emptyStub('auto-enabled-skills'),
-  }))
   vi.doMock('@/components/skills/SkillDetailDialog.vue', () => ({
     default: defineComponent({
       props: ['skill', 'canUseInTask', 'mutationDisabled', 'loadingContent'],
-      emits: ['useInTask', 'close'],
+      emits: ['useInTask', 'close', 'uninstall'],
       setup(props, { emit }) {
         return () => h('div', { 'data-testid': 'skill-detail-dialog' }, props.skill ? [
           props.canUseInTask ? h('button', { 'data-testid': 'use-skill', disabled: props.mutationDisabled || props.loadingContent, onClick: () => emit('useInTask', props.skill) }, 'Use in new task') : null,
           h('button', { 'data-testid': 'close-skill', onClick: () => emit('close') }, 'Close'),
+          h('button', { 'data-testid': 'uninstall-skill', onClick: () => emit('uninstall', props.skill.name, props.skill.install_id || '') }, 'Remove'),
+          h('span', { 'data-testid': 'selected-skill' }, props.skill.name),
         ] : [])
       },
     }),
@@ -68,15 +62,6 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
       },
       setup(props) {
         return () => h('section', { 'data-testid': 'skill-group' }, props.title)
-      },
-    }),
-  }))
-  vi.doMock('@/components/skills/PendingSkillProposals.vue', () => ({
-    default: defineComponent({
-      name: 'PendingSkillProposalsStub',
-      setup(_, { expose }) {
-        expose({ scrollIntoView })
-        return () => h('section', { 'data-testid': 'pending-proposals' })
       },
     }),
   }))
@@ -104,9 +89,8 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
       name: 'SkillsStatsStub',
       props: {
         tiles: { type: Array, required: true },
-        proposalCount: { type: Number, default: 0 },
       },
-      emits: ['select', 'show-proposals'],
+      emits: ['select'],
       setup(props, { emit }) {
         return () => h('div', { 'data-testid': 'skills-stats' }, [
           ...(props.tiles as Array<{ key: string; label: string }>).map((tile) => h(
@@ -118,17 +102,6 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
             },
             tile.label,
           )),
-          props.proposalCount > 0
-            ? h(
-              'button',
-              {
-                'data-testid': 'stat-proposals',
-                type: 'button',
-                onClick: () => emit('show-proposals'),
-              },
-              'Proposals',
-            )
-            : null,
         ])
       },
     }),
@@ -138,22 +111,6 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   }))
   vi.doMock('@/composables/useToasts', () => ({
     useToasts: () => ({ pushToast }),
-  }))
-
-  vi.doMock('@/composables/skills/useSkillProposals', () => ({
-    useSkillProposals: () => ({
-      proposals: ref([{ id: 'proposal-1' }]),
-      autoEnabledSkills: ref([]),
-      proposalsSettings: ref({ available: false }),
-      proposalsSettingsOn: ref(false),
-      loadProposals: vi.fn(async () => {}),
-      toggleAutoPropose: vi.fn(),
-      setAutoEnableRisk: vi.fn(),
-      showProposal: vi.fn(async () => null),
-      acceptProposal: vi.fn(),
-      rejectProposal: vi.fn(),
-      disableAutoEnabled: vi.fn(),
-    }),
   }))
   vi.doMock('@/composables/skills/useSkillRegistry', () => ({
     useSkillRegistry: (_rpc: unknown, _loadData: unknown, mutationGate: {
@@ -187,7 +144,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
         retryQueueItem: vi.fn(async () => {}),
         clearInstallActivity: vi.fn(),
         installDeps: vi.fn(async () => true),
-        uninstallSkill: vi.fn(async () => true),
+        uninstallSkill,
       }
     },
   }))
@@ -196,12 +153,13 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     skillCatalogKey: (skill: { name: string }) => skill.name,
     skillLayerHelp: (key: string) => `help:${key}`,
     skillLayerLabel: (key: string) => `label:${key}`,
-    isMetaSkill: (skill: { kind?: string }) => skill.kind === 'meta' || skill.kind === 'meta_sop',
     useSkillsCatalog: () => ({
       allSkills,
+      loading: catalogLoading,
+      hasLoaded: catalogHasLoaded,
+      error: catalogError,
       filterText: ref(''),
       statusFilter: ref('all'),
-      metaSkills: ref([]),
       visibleLayerGroups: ref([{ key: 'community', skills: [] }]),
       installedEmpty: ref(false),
       emptyMessage: ref(''),
@@ -249,7 +207,6 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     el,
     nextTick,
     setStatusFilter,
-    scrollIntoView,
     loadData,
     rpcCall,
     ready,
@@ -257,9 +214,13 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     viewActive,
     routeState,
     allSkills,
+    catalogLoading,
+    catalogHasLoaded,
+    catalogError,
     detail,
     push,
     listCandidates,
+    uninstallSkill,
   }
 }
 
@@ -271,14 +232,10 @@ beforeEach(() => {
 afterEach(() => {
   vi.doUnmock('vue-router')
   vi.doUnmock('@/components/Icon.vue')
-  vi.doUnmock('@/components/ControlSwitch.vue')
-  vi.doUnmock('@/components/skills/AutoEnabledSkills.vue')
   vi.doUnmock('@/components/skills/SkillDetailDialog.vue')
   vi.doUnmock('@/components/skills/SkillGroup.vue')
-  vi.doUnmock('@/components/skills/PendingSkillProposals.vue')
   vi.doUnmock('@/components/skills/SkillsAddDrawer.vue')
   vi.doUnmock('@/components/skills/SkillsStats.vue')
-  vi.doUnmock('@/composables/skills/useSkillProposals')
   vi.doUnmock('@/composables/skills/useSkillRegistry')
   vi.doUnmock('@/composables/skills/useSkillsCatalog')
   vi.doUnmock('@/composables/useToasts')
@@ -286,6 +243,55 @@ afterEach(() => {
 })
 
 describe('SkillsView stats navigation', () => {
+  it.each(['first', 'second'])('keeps reopened %s detail visible after uninstalling the previous opening', async nextName => {
+    const state = await mountSkillsView()
+    let finish!: (value: boolean) => void
+    state.uninstallSkill.mockReturnValueOnce(new Promise<boolean>(resolve => { finish = resolve }))
+    state.allSkills.value = [
+      { name: 'first', install_id: 'install:first' },
+      { name: 'second', install_id: 'install:second' },
+    ]
+    state.routeState.value.query.skill = 'first'
+    await vi.waitFor(() => expect(state.el.querySelector('[data-testid="selected-skill"]')?.textContent).toBe('first'))
+    state.el.querySelector<HTMLButtonElement>('[data-testid="uninstall-skill"]')!.click()
+    expect(state.uninstallSkill).toHaveBeenCalledExactlyOnceWith('first', 'install:first')
+    state.el.querySelector<HTMLButtonElement>('[data-testid="close-skill"]')!.click()
+    state.routeState.value.query.skill = undefined
+    await state.nextTick()
+    state.routeState.value.query.skill = nextName
+    await vi.waitFor(() => expect(state.el.querySelector('[data-testid="selected-skill"]')?.textContent).toBe(nextName))
+    finish(true)
+    await state.nextTick()
+    await state.nextTick()
+    expect(state.el.querySelector('[data-testid="selected-skill"]')?.textContent).toBe(nextName)
+    state.app.unmount()
+  })
+
+  it('distinguishes loading, a first-load failure, and stale catalog content', async () => {
+    const state = await mountSkillsView()
+    state.catalogHasLoaded.value = false
+    state.catalogLoading.value = true
+    await state.nextTick()
+    expect(state.el.querySelector('[aria-busy="true"]')).not.toBeNull()
+    expect(state.el.querySelector('[data-testid="skill-group"]')).toBeNull()
+
+    state.catalogLoading.value = false
+    state.catalogError.value = 'offline'
+    await state.nextTick()
+    expect(state.el.querySelector('.error-state')).not.toBeNull()
+    expect(state.el.querySelector('[data-testid="skill-group"]')).toBeNull()
+    state.loadData.mockClear()
+    state.el.querySelector<HTMLButtonElement>('.error-state__retry')!.click()
+    await state.nextTick()
+    expect(state.loadData).toHaveBeenCalledOnce()
+
+    state.catalogHasLoaded.value = true
+    await state.nextTick()
+    expect(state.el.querySelector('.error-state')).toBeNull()
+    expect(state.el.querySelector('[data-testid="skill-group"]')).not.toBeNull()
+    expect(state.el.querySelector('.sk-catalog-status button')).not.toBeNull()
+    state.app.unmount()
+  })
   it('opens the catalog detail dialog from an installed registry result', async () => {
     const { app, el, allSkills, detail, nextTick } = await mountSkillsView()
     allSkills.value = [{ name: 'synthetic-installed', install_id: 'install:synthetic', active: true }]
@@ -398,17 +404,20 @@ describe('SkillsView stats navigation', () => {
     app.unmount()
   })
 
-  it('scrolls to proposed skills without changing surfaces', async () => {
-    const { app, el, nextTick, scrollIntoView } = await mountSkillsView()
-
+  it('shows only ordinary skill groups without automation or MetaSkill controls', async () => {
+    const { app, el, nextTick } = await mountSkillsView()
+    expect(el.querySelectorAll('[data-testid="skill-group"]')).toHaveLength(1)
+    expect(el.querySelector('[data-testid="skill-group"]')?.textContent).toBe('label:community')
+    expect(el.querySelector('.sk-group--ap-settings')).toBeNull()
+    expect(el.querySelector('.sk-ap-settings')).toBeNull()
+    expect(el.querySelector('.sk-group--meta')).toBeNull()
+    expect(el.querySelector('[data-testid="pending-proposals"]')).toBeNull()
+    expect(el.querySelector('[data-testid="auto-enabled-skills"]')).toBeNull()
     el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
     await nextTick()
-    el.querySelector<HTMLButtonElement>('[data-testid="stat-proposals"]')?.click()
-    await nextTick()
-    await nextTick()
-
-    expect(el.querySelector('[data-testid="skills-catalog"]')).not.toBeNull()
-    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' })
+    expect(el.querySelector('[data-testid="stat-proposals"]')).toBeNull()
+    expect(el.querySelector('[data-testid="stat-all"]')).not.toBeNull()
+    expect(el.querySelector('[data-testid="skills-add-trigger"]')).not.toBeNull()
     app.unmount()
   })
 })
@@ -478,8 +487,10 @@ describe('SkillsView catalog reload', () => {
     app.unmount()
   })
 
-  it('calls reload before listing the published catalog', async () => {
-    const { app, el, loadData, rpcCall, pushToast } = await mountSkillsView()
+  it.each([true, false])('calls reload before listing the published catalog without redundant feedback when changed=%s', async changed => {
+    const { app, el, loadData, rpcCall, pushToast } = await mountSkillsView({
+      success: true, changed, partial: false, generation: 2,
+    })
     loadData.mockClear()
 
     el.querySelector<HTMLButtonElement>('[data-testid="skills-overview"]')?.click()
@@ -491,9 +502,7 @@ describe('SkillsView catalog reload', () => {
     expect(rpcCall.mock.invocationCallOrder[0]).toBeLessThan(
       loadData.mock.invocationCallOrder[0],
     )
-    expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('generation 2'), {
-      tone: 'ok',
-    })
+    expect(pushToast).not.toHaveBeenCalled()
     app.unmount()
   })
 

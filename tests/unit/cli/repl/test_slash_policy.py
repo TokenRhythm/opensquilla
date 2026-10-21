@@ -94,6 +94,7 @@ def test_destructive_set_matches_plan_lock() -> None:
         "/exit",
         "/quit",
         "/exit  ",
+        " /exit ",
     ],
 )
 def test_classify_exit(command: str) -> None:
@@ -147,7 +148,8 @@ def test_exit_set_matches_plan_lock() -> None:
         ("/file /tmp/path.txt", SlashCategory.TURN),
         ("/image /tmp/pic.png", SlashCategory.TURN),
         ("/path /tmp/file.md", SlashCategory.TURN),
-        ("/meta", SlashCategory.TURN),
+        ("/meta", SlashCategory.COMMAND),
+        ("/coding on", SlashCategory.COMMAND),
     ],
 )
 def test_classify_projects_registry_metadata(

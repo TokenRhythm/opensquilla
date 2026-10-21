@@ -5,7 +5,7 @@ param(
   [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceSha,
   [ValidatePattern('^([0-9]+)?$')][string]$SourceRunId = '',
   [ValidatePattern('^([0-9a-f]{64})?$')][string]$InstallerSha256 = '',
-  [Parameter(Mandatory = $true)][ValidateSet('startup-compat', 'ownership', 'migration', 'session')][string]$Probe,
+  [Parameter(Mandatory = $true)][ValidateSet('startup-compat', 'startup-compat-gateway', 'startup-compat-desktop', 'ownership', 'migration', 'session')][string]$Probe,
   [switch]$RequireSignature
 )
 
@@ -51,9 +51,14 @@ try {
   if ($gateways.Count -ne 1) { throw 'Expected exactly one frozen Gateway.' }
   $gateway = $gateways[0].FullName
   switch ($Probe) {
-    'startup-compat' {
+    # Keep the combined selector for existing callers. PowerShell evaluates both
+    # matching clauses for it; CI runs the complete Gateway and Desktop suites
+    # independently, each against its own verified installation.
+    { $_ -in @('startup-compat', 'startup-compat-gateway') } {
       python .github/scripts/verify-packaged-startup-compatibility.py --gateway $gateway --workdir (Join-Path $evidence 'gateway') --output (Join-Path $evidence 'gateway.json')
       if ($LASTEXITCODE -ne 0) { throw 'Frozen startup compatibility failed.' }
+    }
+    { $_ -in @('startup-compat', 'startup-compat-desktop') } {
       node desktop/electron/scripts/test-packaged-startup-compatibility.mjs --executable $app --workdir (Join-Path $evidence 'electron') --output (Join-Path $evidence 'electron.json') --scenario compatibility
       if ($LASTEXITCODE -ne 0) { throw 'Installed Electron startup compatibility failed.' }
     }

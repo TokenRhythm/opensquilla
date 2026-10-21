@@ -66,6 +66,7 @@ async def test_onboarding_catalog_returns_providers_and_channels(tmp_path, monke
     assert "searchProviders" in payload
     assert "routerProfiles" in payload
     assert "imageGenerationProviders" in payload
+    assert "videoGenerationProviders" in payload
     assert "audioProviders" in payload
     assert "memoryEmbeddingProviders" in payload
     types = {c["type"] for c in payload["channels"]}
@@ -2012,6 +2013,67 @@ async def test_image_models_discover_rejects_unknown_provider(tmp_path, monkeypa
 
     assert res.error is not None
     assert res.error.code == "onboarding.imageGeneration.invalid"
+
+
+@pytest.mark.asyncio
+async def test_video_models_discover_requires_admin_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.videoGeneration.models.discover",
+        {"providerId": "tokenrhythm"},
+        _read_ctx(),
+    )
+
+    assert res.error is not None
+    assert "scope" in res.error.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_video_models_discover_returns_video_specific_catalog(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    async def discover(provider_id: str):
+        assert provider_id == "tokenrhythm"
+        return {
+            "ok": True,
+            "providerId": provider_id,
+            "source": "documented",
+            "models": [{"id": "wan3.0-video", "verified": False}],
+        }
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.video_generation_model_discovery."
+        "discover_video_generation_models",
+        discover,
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.videoGeneration.models.discover",
+        {"providerId": "tokenrhythm"},
+        _admin_ctx(),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["source"] == "documented"
+    assert res.payload["models"] == [{"id": "wan3.0-video", "verified": False}]
+
+
+@pytest.mark.asyncio
+async def test_video_models_discover_rejects_unknown_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.videoGeneration.models.discover",
+        {"providerId": "unknown"},
+        _admin_ctx(),
+    )
+
+    assert res.error is not None
+    assert res.error.code == "onboarding.videoGeneration.invalid"
 
 
 @pytest.fixture()

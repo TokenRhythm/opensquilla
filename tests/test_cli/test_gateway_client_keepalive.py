@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 
+from opensquilla import __version__
 from opensquilla.cli.gateway_client import (
     GatewayClient,
     GatewayRPCError,
@@ -181,6 +182,18 @@ async def test_gateway_client_connect_uses_bounded_transport_limits(
         assert connect_frame["params"]["caps"] == [ANSWER_GENERATION_RESET_CAPABILITY] + (
             [STRUCTURED_USER_INPUT_CAPABILITY] if structured_user_input else []
         )
+        if structured_user_input:
+            from opensquilla.gateway.protocol import ClientInfo
+
+            info = ClientInfo.model_validate(connect_frame["params"]["client"], strict=True)
+            assert info.id == "opensquilla-cli"
+            assert info.mode == "tui"
+            assert info.version == __version__
+            assert info.platform == sys.platform
+            assert info.instance_id is None
+            assert info.model_identifier is None
+        else:
+            assert "client" not in connect_frame["params"]
     finally:
         await client.close()
 
@@ -319,7 +332,7 @@ async def test_call_times_out_without_marking_the_connection_failed() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("server_budget", "elapsed_s"), [
-    (120.0, 60.0), (300.0, 240.0), (None, 60.0), ("restricted", 60.0),
+    (120.0, 60.0), (300.0, 240.0), (None, 500.0), ("restricted", 500.0),
 ])
 async def test_synchronous_compaction_respects_gateway_budget(
     monkeypatch: pytest.MonkeyPatch, server_budget: object, elapsed_s: float,

@@ -19,7 +19,6 @@ import json
 import math
 import os
 import platform
-import re
 import tempfile
 import time
 import uuid
@@ -41,6 +40,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final, Literal, SupportsInt, TypeGuard, cast
 from urllib.parse import urlsplit
 
+import httpx
 import structlog
 
 from opensquilla.artifacts import ArtifactSource, artifact_marker
@@ -53,9 +53,11 @@ from opensquilla.attachment_refs import (
 from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     render_attachment_material_marker,
+    render_historical_attachment_material_marker,
     workspace_attachment_budget_from_config,
 )
 from opensquilla.bootstrap_types import BootstrapFileReport
+from opensquilla.compaction_status import UNPRODUCTIVE_COMPACTION_REASONS
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
@@ -83,10 +85,15 @@ from opensquilla.contracts.attachments import (
 )
 from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.contracts.turn_execution import TurnExecutionContext
-from opensquilla.engine.agent import Agent, ToolHandler
+from opensquilla.engine.agent import Agent, ToolHandler, _ToolArgumentProgress
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
-from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep, sleep_before_retry
+from opensquilla.engine.fallback import FallbackPolicy, sleep_before_retry
+from opensquilla.engine.history import (
+    CONTEXT_SUMMARY_MARKER,
+    strip_context_summary_marker,
+    subagent_terminal_history_notice,
+)
 from opensquilla.engine.hooks import (
     CompactionHook,
     DefaultTraceEmitterHook,
@@ -156,7 +163,6 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerTranscriptAppendAdapter,
     _TurnRunnerTurnErrorPersistAdapter,
     _TurnRunnerTurnMemoryCaptureAdapter,
-    _TurnRunnerUsageTelemetryAdapter,
     create_turn_execution_context,
 )
 from opensquilla.engine.turn_runner.prompt_assembler_stage import (
@@ -199,6 +205,12 @@ from opensquilla.execution_status import (
     normalize_execution_status,
 )
 from opensquilla.git_runtime import git_run_mode_scope
+from opensquilla.identity.project_instructions import (
+    SOURCE_TOOLS,
+    ProjectInitRequest,
+    ProjectRulesSnapshot,
+    load_project_rules,
+)
 from opensquilla.observability.decision_log import (
     DecisionEntry,
     PipelineStepRecord,
@@ -266,11 +278,14 @@ from opensquilla.provider.protocol import (
     provider_metadata,
     validate_provider_chat_admission,
 )
+from opensquilla.provider.recovery import retry_provider_stream
+from opensquilla.provider.tool_input_preview import preview_file_inputs
 from opensquilla.provider.types import (
     ChatConfig,
     Message,
     ProviderGenerationResetEvent,
     ProviderRequestCorrelation,
+    ToolInputPreviewEvent,
     VisionSupport,
     derive_provider_request_correlation,
 )
@@ -373,7 +388,7 @@ from opensquilla.tools.types import (
 
 if TYPE_CHECKING:
     from opensquilla.engine.routing.health import ProviderHealthLedger
-    from opensquilla.persistence.meta_run_writer import MetaRunWriter
+    from opensquilla.provider.selector import ProviderConfig
 
 # Stable user-facing envelope for LLM timeouts.
 _LLM_TIMEOUT_ENVELOPE: dict[str, Any] = {
@@ -385,13 +400,9 @@ _LLM_TIMEOUT_ENVELOPE: dict[str, Any] = {
 _DEFAULT_AGENT_RUNTIME_TIMEOUT_SECONDS: float = 48 * 60 * 60
 _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS: float = 120.0
 _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
-_WEB_CHAT_META_EXEMPT_KEYS: Final[frozenset[str]] = frozenset(
-    {"meta_match", "meta_launch", "meta_resume", "meta_replay", "meta_replay_error"}
-)
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
-_CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
 _DEFAULT_PREFLIGHT_COMPACT_RATIO: Final[float] = 0.85
 _COMPACTION_FAILURE_LIMIT: Final[int] = 3
 _COMPACTION_CIRCUIT_COOLDOWN_SECONDS: Final[float] = 300.0
@@ -601,7 +612,7 @@ def collect_invoked_skills(
             if segment.get("status") != "loaded":
                 continue
             skill_name = segment.get("name")
-        elif tool_name in {"skill_view", "meta_invoke"}:
+        elif tool_name == "skill_view":
             skill_name = (segment.get("input") or {}).get("name")
             if tool_name == "skill_view" and skill_name in receipt_names:
                 continue
@@ -785,22 +796,30 @@ class _ComprehensiveTurnSavings:
 class _CompactionFailureState:
     count: int = 0
     opened_at: float | None = None
+    failure_kind: str = "summary_failed"
+    timeout_cooldown: bool = False
+    overflow_retry_used: bool = False
 
 
-@dataclass
-class _EmergencyCompactionOverride:
+@dataclass(frozen=True)
+class PreparedRequestWindow:
+    """One explicit, request-scoped history view; never session-owned state."""
+
+    session_key: str
     summary: str
-    kept_entries: list[Any]
+    kept_entries: tuple[Any, ...]
     reason: str
     compaction_id: str
     expected_session_id: str | None = None
     expected_session_epoch: int | None = None
     source_fingerprint: str = ""
     source_summary: str = field(default="", repr=False)
+    canonical_boundary: int = 0
     history_window_tokens: int = 0
     history_capacity_chars: int | None = None
     protected_recent_messages: int = 0
     protected_message_id: str | None = None
+    preserve_historical_images: bool = True
     consumer_admission: Callable[[str, list[dict[str, Any]]], bool] | None = field(
         default=None, repr=False
     )
@@ -1020,44 +1039,6 @@ def _require_optional_exact_session_owner(
             "expected_session_id and expected_session_epoch must form a valid pair"
         )
     return True
-
-
-def _strip_context_summary_marker(content: str) -> str:
-    """Return summary text from a legacy transcript summary marker."""
-    if content.startswith(_CONTEXT_SUMMARY_MARKER):
-        return content[len(_CONTEXT_SUMMARY_MARKER) :].lstrip("\r\n")
-    return content
-
-
-def _subagent_terminal_history_notice(entry: Any) -> str | None:
-    """Render trusted non-success subagent completions for the next model turn."""
-    if getattr(entry, "role", None) != "system":
-        return None
-    if getattr(entry, "provenance_kind", None) != "internal_system":
-        return None
-    if getattr(entry, "provenance_source_tool", None) != "subagent_completion":
-        return None
-    content = getattr(entry, "content", None)
-    if not isinstance(content, str) or not content:
-        return None
-    try:
-        payload = json.loads(content)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, dict) or payload.get("type") != "subagent_completion":
-        return None
-    status = str(payload.get("status") or "").strip().lower()
-    if status not in {"cancelled", "failed", "timeout", "abandoned"}:
-        return None
-    child_session_key = str(payload.get("child_session_key") or "unknown")[:200]
-    terminal_reason = str(payload.get("terminal_reason") or status)[:120]
-    return (
-        "[Trusted runtime status] "
-        f'Subagent {child_session_key} finished with status "{status}" '
-        f'(reason: "{terminal_reason}"). It is no longer running. '
-        "Do not wait for it or call sessions_yield for it. Continue from this terminal "
-        "state unless the user asks to start a replacement subagent."
-    )
 
 
 def _format_compaction_summary_context(summary_texts: list[str]) -> str | None:
@@ -1441,6 +1422,11 @@ def _persisted_tool_result_segment(
         segment["tool_presentation"] = dict(event.tool_presentation)
     if event.execution_log_handle is not None:
         segment["execution_log_handle"] = event.execution_log_handle
+    if event.file_snapshot is not None and not event.is_error:
+        # This is the executed operation's display data, not model context or
+        # an expiring tool-result cache entry. Keep it with the transcript so
+        # archive, fork, and deletion share the session's existing lifecycle.
+        segment["file_snapshot"] = dict(event.file_snapshot)
     if event.execution_status is not None:
         segment["execution_status"] = normalize_execution_status(event.execution_status)
 
@@ -1648,8 +1634,8 @@ _SUBAGENT_TASK_PROTOCOL: Final[str] = (
 def _should_use_selector_fallback(provider_name: str, event: ProviderErrorEvent) -> bool:
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     return decide_recovery_action(kind) in {
@@ -1700,8 +1686,10 @@ def _report_credential_pool_failure(
     try:
         kind = classify_provider_error(
             provider_name=provider_name,
-            status_code=int(event.code) if str(event.code).isdigit() else None,
-            raw_code=event.code,
+            status_code=event.http_status or (
+                int(event.code) if str(event.code).isdigit() else None
+            ),
+            raw_code=event.provider_code or event.code,
             message=event.message,
         )
         from opensquilla.gateway.llm_runtime import profile_credential_pools
@@ -1828,6 +1816,7 @@ class _SelectorPreTextBuffer:
         self._seen_tool_use_ids: set[str] = set()
         self._protocol_error = False
         self._overflowed = False
+        self._tool_argument_progress = _ToolArgumentProgress()
 
     @property
     def has_completed_tool_call(self) -> bool:
@@ -1887,6 +1876,7 @@ class _SelectorPreTextBuffer:
             )
 
     def _mark_overflowed(self) -> None:
+        self._tool_argument_progress.clear()
         self._entries.clear()
         self._reasoning_bytes = 0
         self._buffered_bytes = 0
@@ -1900,6 +1890,7 @@ class _SelectorPreTextBuffer:
     def _mark_protocol_error(self) -> None:
         """Discard a malformed provisional leg without retaining its payload."""
 
+        self._tool_argument_progress.clear()
         self._entries.clear()
         self._reasoning_bytes = 0
         self._buffered_bytes = 0
@@ -1960,19 +1951,20 @@ class _SelectorPreTextBuffer:
                 return False
             self._open_tool_use_ids.remove(tool_use_id)
             self._open_tool_names.pop(tool_use_id, None)
+            self._tool_argument_progress.finish(tool_use_id)
             self._has_completed_tool_call = True
             return True
         return True
 
-    def append(self, event: Any) -> None:
+    def append(self, event: Any) -> ProviderHeartbeatEvent | None:
         if self._overflowed or self._protocol_error:
-            return
+            return None
         if not self._accept_tool_frame(event):
-            return
+            return None
         if isinstance(event, ProviderReasoningDeltaEvent):
             text = str(event.text or "")
             if not text:
-                return
+                return None
             byte_count = len(text.encode("utf-8"))
             tail = self._entries[-1] if self._entries else None
             if not isinstance(tail, _BufferedReasoningDeltas):
@@ -1983,7 +1975,7 @@ class _SelectorPreTextBuffer:
             self._reasoning_bytes += byte_count
             self._buffered_bytes += byte_count
             self._trim_reasoning_prefix()
-            return
+            return None
         if isinstance(event, ProviderToolUseDeltaEvent):
             fragment = str(event.json_fragment or "")
             byte_count = len(event.tool_use_id.encode("utf-8")) + len(fragment.encode("utf-8"))
@@ -1999,12 +1991,22 @@ class _SelectorPreTextBuffer:
             self._trim_reasoning_prefix()
             if self._buffered_bytes > self._reasoning_limit_bytes:
                 self._mark_overflowed()
-            return
+            elif self._tool_argument_progress.record(event.tool_use_id, fragment):
+                # A liveness pulse does not commit the pending tool frames or
+                # expose any identity/arguments from this provisional attempt.
+                return ProviderHeartbeatEvent(
+                    phase="llm_tool_arguments",
+                    message="Receiving tool arguments",
+                    upstream_activity=True,
+                    generation_epoch=getattr(event, "generation_epoch", None),
+                )
+            return None
         self._entries.append(event)
         self._buffered_bytes += self._event_buffer_bytes(event)
         self._trim_reasoning_prefix()
         if self._buffered_bytes > self._reasoning_limit_bytes:
             self._mark_overflowed()
+        return None
 
     @staticmethod
     def _trim_text_prefix_bytes(text: str, count: int) -> tuple[str, int]:
@@ -2040,6 +2042,7 @@ class _SelectorPreTextBuffer:
                     entry.chunks.popleft()
 
     def drain(self, *, successful_leg: bool) -> list[Any]:
+        self._tool_argument_progress.clear()
         drained: list[Any] = []
         notice_pending = successful_leg and self._reasoning_truncated
         for entry in self._entries if successful_leg else ():
@@ -2121,11 +2124,30 @@ async def _selector_safe_stream(
     """Convert provider-raised exceptions while preserving engine control flow."""
 
     stream: AsyncIterator[Any] | None = None
+    saw_tool_frame = False
+    saw_terminal = False
     try:
         stream = stream_factory()
         async for event in stream:
+            saw_tool_frame = saw_tool_frame or isinstance(
+                event,
+                (ProviderToolUseStartEvent, ProviderToolUseDeltaEvent, ProviderToolUseEndEvent),
+            )
+            saw_terminal = saw_terminal or isinstance(event, ProviderErrorEvent) or (
+                getattr(event, "kind", "") == "done"
+            )
             yield event
-    except (asyncio.CancelledError, UsageAccountingUnavailableError):
+        if saw_tool_frame and not saw_terminal and not content_started():
+            # Provisional tool frames require a terminal event before they can
+            # commit. EOF must enter recovery as an incomplete tool stream,
+            # rather than silently discard the leg without trying its fallback.
+            yield ProviderErrorEvent(
+                message="Provider stream ended before completing its tool response",
+                code="incomplete_tool_stream",
+            )
+    except (asyncio.CancelledError, UsageAccountingUnavailableError, httpx.HTTPStatusError):
+        # The shared provider recovery owner preserves structured HTTP facts
+        # and Retry-After. Do not turn an HTTP response into a network error.
         raise
     except Exception as exc:  # noqa: BLE001 - raw provider prose must stop here
         yield _selector_stream_exception_error(content_started=content_started(), error=exc)
@@ -2198,19 +2220,6 @@ def _provider_retry_after_hint(event: ProviderErrorEvent) -> float:
     return hint
 
 
-def _selector_retry_after_deadline_error(
-    *,
-    retry_after_s: float,
-) -> ProviderErrorEvent:
-    return ProviderErrorEvent(
-        message=(
-            "The model provider requested a retry delay beyond this turn's remaining deadline."
-        ),
-        code="provider_retry_after_deadline",
-        retry_after_s=retry_after_s,
-    )
-
-
 def _provider_activity_reason_for_error(
     provider_name: str,
     event: ProviderErrorEvent,
@@ -2225,8 +2234,8 @@ def _provider_activity_reason_for_error(
 ]:
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     if kind is ProviderFailureKind.RATE_LIMITED:
@@ -2252,8 +2261,8 @@ def _selector_failure_for_hook(
 
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     return RuntimeError(safe_provider_failure_message(kind.value))
@@ -2267,8 +2276,8 @@ def _selector_execution_leg_failure_code(
 
     kind = classify_provider_error(
         provider_name=provider_name,
-        status_code=int(event.code) if str(event.code).isdigit() else None,
-        raw_code=event.code,
+        status_code=event.http_status or (int(event.code) if str(event.code).isdigit() else None),
+        raw_code=event.provider_code or event.code,
         message=event.message,
     )
     return safe_provider_failure_code(event.code, kind.value)
@@ -2278,6 +2287,7 @@ class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
     projects_image_input_per_leg = True
+    owns_retry_after_admission = True
 
     def __init__(
         self,
@@ -2322,6 +2332,16 @@ class _SelectorFallbackProvider:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
 
+    def current_response_deployment(
+        self, config: ChatConfig,
+    ) -> tuple[Any, ProviderConfig | None, ChatConfig]:
+        """Freeze the bound physical leg without inheriting selector fallback."""
+        bound_config = self.compaction_chat_config(config)
+        resolve = getattr(self._provider, "current_response_deployment", None)
+        if callable(resolve):
+            return cast("tuple[Any, ProviderConfig | None, ChatConfig]", resolve(bound_config))
+        return self._provider, None, bound_config
+
     def configure_retry_policy(self, policy: FallbackPolicy) -> None:
         self._retry_policy = policy
 
@@ -2335,100 +2355,24 @@ class _SelectorFallbackProvider:
         content_started: Callable[[], bool],
         buffer: _SelectorPreTextBuffer,
     ) -> AsyncGenerator[Any, None]:
-        """Retry the same physical leg before selector fallback sees its failure."""
-        rate_retries = 0
-        connection_retries = 0
-        attempts = 0
-        activity_id = uuid.uuid4().hex
-        physical_limit = max(0, int(getattr(config, "physical_attempt_limit", 0) or 0))
-        while True:
-            attempts += 1
-            retry_error: ProviderErrorEvent | None = None
-            stream = stream_factory()
-            try:
-                async for event in stream:
-                    if not isinstance(event, ProviderErrorEvent):
-                        yield event
-                        continue
-                    can_retry = (
-                        event.tool_argument_rejection is None
-                        and not content_started()
-                        and getattr(provider, "retry_failed_call_safe", True) is not False
-                        and (physical_limit == 0 or attempts < physical_limit)
-                    )
-                    if can_retry and event.code == CONNECTION_FAILED_CODE:
-                        delay = min(60.0, 5.0 * 2 ** min(connection_retries, 4))
-                        connection_retries += 1
-                        attempt, limit = connection_retries, 0
-                        reason: Literal["transport_transient", "rate_limited"] = (
-                            "transport_transient"
-                        )
-                    elif (
-                        can_retry
-                        and event.code == "429"
-                        and classify_provider_error(
-                            getattr(provider, "provider_name", ""),
-                            429,
-                            event.code,
-                            event.message,
-                        ) is ProviderFailureKind.RATE_LIMITED
-                    ):
-                        delay = max(
-                            _provider_retry_after_hint(event),
-                            backoff_sleep(
-                                rate_retries,
-                                self._retry_policy.base_backoff_ms,
-                                self._retry_policy.max_backoff_ms,
-                                _fake=True,
-                            ),
-                        )
-                        turn_deadline = getattr(config, "turn_deadline_at_monotonic", None)
-                        if (
-                            isinstance(turn_deadline, int | float)
-                            and not isinstance(turn_deadline, bool)
-                            and asyncio.get_running_loop().time() + delay >= turn_deadline
-                        ):
-                            yield _selector_retry_after_deadline_error(retry_after_s=delay)
-                            return
-                        if (
-                            rate_retries >= self._retry_policy.max_retries
-                            or delay > _SELECTOR_MAX_RETRY_AFTER_SECONDS
-                        ):
-                            yield replace(event, code="rate_limit_retry_exhausted")
-                            return
-                        rate_retries += 1
-                        attempt, limit = rate_retries, self._retry_policy.max_retries
-                        reason = "rate_limited"
-                    else:
-                        yield event
-                        return
-                    retry_error = event
-                    break
-            finally:
-                await stream.aclose()
-            if retry_error is None:
-                return
+        """Use the common one-deployment retry owner before selector fallback."""
+        def reset_attempt() -> None:
             buffer.drain(successful_leg=False)
-            yield ProviderActivityEvent(
-                activity_id=activity_id,
-                model=str(getattr(provider, "active_model_id", model) or ""),
-                phase="retry_wait",
-                reason=reason,
-                retry_attempt=attempt,
-                retry_limit=limit,
-                retry_after_ms=math.ceil(delay * 1000),
-                started_at=time.time_ns() // 1_000_000,
-            )
-            await sleep_before_retry(delay)
-            yield ProviderActivityEvent(
-                activity_id=activity_id,
-                model=str(getattr(provider, "active_model_id", model) or ""),
-                phase="retrying",
-                reason=reason,
-                retry_attempt=attempt,
-                retry_limit=limit,
-                started_at=time.time_ns() // 1_000_000,
-            )
+
+        async for event in retry_provider_stream(
+            lambda: preview_file_inputs(stream_factory()),
+            provider=provider, model=model, config=config,
+            content_started=content_started,
+            reset_attempt=reset_attempt,
+            max_retries=self._retry_policy.max_retries,
+            base_ms=self._retry_policy.base_backoff_ms,
+            max_ms=self._retry_policy.max_backoff_ms,
+            # Preserve selector semantics: overload/transport may choose another
+            # deployment; Agent retains their finite generic recovery budget.
+            retry_transient=False,
+            sleep=sleep_before_retry,
+        ):
+            yield event
 
     def clone_for_model(self, model: str) -> _SelectorFallbackProvider:
         """Freeze an independent child chain at the currently active deployment.
@@ -3323,8 +3267,10 @@ class _SelectorFallbackProvider:
             return
         kind = classify_provider_error(
             provider_name=provider_id,
-            status_code=int(event.code) if str(event.code).isdigit() else None,
-            raw_code=event.code,
+            status_code=event.http_status or (
+                int(event.code) if str(event.code).isdigit() else None
+            ),
+            raw_code=event.provider_code or event.code,
             message=event.message,
         )
         ledger.record_failure(
@@ -3352,7 +3298,7 @@ class _SelectorFallbackProvider:
         *,
         requires_tools: bool = False,
     ) -> bool:
-        """Prove one local-admission candidate is larger and tool-compatible."""
+        """Prove more usable input capacity on a compatible authorized leg."""
 
         if requires_tools and not self._fallback_candidate_accepts_tools(candidate):
             return False
@@ -3380,11 +3326,45 @@ class _SelectorFallbackProvider:
         except Exception:  # noqa: BLE001 - unknown capacity is not an escalation proof
             return False
         reliable_sources = {"override", "config", "catalog"}
-        return bool(
-            str(current_source or "") in reliable_sources
-            and str(candidate_source or "") in reliable_sources
-            and int(candidate_window or 0) > int(current_window or 0)
-        )
+
+        def capacity(deployment: Any, window: int, source: str) -> tuple[int, int] | None:
+            limits = self._fallback_deployment_limits.get(
+                _fallback_deployment_identity(deployment),
+            )
+            if limits is None and str(getattr(deployment, "provider", "")).lower() != "tokenrhythm":
+                limits = self._fallback_limits.get((
+                    str(getattr(deployment, "provider", "")).strip().lower(),
+                    str(getattr(deployment, "model", "")).strip(),
+                ))
+            if limits is not None and limits[0] > 0:
+                window, source = (global_override or limits[0]), "config"
+            if source not in reliable_sources or window <= 0:
+                return None
+            output = _non_negative_int(getattr(config, "max_tokens", 0))
+            if limits is not None and limits[1] > 0:
+                output = min(output, limits[1])
+            budget = ContextBudgetGovernor.from_values(
+                context_window_tokens=window,
+                max_output_tokens=output,
+                thinking_budget_tokens=(
+                    _non_negative_int(getattr(config, "thinking_budget_tokens", 0))
+                    if getattr(config, "thinking", False) else 0
+                ),
+                context_overflow_threshold=AgentConfig().context_overflow_threshold,
+            ).snapshot()
+            explicit_cap = _non_negative_int(
+                getattr(config, "provider_request_max_chars_explicit_cap", 0),
+            )
+            return budget.usable_tokens, (
+                min(explicit_cap, budget.provider_request_max_chars)
+                if explicit_cap else budget.provider_request_max_chars
+            )
+
+        before = capacity(current, int(current_window or 0), str(current_source or ""))
+        after = capacity(candidate, int(candidate_window or 0), str(candidate_source or ""))
+        return bool(before is not None and after is not None
+                    and all(new >= old for new, old in zip(after, before, strict=True))
+                    and after != before)
 
     def _local_admission_fallback_index(
         self,
@@ -3457,6 +3437,99 @@ class _SelectorFallbackProvider:
             requires_vision=False,
             requires_tools=self._last_request_had_tools,
         )
+
+    def fallback_after_context_overflow(
+        self, config: Any, *, requires_tools: bool = False, requires_vision: bool = False,
+    ) -> bool:
+        """Advance the existing chain after the caller exhausts local shrinking."""
+        if _non_negative_int(getattr(config, "physical_attempt_limit", 0)) == 1:
+            return False
+        deadline = getattr(config, "turn_deadline_at_monotonic", None)
+        if deadline is not None and time.monotonic() >= deadline:
+            return False
+        current = getattr(self._selector, "current_config", None)
+        select = getattr(self._selector, "next_fallback_matching", None)
+        if current is None or not callable(select):
+            return False
+
+        def allowed(candidate: Any) -> bool:
+            return bool(
+                (not requires_vision or self._fallback_deployment_vision_support.get(
+                    _fallback_deployment_identity(candidate), "unknown",
+                ) == "supported")
+                and self._local_admission_candidate_is_compatible(
+                    current, candidate, config, requires_tools=requires_tools,
+                )
+            )
+
+        try:
+            # Static remaining candidates cannot revive an exhausted deployment
+            # through a failure hook or introduce another fixed Ensemble authority.
+            self._provider = select(predicate=allowed)
+        except Exception:  # noqa: BLE001 - no compatible remaining deployment
+            return False
+        self._note_fallback_hop()
+        if self._turn_metadata is not None:
+            self._turn_metadata["router_fallback_reason"] = "context_overflow_after_recovery"
+        return True
+
+    def compaction_fallback_targets(self, config: ChatConfig) -> tuple[Any, ...]:
+        """Freeze a larger authorized summary chain without moving execution."""
+        from opensquilla.session.compaction_deployment import (
+            build_compaction_execution_plan_from_provider_config,
+        )
+
+        metadata = provider_metadata(self._provider)
+        if ("ensemble" in {metadata.provider_kind, metadata.provider_name}
+                or config.physical_attempt_limit == 1
+                or (config.turn_deadline_at_monotonic is not None
+                    and time.monotonic() >= config.turn_deadline_at_monotonic)):
+            return ()
+        chain = list(self._selector.remaining_chain())
+        if len(chain) < 2:
+            return ()
+        catalog = shared_catalog()
+        previous = chain[0]
+        targets = []
+        for candidate in chain[1:]:
+            if not self._local_admission_candidate_is_compatible(
+                previous, candidate, config, requires_tools=True,
+            ):
+                continue
+            identity = _fallback_deployment_identity(candidate)
+            exact = self._fallback_deployment_limits.get(identity)
+            if exact is None:
+                limits = catalog.resolve_deployment_limits(
+                    candidate.model, provider=candidate.provider, api_key=candidate.api_key,
+                    base_url=candidate.base_url, proxy=candidate.proxy,
+                )
+                if not limits.context_window_known:
+                    continue
+                exact = (limits.context_window, limits.max_output_tokens
+                         if limits.max_output_tokens_known else config.max_tokens)
+            window = config.context_window_tokens_global_override or exact[0]
+            output = min(config.max_tokens, exact[1]) if exact[1] > 0 else config.max_tokens
+            capabilities = self._fallback_deployment_capabilities.get(identity)
+            if capabilities is None:
+                capabilities = catalog.resolve_deployment_capabilities(
+                    candidate.model, provider=candidate.provider, api_key=candidate.api_key,
+                    base_url=candidate.base_url,
+                )
+            vision = self._fallback_deployment_vision_support.get(identity)
+            if vision is None:
+                vision = catalog.resolve_deployment_vision_support(
+                    candidate.model, provider=candidate.provider, api_key=candidate.api_key,
+                    base_url=candidate.base_url,
+                )
+            plan = build_compaction_execution_plan_from_provider_config(
+                candidate, context_window_tokens=window, max_generation_tokens=output,
+                provider_request_max_chars=config.provider_request_max_chars_explicit_cap or 0,
+                source="authorized_capacity_fallback",
+            )
+            targets.append(replace(plan.primary, model_capabilities=capabilities,
+                                   model_vision_support=vision))
+            previous = candidate
+        return tuple(targets)
 
     def fallback_after_image_rejection(self, reason: str) -> bool:
         """Advance to the next configured Router image probe, if any.
@@ -3779,7 +3852,13 @@ class _SelectorFallbackProvider:
         if getattr(active_provider, "execution_context_aware", False):
             primary_chat_kwargs["execution_context"] = execution_context
 
+        physical_attempts = 0
+        attempted_deployments = {_fallback_deployment_identity(self.active_deployment_config())}
+        follow_remaining_chain = False
+
         def primary_stream_factory() -> AsyncGenerator[Any, None]:
+            nonlocal physical_attempts
+            physical_attempts += 1
             return _selector_safe_stream(
                 lambda: active_provider.chat(physical_messages, **primary_chat_kwargs),
                 content_started=lambda: emitted_user_visible_content,
@@ -3814,6 +3893,7 @@ class _SelectorFallbackProvider:
                         ProviderHeartbeatEvent,
                         ProviderEnsembleProgressEvent,
                         ProviderGenerationResetEvent,
+                        ToolInputPreviewEvent,
                     ),
                 ):
                     # A generation reset is an ordering barrier, not ordinary
@@ -3894,13 +3974,22 @@ class _SelectorFallbackProvider:
 
                 if (
                     not isinstance(event, ProviderErrorEvent)
-                    and not _is_non_empty_provider_text_delta(event)
+                    and (
+                        not _is_non_empty_provider_text_delta(event)
+                        or pre_text_buffer.has_incomplete_tool_call
+                        or pre_text_buffer.has_completed_tool_call
+                    )
                     and getattr(event, "kind", "") != "done"
                 ):
-                    pre_text_buffer.append(event)
+                    # An assistant message may contain both text and tool calls.
+                    # Keep the entire provisional batch bounded until Done,
+                    # including text after ToolUseEnd; text cannot commit it.
+                    argument_progress = pre_text_buffer.append(event)
                     if pre_text_buffer.protocol_error:
                         event = _selector_invalid_stream_order_error()
                     elif not pre_text_buffer.overflowed:
+                        if argument_progress is not None:
+                            yield argument_progress
                         continue
                     else:
                         # Re-enter the ordinary pre-content failure path so a
@@ -3908,16 +3997,6 @@ class _SelectorFallbackProvider:
                         # retries. The whole provisional leg was cleared by the
                         # bounded buffer and no tool frame can escape.
                         event = _selector_pre_text_buffer_overflow_error()
-
-                if (
-                    _is_non_empty_provider_text_delta(event)
-                    and pre_text_buffer.has_incomplete_tool_call
-                ):
-                    # Text cannot commit a provisional leg while any tool id is
-                    # still open.  Otherwise a later selector failure could
-                    # expose an argument prefix for a tool that never completed.
-                    pre_text_buffer.drain(successful_leg=False)
-                    event = _selector_invalid_stream_order_error()
 
                 if (
                     getattr(event, "kind", "") == "done"
@@ -3950,7 +4029,7 @@ class _SelectorFallbackProvider:
                         provider_name=active_provider_id or self.provider_name,
                     ).is_unsupported
                 )
-                if (
+                while (
                     isinstance(event, ProviderErrorEvent)
                     and not precise_image_capability_rejection
                     and (
@@ -3959,9 +4038,13 @@ class _SelectorFallbackProvider:
                         or local_admission_escalation
                     )
                 ):
-                    if not local_admission_escalation:
+                    if not local_admission_escalation and not follow_remaining_chain:
                         self._record_health_failure(event)
-                    if 0 < physical_attempt_limit <= 1:
+                    deadline = getattr(active_config, "turn_deadline_at_monotonic", None)
+                    if (
+                        physical_attempt_limit and physical_attempts >= physical_attempt_limit
+                        or deadline is not None and time.monotonic() >= deadline
+                    ):
                         for buffered_event in pre_text_buffer.drain(successful_leg=False):
                             yield buffered_event
                         yield event
@@ -3973,8 +4056,29 @@ class _SelectorFallbackProvider:
                     )
                     local_candidate_predicate: Callable[[Any], bool] | None = None
                     legacy_selection_mutated = False
+                    fallback_from_model = str(
+                        getattr(active_provider, "active_model_id", active_model) or ""
+                    )
                     try:
-                        if local_admission_escalation:
+                        if follow_remaining_chain:
+                            # Further failures consume only the remaining authorized
+                            # chain. Do not re-run a plugin hook or reset a failed
+                            # deployment's retry budget by selecting it again.
+                            def remaining_candidate_allowed(candidate: Any) -> bool:
+                                return bool(
+                                    _fallback_deployment_identity(candidate)
+                                    not in attempted_deployments
+                                    and (
+                                        not tools
+                                        or self._fallback_candidate_accepts_tools(candidate)
+                                    )
+                                )
+
+                            local_candidate_predicate = remaining_candidate_allowed
+                            self._provider = self._selector.next_fallback_matching(
+                                predicate=local_candidate_predicate,
+                            )
+                        elif local_admission_escalation:
 
                             def _local_candidate_predicate(candidate: Any) -> bool:
                                 return self._local_admission_candidate_is_compatible(
@@ -4063,7 +4167,14 @@ class _SelectorFallbackProvider:
                     await primary_stream.aclose()
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
+                    attempted_deployments.add(
+                        _fallback_deployment_identity(self.active_deployment_config())
+                    )
                     fallback_config = self._config_for_active_leg(config)
+                    if physical_attempt_limit:
+                        fallback_config = fallback_config.model_copy(update={
+                            "physical_attempt_limit": physical_attempt_limit - physical_attempts,
+                        })
                     fallback_messages = self._project_image_messages_for_active_leg(
                         messages,
                         fallback_config,
@@ -4116,18 +4227,6 @@ class _SelectorFallbackProvider:
                             active_provider_id or self.provider_name,
                             event,
                         )
-                        yield ProviderActivityEvent(
-                            activity_id=primary_activity_id,
-                            model=str(
-                                getattr(active_provider, "active_model_id", active_model) or ""
-                            ),
-                            phase="retry_wait",
-                            reason=retry_reason,
-                            retry_attempt=1,
-                            retry_limit=max(1, physical_attempt_limit - 1),
-                            retry_after_ms=math.ceil(retry_after_hint * 1000),
-                            started_at=time.time_ns() // 1_000_000,
-                        )
                         turn_deadline = getattr(
                             active_config,
                             "turn_deadline_at_monotonic",
@@ -4142,11 +4241,31 @@ class _SelectorFallbackProvider:
                             retry_after_hint > _SELECTOR_MAX_RETRY_AFTER_SECONDS
                             or deadline_exhausted
                         ):
-                            yield _selector_retry_after_deadline_error(
+                            yield replace(
+                                event,
+                                code=("provider_retry_after_deadline"
+                                      if retry_reason == "rate_limited"
+                                      else "provider_overload_retry_after_deadline"),
+                                message="The provider retry delay exceeds this request deadline.",
                                 retry_after_s=retry_after_hint,
+                                recovery_exhausted=True,
                             )
                             return
-                        await asyncio.sleep(retry_after_hint)
+                        yield ProviderActivityEvent(
+                            activity_id=primary_activity_id,
+                            model=str(
+                                getattr(active_provider, "active_model_id", active_model) or ""
+                            ),
+                            phase="retry_wait",
+                            reason=retry_reason,
+                            retry_attempt=1,
+                            retry_limit=max(1, physical_attempt_limit - 1),
+                            retry_after_ms=math.ceil(retry_after_hint * 1000),
+                            http_status=event.http_status,
+                            started_at=time.time_ns() // 1_000_000,
+                        )
+                        async with asyncio.timeout_at(turn_deadline):
+                            await sleep_before_retry(retry_after_hint)
                     self._commit_fallback_hops()
                     if local_admission_escalation and self._turn_metadata is not None:
                         self._turn_metadata["router_fallback_reason"] = "local_admission_escalation"
@@ -4161,6 +4280,7 @@ class _SelectorFallbackProvider:
                             getattr(fallback_provider, "active_model_id", fallback_model) or ""
                         ),
                         phase="fallback",
+                        from_model=fallback_from_model,
                         reason=(
                             "context_overflow"
                             if local_admission_escalation
@@ -4186,6 +4306,8 @@ class _SelectorFallbackProvider:
                             ),
                         )
                     def fallback_stream_factory() -> AsyncGenerator[Any, None]:
+                        nonlocal physical_attempts
+                        physical_attempts += 1
                         return _selector_safe_stream(
                             lambda: fallback_provider.chat(
                                 fallback_messages,
@@ -4225,6 +4347,7 @@ class _SelectorFallbackProvider:
                     fallback_activity_id = uuid.uuid4().hex
                     fallback_reasoning_started_at_ms = 0
                     fallback_reasoning_last_pulse_at = 0.0
+                    fallback_error: ProviderErrorEvent | None = None
                     try:
                         async for fallback_event in fallback_stream:
                             if isinstance(
@@ -4233,6 +4356,7 @@ class _SelectorFallbackProvider:
                                     ProviderActivityEvent,
                                     ProviderHeartbeatEvent,
                                     ProviderEnsembleProgressEvent,
+                                    ToolInputPreviewEvent,
                                 ),
                             ):
                                 yield fallback_event
@@ -4250,6 +4374,15 @@ class _SelectorFallbackProvider:
                                 if not fallback_committed:
                                     self._record_health_failure(fallback_event)
                                     fallback_buffer.drain(successful_leg=False)
+                                    if (
+                                        getattr(fallback_provider, "retry_failed_call_safe", True)
+                                        is not False
+                                        and _should_use_selector_fallback(
+                                            fallback_provider_id, fallback_event,
+                                        )
+                                    ):
+                                        fallback_error = fallback_event
+                                        break
                                 yield fallback_event
                                 return
                             if fallback_committed:
@@ -4298,29 +4431,26 @@ class _SelectorFallbackProvider:
                                 continue
                             if (
                                 not isinstance(fallback_event, ProviderErrorEvent)
-                                and not _is_non_empty_provider_text_delta(fallback_event)
+                                and (
+                                    not _is_non_empty_provider_text_delta(fallback_event)
+                                    or fallback_buffer.has_incomplete_tool_call
+                                    or fallback_buffer.has_completed_tool_call
+                                )
                                 and getattr(fallback_event, "kind", "") != "done"
                             ):
-                                fallback_buffer.append(fallback_event)
+                                argument_progress = fallback_buffer.append(fallback_event)
                                 if fallback_buffer.protocol_error:
                                     invalid_order_error = _selector_invalid_stream_order_error()
                                     self._record_health_failure(invalid_order_error)
                                     yield invalid_order_error
                                     return
                                 if not fallback_buffer.overflowed:
+                                    if argument_progress is not None:
+                                        yield argument_progress
                                     continue
                                 overflow_error = _selector_pre_text_buffer_overflow_error()
                                 self._record_health_failure(overflow_error)
                                 yield overflow_error
-                                return
-                            if (
-                                _is_non_empty_provider_text_delta(fallback_event)
-                                and fallback_buffer.has_incomplete_tool_call
-                            ):
-                                fallback_buffer.drain(successful_leg=False)
-                                invalid_order_error = _selector_invalid_stream_order_error()
-                                self._record_health_failure(invalid_order_error)
-                                yield invalid_order_error
                                 return
                             if _is_non_empty_provider_text_delta(fallback_event):
                                 for buffered_event in fallback_buffer.drain(successful_leg=True):
@@ -4342,6 +4472,8 @@ class _SelectorFallbackProvider:
                                     yield incomplete_error
                                     return
                                 tool_leg_committed = fallback_buffer.has_completed_tool_call
+                                if tool_leg_committed:
+                                    fallback_committed = True
                                 for buffered_event in fallback_buffer.drain(
                                     # A no-text/no-tool Done is classified by
                                     # Agent as an invalid or reasoning-only
@@ -4357,6 +4489,17 @@ class _SelectorFallbackProvider:
                                 continue
                     finally:
                         await fallback_stream.aclose()
+                    if fallback_error is not None:
+                        event = fallback_error
+                        active_provider = fallback_provider
+                        active_provider_id, active_model = fallback_provider_id, fallback_model
+                        active_config = fallback_config
+                        local_admission_escalation = False
+                        precise_image_capability_rejection = classify_image_failure(
+                            event, provider_name=active_provider_id or self.provider_name,
+                        ).is_unsupported
+                        follow_remaining_chain = True
+                        continue
                     # An incomplete fallback stream is not a committed leg.
                     fallback_buffer.drain(successful_leg=False)
                     return
@@ -4370,8 +4513,12 @@ class _SelectorFallbackProvider:
                     continue
 
                 if getattr(event, "kind", "") == "done":
+                    tool_leg_committed = pre_text_buffer.has_completed_tool_call
+                    if tool_leg_committed:
+                        emitted_user_visible_content = True
+                        self._record_health_success()
                     for buffered_event in pre_text_buffer.drain(
-                        successful_leg=pre_text_buffer.has_completed_tool_call
+                        successful_leg=tool_leg_committed
                     ):
                         yield buffered_event
                     yield event
@@ -4624,10 +4771,10 @@ def _resolve_identity_prompt_mode(config: object) -> str:
         "full",
         "minimal",
         "none",
-        "headless_source_edit",
-        "headless_repo_coding_scaffold",
     }
     env_prompt_mode = os.environ.get("OPENSQUILLA_PROMPT_MODE", "").strip()
+    if env_prompt_mode in {"headless_source_edit", "headless_repo_coding_scaffold"}:
+        env_prompt_mode = ""
     if env_prompt_mode:
         if env_prompt_mode not in allowed_modes:
             raise ValueError(
@@ -4720,7 +4867,6 @@ class TurnRunner:
         diagnostics_state: Any | None = None,
         turn_hooks: Sequence[TurnHook] | None = None,
         compaction_hooks: Sequence[CompactionHook] | None = None,
-        meta_run_writer: MetaRunWriter | None = None,
         turn_error_writer: Any | None = None,
         provider_call_observer: Callable[..., None] | None = None,
         usage_event_sink: UsageEventSink | None = None,
@@ -4738,6 +4884,7 @@ class TurnRunner:
             Callable[[object, object | None, dict[str, Any]], Any | None] | None
         ) = None,
         usage_telemetry: UsageTelemetryPort | None = None,
+        memory_managers: dict[str, Any] | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._session_deployment_resolver = session_deployment_resolver
@@ -4748,11 +4895,11 @@ class TurnRunner:
         self._config = config
         self._last_agent_max_iterations_source = "AgentConfig default"
         self._memory_sync_managers = memory_sync_managers
+        self._memory_managers = memory_managers
         self._model_catalog = model_catalog
         self._memory_retrievers = memory_retrievers
         self._turn_capture_services = turn_capture_services
         self._diagnostics_state = diagnostics_state
-        self._meta_run_writer = meta_run_writer
         self._turn_error_writer = turn_error_writer
         self._usage_event_sink = usage_event_sink
         self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
@@ -4808,10 +4955,10 @@ class TurnRunner:
         # churn the cacheable prefix mid-session.
         self._bootstrap_snapshots: dict[tuple[str, str, str], BootstrapSnapshot] = {}
         self._compaction_failures: dict[str, _CompactionFailureState] = {}
+        self._compaction_failure_scopes: dict[str, str] = {}
         self._turn_compaction_attempted_sessions: set[str] = set()
         self._turn_compaction_failed_sessions: set[str] = set()
         self._turn_compacted_sessions: set[str] = set()
-        self._emergency_compaction_overrides: dict[str, _EmergencyCompactionOverride] = {}
         # TurnRunner stage decomposition InputStage instance. Holds no per-turn state;
         # constructed once. Active unconditionally as of.
         self._input_stage = InputStage(extra_ctx=_TurnRunnerExtraContextAdapter())
@@ -4886,11 +5033,7 @@ class TurnRunner:
             turn_memory_capture=_TurnRunnerTurnMemoryCaptureAdapter(self),
             session_totals=_TurnRunnerSessionTotalsAdapter(self),
             turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
-            usage_telemetry=(
-                usage_telemetry
-                if usage_telemetry is not None
-                else _TurnRunnerUsageTelemetryAdapter(self)
-            ),
+            usage_telemetry=usage_telemetry,
         )
 
     def prepare_manual_compaction_envelope(
@@ -4903,6 +5046,7 @@ class TurnRunner:
         context_window_known: bool,
         provider_request_max_chars: int,
         workspace_dir: str | None,
+        provider_request_max_chars_explicit_cap: int | None = None,
         caller_tool_context: ToolContext | None = None,
     ) -> Agent:
         """Build idle-session prompt/tools for projection without starting a turn."""
@@ -4917,6 +5061,7 @@ class TurnRunner:
             context_window_known=context_window_known,
             provider_request_max_chars=provider_request_max_chars,
             workspace_dir=workspace_dir,
+            provider_request_max_chars_explicit_cap=provider_request_max_chars_explicit_cap,
             caller_tool_context=caller_tool_context,
         )
 
@@ -4969,7 +5114,6 @@ class TurnRunner:
         self._turn_compaction_attempted_sessions.discard(session_key)
         self._turn_compaction_failed_sessions.discard(session_key)
         self._turn_compacted_sessions.discard(session_key)
-        getattr(self, "_emergency_compaction_overrides", {}).pop(session_key, None)
 
     def refresh_memory_snapshot(self, agent_id: str) -> None:
         """Refresh frozen snapshots for all sessions of the given agent.
@@ -4980,7 +5124,9 @@ class TurnRunner:
         ws = self._resolve_memory_source_dir(agent_id)
         new_snap = MemorySnapshot(
             memory_md=self._load_memory_md(ws),
-            daily_notes=self._load_daily_notes(ws),
+            daily_notes=self._load_daily_notes(
+                ws, notes_dir=self._resolve_memory_notes_dir(agent_id),
+            ),
         )
         for key in list(self._memory_snapshots):
             if key[0] == agent_id:
@@ -5000,13 +5146,20 @@ class TurnRunner:
         """Drop frozen bootstrap snapshots after a bootstrap workspace file write."""
         self.invalidate_profile_snapshot(agent_id)
 
+    def invalidate_memory_snapshot(self, agent_id: str) -> None:
+        """Drop one Agent's cached memory without reading unrelated source files."""
+        for key in list(self._memory_snapshots):
+            if key[0] == agent_id:
+                del self._memory_snapshots[key]
+
     def invalidate_profile_snapshot(self, agent_id: str) -> None:
         """Drop cached bootstrap/profile files for every session of one agent.
 
         Profile writers outside the tool loop (for example, an operator-confirmed
         profile import) call this after committing ``USER.md`` so the next turn
-        reloads the file from disk.  Memory snapshots are intentionally separate
-        and continue to be refreshed through :meth:`refresh_memory_snapshot`.
+        reloads the file from disk. Memory snapshots are separate: management
+        file writes evict them through :meth:`invalidate_memory_snapshot`, while
+        memory tools continue to use :meth:`refresh_memory_snapshot`.
         """
         for key in list(self._bootstrap_snapshots):
             if key[0] == agent_id:
@@ -5024,6 +5177,16 @@ class TurnRunner:
                 )
             except Exception:  # noqa: BLE001 - memory path should not block tool setup
                 pass
+
+        if not tool_context.memory_notes_dir:
+            tool_context = replace(
+                tool_context, memory_notes_dir=str(self._resolve_memory_notes_dir(agent_id)),
+            )
+        if not tool_context.bootstrap_source_dir:
+            tool_context = replace(
+                tool_context,
+                bootstrap_source_dir=str(self._resolve_bootstrap_workspace_dir(agent_id)),
+            )
 
         previous_memory_write = tool_context.on_memory_source_write
         if previous_memory_write is None:
@@ -5539,6 +5702,7 @@ class TurnRunner:
         expected_session_epoch: int | None = None,
         telemetry_surface: ClientSurface | None = None,
         telemetry_execution_mode: ExecutionMode | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one public turn and publish exactly one content-free result fact."""
 
@@ -5605,6 +5769,7 @@ class TurnRunner:
                     assistant_message_id=assistant_message_id,
                     expected_session_id=expected_session_id,
                     expected_session_epoch=expected_session_epoch,
+                    on_initial_provider_ready=on_initial_provider_ready,
                 ),
             )
             async with contextlib.aclosing(stream):
@@ -5753,6 +5918,7 @@ class TurnRunner:
         assistant_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -5919,6 +6085,7 @@ class TurnRunner:
                             expected_session_id=expected_session_id,
                             expected_session_epoch=expected_session_epoch,
                             execution_context=execution_context,
+                            on_initial_provider_ready=on_initial_provider_ready,
                         ),
                     )
                     async with contextlib.aclosing(turn_stream):
@@ -5985,6 +6152,7 @@ class TurnRunner:
                                 expected_session_id=expected_session_id,
                                 expected_session_epoch=expected_session_epoch,
                                 execution_context=execution_context,
+                                on_initial_provider_ready=on_initial_provider_ready,
                             ),
                         )
                         async with contextlib.aclosing(turn_stream):
@@ -6034,6 +6202,9 @@ class TurnRunner:
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
+        on_initial_provider_ready: Callable[[ProviderConfig], None] | None = None,
+        project_init: ProjectInitRequest | None = None,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
     ) -> AsyncIterator[AgentEvent]:
         mark_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
         # Observability: bracket turn setup + stream loop with monotonic clock
@@ -6179,12 +6350,19 @@ class TurnRunner:
                     session_key=session_key,
                     tool_context=tool_context,
                     session_append=session_append,
+                    project_init=project_init,
                 )
             )
             runtime_message = input_out.runtime_message
             semantic_input = input_out.semantic_input
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
+            project_init = input_out.project_init
+            if project_init is not None and tool_context is not None:
+                tool_context = replace(
+                    tool_context,
+                    surfaced_tools=set(tool_context.surfaced_tools or ()) | SOURCE_TOOLS,
+                )
 
             async def _load_turn_transcript() -> Sequence[Any]:
                 if self._session_manager is None:
@@ -6308,6 +6486,11 @@ class TurnRunner:
             tool_handler = pt_out.tool_handler
             tool_context = pt_out.effective_tool_context
             tool_metadata = pt_out.tool_metadata
+            if project_init is not None:
+                authorized = getattr(tool_context, "authorized_tool_names", None)
+                if authorized is None:
+                    authorized = frozenset(tool.name for tool in tool_defs)
+                runtime_message += "\n\n" + project_init.render(authorized)
             skill_catalog = pt_out.skill_catalog
 
             # Uploaded attachments have already crossed the controlled ingress
@@ -6413,6 +6596,21 @@ class TurnRunner:
 
             with bind_usage_accounting_scope(turn_usage_scope):
                 mark_current_turn_failure_stage(TurnFailureStage.PROMPT_ASSEMBLY)
+                workspace_dir = getattr(tool_context, "workspace_dir", None)
+                if (
+                    project_rules_snapshot is None and workspace_dir
+                    and bootstrap_context_mode not in {"stateless", "heartbeat_light"}
+                ):
+                    project_rules_snapshot = load_project_rules(
+                        workspace_dir,
+                        per_file_max_chars=min(
+                            self._resolve_bootstrap_max_chars(),
+                            self._resolve_bootstrap_total_max_chars(),
+                        ),
+                        injection_scan_mode=getattr(
+                            getattr(self._config, "safety", None), "injection_scan_mode", "report",
+                        ),
+                    )
                 prompt_assembly = self._prompt_assembler_stage.run(
                     PromptAssemblerStageInput(
                         runtime_message=runtime_message,
@@ -6450,6 +6648,8 @@ class TurnRunner:
                         expected_session_id=expected_session_id,
                         expected_session_epoch=expected_session_epoch,
                         provider_request_correlation=provider_request_correlation,
+                        on_initial_provider_ready=on_initial_provider_ready,
+                        project_rules_snapshot=project_rules_snapshot,
                     )
                 )
                 if tool_context is not None and tool_context.selected_skills:
@@ -6734,7 +6934,6 @@ class TurnRunner:
                         global_override=getattr(llm_cfg, "context_window_tokens", 0) or 0,
                     )
                     compaction_context_window_tokens = window
-            from opensquilla.session.compaction import compaction_prompt_layout
             from opensquilla.session.compaction_deployment import (
                 CompactionDeploymentIdentity,
                 resolve_compaction_execution_plan,
@@ -6842,11 +7041,17 @@ class TurnRunner:
                                 source=previous_source,
                             )
                         )
+            def current_compaction_chat_config() -> ChatConfig | None:
+                build_context = getattr(agent, "build_compaction_request_context", None)
+                context = build_context() if callable(build_context) else None
+                return getattr(context, "chat_config", None)
+
             compaction_plan = resolve_compaction_execution_plan(
                 app_config=self._turn_config(),
                 active_provider=provider,
                 active_provider_config=selector_current_config,
-                active_only=compaction_prompt_layout() == "suffix",
+                active_only=False,
+                active_chat_config=current_compaction_chat_config(),
                 previous_deployment_identities=previous_deployment_identities,
                 fallback_provider_configs=selector_remaining_chain[1:],
                 compaction_config=configured_compaction,
@@ -6912,7 +7117,8 @@ class TurnRunner:
                     app_config=self._turn_config(),
                     active_provider=provider,
                     active_provider_config=fresh_current,
-                    active_only=compaction_prompt_layout() == "suffix",
+                    active_only=False,
+                    active_chat_config=current_compaction_chat_config(),
                     previous_deployment_identities=(previous_deployment_identities),
                     fallback_provider_configs=fresh_chain[1:],
                     compaction_config=configured_compaction,
@@ -6927,7 +7133,10 @@ class TurnRunner:
             stable_consumer_max_output_tokens = agent.config.max_tokens
             stable_consumer_model_id = agent.config.model_id
             stable_consumer_capabilities = agent.config.model_capabilities
-            stable_consumer_proof_max_chars = agent.config.provider_request_proof_max_chars
+            stable_consumer_proof_max_chars = (
+                agent.config.provider_request_proof_max_chars
+                if agent.config.provider_request_proof_max_chars_explicit else 0
+            )
             stable_consumer_metadata = provider_metadata(durable_base_consumer_provider)
             llm_cfg = getattr(self._config, "llm", None) if self._config else None
             if (
@@ -7039,6 +7248,40 @@ class TurnRunner:
                 )
             agent.config.compaction_execution_plan = compaction_plan
             agent.config.compaction_execution_plan_factory = _refresh_compaction_plan_for_operation
+            agent.config.compaction_enabled = (
+                getattr(configured_compaction, "enabled", True) is not False
+            )
+
+            def bind_compaction_scope() -> None:
+                current = (
+                    getattr(cloned_selector, "current_config", None)
+                    if cloned_selector is not None else selector_current_config
+                )
+                self._bind_compaction_failure_scope(
+                    session_key,
+                    self._compaction_failure_identity(
+                        provider=provider, provider_config=current,
+                        chat_config=current_compaction_chat_config(),
+                        policy=self._compaction_failure_policy(agent.config),
+                    ),
+                )
+
+            def circuit_open(*, provider_overflow: bool = False) -> bool:
+                bind_compaction_scope()
+                return self._compaction_circuit_open(
+                    session_key, provider_overflow=provider_overflow,
+                )
+
+            def report_compaction(success: bool, failure_kind: str = "summary_failed") -> None:
+                bind_compaction_scope()
+                if success:
+                    self._record_compaction_success(session_key)
+                else:
+                    self._record_compaction_failure(session_key, failure_kind=failure_kind)
+
+            bind_compaction_scope()
+            agent.config.compaction_circuit_open = circuit_open
+            agent.config.compaction_outcome_reporter = report_compaction
             agent.config.compaction_trigger_ratio = self._preflight_compact_ratio()
             from opensquilla.session.compaction import (
                 CompactionConfig,
@@ -7087,7 +7330,7 @@ class TurnRunner:
                         trigger_ratio=self._preflight_compact_ratio(),
                         retained_tail_messages=retained_tail_messages,
                         summary_output_tokens=(
-                            compaction_plan.primary.max_output_tokens if compaction_plan else 1024
+                            compaction_plan.primary.max_output_tokens if compaction_plan else 0
                         ),
                     )
                     history_capacity_tokens = compaction_budget.history_capacity_tokens
@@ -7127,38 +7370,70 @@ class TurnRunner:
                         consumer_model_capabilities=stable_consumer_capabilities,
                         consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
                     )
-                if turn.metadata.get("large_context_capacity_retry_pending") is True:
+                if (
+                    turn.metadata.get("large_context_capacity_retry_pending") is True
+                    or (
+                        bool(turn.metadata.get("routing_applied", False))
+                        and agent.config.context_window_tokens < compaction_context_window_tokens
+                    )
+                ):
                     # A summary must fit both the durable session consumer and
-                    # this turn's provisionally bound physical deployment.
-                    # Do not change durable ownership to the routed model.
-                    routed_tokens, routed_chars = preflight_history_capacity(
-                        active_user_message=effective_runtime_message,
-                        active_user_in_history=history_has_persisted_user,
-                        attachments=attachments,
-                        attachment_messages=extra_msgs,
-                        context_window_tokens=agent.config.context_window_tokens,
-                        consumer_provider=provider,
-                        consumer_max_output_tokens=agent.config.max_tokens,
-                        consumer_model_id=agent.config.model_id,
-                        consumer_model_capabilities=agent.config.model_capabilities,
-                        consumer_provider_request_max_chars=(
-                            agent.config.provider_request_proof_max_chars
-                        ),
+                    # this turn's smaller physical deployment. Ordinary routed
+                    # history needs the same early adaptation as attachments;
+                    # otherwise the final proof may fit only by eliding it.
+                    # Keep durable ownership bound to the stable consumer.
+                    routed_character_cap = (
+                        agent.config.provider_request_proof_max_chars
+                        if agent.config.provider_request_proof_max_chars_explicit else 0
                     )
-                    routed_admission, routed_fingerprint = build_consumer_admission(
-                        consumer_provider=provider,
-                        active_user_message=effective_runtime_message,
-                        active_user_in_history=history_has_persisted_user,
-                        bound_user_message_id=bound_user_message_id,
-                        attachment_messages=extra_msgs,
-                        context_window_tokens=agent.config.context_window_tokens,
-                        max_output_tokens=agent.config.max_tokens,
-                        consumer_model_id=agent.config.model_id,
-                        consumer_model_capabilities=agent.config.model_capabilities,
-                        consumer_provider_request_max_chars=(
-                            agent.config.provider_request_proof_max_chars
-                        ),
-                    )
+                    routed_budget = None
+                    if callable(resolve_budget):
+                        routed_budget = resolve_budget(
+                            consumer_provider=provider,
+                            active_user_message=effective_runtime_message,
+                            active_user_in_history=history_has_persisted_user,
+                            bound_user_message_id=bound_user_message_id,
+                            attachment_messages=extra_msgs,
+                            context_window_tokens=agent.config.context_window_tokens,
+                            max_output_tokens=agent.config.max_tokens,
+                            consumer_model_id=agent.config.model_id,
+                            consumer_model_capabilities=agent.config.model_capabilities,
+                            consumer_provider_request_max_chars=routed_character_cap,
+                            trigger_ratio=self._preflight_compact_ratio(),
+                            retained_tail_messages=retained_tail_messages,
+                            summary_output_tokens=(
+                                compaction_plan.primary.max_output_tokens if compaction_plan else 0
+                            ),
+                        )
+                        routed_tokens = routed_budget.history_capacity_tokens
+                        routed_chars = routed_budget.history_capacity_chars
+                        routed_admission = routed_budget.consumer_admission
+                        routed_fingerprint = routed_budget.consumer_admission_fingerprint
+                    else:
+                        routed_tokens, routed_chars = preflight_history_capacity(
+                            active_user_message=effective_runtime_message,
+                            active_user_in_history=history_has_persisted_user,
+                            attachments=attachments,
+                            attachment_messages=extra_msgs,
+                            context_window_tokens=agent.config.context_window_tokens,
+                            consumer_provider=provider,
+                            consumer_max_output_tokens=agent.config.max_tokens,
+                            consumer_model_id=agent.config.model_id,
+                            consumer_model_capabilities=agent.config.model_capabilities,
+                            consumer_provider_request_max_chars=routed_character_cap,
+                        )
+                        routed_admission, routed_fingerprint = build_consumer_admission(
+                            consumer_provider=provider,
+                            active_user_message=effective_runtime_message,
+                            active_user_in_history=history_has_persisted_user,
+                            bound_user_message_id=bound_user_message_id,
+                            attachment_messages=extra_msgs,
+                            context_window_tokens=agent.config.context_window_tokens,
+                            max_output_tokens=agent.config.max_tokens,
+                            consumer_model_id=agent.config.model_id,
+                            consumer_model_capabilities=agent.config.model_capabilities,
+                            consumer_provider_request_max_chars=routed_character_cap,
+                        )
                     stable_admission = consumer_admission
 
                     def admit_both_consumers(summary: str, kept: list[dict[str, Any]]) -> bool:
@@ -7173,18 +7448,47 @@ class TurnRunner:
                     history_capacity_tokens = min(history_capacity_tokens, routed_tokens)
                     history_capacity_chars = min(history_capacity_chars, routed_chars)
                     if compaction_budget is not None:
+                        tail_proofs = tuple(
+                            budget.consumer_tail_over_capacity
+                            for budget in (compaction_budget, routed_budget)
+                            if budget is not None and budget.consumer_tail_over_capacity is not None
+                        )
+
+                        def either_tail_over_capacity(kept: list[dict[str, Any]]) -> bool:
+                            # Both consumers are required for admission. Check
+                            # every bound envelope so stale routing still
+                            # invalidates the proof instead of authorizing work.
+                            return any([proof(kept) for proof in tail_proofs])
+
                         compaction_budget = replace(
                             compaction_budget,
+                            # Retention uses the same smaller consumer window
+                            # as this combined budget, not durable ownership.
+                            physical_context_window_tokens=min(
+                                compaction_budget.physical_context_window_tokens,
+                                routed_budget.physical_context_window_tokens
+                                if routed_budget is not None
+                                else agent.config.context_window_tokens,
+                            ),
                             history_capacity_tokens=history_capacity_tokens,
                             history_capacity_chars=history_capacity_chars,
-                            auto_trigger_tokens=int(
-                                history_capacity_tokens * self._preflight_compact_ratio()
+                            auto_trigger_tokens=min(
+                                compaction_budget.auto_trigger_tokens,
+                                routed_budget.auto_trigger_tokens if routed_budget else int(
+                                    routed_tokens * self._preflight_compact_ratio()
+                                ),
                             ),
-                            auto_trigger_chars=int(
-                                history_capacity_chars * self._preflight_compact_ratio()
+                            auto_trigger_chars=min(
+                                compaction_budget.auto_trigger_chars,
+                                routed_budget.auto_trigger_chars if routed_budget else int(
+                                    routed_chars * self._preflight_compact_ratio()
+                                ),
                             ),
                             retained_tail_tokens=history_capacity_tokens // 5,
                             consumer_admission=consumer_admission,
+                            consumer_tail_over_capacity=(
+                                either_tail_over_capacity if tail_proofs else None
+                            ),
                             consumer_admission_fingerprint=consumer_admission_fingerprint,
                         )
             else:
@@ -7233,41 +7537,57 @@ class TurnRunner:
                     execution_id=uuid.uuid4().hex,
                     call_kind="auxiliary.compaction",
                 )
-                ch_outcome = await self._compaction_and_history_stage.run(
-                    CompactionAndHistoryStageInput(
-                        agent=agent,
-                        context_window_tokens=agent_config.context_window_tokens,
-                        provider=provider,
-                        resolved_model=resolved_model,
-                        compaction_context_window_tokens=compaction_context_window_tokens,
-                        compaction_provider=provider,
-                        compaction_model=compaction_model,
-                        compaction_plan=compaction_plan,
-                        compaction_request_context=compaction_request_context,
-                        compaction_budget=compaction_budget,
-                        history_capacity_tokens=history_capacity_tokens,
-                        history_capacity_chars=history_capacity_chars,
-                        session_key=session_key,
-                        agent_id=agent_id,
-                        history_has_persisted_user=history_has_persisted_user,
-                        expected_session_id=expected_session_id,
-                        expected_session_epoch=expected_session_epoch,
-                        bound_user_message_id=bound_user_message_id,
-                        provider_request_correlation=compaction_correlation,
-                        consumer_admission=consumer_admission,
-                        consumer_admission_fingerprint=consumer_admission_fingerprint,
-                        skip_compaction=image_input_preflight_blocked,
-                        attachment_path_resolver=attachment_path_resolver,
-                        transcript_snapshot=transcript_snapshot,
-                    )
-                )
+                parent_deadline = execution_context.deadline
+                if parent_deadline is not None and time.monotonic() >= parent_deadline:
+                    raise TimeoutError("Turn deadline expired before context preparation")
+                parent_timeout = asyncio.timeout_at(parent_deadline)
+                try:
+                    async with parent_timeout:
+                        ch_outcome = await self._compaction_and_history_stage.run(
+                            CompactionAndHistoryStageInput(
+                                agent=agent,
+                                context_window_tokens=agent_config.context_window_tokens,
+                                provider=provider,
+                                resolved_model=resolved_model,
+                                compaction_context_window_tokens=compaction_context_window_tokens,
+                                compaction_provider=provider,
+                                compaction_model=compaction_model,
+                                compaction_plan=compaction_plan,
+                                compaction_request_context=compaction_request_context,
+                                compaction_budget=compaction_budget,
+                                history_capacity_tokens=history_capacity_tokens,
+                                history_capacity_chars=history_capacity_chars,
+                                session_key=session_key,
+                                agent_id=agent_id,
+                                history_has_persisted_user=history_has_persisted_user,
+                                expected_session_id=expected_session_id,
+                                expected_session_epoch=expected_session_epoch,
+                                bound_user_message_id=bound_user_message_id,
+                                provider_request_correlation=compaction_correlation,
+                                consumer_admission=consumer_admission,
+                                consumer_admission_fingerprint=consumer_admission_fingerprint,
+                                skip_compaction=image_input_preflight_blocked,
+                                attachment_path_resolver=attachment_path_resolver,
+                                transcript_snapshot=transcript_snapshot,
+                            )
+                        )
+                except TimeoutError as exc:
+                    if parent_timeout.expired():
+                        # Windows event-loop timer resolution can precede the
+                        # next monotonic read. Only our own timer's expiry is
+                        # authoritative here, never an unrelated storage timeout.
+                        setattr(
+                            exc, "control_terminal_reason",
+                            ControlTerminalReason.HARD_DEADLINE.value,
+                        )
+                    raise
             ch_out = ch_outcome.require_output()
             # A failed preflight (including a circuit-open local recovery) must
             # not be retried by another Agent entry with a fresh deadline.
             agent._compaction_failed_this_turn = (
                 session_key in self._turn_compaction_failed_sessions
             )
-            agent.config.request_context_prompt = ch_out.final_request_context_prompt
+            agent.config.compaction_summary_context = ch_out.compaction_summary_context
 
             if turn.metadata.get("large_context_capacity_retry_pending") is True:
                 await self._readmit_attachment_capacity(
@@ -7288,6 +7608,7 @@ class TurnRunner:
             compaction_source_context_fingerprint: str | None = None
             compaction_source_boundary_message_id: str | None = None
             compaction_source_boundary_entry_id: int | None = None
+            bound_compaction_source = None
             capture_compaction_source = getattr(
                 self._session_manager,
                 "capture_compaction_source",
@@ -7366,6 +7687,7 @@ class TurnRunner:
                         )
                     )
                     if source_is_entry_aligned:
+                        bound_compaction_source = source_snapshot
                         compaction_source_entries = source_entries
                         compaction_source_preimage = source_snapshot.preimage
                         compaction_source_context_fingerprint = source_snapshot.context_fingerprint
@@ -7384,6 +7706,10 @@ class TurnRunner:
                             loaded_history_count=len(loaded_history),
                         )
 
+            bind_compaction_source = getattr(agent, "bind_compaction_source", None)
+            if callable(bind_compaction_source):
+                bind_compaction_source(bound_compaction_source)
+
             # 8. Stream events (final_text_parts/turn_segments are declared
             # up-front above so the CancelledError handler can read them).
             # StreamConsumerStage owns the slice. The four pre-stream
@@ -7398,6 +7724,7 @@ class TurnRunner:
             turn_input = attachment_turn_input
 
             stream_state = _StreamState(
+                compaction_source_snapshot=bound_compaction_source,
                 current_text_parts=current_text_parts,
                 final_text_parts=final_text_parts,
                 reasoning_parts=reasoning_parts,
@@ -7475,6 +7802,7 @@ class TurnRunner:
                                 error_type=type(exc).__name__,
                             )
             if router_control_replay_event is not None:
+                # 首次部署通知已经消费；同一回合的路由重放不再派发辅助命名。
                 replay_stream = cast(
                     AsyncGenerator[AgentEvent, None],
                     self._run_turn(
@@ -7513,6 +7841,8 @@ class TurnRunner:
                         expected_session_id=expected_session_id,
                         expected_session_epoch=expected_session_epoch,
                         execution_context=execution_context,
+                        project_init=project_init,
+                        project_rules_snapshot=project_rules_snapshot,
                     ),
                 )
                 async with contextlib.aclosing(replay_stream):
@@ -7708,12 +8038,6 @@ class TurnRunner:
                 trace_id=trace_context.trace_id if trace_context is not None else None,
                 skills_invoked=collect_invoked_skills(turn_segments),
             )
-            self._emit_router_train_sample(
-                agent_id=agent_id,
-                session_key=session_key,
-                turn_obj=turn_obj,
-                message=message,
-            )
             if (
                 pending_error_event is not None
                 and not stream_state.terminal_generation_reset
@@ -7765,12 +8089,12 @@ class TurnRunner:
             )
             partial_text = partial_normalization.text.rstrip()
             human_prefix_was_withheld = (
-                input_mode != "system_event"
+                input_mode not in {"system_event", "goal_continuation"}
                 and bool(raw_partial_text_untrimmed)
                 and _could_be_human_silent_reply_prefix(raw_partial_text_untrimmed)
             )
             if (
-                input_mode == "system_event"
+                input_mode in {"system_event", "goal_continuation"}
                 and run_kind in {"goal", "heartbeat"}
                 and is_silent_reply_prefix(raw_partial_text)
             ) or human_prefix_was_withheld:
@@ -8620,12 +8944,6 @@ class TurnRunner:
         if input_mode != "user":
             return None
 
-        metadata = turn_metadata or {}
-        if tool_context.coding_mode or bool(metadata.get("coding_mode")):
-            return None
-        if any(metadata.get(key) is not None for key in _WEB_CHAT_META_EXEMPT_KEYS):
-            return None
-
         base_timeout = self._resolve_agent_runtime_timeout(session_key)
         if base_timeout == 0:
             return 0.0
@@ -8923,10 +9241,6 @@ class TurnRunner:
         """Build tool definitions and handler from registry, filtered by ToolContext."""
         if self._tool_registry is None:
             return [], None
-        from opensquilla.skills.meta.enabled import (
-            is_meta_auto_trigger_enabled,
-            is_meta_skill_enabled,
-        )
         from opensquilla.tools.dispatch import build_tool_handler
         from opensquilla.tools.policy import apply_tool_policy_from_config
         from opensquilla.tools.registry import filter_by_profile, resolve_profile
@@ -8939,26 +9253,27 @@ class TurnRunner:
                 loaded_skills = list(self._skill_loader.load_all())
             except Exception:
                 loaded_skills = []
-        meta_skill_enabled = is_meta_skill_enabled(self._config)
-        meta_auto_trigger = is_meta_auto_trigger_enabled(self._config)
-        has_invokable_meta_skill = any(
-            getattr(skill, "kind", "skill") == "meta"
-            and not getattr(skill, "disable_model_invocation", False)
-            for skill in loaded_skills
-        )
         plan_mode = ctx is not None and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
         attached_plan_run = bool(
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
         )
         if ctx is not None:
+            from opensquilla.session.keys import is_sidechat_key
             from opensquilla.skills.catalog_policy import project_public_catalog
             from opensquilla.skills.install_turn import SkillInstallTurn
 
+            # A side snapshot can be stale by its next turn. Make its existing
+            # history reader discoverable immediately; policy/profile/guest
+            # filtering below still determines whether it is authorized.
+            if is_sidechat_key(ctx.session_key):
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                ctx.surfaced_tools.add("sessions_history")
             skill_tools: set[str] = set()
             if isinstance(ctx.skill_install_turn, SkillInstallTurn):
                 skill_tools.update(ctx.skill_install_turn.surface_tools())
             if project_public_catalog(
-                loaded_skills, coding_mode=ctx.coding_mode, include_stable_meta=False,
+                loaded_skills,
             ):
                 skill_tools.update({"skill_list", "skill_view"})
             if ctx.selected_skills:
@@ -8978,12 +9293,6 @@ class TurnRunner:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
                 ctx.surfaced_tools.add("retrieve_tool_result")
-            if meta_skill_enabled and meta_auto_trigger and has_invokable_meta_skill:
-                if ctx.surfaced_tools is None:
-                    ctx.surfaced_tools = set()
-                ctx.surfaced_tools.add("meta_invoke")
-            else:
-                ctx.denied_tools.add("meta_invoke")
             if plan_mode:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
@@ -8991,7 +9300,7 @@ class TurnRunner:
                 if ctx.interaction_mode is InteractionMode.INTERACTIVE:
                     plan_control_tools.add("request_user_input")
                 ctx.surfaced_tools.update(plan_control_tools)
-                ctx.denied_tools.update({"submit", "meta_invoke"})
+                ctx.denied_tools.add("submit")
             elif (
                 ctx.subagent_depth == 0 and ctx.collaboration_mode == "default"
                 and ctx.caller_kind in {CallerKind.AGENT, CallerKind.WEB, CallerKind.CLI,
@@ -9008,15 +9317,12 @@ class TurnRunner:
                     # Normal allow/deny/profile policy still applies below.
                     ctx.surfaced_tools.discard("update_plan")
                     ctx.explicitly_allowed_tools.add("update_plan")
-                if attached_plan_run:
-                    controls.add("plan_run_checkpoint")
                 if ctx.goal_service is not None or is_goal_owned_main_default_turn(ctx):
                     controls.update(
-                        {"get_goal", "create_goal", "update_goal", "update_goal_progress"}
+                        {"get_goal", "create_goal", "update_goal"}
                     )
                 ctx.surfaced_tools.update(controls)
         if metadata is not None:
-            metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
                 metadata["skill_catalog_generation"] = int(getattr(skill_catalog, "generation", 0))
 
@@ -9043,15 +9349,6 @@ class TurnRunner:
             # ceiling below may still remove it.
             if ctx.allowed_tools is not None and "tool_search" not in ctx.denied_tools:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {"tool_search"}
-            # Surfacing lifts the default-access deny gate but deliberately does
-            # not relax a profile allowlist. Explicit denies still win in the
-            # registry visibility check.
-            from opensquilla.tools.policy_config import coding_mode_denied_tools
-
-            skills_cfg = getattr(self._config, "skills", None)
-            coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
-            ctx.denied_tools.update(coding_mode_denied_tools(coding_mode))
-            ctx.coding_mode = coding_mode
             if ctx is not caller_ctx:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
@@ -9060,10 +9357,11 @@ class TurnRunner:
                 caller_ctx.denied_tools.clear()
                 caller_ctx.denied_tools.update(ctx.denied_tools)
                 caller_ctx.workspace_write_deny_globs[:] = ctx.workspace_write_deny_globs
-                caller_ctx.coding_mode = ctx.coding_mode
+        tool_defs = self._tool_registry.to_tool_definitions(ctx)
+        if ctx is not None:
             log.debug(
                 "tool_policy.policy_pre",
-                allowed_tool_count=len(self._tool_registry.to_tool_definitions(ctx)),
+                allowed_tool_count=len(tool_defs),
                 denied_count=len(ctx.denied_tools),
                 profile=resolve_profile(ctx).value,
             )
@@ -9072,7 +9370,6 @@ class TurnRunner:
             caller_kind=ctx.caller_kind if ctx else "none",
             denied_count=len(ctx.denied_tools) if ctx else 0,
         )
-        tool_defs = self._tool_registry.to_tool_definitions(ctx)
         if ctx is not None:
             from opensquilla.tools.filter import filter_tools
 
@@ -9115,7 +9412,7 @@ class TurnRunner:
             skill.name
             for skill in loaded_skills
             if not getattr(skill, "disable_model_invocation", False)
-            and (meta_skill_enabled or getattr(skill, "kind", "skill") != "meta")
+            and getattr(skill, "kind", "skill") == "skill"
         }
         tool_handler = build_tool_handler(
             self._tool_registry,
@@ -9150,6 +9447,8 @@ class TurnRunner:
             gateway_config=getattr(self, "_config", None) is not None,
             channel_backing=detected.channel_backing,
             image_generation=detected.image_generation,
+            video_generation=detected.video_generation,
+            video_status=detected.video_status,
             git_available=detected.git_available,
         )
         return resolve_runtime_tool_surface(ctx, capabilities=capabilities)
@@ -9261,7 +9560,7 @@ class TurnRunner:
             "messages and saved progress can help locate work, but inspect the relevant "
             "current state before relying on them.\n\n"
             "Optional progress view:\n"
-            "- update_plan is optional; update_goal_progress is its legacy adapter. "
+            "- update_plan is optional. "
             "Use it only when a concise current-state "
             "view helps with meaningful multi-step work, and replace the view when reality "
             "changes. It must not define fixed phases or turn boundaries, schedule future "
@@ -9508,6 +9807,10 @@ class TurnRunner:
         bootstrap_context_mode: str | None = None,
         fresh_user_session: bool = False,
         workspace_dir: str | None = None,
+        webui_rendering: bool = False,
+        project_rules_snapshot: ProjectRulesSnapshot | None = None,
+        include_project_rules: bool = True,
+        persistence_tools: frozenset[str] | None = None,
     ) -> str | tuple[str, str]:
         """Assemble identity system prompt via Jinja2 template.
 
@@ -9587,6 +9890,28 @@ class TurnRunner:
                     report=list(visible_bootstrap_report),
                 )
         memory_source_dir = self._resolve_memory_source_dir(agent_id)
+        if (
+            project_rules_snapshot is None and workspace_dir and include_project_rules
+            and bootstrap_context_mode not in {"stateless", "heartbeat_light"}
+        ):
+            project_rules_snapshot = load_project_rules(
+                workspace_dir,
+                per_file_max_chars=min(
+                    self._resolve_bootstrap_max_chars(),
+                    self._resolve_bootstrap_total_max_chars(),
+                ),
+                injection_scan_mode=getattr(
+                    getattr(self._config, "safety", None), "injection_scan_mode", "report",
+                ),
+            )
+        if (
+            project_rules_snapshot is not None
+            and project_rules_snapshot.includes_file(bootstrap_workspace_dir / "AGENTS.md")
+        ):
+            workspace_files.pop("AGENTS.md", None)
+            visible_bootstrap_report = [
+                report for report in visible_bootstrap_report if report.filename != "AGENTS.md"
+            ]
         stateless_prompt = bootstrap_context_mode in {
             "stateless",
             "stateless_keep_project_rules",
@@ -9605,7 +9930,9 @@ class TurnRunner:
             memory_text = snap.memory_md
             daily = snap.daily_notes
         else:
-            daily = self._load_daily_notes(memory_source_dir)
+            daily = self._load_daily_notes(
+                memory_source_dir, notes_dir=self._resolve_memory_notes_dir(agent_id),
+            )
             memory_text = self._load_memory_md(memory_source_dir)
         daily_notes_count_before_omit = len(daily)
         daily_notes_omitted = daily_notes_count_before_omit > 0
@@ -9675,11 +10002,14 @@ class TurnRunner:
         }
         base_prompt = assemble_system_prompt(
             agent_profile,
-            tools=[td.name for td in tool_defs] if tool_defs else None,
+            tools=sorted(
+                {td.name for td in tool_defs} | set(persistence_tools or ()),
+            ) or None,
             memory=memory_text,
             runtime_info=runtime_info,
             docs_path=(self._resolve_docs_path()),
             heartbeat_prompt=(getattr(self._config, "heartbeat_prompt", None)),
+            webui_rendering=webui_rendering,
         )
         # daily_notes, workspace_files, and extra_context are per-turn /
         # per-day volatile content. Keeping them in the cacheable base
@@ -9689,6 +10019,10 @@ class TurnRunner:
         # Render them into the dynamic suffix instead so the base hash
         # stays stable across those rotations.
         dynamic_blocks: list[str] = []
+        if include_project_rules and project_rules_snapshot is not None:
+            project_rules_block = project_rules_snapshot.render()
+            if project_rules_block:
+                dynamic_blocks.append(project_rules_block)
         volatile_block = self._render_volatile_block(
             daily_notes=daily,
             workspace_files=workspace_files,
@@ -9718,10 +10052,22 @@ class TurnRunner:
         return None
 
     def _resolve_memory_source_dir(self, agent_id: str):
-        from opensquilla.agents.scope import resolve_agent_memory_source_dir
+        from opensquilla.agents.scope import resolve_agent_source_paths
 
-        source = getattr(getattr(self._config, "memory", None), "source", "state")
-        return resolve_agent_memory_source_dir(agent_id, self._config, source=source)
+        manager = (self._memory_managers or {}).get(agent_id)
+        source = getattr(manager, "workspace_dir", None)
+        if source is not None:
+            return source
+        return resolve_agent_source_paths(agent_id, self._config).memory_root
+
+    def _resolve_memory_notes_dir(self, agent_id: str):
+        from opensquilla.agents.scope import resolve_agent_source_paths
+
+        manager = (self._memory_managers or {}).get(agent_id)
+        notes = getattr(manager, "memory_dir", None)
+        if notes is not None:
+            return notes
+        return resolve_agent_source_paths(agent_id, self._config).notes_dir
 
     def _effective_memory_retrieval_metadata(self, agent_id: str) -> dict[str, str]:
         retrievers = self._memory_retrievers or {}
@@ -9788,51 +10134,14 @@ class TurnRunner:
             return content[:max_chars] + "\n..."
         return content
 
-    def _make_meta_llm_chat(
-        self,
-        provider: Any,
-        session_key: str,
-        usage_execution_context: UsageExecutionContext | None = None,
-        provider_request_correlation: ProviderRequestCorrelation | None = None,
-    ) -> Any:
-        """Construct the (system_prompt, user_message) -> str callable that
-        meta_resolution's awaiting branch invokes for ``nl_extract: true``.
 
-        Returns None when the provider isn't available — the awaiting
-        branch silently falls back to the deterministic parser's errors,
-        which is exactly the behavior we want for non-LLM unit tests.
-        """
-        if provider is None:
-            return None
-        # Lazy import keeps the runtime cold-start independent of meta.
-        from opensquilla.engine.types import AgentConfig
-        from opensquilla.skills.meta.orchestrator import make_llm_chat_from_provider
-
-        # ``make_llm_chat_from_provider`` only reads ``model_id`` /
-        # ``metadata`` off base_config (via getattr). ``self._config`` is
-        # the GatewayConfig (different shape — no .model_id), so build a
-        # minimal AgentConfig() rather than passing the wrong type.
-        meta_correlation = derive_provider_request_correlation(
-            provider_request_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.meta",
-        )
-        return make_llm_chat_from_provider(
-            provider=provider,
-            base_config=AgentConfig(),
-            usage_tracker=getattr(self, "_usage_tracker", None),
-            session_key=session_key,
-            usage_event_sink=self._usage_event_sink,
-            usage_execution_context=usage_execution_context,
-            provider_request_correlation=meta_correlation,
-        )
-
-    def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
+    def _load_daily_notes(self, workspace_dir: Any, *, notes_dir: Any = None) -> dict[str, str]:
         from opensquilla.identity.workspace import load_daily_notes
 
         memory_cfg = getattr(self._config, "memory", None)
         return load_daily_notes(
             str(workspace_dir),
+            notes_dir=notes_dir,
             per_note_max_chars=getattr(memory_cfg, "daily_note_max_chars", 4000),
             total_max_chars=getattr(memory_cfg, "daily_notes_total_max_chars", 8000),
         )
@@ -9889,12 +10198,9 @@ class TurnRunner:
         from opensquilla.engine.steps import (
             apply_prompt_cache,
             apply_squilla_router,
-            enforce_coding_mode,
             finalize_squilla_router_capacity,
             inject_platform_hint,
             inject_subagent_grounding,
-            meta_command_launch,
-            meta_resolution,
             observe_reasoning_hint,
             resolve_model,
             resolve_skill_catalog,
@@ -9973,52 +10279,13 @@ class TurnRunner:
             from opensquilla.skills.loader import PinnedSkillLoader
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
-        from opensquilla.skills.meta.readiness import (
-            META_READINESS_ENV_ALIASES_METADATA_KEY,
-            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
-            configured_meta_readiness_env_aliases,
-            configured_meta_skill_runtime_env,
-        )
-
         turn_config = self._turn_config()
         initial_metadata: dict[str, Any] = {
-            # Agent-side skill_view coercion, meta execution, and child
-            # orchestrators must resolve against the same generation used for
-            # prompt/tool selection. The pinned loader view preserves configured
-            # roots while keeping every catalog read free of filesystem probes.
             "skill_loader": agent_skill_loader,
-            "meta_run_writer": getattr(self, "_meta_run_writer", None),
-            # A content-free callback for the authoritative MetaSkill run
-            # boundary. It is copied to sub-Agent configs by the orchestrator
-            # and never enters persisted run inputs or telemetry payloads.
-            "metaskill_usage_recorder": getattr(
-                getattr(self, "growth_event_sink", None),
-                "observe_metaskill_usage",
-                None,
-            ),
-            # PR9+: meta_resolution's awaiting branch calls this first when
-            # the SKILL.md has ``nl_extract: true``. None keeps clarify reply
-            # parsing on the deterministic compatibility path.
-            "meta_llm_chat": self._make_meta_llm_chat(
-                provider,
-                session_key,
-                usage_execution_context,
-                provider_request_correlation,
-            ),
             "router_control_hold_store": self._router_control_hold_store,
             "router_control_routing_revision": getattr(
                 tool_context, "router_control_routing_revision", None
             ),
-            # Surface the resolved per-agent workspace so the meta_invoke
-            # handler in Agent._run_one_streaming (agent.py ~L4724) can
-            # find it without falling through to default_workspace_dir().
-            # Prefer tool_context.workspace_dir (already resolved with
-            # the gateway config in rpc_sessions / channel_dispatch /
-            # scheduler); fall back to resolving from agent_id on the
-            # tool_context, then to an empty string. When this key was
-            # absent the meta_invoke handler dropped to
-            # default_workspace_dir() and exec_command sandbox blocked
-            # paths under ``/root/`` instead of the gateway workspace.
             "bootstrap_workspace_dir": (
                 getattr(tool_context, "workspace_dir", None)
                 or (
@@ -10029,31 +10296,6 @@ class TurnRunner:
                     )
                     if tool_context is not None
                     else ""
-                )
-            ),
-            # Opaque callable only: credential bytes never enter metadata,
-            # transcripts, persisted inputs, or manifest-rendered arguments.
-            # The Agent must supply the current parent spec and the exact plan
-            # it is about to execute; the callable fails closed for any
-            # workspace/project parent or paid-step contract drift.
-            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY: (
-                lambda parent_spec, plan: configured_meta_skill_runtime_env(
-                    turn_config,
-                    parent_spec=parent_spec,
-                    plan=plan,
-                    session_key=session_key,
-                    skill_resolver=agent_skill_loader,
-                )
-            ),
-            # Names only, likewise parent+plan scoped. A global alias would
-            # make an untrusted MetaSkill appear executable even though no
-            # capability lease could safely be injected into its child.
-            META_READINESS_ENV_ALIASES_METADATA_KEY: (
-                lambda parent_spec, plan: configured_meta_readiness_env_aliases(
-                    turn_config,
-                    parent_spec=parent_spec,
-                    plan=plan,
-                    skill_resolver=agent_skill_loader,
                 )
             ),
         }
@@ -10239,10 +10481,27 @@ class TurnRunner:
             and getattr(budget_cfg, "limit_usd", None)
             and self._session_manager is not None
         ):
+            budget_session = None
             try:
                 budget_session = await self._session_manager.get_session(session_key)
+                reconcile_usage = getattr(
+                    getattr(self._session_manager, "storage", None),
+                    "reconcile_session_usage_totals_from_ledger",
+                    None,
+                )
+                if budget_session is not None and callable(reconcile_usage):
+                    budget_session = (
+                        await reconcile_usage(
+                            session_key=session_key,
+                            expected_session_id=budget_session.session_id,
+                            expected_epoch=budget_session.epoch,
+                        )
+                        or budget_session
+                    )
             except Exception:  # noqa: BLE001 - budget seeding must never break a turn
-                budget_session = None
+                # A failed refresh must not erase spend already read from the
+                # exact session generation's compatibility cache.
+                pass
             if budget_session is not None:
                 initial_metadata["session_billed_cost_usd"] = float(
                     getattr(budget_session, "billed_cost_usd", 0.0) or 0.0
@@ -10277,10 +10536,6 @@ class TurnRunner:
         from opensquilla.engine.steps.selected_skills import load_selected_skills
 
         turn = await load_selected_skills(turn, tool_context)
-        planning_turn = (
-            tool_context is not None
-            and str(getattr(tool_context, "collaboration_mode", "default")) == "plan"
-        )
         pipeline_steps: list[TurnStep] = [resolve_model]
         pipeline_steps.extend(
             [
@@ -10288,8 +10543,6 @@ class TurnRunner:
                 observe_reasoning_hint,
             ]
         )
-        if not planning_turn:
-            pipeline_steps.extend([meta_resolution, enforce_coding_mode])
         pipeline_steps.extend(
             [
                 resolve_skill_catalog,
@@ -10298,8 +10551,6 @@ class TurnRunner:
                 apply_prompt_cache,
             ]
         )
-        if not planning_turn:
-            pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
         if router_history_replay_request is not None:
             history_capacity = await self._router_history_capacity_for_request(
@@ -10891,8 +11142,9 @@ class TurnRunner:
 
         Ordinary JSON is not treated as an attachment envelope and remains a
         conservative text input. The result is ``(recognized, valid,
-        estimate_complete)``. Invalid recognized envelopes remain raw text;
-        only a valid envelope may replace its persisted raw-token floor.
+        estimate_complete)``. Once the outer envelope is recognized, corrupt
+        non-image material remains a bounded replay marker; only retained
+        image media requires a material proof.
         """
 
         if not content or not content.lstrip().startswith("{"):
@@ -10905,22 +11157,30 @@ class TurnRunner:
             return False, True, True
         if not isinstance(parsed.get("text"), str):
             return True, False, False
-        attachments = parsed.get("attachments") or []
+        attachments = parsed.get("attachments")
         if not isinstance(attachments, list):
             return True, False, False
-        for attachment in attachments:
+        from opensquilla.session.attachment_manifest import (
+            extract_attachment_occurrences_from_envelope,
+        )
+
+        occurrences = extract_attachment_occurrences_from_envelope(
+            content,
+            session_id=session_id or "capacity",
+            source_message_id="capacity",
+        )
+        image_occurrences = {occurrence.ordinal: occurrence for occurrence in occurrences}
+        for ordinal, attachment in enumerate(attachments):
             if not isinstance(attachment, dict):
-                return True, False, False
-            media_type = (
+                # The replay decoder skips malformed list members entirely.
+                continue
+            raw_media_type = (
                 attachment.get("type")
                 or attachment.get("mime")
                 or attachment.get("media_type")
             )
-            if (
-                not isinstance(media_type, str)
-                or media_type not in _ALLOWED_ENGINE_MEDIA_TYPES
-            ):
-                return True, False, False
+            if not isinstance(raw_media_type, str):
+                continue
             data = attachment.get("data")
             sha_ref = attachment.get("sha256_ref")
             missing_reason = attachment.get("missing_reason")
@@ -10928,114 +11188,52 @@ class TurnRunner:
             sha_ref_text = sha_ref if isinstance(sha_ref, str) and sha_ref else None
             has_missing_reason = isinstance(missing_reason, str) and bool(missing_reason)
             if not (data_text is not None or sha_ref_text is not None or has_missing_reason):
+                # The historical decoder skips MIME-only and alias-only rows.
+                continue
+            # Historical non-image material is never included in a provider
+            # message. A corrupt or missing file changes only its bounded
+            # workspace/omission marker, not whether the storage Base64 is
+            # replayed. Only images retained by this route need material proof.
+            if not preserve_image_attachments or raw_media_type not in _IMAGE_ATTACHMENT_MIMES:
+                continue
+            media_type = _normalize_attachment_mime(raw_media_type)
+            if media_type is None:
+                return True, False, False
+            occurrence = image_occurrences.get(ordinal)
+            if occurrence is None:
                 return True, False, False
             if data_text is not None:
                 try:
-                    base64.b64decode(data_text, validate=True)
+                    decoded = base64.b64decode(data_text, validate=True)
+                    validate_image_bytes(decoded, media_type)
                 except (binascii.Error, ValueError):
                     return True, False, False
-            if not preserve_image_attachments or media_type not in _IMAGE_ATTACHMENT_MIMES:
                 continue
-            if data_text is not None:
-                continue
-            if sha_ref_text is None:
-                # A persisted missing_reason-only record intentionally replays
-                # as an unavailable marker and needs no media hydration.
-                continue
-            if media_root is None or not session_id:
-                return True, True, False
-            raw_size = attachment.get("size")
-            size = raw_size if isinstance(raw_size, int) else -1
-            label = attachment.get("name")
-            if not isinstance(label, str) or not label.strip():
-                label = "image"
-            try:
-                ref = make_attachment_ref(
-                    sha256=sha_ref_text,
-                    name=label,
-                    mime=media_type,
-                    size=size,
-                    session_id=session_id,
-                    source="transcript",
-                )
-                read_attachment_ref_bytes(ref, media_root=media_root)
-            except (OSError, ValueError):
-                return True, True, False
+            if occurrence.material_state == "invalid" and sha_ref_text is None:
+                return True, False, False
+            if data_text is None and sha_ref_text is not None:
+                # Retained images can enter the provider request as media, so
+                # prove their reference before reserving the media budget.
+                if media_root is None or not session_id:
+                    return True, True, False
+                raw_size = attachment.get("size")
+                size = raw_size if isinstance(raw_size, int) else -1
+                label = attachment.get("name")
+                if not isinstance(label, str) or not label.strip():
+                    label = "attachment"
+                try:
+                    ref = make_attachment_ref(
+                        sha256=sha_ref_text,
+                        name=label,
+                        mime=media_type,
+                        size=size,
+                        session_id=session_id,
+                        source="transcript",
+                    )
+                    read_attachment_ref_bytes(ref, media_root=media_root)
+                except (OSError, ValueError):
+                    return True, True, False
         return True, True, True
-
-    @staticmethod
-    def _attachment_history_residual_token_floor(
-        content: str,
-        projected_content: Any,
-        persisted_token_count: int,
-    ) -> int:
-        """Remove only replayed inline-image data from a persisted raw floor.
-
-        A transcript token_count is row-scoped, so clearing it wholesale can
-        also discount ordinary text, PDF bytes, or a legacy provider-usage
-        surplus. Replace the exact canonical ``data`` JSON values for images
-        that became typed blocks, then subtract only that measured delta.
-        Failure to locate every value keeps the original conservative floor.
-        """
-
-        raw_tokens = estimate_tokens(content)
-        raw_floor = max(0, persisted_token_count, raw_tokens)
-        if not isinstance(projected_content, list):
-            return raw_floor
-        from opensquilla.provider.types import ContentBlockImage
-
-        typed_image_count = sum(
-            isinstance(block, ContentBlockImage) and block.source_type == "base64"
-            for block in projected_content
-        )
-        if typed_image_count <= 0:
-            return raw_floor
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return raw_floor
-        if not isinstance(parsed, dict):
-            return raw_floor
-        attachments = parsed.get("attachments") or []
-        if not isinstance(attachments, list):
-            return raw_floor
-        inline_image_data = [
-            attachment["data"]
-            for attachment in attachments
-            if isinstance(attachment, dict)
-            and (
-                attachment.get("type")
-                or attachment.get("mime")
-                or attachment.get("media_type")
-            )
-            in _IMAGE_ATTACHMENT_MIMES
-            and isinstance(attachment.get("data"), str)
-            and bool(attachment.get("data"))
-        ]
-        if not inline_image_data or typed_image_count < len(inline_image_data):
-            return raw_floor
-
-        residual = content
-        for data in set(inline_image_data):
-            encoded_data = json.dumps(data, ensure_ascii=False)
-            placeholder = json.dumps(
-                f"[history_image_omitted: {len(data)} chars]",
-                ensure_ascii=False,
-            )
-            pattern = re.compile(r'("data"\s*:\s*)' + re.escape(encoded_data))
-            expected_replacements = inline_image_data.count(data)
-            if len(pattern.findall(residual)) != expected_replacements:
-                return raw_floor
-            residual, replacements = pattern.subn(
-                lambda match: match.group(1) + placeholder,
-                residual,
-            )
-            if replacements != expected_replacements:
-                return raw_floor
-
-        residual_tokens = estimate_tokens(residual)
-        image_data_delta = max(0, raw_tokens - residual_tokens)
-        return max(0, residual_tokens, persisted_token_count - image_data_delta)
 
     def _project_history_replay(
         self,
@@ -11076,12 +11274,12 @@ class TurnRunner:
             if (
                 role == "system"
                 and isinstance(raw_content, str)
-                and raw_content.startswith(_CONTEXT_SUMMARY_MARKER)
+                and raw_content.startswith(CONTEXT_SUMMARY_MARKER)
             ):
                 return HistoryReplayEntryProjection(
-                    legacy_summary_marker=_strip_context_summary_marker(raw_content)
+                    legacy_summary_marker=strip_context_summary_marker(raw_content)
                 )
-            subagent_notice = _subagent_terminal_history_notice(entry)
+            subagent_notice = subagent_terminal_history_notice(entry)
             if subagent_notice is not None:
                 return HistoryReplayEntryProjection(
                     terminal_notice=subagent_notice,
@@ -11093,6 +11291,7 @@ class TurnRunner:
 
             estimate_complete = True
             raw_token_floor_applies = True
+            persisted_token_surplus = 0
             if raw_content and role == "user":
                 preserve_image = entry_index in image_indexes
                 recognized = False
@@ -11111,8 +11310,9 @@ class TurnRunner:
                     and recognized
                     and (not valid or not estimate_complete)
                 ):
-                    # Do not partially unpack unproven attachment envelopes:
-                    # retaining their raw JSON/base64 is the conservative view.
+                    # An unproven retained image or malformed outer envelope
+                    # retains its conservative raw estimate. Opaque material
+                    # is always projected through the history decoder.
                     projected_content = raw_content
                 else:
                     projected_content = self._maybe_unpack_attachments(
@@ -11134,14 +11334,59 @@ class TurnRunner:
                         allowed_image_attachment_ids=allowed_image_attachment_ids,
                         source_message_id=getattr(entry, "message_id", None),
                     )
-                if require_capacity_proof and recognized and valid:
-                    persisted_token_count = (
-                        self._attachment_history_residual_token_floor(
-                            raw_content,
-                            projected_content,
-                            persisted_token_count,
-                        )
+                if require_capacity_proof and recognized and valid and estimate_complete:
+                    # Capacity measurement uses the same side-effect-free
+                    # projection as compaction admission. It reserves possible
+                    # materialized path text for both opaque files and images;
+                    # the ordinary history load remains the actual replay.
+                    from opensquilla.session.compaction import (
+                        project_entry_content_for_provider,
                     )
+
+                    budget_content, budget_complete = project_entry_content_for_provider(
+                        raw_content,
+                        preserve_images=preserve_image,
+                        session_id=session_id or "",
+                        message_id=str(getattr(entry, "message_id", "") or ""),
+                    )
+                    if budget_complete:
+                        if (
+                            preserve_image
+                            and self._attachment_envelope_has_image(raw_content)
+                            and isinstance(budget_content, list)
+                        ):
+                            # A retained ref must use the decoder's proven
+                            # base64 media. The pure projection cannot read
+                            # it and uses a URL placeholder, which the
+                            # capacity proof would correctly reject. Add
+                            # only its conservative text markers to the
+                            # decoded media replay, without materializing.
+                            from opensquilla.provider.types import ContentBlockText
+
+                            reserve_blocks = [
+                                block for block in budget_content[1:]
+                                if isinstance(block, ContentBlockText)
+                            ]
+                            if isinstance(projected_content, list):
+                                projected_content = [*projected_content, *reserve_blocks]
+                            elif reserve_blocks:
+                                projected_content = "\n".join([
+                                    str(projected_content),
+                                    *(block.text for block in reserve_blocks),
+                                ])
+                        else:
+                            projected_content = budget_content
+                    else:
+                        projected_content = raw_content
+                        estimate_complete = False
+                if require_capacity_proof and recognized and valid and estimate_complete:
+                    # Keep only usage that exceeds the raw storage envelope;
+                    # its Base64 estimate must not become a history floor.
+                    persisted_token_surplus = max(
+                        0, persisted_token_count - estimate_tokens(raw_content),
+                    )
+                    persisted_token_count = 0
+                    raw_token_floor_applies = False
             elif raw_content and role == "assistant":
                 projected_content = self._maybe_unpack_assistant_artifacts(raw_content)
             else:
@@ -11156,6 +11401,7 @@ class TurnRunner:
                 turn_context=(turn_context if isinstance(turn_context, dict) else None),
                 estimate_complete=estimate_complete,
                 persisted_token_count=persisted_token_count,
+                persisted_token_surplus=persisted_token_surplus,
                 raw_token_floor_applies=raw_token_floor_applies,
                 last_entry_was_user=role == "user",
             )
@@ -11402,14 +11648,17 @@ class TurnRunner:
             context_states = []
             capacity_estimate_complete = False
 
-        def _summary_projection(
+        async def _summary_projection(
             skip_covered_through_ids: set[int] | None = None,
         ) -> tuple[int, int]:
-            records = build_compaction_context_records(
+            records = await self._resolve_compaction_context_records(
+                session_key,
                 context_states=context_states,
                 summaries=summaries,
                 legacy_summary_markers=legacy_summary_markers,
                 skip_covered_through_ids=skip_covered_through_ids,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
             )
             rendered = format_compaction_summary_context(
                 [record.text for record in records if record.text]
@@ -11419,7 +11668,7 @@ class TurnRunner:
                 1 if rendered else 0,
             )
 
-        portable_summary_tokens, portable_summary_messages = _summary_projection()
+        portable_summary_tokens, portable_summary_messages = await _summary_projection()
         # A provider without a native checkpoint sees the route-limited
         # transcript plus the portable request-context summary.
         capacity_tokens = capacity.estimated_tokens + portable_summary_tokens
@@ -11474,7 +11723,7 @@ class TurnRunner:
                 native_replay,
                 max_history_turns=max_history_turns,
             )
-            residual_tokens, residual_messages = _summary_projection(
+            residual_tokens, residual_messages = await _summary_projection(
                 native_context.covered_through_ids
             )
             provider_view_tokens = provider_capacity.estimated_tokens + residual_tokens
@@ -11703,9 +11952,9 @@ class TurnRunner:
         compaction_config: Any | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> bool:
+    ) -> bool | None:
         if self._session_manager is None:
-            return False
+            return None
         method = getattr(type(self._session_manager), "record_memory_checkpoint", None)
         if method is None:
             method = getattr(
@@ -11714,7 +11963,7 @@ class TurnRunner:
                 lambda *_: None,
             )("record_memory_checkpoint")
         if not callable(method):
-            return False
+            return None
         async with self._session_write_context(session_key):
             checkpoint_method = self._session_manager.record_memory_checkpoint
             checkpoint_kwargs: dict[str, Any] = {
@@ -11729,13 +11978,24 @@ class TurnRunner:
             if expected_session_id is not None or expected_session_epoch is not None:
                 checkpoint_kwargs["expected_session_id"] = expected_session_id
                 checkpoint_kwargs["expected_session_epoch"] = expected_session_epoch
-            receipt = await checkpoint_method(
-                session_key,
-                list(transcript),
-                **checkpoint_kwargs,
-            )
+            try:
+                receipt = await checkpoint_method(
+                    session_key,
+                    list(transcript),
+                    **checkpoint_kwargs,
+                )
+            except TimeoutError:
+                # TimeoutError is also an OSError. Preserve the compaction
+                # deadline handler instead of relabeling it as backup I/O.
+                raise
+            except OSError:
+                # A backup-file failure precedes any transcript rewrite. Keep
+                # durable compaction disabled, but allow a verified local view.
+                # Ownership, database, accounting and cancellation failures
+                # retain their existing error semantics.
+                return False
         if not durable_receipt_allows_destructive_compaction(receipt):
-            raise RuntimeError("Memory checkpoint did not confirm a durable transcript backup")
+            return False
         return True
 
     def _emit_decision_entry(
@@ -12073,52 +12333,6 @@ class TurnRunner:
         except Exception as exc:  # pragma: no cover — observability must not break turns
             log.warning("decision_log.write_failed", error=str(exc))
 
-    def _emit_router_train_sample(
-        self,
-        *,
-        agent_id: str,
-        session_key: str,
-        turn_obj: Any | None,
-        message: str,
-    ) -> None:
-        """Append one self-learning sample for this turn (best-effort).
-
-        Opt-in (``squilla_router.self_learning.{enabled,capture_enabled}``) and
-        kill-switched. Writes the float16 feature vectors the model produced plus
-        the routing decision; never raw prompt text (unless the audit sidecar is
-        explicitly enabled). Must never break turn execution.
-        """
-
-        try:
-            if turn_obj is None:
-                return
-            router_cfg = getattr(self._turn_config(), "squilla_router", None)
-            sl = getattr(router_cfg, "self_learning", None)
-            if sl is None or not getattr(sl, "enabled", False):
-                return
-            if not getattr(sl, "capture_enabled", True):
-                return
-
-            from opensquilla.squilla_router.self_learning import (
-                self_learning_disabled_by_env,
-                write_sample,
-            )
-            from opensquilla.squilla_router.self_learning.capture import build_train_sample
-
-            if self_learning_disabled_by_env():
-                return
-
-            sample = build_train_sample(
-                session_key=session_key,
-                metadata=turn_obj.metadata,
-                store_audit_summary=bool(getattr(sl, "store_audit_summary", False)),
-                message=message,
-            )
-            if sample is None:
-                return
-            write_sample(sample, agent_id)
-        except Exception as exc:  # pragma: no cover — capture must not break turns
-            log.warning("router_self_learning.capture_failed", error=str(exc))
 
     @staticmethod
     def _active_persisted_user_index(
@@ -12231,9 +12445,12 @@ class TurnRunner:
                 error=type(exc).__name__,
             )
             return (0, 0)
-        records = build_compaction_context_records(
+        records = await self._resolve_compaction_context_records(
+            session_key,
             context_states=context_states,
             summaries=summaries,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
         rendered = format_compaction_summary_context(
             [record.text for record in records if record.text]
@@ -12253,6 +12470,7 @@ class TurnRunner:
         compaction_request_context: Any | None = None,
         compaction_budget: CompactionBudget | None = None,
         attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
+        preserve_historical_images: bool = True,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -12263,15 +12481,34 @@ class TurnRunner:
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> None:
+    ) -> PreparedRequestWindow | None:
         """Compact proactively if session history exceeds token budget.
 
         Called before _load_history(). Uses the prepared consumer envelope and
         SessionManager.compact_with_result() to summarize and atomically commit
         the frozen durable transcript before the agent begins streaming.
         """
+        parent_deadline = (
+            compaction_request_context.chat_config.turn_deadline_at_monotonic
+            if compaction_request_context is not None else None
+        )
+
+        def require_parent_time(*, terminalize: bool = False) -> None:
+            if parent_deadline is not None and time.monotonic() >= parent_deadline:
+                if terminalize:
+                    notify_compaction(
+                        session_key, source="automatic", phase="preflight", status="timed_out",
+                        reason="turn_deadline_exceeded",
+                        **compaction_effect_payload(
+                            status="timed_out", reason="turn_deadline_exceeded",
+                        ),
+                        **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+                    )
+                raise TimeoutError("Turn deadline expired during context preparation")
+
+        require_parent_time()
         if self._session_manager is None:
-            return
+            return None
         if compaction_budget is not None:
             history_capacity_tokens = compaction_budget.history_capacity_tokens
             history_capacity_chars = compaction_budget.history_capacity_chars
@@ -12291,7 +12528,7 @@ class TurnRunner:
                     context_window_tokens=context_window_tokens,
                     history_capacity_tokens=history_capacity_tokens,
                 )
-                return
+                return None
         if history_capacity_chars is not None and int(history_capacity_chars) <= 0:
             log.info(
                 "preflight_compaction.skipped",
@@ -12300,17 +12537,17 @@ class TurnRunner:
                 context_window_tokens=context_window_tokens,
                 history_capacity_chars=history_capacity_chars,
             )
-            return
+            return None
         # Skip ephemeral sessions
         if session_key.startswith(("cron:", "subagent:")):
-            return
+            return None
         if self.has_compacted_this_turn(session_key):
             log.info(
                 "preflight_compaction.skipped",
                 session_key=session_key,
                 reason="already_compacted_this_turn",
             )
-            return
+            return None
 
         from opensquilla.session.compaction import (
             CompactionConfig,
@@ -12337,13 +12574,15 @@ class TurnRunner:
         compaction_config.request_context = compaction_request_context
         compaction_config.budget = compaction_budget
         compaction_config.attachment_path_resolver = attachment_path_resolver
+        compaction_config.attachment_media_root = self._attachment_media_root()
+        compaction_config.preserve_historical_images = preserve_historical_images
         if self.has_attempted_compaction_this_turn(session_key):
             log.info(
                 "preflight_compaction.skipped",
                 session_key=session_key,
                 reason="already_attempted_this_turn",
             )
-            return
+            return None
         try:
             if transcript_snapshot is not None:
                 transcript = list(await transcript_snapshot.get_entries())
@@ -12364,7 +12603,7 @@ class TurnRunner:
                         )
                 transcript = await get_transcript(session_key, **transcript_kwargs)
         except KeyError:
-            return  # session doesn't exist yet
+            return None  # session doesn't exist yet
         (
             checkpoint_tokens,
             checkpoint_chars,
@@ -12374,7 +12613,7 @@ class TurnRunner:
             expected_session_epoch=expected_session_epoch,
         )
         if not transcript and checkpoint_tokens <= 0 and checkpoint_chars <= 0:
-            return
+            return None
         protected_suffix_count = self._protected_current_turn_suffix_count(
             transcript,
             history_has_persisted_user=history_has_persisted_user,
@@ -12388,12 +12627,30 @@ class TurnRunner:
         )
 
         durable_prefix_end = len(transcript) - protected_suffix_count
+        replay_session_id = expected_session_id or next(
+            (
+                str(getattr(entry, "session_id"))
+                for entry in transcript
+                if getattr(entry, "session_id", None)
+            ),
+            "",
+        )
+        replay_measure_kwargs: dict[str, Any] = {
+            "media_root": compaction_config.attachment_media_root,
+            "session_id": replay_session_id,
+            "preserve_images": preserve_historical_images,
+        }
 
         def measure_replay() -> tuple[list[int], int, int]:
             return (
-                [estimate_entry_model_replay_tokens(entry) for entry in transcript],
-                estimate_entries_model_replay_chars(transcript),
-                estimate_entries_model_replay_chars(transcript[:durable_prefix_end]),
+                [
+                    estimate_entry_model_replay_tokens(entry, **replay_measure_kwargs)
+                    for entry in transcript
+                ],
+                estimate_entries_model_replay_chars(transcript, **replay_measure_kwargs),
+                estimate_entries_model_replay_chars(
+                    transcript[:durable_prefix_end], **replay_measure_kwargs,
+                ),
             )
 
         # Long histories must not block unrelated SQLite completions on the
@@ -12440,7 +12697,7 @@ class TurnRunner:
                     threshold=threshold,
                     char_threshold=char_threshold,
                 )
-            return
+            return None
         if transcript and protected_suffix_count >= len(transcript):
             log.info(
                 "preflight_compaction.skipped",
@@ -12448,7 +12705,7 @@ class TurnRunner:
                 reason="current_request_only",
                 protected_recent_messages=protected_suffix_count,
             )
-            return
+            return None
         active_user_index = self._active_persisted_user_index(
             transcript,
             history_has_persisted_user=history_has_persisted_user,
@@ -12462,6 +12719,7 @@ class TurnRunner:
         protected_request_chars = (
             await asyncio.to_thread(
                 estimate_entry_model_replay_chars, transcript[active_user_index],
+                **replay_measure_kwargs,
             )
             if active_user_index is not None
             else 0
@@ -12486,31 +12744,33 @@ class TurnRunner:
                 history_capacity_chars=history_capacity_chars,
                 safety_margin=safety_margin,
             )
-            return
+            return None
         compaction_config.protected_recent_messages = max(
             effective_protected_recent_messages(compaction_config),
             protected_suffix_count,
         )
-        if self._compaction_circuit_open(session_key):
+        require_parent_time()
+        disabled = getattr(configured_compaction, "enabled", True) is False
+        if disabled or self._compaction_circuit_open(session_key):
             self.mark_compaction_attempted_this_turn(session_key)
-            await self._record_emergency_ephemeral_compaction(
+            return await self._prepare_request_window(
                 session_key,
                 transcript,
                 history_window_tokens,
                 attachment_path_resolver=attachment_path_resolver,
                 compaction_id=new_compaction_id(),
                 phase="preflight",
-                reason="durable_compaction_circuit_open",
+                reason="disabled" if disabled else "durable_compaction_circuit_open",
                 protected_recent_messages=protected_suffix_count,
                 history_capacity_chars=history_capacity_chars,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
-            return
         if protected_suffix_count and not self._durable_compaction_accepts_config():
             self.mark_compaction_attempted_this_turn(session_key)
-            await self._record_emergency_ephemeral_compaction(
+            return await self._prepare_request_window(
                 session_key,
                 transcript,
                 history_window_tokens,
@@ -12523,8 +12783,8 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
-            return
 
         log.info(
             "preflight_compaction.triggered",
@@ -12568,7 +12828,7 @@ class TurnRunner:
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
         try:
-            await self._record_checkpoint_before_compaction(
+            checkpoint_confirmed = await self._record_checkpoint_before_compaction(
                 session_key,
                 transcript,
                 turn_id=compaction_id,
@@ -12578,17 +12838,32 @@ class TurnRunner:
                 expected_session_epoch=expected_session_epoch,
             )
         except asyncio.CancelledError:
+            expired = parent_deadline is not None and time.monotonic() >= parent_deadline
             notify_compaction(
                 session_key,
                 source="automatic",
                 phase="preflight",
-                status="cancelled",
-                reason="cancelled",
-                **compaction_effect_payload(status="cancelled"),
+                status="timed_out" if expired else "cancelled",
+                reason="turn_deadline_exceeded" if expired else "cancelled",
+                **compaction_effect_payload(status="timed_out" if expired else "cancelled"),
                 **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
             )
             raise
         except CompactionTimeoutError as exc:
+            require_parent_time(terminalize=True)
+            prepared_window = await self._prepare_request_window(
+                session_key, transcript, history_window_tokens,
+                compaction_id=compaction_id, phase="preflight",
+                reason="compaction_deadline_exceeded",
+                protected_recent_messages=protected_suffix_count,
+                history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
+            )
+            if prepared_window is not None:
+                return prepared_window
             notify_compaction(
                 session_key,
                 source="automatic",
@@ -12598,17 +12873,7 @@ class TurnRunner:
                 **compaction_effect_payload(status="timed_out"),
                 **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
             )
-            await self._record_emergency_ephemeral_compaction(
-                session_key, transcript, history_window_tokens,
-                compaction_id=compaction_id, phase="preflight",
-                reason="compaction_deadline_exceeded",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            return
+            return None
         except Exception as exc:
             notify_compaction(
                 session_key,
@@ -12621,9 +12886,55 @@ class TurnRunner:
                 **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
             )
             raise
+        if checkpoint_confirmed is False:
+            require_parent_time(terminalize=True)
+            prepared_window = await self._prepare_request_window(
+                session_key, transcript, history_window_tokens,
+                compaction_id=compaction_id, phase="preflight",
+                reason="checkpoint_failed",
+                protected_recent_messages=protected_suffix_count,
+                history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
+            )
+            if prepared_window is None:
+                notify_compaction(
+                    session_key, source="automatic", phase="checkpointing",
+                    status="failed", reason="checkpoint_failed",
+                    **compaction_effect_payload(status="failed"),
+                    **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+                )
+            return prepared_window
+        require_parent_time(terminalize=True)
         skip_reason = "empty_summary"
         from opensquilla.session.compaction import call_compact_with_optional_config
 
+        summary_started = False
+        previous_started = compaction_config.on_summary_call_started
+        previous_recovery = compaction_config.on_summary_recovery
+
+        def on_summary_recovery(event: ProviderActivityEvent) -> None:
+            from opensquilla.session.compaction import summary_recovery_payload
+            if previous_recovery is not None:
+                previous_recovery(event)
+            notify_compaction(
+                session_key, source="automatic", phase="summarizing", status="observed",
+                recovery=summary_recovery_payload(event),
+                **compaction_effect_payload(status="observed"),
+                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
+            )
+
+        compaction_config.on_summary_recovery = on_summary_recovery
+
+        def on_summary_started() -> None:
+            nonlocal summary_started
+            if previous_started is not None:
+                previous_started()
+            summary_started = True
+
+        compaction_config.on_summary_call_started = on_summary_started
         try:
             compaction_result = None
             compact_with_result = getattr(type(self._session_manager), "compact_with_result", None)
@@ -12713,6 +13024,8 @@ class TurnRunner:
                     compaction_config,
                     phase="summarizing",
                 )
+            if getattr(compaction_result, "cancellation_reconciled", False) and not result:
+                raise asyncio.CancelledError
             if (
                 compaction_result is not None
                 and int(getattr(compaction_result, "removed_count", 0) or 0) > 0
@@ -12739,15 +13052,16 @@ class TurnRunner:
                         **observed_payload,
                     )
         except asyncio.CancelledError:
+            expired = parent_deadline is not None and time.monotonic() >= parent_deadline
             notify_compaction(
                 session_key,
                 source="automatic",
                 phase="preflight",
-                status="cancelled",
-                reason="cancelled",
+                status="timed_out" if expired else "cancelled",
+                reason="turn_deadline_exceeded" if expired else "cancelled",
                 tokens_before=total_tokens,
                 context_window_tokens=context_window_tokens,
-                **compaction_effect_payload(status="cancelled"),
+                **compaction_effect_payload(status="timed_out" if expired else "cancelled"),
                 **compaction_lifecycle_payload(
                     compaction_id,
                     COMPACTION_TRIGGERED_EVENT,
@@ -12755,12 +13069,27 @@ class TurnRunner:
             )
             raise
         except CompactionTimeoutError as exc:
+            require_parent_time(terminalize=True)
             log.warning(
                 "preflight_compaction.timed_out",
                 session_key=session_key,
                 phase=exc.phase,
             )
-            self._record_compaction_failure(session_key)
+            if summary_started:
+                self._record_compaction_failure(session_key, failure_kind="operation_timeout")
+            prepared_window = await self._prepare_request_window(
+                session_key, transcript, history_window_tokens,
+                compaction_id=compaction_id, phase="preflight",
+                reason="compaction_deadline_exceeded",
+                protected_recent_messages=protected_suffix_count,
+                history_capacity_chars=history_capacity_chars,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
+            )
+            if prepared_window is not None:
+                return prepared_window
             notify_compaction(
                 session_key,
                 source="automatic",
@@ -12775,40 +13104,13 @@ class TurnRunner:
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
-            await self._record_emergency_ephemeral_compaction(
-                session_key, transcript, history_window_tokens,
-                compaction_id=compaction_id, phase="preflight",
-                reason="compaction_deadline_exceeded",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            return
+            return None
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "preflight_compaction.compact_failed",
                 session_key=session_key,
                 error=str(exc),
             )
-            self._record_compaction_failure(session_key)
-            emergency_applied = await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                history_window_tokens,
-                attachment_path_resolver=attachment_path_resolver,
-                compaction_id=compaction_id,
-                phase="preflight",
-                reason="compact_failed",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            if emergency_applied:
-                return
             notify_compaction(
                 session_key,
                 source="automatic",
@@ -12823,10 +13125,19 @@ class TurnRunner:
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
-            return
+            # Provider refusal is a CompactionResult. Exceptions escaping the
+            # session owner may be storage/ledger failures or an uncertain
+            # commit; a temporary request view cannot settle those errors.
+            raise
+        finally:
+            compaction_config.on_summary_call_started = previous_started
+            compaction_config.on_summary_recovery = previous_recovery
         if not result:
+            require_parent_time(terminalize=True)
             skip_reason = str(getattr(compaction_result, "skip_reason", None) or "empty_summary")
             outcome_status = compaction_failure_status(skip_reason)
+            if summary_started and skip_reason in UNPRODUCTIVE_COMPACTION_REASONS:
+                self._record_compaction_failure(session_key, failure_kind="unproductive")
             if outcome_status != "failed":
                 notify_compaction(
                     session_key,
@@ -12845,9 +13156,13 @@ class TurnRunner:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-                return
-            self._record_compaction_failure(session_key)
-            emergency_applied = await self._record_emergency_ephemeral_compaction(
+                return None
+            if summary_started:
+                self._record_compaction_failure(
+                    session_key,
+                    failure_kind=str(getattr(compaction_result, "failure_kind", "") or skip_reason),
+                )
+            prepared_window = await self._prepare_request_window(
                 session_key,
                 transcript,
                 history_window_tokens,
@@ -12860,9 +13175,10 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
-            if emergency_applied:
-                return
+            if prepared_window is not None:
+                return prepared_window
         if result:
             durable_transcript_changed = compaction_result is None or (
                 int(getattr(compaction_result, "removed_count", 0) or 0) > 0
@@ -12897,6 +13213,7 @@ class TurnRunner:
                 phase="preflight",
                 status=compaction_failure_status(skip_reason),
                 reason=skip_reason,
+                failure_detail=getattr(compaction_result, "failure_detail", {}),
                 tokens_before=total_tokens,
                 context_window_tokens=context_window_tokens,
                 **compaction_effect_payload(
@@ -12908,11 +13225,88 @@ class TurnRunner:
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
+        if getattr(compaction_result, "cancellation_reconciled", False):
+            # Publish the settled commit before propagating the turn cancellation.
+            # No further provider/tool request may start after this barrier.
+            raise asyncio.CancelledError
+        require_parent_time()
+        return None
 
 
-    def _compaction_circuit_open(self, session_key: str) -> bool:
+    @staticmethod
+    def _compaction_failure_policy(config: AgentConfig) -> tuple[Any, ...]:
+        return (
+            config.compaction_enabled, config.compaction_profile,
+            config.context_window_tokens, config.compaction_total_timeout_seconds,
+            config.compaction_protected_recent_messages, config.compaction_timeout_seconds,
+        )
+
+    @staticmethod
+    def _compaction_failure_identity(
+        *, provider: Any, provider_config: Any, chat_config: ChatConfig | None,
+        policy: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        """Identify the physical responder and effective summary controls without I/O."""
+        from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
+
+        physical = provider
+        bound = provider_config
+        config = chat_config or ChatConfig()
+        resolve = getattr(provider, "current_response_deployment", None)
+        if callable(resolve):
+            physical, actual_config, config = resolve(config)
+            bound = actual_config or bound
+        metadata = provider_metadata(physical)
+        connection = provider_connection_config(physical)
+        credential = connection.api_key or str(getattr(bound, "api_key", "") or "")
+        provider_id = (
+            metadata.provider_id or metadata.provider_kind
+            or str(getattr(bound, "provider", "") or "")
+        )
+        model = metadata.model or str(getattr(bound, "model", "") or "")
+        base_url = connection.base_url or str(getattr(bound, "base_url", "") or "")
+        controls = {
+            name: getattr(config, name, None)
+            for name in (
+                "max_tokens", "thinking", "thinking_budget_tokens", "thinking_budget_explicit",
+                "thinking_level", "provider_context_window_tokens", "provider_request_max_chars",
+                "provider_request_max_chars_explicit_cap", "model_capabilities",
+            )
+        }
+        if config.provider_request_max_chars_explicit_cap is not None:
+            # Derived character estimates vary with the current prompt. They
+            # are not a changed provider constraint and must not reset failure
+            # history when moving between idle/manual and ordinary requests.
+            controls["provider_request_max_chars"] = config.provider_request_max_chars_explicit_cap
+        return (
+            provider_id,
+            model,
+            base_url,
+            compaction_deployment_fingerprint(
+                provider=provider_id, model=model, base_url=base_url, api_key=credential,
+            ) if credential else "",
+            json.dumps(controls, sort_keys=True, default=str),
+            *policy,
+        )
+
+    def _bind_compaction_failure_scope(self, session_key: str, identity: tuple[Any, ...]) -> None:
+        """A deployment/configuration change gets a fresh auxiliary circuit."""
+        scope = hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+        scopes = getattr(self, "_compaction_failure_scopes", None)
+        if scopes is None:
+            scopes = self._compaction_failure_scopes = {}
+        previous = scopes.get(session_key)
+        if previous is not None and previous != scope:
+            self._record_compaction_success(session_key)
+        scopes[session_key] = scope
+
+    def _compaction_circuit_open(
+        self, session_key: str, *, provider_overflow: bool = False,
+    ) -> bool:
         state = getattr(self, "_compaction_failures", {}).get(session_key)
-        if state is None or state.count < _COMPACTION_FAILURE_LIMIT:
+        if state is None or (
+            state.opened_at is None and state.count < _COMPACTION_FAILURE_LIMIT
+        ):
             return False
         opened_at = state.opened_at if state.opened_at is not None else time.monotonic()
         cooldown_elapsed = time.monotonic() - opened_at
@@ -12921,13 +13315,21 @@ class TurnRunner:
                 "compaction_circuit.half_open",
                 session_key=session_key,
                 consecutive_failures=state.count,
+                failure_kind=state.failure_kind,
                 cooldown_elapsed_s=round(cooldown_elapsed, 1),
             )
+            return False
+        if provider_overflow and not state.timeout_cooldown and not state.overflow_retry_used:
+            # A confirmed provider overflow may probe a circuit opened by
+            # quick failures once. It cannot repeat a fully spent operation
+            # budget, or turn repeated overflow responses into a retry loop.
+            state.overflow_retry_used = True
             return False
         log.warning(
             "compaction_circuit.open",
             session_key=session_key,
             consecutive_failures=state.count,
+            failure_kind=state.failure_kind,
             cooldown_remaining_s=round(
                 _COMPACTION_CIRCUIT_COOLDOWN_SECONDS - cooldown_elapsed,
                 1,
@@ -12935,13 +13337,37 @@ class TurnRunner:
         )
         return True
 
-    def _record_compaction_failure(self, session_key: str) -> None:
+    def _record_compaction_failure(
+        self, session_key: str, *, failure_kind: str = "summary_failed",
+    ) -> None:
+        # Only an auxiliary candidate failure belongs to this ledger. Parent
+        # ownership, cancellation and uncertain durability must keep their own
+        # error semantics and cannot make a healthy provider appear unavailable.
+        if failure_kind in {
+            "cancelled", "parent_deadline", "turn_deadline_exceeded",
+            "usage_error", "storage_error", "commit_failed", "stale_source",
+            "stale_preimage", "stale_context_state", "consumer_admission_stale",
+            "consumer_admission_stale_or_failed",
+        }:
+            return
         self._turn_compaction_failed_sessions.add(session_key)
         if not hasattr(self, "_compaction_failures"):
             self._compaction_failures = {}
         state = self._compaction_failures.setdefault(session_key, _CompactionFailureState())
+        if (
+            state.opened_at is not None
+            and time.monotonic() - state.opened_at >= _COMPACTION_CIRCUIT_COOLDOWN_SECONDS
+        ):
+            state.timeout_cooldown = False
+            state.overflow_retry_used = False
         state.count += 1
-        state.opened_at = time.monotonic() if state.count >= _COMPACTION_FAILURE_LIMIT else None
+        state.failure_kind = failure_kind
+        state.timeout_cooldown = state.timeout_cooldown or failure_kind == "operation_timeout"
+        if failure_kind == "operation_timeout" or state.count >= _COMPACTION_FAILURE_LIMIT:
+            # A full operation budget was already spent. Unlike a quick
+            # disconnect/5xx, repeating it on the immediately following turn
+            # would spend a second full window under unchanged conditions.
+            state.opened_at = time.monotonic()
 
     def _record_compaction_success(self, session_key: str) -> None:
         if not hasattr(self, "_compaction_failures"):
@@ -12961,6 +13387,7 @@ class TurnRunner:
             turn_context=turn_context if isinstance(turn_context, dict) else None,
         )
         return {
+            "session_id": getattr(entry, "session_id", None),
             "message_id": getattr(entry, "message_id", None),
             "role": role,
             "content": silent_reply.content or "",
@@ -12971,11 +13398,14 @@ class TurnRunner:
             "assistant_replay": copy.deepcopy(getattr(entry, "assistant_replay", None)),
             "turn_usage": getattr(entry, "turn_usage", None),
             "turn_context": turn_context,
+            "provenance_kind": getattr(entry, "provenance_kind", None),
+            "provenance_source_tool": getattr(entry, "provenance_source_tool", None),
         }
 
     @staticmethod
     def _emergency_replay_entry(raw: Mapping[str, Any]) -> Any:
         return SimpleNamespace(
+            session_id=raw.get("session_id"),
             message_id=raw.get("message_id"),
             role=str(raw.get("role") or "user"),
             content=str(raw.get("content") or ""),
@@ -12986,6 +13416,8 @@ class TurnRunner:
             assistant_replay=copy.deepcopy(raw.get("assistant_replay")),
             turn_usage=raw.get("turn_usage"),
             turn_context=raw.get("turn_context"),
+            provenance_kind=raw.get("provenance_kind"),
+            provenance_source_tool=raw.get("provenance_source_tool"),
         )
 
     @classmethod
@@ -12995,7 +13427,7 @@ class TurnRunner:
             json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
-    async def _record_emergency_ephemeral_compaction(
+    async def _prepare_request_window(
         self,
         session_key: str,
         transcript: Sequence[Any],
@@ -13010,27 +13442,61 @@ class TurnRunner:
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], bool] | None = None,
-    ) -> bool:
+        preserve_historical_images: bool = True,
+    ) -> PreparedRequestWindow | None:
         """Select a local request view; never summarize or mutate session storage."""
         self._turn_compaction_failed_sessions.add(session_key)
+        from opensquilla.engine.history import _is_real_user_turn
         from opensquilla.engine.request_window import (
             compact_entry_tool_results,
+            compact_request_user_text,
+            iter_window_index_candidates,
             iter_window_prefix_cuts,
             request_window_notice,
         )
+        from opensquilla.provider import Message
         from opensquilla.session.compaction import (
+            _api_round_boundaries,
             _api_round_groups,
             _api_round_requires_raw,
-            _retreat_to_api_round_boundary,
+            _is_assistant_tool_call_entry,
+            _is_tool_result_entry,
+            _retreat_to_turn_boundary,
             estimate_entries_model_replay_chars,
             estimate_entry_model_replay_tokens,
         )
         from opensquilla.session.tokenizer import estimate_tokens
 
-        raw_entries = [self._entry_for_emergency_compaction(entry) for entry in transcript]
-        complete_summary = await self._compaction_summary_context(
+        context_records = await self._load_compaction_context_records(
             session_key, [], expected_session_id=expected_session_id,
-            expected_session_epoch=expected_session_epoch, emit_event=False, raw_complete=True,
+            expected_session_epoch=expected_session_epoch,
+        )
+        recovered_entries = [entry for record in context_records
+                             for entry in record.source_entries]
+        canonical_boundary = max(
+            (entry.id or 0 for entry in recovered_entries), default=0,
+        )
+        if recovered_entries:
+            # A damaged checkpoint is not a reason to lose the archived task.
+            # Feed the proven raw prefix through the existing bounded window,
+            # without counting it as active rows eligible for a durable cut.
+            recovered_ids = {entry.message_id for entry in recovered_entries}
+            transcript = [*recovered_entries, *[
+                entry for entry in transcript
+                if getattr(entry, "message_id", None) not in recovered_ids
+            ]]
+        raw_entries = [self._entry_for_emergency_compaction(entry) for entry in transcript]
+        replay_measure_kwargs: dict[str, Any] = {
+            "media_root": self._attachment_media_root(),
+            "session_id": expected_session_id or "",
+            "preserve_images": preserve_historical_images,
+        }
+        context_items = [] if recovered_entries else [record.text for record in context_records]
+        complete_summary = (
+            "\n\n".join(context_items)
+            if not context_items or compaction_replay_is_complete(
+                context_items, _format_compaction_summary_context(context_items),
+            ) else None
         )
         old_summary = complete_summary or ""
 
@@ -13042,8 +13508,11 @@ class TurnRunner:
                 return bool(consumer_admission(summary, kept))
             # Compatibility callers supply history capacity with the fixed
             # envelope already deducted. Production uses the exact wire gate.
-            tokens = sum(estimate_entry_model_replay_tokens(e) for e in kept)
-            chars = estimate_entries_model_replay_chars(kept)
+            tokens = sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in kept
+            )
+            chars = estimate_entries_model_replay_chars(kept, **replay_measure_kwargs)
             return (
                 tokens + estimate_tokens(rendered or "") <= history_window_tokens
                 and (history_capacity_chars is None
@@ -13051,78 +13520,150 @@ class TurnRunner:
             )
 
         try:
-            if complete_summary is not None and fits(old_summary, raw_entries):
-                return False
-            protected_count = min(len(raw_entries), max(2, protected_recent_messages))
+            if (not recovered_entries and complete_summary is not None
+                    and fits(old_summary, raw_entries)):
+                return None
+            protected_count = min(len(raw_entries), max(0, protected_recent_messages))
             protected_start = len(raw_entries) - protected_count
             protected_message_id = (
                 str(raw_entries[protected_start].get("message_id") or "") or None
-                if raw_entries else None
+                if protected_start < len(raw_entries) else None
             )
             pruned = compact_entry_tool_results(raw_entries, protected_start_index=protected_start)
-            # Error and unfinished tool state cannot be discarded by a window.
-            from opensquilla.provider.request_proof import _tool_result_entry_is_error
-
             protected_indexes: set[int] = set()
+            user_groups: list[tuple[int, ...]] = []
+            complete_user_groups: list[tuple[int, ...]] = []
             round_start = 0
             for group in _api_round_groups(raw_entries):
-                if (_api_round_requires_raw(group)
-                    or any(entry.get("role") == "tool" and _tool_result_entry_is_error(entry)
-                           for entry in group)
-                    or any(
-                    _tool_result_entry_is_error(segment)
-                    for entry in group for segment in (entry.get("tool_calls") or [])
-                    if isinstance(segment, dict) and segment.get("type") == "tool_result"
-                )):
-                    protected_indexes.add(round_start)
+                if _api_round_requires_raw(group):
+                    protected_indexes.update(range(round_start, round_start + len(group)))
+                if (round_start < protected_start and group[0].get("role") == "user"
+                        and not _is_tool_result_entry(group[0])
+                        and _is_real_user_turn(Message(
+                            role="user", content=str(group[0].get("content") or ""),
+                        ))):
+                    has_tools = any(_is_assistant_tool_call_entry(entry)
+                                    or _is_tool_result_entry(entry) for entry in group)
+                    user_groups.append(
+                        tuple(range(round_start, round_start + len(group)))
+                        if has_tools else (round_start,)
+                    )
+                    if round_start + len(group) <= protected_start:
+                        complete_user_groups.append(
+                            tuple(range(round_start, round_start + len(group)))
+                        )
                 round_start += len(group)
-            cuts = [0, *iter_window_prefix_cuts(
+            round_boundaries = _api_round_boundaries(pruned)
+            cuts = [cut for cut in iter_window_prefix_cuts(
                 [str(entry.get("role") or "") for entry in pruned],
                 protected_start=protected_start, protected_indexes=protected_indexes,
-            )]
+            ) if cut in round_boundaries and _retreat_to_turn_boundary(pruned, cut) == cut]
+            def views():
+                yield pruned
+                projected = list(pruned)
+                for group in user_groups:
+                    if protected_indexes.intersection(group):
+                        continue
+                    index = group[0]
+                    original_text = pruned[index].get("content")
+                    if not isinstance(original_text, str):
+                        continue
+                    text = compact_request_user_text(
+                        original_text, max_chars=history_window_tokens,
+                    )
+                    if text != original_text:
+                        projected[index] = {
+                            **pruned[index], "content": text, "token_count": estimate_tokens(text),
+                        }
+                if any(a is not b for a, b in zip(pruned, projected, strict=True)):
+                    yield projected
+
+            def windows():
+                yield pruned, tuple(range(len(pruned)))
+                for view in views():
+                    if view is not pruned:
+                        yield view, tuple(range(len(pruned)))
+                    for indices in iter_window_index_candidates(
+                        len(pruned), prefix_cuts=cuts, protected_indexes=protected_indexes,
+                        user_groups=user_groups, include_suffix_fallback=False,
+                    ):
+                        yield view, indices
+                for indices in iter_window_index_candidates(
+                    len(pruned), prefix_cuts=cuts, protected_indexes=protected_indexes,
+                ):
+                    yield pruned, indices
+
             selected: tuple[str, list[dict[str, Any]], int] | None = None
             for previous in dict.fromkeys((old_summary, "")):
-                for cut in cuts:
-                    if cut and _retreat_to_api_round_boundary(pruned, cut) != cut:
-                        continue
-                    if (cut == 0 and pruned == raw_entries and previous == old_summary
-                            and complete_summary is not None):
+                for view, indices in windows():
+                    cut = len(pruned) - len(indices)
+                    if (cut == 0 and view == raw_entries and previous == old_summary
+                            and complete_summary is not None and not recovered_entries):
                         continue
                     notice = request_window_notice(cut)
                     if cut == 0:
                         notice = (
                             "[Temporary history window]\n"
-                            "Earlier tool output or an unusable checkpoint is omitted from this "
+                            "Earlier historical text, tool output or an unusable checkpoint "
+                            "is omitted from this "
                             "request. Original records remain stored. Do not infer omitted details."
                         )
+                    if recovered_entries and cut == 0 and view == raw_entries:
+                        notice = (
+                            "[Temporary canonical recovery]\n"
+                            "The checkpoint was unavailable; this request replays its verified "
+                            "archived conversation with the active tail. No checkpoint was written."
+                        )
                     summary = f"{previous}\n\n{notice}".strip()
-                    kept = pruned[cut:]
+                    kept = [view[index] for index in indices]
                     if fits(summary, kept):
                         selected = summary, kept, cut
+                        # Releasing an old small round before a larger one can
+                        # leave room unused. Restore only wholly omitted, complete
+                        # historical rounds, newest first, once per round. Keep the
+                        # admitted view if an addition does not fit; never change
+                        # the existing projection, source or protected tail.
+                        restored = set(indices)
+                        for user_group in reversed(complete_user_groups):
+                            if not restored.isdisjoint(user_group):
+                                continue
+                            trial_indices = sorted(restored.union(user_group))
+                            trial_cut = len(pruned) - len(trial_indices)
+                            if trial_cut == 0:
+                                # The full view was already tried before shrinking.
+                                continue
+                            trial_summary = (
+                                f"{previous}\n\n{request_window_notice(trial_cut)}".strip()
+                            )
+                            trial_kept = [view[index] for index in trial_indices]
+                            if fits(trial_summary, trial_kept):
+                                restored.update(user_group)
+                                selected = trial_summary, trial_kept, trial_cut
                         break
                 if selected is not None:
                     break
             if selected is None:
                 log.info("compaction.emergency_window_unavailable", session_key=session_key,
                          phase=phase, reason="protected_request_exceeds_budget")
-                return False
+                return None
         except ConsumerAdmissionStaleError:
             # The next request rebuilds its own envelope; never apply an old gate.
-            return False
+            return None
 
         summary, kept, omitted_count = selected
-        if not hasattr(self, "_emergency_compaction_overrides"):
-            self._emergency_compaction_overrides = {}
-        self._emergency_compaction_overrides[session_key] = _EmergencyCompactionOverride(
+        prepared_window = PreparedRequestWindow(
+            session_key=session_key,
             summary=summary,
-            kept_entries=[self._emergency_replay_entry(entry) for entry in kept],
+            kept_entries=tuple(self._emergency_replay_entry(entry) for entry in kept),
             reason=reason, compaction_id=compaction_id,
             expected_session_id=expected_session_id, expected_session_epoch=expected_session_epoch,
             source_fingerprint=self._emergency_source_fingerprint(transcript),
             source_summary=old_summary,
+            canonical_boundary=canonical_boundary,
             history_window_tokens=history_window_tokens,
             history_capacity_chars=history_capacity_chars,
             protected_recent_messages=protected_count, protected_message_id=protected_message_id,
+            preserve_historical_images=preserve_historical_images,
             consumer_admission=consumer_admission,
         )
         self.mark_compacted_this_turn(session_key)
@@ -13130,13 +13671,19 @@ class TurnRunner:
             session_key, source="automatic", phase=phase, status="emergency_ephemeral",
             reason=reason, removed_count=omitted_count, kept_count=len(kept),
             omitted_count=omitted_count, archived_count=0,
-            tokens_before=sum(estimate_entry_model_replay_tokens(e) for e in raw_entries),
-            tokens_after=sum(estimate_entry_model_replay_tokens(e) for e in kept)
+            tokens_before=sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in raw_entries
+            ),
+            tokens_after=sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in kept
+            )
                          + estimate_tokens(_format_compaction_summary_context([summary]) or ""),
             **compaction_effect_payload(status="emergency_ephemeral", reason=reason),
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
-        return True
+        return prepared_window
 
     def _preflight_compact_ratio(self) -> float:
         raw_ratio = getattr(self._config, "preflight_compact_ratio", None)
@@ -13401,6 +13948,7 @@ class TurnRunner:
         session_key: str,
         *,
         trim_last_user: bool = True,
+        prepared_window: PreparedRequestWindow | None = None,
         bound_user_message_id: str | None = None,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
@@ -13454,21 +14002,19 @@ class TurnRunner:
         history: list[Message] = []
         summary_markers: list[str] = []
         exact_owner = expected_session_id is not None or expected_session_epoch is not None
-        emergency_overrides = getattr(self, "_emergency_compaction_overrides", {})
-        emergency_override = emergency_overrides.pop(session_key, None)
-        if emergency_override is not None:
+        if prepared_window is not None:
             override_has_owner = (
-                emergency_override.expected_session_id is not None
-                or emergency_override.expected_session_epoch is not None
+                prepared_window.expected_session_id is not None
+                or prepared_window.expected_session_epoch is not None
             )
             if exact_owner:
                 override_matches_owner = (
-                    emergency_override.expected_session_id == expected_session_id
-                    and emergency_override.expected_session_epoch == expected_session_epoch
+                    prepared_window.expected_session_id == expected_session_id
+                    and prepared_window.expected_session_epoch == expected_session_epoch
                 )
             else:
                 override_matches_owner = not override_has_owner
-            if override_matches_owner:
+            if override_matches_owner and prepared_window.session_key == session_key:
                 # A cached turn snapshot can predate queued/appended messages.
                 # Re-read before applying this request-only projection.
                 getter = self._session_manager.get_transcript
@@ -13482,38 +14028,87 @@ class TurnRunner:
                 elif exact_owner and _has_session_storage(self._session_manager):
                     raise RuntimeError("session history reader does not support exact ownership")
                 transcript = list(await getter(session_key, **fresh_kwargs))
-                latest_summary = await self._compaction_summary_context(
-                    session_key, [], expected_session_id=expected_session_id,
-                    expected_session_epoch=expected_session_epoch, emit_event=False,
-                    raw_complete=True,
-                ) or ""
-                if (self._emergency_source_fingerprint(transcript)
-                        != emergency_override.source_fingerprint
-                        or latest_summary != emergency_override.source_summary):
+                recovery_records = (
+                    await self._load_compaction_context_records(
+                        session_key, [], expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                    ) if prepared_window.canonical_boundary else []
+                )
+                recovered_entries = [entry for record in recovery_records
+                                     for entry in record.source_entries]
+                if recovered_entries:
+                    recovered_ids = {entry.message_id for entry in recovered_entries}
+                    transcript = [*recovered_entries, *[
+                        entry for entry in transcript
+                        if getattr(entry, "message_id", None) not in recovered_ids
+                    ]]
+                    latest_summary = ""
+                else:
+                    latest_summary = await self._compaction_summary_context(
+                        session_key, [], expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch, emit_event=False,
+                        raw_complete=True,
+                    ) or ""
+                source_changed = (
+                    self._emergency_source_fingerprint(transcript)
+                    != prepared_window.source_fingerprint
+                )
+                if source_changed or latest_summary != prepared_window.source_summary:
                     # Recompute locally against the latest source; retain the
                     # previously protected suffix plus every newly appended row.
-                    boundary_id = emergency_override.protected_message_id
+                    boundary_id = prepared_window.protected_message_id
                     boundary = next((i for i, entry in enumerate(transcript)
                                      if str(getattr(entry, "message_id", "") or "")
                                      == boundary_id), None) if boundary_id else None
-                    if boundary is None:
-                        emergency_override = None
+                    # Every window retains its source suffix. Its last row
+                    # locates newly appended rows without making an optional
+                    # historical round mandatory on the next fit attempt.
+                    previous_end_id = (
+                        str(getattr(prepared_window.kept_entries[-1], "message_id", "") or "")
+                        if prepared_window.kept_entries else ""
+                    )
+                    previous_end = next((i for i, entry in enumerate(transcript)
+                                         if str(getattr(entry, "message_id", "") or "")
+                                         == previous_end_id), None) if previous_end_id else None
+                    if ((boundary is None and boundary_id is not None)
+                            or (source_changed and previous_end is None)):
+                        prepared_window = None
                     else:
-                        await self._record_emergency_ephemeral_compaction(
-                            session_key, transcript, emergency_override.history_window_tokens,
-                            compaction_id=emergency_override.compaction_id,
-                            phase="preflight", reason=emergency_override.reason,
-                            protected_recent_messages=len(transcript) - boundary,
-                            history_capacity_chars=emergency_override.history_capacity_chars,
+                        if source_changed:
+                            boundary = min(
+                                boundary if boundary is not None else len(transcript),
+                                cast(int, previous_end) + 1,
+                            )
+                        prepared_window = await self._prepare_request_window(
+                            session_key, transcript, prepared_window.history_window_tokens,
+                            compaction_id=prepared_window.compaction_id,
+                            phase="preflight", reason=prepared_window.reason,
+                            protected_recent_messages=(
+                                len(transcript) - boundary if boundary is not None else 0
+                            ),
+                            history_capacity_chars=prepared_window.history_capacity_chars,
                             expected_session_id=expected_session_id,
                             expected_session_epoch=expected_session_epoch,
-                            consumer_admission=emergency_override.consumer_admission,
+                            consumer_admission=prepared_window.consumer_admission,
+                            preserve_historical_images=(
+                                prepared_window.preserve_historical_images
+                            ),
                         )
-                        emergency_override = emergency_overrides.pop(session_key, None)
-                if emergency_override is not None:
-                    transcript = list(emergency_override.kept_entries)
+                if prepared_window is not None and prepared_window.consumer_admission is not None:
+                    try:
+                        admitted = prepared_window.consumer_admission(
+                            prepared_window.summary,
+                            [self._entry_for_emergency_compaction(entry)
+                             for entry in prepared_window.kept_entries],
+                        )
+                    except ConsumerAdmissionStaleError:
+                        admitted = False
+                    if not admitted:
+                        prepared_window = None
+                if prepared_window is not None:
+                    transcript = list(prepared_window.kept_entries)
             else:
-                emergency_override = None
+                prepared_window = None
 
         transcript = await self._workspace_file_history_projection(
             transcript, getattr(agent, "_tool_context", None), session_key,
@@ -13981,13 +14576,13 @@ class TurnRunner:
             context_states=context_states,
             provider_kind=str(getattr(provider, "provider_name", "")),
         )
-        if provider_context.messages and emergency_override is None:
+        if provider_context.messages and prepared_window is None:
             history = provider_context.messages + history
         if history:
             agent.set_history(history)
-        if emergency_override is not None:
+        if prepared_window is not None:
             # Already contains the optional complete checkpoint exactly once.
-            return _format_compaction_summary_context([emergency_override.summary])
+            return _format_compaction_summary_context([prepared_window.summary])
         return await self._compaction_summary_context(
             session_key,
             summary_markers,
@@ -14040,7 +14635,28 @@ class TurnRunner:
                 context_states = []
         return context_states
 
-    async def _compaction_summary_context(
+    async def _resolve_compaction_context_records(
+        self, session_key: str, *, context_states: list[Any], summaries: list[Any],
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        legacy_summary_markers: list[str] | None = None,
+        skip_covered_through_ids: set[int] | None = None,
+    ) -> list[Any]:
+        resolver = getattr(self._session_manager, "resolve_compaction_context", None)
+        kwargs: dict[str, Any] = {
+            "context_states": context_states, "summaries": summaries,
+            "legacy_summary_markers": legacy_summary_markers or [],
+            "skip_covered_through_ids": skip_covered_through_ids,
+        }
+        if callable(resolver):
+            records, _ = await resolver(
+                session_key, **kwargs, expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            return cast(list[Any], records)
+        return build_compaction_context_records(**kwargs)
+
+    async def _load_compaction_context_records(
         self,
         session_key: str,
         legacy_summary_markers: list[str],
@@ -14049,10 +14665,8 @@ class TurnRunner:
         skip_covered_through_ids: set[int] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-        emit_event: bool = True,
-        raw_complete: bool = False,
-    ) -> str | None:
-        """Return durable compaction summaries as request-scoped context."""
+    ) -> list[Any]:
+        """Load checkpoint records, including verified canonical recovery data."""
         summaries: list[Any] = []
         get_summaries = getattr(self._session_manager, "get_summaries", None)
         if callable(get_summaries):
@@ -14096,11 +14710,40 @@ class TurnRunner:
             if context_states is None
             else context_states
         )
-        context_records = build_compaction_context_records(
+        context_records = await self._resolve_compaction_context_records(
+            session_key,
             context_states=loaded_context_states,
             summaries=summaries,
             legacy_summary_markers=legacy_summary_markers,
             skip_covered_through_ids=skip_covered_through_ids,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+        return context_records
+
+    async def _compaction_summary_context(
+        self,
+        session_key: str,
+        legacy_summary_markers: list[str],
+        *,
+        context_states: list[Any] | None = None,
+        skip_covered_through_ids: set[int] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        emit_event: bool = True,
+        raw_complete: bool = False,
+    ) -> str | None:
+        """Return durable compaction summaries as request-scoped context."""
+        if context_states is None:
+            context_states = await self._load_context_states(
+                session_key, expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+        context_records = await self._load_compaction_context_records(
+            session_key, legacy_summary_markers, context_states=context_states,
+            skip_covered_through_ids=skip_covered_through_ids,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
         context_items = [record.text for record in context_records]
         rendered = _format_compaction_summary_context(context_items)
@@ -14129,7 +14772,7 @@ class TurnRunner:
                 summary_len=sum(len(text) for text in context_items),
                 rendered_summary_len=len(rendered or ""),
                 replay_complete=replay_complete,
-                context_state_count=len(loaded_context_states),
+                context_state_count=len(context_states or []),
                 replayed_compaction_ids=replayed_compaction_ids,
                 **compaction_lifecycle_payload(
                     replay_compaction_id,
@@ -14464,14 +15107,12 @@ class TurnRunner:
         preserved_image = False
         occurrence_ids: dict[int, str] = {}
         attachment_identity_session_id = session_id or "history"
-        try:
-            from opensquilla.session.attachment_manifest import (
-                extract_attachment_occurrences_from_envelope,
-            )
+        from opensquilla.session import attachment_manifest
 
+        try:
             occurrence_ids = {
                 occurrence.ordinal: occurrence.attachment_id
-                for occurrence in extract_attachment_occurrences_from_envelope(
+                for occurrence in attachment_manifest.extract_attachment_occurrences_from_envelope(
                     content,
                     session_id=attachment_identity_session_id,
                     source_message_id=source_message_id or "unknown",
@@ -14516,15 +15157,17 @@ class TurnRunner:
             name = att.get("name")
             fallback = "image" if media_type.startswith("image/") else "attachment"
             label = name if isinstance(name, str) and name.strip() else fallback
+            display_name = attachment_manifest.normalize_attachment_name(
+                label, fallback=fallback,
+            )
+            display_mime = attachment_manifest.normalize_attachment_mime(media_type)
             attachment_id = occurrence_ids.get(ordinal)
             if attachment_id is None:
                 # Keep legacy IDs deterministic when an old envelope omitted
                 # them. This is metadata-only; no bytes or paths enter the
                 # marker or persisted state.
                 try:
-                    from opensquilla.session.attachment_manifest import legacy_attachment_id
-
-                    attachment_id = legacy_attachment_id(
+                    attachment_id = attachment_manifest.legacy_attachment_id(
                         session_id=attachment_identity_session_id,
                         message_id=source_message_id or "unknown",
                         index=ordinal,
@@ -14542,7 +15185,7 @@ class TurnRunner:
                 image_path = historical_materializer.materialize_image_path(att, session_id)
                 if image_path:
                     image_material_marker = TurnRunner._image_attachment_material_marker(
-                        name, media_type, image_path,
+                        display_name, display_mime, image_path,
                     )
             image_replay_allowed = (
                 allowed_image_attachment_ids is None
@@ -14603,17 +15246,17 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root and session_id:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
-                        name=label,
-                        mime=media_type,
-                        size=size,
-                        session_id=session_id,
-                        source="transcript",
-                    )
                     try:
+                        ref = make_attachment_ref(
+                            sha256=sha_ref,
+                            name=label,
+                            mime=media_type,
+                            size=size,
+                            session_id=session_id,
+                            source="transcript",
+                        )
                         raw_bytes = read_attachment_ref_bytes(ref, media_root=media_root)
-                    except (FileNotFoundError, ValueError):
+                    except (OSError, ValueError):
                         omitted.append(
                             image_marker(
                                 ImageMarkerState.UNAVAILABLE,
@@ -14666,14 +15309,22 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root is not None:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
-                        name=label,
-                        mime=media_type,
-                        size=size,
-                        session_id=session_id,
-                        source="transcript",
-                    )
+                    try:
+                        ref = make_attachment_ref(
+                            sha256=sha_ref,
+                            name=label,
+                            mime=media_type,
+                            size=size,
+                            session_id=session_id,
+                            source="transcript",
+                        )
+                    except ValueError:
+                        omitted.append(
+                            "[historical attachment unavailable: "
+                            f"{display_name} ({display_mime}): "
+                            "invalid attachment reference]"
+                        )
+                        continue
                     result = materializer.materialize(ref, session_id=session_id)
                 elif isinstance(data, str) and data:
                     try:
@@ -14681,7 +15332,8 @@ class TurnRunner:
                     except (binascii.Error, ValueError):
                         omitted.append(
                             "[historical attachment unavailable: "
-                            f"{label} ({media_type}): attachment data is not valid base64]"
+                            f"{display_name} ({display_mime}): "
+                            "attachment data is not valid base64]"
                         )
                         continue
                     result = materializer.materialize_bytes(
@@ -14691,12 +15343,7 @@ class TurnRunner:
                         session_id=session_id,
                     )
                 if result is not None:
-                    prefix = (
-                        "historical attachment available"
-                        if result.available
-                        else "historical attachment unavailable"
-                    )
-                    omitted.append(render_attachment_material_marker(result, prefix=prefix))
+                    omitted.append(render_historical_attachment_material_marker(result))
                     continue
             if media_type in _IMAGE_ATTACHMENT_MIMES:
                 if image_material_marker:
@@ -14713,11 +15360,13 @@ class TurnRunner:
                 # it, while adding the explicit state and stable ID required
                 # for a model switch after compaction.
                 omitted.append(
-                    f"[historical attachment omitted: {label} ({media_type}); "
+                    f"[historical attachment omitted: {display_name} ({display_mime}); "
                     f"{marker[1:-1]}]"
                 )
             else:
-                omitted.append(f"[historical attachment omitted: {label} ({media_type})]")
+                omitted.append(
+                    f"[historical attachment omitted: {display_name} ({display_mime})]"
+                )
         if preserved_image:
             if omitted:
                 from opensquilla.provider.types import ContentBlockText

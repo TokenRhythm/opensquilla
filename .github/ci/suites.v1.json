@@ -6,6 +6,9 @@
     "tests/test_recovery/**",
     "tests/test_migration/test_opensquilla_home_migration.py",
     "tests/test_desktop/test_electron_startup_contract.py",
+    "tests/test_desktop/test_process_cleanup.py",
+    "tests/test_desktop/test_posix_quit_process_cleanup.py",
+    "tests/test_mcp/test_stdio_client.py",
     "tests/test_gateway/test_goal_rpc.py",
     "tests/test_gateway/test_goal_child_wait.py",
     "tests/test_gateway/test_goal_plan_rpc_admission.py",
@@ -31,6 +34,18 @@
     "tests/test_migrations/test_v045_goal_runtime_accounting.py",
     "tests/test_tools/test_plan_access.py",
     "tests/test_sandbox/test_trusted_sandbox_execution.py",
+    "tests/test_sandbox/test_run_context.py",
+    "tests/test_sandbox/test_run_context_grants.py",
+    "tests/test_sandbox/test_user_grants_workers.py",
+    "tests/test_sandbox/test_user_grants_service_workers.py",
+    "tests/test_sandbox/test_user_grants_mutation_order.py",
+    "tests/test_sandbox/test_startup_without_canaries.py",
+    "tests/test_gateway/test_rpc_run_mode_preference.py",
+    "tests/test_gateway/test_rpc_sandbox_setup.py",
+    "tests/test_gateway/test_admission_preparation.py",
+    "tests/test_gateway/test_project_workspace_execution.py",
+    "tests/test_gateway/test_full_policy_preparation_workers.py",
+    "tests/test_gateway/test_sandbox_policy_workers.py",
     "tests/test_tools/test_approval_unification.py",
     "tests/test_live_multi_provider_matrix.py",
     "tests/test_live_provider_profile_smoke.py",
@@ -38,7 +53,10 @@
     "tests/test_gateway/test_session_model_routing_rpc.py",
     "tests/test_tools/test_execution_status.py",
     "tests/test_tools/test_shell_native_argv.py",
-    "tests/test_provider_ensemble.py"
+    "tests/test_provider_ensemble.py",
+    "tests/test_scripts/test_verify_webui_artifact.py",
+    "tests/test_scripts/test_stage_webui_artifact.py",
+    "tests/test_packaging/test_webui_build_contract.py"
   ],
   "baseline_suites": [
     "dependency-audit",
@@ -54,10 +72,12 @@
     "macos-recovery",
     "managed-toolchain",
     "python-full",
+    "python-stress",
     "readme-locale",
     "release-packaging",
     "skill-hub",
     "tui",
+    "webui-capacity",
     "webui-chat-recovery",
     "wheel-webui-roundtrip",
     "windows-high-risk",
@@ -67,7 +87,15 @@
   "full_desktop_matrix": [
     {
       "os": "ubuntu-latest",
-      "shard": "all"
+      "shard": "profiles"
+    },
+    {
+      "os": "ubuntu-latest",
+      "shard": "ownership"
+    },
+    {
+      "os": "ubuntu-latest",
+      "shard": "workbench"
     },
     {
       "os": "macos-latest",
@@ -84,6 +112,30 @@
     {
       "os": "windows-latest",
       "shard": "profiles"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-onboarding-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-onboarding-first-chat"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-profile-consolidation-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-primary-repair-accessibility"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-profile-import-flow"
+    },
+    {
+      "os": "windows-latest",
+      "shard": "profiles-desktop-cleanup-flow"
     },
     {
       "os": "windows-latest",
@@ -94,22 +146,59 @@
       "shard": "workbench"
     }
   ],
+  "python_shard_families": [
+    "core",
+    "gateway-sqlite",
+    "recovery-migration",
+    "desktop-installer-contracts"
+  ],
   "full_python_matrix": {
     "ubuntu": [
-      "core",
-      "gateway-sqlite",
-      "recovery-migration",
-      "desktop-installer-contracts"
+      "core-1",
+      "core-2",
+      "core-3",
+      "core-4",
+      "gateway-sqlite-1",
+      "gateway-sqlite-2",
+      "gateway-sqlite-3",
+      "gateway-sqlite-4",
+      "gateway-sqlite-5",
+      "gateway-sqlite-6",
+      "gateway-sqlite-7",
+      "gateway-sqlite-8",
+      "recovery-migration-1",
+      "recovery-migration-2",
+      "recovery-migration-3",
+      "recovery-migration-4",
+      "desktop-installer-contracts-1",
+      "desktop-installer-contracts-2",
+      "desktop-installer-contracts-3",
+      "desktop-installer-contracts-4"
     ],
     "windows": [
       "core-1",
       "core-2",
+      "core-3",
+      "core-4",
       "gateway-sqlite-1",
       "gateway-sqlite-2",
+      "gateway-sqlite-3",
+      "gateway-sqlite-4",
+      "gateway-sqlite-5",
+      "gateway-sqlite-6",
+      "gateway-sqlite-7",
+      "gateway-sqlite-8",
+      "gateway-sqlite-9",
+      "gateway-sqlite-10",
+      "gateway-sqlite-11",
       "recovery-migration-1",
       "recovery-migration-2",
+      "recovery-migration-3",
+      "recovery-migration-4",
       "desktop-installer-contracts-1",
-      "desktop-installer-contracts-2"
+      "desktop-installer-contracts-2",
+      "desktop-installer-contracts-3",
+      "desktop-installer-contracts-4"
     ]
   },
   "desktop_groups": {
@@ -152,6 +241,10 @@
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
         "desktop/electron/scripts/test-desktop-window-background-flow.mjs",
         "desktop/electron/scripts/test-desktop-theme-flow.mjs",
+        "desktop/electron/scripts/test-desktop-quit-native-acceptance.mjs",
+        "desktop/electron/scripts/fixtures/desktop-quit-acceptance/**",
+        "desktop/electron/src/desktop-quit*.ts",
+        "desktop/electron/src/desktop-window-lifecycle.ts",
         "desktop/electron/scripts/test-windows-update-*.mjs",
         "desktop/electron/scripts/fixtures/windows-update-electron/**",
         "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
@@ -184,7 +277,9 @@
       "execution_inputs": [
         ".github/actions/download-required-artifact/action.yml",
         ".github/scripts/audit_dependencies.py",
+        ".github/scripts/nsis_packaged_proof.py",
         ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/wait_ci_candidate.py",
         ".github/scripts/verify-packaged-ownership-long-paths.py",
         ".github/scripts/verify-packaged-startup-compatibility.py",
         ".github/scripts/verify-packaged-v054-upgrade.py",
@@ -230,7 +325,7 @@
         "opensquilla-webui/.node-version",
         "opensquilla-webui/package.json",
         "opensquilla-webui/scripts/check-readme-locales.mjs",
-        "opensquilla-webui/src/components/LanguageSwitcher.vue",
+        "opensquilla-webui/src/components/settings/SettingsLanguageControl.vue",
         "opensquilla-webui/src/i18n/index.ts"
       ]
     },
@@ -263,8 +358,21 @@
         "src/opensquilla/gateway/static/**"
       ]
     },
+    "webui-capacity": {
+      "execution_inputs": [
+        ".github/scripts/webui_browser_suites.py",
+        "tests/test_ci/test_webui_browser_suites.py",
+        "opensquilla-webui/**",
+        "pyproject.toml",
+        "uv.lock",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/session/**"
+      ]
+    },
     "webui-chat-recovery": {
       "execution_inputs": [
+        ".github/scripts/webui_browser_suites.py",
+        "tests/test_ci/test_webui_browser_suites.py",
         "opensquilla-webui/e2e/**",
         "opensquilla-webui/src/**",
         "src/opensquilla/gateway/**",
@@ -289,6 +397,8 @@
     },
     "desktop-recovery-e2e": {
       "execution_inputs": [
+        ".github/scripts/windows_profile_cases.py",
+        ".github/workflows/desktop-native-probes.yml",
         ".dockerignore",
         "Dockerfile",
         ".github/scripts/verify-windows-native-write-view.mjs",
@@ -350,6 +460,14 @@
         "**"
       ]
     },
+    "python-stress": {
+      "execution_inputs": [
+        "src/opensquilla/**",
+        "tests/**",
+        "pyproject.toml",
+        "uv.lock"
+      ]
+    },
     "windows-high-risk": {
       "execution_inputs": [
         "**"
@@ -362,12 +480,18 @@
         "src/opensquilla/provider/**",
         "src/opensquilla/tools/**",
         "src/opensquilla/process_tree.py",
+        "src/opensquilla/desktop_process_cleanup.py",
+        "src/opensquilla/mcp/**",
         "src/opensquilla/gateway/**",
         "src/opensquilla/router_control.py",
         "src/opensquilla/persistence/**",
         "src/opensquilla/recovery/**",
+        "src/opensquilla/sandbox/**",
         "src/opensquilla/session/**",
         "tests/test_desktop/test_electron_startup_contract.py",
+        "tests/test_desktop/test_process_cleanup.py",
+        "tests/test_desktop/test_posix_quit_process_cleanup.py",
+        "tests/test_mcp/test_stdio_client.py",
         "tests/test_migration/test_opensquilla_home_migration.py",
         "tests/test_recovery/**",
         "tests/test_gateway/test_goal_rpc.py",
@@ -395,6 +519,18 @@
         "tests/test_migrations/test_v045_goal_runtime_accounting.py",
         "tests/test_tools/test_plan_access.py",
         "tests/test_sandbox/test_trusted_sandbox_execution.py",
+        "tests/test_sandbox/test_run_context.py",
+        "tests/test_sandbox/test_run_context_grants.py",
+        "tests/test_sandbox/test_user_grants_workers.py",
+        "tests/test_sandbox/test_user_grants_service_workers.py",
+        "tests/test_sandbox/test_user_grants_mutation_order.py",
+        "tests/test_sandbox/test_startup_without_canaries.py",
+        "tests/test_gateway/test_rpc_run_mode_preference.py",
+        "tests/test_gateway/test_rpc_sandbox_setup.py",
+        "tests/test_gateway/test_admission_preparation.py",
+        "tests/test_gateway/test_project_workspace_execution.py",
+        "tests/test_gateway/test_full_policy_preparation_workers.py",
+        "tests/test_gateway/test_sandbox_policy_workers.py",
         "tests/test_tools/test_approval_unification.py",
         "tests/test_live_multi_provider_matrix.py",
         "tests/test_live_provider_profile_smoke.py",
@@ -402,7 +538,10 @@
         "tests/test_gateway/test_session_model_routing_rpc.py",
         "tests/test_tools/test_execution_status.py",
         "tests/test_tools/test_shell_native_argv.py",
-        "tests/test_provider_ensemble.py"
+        "tests/test_provider_ensemble.py",
+        "tests/test_scripts/test_verify_webui_artifact.py",
+        "tests/test_scripts/test_stage_webui_artifact.py",
+        "tests/test_packaging/test_webui_build_contract.py"
       ]
     },
     "release-packaging": {
@@ -464,24 +603,19 @@
         "src/opensquilla/cli/gateway_client.py",
         "src/opensquilla/cli/main.py",
         "src/opensquilla/cli/skills_cmd.py",
-        "src/opensquilla/cli/skills_meta_cmd.py",
         "src/opensquilla/application/skill_catalog.py",
         "src/opensquilla/application/skill_management.py",
-        "src/opensquilla/application/skill_proposal_review.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/adapters/skill_catalog.py",
         "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
         "src/opensquilla/gateway/adapters/skill_management.py",
         "src/opensquilla/gateway/adapters/skill_management_contract.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
         "src/opensquilla/gateway/boot.py",
         "src/opensquilla/gateway/config.py",
         "src/opensquilla/gateway/protocol.py",
         "src/opensquilla/gateway/rpc/__init__.py",
         "src/opensquilla/gateway/rpc/registry.py",
         "src/opensquilla/gateway/rpc_skills.py",
-        "src/opensquilla/gateway/rpc_proposals.py",
         "src/opensquilla/gateway/scopes.py",
         "src/opensquilla/gateway/websocket.py",
         "src/opensquilla/skills/**",
@@ -496,17 +630,14 @@
         "tests/test_gateway/test_skill_catalog_*.py",
         "tests/test_gateway/test_skill_management_*.py",
         "tests/test_gateway/test_skill_management_service_injection.py",
-        "tests/test_gateway/test_skill_proposal_review_*.py",
         "tests/test_scripts/test_bench_skill_integrity.py",
         "tests/test_skills/test_hub_*.py",
         "tests/test_skills/test_loader_*.py",
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_hash_consumers.py",
         "tests/test_skills_hot_reload.py",
@@ -523,6 +654,7 @@
         "tests/test_engine/test_skill_install_settlement.py",
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
+        "tests/test_skills/test_install_operation_io.py",
         "tests/test_skills/test_staging_io_worker.py",
         "src/opensquilla/engine/agent.py",
         "tests/test_engine/test_skill_install_turn.py",
@@ -532,18 +664,9 @@
     "managed-toolchain": {
       "execution_inputs": [
         "scripts/validate_managed_toolchain_artifacts*.py",
-        "src/opensquilla/skills/bundled/meta-paper-write/**",
-        "src/opensquilla/skills/bundled/meta-short-drama/**",
-        "src/opensquilla/skills/bundled/paper-*/**",
-        "src/opensquilla/skills/bundled/subtitle-burner/**",
-        "src/opensquilla/skills/bundled/video-still-animator/**",
         "src/opensquilla/skills/runtime_env.py",
         "src/opensquilla/skills/toolchains/**",
         "tests/test_skills/test_managed_toolchains.py",
-        "tests/test_skills/test_meta_paper*.py",
-        "tests/test_skills/test_meta_short_drama*.py",
-        "tests/test_skills/test_paper_*.py",
-        "tests/test_skills/test_subtitle_burner.py",
         "tests/test_skills/test_toolchain_*.py"
       ]
     },

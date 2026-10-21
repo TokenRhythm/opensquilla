@@ -229,11 +229,11 @@ class _GoalPostPublishLoopProvider:
         if call_number == 2:
             yield ProviderToolUseStart(
                 tool_use_id="progress-2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
             )
             yield ProviderToolUseEnd(
                 tool_use_id="progress-2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
                 arguments={
                     "steps": [
                         {
@@ -1118,9 +1118,9 @@ def _goal_publish_loop_registry(
         )
         return json.dumps({"status": "published", "artifact": {"name": path}})
 
-    async def update_goal_progress(steps: list[dict[str, Any]]) -> str:
+    async def update_plan(steps: list[dict[str, Any]]) -> str:
         control_calls.append(f"progress:{steps[0]['status']}")
-        return json.dumps({"status": "accepted"})
+        return json.dumps({"status": "accepted", "progress": {"revision": 1, "steps": steps}})
 
     async def update_goal(status: str, reason: str | None = None) -> str:
         control_calls.append(f"goal:{status}")
@@ -1146,8 +1146,8 @@ def _goal_publish_loop_registry(
     )
     registry.register(
         ToolSpec(
-            name="update_goal_progress",
-            description="Update Goal progress",
+            name="update_plan",
+            description="Update task progress",
             parameters={
                 "type": "object",
                 "properties": {"steps": {"type": "array"}},
@@ -1155,7 +1155,7 @@ def _goal_publish_loop_registry(
             },
             default_access="deny",
         ),
-        update_goal_progress,
+        update_plan,
     )
     registry.register(
         ToolSpec(
@@ -1507,7 +1507,7 @@ async def test_goal_publish_continues_normal_loop_through_terminal_and_final_sum
         "publish_artifact",
         "qa_check",
         "update_goal",
-        "update_goal_progress",
+        "update_plan",
     }
     assert all(set(tool_names) == expected_tools for tool_names in provider.tool_names_seen)
     assert isinstance(provider.requests[3][-1].content, list)
@@ -1535,7 +1535,7 @@ async def test_goal_publish_continues_normal_loop_through_terminal_and_final_sum
         event.tool_name
         for event in events
         if isinstance(event, ToolUseStartEvent)
-    ] == ["publish_artifact", "update_goal_progress", "update_goal"]
+    ] == ["publish_artifact", "update_plan", "update_goal"]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.text == "The Goal is complete."
 
@@ -1555,7 +1555,7 @@ async def test_goal_terminal_keeps_tools_available_for_final_checks(
 
     assert provider.calls == 5
     assert all(
-        set(names) == {"publish_artifact", "qa_check", "update_goal", "update_goal_progress"}
+        set(names) == {"publish_artifact", "qa_check", "update_goal", "update_plan"}
         for names in provider.tool_names_seen
     )
     assert control_calls == ["progress:completed", f"goal:{terminal_status}"]
@@ -1710,7 +1710,7 @@ async def test_goal_publish_then_plain_final_succeeds_without_artificial_error(
         "publish_artifact",
         "qa_check",
         "update_goal",
-        "update_goal_progress",
+        "update_plan",
     }
     assert control_calls == []
     assert qa_calls == []
@@ -2100,6 +2100,7 @@ async def test_sessions_yield_is_a_dispatch_boundary_before_goal_terminal(
 async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publish(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2161,6 +2162,7 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
 async def test_turn_runner_html_backstop_respects_preview_capability(
     tmp_path, caller_kind: CallerKind, preview_available: bool, expected_artifacts: int,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2241,6 +2243,7 @@ async def test_custom_named_publication_is_not_duplicated_in_events_or_transcrip
     tmp_path, name: str, mention_source: bool,
 ) -> None:
     # #1164: the real write/publish/Done chain must deliver only the explicit artifact.
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2301,6 +2304,7 @@ async def test_repeated_cancel_persists_completed_artifact_and_interrupted_trans
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2735,6 +2739,7 @@ def test_auto_publish_oversized_pptx_preflights_before_read_or_validation(
 async def test_turn_runner_rejects_invalid_omitted_pptx_and_marks_delivery_failure(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2835,6 +2840,7 @@ async def test_turn_runner_does_not_auto_publish_edited_config_json(tmp_path) ->
 async def test_turn_runner_auto_publishes_deliverable_file_created_by_apply_patch(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2884,6 +2890,7 @@ async def test_turn_runner_auto_publishes_deliverable_file_created_by_apply_patc
 async def test_turn_runner_marks_partial_omitted_artifact_delivery_failure(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2946,6 +2953,7 @@ async def test_turn_runner_marks_partial_omitted_artifact_delivery_failure(
 async def test_turn_runner_auto_publishes_same_content_deliverables_by_name(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -2999,6 +3007,7 @@ async def test_turn_runner_auto_publishes_same_content_deliverables_by_name(
 async def test_turn_runner_auto_publishes_omitted_deliverable_after_existing_artifact(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -3051,6 +3060,7 @@ async def test_turn_runner_auto_publishes_omitted_deliverable_after_existing_art
 
 @pytest.mark.asyncio
 async def test_turn_runner_does_not_auto_publish_memory_json_write(tmp_path) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -3099,6 +3109,7 @@ async def test_turn_runner_does_not_auto_publish_memory_json_write(tmp_path) -> 
 async def test_turn_runner_marks_failed_omitted_artifact_delivery_in_final_text(
     tmp_path,
 ) -> None:
+    (tmp_path / "workspace").mkdir()
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
@@ -3541,7 +3552,7 @@ async def test_goal_post_publish_selector_keeps_the_active_fallback_leg(
     _assert_goal_artifact_published_once(events)
     assert all(
         set(tool_names)
-        == {"publish_artifact", "qa_check", "update_goal", "update_goal_progress"}
+        == {"publish_artifact", "qa_check", "update_goal", "update_plan"}
         for tool_names in fallback.tool_names_seen
     )
 

@@ -23,12 +23,12 @@ const parsed = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, tr
 const declarations = new Map(parsed.statements.filter(ts.isFunctionDeclaration)
   .filter((statement) => statement.name).map((statement) => [statement.name.text, statement]))
 const names = [
-  'windowsInstallerActionsSupported', 'windowsUpdateDownloadDirectory', 'clearWindowsUpdateCache',
+  'windowsInstallerActionsSupported', 'desktopUpdateAutomaticDownloadSupported', 'windowsUpdateDownloadDirectory', 'clearWindowsUpdateCache',
   'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache', 'revalidateReadyWindowsInstaller',
   'activeDesktopUpdateSnoozeFor', 'clearDesktopUpdateSnoozeIfVersionChanged',
   'desktopUpdateSnapshot', 'publishDesktopUpdateState', 'setDesktopUpdateState', 'dismissDesktopUpdate',
-  'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate',
-  'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates', 'applyWindowsInstaller',
+  'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate', 'runDesktopUpdateDownload',
+  'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkDesktopUpdateCandidate', 'checkForUpdates', 'applyWindowsInstaller',
 ]
 for (const name of names) assert.ok(declarations.has(name), `production function ${name} must exist`)
 const schedulerStatement = parsed.statements.find((statement) => ts.isVariableStatement(statement)
@@ -101,6 +101,7 @@ async function fixture(options = {}) {
     desktopUpdateCandidate: null, nativeUpdateReady: null, downloadedUpdateVersion: null,
     verifiedManualInstallerPath: null, windowsUpdateCacheDescriptor: null,
     windowsUpdateCacheRestore: null, windowsUpdateCacheRestoreAttempted: false,
+    desktopUpdateDownloadTask: null, desktopUpdateDownloadOrigin: null,
     updateApplying: false, updateDownloadInProgress: false, manualInstallerActionInProgress: false,
     isQuitting: false, appExitPhase: 'running', desktopWriters: new DesktopWriterAdmission(),
     lastSuccessfulUpdateSource: 'oss', mockDownloadedUpdate: false,

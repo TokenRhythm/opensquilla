@@ -35,7 +35,7 @@ SOURCE_INPUT_ROOTS = (
     "tsconfig.json",
     "tsconfig.app.json",
     "tsconfig.node.json",
-    "public",
+    "public-assets",
     "scripts",
     "src",
 )
@@ -61,47 +61,30 @@ NORMALIZED_TEXT_SUFFIXES = {
 IGNORED_SOURCE_FILE_NAMES = frozenset({".DS_Store"})
 FORBIDDEN_ARTIFACT_FILE_NAMES = frozenset({".ds_store", ".npmrc"})
 FORBIDDEN_ARTIFACT_SUFFIXES = frozenset({".key", ".pem"})
-OFFICIAL_MUSIC_FILES = {"music/README.md", "music/playlist.json"}
 
 
 class ArtifactError(RuntimeError):
     """The WebUI artifact is missing, incomplete, or internally inconsistent."""
 
 
-def _verify_official_music(files: dict[str, bytes]) -> None:
-    """Reject personal music while allowing the tracked, empty library metadata."""
-
-    personal_bgm = sorted(
-        relative
-        for relative in files
-        if relative.startswith("music/") and relative not in OFFICIAL_MUSIC_FILES
-    )
-    if personal_bgm:
-        raise ArtifactError(
-            f"personal BGM content is forbidden in official WebUI artifacts: {personal_bgm}"
-        )
-
-    playlist_bytes = files.get("music/playlist.json")
-    if playlist_bytes is None:
-        return
-    try:
-        playlist = json.loads(playlist_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ArtifactError(f"official music/playlist.json is invalid: {exc}") from exc
-    if not isinstance(playlist, dict) or playlist.get("tracks") != []:
-        raise ArtifactError(
-            "official music/playlist.json must keep its tracks list empty; "
-            "use playlist.local.json only for private builds"
-        )
-
-
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _is_retired_media_path(relative: str) -> bool:
+    # Match the root as Windows extraction would; keep this mirrored in verify-dist.mjs.
+    parts = (part for part in relative.replace("\\", "/").split("/") if part and part != ".")
+    return next(parts, "").rstrip(" .").lower() == "music"
 
 
 def _files(dist_dir: Path) -> dict[str, bytes]:
     if not dist_dir.is_dir():
         raise ArtifactError(f"WebUI artifact directory is missing: {dist_dir}")
+    for path in dist_dir.iterdir():
+        if _is_retired_media_path(path.name):
+            raise ArtifactError(
+                f"WebUI artifact contains forbidden metadata or sensitive files: {path.name}"
+            )
     files: dict[str, bytes] = {}
     for path in sorted(dist_dir.rglob("*")):
         if path.is_symlink():
@@ -119,7 +102,8 @@ def _forbidden_artifact_paths(files: dict[str, bytes]) -> list[str]:
         name = PurePosixPath(relative).name
         lowered = name.lower()
         if (
-            lowered in FORBIDDEN_ARTIFACT_FILE_NAMES
+            _is_retired_media_path(relative)
+            or lowered in FORBIDDEN_ARTIFACT_FILE_NAMES
             or lowered == ".env"
             or lowered.startswith(".env.")
             or PurePosixPath(lowered).suffix in FORBIDDEN_ARTIFACT_SUFFIXES
@@ -235,7 +219,6 @@ def verify_dist(
     dist_dir: Path,
     *,
     webui_root: Path = DEFAULT_WEBUI_ROOT,
-    forbid_personal_bgm: bool = False,
 ) -> dict[str, bytes]:
     """Return artifact files after checking manifest and entrypoint integrity."""
 
@@ -287,8 +270,6 @@ def verify_dist(
     ]
     if manifest["files"] != expected_records:
         raise ArtifactError("WebUI artifact files do not match the generated manifest")
-    if forbid_personal_bgm:
-        _verify_official_music(files)
 
     for entry_name, entry_bytes in (("index.html", index), ("desktop.html", desktop)):
         try:
@@ -322,18 +303,24 @@ def verify_wheel(
     wheel_path: Path,
     *,
     webui_root: Path = DEFAULT_WEBUI_ROOT,
-    forbid_personal_bgm: bool = False,
 ) -> None:
     """Require the wheel's WebUI tree to be byte-identical to ``dist_dir``."""
 
     files = verify_dist(
         dist_dir,
         webui_root=webui_root,
-        forbid_personal_bgm=forbid_personal_bgm,
     )
     if not wheel_path.is_file():
         raise ArtifactError(f"wheel is missing: {wheel_path}")
     with zipfile.ZipFile(wheel_path) as wheel:
+        retired_media = [
+            name
+            for name in wheel.namelist()
+            if name.startswith(WHEEL_PREFIX)
+            and _is_retired_media_path(name.removeprefix(WHEEL_PREFIX))
+        ]
+        if retired_media:
+            raise ArtifactError(f"wheel contains forbidden retired media paths: {retired_media}")
         packaged = {
             name.removeprefix(WHEEL_PREFIX): wheel.read(name)
             for name in wheel.namelist()
@@ -368,11 +355,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="frontend source directory used to validate the artifact fingerprint",
     )
     parser.add_argument("--wheel", type=Path, help="optional wheel to compare byte-for-byte")
-    parser.add_argument(
-        "--forbid-personal-bgm",
-        action="store_true",
-        help="reject local BGM files and overrides in an official artifact",
-    )
     return parser.parse_args(argv)
 
 
@@ -382,14 +364,12 @@ def main(argv: list[str] | None = None) -> int:
         files = verify_dist(
             args.dist,
             webui_root=args.webui_root,
-            forbid_personal_bgm=args.forbid_personal_bgm,
         )
         if args.wheel is not None:
             verify_wheel(
                 args.dist,
                 args.wheel,
                 webui_root=args.webui_root,
-                forbid_personal_bgm=args.forbid_personal_bgm,
             )
     except (ArtifactError, OSError, zipfile.BadZipFile) as exc:
         print(f"verify_webui_artifact: {exc}", file=sys.stderr)

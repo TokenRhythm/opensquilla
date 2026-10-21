@@ -9,6 +9,7 @@ from opensquilla.application.turn_input import (
     IncomingTurnSource,
     MemoryCapturePolicy,
 )
+from opensquilla.contracts.local_path_references import normalize_local_path_references
 from opensquilla.contracts.selected_skills import normalize_selected_skills
 from opensquilla.gateway.turn_ingress import request_identity
 from opensquilla.session.keys import canonicalize_session_key
@@ -190,8 +191,70 @@ def _capture(params: dict[str, Any]) -> MemoryCapturePolicy:
         provenance = {"kind": str(kind)}
     elif provenance is not None and "kind" not in provenance and kind:
         provenance["kind"] = str(kind)
+    from opensquilla.contracts.turn_commands import normalize_turn_command
+
+    # The public provenance bag is descriptive. Only the explicit wire field
+    # establishes command intent; quoted/history/literal input never does.
+    if provenance is not None:
+        provenance.pop("turn_command", None)
+    command = normalize_turn_command(params.get("turnCommand"))
+    if command is not None:
+        provenance = {**(provenance or {}), "turn_command": command}
     # Public run-kind labels never grant an internal execution role.
     return MemoryCapturePolicy(bool(no_capture), provenance)
+
+
+def _required_services(params: dict[str, Any]) -> tuple[str, ...]:
+    """Decode the bounded producer dependency declaration.
+
+    ``requiredServices`` is an additive producer hint.  The bundled
+    ``browser-use`` skill is the one user-facing selection whose execution
+    contract is known to require the Desktop-owned browser bridge, so derive
+    that dependency here as well.  Keeping this inference at the Gateway
+    ingress boundary means queued/replayed inputs and older WebUI builds get
+    the same readiness fence; an omitted declaration can no longer silently
+    accept a turn whose selected skill needs the delayed browser service.
+    """
+    aliases = {
+        "browser": "desktop_browser",
+        "desktop-browser": "desktop_browser",
+        "desktopbrowser": "desktop_browser",
+    }
+    raw = params.get("requiredServices", params.get("required_services"))
+    if raw is None:
+        source = params.get("_source")
+        if isinstance(source, dict):
+            raw = source.get("requiredServices", source.get("required_services"))
+    if raw is not None and not isinstance(raw, (list, tuple)):
+        raise ValueError("requiredServices must be an array of strings")
+    values: list[str] = []
+    for value in raw or ():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("requiredServices must contain non-empty strings")
+        name = aliases.get(value.strip().lower(), value.strip().lower())
+        if name not in values:
+            values.append(name)
+
+    # ``selectedSkills`` is part of the authenticated turn input and is
+    # validated again by the acceptance path.  Only infer the fixed bundled
+    # skill contract; arbitrary skill names never manufacture a service claim.
+    selected = params.get("selectedSkills")
+    if isinstance(selected, (list, tuple)):
+        for item in selected:
+            if not isinstance(item, dict):
+                continue
+            skill_name = item.get("name")
+            if isinstance(skill_name, str) and skill_name.strip().lower() in {
+                "browser-use",
+                "browser_use",
+                "browseruse",
+            }:
+                if "desktop_browser" not in values:
+                    values.append("desktop_browser")
+                break
+    if len(values) > 8:
+        raise ValueError("requiredServices may contain at most 8 services")
+    return tuple(values)
 
 
 
@@ -234,6 +297,9 @@ def decode_admit_turn(
     workspace_files = normalize_workspace_files(params.get("workspaceFiles"))
     page_context = normalize_page_context(params.get("pageContext"))
     selected_skills = normalize_selected_skills(params.get("selectedSkills"))
+    local_path_references = normalize_local_path_references(
+        params.get("localPathReferences"), message=message,
+    )
     attachments = params.get("attachments", [])
     attachments = attachments if isinstance(attachments, list) else []
     if workspace_files:
@@ -284,6 +350,7 @@ def decode_admit_turn(
         fingerprint_params=fingerprint,
     )
     display = params.get("displayText")
+    capture = _capture(params)
     routing = _optional_string(params, "initialRoutingMode", "initial_routing_mode")
     if routing is not None and routing not in {"direct", "router", "ensemble"}:
         raise ValueError("initialRoutingMode must be direct, router, or ensemble")
@@ -292,7 +359,7 @@ def decode_admit_turn(
         message=message,
         surface="webchat" if surface == "webchat" else "session",
         source=_source(source),
-        capture=_capture(params),
+        capture=capture,
         client_request_id=identity.client_request_id,
         request_fingerprint=identity.request_fingerprint,
         source_scope=identity.source_scope,
@@ -308,6 +375,7 @@ def decode_admit_turn(
         attachments=tuple(attachments),
         workspace_files=tuple(workspace_files),
         selected_skills=selected_skills,
+        local_path_references=local_path_references,
         intent=params.get("intent", "continue"),
         intent_was_provided=params.get("intent") is not None,
         fork_before_message_id=_optional_string(
@@ -317,7 +385,10 @@ def decode_admit_turn(
         page_context=page_context,
         receipt_replay_only=retired_input,
         display_text=display if isinstance(display, str) else None,
-        queue_mode=params.get("queueMode") or params.get("queue_mode"),
+        queue_mode=(
+            "followup" if (capture.input_provenance or {}).get("turn_command") is not None
+            else params.get("queueMode") or params.get("queue_mode")
+        ),
         initial_collaboration_mode=params.get(
             "collaborationMode", params.get("collaboration_mode")
         ),
@@ -325,4 +396,5 @@ def decode_admit_turn(
         initial_model=initial_model,
         initial_provider=initial_provider,
         pending_input=pending_input,
+        required_services=_required_services(params),
     )

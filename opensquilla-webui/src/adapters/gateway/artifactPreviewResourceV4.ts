@@ -19,6 +19,7 @@ import {
   type ArtifactWorkbenchPreviewKind,
   artifactPreviewLimit,
   artifactWorkbenchPreviewKind,
+  isOfficePreviewFormat,
   buildOfflineArtifactHtml,
   detectArtifactHtmlRelativeResources,
   renderArtifactMarkdown,
@@ -52,6 +53,13 @@ interface ArtifactPreviewResourceAdapterOptions extends ArtifactPreviewResourceO
   baseOrigin?: () => string
 }
 
+interface MarkdownImageWork {
+  sources: string[]
+  baseOrigin: string
+  nextIndex: number
+  received: number
+}
+
 const INLINE_WORKBENCH_ATTACHMENT_URL_PATTERN =
   /^data:([a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*(?:;charset=[^;,]+)?);base64,([a-z0-9+/=]*)$/i
 
@@ -65,31 +73,6 @@ const GENERIC_IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
   png: 'image/png',
   svg: 'image/svg+xml',
   webp: 'image/webp',
-}
-
-function isDesktopRendererOrigin(origin: string): boolean {
-  try {
-    const parsed = new URL(origin)
-    return parsed.protocol === 'opensquilla-app:' && parsed.hostname === 'desktop'
-  } catch {
-    return false
-  }
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  // Avoid spreading a large PDF into a function call (which can overflow the
-  // stack) while still keeping the conversion local to the preview boundary.
-  let binary = ''
-  const chunkSize = 0x8000
-  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-    const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length))
-    binary += String.fromCharCode(...chunk)
-  }
-  return globalThis.btoa(binary)
-}
-
-function desktopPdfDataUrl(bytes: Uint8Array, mime: string): string {
-  return `data:${mime};base64,${bytesToBase64(bytes)}`
 }
 
 function defaultBaseOrigin(): string {
@@ -205,6 +188,7 @@ async function readResponseBytes(
   limit: number,
   signal: AbortSignal,
   onProgress: (progress: number | null) => void,
+  onReceived?: (bytes: number) => void,
 ): Promise<Uint8Array> {
   const total = contentLength(response)
   if (total !== null && total > limit) {
@@ -216,6 +200,7 @@ async function readResponseBytes(
   if (!body) {
     onProgress(null)
     const blob = await response.blob()
+    onReceived?.(blob.size)
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
     if (blob.size > limit) throw new ArtifactPreviewTooLargeError()
     return new Uint8Array(await blob.arrayBuffer())
@@ -233,6 +218,7 @@ async function readResponseBytes(
       if (done) break
       if (!value) continue
       received += value.byteLength
+      onReceived?.(received)
       if (received > limit) {
         await reader.cancel()
         throw new ArtifactPreviewTooLargeError()
@@ -262,6 +248,38 @@ function bytesToArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   ) as ArrayBuffer
 }
 
+export const MARKDOWN_IMAGE_BYTE_LIMIT = 5 * 1024 * 1024
+export const MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT = 20 * 1024 * 1024
+export const MARKDOWN_IMAGE_COUNT_LIMIT = 24
+const IMAGE_MIMES = new Set(Object.values(GENERIC_IMAGE_MIME_BY_EXTENSION))
+
+function registeredMarkdownImage(source: string, baseOrigin: string): ArtifactPayload | null {
+  try {
+    const url = new URL(source, baseOrigin)
+    if (url.username || url.password) return null
+    if (!/^\/api\/v1\/(?:artifacts\/[^/]+|attachments\/[a-f\d]{64})$/i.test(url.pathname)) return null
+    // Session authorization comes from the bound transport, never Markdown.
+    url.search = ''
+    url.hash = ''
+    return { download_url: url.href }
+  } catch { return null }
+}
+
+function retainMarkdownImageFallback(placeholder: Element, source: string) {
+  const alt = placeholder.getAttribute('data-markdown-image-alt') || 'Image'
+  placeholder.textContent = alt
+  try {
+    const url = new URL(source)
+    if (url.protocol !== 'https:' || url.username || url.password) return
+    const link = document.createElement('a')
+    link.href = url.href
+    link.textContent = alt
+    link.target = '_blank'
+    link.rel = 'noopener noreferrer'
+    placeholder.replaceChildren(link)
+  } catch { /* Retain visible alt for missing local assets. */ }
+}
+
 export function createArtifactPreviewResource(
   http: Pick<ArtifactPreviewResourceHttpTransport, 'requestBinary'>,
   options: ArtifactPreviewResourceAdapterOptions,
@@ -271,8 +289,10 @@ export function createArtifactPreviewResource(
   const errorCode = ref<ArtifactPreviewResourceErrorCode | null>(null)
   const progress = ref<number | null>(null)
   const objectUrl = shallowRef('')
+  const binary = shallowRef<ArrayBuffer | null>(null)
   const text = shallowRef('')
   const markdownHtml = shallowRef('')
+  const markdownImages = shallowRef<ReadonlyMap<string, string>>(new Map())
   const relativeResources = shallowRef<string[]>([])
 
   const createObjectUrl = options.createObjectUrl || defaultCreateObjectUrl
@@ -285,6 +305,8 @@ export function createArtifactPreviewResource(
   let stateBeforeSuspend: ArtifactPreviewResourceState = 'idle'
   let nativePayloadDelivered = false
   let objectUrlOwned = false
+  const markdownImageUrls = new Set<string>()
+  let markdownImageWork: MarkdownImageWork | null = null
 
   function revokeCurrentObjectUrl() {
     if (!objectUrl.value) return
@@ -296,11 +318,87 @@ export function createArtifactPreviewResource(
   }
 
   function clearOutput() {
+    markdownImageWork = null
     revokeCurrentObjectUrl()
+    for (const url of markdownImageUrls) {
+      try { revokeObjectUrl(url) } catch {}
+    }
+    markdownImageUrls.clear()
+    markdownImages.value = new Map()
+    binary.value = null
     text.value = ''
     markdownHtml.value = ''
     relativeResources.value = []
     nativePayloadDelivered = false
+  }
+
+  function prepareMarkdownDocument(html: string): { html: string; sources: string[] } {
+    const template = document.createElement('template')
+    template.innerHTML = html
+    const placeholders = [...template.content.querySelectorAll('[data-markdown-image]')]
+    const sources = new Set<string>()
+    for (const placeholder of placeholders) {
+      const source = placeholder.getAttribute('data-markdown-image') || ''
+      retainMarkdownImageFallback(placeholder, source)
+      if (sources.size < MARKDOWN_IMAGE_COUNT_LIMIT) sources.add(source)
+    }
+    return { html: template.innerHTML, sources: [...sources].slice(0, MARKDOWN_IMAGE_COUNT_LIMIT) }
+  }
+
+  async function prepareMarkdownImages(work: MarkdownImageWork, signal: AbortSignal): Promise<void> {
+    const { sources, baseOrigin } = work
+    // Advance only after a source settles. Suspending leaves the interrupted
+    // source pending, while completed images and the document budget survive.
+    for (; work.nextIndex < sources.length; work.nextIndex += 1) {
+      const source = sources[work.nextIndex]!
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+      if (work.received < MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT) {
+        try {
+          const remaining = Math.min(MARKDOWN_IMAGE_BYTE_LIMIT, MARKDOWN_IMAGES_TOTAL_BYTE_LIMIT - work.received)
+          let response: ArtifactPreviewResourceBinaryResponse | null = null
+          let candidate: ArtifactPayload | null = null
+          if (/^data:image\//i.test(source)) {
+            response = inlineWorkbenchAttachmentResponse(source, remaining)
+          } else {
+            candidate = registeredMarkdownImage(source, baseOrigin)
+            // The resolver rejects absolute/network paths and uses one bounded
+            // current-session catalog page. Never walk the user's filesystem.
+            candidate ??= await options.resolveMarkdownImage?.(source, signal) || null
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+            if (!candidate) continue
+            const request = bindArtifactBinaryRequest(http, candidate, { baseOrigin, policy: 'trusted-origin' })
+            if (!request) continue
+            response = await request.execute({ sessionKey: options.sessionKey?.() || '', signal, timeoutMs: 15_000 })
+          }
+          if (signal.aborted) { await cancelResponseBody(response); break }
+          const responseMime = (response.metadata.contentType || '').split(';', 1)[0]!.trim().toLowerCase()
+          const mime = responseMime === 'application/octet-stream' || !responseMime
+            ? GENERIC_IMAGE_MIME_BY_EXTENSION[artifactExtension(String(candidate?.name || ''))] || ''
+            : responseMime
+          if (!IMAGE_MIMES.has(mime)) {
+            await cancelResponseBody(response)
+            // Cleanup may settle after a resumed worker owns this same cursor.
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+            continue
+          }
+          const alreadyReceived = work.received
+          const bytes = await readResponseBytes(response, remaining, signal, () => undefined, count => {
+            if (!signal.aborted) work.received = alreadyReceived + count
+          })
+          if (signal.aborted) break
+          // Even SVG stays in the inert image context; never inline SVG markup.
+          const url = createObjectUrl(new Blob([bytesToArrayBuffer(bytes)], { type: mime }))
+          markdownImageUrls.add(url)
+          // Publish each completed image independently. Never replace the
+          // Markdown HTML after it mounts: diagrams, focus and selection stay.
+          markdownImages.value = new Map(markdownImages.value).set(source, url)
+        } catch (error) {
+          if (signal.aborted || isAbortError(error)) throw error
+          // A single unavailable image does not discard the readable document.
+        }
+      }
+    }
+    if (!signal.aborted && markdownImageWork === work) markdownImageWork = null
   }
 
   function abortActive() {
@@ -327,8 +425,14 @@ export function createArtifactPreviewResource(
     errorCode.value = null
     progress.value = null
 
-    const artifact = options.artifact()
-    const nextKind = artifactWorkbenchPreviewKind(artifact)
+    const selectedArtifact = options.artifact()
+    const nextKind = artifactWorkbenchPreviewKind(selectedArtifact)
+    // A document's download action follows its latest head. Verified Office
+    // previews must instead fetch the same immutable revision as their hash:
+    // the server head can advance while this selected snapshot is still visible.
+    const artifact = isOfficePreviewFormat(nextKind) && selectedArtifact.revision_download_url
+      ? { ...selectedArtifact, download_url: selectedArtifact.revision_download_url }
+      : selectedArtifact
     kind.value = nextKind
     if (nextKind === 'unsupported') {
       setFailure('unsupported', 'unsupported')
@@ -415,7 +519,7 @@ export function createArtifactPreviewResource(
         if (!disposed && run === generation) progress.value = value
       })
       if (disposed || suspended || run !== generation) return
-      if (inlineAttachment) {
+      if (inlineAttachment || isOfficePreviewFormat(nextKind)) {
         await verifyInlineWorkbenchAttachmentIntegrity(artifact, bytes)
         if (disposed || suspended || run !== generation) return
       }
@@ -460,31 +564,33 @@ export function createArtifactPreviewResource(
           objectUrlOwned = true
         }
         state.value = missing.length > 0 ? 'missing-resource' : 'ready'
-      } else if (nextKind === 'markdown') {
-        markdownHtml.value = renderArtifactMarkdown(new TextDecoder().decode(bytes))
+      } else if (isOfficePreviewFormat(nextKind) || nextKind === 'pdf') {
+        binary.value = bytesToArrayBuffer(bytes)
         state.value = 'ready'
+      } else if (nextKind === 'markdown') {
+        const document = prepareMarkdownDocument(renderArtifactMarkdown(new TextDecoder().decode(bytes)))
+        // Text remains readable while optional authorized images arrive. A slow
+        // image must never keep the entire document behind its loading state.
+        markdownHtml.value = document.html
+        state.value = 'ready'
+        progress.value = 100
+        markdownImageWork = { sources: document.sources, baseOrigin, nextIndex: 0, received: 0 }
+        await prepareMarkdownImages(markdownImageWork, controller.signal)
+        if (disposed || suspended || run !== generation) return
       } else if (nextKind === 'text') {
+        // Generic transport MIME may accompany a .js/.json/etc filename. Do
+        // not present a binary payload as source solely because of that name.
+        if (bytes.includes(0)) throw new ArtifactPreviewInvalidContentError()
         text.value = new TextDecoder().decode(bytes)
         state.value = 'ready'
       } else {
-        // Chromium's native PDF viewer cannot reliably consume blob URLs
-        // whose origin is Electron's custom `opensquilla-app:` protocol. It
-        // may render the viewer chrome while leaving the page area blank.
-        // A data URL keeps the same authenticated byte path and avoids that
-        // custom-origin handoff. HTTP/Web UI previews keep their normal Blob
-        // URL so ordinary browser memory and navigation behavior is unchanged.
-        const useDesktopPdfDataUrl = nextKind === 'pdf' && isDesktopRendererOrigin(baseOrigin)
-        const nextObjectUrl = useDesktopPdfDataUrl
-          ? desktopPdfDataUrl(bytes, mime)
-          : createObjectUrl(new Blob([bytesToArrayBuffer(bytes)], { type: mime }))
+        const nextObjectUrl = createObjectUrl(new Blob([bytesToArrayBuffer(bytes)], { type: mime }))
         if (disposed || suspended || run !== generation) {
-          if (!useDesktopPdfDataUrl) {
-            try { revokeObjectUrl(nextObjectUrl) } catch {}
-          }
+          try { revokeObjectUrl(nextObjectUrl) } catch {}
           return
         }
         objectUrl.value = nextObjectUrl
-        objectUrlOwned = !useDesktopPdfDataUrl
+        objectUrlOwned = true
         state.value = 'ready'
       }
       progress.value = 100
@@ -534,6 +640,7 @@ export function createArtifactPreviewResource(
     suspended = false
     const hasReadyOutput = !!(
       objectUrl.value
+      || binary.value
       || text.value
       || markdownHtml.value
       || nativePayloadDelivered
@@ -543,6 +650,17 @@ export function createArtifactPreviewResource(
         || stateBeforeSuspend === 'ready-with-warnings'
         ? stateBeforeSuspend
         : 'ready'
+      if (markdownImageWork) {
+        const controller = new AbortController()
+        activeController = controller
+        // Optional images must not delay the owner's revision check on return
+        // from Source. A changed document can immediately abort this work.
+        void prepareMarkdownImages(markdownImageWork, controller.signal).catch(() => {
+          // Cancellation preserves the cursor; per-image failures stay local.
+        }).finally(() => {
+          if (activeController === controller) activeController = null
+        })
+      }
       return
     }
     await load()
@@ -578,7 +696,9 @@ export function createArtifactPreviewResource(
     errorCode,
     kind,
     markdownHtml,
+    markdownImages,
     objectUrl,
+    binary,
     progress,
     relativeResources,
     state,

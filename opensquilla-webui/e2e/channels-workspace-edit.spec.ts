@@ -13,7 +13,7 @@ const NAME = 'e2e-edit-telegram'
 
 async function openChannels(page: Page, suffix = ''): Promise<void> {
   await page.goto(`${CONTROL_URL}channels${suffix}`)
-  await expect(page.locator('.conn-pill')).toBeVisible({ timeout: 15000 })
+  await expect(page.locator('.topbar[data-connection-state]')).toBeVisible({ timeout: 15000 })
 }
 
 test.describe.serial('channel workspace compose + edit', () => {

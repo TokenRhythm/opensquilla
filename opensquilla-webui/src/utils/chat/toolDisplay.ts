@@ -50,6 +50,24 @@ export function isInternalToolName(name: string): boolean {
   return name === 'router_control'
 }
 
+export function activityToolName(name: string): string {
+  const normalized = String(name || '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .replace(/-/g, '_')
+  const namespaced = normalized.split(/__|[.:/]/).filter(Boolean)
+  return namespaced[namespaced.length - 1] || ''
+}
+
+// Successful progress calls may follow an answer without moving it back into
+// Activity. Retain the retired checkpoint name for historical PlanRun turns.
+const ANSWER_TRANSPARENT_CONTROL_TOOLS = new Set(['plan_run_checkpoint', 'update_plan'])
+
+export function isAnswerTransparentControlTool(name: string): boolean {
+  return ANSWER_TRANSPARENT_CONTROL_TOOLS.has(activityToolName(name))
+}
+
 export function normalizeToolInputText(raw: unknown): string {
   const record = asRecord(raw)
   const value = record?.input ?? record?.arguments ?? ''
@@ -181,8 +199,20 @@ export function toolDisplayName(name: string, input: unknown): string {
   return name
 }
 
+// These names come from registered tools. Keep their presentation separate from
+// the raw identity and grouping key; unrelated MCP tools keep their identifier.
+const REGISTERED_TOOL_ACTIONS = new Map<string, { label: string; icon: IconName }>([
+  ['mcp__desktop-browser__browser_open', { label: 'openBrowser', icon: 'monitor' }],
+  ['open_workspace_preview', { label: 'openPreview', icon: 'monitor' }],
+  ['skill_view', { label: 'readSkill', icon: 'skills' }],
+])
+
 export function toolIconName(name: string): IconName {
   const n = String(name || '').toLowerCase()
+  const registeredAction = REGISTERED_TOOL_ACTIONS.get(n)
+  if (registeredAction) return registeredAction.icon
+  if (isProcessTool(n)) return 'terminal'
+  if (isToolResultRetrieval(n)) return 'logs'
   if (n.includes('search') || n.includes('google') || n.includes('bing')) return 'search'
   if (n.includes('fetch') || n.includes('http') || n.includes('curl') || n.includes('wget')) return 'monitor'
   if (n.includes('python') || n === 'py' || n.includes('exec') || n.includes('bash') || n.includes('shell')) return 'config'
@@ -201,8 +231,58 @@ function hasToolNameSuffix(name: string, tool: string): boolean {
     || name.endsWith(`__${tool}`)
 }
 
+function isToolResultRetrieval(name: string): boolean {
+  return hasToolNameSuffix(String(name || '').trim().toLowerCase(), 'retrieve_tool_result')
+}
+
+export function isProcessTool(name: string): boolean {
+  const normalized = String(name || '').toLowerCase()
+  return ['process', 'background_process'].some(tool => hasToolNameSuffix(normalized, tool))
+}
+
+const PROCESS_ACTION_LABELS: Record<string, string> = {
+  poll: 'checkBackgroundCommand',
+  wait: 'waitBackgroundCommand',
+  log: 'readBackgroundOutput',
+  list: 'listBackgroundCommands',
+  kill: 'stopBackgroundCommand',
+  remove: 'removeBackgroundCommand',
+  write: 'sendBackgroundInput',
+  submit: 'submitBackgroundInput',
+  eof: 'closeBackgroundInput',
+  resize: 'resizeBackgroundTerminal',
+}
+
+/** Identify the managed command without repeating the action or its raw JSON. */
+export function processToolTarget(toolCall: ChatToolCall): string {
+  const input = parseToolInput(toolCall.inputRaw || toolCall.inputPreview)
+  const result = parseToolInput(toolCall.result || toolCall.resultPreview)
+  const session = asRecord(result?.session)
+  const primary = toolCall.presentation?.argumentDisplay === 'primary'
+    ? toolCall.presentation.primaryArguments : null
+  const value = (record: Record<string, unknown> | null, key: string): string => {
+    const field = record?.[key]
+    return typeof field === 'string' ? field.trim() : ''
+  }
+  // A server-declared primary-only projection must remain primary-only.
+  const command = !primary
+    ? value(session, 'command') || value(result, 'command') || value(input, 'command')
+    : primary.includes('command') ? value(input, 'command') : ''
+  if (command) return truncateToolText(command.replace(/\s+/g, ' '), 110)
+  for (const key of ['execution_id', 'session_id', 'sessionId']) {
+    if (primary && !primary.includes(key)) continue
+    const target = value(input, key) || (!primary ? value(result, key) || value(session, key) : '')
+    if (target) return truncateToolText(target, 86)
+  }
+  if ((!primary || primary.includes('execution_ids')) && Array.isArray(input?.execution_ids)) {
+    return truncateToolText(input.execution_ids.filter(id => typeof id === 'string').join(' · '), 86)
+  }
+  return ''
+}
+
 export function toolOperationKey(name: string): string {
   const n = String(name || '').toLowerCase()
+  if (isToolResultRetrieval(n)) return 'tool.retrieve.tool.result'
   if (n.includes('web_discover')) return 'web.discover'
   if (n.includes('web_search') || n === 'search' || n.includes('google') || n.includes('bing')) return 'web.search'
   if (n.includes('web_fetch') || n.includes('http') || n.includes('fetch') || n.includes('curl') || n.includes('wget')) return 'web.read'
@@ -218,9 +298,27 @@ export function toolOperationKey(name: string): string {
   return `tool.${n.replace(/[^a-z0-9]+/g, '.') || 'unknown'}`
 }
 
-export function toolActionLabel(name: string): string {
+/** Unknown tools use a neutral translated action; their identifier stays verbatim. */
+export function isGenericTool(name: string): boolean {
+  const normalized = String(name || '').toLowerCase()
+  return !REGISTERED_TOOL_ACTIONS.has(normalized)
+    && !isProcessTool(name)
+    && !isToolResultRetrieval(name)
+    && !isLegacyDocumentTool(name)
+    && toolOperationKey(name).startsWith('tool.')
+}
+
+export function toolActionLabel(name: string, input?: unknown): string {
   const key = toolOperationKey(name)
   const t = i18n.global.t
+  const registeredAction = REGISTERED_TOOL_ACTIONS.get(String(name || '').toLowerCase())
+  if (registeredAction) return t(`chat.tool.${registeredAction.label}`)
+  if (isToolResultRetrieval(name)) return t('chat.tool.retrieveToolResult')
+  if (isProcessTool(name)) {
+    const action = parseToolInput(input)?.action
+    const label = typeof action === 'string' ? PROCESS_ACTION_LABELS[action] : undefined
+    return t(`chat.tool.${label || 'manageBackgroundCommand'}`)
+  }
   if (key === 'web.discover') return t('chat.tool.discoverLinks')
   if (key === 'web.search') return t('chat.tool.searchWeb')
   if (key === 'web.read') return t('chat.tool.readWebPage')
@@ -231,11 +329,16 @@ export function toolActionLabel(name: string): string {
   if (key === 'file.edit') return t('chat.tool.editFile')
   if (key === 'artifact.create') return t('chat.tool.createFile')
   if (key === 'memory.search') return t('chat.tool.searchMemory')
-  return name.replace(/[_-]+/g, ' ')
+  return t('chat.tool.genericCall')
 }
 
 export function toolSecondaryText(toolCall: ChatToolCall): string {
   if (isLegacyDocumentTool(toolCall.name)) return ''
+  if (isGenericTool(toolCall.name)) return toolCall.name || ''
+  if (isProcessTool(toolCall.name)) return processToolTarget(toolCall)
+  // Retrieval handles and slice/query parameters do not identify the original
+  // file or web page. Keep them in the invocation detail, not the row summary.
+  if (isToolResultRetrieval(toolCall.name)) return ''
   const operation = toolOperationKey(toolCall.name)
   if (operation === 'web.search' || operation === 'web.discover') return ''
   if (toolCall.presentation?.argumentDisplay === 'primary') {
@@ -292,6 +395,10 @@ export function toolCallGroups(calls: ChatToolCall[] | undefined, ownerKey: stri
   })
 
   groups.forEach(group => {
+    if (group.calls.length === 1 && isProcessTool(group.calls[0].name)) {
+      const call = group.calls[0]
+      group.label = toolActionLabel(call.name, call.inputRaw || call.inputPreview)
+    }
     group.isRunning = group.calls.some(tc => tc.isRunning)
     group.isError = group.calls.some(tc => tc.isError || tc.status === 'error')
     group.status = group.isError ? 'error' : (group.calls.every(tc => tc.status === 'success') ? 'success' : '')

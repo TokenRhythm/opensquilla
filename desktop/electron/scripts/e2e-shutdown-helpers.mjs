@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { terminateOwnedPosixProcessGroup } from './e2e-posix-process-group.mjs'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
 import {
   desktopGatewayStartIdentityConflict,
@@ -40,11 +41,11 @@ function timeoutError(label, timeoutMs) {
   return error
 }
 
-async function withDeadline(operation, label, timeoutMs) {
+export async function withDeadline(operation, label, timeoutMs) {
   const controller = new AbortController()
   try {
     return await Promise.race([
-      Promise.resolve().then(operation),
+      Promise.resolve().then(() => operation(controller.signal)),
       delay(timeoutMs, undefined, { signal: controller.signal }).then(() => {
         throw timeoutError(label, timeoutMs)
       }),
@@ -161,7 +162,136 @@ function childHasExited(child) {
   return child.exitCode !== null || child.signalCode !== null
 }
 
-async function forceElectronProcessExit(child, phase, emit) {
+// Keep Playwright's main-process connection until the real dialog has accepted
+// the click; app.close() closes that connection after app.quit(). Fixtures that
+// intentionally leave activity unknown require the dialog by default. Isolated
+// profile cleanup may also accept the ordinary idle exit without a dialog.
+export async function requestElectronQuitWithConfirmation(app, {
+  signal, timeoutMs, requireConfirmation = true,
+}) {
+  const child = app.process()
+  const deadline = Date.now() + timeoutMs
+  const remainingMs = () => Math.max(1, deadline - Date.now())
+  let acceptWindow
+  let acceptExit
+  let rejectFailure
+  let confirmationClicked = false
+  let confirmationSeen = false
+  const windowReady = new Promise(resolve => { acceptWindow = resolve })
+  const exited = new Promise(resolve => { acceptExit = resolve })
+  const failed = new Promise((_, reject) => { rejectFailure = reject })
+  // An abort/exit may arrive while Playwright is still dispatching app.quit().
+  // Keep that failure observed until the current operation races it below.
+  void failed.catch(() => {})
+  const onWindow = page => {
+    confirmationSeen = true
+    acceptWindow(page)
+  }
+  const onExit = () => {
+    if (confirmationClicked || (!requireConfirmation && !confirmationSeen)) acceptExit()
+    else rejectFailure(new Error('Electron exited before the expected quit confirmation'))
+  }
+  const onAbort = () => rejectFailure(timeoutError('Expected quit confirmation', timeoutMs))
+  // A recorded exit/abort failure wins even if a mock or queued operation has
+  // already completed; do not accept a dialog after the process has exited.
+  const wait = operation => Promise.race([failed, operation])
+  app.on('window', onWindow)
+  child.on('exit', onExit)
+  signal.addEventListener('abort', onAbort, { once: true })
+  try {
+    if (childHasExited(child)) {
+      throw new Error('Electron exited before the expected quit confirmation')
+    }
+    if (signal.aborted) throw timeoutError('Expected quit confirmation', timeoutMs)
+    const requested = app.evaluate(({ app }) => app.quit())
+    await wait(requireConfirmation ? requested : Promise.race([requested, exited]))
+    const page = await wait(requireConfirmation
+      ? windowReady
+      : Promise.race([windowReady, exited.then(() => null)]))
+    if (page === null) return
+    await wait(page.locator('[role="dialog"]').waitFor({
+      state: 'visible', timeout: remainingMs(),
+    }))
+    if (!page.url().startsWith('data:text/html;charset=utf-8,')) {
+      throw new Error('Expected the self-contained Desktop quit confirmation')
+    }
+    await wait(page.locator('#keep').waitFor({ state: 'visible', timeout: remainingMs() }))
+    confirmationClicked = true
+    await wait(page.locator('#confirm').click({ timeout: remainingMs(), noWaitAfter: true }))
+    if (childHasExited(child)) acceptExit()
+    await wait(exited)
+  } finally {
+    app.off('window', onWindow)
+    child.off('exit', onExit)
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+function observeElectronShutdown(app) {
+  const startedAt = performance.now()
+  const events = []
+  const listeners = []
+  let child = null
+  let childError = null
+  try { child = app.process() } catch (error) { childError = error?.message || String(error) }
+  const state = () => {
+    if (!child) return { diagnosticError: childError || 'Electron child process is unavailable.' }
+    let pidPresent = null
+    if (Number.isSafeInteger(child.pid) && child.pid > 0) {
+      try { process.kill(child.pid, 0); pidPresent = true }
+      catch (error) { if (error?.code === 'ESRCH') pidPresent = false }
+    }
+    return {
+      pid: child.pid ?? null,
+      exitCode: child.exitCode ?? null,
+      signalCode: child.signalCode ?? null,
+      killed: child.killed ?? false,
+      // A PID probe is diagnostic only; absence never proves tree cleanup.
+      pidPresent,
+      stdio: Object.fromEntries(['stdin', 'stdout', 'stderr'].map(name => [name,
+        child[name] ? {
+          destroyed: child[name].destroyed,
+          readableEnded: child[name].readableEnded,
+          writableFinished: child[name].writableFinished,
+        } : null,
+      ])),
+    }
+  }
+  const record = (event, details = {}) => {
+    // These are one-shot lifecycle observations, never stdout or stderr data.
+    if (events.length < 32) events.push({
+      event, at: new Date().toISOString(), elapsedMs: performance.now() - startedAt, ...details,
+    })
+  }
+  const listen = (target, event, listener) => {
+    if (!target?.once) return
+    target.once(event, listener)
+    listeners.push(() => target.removeListener(event, listener))
+  }
+  listen(child, 'exit', (code, signal) => record('child-exit', { code, signal }))
+  listen(child, 'close', (code, signal) => record('child-close', { code, signal }))
+  for (const name of ['stdin', 'stdout', 'stderr']) {
+    for (const event of name === 'stdin' ? ['finish', 'close'] : ['end', 'close']) {
+      listen(child?.[name], event, () => record(`${name}-${event}`))
+    }
+  }
+  record('close-start', { process: state() })
+  return {
+    child,
+    state,
+    record,
+    snapshot: () => ({ process: state(), events: [...events] }),
+    dispose: () => { for (const remove of listeners) remove() },
+  }
+}
+
+async function forceElectronProcessExit(child, phase, emit, observation) {
+  observation.record('force-start', { process: observation.state() })
+  if (process.platform !== 'win32') {
+    return terminateOwnedPosixProcessGroup(child, {
+      timeoutMs: FORCED_PROCESS_EXIT_TIMEOUT_MS,
+    })
+  }
   if (childHasExited(child)) {
     const processTreeReaped = process.platform !== 'win32'
     return {
@@ -180,12 +310,16 @@ async function forceElectronProcessExit(child, phase, emit) {
       fallback: () => {
         if (!childHasExited(child)) child.kill('SIGKILL')
       },
-      onFailure: failure => emit(JSON.stringify({
-        event: 'desktop_e2e_process_tree_termination_failed',
-        phase,
-        ...failure,
-      })),
+      onFailure: failure => {
+        observation.record('tree-termination-failed', { ...failure, process: observation.state() })
+        emit(JSON.stringify({
+          event: 'desktop_e2e_process_tree_termination_failed',
+          phase,
+          ...failure,
+        }))
+      },
     })
+    observation.record('tree-termination-result', { processTreeReaped })
   } else {
     try {
       child.kill('SIGKILL')
@@ -214,13 +348,30 @@ async function forceElectronProcessExit(child, phase, emit) {
 export async function closeElectronWithDeadline({
   app,
   phase,
+  requestClose = () => app.close(),
   diagnostics,
   emit = line => console.error(line),
   timeoutMs = 15_000,
   diagnosticTimeoutMs = 3_000,
 }) {
+  // Playwright's Windows process() is the shell wrapper. Its close protocol
+  // waits for child 'close' (including stdio), not just the OS process 'exit'.
+  // Capture the owned handle and events before close can dispose its dispatcher.
+  const observation = observeElectronShutdown(app)
   try {
-    await withDeadline(() => app.close(), `${phase} Electron shutdown`, timeoutMs)
+    await withDeadline(
+      signal => requestClose({ signal, timeoutMs }), `${phase} Electron shutdown`, timeoutMs,
+    )
+    const child = observation.child
+    if (!child || !Number.isSafeInteger(child.pid) || child.pid <= 0
+      || child.exitCode !== 0 || child.signalCode !== null) {
+      const error = new Error(`${phase} Electron close resolved without a clean process exit: `
+        + `exitCode=${child?.exitCode ?? 'unknown'} signal=${child?.signalCode ?? 'none'}`)
+      error.code = child && Number.isSafeInteger(child.pid) && child.pid > 0
+        && ((Number.isInteger(child.exitCode) && child.exitCode !== 0) || typeof child.signalCode === 'string')
+        ? 'DESKTOP_E2E_ABNORMAL_EXIT' : 'DESKTOP_E2E_UNVERIFIED_EXIT'
+      throw error
+    }
     return {
       closed: true,
       error: null,
@@ -229,21 +380,11 @@ export async function closeElectronWithDeadline({
       processTreeReaped: false,
     }
   } catch (cause) {
+    observation.record('close-failed', { process: observation.state() })
     const snapshot = await boundedDiagnostics(diagnostics, diagnosticTimeoutMs)
-    let child = null
-    const processState = (() => {
-      try {
-        child = app.process()
-        return {
-          pid: child?.pid ?? null,
-          exitCode: child?.exitCode ?? null,
-          signalCode: child?.signalCode ?? null,
-          killed: child?.killed ?? false,
-        }
-      } catch (error) {
-        return { diagnosticError: error?.message || String(error) }
-      }
-    })()
+    observation.record('diagnostics-complete', { process: observation.state() })
+    const child = observation.child
+    const { pidPresent: _pidPresent, stdio: _stdio, ...processState } = observation.state()
     const detail = {
       event: 'desktop_e2e_electron_shutdown_failed',
       phase,
@@ -251,18 +392,31 @@ export async function closeElectronWithDeadline({
       error: cause?.stack || cause?.message || String(cause),
       process: processState,
       diagnostics: snapshot,
+      shutdownObservation: observation.snapshot(),
     }
     emit(JSON.stringify(detail))
-    const forcedExit = child
-      ? await forceElectronProcessExit(child, phase, emit)
+    const forceNeeded = child && Number.isSafeInteger(child.pid) && child.pid > 0 && !childHasExited(child)
+    const forcedExit = forceNeeded
+      ? await forceElectronProcessExit(child, phase, emit, observation)
       : {
-          error: new Error('Electron child process was unavailable for forced shutdown.'),
+          error: null,
           processTreeReaped: false,
         }
+    const forcedExitSucceeded = Boolean(forceNeeded && forcedExit.error === null)
+    observation.record('cleanup-complete', { process: observation.state() })
+    emit(JSON.stringify({
+      event: 'desktop_e2e_electron_shutdown_cleanup',
+      phase,
+      forcedExitSucceeded,
+      cleanupSkipped: forceNeeded ? null : child && childHasExited(child) ? 'already-exited' : 'unverified-child',
+      processTreeReaped: forcedExit.processTreeReaped,
+      error: forcedExit.error?.message || null,
+      shutdownObservation: observation.snapshot(),
+    }))
     const error = new Error(
       `DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED: phase=${phase} `
       + `cause=${cause?.message || String(cause)} `
-      + `forcedExit=${forcedExit.error?.message || 'ok'} `
+      + `forcedExit=${forceNeeded ? forcedExit.error?.message || 'ok' : 'not-attempted'} `
       + `diagnostics=${JSON.stringify(snapshot)}`,
       { cause },
     )
@@ -270,8 +424,11 @@ export async function closeElectronWithDeadline({
       closed: false,
       error,
       closeErrorCode: typeof cause?.code === 'string' ? cause.code : null,
-      forcedExitSucceeded: child !== null && forcedExit.error === null,
+      forcedExitSucceeded,
       processTreeReaped: forcedExit.processTreeReaped,
+      shutdownObservation: observation.snapshot(),
     }
+  } finally {
+    observation.dispose()
   }
 }

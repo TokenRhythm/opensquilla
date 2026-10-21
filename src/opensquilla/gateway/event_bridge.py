@@ -26,8 +26,8 @@ def bridge_event_name(event: AgentEvent) -> str:
     """Return the canonical ``session.event.*`` name for an engine event.
 
     Derives the name from the event's ``kind`` discriminator (e.g. a
-    :class:`~opensquilla.engine.types.MetaStepStateEvent` whose ``kind`` is
-    ``"meta_step_state"`` maps to ``"session.event.meta_step_state"``).
+    :class:`~opensquilla.engine.types.TextDeltaEvent` whose ``kind`` is
+    ``"text_delta"`` maps to ``"session.event.text_delta"``).
 
     This single derivation point lets new event types (engine dataclasses
     in :mod:`opensquilla.engine.types`) flow through to WebSocket

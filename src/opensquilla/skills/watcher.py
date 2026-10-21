@@ -99,8 +99,10 @@ class SkillCatalogWatcher:
         if awatch is None:
             return
         while not stop_event.is_set():
-            roots = self._roots()
-            existing_roots = tuple(root for root in roots if root.is_dir())
+            # Catalog access may wait for the loader's filesystem refresh lock.
+            roots = await self._roots_async()
+            # Root probes may reach network drives; keep them off the event loop.
+            existing_roots = await asyncio.to_thread(_existing_roots, roots)
             if not existing_roots:
                 self._polling = True
                 await self._poll_once(stop_event)
@@ -121,14 +123,18 @@ class SkillCatalogWatcher:
                 ):
                     if stop_event.is_set():
                         return
-                    current_roots = self._roots()
+                    current_roots = await self._roots_async()
                     roots_changed = current_roots != roots
-                    presence_changed = _root_presence(current_roots) != _root_presence(roots)
+                    current_presence, initial_presence = await asyncio.gather(
+                        asyncio.to_thread(_root_presence, current_roots),
+                        asyncio.to_thread(_root_presence, roots),
+                    )
+                    presence_changed = current_presence != initial_presence
                     if roots_changed or presence_changed:
-                        self._loader.mark_dirty("watch.roots")
+                        await self._mark_dirty("watch.roots")
                         break
                     if changes:
-                        self._loader.mark_dirty("watch")
+                        await self._mark_dirty("watch")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -144,18 +150,25 @@ class SkillCatalogWatcher:
                 continue
 
     async def _poll_once(self, stop_event: asyncio.Event) -> None:
-        roots = self._roots()
+        roots = await self._roots_async()
         signature = await asyncio.to_thread(_root_signature, roots)
         if self._poll_signature is None:
             self._poll_signature = signature
         elif signature != self._poll_signature:
             self._poll_signature = signature
-            self._loader.mark_dirty("poll")
-        if roots != self._roots():
-            self._loader.mark_dirty("poll.roots")
+            await self._mark_dirty("poll")
+        current_roots = await self._roots_async()
+        if roots != current_roots:
+            await self._mark_dirty("poll.roots")
         await asyncio.sleep(0)
         if stop_event.is_set():
             return
+
+    async def _roots_async(self) -> tuple[Path, ...]:
+        return await asyncio.to_thread(self._roots)
+
+    async def _mark_dirty(self, reason: str) -> None:
+        await asyncio.to_thread(self._loader.mark_dirty, reason)
 
     def _roots(self) -> tuple[Path, ...]:
         roots = getattr(self._loader, "watch_roots", None)
@@ -205,6 +218,11 @@ def _root_signature(roots: Iterable[Path]) -> tuple[tuple[str, int, int, int], .
                     )
                 )
     return tuple(entries)
+
+
+def _existing_roots(roots: Iterable[Path]) -> tuple[Path, ...]:
+    """Return directory roots without probing them on the event-loop thread."""
+    return tuple(root for root in roots if root.is_dir())
 
 
 def _root_presence(roots: Iterable[Path]) -> tuple[bool, ...]:

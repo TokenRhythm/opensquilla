@@ -33,6 +33,7 @@ from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdo
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
@@ -254,6 +255,7 @@ async def resource_env(tmp_path: Path):
         state_dir=str(tmp_path / "state"),
         config_path=None,
         workspace_dir=str(tmp_path / "workspace"),
+        sandbox=SandboxSettings(),
     )
     ctx = RpcContext(
         conn_id="workbench-resource-test",
@@ -275,6 +277,165 @@ async def resource_env(tmp_path: Path):
 
 async def _dispatch(env, method: str, params: dict[str, object]):
     return await get_dispatcher().dispatch(f"test:{method}", method, params, env.ctx)
+
+
+@pytest.mark.asyncio
+async def test_resource_source_paths_distinguish_same_names_without_read_side_writes(
+    resource_env,
+) -> None:
+    env = resource_env
+    workspace = Path(env.config.workspace_dir)
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    documents = []
+    for directory in ("original", "copy"):
+        folder = workspace / directory
+        folder.mkdir(parents=True)
+        payload = f"<h1>{directory}</h1>".encode()
+        (folder / "report.html").write_bytes(payload)
+        ref = env.store.publish_bytes(
+            payload, session_id=env.session.session_id, session_key=SESSION_KEY,
+            name="report.html", mime="text/html", source="source-path-test",
+        )
+        adopted = await resource_rpc.adopt_generated_deliverable_if_editable(
+            service=service, store=env.store, session_key=SESSION_KEY,
+            session_id=env.session.session_id, ref=ref,
+            working_source={
+                "workspace": str(workspace), "source_path": f"{directory}/report.html",
+                "relative_root": directory, "entrypoint": "report.html",
+                "bundle_mode": "none", "bundle_root": "",
+            },
+        )
+        assert adopted is not None
+        documents.append((adopted[0].document_id, ref.id, f"{directory}/report.html"))
+    changes_before = await _sqlite_total_changes(env.storage)
+
+    listed = await _dispatch(env, "workbench.resources.list", {"sessionKey": SESSION_KEY})
+    assert listed.error is None, listed.error
+    assert sorted(item["sourcePath"] for item in listed.payload["resources"]) == [
+        "copy/report.html", "copy/report.html", "original/report.html", "original/report.html",
+    ]
+    for document_id, artifact_id, relative in documents:
+        for ref in (
+            {"type": "document", "documentId": document_id},
+            {"type": "deliverable", "artifactId": artifact_id},
+        ):
+            fetched = await _dispatch(env, "workbench.resources.get", {
+                "sessionKey": SESSION_KEY, "resourceRef": ref,
+            })
+            assert fetched.error is None, fetched.error
+            assert fetched.payload["resource"]["sourcePath"] == relative
+    assert await _sqlite_total_changes(env.storage) == changes_before
+
+    # Changing the current workspace or its read policy must not disclose old
+    # host bindings, even though immutable artifact previews remain available.
+    env.config.sandbox = SandboxSettings(denied_read_globs=["**/copy/**"])
+    denied = await _dispatch(env, "workbench.resources.list", {"sessionKey": SESSION_KEY})
+    assert denied.error is None, denied.error
+    for item in denied.payload["resources"]:
+        if item["relations"]["documentId"] == documents[1][0]:
+            assert "sourcePath" not in item
+    elsewhere = workspace.parent / "elsewhere"
+    elsewhere.mkdir()
+    env.config.workspace_dir = str(elsewhere)
+    moved = await _dispatch(env, "workbench.resources.list", {"sessionKey": SESSION_KEY})
+    assert moved.error is None, moved.error
+    assert all("sourcePath" not in item for item in moved.payload["resources"])
+    assert await _sqlite_total_changes(env.storage) == changes_before
+
+
+@pytest.mark.asyncio
+async def test_fork_history_preview_opens_own_copy_without_rewriting_transcript(resource_env):
+    env = resource_env
+    workspace = Path(env.config.workspace_dir)
+    workspace.mkdir()
+    (workspace / "game.html").write_text("<h1>Inherited game</h1>", encoding="utf-8")
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    adopter = GeneratedArtifactAdopter(
+        service=service, store=env.store, session_key=SESSION_KEY,
+        session_id=env.session.session_id, workspace=str(workspace),
+    )
+    context = ToolContext(
+        is_owner=True, session_key=SESSION_KEY, session_id=env.session.session_id,
+        workspace_dir=str(workspace),
+    )
+    token = current_tool_context.set(context)
+    try:
+        registered = await adopter.open_workspace_preview(context, path="game.html", bundle="none")
+    finally:
+        current_tool_context.reset(token)
+    segments = [
+        {"type": "tool_use", "name": "open_workspace_preview", "id": "preview-call",
+         "input": {"path": "game.html"}},
+        {"type": "tool_result", "name": "open_workspace_preview", "tool_use_id": "preview-call",
+         "result": json.dumps(registered), "is_error": False},
+    ]
+    # Failed, malformed and unrelated actions must not acquire a document alias.
+    invalid_results = [
+        {**registered, "error": "failed"},
+        {**registered, "previewStatus": "failed"},
+        {**registered, "resourceId": "document:doc_unrelated"},
+        {**registered, "open": {"resourceId": "document:doc_unrelated"}},
+        {**registered, "documentId": "doc_unknown", "resourceId": "document:doc_unknown",
+         "open": {"resourceId": "document:doc_unknown"}},
+    ]
+    for index, result in enumerate(invalid_results):
+        segments.extend([
+            {**segments[0], "id": f"invalid-{index}"},
+            {**segments[1], "tool_use_id": f"invalid-{index}", "result": json.dumps(result)},
+        ])
+    await env.manager.append_message(
+        SESSION_KEY, "assistant", "Preview: game.html", tool_calls=segments,
+    )
+    child_key = "agent:main:webchat:preview-fork"
+    child = await env.manager.branch(SESSION_KEY, child_key, fork_transcript=True)
+    child_documents = await service.list_documents(
+        session_key=child_key, session_id=child.session_id,
+    )
+    assert len(child_documents) == 1
+    child_document = child_documents[0]
+    assert child_document.document_id != registered["documentId"]
+
+    # This is a read-time projection: an already-created fork is repaired without
+    # rewriting its model history or changing the parent's source identity.
+    parent_history = await _dispatch(env, "chat.history", {"sessionKey": SESSION_KEY})
+    history = await _dispatch(env, "chat.history", {"sessionKey": child_key})
+    assert parent_history.error is None, parent_history.error
+    assert history.error is None, history.error
+    assert parent_history.payload["messages"][0]["tool_calls"] == segments
+    projected_segments = history.payload["messages"][0]["tool_calls"]
+    projected = json.loads(projected_segments[1]["result"])
+    assert projected["documentId"] == child_document.document_id
+    assert projected["revisionId"] == child_document.head_revision_id
+    assert projected["resourceId"] == f"document:{child_document.document_id}"
+    assert projected["open"]["resourceId"] == projected["resourceId"]
+    assert projected["entrypoint"] == registered["entrypoint"]
+    assert projected_segments[2:] == segments[2:]
+    stored = await env.manager.get_transcript(child_key)
+    assert stored[0].tool_calls == segments
+
+    for method in ("workbench.resources.get", "workbench.resources.open"):
+        rejected = await _dispatch(env, method, {
+            "sessionKey": child_key,
+            "resourceRef": {"type": "document", "documentId": registered["documentId"]},
+        })
+        assert rejected.error is not None
+        assert rejected.error.code == "DOCUMENT_UNAVAILABLE"
+        opened = await _dispatch(env, method, {
+            "sessionKey": child_key,
+            "resourceRef": {"type": "document", "documentId": projected["documentId"]},
+        })
+        assert opened.error is None, opened.error
+        if method.endswith(".open"):
+            assert opened.payload["document"]["id"] == child_document.document_id
+        else:
+            assert (
+                opened.payload["resource"]["resource"]["documentId"] == child_document.document_id
+            )
+    source = await _dispatch(env, "artifacts.source.read", {
+        "sessionKey": child_key, "documentId": projected["documentId"],
+    })
+    assert source.error is None, source.error
+    await service.close()
 
 
 @pytest.mark.parametrize("bundle_mode", ["directory", "none"])
@@ -566,6 +727,77 @@ async def test_generated_artifact_adopter_emits_once_after_atomic_adoption(
             "action": "document.created",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_show_widget_document_is_recoverable_but_hidden_from_files_inventory(
+    resource_env,
+) -> None:
+    env = resource_env
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    ref = env.store.publish_bytes(
+        b"<button>inline widget</button>",
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="capacity-1234abcd.html",
+        mime="text/html",
+        source="show-widget",
+        visibility="internal",
+    )
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        name=ref.name,
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=ref.id,
+            sha256=ref.sha256,
+            filename=ref.name,
+            media_type=ref.mime,
+            byte_size=ref.size,
+        ),
+        actor=Actor(ActorKind.SYSTEM, "visualize"),
+    )
+    await service.close()
+
+    listed = await _dispatch(
+        env,
+        "workbench.resources.list",
+        {"sessionKey": SESSION_KEY, "types": ["document"]},
+    )
+    assert listed.error is None, listed.error
+    assert listed.payload["resources"] == []
+    assert listed.payload["totalCount"] == 0
+
+    recovered = await _dispatch(
+        env,
+        "workbench.resources.get",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "document", "id": created.document.document_id},
+        },
+    )
+    assert recovered.error is None, recovered.error
+    assert recovered.payload["resource"]["source"] == "show-widget"
+    assert recovered.payload["resource"]["visibility"] == "internal"
+    assert recovered.payload["resource"]["presentation"] == "inline"
+    assert recovered.payload["resource"]["capabilities"]["agentEdit"] is False
+    assert recovered.payload["resource"]["capabilities"]["edit"] is False
+    assert recovered.payload["resource"]["capabilities"]["publish"] is False
+
+    opened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "document", "id": created.document.document_id},
+            "intent": "edit-current",
+        },
+    )
+    assert opened.error is None, opened.error
+    assert opened.payload["disposition"] == "readonly"
+    assert opened.payload["reasonCode"] == "visualize_internal"
+    assert "workingFile" not in opened.payload
 
 
 @pytest.mark.asyncio
@@ -1639,7 +1871,7 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     assert capabilities["agentEdit"] is False
     assert capabilities["edit"] is False
     assert capabilities["publish"] is False
-    assert capabilities["editReasonCode"] == "office_adapter_not_available"
+    assert capabilities["editReasonCode"] == "office_not_zip"
 
     forged_import = await _dispatch(
         env,
@@ -1654,7 +1886,7 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     )
     assert forged_import.error is not None
     assert forged_import.error.code == "RESOURCE_UNSUPPORTED"
-    assert forged_import.error.details == {"reasonCode": "office_adapter_not_available"}
+    assert forged_import.error.details == {"reasonCode": "office_not_zip"}
     service = await ArtifactSessionService.from_session_storage(env.storage)
     assert (
         await service.list_documents(
@@ -1721,7 +1953,7 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     )
     assert rejected_publish.error is not None
     assert rejected_publish.error.code == "RESOURCE_UNSUPPORTED"
-    assert rejected_publish.error.details == {"reasonCode": "office_adapter_not_available"}
+    assert rejected_publish.error.details == {"reasonCode": "office_not_zip"}
     assert (
         await service.list_document_publications(
             session_id=env.session.session_id,

@@ -610,11 +610,55 @@ async def test_wecom_sdk_empty_target_does_not_read_file(tmp_path: Path) -> None
         await channel.send_file("", str(tmp_path / "absent.csv"))
 
 
-async def test_wecom_corp_artifact_has_one_contextual_outbox_record(tmp_path: Path) -> None:
+async def test_wecom_cancel_joins_native_reader_before_temporary_material_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    path = tmp_path / "page.zip"
+    path.write_bytes(b"PK fixed bundle")
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original_open = Path.open
+
+    def delayed_open(self, *args, **kwargs):
+        if self == path:
+            started.set()
+            if not release.wait(10):
+                raise TimeoutError("test reader was not released")
+            assert self.exists()
+            finished.set()
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", delayed_open)
+    sdk = SimpleNamespace(upload_media=AsyncMock())
+    channel = WeComChannel(WeComChannelConfig(connection_mode="websocket"))
+    channel._ws_sdk = sdk
+    channel._connected = True
+    task = asyncio.create_task(channel._send_sdk_file("chat", str(path)))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not finished.is_set()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert finished.is_set()
+    sdk.upload_media.assert_not_called()
+
+
+async def test_wecom_corp_artifact_has_one_contextual_outbox_record(
+    channel_store, tmp_path: Path
+) -> None:
     import sqlite3
     from unittest.mock import AsyncMock
 
-    from opensquilla.channels.delivery_store import ChannelDeliveryStore, install_outbox
+    from opensquilla.channels.delivery_store import install_outbox
 
     file_path = tmp_path / "report.txt"
     file_path.write_text("report", encoding="utf-8")
@@ -642,7 +686,7 @@ async def test_wecom_corp_artifact_has_one_contextual_outbox_record(tmp_path: Pa
     channel._client = Client()  # type: ignore[assignment]
     channel._get_token = AsyncMock(return_value="synthetic-token")  # type: ignore[method-assign]
     db_path = tmp_path / "outbox.sqlite"
-    store = ChannelDeliveryStore(db_path)
+    store = await channel_store(db_path)
     channel._delivery_store = store
     channel._delivery_channel_name = "wecom-test"
     install_outbox(channel)
@@ -663,4 +707,4 @@ async def test_wecom_corp_artifact_has_one_contextual_outbox_record(tmp_path: Pa
         assert len(records) == 1
         assert str(tmp_path) not in records[0][0]
     finally:
-        store.close()
+        (await store.close())

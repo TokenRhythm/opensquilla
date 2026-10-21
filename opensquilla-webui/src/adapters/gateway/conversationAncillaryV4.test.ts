@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from 'vitest'
 import { createV4ClarificationSubmission } from './clarificationSubmissionV4'
 import { createV4CommandCatalog } from './commandCatalogV4'
 import { createV4PromptCacheLease } from './promptCacheLeaseV4'
-import { createV4RouteFeedback } from './routeFeedbackV4'
 import { createV4UsageReporting } from './usageReportingV4'
 
 function transport() {
@@ -14,7 +13,6 @@ function transport() {
     if (method === 'commands.list_for_surface') {
       return { surface: 'web_chat', commands: [] } as T
     }
-    if (method === 'router.feedback.submit') return { accepted: true, recorded: 'up' } as T
     if (method.startsWith('sessions.promptCacheKeepalive.')) {
       return {
         enabled: true,
@@ -37,16 +35,13 @@ function transport() {
 }
 
 describe('conversation ancillary v4 adapters', () => {
-  it('maps all eight generated contract methods to narrow domain interfaces', async () => {
+  it('maps all seven generated contract methods to narrow domain interfaces', async () => {
     const rpc = transport()
     const usage = createV4UsageReporting(
       rpc as Parameters<typeof createV4UsageReporting>[0],
     )
     const commands = createV4CommandCatalog(
       rpc as Parameters<typeof createV4CommandCatalog>[0],
-    )
-    const feedback = createV4RouteFeedback(
-      rpc as Parameters<typeof createV4RouteFeedback>[0],
     )
     const promptCache = createV4PromptCacheLease(
       rpc as Parameters<typeof createV4PromptCacheLease>[0],
@@ -59,7 +54,6 @@ describe('conversation ancillary v4 adapters', () => {
     await usage.snapshot('all', { timezone: 'UTC' })
     await usage.costBreakdown()
     await commands.list('web_chat')
-    await feedback.submit('decision-1', 'up')
     await promptCache.status('agent:main:webchat:test')
     await promptCache.setPolicy({
       key: 'agent:main:webchat:test',
@@ -71,7 +65,6 @@ describe('conversation ancillary v4 adapters', () => {
       sessionKey: 'agent:main:webchat:test',
       fields: { scope: 'complete' },
       requestId: 'request-1',
-      runId: 'run-1',
     })
 
     expect(rpc.request.mock.calls.map(call => call[0])).toEqual([
@@ -79,7 +72,6 @@ describe('conversation ancillary v4 adapters', () => {
       'usage.query',
       'usage.cost',
       'commands.list_for_surface',
-      'router.feedback.submit',
       'sessions.promptCacheKeepalive.status',
       'sessions.promptCacheKeepalive.set',
       'chat.clarify_submit',
@@ -88,7 +80,6 @@ describe('conversation ancillary v4 adapters', () => {
       sessionKey: 'agent:main:webchat:test',
       fields: { scope: 'complete' },
       requestId: 'request-1',
-      run_id: 'run-1',
     })
   })
 

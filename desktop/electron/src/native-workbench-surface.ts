@@ -6,17 +6,24 @@ import {
   MessageChannelMain,
   session,
   shell,
+  webContents,
+  webFrameMain,
   type Certificate,
   type MessagePortMain,
   type Session,
+  type WebContents,
   WebContentsView,
 } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { fileURLToPath } from 'node:url'
+import { placeAnnotationCard, type AnnotationSide } from './annotationPlacement.js'
 import {
   NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT,
   NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_WIDTH,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
+  NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT,
   parseNativeWorkbenchAnnotationGeometry,
   parseNativeWorkbenchAnnotationOverlayMessage,
   parseNativeWorkbenchAnnotationSelection,
@@ -24,13 +31,13 @@ import {
   type NativeWorkbenchAnnotationModeRequest,
   type NativeWorkbenchAnnotationOverlayCloseRequest,
   type NativeWorkbenchAnnotationOverlayShowRequest,
+  type NativeWorkbenchAnnotationOverlayUpdateRequest,
   type NativeWorkbenchAnnotationSelection,
   type NativeWorkbenchAnnotationSelectionCandidate,
 } from './native-workbench-annotation-contract.js'
 import {
   clampNativeWorkbenchSurfaceRect,
   NATIVE_WORKBENCH_ARTIFACT_SCHEME,
-  NATIVE_WORKBENCH_MAX_SURFACES,
   NATIVE_WORKBENCH_PROTOCOL_VERSION,
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
@@ -50,8 +57,21 @@ import {
   type NativeWorkbenchSurfaceRect,
   type NativeWorkbenchSurfaceRectRequest,
 } from './native-workbench-surface-contract.js'
-import { DesktopBrowserError, type DesktopBrowserRequest } from './desktop-browser.js'
+import { DesktopBrowserError, type DesktopBrowserOperation, type DesktopBrowserRequest } from './desktop-browser.js'
+import { BROWSER_BLANK_URL } from './browser-action-contract.js'
+import { BrowserPlaywrightDriver } from './browser-playwright.js'
+import { BrowserPointerController } from './browser-pointer-controller.js'
+import { BrowserManagedDownloads } from './browser-managed-downloads.js'
+import { showBrowserContextMenu } from './browser-context-menu.js'
+import { NativeWorkbenchPdfResourcePolicy } from './native-workbench-pdf-policy.js'
+import { BROWSER_PROMPT_PRELOAD, BrowserPromptController } from './browser-prompt.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import { WorkbenchResourceBudget, WORKBENCH_RESOURCE_LIMITS, type WorkbenchResourceReservation } from './workbench-resource-budget.js'
+
+function releaseReservationAfterDestruction(reservation: WorkbenchResourceReservation, contents?: WebContents): void {
+  if (!contents || contents.isDestroyed()) reservation.release()
+  else contents.once('destroyed', () => reservation.release())
+}
 
 function artifactHtmlCsp(allowRemoteResources: boolean): string {
   const remote = allowRemoteResources ? ' https:' : ''
@@ -75,6 +95,7 @@ function artifactHtmlCsp(allowRemoteResources: boolean): string {
 
 interface NativeWorkbenchSurfaceRecord {
   id: string
+  resourceReservation: WorkbenchResourceReservation
   surfaceInstanceId: string
   version: NativeWorkbenchCreateRequest['version']
   kind: NativeWorkbenchCreateRequest['kind']
@@ -86,9 +107,20 @@ interface NativeWorkbenchSurfaceRecord {
   targetRef: string
   revisionTimer: NodeJS.Timeout | null
   revisionRequest: AbortController | null
+  revisionRequestBackground: boolean
+  revisionCheckQueued: boolean
+  revisionWatching: boolean
+  revisionVisible: boolean
+  revisionEpoch: number
+  revisionKind: 'unknown' | 'working' | 'immutable'
+  revisionLast: string | null
+  /** Conservatively retain document state after potentially mutating interaction. */
+  revisionInteracted: boolean
   owner: BrowserWindow
   previewSession: Session
   view: WebContentsView
+  contents: WebContents
+  webContentsId: number
   requestedRect: NativeWorkbenchSurfaceRect | null
   rect: NativeWorkbenchSurfaceRect | null
   visibleRequested: boolean
@@ -116,10 +148,32 @@ interface NativeWorkbenchSurfaceRecord {
   browserDocumentReady: boolean
   /** A browser-opened page keeps its initial hidden viewport until UI adoption. */
   browserOpenedHidden: boolean
+  openerTargetRef?: string
+  contextTargetRef?: string
+  popupAnnounced?: boolean
+  browserNavigationPromise?: Promise<void>
+  browserNavigationGeneration: number
+  browserNavigationOwner?: { url: string; started: boolean; cancelled: boolean;
+    manualDownload: boolean; downloadAccepted: boolean; acceptDownload(): void; supersede(): void; cancel(): void }
+  browserPreviousDocument?: { url: string; ready: boolean; stopped: boolean;
+    error?: { url: string; code: string; errorCode?: number; message: string } }
+  browserNavigationError?: { url: string; code: string; errorCode?: number; message: string }
+  browserUnresponsive: boolean
+  browserBlockerWaiters: Set<() => void>
   browserViewportReady: Promise<void>
   browserNavigationStopped: boolean
   /** Set by CDP Runtime.exceptionThrown until the next successful navigation. */
   browserRuntimeException: boolean
+  browserFindQuery: string
+  browserFindRequestId: number | null
+  browserClosePromise?: Promise<boolean>
+  browserCloseCancelled?: () => void
+  browserCloseWatchdog?: { pause(): void; resume(): void }
+  browserDownloadAttempt?: string
+  browserDownloadParent?: { targetRef: string; attempt: string }
+  browserCapturedPdfNavigation?: boolean
+  browserDownloadNavigation?: { url: string; generation: number; confirmed?: boolean }
+  browserDownloadedDocument?: { url: string; name: string }
   /** WebRTC guard for an offline preview. */
   offlineRealmGuardInstalled: boolean
   /** CDP id for the offline WebRTC guard. */
@@ -127,6 +181,9 @@ interface NativeWorkbenchSurfaceRecord {
   browserObjectGroup: string | null
   browserAnchors: Map<string, NativeWorkbenchBrowserAnchor>
   browserAnchorGeneration: number
+  playwright?: BrowserPlaywrightDriver
+  prompt?: BrowserPromptController
+  pointer?: BrowserPointerController
   cdpQueue: Promise<void>
   cdpReady: boolean
   debuggerExpectedDetach: boolean
@@ -153,6 +210,9 @@ interface NativeWorkbenchAnnotationOverlayBinding {
   port: MessagePortMain
   record: NativeWorkbenchSurfaceRecord
   selectionId: string
+  editorVersion: 1 | 2
+  contentHeight: number
+  placementSide?: AnnotationSide
 }
 
 interface NativeWorkbenchAnnotationOverlayRecord {
@@ -518,6 +578,41 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
     @media (prefers-reduced-motion: reduce) {
       textarea, button { transition: none; }
     }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg-surface: #FFFFFF; --bg-surface-2: #F0F0F2; --bg-hover: #EAEAED;
+      --text: #1D1D1F; --text-muted: #5F6066; --text-dim: #85868D;
+      --border: #E6E6E9; --border-strong: #D5D5DA;
+      --accent: #BA4D0F; --accent-hover: #A5440C; --accent-foreground: #FFFFFF;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg-surface: #202022; --bg-surface-2: #28282B; --bg-hover: #353539;
+      --text: #F5F5F7; --text-muted: #B0B0B6; --text-dim: #87878E;
+      --border: #303034; --border-strong: #444448;
+      --accent: #F26A1B; --accent-hover: #FF7A2E; --accent-foreground: #160B02;
+    }
+    #annotation-error { margin: 0; color: #D85444; font-size: 11px; overflow-wrap: anywhere; }
+    [hidden] { display: none !important; }
+    :root[data-editor-version="2"] .annotation-card {
+      display: flex; flex-direction: column; gap: 7px; height: auto; min-height: 48px;
+      max-height: 100vh; overflow: auto; padding: 12px 12px 10px 15px;
+      border-radius: 10px; box-shadow: none;
+    }
+    :root[data-editor-version="2"] .annotation-card::before { inset: 12px auto 12px 0; }
+    :root[data-editor-version="2"] .annotation-header { display: none; }
+    :root[data-editor-version="2"] textarea {
+      flex: none; min-height: 20px; max-height: 180px; padding: 0; border: 0;
+      border-radius: 0; background: transparent; line-height: 20px; box-shadow: none;
+    }
+    :root[data-editor-version="2"] footer { flex: none; min-height: 28px; gap: 7px; }
+    :root[data-editor-version="2"] .annotation-card[data-expanded="false"] footer { display: none; }
+    :root[data-editor-version="2"] button { height: 28px; font-size: 11px; font-weight: 500; }
+    :root[data-editor-version="2"] #annotation-cancel { min-width: 0; padding: 0 5px; border: 0; }
+    :root[data-editor-version="2"] #annotation-submit {
+      min-width: 28px; width: 28px; padding: 0; border-radius: 7px; font-size: 19px;
+    }
+    :root[data-editor-version="2"] .annotation-shortcut-hint { line-height: 1.4; white-space: normal; }
   </style>
 </head>
 <body>
@@ -540,6 +635,7 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       <button id="annotation-cancel" type="button">Cancel</button>
       <button id="annotation-submit" type="submit">Add annotation</button>
     </footer>
+    <p id="annotation-error" role="alert" hidden></p>
   </form>
 </body>
 </html>`
@@ -550,6 +646,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
 export interface NativeWorkbenchAnnotationLifecycleDiagnostic {
@@ -620,6 +717,11 @@ export interface NativeWorkbenchSurfaceManagerOptions {
   emit(event: NativeWorkbenchSurfaceEvent): void
   forceArtifactPreviewsOffline?: boolean
   permissionTimeoutMs?: number
+}
+
+export interface NativeWorkbenchBrowserTabsCloseOptions {
+  /** Obtain consent for this exact batch before any native page close. */
+  confirm?(snapshot: { readonly tabCount: number }): boolean | Promise<boolean>
 }
 
 function errorMessage(error: unknown): string {
@@ -761,6 +863,9 @@ const BASIC_AUTH_PROMPT_HTML = `<!doctype html>
  * permission and lifecycle policy is still enforced here in the main process.
  */
 export class NativeWorkbenchSurfaceManager {
+  private readonly resourceBudget = new WorkbenchResourceBudget()
+  private browserTabsClosePromise?: Promise<boolean>
+  private browserTabsCloseApproved?: { record: NativeWorkbenchSurfaceRecord; generation: number; url: string; invalid: boolean }
   private readonly surfaces = new Map<string, NativeWorkbenchSurfaceRecord>()
   private readonly surfaceQueues = new Map<string, Promise<void>>()
   private readonly recordCleanups = new Set<Promise<void>>()
@@ -768,11 +873,48 @@ export class NativeWorkbenchSurfaceManager {
   private readonly hookedWindows = new WeakSet<BrowserWindow>()
   private readonly unresponsiveWindows = new WeakSet<BrowserWindow>()
   private activeSurfaceId: string | null = null
+  private htmlFullscreen: { record: NativeWorkbenchSurfaceRecord; ownerWasFullscreen: boolean } | null = null
+  private readonly browserAutomationStates = new Map<string, { taskId: string; active: boolean }>()
+  private readonly browserDownloads = new BrowserManagedDownloads()
+  private readonly userDownloads = new Map<string, { record: NativeWorkbenchSurfaceRecord; path: string; state: string }>()
+  private readonly pdfPolicies = new WeakMap<Session, NativeWorkbenchPdfResourcePolicy>()
 
   constructor(private readonly options: NativeWorkbenchSurfaceManagerOptions) {}
 
+  async setBrowserAutomationState(payload: unknown): Promise<NativeWorkbenchSurfaceResult> {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return { ok: false, message: 'Invalid browser activity.' }
+    const { sessionKey, taskId, active } = payload as Record<string, unknown>
+    const validId = (value: unknown): value is string => typeof value === 'string'
+      && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value)
+    if (!validId(sessionKey) || !validId(taskId) || typeof active !== 'boolean') return { ok: false, message: 'Invalid browser activity.' }
+    const current = this.browserAutomationStates.get(sessionKey)
+    if (!active && current?.taskId !== taskId) return { ok: true }
+    if (active) this.browserAutomationStates.set(sessionKey, { taskId, active })
+    else this.browserAutomationStates.delete(sessionKey)
+    await Promise.all([...this.surfaces.values()].filter(record => record.scopeId === sessionKey)
+      .map(record => record.pointer?.setTask(active ? taskId : null)))
+    return { ok: true }
+  }
+
+  private async touchBrowserPointer(record: NativeWorkbenchSurfaceRecord): Promise<BrowserPointerController> {
+    record.pointer ??= new BrowserPointerController(record.contents,
+      () => !record.disposed && !record.crashed && record.view.getVisible() && record.owner.isVisible())
+    const activity = this.browserAutomationStates.get(record.scopeId)
+    if (activity) await record.pointer.setTask(activity.active ? activity.taskId : null)
+    await record.pointer.touch()
+    return record.pointer
+  }
+
+  async createSurfaceFromControlUi(request: NativeWorkbenchCreateRequest): Promise<NativeWorkbenchSurfaceResult> {
+    return await this.createSurface(request, false, undefined, undefined, true)
+  }
+
   async createSurface(
     request: NativeWorkbenchCreateRequest,
+    prepareBrowser = false,
+    signal?: AbortSignal,
+    context?: { sessionKey: string; targetRef: string },
+    manualDownload = false,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const pending = this.surfaces.get(request.surfaceId)
     if (pending) {
@@ -783,29 +925,34 @@ export class NativeWorkbenchSurfaceManager {
       pending.annotationPickerEpoch += 1
       this.cancelPendingAuthentication(pending)
     }
-    return await this.queueSurfaceOperation(
-      request.surfaceId,
-      () => this.createSurfaceNow(request),
-    )
+    try {
+      return await this.queueSurfaceOperation(
+        request.surfaceId,
+        () => this.createSurfaceNow(request, prepareBrowser, signal, context, manualDownload),
+      )
+    } catch (error) {
+      if (error instanceof DesktopBrowserError && error.code === 'RESOURCE_LIMIT') {
+        return { ok: false, code: error.code, message: error.message }
+      }
+      throw error
+    }
   }
 
-  private async createSurfaceNow(
-    request: NativeWorkbenchCreateRequest,
-  ): Promise<NativeWorkbenchSurfaceResult> {
-    const previous = this.surfaces.get(request.surfaceId)
-    if (previous) await this.destroyRecord(previous)
-    if (this.surfaces.size >= NATIVE_WORKBENCH_MAX_SURFACES) {
-      return {
-        ok: false,
-        message: `Close a Workbench preview before opening more than ${NATIVE_WORKBENCH_MAX_SURFACES}.`,
-      }
+  private allocateSurface(
+    request: NativeWorkbenchCreateRequest, owner: BrowserWindow,
+    inheritedSession?: Session, inheritedView?: WebContentsView,
+    reserved?: WorkbenchResourceReservation,
+  ): NativeWorkbenchSurfaceRecord {
+    const resourceKind = request.kind === 'url-preview' ? 'browser' : 'preview'
+    const resourceReservation = reserved ?? this.resourceBudget.acquire(resourceKind)
+    if (!resourceReservation) {
+      if (inheritedView && !inheritedView.webContents.isDestroyed()) inheritedView.webContents.close({ waitForBeforeUnload: false })
+      throw new DesktopBrowserError('RESOURCE_LIMIT',
+        `Up to ${WORKBENCH_RESOURCE_LIMITS[resourceKind]} ${resourceKind === 'browser' ? 'browser tabs' : 'interactive previews'} can remain open. Close an existing tab before opening another. Existing pages are preserved.`)
     }
-    const owner = this.options.getWindow()
-    if (!owner || owner.isDestroyed()) {
-      return { ok: false, message: 'The OpenSquilla window is unavailable.' }
-    }
-
-    this.hookWindow(owner)
+    resourceReservation.setPhase('creating')
+    let allocatedView = inheritedView
+    try {
     const isLegacyArtifact = request.kind === 'artifact-html'
     const handle = isLegacyArtifact ? randomUUID() : null
     const documentUrl = isLegacyArtifact
@@ -821,14 +968,29 @@ export class NativeWorkbenchSurfaceManager {
         ? 'offline'
         : request.payload.mode
       : 'full'
-    const previewSession = session.fromPartition(
+    const previewSession = inheritedSession ?? session.fromPartition(
       `${isLegacyArtifact
         ? 'opensquilla-artifact-preview'
         : 'opensquilla-workbench-preview'}:${randomUUID()}`,
       { cache: false },
     )
+    const view = inheritedView ?? new WebContentsView({
+      webPreferences: {
+        contextIsolation: true, nodeIntegration: false, sandbox: true,
+        webSecurity: true, webviewTag: false, disableDialogs: isLegacyArtifact,
+        disableHtmlFullscreenWindowResize: true,
+        ...(isLegacyArtifact ? {} : {
+          devTools: false, navigateOnDragDrop: false, safeDialogs: true,
+          safeDialogsMessage: 'Repeated dialogs were blocked in this temporary preview.', spellcheck: true,
+        }),
+        session: previewSession,
+        ...(request.kind === 'url-preview' ? { preload: BROWSER_PROMPT_PRELOAD } : {}),
+      },
+    })
+    allocatedView = view
     const record: NativeWorkbenchSurfaceRecord = {
       id: request.surfaceId,
+      resourceReservation,
       surfaceInstanceId: randomUUID(),
       version: request.version,
       kind: request.kind,
@@ -840,29 +1002,19 @@ export class NativeWorkbenchSurfaceManager {
       targetRef: `page-${randomUUID()}`,
       revisionTimer: null,
       revisionRequest: null,
+      revisionRequestBackground: false,
+      revisionCheckQueued: false,
+      revisionWatching: false,
+      revisionVisible: false,
+      revisionEpoch: 0,
+      revisionKind: 'unknown',
+      revisionLast: null,
+      revisionInteracted: false,
       owner,
       previewSession,
-      view: new WebContentsView({
-        webPreferences: {
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: true,
-          webSecurity: true,
-          webviewTag: false,
-          disableDialogs: isLegacyArtifact,
-          disableHtmlFullscreenWindowResize: true,
-          ...(isLegacyArtifact
-            ? {}
-            : {
-                devTools: false,
-                navigateOnDragDrop: false,
-                safeDialogs: true,
-                safeDialogsMessage: 'Repeated dialogs were blocked in this temporary preview.',
-                spellcheck: true,
-              }),
-          session: previewSession,
-        },
-      }),
+      view,
+      contents: view.webContents,
+      webContentsId: view.webContents.id,
       requestedRect: null,
       rect: null,
       visibleRequested: false,
@@ -888,9 +1040,14 @@ export class NativeWorkbenchSurfaceManager {
       annotationPickerEpoch: 0,
       browserDocumentReady: false,
       browserOpenedHidden: false,
+      browserBlockerWaiters: new Set(),
       browserViewportReady: Promise.resolve(),
       browserNavigationStopped: false,
+      browserNavigationGeneration: 0,
+      browserUnresponsive: false,
       browserRuntimeException: false,
+      browserFindQuery: '',
+      browserFindRequestId: null,
       offlineRealmGuardInstalled: false,
       offlineRealmGuardScriptId: null,
       browserObjectGroup: null,
@@ -901,21 +1058,100 @@ export class NativeWorkbenchSurfaceManager {
       debuggerExpectedDetach: false,
     }
     record.view.setBounds({ x: 0, y: 0, width: 960, height: 720 })
+    if (record.kind === 'url-preview') record.prompt = new BrowserPromptController({
+      owner, contents: record.contents,
+      isAllowed: () => !record.disposed && record.mode === 'full',
+      onStateChange: () => record.playwright?.notifyHostPromptState(),
+    })
     record.removeZoomShortcuts = installDesktopZoomShortcuts(
-      record.view.webContents,
-      owner.webContents,
-      () => this.refreshBounds(owner),
+      record.contents,
+      request.kind === 'url-preview' ? record.contents : owner.webContents,
+      () => request.kind === 'url-preview' ? this.emitBrowserFindState(record) : this.refreshBounds(owner),
     )
     this.surfaces.set(record.id, record)
 
+    return record
+    } catch (error) {
+      try {
+        if (allocatedView && !allocatedView.webContents.isDestroyed()) allocatedView.webContents.close({ waitForBeforeUnload: false })
+      } catch { /* Keep its slot until Chromium reports actual destruction. */ }
+      releaseReservationAfterDestruction(resourceReservation, allocatedView?.webContents)
+      throw error
+    }
+  }
+
+  private async createSurfaceNow(
+    request: NativeWorkbenchCreateRequest,
+    prepareBrowser = false,
+    signal?: AbortSignal,
+    context?: { sessionKey: string; targetRef: string },
+    manualDownload = false,
+  ): Promise<NativeWorkbenchSurfaceResult> {
+    const previous = this.surfaces.get(request.surfaceId)
+    const resourceKind = request.kind === 'url-preview' ? 'browser' : 'preview'
+    const previousKind = previous?.kind === 'url-preview' ? 'browser' : previous ? 'preview' : null
+    const reservation = previous && previousKind === resourceKind
+      ? previous.resourceReservation.retain() : this.resourceBudget.acquire(resourceKind)
+    if (!reservation) {
+      return { ok: false, code: 'RESOURCE_LIMIT',
+        message: `Close an existing ${resourceKind === 'browser' ? 'browser tab' : 'interactive preview'} before opening another. Existing pages are preserved.` }
+    }
     try {
+      return await this.createReservedSurfaceNow(request, reservation, previous,
+        prepareBrowser, signal, context, manualDownload)
+    } finally {
+      reservation.release()
+    }
+  }
+
+  private async createReservedSurfaceNow(
+    request: NativeWorkbenchCreateRequest,
+    reservation: WorkbenchResourceReservation,
+    previous: NativeWorkbenchSurfaceRecord | undefined,
+    prepareBrowser: boolean,
+    signal: AbortSignal | undefined,
+    context: { sessionKey: string; targetRef: string } | undefined,
+    manualDownload: boolean,
+  ): Promise<NativeWorkbenchSurfaceResult> {
+    if (previous?.kind === 'url-preview' && !await this.requestBrowserClose(previous)) {
+      return { ok: false, code: 'CLOSE_CANCELLED', message: 'The page remains open because replacement was cancelled.' }
+    }
+    if (previous) {
+      await this.destroyRecord(previous)
+      if (!previous.contents.isDestroyed()) {
+        return { ok: false, code: 'RESOURCE_RELEASING', message: 'The previous preview is still closing. Retry after it closes.' }
+      }
+    }
+    const owner = this.options.getWindow()
+    if (!owner || owner.isDestroyed()) {
+      return { ok: false, message: 'The OpenSquilla window is unavailable.' }
+    }
+
+    // Resolve inside the creation queue so a closed/replaced source cannot lend
+    // its Session to a later request. Only URL tabs owned by this task may share.
+    const contextRef = context?.targetRef ?? (request.kind === 'url-preview' ? request.payload.contextTargetRef : undefined)
+    const source = contextRef ? this.browserRecord(context?.sessionKey ?? request.payload.scopeId, contextRef) : undefined
+    if (source && (source.kind !== 'url-preview' || source.mode !== 'full'
+      || request.kind !== 'url-preview' || request.payload.scopeId !== source.scopeId || source.owner !== owner)) {
+      throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser context is not owned by this session.', 404)
+    }
+    this.hookWindow(owner)
+    const record = this.allocateSurface(request, owner, source?.previewSession, undefined, reservation.retain())
+    if (source) record.contextTargetRef = source.targetRef
+    let interruptedNavigation: DesktopBrowserError | undefined
+
+    try {
+      if (record.kind === 'url-preview' && !this.v2TopLevelNavigationAllowed(record, record.documentUrl)) {
+        this.reportPrivilegedGatewayBlock(record, record.documentUrl)
+        throw new DesktopBrowserError('NAVIGATION_BLOCKED', 'This URL is unavailable inside isolated previews.', 403)
+      }
       if (request.kind === 'artifact-html') {
         await this.configureLegacySession(
           record,
           request.payload.data,
           request.payload.allowRemoteResources,
         )
-      } else {
+      } else if (!source) {
         await this.configureV2Session(record)
       }
       if (request.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
@@ -933,10 +1169,33 @@ export class NativeWorkbenchSurfaceManager {
         }
       }
       this.configureWebContents(record)
+      if (prepareBrowser && record.kind === 'url-preview') {
+        record.playwright = new BrowserPlaywrightDriver(record.contents,
+          () => record.view.getVisible() && record.owner.isVisible(), undefined, record.prompt)
+        record.pointer = record.playwright.pointer
+        await record.playwright.initialize(() => {
+          if (record.disposed) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page closed.')
+        }, signal ?? new AbortController().signal)
+      }
       record.view.setVisible(false)
       owner.contentView.addChildView(record.view)
       this.emit(record, 'loading')
-      await record.view.webContents.loadURL(record.documentUrl)
+      try {
+        if (record.kind === 'url-preview') {
+          // Versions 2 and 3 acknowledge creation after initial navigation settles.
+          await this.loadBrowserDocument(record, record.documentUrl, undefined, signal, false, false,
+            record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4, manualDownload)
+        } else {
+          await record.contents.loadURL(record.documentUrl)
+        }
+      } catch (error) {
+        // Browser targets retain their identity and recovery controls after a
+        // failed navigation, including tabs created by the version 2 Control UI.
+        if (record.kind !== 'url-preview' || record.disposed) throw error
+        if (error instanceof DesktopBrowserError && ['PAGE_CHANGED', 'TIMEOUT'].includes(error.code)) {
+          interruptedNavigation = error
+        } else if (!record.browserNavigationError) throw error
+      }
       if (record.disposed || this.surfaces.get(record.id) !== record) {
         await this.destroyRecord(record)
         return { ok: false, message: 'The native Workbench surface was closed.' }
@@ -946,7 +1205,10 @@ export class NativeWorkbenchSurfaceManager {
       }
       if (record.kind === 'artifact-preview') await this.watchWorkingPreview(record)
       if (this.surfaces.get(record.id) !== record) return { ok: false, message: 'The browser page was closed.' }
-      return { ok: true, surfaceInstanceId: record.surfaceInstanceId }
+      record.resourceReservation.setPhase('resident')
+      return { ok: true, surfaceInstanceId: record.surfaceInstanceId,
+        ...(interruptedNavigation ? { code: interruptedNavigation.code, message: interruptedNavigation.message } : {}),
+        ...(record.browserNavigationError ? { navigationError: record.browserNavigationError } : {}) }
     } catch (error) {
       this.failRecord(record, 'error', { message: errorMessage(error) })
       await this.destroyRecord(record)
@@ -957,7 +1219,7 @@ export class NativeWorkbenchSurfaceManager {
   setSurfaceRect(request: NativeWorkbenchSurfaceRectRequest): NativeWorkbenchSurfaceResult {
     const record = this.surfaces.get(request.surfaceId)
     if (!record || record.disposed) {
-      return { ok: false, message: 'The native Workbench surface no longer exists.' }
+      return { ok: false, code: 'TARGET_NOT_FOUND', message: 'The native Workbench surface no longer exists.' }
     }
     if (record.crashed) {
       return { ok: false, message: 'The native Workbench surface renderer crashed.' }
@@ -980,6 +1242,199 @@ export class NativeWorkbenchSurfaceManager {
       this.hideRecord(record)
     }
     return { ok: true }
+  }
+
+  private noteBrowserNavigationFailure(
+    record: NativeWorkbenchSurfaceRecord, url: string, code: string, errorCode?: number,
+  ): void {
+    if (record.disposed || record.crashed || record.contents.isDestroyed()) return
+    record.browserDocumentReady = false
+    record.browserNavigationError = { url, code, ...(errorCode !== undefined ? { errorCode } : {}),
+      message: `Page navigation failed (${code}). The tab is still available, but its document is not ready.` }
+    this.invalidateBrowserAnchors(record)
+    // Hide only the child view, so the host can show its error and address bar.
+    // Its requested rectangle and stable target remain available for recovery.
+    this.setPhysicalVisibility(record, false)
+    this.emitNavigationState(record)
+  }
+
+  private browserNavigationFailure(record: NativeWorkbenchSurfaceRecord, operation: DesktopBrowserOperation = 'open'): DesktopBrowserError {
+    const failure = record.browserNavigationError!
+    const initialization = failure.code === 'ERR_BROWSER_INITIALIZATION_FAILED'
+    return new DesktopBrowserError(failure.code === 'ERR_TIMED_OUT' ? 'TIMEOUT' : initialization ? 'PAGE_NOT_READY' : 'NAVIGATION_FAILED',
+      failure.message, 409, { targetRef: record.targetRef, operation, pageState: 'navigation_failed',
+        navigation: { url: failure.url, code: failure.code, errorCode: failure.errorCode },
+        outcome: 'completed', retryable: false, recovery: 'change_url_or_network' })
+  }
+
+  private async loadBrowserDocument(record: NativeWorkbenchSurfaceRecord, url: string,
+    options?: Electron.LoadURLOptions, signal?: AbortSignal, reload = false, ignoreCache = false,
+    returnOnBlocker = true, manualDownload = false): Promise<void> {
+    if (signal?.aborted) {
+      throw new DesktopBrowserError('TIMEOUT', 'Browser navigation was cancelled before loading.', 409,
+        { targetRef: record.targetRef, outcome: 'not_started', retryable: false, recovery: 'inspect' })
+    }
+    record.browserNavigationOwner?.supersede()
+    const generation = ++record.browserNavigationGeneration
+    const isCurrent = () => !record.disposed && !record.crashed
+      && !record.contents.isDestroyed() && record.browserNavigationGeneration === generation
+    if (record.kind === 'url-preview') {
+      record.browserPreviousDocument = { url: record.contents.mainFrame.url || record.contents.getURL() || record.documentUrl,
+        ready: record.browserDocumentReady,
+        stopped: record.browserNavigationStopped, error: record.browserNavigationError }
+      record.browserNavigationError = undefined
+    }
+    let rejectCancellation!: (error: Error) => void
+    const cancelled = new Promise<never>((_resolve, reject) => { rejectCancellation = reject })
+    const superseded = () => new DesktopBrowserError('PAGE_CHANGED', 'Another navigation replaced this request. Inspect the current tab.', 409,
+      { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
+    const cancel = () => {
+      if (!isCurrent()) { rejectCancellation(superseded()); return }
+      if (record.browserNavigationOwner) record.browserNavigationOwner.manualDownload = false
+      record.browserNavigationStopped = true
+      if (record.kind === 'url-preview') this.noteBrowserNavigationFailure(record, url, 'ERR_TIMED_OUT')
+      rejectCancellation(record.browserNavigationError ? this.browserNavigationFailure(record)
+        : new DesktopBrowserError('TIMEOUT', 'Browser navigation was cancelled.'))
+      record.contents.stop()
+    }
+    const userCancelled = () => new DesktopBrowserError('NAVIGATION_CANCELLED',
+      'The page remains open because leaving was cancelled.', 409,
+      { targetRef: record.targetRef, outcome: 'not_started', retryable: false, recovery: 'inspect' })
+    let acceptDownload!: () => void
+    const downloadReceipt = new Promise<void>(resolve => { acceptDownload = resolve })
+    const owner = { url: this.httpUrl(url)?.href ?? url, started: false, cancelled: false,
+      manualDownload, downloadAccepted: false,
+      acceptDownload: () => { owner.downloadAccepted = true; acceptDownload() },
+      supersede: () => { owner.manualDownload = false; rejectCancellation(superseded()) }, cancel: () => {
+        if (!isCurrent()) return
+        owner.cancelled = true
+        owner.manualDownload = false
+        this.restoreBrowserDocumentAfterAbortedNavigation(record)
+        rejectCancellation(userCancelled())
+      } }
+    record.browserNavigationOwner = owner
+    let detachReload = () => {}
+    const raw = reload ? new Promise<void>((resolve, reject) => {
+      const finished = () => resolve()
+      const failed = (_event: unknown, code: number, description: string, _url: string, mainFrame: boolean) => {
+        if (mainFrame) reject(new Error(`${description} (${code}) loading '${url}'`))
+      }
+      const destroyed = () => reject(new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser target closed.'))
+      detachReload = () => {
+        record.contents.removeListener('did-finish-load', finished)
+        record.contents.removeListener('did-fail-load', failed)
+        record.contents.removeListener('destroyed', destroyed)
+      }
+      record.contents.once('did-finish-load', finished)
+      record.contents.on('did-fail-load', failed)
+      record.contents.once('destroyed', destroyed)
+      try {
+        if (ignoreCache) record.contents.reloadIgnoringCache()
+        else record.contents.reload()
+      } catch (error) { reject(error) }
+    }) : record.contents.loadURL(url, options)
+    signal?.addEventListener('abort', cancel, { once: true })
+    const navigation = Promise.race([raw, cancelled]).catch(async error => {
+      if (owner.cancelled) {
+        // Wait for Chromium to apply Stay before accepting a subsequent reload.
+        // Otherwise it aborts the new request while finishing the old decision.
+        await record.contents.executeJavaScript('0').catch(() => undefined)
+        record.playwright?.finishNativeBeforeUnload()
+        throw userCancelled()
+      }
+      const receipt = record.browserDownloadNavigation
+      if (isCurrent() && owner.manualDownload && owner.started && !record.browserNavigationStopped
+        && receipt?.generation === generation && /ERR_(?:FAILED|ABORTED)/.test(String(error))) {
+        // Chromium can reject loadURL before dispatching the attachment event.
+        // Headers alone never authorize a successful download outcome.
+        let timeout: NodeJS.Timeout | undefined
+        try {
+          await Promise.race([downloadReceipt, cancelled,
+            new Promise<void>(resolve => { timeout = setTimeout(resolve, 5_000) })])
+        } finally { if (timeout) clearTimeout(timeout) }
+      }
+      if (isCurrent() && owner.downloadAccepted) {
+        this.restoreBrowserDocumentAfterDownload(record)
+        return
+      }
+      if (record.kind === 'url-preview' && String(error).includes('ERR_ABORTED')) throw superseded()
+      if (isCurrent() && !String(error).includes('ERR_ABORTED')) {
+        if (record.kind === 'url-preview') {
+          if (!record.browserNavigationError) {
+            const code = errorMessage(error).match(/ERR_[A-Z_]+/)?.[0] ?? 'ERR_FAILED'
+            const errno = (error as { errno?: unknown })?.errno
+            this.noteBrowserNavigationFailure(record, url, code,
+              typeof errno === 'number' ? errno : undefined)
+          }
+          throw this.browserNavigationFailure(record)
+        }
+        this.failRecord(record, 'error', { message: errorMessage(error) })
+      }
+      throw error
+    }).finally(() => {
+      owner.manualDownload = false
+      detachReload()
+      signal?.removeEventListener('abort', cancel)
+      if (record.browserNavigationPromise === navigation) record.browserNavigationPromise = undefined
+      if (record.browserNavigationOwner === owner) record.browserNavigationOwner = undefined
+    })
+    record.browserNavigationPromise = navigation
+    // A dialog may finish this call before the navigation itself settles.
+    void navigation.catch(() => undefined)
+    const listener = new AbortController()
+    try {
+      await Promise.race([navigation,
+        ...(returnOnBlocker ? [this.waitForBrowserHostBlocker(record, listener.signal)] : []),
+        ...(returnOnBlocker && record.playwright ? [record.playwright.waitForPendingDialog(listener.signal).then(dialog =>
+          dialog.type === 'beforeunload' ? navigation : undefined)] : [])])
+      if (owner.cancelled) throw userCancelled()
+    } finally { listener.abort() }
+  }
+
+  /** Recover the retained document after a navigation ended before committing. */
+  private restoreBrowserDocumentAfterAbortedNavigation(record: NativeWorkbenchSurfaceRecord): boolean {
+    if (record.disposed || record.contents.isDestroyed()) return false
+    const currentUrl = this.browserDocumentUrl(record.contents.getURL())
+    const previous = record.browserPreviousDocument
+    if (previous && currentUrl && currentUrl === this.browserDocumentUrl(previous.url)) {
+      record.documentUrl = currentUrl!
+      record.browserDocumentReady = previous.ready
+      record.browserNavigationStopped = previous.stopped
+      record.browserNavigationError = previous.error
+      record.browserPreviousDocument = undefined
+    } else if (currentUrl) record.documentUrl = currentUrl
+    if (record.browserDocumentReady) this.emit(record, 'ready')
+    this.emitNavigationState(record)
+    return Boolean(previous && currentUrl && currentUrl === this.browserDocumentUrl(previous.url))
+  }
+
+  private restoreBrowserDocumentAfterDownload(record: NativeWorkbenchSurfaceRecord): void {
+    const navigation = record.browserDownloadNavigation
+    const previous = record.browserPreviousDocument
+    if (!navigation?.confirmed || navigation.generation !== record.browserNavigationGeneration
+      || record.disposed || record.contents.isDestroyed()
+      || record.browserNavigationStopped || record.browserNavigationError) return
+    if (record.browserDownloadedDocument) {
+      record.browserPreviousDocument = undefined
+      record.browserDownloadNavigation = undefined
+      this.emitNavigationState(record)
+      return
+    }
+    if (!previous || record.contents.isLoadingMainFrame()
+      || this.browserDocumentUrl(record.contents.getURL()) !== this.browserDocumentUrl(previous.url)) return
+    if (this.restoreBrowserDocumentAfterAbortedNavigation(record)) record.browserDownloadNavigation = undefined
+  }
+
+  private waitForBrowserHostBlocker(record: NativeWorkbenchSurfaceRecord, signal: AbortSignal): Promise<void> {
+    if (this.browserHostBlockers(record).length) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { record.browserBlockerWaiters.delete(finish); signal.removeEventListener('abort', cancel) }
+      const finish = () => { cleanup(); resolve() }
+      const cancel = () => { cleanup(); reject(new DesktopBrowserError('TIMEOUT', 'Browser state listener ended.')) }
+      if (signal.aborted) { cancel(); return }
+      record.browserBlockerWaiters.add(finish)
+      signal.addEventListener('abort', cancel, { once: true })
+    })
   }
 
   activateSurface(surfaceId: string): NativeWorkbenchSurfaceResult {
@@ -1007,17 +1462,19 @@ export class NativeWorkbenchSurfaceManager {
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'No active browser page is available.',
       }
     }
-    if (!record.cdpReady || !record.view.webContents.debugger.isAttached()) {
+    if (!record.cdpReady || !record.contents.debugger.isAttached()) {
       return {
         version: annotationVersion,
         available: false,
         picker: false,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'The isolated DOM inspector is unavailable.',
       }
@@ -1037,6 +1494,7 @@ export class NativeWorkbenchSurfaceManager {
         picker: true,
         trustedOverlay: false,
         overlayCopyVersion: 1,
+        overlayEditorVersion: 2,
         atomicCloseRearm: true,
         reason: 'The trusted annotation editor is unavailable.',
       }
@@ -1047,6 +1505,7 @@ export class NativeWorkbenchSurfaceManager {
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1,
+      overlayEditorVersion: 2,
       atomicCloseRearm: true,
     }
   }
@@ -1069,9 +1528,9 @@ export class NativeWorkbenchSurfaceManager {
       || !record.rect
       || record.owner.isDestroyed()
       || !this.ownerCanShowSurfaces(record.owner)
-      || record.view.webContents.isDestroyed()
+      || record.contents.isDestroyed()
       || !record.cdpReady
-      || !record.view.webContents.debugger.isAttached()
+      || !record.contents.debugger.isAttached()
     ) return false
     return binding === null || this.activeAnnotationOverlayBinding(record) === binding
   }
@@ -1091,10 +1550,10 @@ export class NativeWorkbenchSurfaceManager {
         elapsedMs: Math.max(0, Date.now() - startedAt),
         pickerEpoch: record.annotationPickerEpoch,
         generation: record.annotationDocumentGeneration,
-        webContentsId: record.view.webContents.id,
+        webContentsId: record.webContentsId,
         current: this.surfaces.get(record.id) === record && !record.disposed && !record.crashed,
         visible: record.view.getVisible(),
-        cdpReady: record.cdpReady && record.view.webContents.debugger.isAttached(),
+        cdpReady: record.cdpReady && record.contents.debugger.isAttached(),
       })
     } catch {
       // Diagnostics must never change picker lifecycle semantics.
@@ -1224,7 +1683,7 @@ export class NativeWorkbenchSurfaceManager {
       }
       return { ok: true }
     }
-    if (!record.cdpReady || !record.view.webContents.debugger.isAttached()) {
+    if (!record.cdpReady || !record.contents.debugger.isAttached()) {
       return {
         ok: false,
         code: 'ANNOTATION_UNAVAILABLE',
@@ -1303,6 +1762,8 @@ export class NativeWorkbenchSurfaceManager {
         port: channel.port1,
         record,
         selectionId: request.selectionId,
+        editorVersion: request.overlayEditorVersion === 2 ? 2 : 1,
+        contentHeight: NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
       }
       overlay.binding = binding
       channel.port1.on('message', event => {
@@ -1317,13 +1778,21 @@ export class NativeWorkbenchSurfaceManager {
       overlay.view.webContents.postMessage(
         NATIVE_WORKBENCH_ANNOTATION_OVERLAY_CHANNEL,
         {
-          version: 1,
+          version: binding.editorVersion,
           initialBody: request.initialBody,
           copy: request.copy || NATIVE_WORKBENCH_ANNOTATION_OVERLAY_DEFAULT_COPY,
+          ...(binding.editorVersion === 2 ? { editorState: request.editorState } : {}),
         },
         [channel.port2],
       )
       const bounds = this.annotationOverlayBounds(record, candidate)
+      // Inspect mode has ended, but the selected target remains visible while
+      // the trusted editor owns focus. Chromium tracks this node decoration
+      // through scroll/zoom without mutating the untrusted preview document.
+      await this.cdpCommand(record, 'Overlay.highlightNode', {
+        objectId: candidate.objectId,
+        highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
+      })
       this.presentAnnotationOverlay(
         overlay,
         bounds,
@@ -1351,6 +1820,26 @@ export class NativeWorkbenchSurfaceManager {
         retryable: true,
         message: errorMessage(error),
       }
+    }
+  }
+
+  updateArtifactAnnotationOverlay(request: NativeWorkbenchAnnotationOverlayUpdateRequest): NativeWorkbenchSurfaceResult {
+    const record = this.annotationRecordForUiRequest(request.surfaceId)
+    const overlay = record ? this.annotationOverlays.get(record.owner) : undefined
+    const binding = overlay?.binding
+    if (!record || !binding || binding.record !== record || binding.annotationId !== request.annotationId
+      || binding.editorVersion !== 2
+      || record.annotationCandidate?.selection.selectionId !== binding.selectionId
+      || record.annotationCandidate.documentGeneration !== record.annotationDocumentGeneration) {
+      return { ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: false,
+        message: 'The annotation editor changed before its state could be updated.' }
+    }
+    try {
+      binding.port.postMessage({ version: 2, type: 'editor-state', editorState: request.editorState })
+      return { ok: true }
+    } catch {
+      return { ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: true,
+        message: 'The annotation editor is unavailable.' }
     }
   }
 
@@ -1389,7 +1878,7 @@ export class NativeWorkbenchSurfaceManager {
         || binding.record !== record
         || candidate.documentGeneration !== record.annotationDocumentGeneration
         || !record.cdpReady
-        || !record.view.webContents.debugger.isAttached()
+        || !record.contents.debugger.isAttached()
         || this.activeSurfaceId !== record.id
         || !record.visibleRequested
         || !record.rect
@@ -1407,7 +1896,7 @@ export class NativeWorkbenchSurfaceManager {
       this.auditAnnotationPicker(record, 'close-start', 'started', 'requested', startedAt)
       this.stopAnnotationGeometryWatcher(candidate)
       try {
-        record.view.webContents.setAudioMuted(true)
+        record.contents.setAudioMuted(true)
         record.view.setVisible(false)
         overlay.view.setVisible(this.ownerCanShowSurfaces(record.owner))
       } catch {
@@ -1477,51 +1966,142 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   private async watchWorkingPreview(record: NativeWorkbenchSurfaceRecord): Promise<void> {
-    let lastRevision: string | null = null
-    const check = async (): Promise<void> => {
-      if (record.disposed || record.crashed || record.view.webContents.isDestroyed()) return
-      let keepWatching = true
-      try {
-        if (record.view.webContents.isLoading() && lastRevision !== null) return
-        const controller = new AbortController()
-        record.revisionRequest = controller
-        const timeout = setTimeout(() => controller.abort(), 2000)
-        timeout.unref()
-        try {
-          const response = await record.previewSession.fetch(record.documentUrl, {
-            method: 'HEAD', cache: 'no-store', redirect: 'error', signal: controller.signal,
-          })
-          if (record.disposed || record.crashed) return
-          if (!response.ok) return
-          if (response.headers.get('x-opensquilla-working-preview') !== '1') {
-            keepWatching = false
-            return
-          }
-          const revision = response.headers.get('etag')
-          if (revision && lastRevision && revision !== lastRevision && !record.view.webContents.isLoading()) {
-            record.view.webContents.reload()
-          }
-          if (revision) lastRevision = revision
-        } finally {
-          clearTimeout(timeout)
-          if (record.revisionRequest === controller) record.revisionRequest = null
+    record.revisionWatching = true
+    // Classify once even before layout adoption. Immutable previews never poll.
+    await this.queueSurfaceOperation(`operation:${record.targetRef}`, () =>
+      this.checkWorkingPreview(record, false)).catch(() => undefined)
+    this.scheduleWorkingPreviewCheck(record)
+  }
+
+  private workingPreviewProtected(record: NativeWorkbenchSurfaceRecord): boolean {
+    return record.revisionInteracted || record.annotationPickerActive
+      || record.annotationCandidate !== null || record.annotationFallbackActive
+      || record.annotationFocusTimer !== null || record.pendingPermissions.size > 0
+      || record.pendingAuthentication !== null
+  }
+
+  private scheduleWorkingPreviewCheck(record: NativeWorkbenchSurfaceRecord, delay = 1000): void {
+    if (!record.revisionWatching || !record.revisionVisible || record.revisionKind === 'immutable'
+      || record.revisionTimer || record.revisionCheckQueued || record.disposed || record.crashed
+      || this.surfaces.get(record.id) !== record) return
+    record.revisionTimer = setTimeout(() => {
+      record.revisionTimer = null
+      record.revisionCheckQueued = true
+      // A refresh cannot invalidate refs or overwrite state during an Agent operation.
+      void this.queueSurfaceOperation(`operation:${record.targetRef}`, () =>
+        this.checkWorkingPreview(record, true)).catch(() => undefined).finally(() => {
+        record.revisionCheckQueued = false
+        this.scheduleWorkingPreviewCheck(record)
+      })
+    }, delay)
+    record.revisionTimer.unref()
+  }
+
+  private updateWorkingPreviewVisibility(record: NativeWorkbenchSurfaceRecord, visible: boolean): void {
+    if (record.revisionVisible === visible) return
+    record.revisionVisible = visible
+    record.revisionEpoch += 1
+    if (record.revisionTimer) clearTimeout(record.revisionTimer)
+    record.revisionTimer = null
+    // A hidden Agent operation owns its probe independently of UI visibility.
+    if (record.revisionRequestBackground) record.revisionRequest?.abort()
+    if (visible) this.scheduleWorkingPreviewCheck(record, 0)
+  }
+
+  private async checkWorkingPreview(
+    record: NativeWorkbenchSurfaceRecord,
+    background: boolean,
+    assertCurrent?: () => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (record.kind !== 'artifact-preview' || record.revisionKind === 'immutable') return
+    const contents = record.contents
+    const epoch = record.revisionEpoch
+    const generation = record.annotationDocumentGeneration
+    const current = () => this.surfaces.get(record.id) === record && !record.disposed
+      && !record.browserNavigationStopped
+      && !record.crashed && !contents.isDestroyed()
+      && generation === record.annotationDocumentGeneration
+      && (!background || (record.revisionVisible && epoch === record.revisionEpoch))
+    // loadURL resolves at did-finish-load, before isLoading necessarily clears.
+    // Classifying that ready document cannot reload it (revisionLast is null).
+    // Otherwise a hidden preview can miss its only initial probe indefinitely.
+    const initialClassification = record.revisionKind === 'unknown' && record.browserDocumentReady
+    if (!current() || (contents.isLoading() && !initialClassification)
+      || (background && this.workingPreviewProtected(record))) return
+    assertCurrent?.()
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    record.revisionRequest = controller
+    record.revisionRequestBackground = background
+    const timeout = setTimeout(() => controller.abort(), 2000)
+    timeout.unref()
+    try {
+      const response = await record.previewSession.fetch(record.documentUrl, {
+        method: 'HEAD', cache: 'no-store', redirect: 'error', signal: controller.signal,
+      })
+      assertCurrent?.()
+      if (controller.signal.aborted) throw new Error('The revision check timed out.')
+      if (!current()) {
+        if (assertCurrent) throw new DesktopBrowserError('PAGE_CHANGED', 'The preview changed during its revision check.')
+        return
+      }
+      if (!response.ok) throw new Error('The working preview revision is unavailable.')
+      if (response.headers.get('x-opensquilla-working-preview') !== '1') {
+        record.revisionKind = 'immutable'
+        return
+      }
+      record.revisionKind = 'working'
+      const revision = response.headers.get('etag')
+      if (!revision) throw new Error('The working preview revision is unavailable.')
+      if (record.revisionLast !== null && revision !== record.revisionLast) {
+        // Recheck after the network await: UI edits/annotations may have started.
+        if (this.workingPreviewProtected(record)) {
+          if (assertCurrent) throw new DesktopBrowserError('REFRESH_DEFERRED',
+            'The working preview changed on disk. Save pending edits or annotations, then explicitly reload the preview.')
+          return
         }
-      } catch {
-        // A lease may be renewing; the normal preview lifecycle reports its own errors.
-      } finally {
-        if (keepWatching && !record.disposed && !record.crashed) {
-          record.revisionTimer = setTimeout(() => { void check() }, 1000)
-          record.revisionTimer.unref()
+        if (contents.isLoading()) return
+        record.revisionLast = revision
+        contents.reload()
+        // Artifact views retain their WebContents and layout. Wait only for this
+        // short refresh, never for a whole Agent turn or a hidden browser lease.
+        const end = Date.now() + 3000
+        while (Date.now() < end) {
+          assertCurrent?.()
+          if (record.disposed || record.crashed || contents.isDestroyed()
+            || this.surfaces.get(record.id) !== record) return
+          if (record.annotationDocumentGeneration > generation + 1) {
+            throw new DesktopBrowserError('PAGE_CHANGED', 'The preview navigated during refresh.')
+          }
+          if (record.annotationDocumentGeneration > generation && record.browserDocumentReady) return
+          await new Promise(resolve => setTimeout(resolve, 20))
         }
+        throw new DesktopBrowserError('PAGE_NOT_READY', 'The working preview is still reloading.')
+      }
+      record.revisionLast = revision
+    } catch (error) {
+      assertCurrent?.()
+      if (assertCurrent) {
+        if (error instanceof DesktopBrowserError) throw error
+        throw new DesktopBrowserError('PAGE_NOT_READY', 'The working preview revision could not be checked. Retry after the preview reconnects.')
+      }
+      // Background lease renewal failures retain the current document and retry.
+    } finally {
+      clearTimeout(timeout)
+      signal?.removeEventListener('abort', abort)
+      if (record.revisionRequest === controller) {
+        record.revisionRequest = null
+        record.revisionRequestBackground = false
       }
     }
-    await check()
   }
 
   private browserRecord(sessionKey: string, targetRef: string | undefined): NativeWorkbenchSurfaceRecord {
     const record = [...this.surfaces.values()].find(value => value.targetRef === targetRef)
     if (!record || record.scopeId !== sessionKey || record.disposed || record.crashed
-      || record.owner.isDestroyed() || record.view.webContents.isDestroyed()) {
+      || record.owner.isDestroyed() || record.contents.isDestroyed()) {
       throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser target no longer exists in this session.', 404)
     }
     return record
@@ -1530,8 +2110,17 @@ export class NativeWorkbenchSurfaceManager {
   private describeBrowserRecord(record: NativeWorkbenchSurfaceRecord) {
     return {
       targetRef: record.targetRef, surfaceId: record.id, sessionKey: record.scopeId,
-      url: record.view.webContents.getURL(), title: record.view.webContents.getTitle(), kind: record.kind,
+      url: record.browserNavigationError?.url || record.browserDownloadedDocument?.url
+        || this.browserDocumentUrl(record.contents.getURL()) || record.documentUrl,
+      title: record.browserDownloadedDocument ? `Download: ${record.browserDownloadedDocument.name}`
+        : record.contents.getTitle(), kind: record.kind,
       active: this.activeSurfaceId === record.id,
+      pageState: record.browserUnresponsive || this.unresponsiveWindows.has(record.owner) ? 'unresponsive'
+        : record.browserNavigationError ? 'navigation_failed'
+          : record.browserDocumentReady ? 'ready' : record.browserDownloadedDocument ? 'download' : 'loading',
+      ...(record.browserNavigationError ? { navigationError: record.browserNavigationError } : {}),
+      ...(record.openerTargetRef ? { openerTargetRef: record.openerTargetRef } : {}),
+      ...(record.contextTargetRef ? { contextTargetRef: record.contextTargetRef } : {}),
     }
   }
 
@@ -1554,7 +2143,7 @@ export class NativeWorkbenchSurfaceManager {
       }
       if (pagePath !== undefined) {
         let current: URL
-        try { current = new URL(record.view.webContents.getURL()) } catch {
+        try { current = new URL(record.contents.getURL()) } catch {
           throw new DesktopBrowserError('PAGE_CHANGED', 'The annotation page is unavailable.')
         }
         if (record.kind !== 'artifact-preview' || current.origin !== record.expectedOrigin
@@ -1596,6 +2185,280 @@ export class NativeWorkbenchSurfaceManager {
     }
   }
 
+  private browserHostBlockers(record: NativeWorkbenchSurfaceRecord) {
+    return [
+      ...[...record.pendingPermissions.values()].map(pending => ({
+        id: pending.requestId, kind: 'permission', permission: pending.permission,
+        origin: pending.origin, requiresUser: true,
+      })),
+      ...(record.pendingAuthentication ? [{ kind: 'authentication', requiresUser: true }] : []),
+      ...(record.playwright?.pendingFileChooser ? [{ kind: 'file_chooser', requiresUser: false,
+        ...record.playwright.pendingFileChooser }] : []),
+    ]
+  }
+
+  private browserResult(record: NativeWorkbenchSurfaceRecord, value: unknown): Record<string, unknown> {
+    const result = value as Record<string, unknown>
+    const observation = result.observation as Record<string, unknown> | undefined
+    const hostBlockers = this.browserHostBlockers(record)
+    return { ...result, targetRef: record.targetRef,
+      ...(observation ? { observation: { ...observation, targetRef: record.targetRef,
+        hostBlockers,
+        tabs: [...this.surfaces.values()].filter(candidate => candidate.scopeId === record.scopeId
+          && candidate.kind === 'url-preview' && !candidate.disposed && !candidate.crashed
+          && !candidate.contents.isDestroyed()).map(candidate => this.describeBrowserRecord(candidate)),
+      } } : { hostBlockers }),
+    }
+  }
+
+  async executeBrowserMcp(request: DesktopBrowserRequest, signal: AbortSignal): Promise<unknown> {
+    const check = () => {
+      if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'Browser request ended. Inspect the page before retrying.', 504)
+    }
+    check()
+    if (request.operation === 'list') {
+      return { targets: [...this.surfaces.values()].filter(record => record.scopeId === request.sessionKey
+        && record.kind === 'url-preview' && !record.disposed && !record.crashed
+        && !record.owner.isDestroyed() && !record.contents.isDestroyed())
+        .map(record => {
+          const target = this.describeBrowserRecord(record)
+          return { ...target, pageState: target.pageState === 'ready' && !record.cdpReady ? 'loading' : target.pageState,
+            hostBlockers: this.browserHostBlockers(record),
+            ...(record.playwright?.pendingDialog ? { dialog: record.playwright.pendingDialog } : {}) }
+        }) }
+    }
+    if (request.operation === 'open' && !request.targetRef) {
+      const opened = await this.executeBrowser(request, signal) as Record<string, unknown>
+      if (!request.observationMode) return opened
+      try {
+        return { ...opened, ...await this.executeBrowserMcp({ ...request, operation: 'observe',
+          targetRef: String(opened.targetRef) }, signal) as Record<string, unknown>, execution: { state: 'completed' } }
+      } catch (error) {
+        return { ...opened, execution: { state: 'completed' }, observation: { status: 'unavailable',
+          reason: error instanceof DesktopBrowserError ? error.code : 'OBSERVATION_UNAVAILABLE' } }
+      }
+    }
+    const record = this.browserRecord(request.sessionKey, request.targetRef)
+    if (record.kind !== 'url-preview') {
+      throw new DesktopBrowserError('TARGET_NOT_FOUND', 'This MCP tool controls built-in URL pages only.', 404)
+    }
+    if (request.operation === 'snapshot' && request.downloadId) {
+      const downloadOwner = {
+        sessionKey: record.scopeId, targetRef: record.targetRef, webContentsId: record.webContentsId,
+      }
+      const download = await this.browserDownloads.inspect(downloadOwner, request.downloadId, request.maxChars)
+      let pdfExport: unknown
+      if (request.exportPdf) {
+        try { pdfExport = await this.browserDownloads.exportPdf(downloadOwner, request.downloadId) }
+        catch (error) {
+          if (!(error instanceof DesktopBrowserError) || error.code !== 'DOWNLOAD_NOT_PDF') throw error
+        }
+      }
+      return this.browserResult(record, { download, ...(pdfExport ? { pdfExport } : {}) })
+    }
+    const assertCurrent = () => {
+      check()
+      if (this.browserRecord(request.sessionKey, request.targetRef) !== record) {
+        throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was replaced.', 404)
+      }
+      if (record.browserUnresponsive || this.unresponsiveWindows.has(record.owner)) {
+        throw new DesktopBrowserError('PAGE_UNRESPONSIVE', 'The browser is temporarily unresponsive. Inspect its state before retrying.', 409,
+          { targetRef: record.targetRef, pageState: 'unresponsive', outcome: 'not_started', retryable: true, recovery: 'inspect' })
+      }
+    }
+    const driver = async () => {
+      assertCurrent()
+      if (record.playwright?.pendingDialog) return record.playwright
+      const pointer = await this.touchBrowserPointer(record)
+      record.playwright ??= new BrowserPlaywrightDriver(record.contents,
+        () => record.view.getVisible() && record.owner.isVisible(), pointer, record.prompt)
+      return record.playwright
+    }
+    const blockedResult = async (): Promise<Record<string, unknown> | undefined> => {
+      if (record.playwright?.pendingDialog) {
+        return this.browserResult(record, { execution: { state: 'blocked', reason: 'dialog' },
+          ...await record.playwright.observe(record.annotationDocumentGeneration, assertCurrent, signal, request.observationMode) })
+      }
+      const canHandleChooser = ['observe', 'snapshot', 'screenshot', 'tab'].includes(request.operation)
+        || request.operation === 'act' && ['upload', 'cancelUpload'].includes(request.action ?? '')
+      const hostBlockers = this.browserHostBlockers(record).filter(blocker =>
+        blocker.kind !== 'file_chooser' || !canHandleChooser)
+      if (hostBlockers.length) {
+        return this.browserResult(record, { execution: { state: 'blocked', reason:
+          hostBlockers.some(blocker => blocker.requiresUser) ? 'requires_user' : 'file_chooser' },
+          observation: { consistency: 'blocked', hostBlockers, imageStatus: 'unavailable' } })
+      }
+      return undefined
+    }
+    const serialized = (work: () => Promise<unknown>): Promise<unknown> => {
+      let resolve!: (value: unknown) => void
+      let reject!: (reason: unknown) => void
+      const response = new Promise<unknown>((yes, no) => { resolve = yes; reject = no })
+      void this.queueSurfaceOperation(`operation:${record.targetRef}`, async () => {
+        try { resolve(await work()) } catch (error) { reject(error) }
+        finally {
+          await record.playwright?.waitForIdle()
+          await record.browserNavigationPromise?.catch(() => undefined)
+        }
+      }).catch(reject)
+      return response
+    }
+    if (request.operation === 'tab' && request.tabAction === 'close') {
+      if (!await this.requestBrowserClose(record)) {
+        return { targetRef: request.targetRef, execution: { state: 'cancelled' }, closed: false,
+          code: 'CLOSE_CANCELLED', message: 'The page remains open because closing was cancelled.' }
+      }
+      return { targetRef: request.targetRef, execution: { state: 'completed' }, closed: true }
+    }
+    // Dialog control must bypass a click waiting for this same dialog to close.
+    if (request.operation === 'dialog') {
+      const page = await driver()
+      const result = await page.handleDialog(request, assertCurrent, signal)
+      // Resolving one dialog may immediately open another. Neither the original
+      // click nor an in-flight navigation may hold up reporting that new blocker.
+      if (!page.pendingDialog) {
+        const listener = new AbortController()
+        try {
+          await Promise.race([
+            Promise.all([page.waitForIdle(), record.browserNavigationPromise?.catch(() => undefined)]),
+            page.waitForPendingDialog(AbortSignal.any([listener.signal, signal])),
+            this.waitForBrowserHostBlocker(record, AbortSignal.any([listener.signal, signal])),
+          ])
+        } finally { listener.abort() }
+      }
+      assertCurrent()
+      const blocked = await blockedResult()
+      if (blocked) return { ...result, ...blocked }
+      // Only the dialog response bypasses the ordinary operation queue. Its
+      // follow-up observation must not race another queued page action.
+      return await serialized(async () => {
+      assertCurrent()
+      const blocked = await blockedResult()
+      if (blocked) return { ...result, ...blocked }
+      try {
+        return this.browserResult(record, { ...result, ...await page.observe(record.annotationDocumentGeneration,
+          assertCurrent, signal, request.observationMode) })
+      } catch (error) {
+        return this.browserResult(record, { ...result, observation: { status: 'unavailable',
+          reason: error instanceof DesktopBrowserError ? error.code : 'OBSERVATION_UNAVAILABLE' } })
+      }
+    })
+  }
+  const blocked = await blockedResult()
+  if (blocked) return blocked
+  // Publish a blocked receipt promptly, but keep the write queue until the
+  // original input actually settles. Later ordinary actions cannot overtake it.
+  return await serialized(async () => {
+      assertCurrent()
+      const blocked = await blockedResult()
+      if (blocked) return blocked
+      let result: Record<string, unknown>
+      if (request.operation === 'open' || request.operation === 'reload') {
+        result = await this.executeBrowser(request, signal) as Record<string, unknown>
+        if (request.observationMode) {
+          try {
+            const page = await driver()
+            result = { ...result, ...await page.observe(record.annotationDocumentGeneration,
+              assertCurrent, signal, request.observationMode), execution: { state: 'completed' } }
+          } catch (error) {
+            result = { ...result, execution: { state: 'completed' }, observation: { status: 'unavailable',
+              reason: error instanceof DesktopBrowserError ? error.code : 'OBSERVATION_UNAVAILABLE' } }
+          }
+        }
+      } else {
+        if (record.browserNavigationError) {
+          if (request.operation === 'tab') {
+            const target = this.describeBrowserRecord(record)
+            this.emit(record, 'browser-opened', { url: record.browserNavigationError.url,
+              title: target.title, sessionKey: record.scopeId, targetRef: record.targetRef,
+              navigationError: record.browserNavigationError })
+          }
+          throw this.browserNavigationFailure(record, request.operation)
+        }
+        if (!record.browserDocumentReady || !record.cdpReady) {
+          throw new DesktopBrowserError('PAGE_NOT_READY', record.browserDownloadedDocument
+            ? 'A download was started in this tab. Open a web page to read its document.'
+            : 'The browser page is still loading or unavailable.', 409,
+            { targetRef: record.targetRef, operation: request.operation,
+              pageState: record.browserDocumentReady ? 'initializing' : record.browserDownloadedDocument ? 'download' : 'loading',
+              outcome: 'not_started', retryable: !record.browserDownloadedDocument,
+              ...(record.browserDownloadedDocument ? { recovery: 'change_url' } : {}) })
+        }
+        const page = await driver()
+        const generation = record.annotationDocumentGeneration
+        if (request.operation === 'tab') {
+          const target = this.describeBrowserRecord(record)
+          this.emit(record, 'browser-opened', { url: target.url, title: target.title,
+            sessionKey: record.scopeId, targetRef: record.targetRef })
+          result = await page.observe(generation, assertCurrent, signal, request.observationMode)
+        } else if (request.operation === 'observe') {
+          result = await page.observe(generation, assertCurrent, signal, request.observationMode)
+        } else if (request.operation === 'batch') {
+          result = await page.batch(request, generation, assertCurrent, signal)
+        } else if (request.operation === 'snapshot') {
+          result = request.ref ? await page.readText(request, generation, assertCurrent, signal)
+            : await page.snapshot(generation, assertCurrent, signal)
+        } else if (request.operation === 'screenshot') {
+          result = await page.screenshot(assertCurrent, signal)
+        } else {
+          if (request.action === 'upload') {
+            result = await page.uploadFile(request, generation, assertCurrent, signal)
+          } else if (request.action === 'cancelUpload') {
+            result = await page.cancelFileChooser(request, generation, assertCurrent, signal)
+          } else if (request.action === 'download') {
+            const download = await this.browserDownloads.arm({ sessionKey: record.scopeId,
+              targetRef: record.targetRef, webContentsId: record.webContentsId }, signal)
+            const attempt = randomUUID()
+            record.browserDownloadAttempt = attempt
+            try {
+              assertCurrent()
+              // Keep the browser's real activation, event listeners, redirects,
+              // referrer policy and POST body. Inline PDF navigation is captured
+              // only after its actual response reaches the owning Session.
+              const clicked = await page.act({ ...request, action: 'click' }, generation, assertCurrent, signal)
+              if (clicked.execution?.state === 'blocked') {
+                // Do not keep an armed capture across a dialog decision. A
+                // later accepted download follows the ordinary native save
+                // flow; the agent must not infer a completed artifact here.
+                download.cancel()
+                result = { ...clicked, action: 'download', download: { state: 'not_captured',
+                  managedCapture: false, reason: 'dialog_blocked',
+                  message: 'The dialog interrupted download capture. Resolve it according to the task; accepting may use the native save dialog. No managed artifact was created.' } }
+              } else {
+                result = { ...clicked, action: 'download', download: await download.completed }
+              }
+            } finally {
+              record.browserDownloadAttempt = undefined
+              download.cancel()
+              for (const child of [...this.surfaces.values()]) {
+                if (child.browserDownloadParent?.targetRef !== record.targetRef
+                  || child.browserDownloadParent.attempt !== attempt) continue
+                child.browserDownloadParent = undefined
+                // A newly opened PDF download has no committed page to retain.
+                if (child.browserCapturedPdfNavigation && !child.initialDocumentCommitted) {
+                  await this.destroyRecord(child)
+                }
+              }
+            }
+          } else {
+            result = await page.act(request, generation, assertCurrent, signal)
+          }
+          if (request.observationMode) {
+            try {
+              result = { ...result, ...await page.observe(record.annotationDocumentGeneration,
+                assertCurrent, signal, request.observationMode) }
+            } catch (error) {
+              result = { ...result, observation: { status: 'unavailable',
+                reason: error instanceof DesktopBrowserError ? error.code : 'OBSERVATION_UNAVAILABLE' } }
+            }
+          }
+        }
+      }
+      assertCurrent()
+      return this.browserResult(record, result)
+    })
+  }
+
   async executeBrowser(request: DesktopBrowserRequest, signal: AbortSignal): Promise<unknown> {
     const check = () => {
       if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The browser request ended.', 504)
@@ -1603,37 +2466,75 @@ export class NativeWorkbenchSurfaceManager {
     check()
     if (request.operation === 'list') {
       return { targets: [...this.surfaces.values()].filter(record => record.scopeId === request.sessionKey
-        && !record.disposed && !record.crashed && !record.view.webContents.isDestroyed()
+        && !record.disposed && !record.crashed && !record.contents.isDestroyed()
         && record.kind !== 'artifact-html').map(record => this.describeBrowserRecord(record)) }
     }
     if (request.operation === 'open' && !request.targetRef) {
-      const url = parseNativeWorkbenchNavigationUrl(request.url)
+      const url = parseNativeWorkbenchNavigationUrl(request.url ?? BROWSER_BLANK_URL)
       if (this.isPrivilegedGatewayTarget(url)) throw new DesktopBrowserError('NAVIGATION_BLOCKED', 'This URL is unavailable inside isolated previews.')
       const surfaceId = `browser-${randomUUID()}`
       const result = await this.createSurface({ version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
-        surfaceId, kind: 'url-preview', payload: { url, scopeId: request.sessionKey } })
-      if (!result.ok) throw new DesktopBrowserError('OPEN_FAILED', result.message || 'The browser page could not open.')
+        surfaceId, kind: 'url-preview', payload: { url, scopeId: request.sessionKey } }, true, signal,
+        request.contextTargetRef ? { sessionKey: request.sessionKey, targetRef: request.contextTargetRef } : undefined)
+      if (!result.ok) throw new DesktopBrowserError(result.code === 'RESOURCE_LIMIT' ? result.code : 'OPEN_FAILED', result.message || 'The browser page could not open.')
       const record = this.surfaces.get(surfaceId)
       if (!record) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
       const assertOpeningRecord = () => {
         if (this.surfaces.get(surfaceId) !== record || record.disposed || record.crashed || record.owner.isDestroyed()
-          || record.view.webContents.isDestroyed()) {
+          || record.contents.isDestroyed()) {
           throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
         }
       }
-      const assertOpening = () => { check(); assertOpeningRecord() }
+      const openingGeneration = record.annotationDocumentGeneration
+      const assertOpening = () => {
+        check(); assertOpeningRecord()
+        if (record.annotationDocumentGeneration !== openingGeneration) {
+          throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated while it was being opened.', 409,
+            { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
+        }
+      }
+      record.browserOpenedHidden = true
+      if (record.browserNavigationError) {
+        const target = this.getBrowserTarget(surfaceId)
+        this.emit(record, 'browser-opened', { url, title: target.title,
+          sessionKey: request.sessionKey, targetRef: target.targetRef,
+          navigationError: record.browserNavigationError })
+        this.emitNavigationState(record)
+        throw this.browserNavigationFailure(record)
+      }
+      if (result.code === 'PAGE_CHANGED' || result.code === 'TIMEOUT') {
+        const target = this.getBrowserTarget(surfaceId)
+        this.emit(record, 'browser-opened', { url: target.url, title: target.title,
+          sessionKey: request.sessionKey, targetRef: target.targetRef })
+        throw new DesktopBrowserError(result.code, result.message || 'The tab was created but its navigation was interrupted.', 409,
+          { targetRef: record.targetRef, outcome: 'unknown', retryable: false, recovery: 'inspect' })
+      }
       try {
-        record.browserOpenedHidden = true
-        await this.initializeHiddenBrowserViewport(record, assertOpening)
+        if (!record.playwright?.pendingDialog && !this.browserHostBlockers(record).length) await this.initializeHiddenBrowserViewport(record, assertOpening)
         assertOpening()
+        if (!record.playwright?.pendingDialog && !this.browserHostBlockers(record).length) await this.touchBrowserPointer(record)
         // The current session's UI adopts the hidden page and supplies its visible layout.
         const target = this.getBrowserTarget(surfaceId)
         this.emit(record, 'browser-opened', { url: target.url, title: target.title,
           sessionKey: request.sessionKey, targetRef: target.targetRef })
         return target
       } catch (error) {
-        if (this.surfaces.get(surfaceId) === record) await this.destroyRecord(record)
-        throw error
+        if (record.owner.isDestroyed() || record.contents.isDestroyed()
+          || record.disposed || this.surfaces.get(surfaceId) !== record) {
+          if (this.surfaces.get(surfaceId) === record) await this.destroyRecord(record)
+          throw error
+        }
+        if (error instanceof DesktopBrowserError && error.code === 'PAGE_CHANGED') {
+          const target = this.getBrowserTarget(surfaceId)
+          this.emit(record, 'browser-opened', { url: target.url, title: target.title,
+            sessionKey: request.sessionKey, targetRef: target.targetRef })
+          throw error
+        }
+        this.noteBrowserNavigationFailure(record, url,
+          signal.aborted ? 'ERR_TIMED_OUT' : 'ERR_BROWSER_INITIALIZATION_FAILED')
+        this.emit(record, 'browser-opened', { url, sessionKey: request.sessionKey,
+          targetRef: record.targetRef, navigationError: record.browserNavigationError })
+        throw this.browserNavigationFailure(record)
       }
     }
     const record = this.browserRecord(request.sessionKey, request.targetRef)
@@ -1642,41 +2543,53 @@ export class NativeWorkbenchSurfaceManager {
     if (request.operation === 'open' || request.operation === 'reload') {
       const navigation = await this.navigateSurface({ version: record.version as 2 | 3 | 4,
         surfaceId: record.id, action: request.operation === 'open' ? 'navigate' : 'reload',
-        ...(request.operation === 'open' ? { url: parseNativeWorkbenchNavigationUrl(request.url) } : {}) })
+        ...(request.operation === 'open' ? { url: parseNativeWorkbenchNavigationUrl(request.url) } : {}) }, signal)
+      if (record.browserNavigationError) throw this.browserNavigationFailure(record, request.operation)
       assertCurrent()
       if (!navigation.ok) throw new DesktopBrowserError('NAVIGATION_BLOCKED', navigation.message || 'Browser navigation failed.')
-      return { ...this.describeBrowserRecord(record), loading: record.view.webContents.isLoading() }
+      return { ...this.describeBrowserRecord(record), loading: record.contents.isLoading() }
     }
-    if (!record.browserDocumentReady || !record.cdpReady) {
-      throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser page is still loading or unavailable.')
-    }
-    if (request.operation === 'screenshot') {
-      const generation = record.annotationDocumentGeneration
-      const image = await record.view.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })
-      let png = image.toPNG()
-      let { width, height } = image.getSize()
-      if (!png.length) {
-        // Hidden child views may have no compositor surface. CDP captures the same
-        // WebContents renderer without activating another tab or opening a new page.
-        const captured = await this.cdpCommand(record, 'Page.captureScreenshot', {
-          format: 'png', captureBeyondViewport: false,
-        }, assertCurrent) as { data?: string }
-        if (typeof captured.data === 'string' && captured.data.length <= 12 * 1024 * 1024) {
-          png = Buffer.from(captured.data, 'base64')
-          if (png.length >= 24 && png.subarray(1, 4).toString() === 'PNG') {
-            width = png.readUInt32BE(16)
-            height = png.readUInt32BE(20)
-          }
-        }
-      }
-      assertCurrent()
-      if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated during capture.')
-      if (!png.length || png.length > 8 * 1024 * 1024 || width < 1 || height < 1) throw new DesktopBrowserError('SCREENSHOT_UNAVAILABLE', 'The screenshot is empty or exceeds 8 MiB.')
-      return { targetRef: record.targetRef, mimeType: 'image/png', dataBase64: png.toString('base64'), width, height }
-    }
-    // Serialize short browser operations only. No turn lease prevents the user from closing or replacing a page.
+    // Freshness, capture and actions share one short queue with background refresh.
+    // Closing or replacing the view remains independent of this operation queue.
     return await this.queueSurfaceOperation(`operation:${record.targetRef}`, async () => {
       assertCurrent()
+      if (record.browserNavigationError) throw this.browserNavigationFailure(record, request.operation)
+      if (!record.browserDocumentReady || !record.cdpReady) {
+        throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser page is still loading or unavailable.')
+      }
+      await this.checkWorkingPreview(record, false, assertCurrent, signal)
+      assertCurrent()
+      if (!record.browserDocumentReady || !record.cdpReady) {
+        throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser page is still loading or unavailable.')
+      }
+      const pointer = record.playwright?.pendingDialog
+        ? record.playwright.pointer : await this.touchBrowserPointer(record)
+      if (request.operation === 'screenshot') {
+        return pointer.pauseForScreenshot(async () => {
+          const generation = record.annotationDocumentGeneration
+          const image = await record.contents.capturePage(undefined, { stayHidden: true, stayAwake: true })
+          let png = image.toPNG()
+          let { width, height } = image.getSize()
+          if (!png.length) {
+            // Hidden child views may have no compositor surface. CDP captures the same
+            // WebContents renderer without activating another tab or opening a new page.
+            const captured = await this.cdpCommand(record, 'Page.captureScreenshot', {
+              format: 'png', captureBeyondViewport: false,
+            }, assertCurrent) as { data?: string }
+            if (typeof captured.data === 'string' && captured.data.length <= 12 * 1024 * 1024) {
+              png = Buffer.from(captured.data, 'base64')
+              if (png.length >= 24 && png.subarray(1, 4).toString() === 'PNG') {
+                width = png.readUInt32BE(16)
+                height = png.readUInt32BE(20)
+              }
+            }
+          }
+          assertCurrent()
+          if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated during capture.')
+          if (!png.length || png.length > 8 * 1024 * 1024 || width < 1 || height < 1) throw new DesktopBrowserError('SCREENSHOT_UNAVAILABLE', 'The screenshot is empty or exceeds 8 MiB.')
+          return { targetRef: record.targetRef, mimeType: 'image/png', dataBase64: png.toString('base64'), width, height }
+        })
+      }
       const result = request.operation === 'snapshot'
         ? await this.snapshotBrowser(record, assertCurrent)
         : await this.performBrowserAction(record, request, assertCurrent)
@@ -1729,6 +2642,7 @@ export class NativeWorkbenchSurfaceManager {
 
   private async performBrowserAction(record: NativeWorkbenchSurfaceRecord, request: DesktopBrowserRequest, assertCurrent: () => void) {
     const generation = record.annotationDocumentGeneration
+    let actionPoint: { x: number; y: number } | undefined
     const anchor = request.ref ? record.browserAnchors.get(request.ref) : undefined
     if (request.ref && (!anchor || anchor.documentGeneration !== generation)) {
       throw new DesktopBrowserError('STALE_ELEMENT', 'The element reference expired. Request a new snapshot.')
@@ -1736,10 +2650,29 @@ export class NativeWorkbenchSurfaceManager {
     const send = async (method: string, params: Record<string, unknown>) => {
       assertCurrent()
       if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated before the action completed.')
-      return await this.cdpCommand(record, method, params, () => {
+      let result: unknown
+      try { result = await this.cdpCommand(record, method, params, () => {
         assertCurrent()
         if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated before the action was sent.')
-      })
+        if (method === 'Input.insertText' || method === 'Input.dispatchKeyEvent'
+          || (method === 'Input.dispatchMouseEvent' && params.type === 'mousePressed')
+          || (method === 'Runtime.callFunctionOn' && request.action === 'select')) {
+          record.revisionInteracted = true
+        }
+      }) } catch (error) {
+        if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseReleased'
+          && generation === record.annotationDocumentGeneration
+          && typeof params.x === 'number' && typeof params.y === 'number') {
+          await record.pointer?.update({ x: params.x, y: params.y, action: 'cancel', immediate: true })
+        }
+        throw error
+      }
+      if (method === 'Input.dispatchMouseEvent' && generation === record.annotationDocumentGeneration
+        && typeof params.x === 'number' && typeof params.y === 'number') {
+        await record.pointer?.update({ x: params.x, y: params.y, immediate: true,
+          action: params.type === 'mouseReleased' ? 'click' : params.type === 'mousePressed' ? 'down' : 'move' })
+      }
+      return result
     }
     if (anchor) {
       const geometry = await send('Runtime.callFunctionOn', {
@@ -1770,6 +2703,7 @@ export class NativeWorkbenchSurfaceManager {
       const rect = geometry.result?.value
       if (!rect) throw new DesktopBrowserError('STALE_ELEMENT', 'The selected element is no longer available.')
       if (rect.unavailable || rect.width <= 0 || rect.height <= 0) throw new DesktopBrowserError('ACTION_UNAVAILABLE', 'The element is hidden, disabled, moving or covered.')
+      actionPoint = { x: rect.x, y: rect.y }
       if (request.action === 'click' || request.action === 'hover') {
         await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x, y: rect.y })
         if (request.action === 'click') {
@@ -1826,6 +2760,10 @@ export class NativeWorkbenchSurfaceManager {
         deltaX: request.direction === 'left' ? -amount : request.direction === 'right' ? amount : 0,
         deltaY: request.direction === 'up' ? -amount : request.direction === 'down' ? amount : 0 })
     }
+    if (actionPoint && ['fill', 'select', 'press'].includes(request.action ?? '')
+      && generation === record.annotationDocumentGeneration) {
+      await record.pointer?.update({ ...actionPoint, action: request.action! })
+    }
     return { targetRef: record.targetRef, action: request.action, performed: true }
   }
 
@@ -1856,7 +2794,7 @@ export class NativeWorkbenchSurfaceManager {
 
   private isActiveAnnotationRecord(record: NativeWorkbenchSurfaceRecord): boolean {
     return record.kind !== 'artifact-html' && this.surfaces.get(record.id) === record
-      && !record.disposed && !record.crashed && !record.view.webContents.isDestroyed()
+      && !record.disposed && !record.crashed && !record.contents.isDestroyed()
       && this.activeSurfaceId === record.id && record.visibleRequested
   }
 
@@ -1878,8 +2816,8 @@ export class NativeWorkbenchSurfaceManager {
     if (!candidate) return
     this.stopAnnotationGeometryWatcher(candidate)
     if (
-      !record.view.webContents.isDestroyed()
-      && record.view.webContents.debugger.isAttached()
+      !record.contents.isDestroyed()
+      && record.contents.debugger.isAttached()
     ) {
       void this.cdpCommand(record, 'Runtime.releaseObjectGroup', {
         objectGroup: candidate.objectGroup,
@@ -2026,14 +2964,15 @@ export class NativeWorkbenchSurfaceManager {
     record.annotationFocusTimer = null
     if (
       record.cdpReady
-      && !record.view.webContents.isDestroyed()
-      && record.view.webContents.debugger.isAttached()
+      && !record.contents.isDestroyed()
+      && record.contents.debugger.isAttached()
     ) {
       await this.cdpCommand(record, 'Overlay.hideHighlight').catch(() => undefined)
     }
   }
 
   private invalidateBrowserAnchors(record: NativeWorkbenchSurfaceRecord): void {
+    record.playwright?.invalidate()
     const objectGroup = record.browserObjectGroup
     record.browserObjectGroup = null
     if (objectGroup) void this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined)
@@ -2092,11 +3031,13 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   private async ensureDebuggerAttached(record: NativeWorkbenchSurfaceRecord): Promise<void> {
-    const contents = record.view.webContents
+    const contents = record.contents
     if (contents.debugger.isAttached()) return
-    if (!contents.getURL()) await contents.loadURL('about:blank')
+    if (!contents.getURL() && !record.openerTargetRef) await contents.loadURL('about:blank')
     contents.debugger.attach('1.3')
-    contents.debugger.on('message', (_event, method, params) => {
+    contents.debugger.on('message', (_event, method, params, sessionId) => {
+      // Playwright owns a separate child CDP session on the same renderer.
+      if (sessionId) return
       if (
         (method === 'Runtime.exceptionThrown' || method === 'Runtime.consoleAPICalled')
       ) {
@@ -2174,7 +3115,7 @@ export class NativeWorkbenchSurfaceManager {
           try {
             await this.cdpCommand(record, 'Emulation.clearDeviceMetricsOverride', undefined, () => {
               if (this.surfaces.get(record.id) !== record || record.disposed || record.crashed
-                || record.owner.isDestroyed() || record.view.webContents.isDestroyed()) {
+                || record.owner.isDestroyed() || record.contents.isDestroyed()) {
                 throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
               }
             })
@@ -2198,13 +3139,13 @@ export class NativeWorkbenchSurfaceManager {
       if (
         record.disposed
         || record.crashed
-        || record.view.webContents.isDestroyed()
-        || !record.view.webContents.debugger.isAttached()
+        || record.contents.isDestroyed()
+        || !record.contents.debugger.isAttached()
       ) throw new Error('The isolated DOM inspector is unavailable.')
       let timeout: NodeJS.Timeout | undefined
       try {
         return await Promise.race([
-          record.view.webContents.debugger.sendCommand(method, params),
+          record.contents.debugger.sendCommand(method, params),
           new Promise<never>((_resolve, reject) => {
             timeout = setTimeout(
               () => reject(new Error(`DOM inspector command timed out: ${method}`)),
@@ -2416,8 +3357,8 @@ export class NativeWorkbenchSurfaceManager {
       cleanupFailure
       && !record.disposed
       && !record.crashed
-      && !record.view.webContents.isDestroyed()
-      && record.view.webContents.debugger.isAttached()
+      && !record.contents.isDestroyed()
+      && record.contents.debugger.isAttached()
     ) record.annotationPickerActive = true
     this.auditAnnotationPicker(
       record,
@@ -2436,8 +3377,8 @@ export class NativeWorkbenchSurfaceManager {
     if (record.annotationFocusTimer) clearTimeout(record.annotationFocusTimer)
     record.annotationFocusTimer = null
     if (
-      record.view.webContents.isDestroyed()
-      || !record.view.webContents.debugger.isAttached()
+      record.contents.isDestroyed()
+      || !record.contents.debugger.isAttached()
     ) return null
 
     let inspectModeDisableError: unknown = null
@@ -2552,22 +3493,43 @@ export class NativeWorkbenchSurfaceManager {
       height: candidate.selection.rect.height * scaleY,
     }
     const gap = 8
+    const binding = this.annotationOverlays.get(record.owner)?.binding
+    const editorV2 = binding?.record === record && binding.editorVersion === 2
+    const width = editorV2 ? NATIVE_WORKBENCH_ANNOTATION_EDITOR_WIDTH : NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH
+    const height = editorV2 ? Math.max(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MIN_HEIGHT,
+      Math.min(NATIVE_WORKBENCH_ANNOTATION_EDITOR_MAX_HEIGHT, binding.contentHeight)) : NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT
+    if (editorV2) {
+      const placement = placeAnnotationCard({
+        anchor: { left: selected.x, top: selected.y, width: selected.width, height: selected.height },
+        viewport: { left: surface.x, top: surface.y, width: surface.width, height: surface.height },
+        width,
+        height,
+        preferredSide: binding.placementSide,
+      })
+      binding.placementSide = placement.side
+      return {
+        x: Math.round(placement.left),
+        y: Math.round(placement.top),
+        width: Math.floor(placement.width),
+        height: Math.floor(placement.height),
+      }
+    }
     let x = selected.x + selected.width + gap
     let y = selected.y
-    if (x + NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH > surface.x + surface.width) {
-      x = selected.x - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH - gap
+    if (x + width > surface.x + surface.width) {
+      x = selected.x - width - gap
     }
-    if (x < surface.x) x = surface.x + surface.width - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH
-    if (y + NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT > surface.y + surface.height) {
-      y = selected.y + selected.height - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT
+    if (x < surface.x) x = surface.x + surface.width - width
+    if (y + height > surface.y + surface.height) {
+      y = selected.y + selected.height - height
     }
     return {
       x: Math.round(Math.max(surface.x, Math.min(x, surface.x + surface.width
-        - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH))),
+        - width))),
       y: Math.round(Math.max(surface.y, Math.min(y, surface.y + surface.height
-        - NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT))),
-      width: Math.min(NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH, surface.width),
-      height: Math.min(NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT, surface.height),
+        - height))),
+      width: Math.min(width, surface.width),
+      height: Math.min(height, surface.height),
     }
   }
 
@@ -2674,8 +3636,17 @@ export class NativeWorkbenchSurfaceManager {
     let message
     try {
       message = parseNativeWorkbenchAnnotationOverlayMessage(value)
+      if (message.version !== binding.editorVersion) throw new Error('Unexpected annotation editor version.')
     } catch {
       this.failAnnotationOverlay(binding.record, binding.annotationId, 'invalid-overlay-message')
+      return
+    }
+    if (message.type === 'content-size') {
+      if (binding.contentHeight === message.height) return
+      binding.contentHeight = message.height
+      this.presentAnnotationOverlay(overlay,
+        this.annotationOverlayBounds(binding.record, binding.record.annotationCandidate!),
+        this.ownerCanShowSurfaces(binding.record.owner), true)
       return
     }
     if (message.type === 'draft-changed') {
@@ -2685,8 +3656,9 @@ export class NativeWorkbenchSurfaceManager {
       })
       return
     }
-    if (message.type === 'submit') {
-      this.emit(binding.record, 'annotation-submit', {
+    if (message.type === 'submit' || message.type === 'record-current' || message.type === 'request-batch-submit') {
+      this.emit(binding.record, message.type === 'submit' ? 'annotation-submit'
+        : message.type === 'record-current' ? 'annotation-record-current' : 'annotation-batch-submit', {
         annotationId: binding.annotationId,
         body: message.body,
       })
@@ -2694,6 +3666,7 @@ export class NativeWorkbenchSurfaceManager {
       this.emit(binding.record, 'annotation-cancel', {
         annotationId: binding.annotationId,
         reason: 'user-cancelled',
+        ...(message.type === 'cancel-current' ? { body: message.body } : {}),
       })
     }
     // Submit/cancel are intents, not acknowledgements that Gateway state was
@@ -2768,20 +3741,27 @@ export class NativeWorkbenchSurfaceManager {
     ])
   }
 
+  async navigateSurfaceFromControlUi(request: NativeWorkbenchNavigationRequest): Promise<NativeWorkbenchSurfaceResult> {
+    return await this.navigateSurface(request, undefined, false, request.action === 'navigate')
+  }
+
   async navigateSurface(
     request: NativeWorkbenchNavigationRequest,
+    signal?: AbortSignal,
+    ignoreCache = false,
+    manualDownload = false,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const record = this.surfaces.get(request.surfaceId)
     if (!record || record.disposed) {
-      return { ok: false, message: 'The native Workbench surface no longer exists.' }
+      return { ok: false, code: 'TARGET_NOT_FOUND', message: 'The native Workbench surface no longer exists.' }
     }
     if (record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION) {
       return { ok: false, message: 'This native Workbench surface does not support navigation.' }
     }
-    if (record.crashed || record.view.webContents.isDestroyed()) {
-      return { ok: false, message: 'The native Workbench surface renderer crashed.' }
+    if (record.crashed || record.contents.isDestroyed()) {
+      return { ok: false, code: 'BROWSER_CRASHED', message: 'The native Workbench surface renderer crashed.' }
     }
-    const contents = record.view.webContents
+    const contents = record.contents
     if (
       record.kind === 'artifact-preview'
       && request.action !== 'stop'
@@ -2789,7 +3769,7 @@ export class NativeWorkbenchSurfaceManager {
     ) {
       await this.cancelAnnotationInteraction(record, 'surface-navigation', true)
     }
-    this.cancelPendingAuthentication(record)
+    if (!['find', 'find-next', 'find-stop', 'zoom'].includes(request.action)) this.cancelPendingAuthentication(record)
     if (
       request.action === 'navigate'
       || request.action === 'back'
@@ -2808,10 +3788,15 @@ export class NativeWorkbenchSurfaceManager {
             this.reportPrivilegedGatewayBlock(record, request.url!)
             return {
               ok: false,
+              code: 'NAVIGATION_BLOCKED',
               message: 'The OpenSquilla Gateway is unavailable inside isolated previews.',
             }
           }
-          await contents.loadURL(request.url!)
+          if (record.kind === 'url-preview') {
+            await this.loadBrowserDocument(record, request.url!, undefined, signal, false, false, true, manualDownload)
+          } else {
+            await contents.loadURL(request.url!)
+          }
           break
         case 'back':
           if (contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack()
@@ -2820,9 +3805,17 @@ export class NativeWorkbenchSurfaceManager {
           if (contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward()
           break
         case 'reload':
-          contents.reload()
+          if (record.kind === 'url-preview') {
+            const currentUrl = contents.getURL()
+            const failedUrl = record.browserNavigationError?.url
+            await this.loadBrowserDocument(record, failedUrl || currentUrl || record.documentUrl,
+              undefined, signal, !failedUrl || this.httpUrl(failedUrl)?.href === this.httpUrl(currentUrl)?.href,
+              ignoreCache)
+          } else if (ignoreCache) contents.reloadIgnoringCache()
+          else contents.reload()
           break
         case 'stop':
+          record.browserNavigationOwner?.supersede()
           if (contents.isLoading() || !record.browserDocumentReady) {
             record.browserNavigationStopped = true
             record.browserDocumentReady = false
@@ -2832,12 +3825,65 @@ export class NativeWorkbenchSurfaceManager {
         case 'open-external':
           await shell.openExternal(request.url!, { activate: true })
           break
+        case 'find':
+          record.browserFindQuery = request.query!
+          if (!record.browserFindQuery) contents.stopFindInPage('clearSelection')
+          record.browserFindRequestId = record.browserFindQuery
+            ? contents.findInPage(record.browserFindQuery) : null
+          this.emitBrowserFindState(record)
+          break
+        case 'find-next':
+          if (record.browserFindQuery) record.browserFindRequestId = contents.findInPage(record.browserFindQuery,
+            // Electron 42 passes findNext to Chromium's new_session flag.
+            // False continues an existing query; the default starts a new one.
+            { forward: request.forward !== false, findNext: false })
+          break
+        case 'find-stop':
+          contents.stopFindInPage('clearSelection')
+          record.browserFindQuery = ''
+          record.browserFindRequestId = null
+          this.emitBrowserFindState(record)
+          break
+        case 'zoom':
+          contents.setZoomFactor(request.zoomFactor!)
+          this.emitBrowserFindState(record)
+          break
+        case 'close':
+          if (record.kind !== 'url-preview') return { ok: false, message: 'Only browser tabs support close navigation.' }
+          return await this.requestBrowserClose(record)
+            ? { ok: true } : { ok: false, code: 'CLOSE_CANCELLED', message: 'The page remains open because closing was cancelled.' }
+        case 'download-open': {
+          const download = this.userDownloads.get(request.downloadId!)
+          if (!download || download.record !== record || download.state !== 'completed' || !download.path) {
+            return { ok: false, code: 'DOWNLOAD_NOT_FOUND', message: 'The saved download is no longer available.' }
+          }
+          const error = await shell.openPath(download.path)
+          if (error) return { ok: false, code: 'DOWNLOAD_OPEN_FAILED', message: 'The saved download could not be opened.' }
+          break
+        }
       }
       this.emitNavigationState(record)
       return { ok: true }
     } catch (error) {
-      return { ok: false, message: errorMessage(error) }
+      if (signal && error instanceof DesktopBrowserError) throw error
+      if (error instanceof DesktopBrowserError && error.code === 'NAVIGATION_CANCELLED') {
+        return { ok: false, code: error.code, message: error.message }
+      }
+      return { ok: false, message: errorMessage(error),
+        ...(record.browserNavigationError ? { code: 'NAVIGATION_FAILED', navigationError: record.browserNavigationError } : {}) }
     }
+  }
+
+  reloadFocusedBrowser(owner: BrowserWindow, ignoreCache = false): boolean {
+    const focusedContents = webContents.getFocusedWebContents()
+    const focused = focusedContents?.hostWebContents ?? focusedContents
+    const record = [...this.surfaces.values()].find(candidate => candidate.contents === focused
+      && candidate.kind === 'url-preview' && !candidate.disposed && !candidate.crashed
+      && !candidate.contents.isDestroyed() && candidate.owner === owner && candidate.view.getVisible())
+    if (!record) return false
+    void this.navigateSurface({ version: record.version as 2 | 3 | 4,
+      surfaceId: record.id, action: 'reload' }, undefined, ignoreCache)
+    return true
   }
 
   respondToPermission(
@@ -2868,8 +3914,11 @@ export class NativeWorkbenchSurfaceManager {
     return { ok: true }
   }
 
-  async destroySurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult> {
+  async destroySurface(surfaceId: string, force = false): Promise<NativeWorkbenchSurfaceResult> {
     const pending = this.surfaces.get(surfaceId)
+    if (!force && pending?.kind === 'url-preview' && !await this.requestBrowserClose(pending)) {
+      return { ok: false, code: 'CLOSE_CANCELLED', message: 'The page remains open because closing was cancelled.' }
+    }
     if (pending) {
       // destroyAll and ordinary close share this queue-external fence so a
       // blocked searchForNode cannot complete successfully while disposal is
@@ -2883,6 +3932,125 @@ export class NativeWorkbenchSurfaceManager {
     )
   }
 
+  private emitBrowserFindState(record: NativeWorkbenchSurfaceRecord): void {
+    if (record.kind !== 'url-preview' || record.contents.isDestroyed()) return
+    this.emit(record, 'find-state', { findQuery: record.browserFindQuery,
+      ...(!record.browserFindQuery ? { findMatches: 0, findActiveMatch: 0, findFinal: true } : {}),
+      zoomFactor: record.contents.getZoomFactor() })
+  }
+
+  /** User tab closure must finish before removing its UI or clearing its session. */
+  private requestBrowserClose(record: NativeWorkbenchSurfaceRecord): Promise<boolean> {
+    if (record.disposed || record.contents.isDestroyed()) return Promise.resolve(true)
+    if (this.browserTabsClosePromise && this.browserTabsCloseApproved?.record !== record) return Promise.resolve(false)
+    if (record.browserClosePromise) return record.browserClosePromise
+    const contents = record.contents
+    const pendingPrompt = record.prompt?.state()
+    if (pendingPrompt) record.prompt?.respond(pendingPrompt.id, null)
+    const closing = new Promise<boolean>(resolve => {
+      let settled = false
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      const pause = () => { clearTimeout(timeout); timeout = undefined }
+      const finish = (closed: boolean) => {
+        if (settled) return
+        settled = true
+        pause()
+        contents.removeListener('destroyed', destroyed)
+        record.browserCloseCancelled = undefined
+        record.browserCloseWatchdog = undefined
+        resolve(closed)
+      }
+      const destroyed = () => finish(true)
+      const resume = () => {
+        if (settled) return
+        pause()
+        timeout = setTimeout(() => finish(false), 10_000)
+      }
+      record.browserCloseWatchdog = { pause, resume }
+      record.browserCloseCancelled = () => {
+        // Wait for Chromium to finish its cancellation acknowledgement before
+        // admitting another close on this same document.
+        void contents.executeJavaScript('0').catch(() => undefined).finally(() => {
+          record.playwright?.finishNativeBeforeUnload()
+          finish(false)
+        })
+      }
+      contents.once('destroyed', destroyed)
+      resume()
+      try { contents.close({ waitForBeforeUnload: true }) }
+      catch { finish(false) }
+    })
+    record.browserClosePromise = closing
+    void closing.finally(() => { record.browserClosePromise = undefined })
+    return closing
+  }
+
+  hasBrowserTabs(): boolean {
+    return [...this.surfaces.values()].some(record => record.kind === 'url-preview'
+      && !record.disposed && !record.contents.isDestroyed())
+  }
+
+  async closeBrowserTabs(options: NativeWorkbenchBrowserTabsCloseOptions = {}): Promise<boolean> {
+    if (this.browserTabsClosePromise) {
+      // A caller with its own confirmation cannot borrow another operation's
+      // decision, which may cover a reload rather than the application's quit.
+      return options.confirm ? false : this.browserTabsClosePromise
+    }
+    // Individual native closes are destructive even for clean documents. The
+    // batch must obtain one decision before admitting any of them.
+    const closing = Promise.resolve().then(async () => {
+      const records = [...this.surfaces.values()].filter(record => record.kind === 'url-preview'
+        && !record.disposed && !record.contents.isDestroyed())
+      if (!records.length && !options.confirm) return true
+      if (records.some(record => record.browserClosePromise || record.owner.isDestroyed())) return false
+      const snapshot = records.map(record => ({ record, url: record.contents.getURL(),
+        generation: record.annotationDocumentGeneration }))
+      const chinese = app.getLocale().toLowerCase().startsWith('zh')
+      const approved = options.confirm ? await options.confirm({ tabCount: snapshot.length })
+        : dialog.showMessageBoxSync(records[0]!.owner, {
+          type: 'question',
+          buttons: chinese ? ['保留网页', '关闭所有网页'] : ['Keep pages', 'Close all pages'],
+          title: chinese ? '关闭所有网页？' : 'Close all pages?',
+          message: chinese
+            ? `关闭所有会话的 ${records.length} 个网页，网页中未保存的内容可能丢失。`
+            : `Close ${records.length} web pages across all sessions? Unsaved changes in these pages may be lost.`,
+          defaultId: 0, cancelId: 0, noLink: true,
+        }) === 1
+      if (!approved) return false
+      const unchanged = (entry: typeof snapshot[number]) => !entry.record.disposed
+        && !entry.record.contents.isDestroyed() && this.surfaces.get(entry.record.id) === entry.record
+        && entry.record.annotationDocumentGeneration === entry.generation
+        && entry.record.contents.getURL() === entry.url
+      const current = [...this.surfaces.values()].filter(record => record.kind === 'url-preview'
+        && !record.disposed && !record.contents.isDestroyed())
+      // Changes while the user decides require a fresh decision. In particular,
+      // a new tab must never inherit approval for an earlier batch.
+      if (current.length !== records.length || current.some(record => !records.includes(record))
+        || snapshot.some(entry => !unchanged(entry))) return false
+      try {
+        for (const [index, entry] of snapshot.entries()) {
+          if (snapshot.slice(index).some(pending => !unchanged(pending))) return false
+          const grant = { ...entry, invalid: false }
+          this.browserTabsCloseApproved = grant
+          let closed
+          try { closed = await this.requestBrowserClose(entry.record) }
+          finally { this.browserTabsCloseApproved = undefined }
+          if (!closed) {
+            if (grant.invalid || !unchanged(entry) || entry.record.browserNavigationOwner
+              || entry.record.contents.isLoadingMainFrame()) return false
+            // The user already approved discarding this exact document. A
+            // renderer that cannot complete its close must not stall shutdown.
+            await this.destroyRecord(entry.record)
+          }
+        }
+        return !this.hasBrowserTabs()
+      } finally { this.browserTabsCloseApproved = undefined }
+    })
+    this.browserTabsClosePromise = closing
+    try { return await closing }
+    finally { if (this.browserTabsClosePromise === closing) this.browserTabsClosePromise = undefined }
+  }
+
   private async destroySurfaceNow(surfaceId: string): Promise<NativeWorkbenchSurfaceResult> {
     const record = this.surfaces.get(surfaceId)
     if (!record) return { ok: true }
@@ -2894,15 +4062,28 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
   ): Promise<void> {
     if (record.cleanupPromise) return record.cleanupPromise
+    record.resourceReservation.setPhase('disposing')
     const isCurrent = this.surfaces.get(record.id) === record
     if (isCurrent) this.surfaces.delete(record.id)
     if (isCurrent && this.activeSurfaceId === record.id) this.activeSurfaceId = null
     void this.cancelAnnotationInteraction(record, 'surface-closed', true)
     record.disposed = true
+    record.prompt?.dispose()
+    record.browserDownloadAttempt = undefined
+    record.browserDownloadParent = undefined
+    this.pdfPolicies.get(record.previewSession)?.forgetWebContents(record.webContentsId)
+    this.leaveBrowserFullscreen(record)
+    for (const [id, download] of this.userDownloads) if (download.record === record) this.userDownloads.delete(id)
+    void record.pointer?.dispose()
+    void record.playwright?.dispose().catch(() => undefined)
+    record.playwright = undefined
+    record.revisionWatching = false
+    record.revisionEpoch += 1
     if (record.revisionTimer) clearTimeout(record.revisionTimer)
     record.revisionTimer = null
     record.revisionRequest?.abort()
     record.revisionRequest = null
+    record.revisionRequestBackground = false
     record.visibleRequested = false
     this.rejectPendingPermissions(record)
     this.cancelPendingAuthentication(record)
@@ -2915,16 +4096,20 @@ export class NativeWorkbenchSurfaceManager {
       if (!record.owner.isDestroyed()) record.owner.contentView.removeChildView(record.view)
     } catch {}
     try {
-      if (!record.view.webContents.isDestroyed()) {
-        if (record.view.webContents.debugger.isAttached()) {
+      if (!record.contents.isDestroyed()) {
+        if (record.contents.debugger.isAttached()) {
           record.debuggerExpectedDetach = true
-          record.view.webContents.debugger.detach()
+          record.contents.debugger.detach()
         }
-        record.view.webContents.close({ waitForBeforeUnload: false })
+        record.contents.close({ waitForBeforeUnload: false })
       }
     } catch {}
 
-    const cleanupPromise = this.cleanupDisposedRecord(record)
+    const cleanupPromise = this.cleanupDisposedRecord(record).finally(() => {
+      // Cache cleanup alone does not prove that Chromium released its renderer.
+      // A failed/async native close keeps its slot until actual destruction.
+      releaseReservationAfterDestruction(record.resourceReservation, record.contents)
+    })
     record.cleanupPromise = cleanupPromise
     this.recordCleanups.add(cleanupPromise)
     void cleanupPromise.then(
@@ -2937,11 +4122,15 @@ export class NativeWorkbenchSurfaceManager {
   private async cleanupDisposedRecord(
     record: NativeWorkbenchSurfaceRecord,
   ): Promise<void> {
+    await this.browserDownloads.disposePage({ sessionKey: record.scopeId,
+      targetRef: record.targetRef, webContentsId: record.webContentsId })
     if (record.kind === 'artifact-html') {
       try {
         await record.previewSession.protocol.unhandle(NATIVE_WORKBENCH_ARTIFACT_SCHEME)
       } catch {}
     }
+    if ([...this.surfaces.values()].some(candidate => !candidate.disposed
+      && candidate.previewSession === record.previewSession)) return
     await Promise.allSettled([
       record.previewSession.clearStorageData(),
       record.previewSession.clearCache(),
@@ -2950,6 +4139,7 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   async destroyAll(): Promise<void> {
+    this.browserAutomationStates.clear()
     // Include queued IDs whose replacement record is temporarily between the
     // old-record cleanup and insertion. Enqueuing the destroy behind each
     // create guarantees a close, navigation or owner crash cannot be lost in
@@ -2961,7 +4151,7 @@ export class NativeWorkbenchSurfaceManager {
     for (const record of this.surfaces.values()) {
       this.cancelPendingAuthentication(record)
     }
-    await Promise.all([...ids].map(id => this.destroySurface(id)))
+    await Promise.all([...ids].map(id => this.destroySurface(id, true)))
     await Promise.allSettled([...this.recordCleanups])
     await Promise.allSettled(
       [...this.annotationOverlays.values()].map(overlay => this.disposeAnnotationOverlay(overlay)),
@@ -3052,15 +4242,77 @@ export class NativeWorkbenchSurfaceManager {
     })
   }
 
+  private managedDownloadOwner(record: NativeWorkbenchSurfaceRecord) {
+    const own = { sessionKey: record.scopeId, targetRef: record.targetRef, webContentsId: record.webContentsId }
+    if (record.kind !== 'url-preview' || record.mode !== 'full' || record.disposed) return undefined
+    if (this.browserDownloads.isArmed(own)) return own
+    const grant = record.browserDownloadParent
+    if (!grant) return undefined
+    const parent = [...this.surfaces.values()].find(candidate => candidate.targetRef === grant.targetRef)
+    if (!parent || parent.disposed || parent.kind !== 'url-preview' || parent.mode !== 'full'
+      || parent.contents.isDestroyed() || parent.browserDownloadAttempt !== grant.attempt
+      || parent.previewSession !== record.previewSession || parent.scopeId !== record.scopeId
+      || parent.owner !== record.owner) return undefined
+    const owner = { sessionKey: parent.scopeId, targetRef: parent.targetRef, webContentsId: parent.webContentsId }
+    return this.browserDownloads.isArmed(owner) ? owner : undefined
+  }
+
   private async configureV2Session(record: NativeWorkbenchSurfaceRecord): Promise<void> {
     const { previewSession } = record
+    const pdfPolicy = new NativeWorkbenchPdfResourcePolicy()
+    this.pdfPolicies.set(previewSession, pdfPolicy)
+    const ownerRecord = record
+    const member = (id: number | undefined) => [...this.surfaces.values()].find(candidate =>
+      !candidate.disposed && candidate.previewSession === previewSession
+      && !candidate.contents.isDestroyed() && candidate.webContentsId === id)
     if (record.mode === 'offline') {
       await this.installOfflineRealmGuard(record)
-      record.view.webContents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp')
+      record.contents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp')
     }
     previewSession.webRequest.onHeadersReceived(
       { urls: ['<all_urls>'] },
       (details, callback) => {
+        const browser = member(details.webContentsId)
+        const captureOwner = browser && this.managedDownloadOwner(browser)
+        const disposition = Object.entries(details.responseHeaders ?? {}).find(([name]) =>
+          name.toLowerCase() === 'content-disposition')?.[1]?.[0] ?? ''
+        if (browser?.kind === 'url-preview' && details.resourceType === 'mainFrame'
+          && details.statusCode >= 200 && details.statusCode < 300
+          && this.httpUrl(details.url) && this.v2TopLevelNavigationAllowed(browser, details.url)
+          && /^\s*attachment\s*(?:;|$)/i.test(disposition)) {
+          browser.browserDownloadNavigation = { url: details.url, generation: browser.browserNavigationGeneration }
+        }
+        if (browser && captureOwner && details.resourceType === 'mainFrame'
+          && details.statusCode >= 200 && details.statusCode < 300
+          && this.httpUrl(details.url) && this.v2TopLevelNavigationAllowed(browser, details.url)
+          && Object.entries(details.responseHeaders ?? {}).some(([name, values]) =>
+            name.toLowerCase() === 'content-type' && values.some(value => /^\s*application\/pdf\s*(?:;|$)/i.test(value)))) {
+          // Convert only the authorized tab navigation. An inline iframe PDF
+          // can be a preview generated before the requested export and must
+          // never consume the tab's download capture.
+          if (details.resourceType === 'mainFrame') {
+            browser.browserCapturedPdfNavigation = true
+            browser.browserDownloadNavigation = { url: details.url, generation: browser.browserNavigationGeneration }
+          }
+          callback({ responseHeaders: replaceResponseHeader(details.responseHeaders,
+            'Content-Disposition', /^\s*(?:inline|attachment)\s*(?:;|$)/i.test(disposition)
+              ? disposition.replace(/^\s*(?:inline|attachment)/i, 'attachment') : 'attachment') })
+          return
+        }
+        if (browser?.kind === 'url-preview' && browser.mode === 'full') pdfPolicy.observeResponse({
+          ...details, webContentsId: browser.webContentsId, frame: details.frame ?? null })
+        // Track the version actually loaded, including an explicit reload. A
+        // later HEAD must never label a different on-disk version as loaded.
+        if (record.kind === 'artifact-preview' && details.resourceType === 'mainFrame'
+          && details.url === record.documentUrl && details.statusCode === 200) {
+          const headers = new Headers()
+          for (const [name, values] of Object.entries(details.responseHeaders ?? {})) {
+            for (const value of values) headers.append(name, value)
+          }
+          if (headers.get('x-opensquilla-working-preview') === '1') {
+            record.revisionLast = headers.get('etag')
+          }
+        }
         if (record.mode !== 'offline') {
           // Electron rejects an explicit `undefined` responseHeaders value on
           // some opaque/data responses. Preserve the response untouched while
@@ -3111,9 +4363,9 @@ export class NativeWorkbenchSurfaceManager {
       })
     })
     previewSession.setPermissionCheckHandler(
-      (webContents, permission, requestingOrigin, details) => (
-        webContents === record.view.webContents
-        && record.permissionGrants.has(this.permissionGrantKey(
+      (webContents, permission, requestingOrigin, details) => permission === 'fullscreen'
+        ? Boolean(member(webContents?.id)?.kind === 'url-preview') : Boolean(
+        member(webContents?.id)?.permissionGrants.has(this.permissionGrantKey(
           this.normalizedOrigin(requestingOrigin),
           permission === 'media'
             ? `media:${details.mediaType ?? 'unknown'}`
@@ -3123,12 +4375,18 @@ export class NativeWorkbenchSurfaceManager {
     )
     previewSession.setPermissionRequestHandler(
       (webContents, permission, callback, details) => {
+        const record = member(webContents?.id)
+        if (permission === 'fullscreen') {
+          callback(Boolean(record?.kind === 'url-preview' && record.mode === 'full'
+            && this.activeSurfaceId === record.id && this.hasRecentTrustedGesture(record)))
+          return
+        }
         if (
-          webContents !== record.view.webContents
+          !record
           || !NATIVE_WORKBENCH_PROMPTABLE_PERMISSIONS.has(permission)
         ) {
           callback(false)
-          this.emit(record, 'blocked-action', {
+          this.emit(record ?? ownerRecord, 'blocked-action', {
             action: 'permission',
             reason: 'unsupported-permission',
           })
@@ -3164,10 +4422,13 @@ export class NativeWorkbenchSurfaceManager {
       },
     )
     previewSession.setDisplayMediaRequestHandler((request, callback) => {
+      const record = [...this.surfaces.values()].find(candidate => !candidate.disposed
+        && candidate.previewSession === previewSession && !candidate.contents.isDestroyed()
+        && candidate.contents.mainFrame === request.frame?.top)
       const origin = this.permissionRequestOrigin(request.securityOrigin)
-      if (!request.userGesture || !origin) {
+      if (!record || !request.userGesture || !origin) {
         callback({})
-        this.emit(record, 'blocked-action', {
+        this.emit(record ?? ownerRecord, 'blocked-action', {
           action: 'display-capture',
           reason: 'user-gesture-required',
         })
@@ -3186,24 +4447,89 @@ export class NativeWorkbenchSurfaceManager {
       })
     }, { useSystemPicker: false })
     previewSession.on('will-download', (event, item, webContents) => {
+      const record = member(webContents?.id)
+      const captureOwner = record && this.managedDownloadOwner(record)
+      const navigation = record?.browserNavigationOwner
+      const receipt = record?.browserDownloadNavigation
+      const chain = navigation?.manualDownload && receipt ? item.getURLChain() : []
+      // Only the trusted host address operation can lend one gesture to its
+      // current main-frame attachment, including permitted HTTP redirects.
+      const manualDownload = record?.kind === 'url-preview' && record.mode === 'full'
+        && navigation?.manualDownload && navigation.started && !navigation.cancelled
+        && !record.browserNavigationStopped
+        && receipt?.generation === record.browserNavigationGeneration
+        && chain.includes(navigation.url) && chain.includes(receipt.url)
+        && chain.every(url => this.v2TopLevelNavigationAllowed(record, url))
       if (
-        webContents !== record.view.webContents
-        || record.disposed
-        || !nativeWorkbenchDownloadAllowed(item.hasUserGesture())
+        !record
+        || (!captureOwner && !manualDownload && !nativeWorkbenchDownloadAllowed(item.hasUserGesture()))
       ) {
         event.preventDefault()
-        this.emit(record, 'blocked-action', {
+        this.emit(record ?? ownerRecord, 'blocked-action', {
           action: 'download',
           targetUrl: item.getURL(),
           reason: 'user-gesture-required',
         })
         return
       }
+      if (manualDownload && navigation) {
+        navigation.manualDownload = false
+        navigation.acceptDownload()
+        if (!record.initialDocumentCommitted || record.browserPreviousDocument?.error) {
+          record.browserDownloadedDocument = { url: receipt!.url, name: item.getFilename() }
+          record.browserDocumentReady = false
+          record.browserNavigationError = undefined
+        }
+      }
+      const downloadNavigation = record.browserDownloadNavigation
+      if (downloadNavigation?.generation === record.browserNavigationGeneration
+        && item.getURLChain().includes(downloadNavigation.url)) {
+        downloadNavigation.confirmed = true
+        this.restoreBrowserDocumentAfterDownload(record)
+        // A native save dialog can outlive the provisional navigation. Retain
+        // the confirmed receipt until Chromium exposes the original document;
+        // completion/cancellation and loading events may arrive in either order.
+        item.once('done', () => this.restoreBrowserDocumentAfterDownload(record))
+        void record.contents.executeJavaScript('0').then(() => {
+          this.restoreBrowserDocumentAfterDownload(record)
+        }, () => undefined)
+      }
+      if (captureOwner && this.browserDownloads.capture(captureOwner, item)) return
       // Leaving the save path unset makes Electron show its native confirmation
       // dialog. Supplying options here makes that contract explicit.
       item.setSaveDialogOptions({ title: 'Save preview download' })
+      if (record.kind === 'url-preview' && typeof item.once === 'function') {
+        const id = `download-${randomUUID()}`
+        // Retain only a bounded set of session-owned completion actions.
+        const previous = [...this.userDownloads].filter(([, download]) => download.record === record)
+        if (previous.length >= 8) this.userDownloads.delete(previous[0]![0])
+        const saved = { record, path: '', state: 'progressing' }
+        this.userDownloads.set(id, saved)
+        let lastUpdate = 0
+        const report = (state: 'progressing' | 'completed' | 'cancelled' | 'interrupted') => {
+          saved.state = state
+          this.emit(record, 'download-state', { downloadId: id, downloadName: item.getFilename(),
+            downloadState: state, receivedBytes: item.getReceivedBytes(), totalBytes: item.getTotalBytes() })
+        }
+        item.on('updated', (_event, state) => {
+          if (Date.now() - lastUpdate < 200) return
+          lastUpdate = Date.now()
+          report(state)
+        })
+        item.once('done', (_event, state) => {
+          if (state === 'completed') saved.path = item.getSavePath()
+          report(state)
+        })
+        report('progressing')
+      }
+      this.emitNavigationState(record)
     })
     previewSession.webRequest.onBeforeRequest({ urls: ['<all_urls>'] }, (details, callback) => {
+      const browser = member(details.webContentsId)
+      const pdfRequest = browser && { ...details, webContentsId: browser.webContentsId,
+        frame: details.frame ?? null }
+      const pdfAllowed = browser?.kind === 'url-preview' && browser.mode === 'full'
+        && pdfPolicy.requestAllowed(pdfRequest!)
       const networkAllowed = nativeWorkbenchV2NetworkUrlAllowed(
         details.url,
         record.mode,
@@ -3213,7 +4539,7 @@ export class NativeWorkbenchSurfaceManager {
         networkAllowed
         && this.isPrivilegedGatewayTarget(details.url)
       )
-      const allowed = networkAllowed && !privilegedGateway
+      const allowed = (networkAllowed && !privilegedGateway) || Boolean(pdfAllowed)
       if (privilegedGateway) {
         this.reportPrivilegedGatewayBlock(record, details.url)
       } else if (!allowed && record.mode === 'offline' && !record.blockedNetworkReported) {
@@ -3223,9 +4549,45 @@ export class NativeWorkbenchSurfaceManager {
           reason: 'offline-policy',
         })
       }
-      callback({
-        cancel: !allowed,
-      })
+      if (!allowed && browser?.kind === 'url-preview' && browser.mode === 'full'
+        && pdfRequest && pdfPolicy.needsFrameTree(pdfRequest)
+        && browser.contents.debugger.isAttached()) {
+        // Blob/data PDF documents do not traverse Session response headers.
+        // Query only this existing target's canonical browser MIME metadata;
+        // renderer document properties are not evidence for an internal grant.
+        const generation = browser.annotationDocumentGeneration
+        const frameLineage: { frameTreeNodeId: number; url: string }[] = []
+        for (let frame = pdfRequest.frame; frame; frame = frame.parent) {
+          if (frame.detached || frameLineage.length >= 64) { callback({ cancel: true }); return }
+          frameLineage.push({ frameTreeNodeId: frame.frameTreeNodeId, url: frame.url })
+        }
+        let completed = false
+        const finish = (permit: boolean) => {
+          if (completed) return
+          completed = true
+          clearTimeout(timer)
+          callback({ cancel: !permit })
+        }
+        const timer = setTimeout(() => finish(false), 1500)
+        void browser.contents.debugger.sendCommand('Page.getFrameTree').then(result => {
+          if (completed) return
+          if (browser.disposed || browser.contents.isDestroyed()
+            || member(browser.webContentsId) !== browser
+            || browser.annotationDocumentGeneration !== generation) { finish(false); return }
+          let frame = pdfRequest.frame
+          for (const captured of frameLineage) {
+            if (!frame || frame.detached || frame.frameTreeNodeId !== captured.frameTreeNodeId
+              || frame.url !== captured.url) { finish(false); return }
+            frame = frame.parent
+          }
+          if (frame) { finish(false); return }
+          pdfPolicy.observeFrameTree(pdfRequest,
+            result as Parameters<NativeWorkbenchPdfResourcePolicy['observeFrameTree']>[1])
+          finish(pdfPolicy.isViewerResourceRequest(pdfRequest))
+        }).catch(() => finish(false))
+        return
+      }
+      callback({ cancel: !allowed })
     })
     previewSession.webRequest.onCompleted({ urls: ['<all_urls>'] }, details => {
       if (
@@ -3242,6 +4604,14 @@ export class NativeWorkbenchSurfaceManager {
       }
     })
     previewSession.webRequest.onErrorOccurred({ urls: ['<all_urls>'] }, details => {
+      const browser = member(details.webContentsId)
+      if (browser?.kind === 'url-preview' && details.error !== 'net::ERR_ABORTED'
+        && pdfPolicy.isViewerResourceRequest({ ...details, webContentsId: browser.webContentsId,
+          frame: details.frame ?? null })) {
+        this.noteBrowserNavigationFailure(browser, this.httpUrl(browser.contents.getURL())?.href
+          ?? browser.documentUrl, 'ERR_PDF_VIEWER_FAILED')
+        return
+      }
       if (
         details.resourceType !== 'mainFrame'
         && nativeWorkbenchMissingResourceIsLocal(
@@ -3266,7 +4636,7 @@ export class NativeWorkbenchSurfaceManager {
       record.offlineRealmGuardInstalled = installed
       record.offlineRealmGuardScriptId = scriptId
     }
-    const contents = record.view.webContents
+    const contents = record.contents
     // A newly-created WebContentsView has no renderer target until its first
     // navigation. Materialize a trusted empty document before attaching CDP;
     // the untrusted artifact is loaded only after the guard is registered.
@@ -3359,6 +4729,7 @@ export class NativeWorkbenchSurfaceManager {
       callback: finish,
       timeout,
     })
+    for (const notify of [...record.browserBlockerWaiters]) notify()
     this.emit(record, 'permission-request', {
       requestId,
       permission: request.permission,
@@ -3507,6 +4878,7 @@ export class NativeWorkbenchSurfaceManager {
       promptSession,
       timeout,
     }
+    for (const notify of [...record.browserBlockerWaiters]) notify()
     prompt.once('closed', () => {
       if (record.pendingAuthentication?.prompt === prompt) {
         this.cancelPendingAuthentication(record)
@@ -3614,23 +4986,189 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   private configureWebContents(record: NativeWorkbenchSurfaceRecord): void {
-    const contents = record.view.webContents
-    contents.setWindowOpenHandler(details => {
-      if (record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
-        if (
-          !details.postBody
-          && this.hasRecentTrustedGesture(record)
-          && this.httpUrl(details.url)
-        ) {
-          void this.confirmPopup(record, details.url)
+    const contents = record.contents
+    if (record.kind === 'url-preview') {
+      contents.on('will-frame-navigate', event => {
+        if (!event.isMainFrame || record.disposed || contents.isDestroyed()
+          || record.owner.isDestroyed() || record.mode !== 'full'
+          || event.frame !== contents.mainFrame) return
+        let initiator: Electron.WebFrameMain | null | undefined
+        try { initiator = event.initiator?.top } catch { return }
+        const parent = [...this.surfaces.values()].find(candidate =>
+          candidate !== record && candidate.kind === 'url-preview' && candidate.mode === 'full'
+          && !candidate.disposed && !candidate.contents.isDestroyed() && candidate.browserDownloadAttempt
+          && candidate.previewSession === record.previewSession && candidate.scopeId === record.scopeId
+          && candidate.owner === record.owner && candidate.contents.mainFrame === initiator)
+        // Chromium identifies the real initiating frame even when an existing
+        // named tab is reused by script, late listeners or form.submit().
+        if (!parent || !this.v2TopLevelNavigationAllowed(record, event.url)
+          || !this.browserDownloads.isArmed({ sessionKey: parent.scopeId,
+            targetRef: parent.targetRef, webContentsId: parent.webContentsId })) {
+          // Keep a verified attempt through the destination's own landing-page
+          // redirect, and through a new popup's initial host loadURL path.
+          if ((initiator === contents.mainFrame || !initiator && !record.initialDocumentCommitted
+            && record.openerTargetRef === record.browserDownloadParent?.targetRef)
+            && this.v2TopLevelNavigationAllowed(record, event.url)
+            && record.browserDownloadParent && this.managedDownloadOwner(record)) return
+          record.browserDownloadParent = undefined
+          return
         }
-        this.emit(record, 'blocked-action', {
-          action: 'popup',
-          targetUrl: details.url,
-          reason: this.hasRecentTrustedGesture(record)
-            ? 'host-confirmation-required'
-            : 'user-gesture-required',
+        if (!this.browserDownloads.isArmed({ sessionKey: record.scopeId,
+          targetRef: record.targetRef, webContentsId: record.webContentsId })) record.browserDownloadParent = {
+          targetRef: parent.targetRef, attempt: parent.browserDownloadAttempt!,
+        }
+      })
+      contents.on('found-in-page', (_event, result) => {
+        if (record.browserFindRequestId !== result.requestId) return
+        this.emit(record, 'find-state', { findQuery: record.browserFindQuery,
+          findMatches: result.matches, findActiveMatch: result.activeMatchOrdinal,
+          findFinal: result.finalUpdate, zoomFactor: contents.getZoomFactor() })
+      })
+      contents.on('zoom-changed', () => this.emitBrowserFindState(record))
+      contents.on('enter-html-full-screen', () => {
+        if (record.disposed || record.owner.isDestroyed()) return
+        this.htmlFullscreen = { record, ownerWasFullscreen: record.owner.isFullScreen() }
+        record.owner.setFullScreen(true)
+        this.reapplyActiveBounds(record.owner)
+      })
+      contents.on('leave-html-full-screen', () => this.leaveBrowserFullscreen(record))
+      contents.on('context-menu', (_event, params) => {
+        record.lastTrustedGestureAt = Date.now()
+        showBrowserContextMenu(contents, params, {
+          canOpen: url => Boolean(this.httpUrl(url) && this.v2TopLevelNavigationAllowed(record, url)),
+          openRelated: url => { void this.executeBrowser({ sessionKey: record.scopeId, operation: 'open',
+            url, contextTargetRef: record.targetRef }, AbortSignal.timeout(30_000)).catch(() => undefined) },
+          navigate: action => { void this.navigateSurface({ version: record.version as 2 | 3 | 4,
+            surfaceId: record.id, action }) },
+          find: () => this.emit(record, 'find-requested'),
         })
+      })
+      contents.on('will-prevent-unload', event => {
+        const approved = this.browserTabsCloseApproved
+        if (approved?.record === record) {
+          // Preserve Chromium's trusted beforeunload/unload execution after the
+          // explicit batch decision; there is no second, partially destructive
+          // series of user decisions.
+          record.playwright?.finishNativeBeforeUnload()
+          if (record.annotationDocumentGeneration === approved.generation
+            && contents.getURL() === approved.url && !record.browserNavigationOwner
+            && !contents.isLoadingMainFrame()) event.preventDefault()
+          else {
+            approved.invalid = true
+            record.browserCloseCancelled?.()
+          }
+          return
+        }
+        const chinese = app.getLocale().toLowerCase().startsWith('zh')
+        record.browserCloseWatchdog?.pause()
+        let leave = false
+        try {
+          leave = dialog.showMessageBoxSync(record.owner, {
+            type: 'question', buttons: chinese ? ['留在页面', '离开页面'] : ['Stay', 'Leave'],
+            title: chinese ? '离开此页面？' : 'Leave this page?',
+            message: chinese ? '此页面上的更改可能尚未保存。' : 'Changes on this page may not be saved.',
+            defaultId: 0, cancelId: 0, noLink: true,
+          }) === 1
+        } finally {
+          // Human decision time is separate from Chromium's close watchdog.
+          record.browserCloseWatchdog?.resume()
+        }
+        // Electron resolves this decision locally. Its CDP notification may
+        // omit javascriptDialogClosed when the page stays open.
+        record.playwright?.finishNativeBeforeUnload()
+        if (leave) event.preventDefault()
+        else {
+          if (record.browserNavigationOwner) record.browserNavigationOwner.cancel()
+          else this.restoreBrowserDocumentAfterAbortedNavigation(record)
+          record.browserCloseCancelled?.()
+        }
+      })
+    }
+    contents.setWindowOpenHandler(details => {
+      const target = this.httpUrl(details.url)
+      const managedPopup = record.kind === 'url-preview' && record.mode === 'full'
+        && !record.disposed && !record.owner.isDestroyed()
+        && (details.url === 'about:blank' || (target && this.v2TopLevelNavigationAllowed(record, target.href)))
+      if (managedPopup) {
+        if (!this.resourceBudget.hasCapacity('browser')) {
+          this.emit(record, 'blocked-action', { action: 'popup', reason: 'resource-limit' })
+          return { action: 'deny' }
+        }
+        return { action: 'allow', outlivesOpener: true,
+          overrideBrowserWindowOptions: { webPreferences: {
+            session: record.previewSession, contextIsolation: true, nodeIntegration: false,
+            preload: BROWSER_PROMPT_PRELOAD,
+            sandbox: true, webSecurity: true, webviewTag: false, devTools: false,
+            navigateOnDragDrop: false, disableHtmlFullscreenWindowResize: true,
+          } }, createWindow: options => {
+          // Recheck at actual allocation: another surface may have been created
+          // since Chromium asked whether the popup was allowed.
+          if (!this.resourceBudget.hasCapacity('browser')) {
+            const guest = (options as Electron.WebContentsViewConstructorOptions).webContents
+            if (guest && !guest.isDestroyed()) guest.close({ waitForBeforeUnload: false })
+            throw new DesktopBrowserError('RESOURCE_LIMIT', 'Close an existing browser tab before opening another.')
+          }
+          // Retain Chromium's opener, POST body and shared session semantics.
+          // Only the child renderer is registered as a new authorized target.
+          const viewOptions: Electron.WebContentsViewConstructorOptions = { ...options, webPreferences: { ...options.webPreferences,
+            session: record.previewSession, contextIsolation: true, nodeIntegration: false,
+            preload: BROWSER_PROMPT_PRELOAD,
+            sandbox: true, webSecurity: true, webviewTag: false, devTools: false,
+            navigateOnDragDrop: false, disableHtmlFullscreenWindowResize: true,
+          } }
+          // OpenURLFromTab supplies an explicit undefined guest. WebContentsView
+          // treats a present webContents property as an existing renderer.
+          const hasGuest = Boolean(viewOptions.webContents)
+          if (!hasGuest) delete viewOptions.webContents
+          const view = new WebContentsView(viewOptions)
+          if (view.webContents.session !== record.previewSession) {
+            view.webContents.close({ waitForBeforeUnload: false })
+            throw new DesktopBrowserError('NAVIGATION_BLOCKED', 'The popup browser session did not match its opener.')
+          }
+          const child = this.allocateSurface({ version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
+            surfaceId: `browser-${randomUUID()}`, kind: 'url-preview',
+            payload: { scopeId: record.scopeId, url: details.url } }, record.owner, record.previewSession, view)
+          child.openerTargetRef = record.targetRef
+          child.resourceReservation.setPhase('resident')
+          if (record.browserDownloadAttempt && this.managedDownloadOwner(record)) {
+            child.browserDownloadParent = { targetRef: record.targetRef, attempt: record.browserDownloadAttempt }
+          }
+          child.browserOpenedHidden = true
+          this.configureWebContents(child)
+          view.setVisible(false)
+          record.owner.contentView.addChildView(view)
+          record.playwright?.invalidate()
+          // Finish Chromium's synchronous window.open handshake before attaching
+          // a debugger to the child renderer or asking it to execute commands.
+          setImmediate(() => {
+            if (child.disposed || view.webContents.isDestroyed()) return
+            void this.initializeAnnotationCdp(child).then(async () => {
+              if (record.playwright && !child.disposed) {
+                child.playwright = new BrowserPlaywrightDriver(view.webContents,
+                  () => view.getVisible() && child.owner.isVisible(), undefined, child.prompt)
+                child.pointer = child.playwright.pointer
+                await child.playwright.initialize(() => {
+                  if (child.disposed) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The popup closed.')
+                }, new AbortController().signal)
+              }
+            }).catch(() => { child.cdpReady = false })
+            if (!hasGuest) {
+              const postBody = details.postBody
+              void this.loadBrowserDocument(child, details.url, {
+                httpReferrer: details.referrer,
+                ...(postBody ? { postData: postBody.data,
+                  extraHeaders: `Content-Type: ${postBody.contentType}${postBody.boundary ? `; boundary=${postBody.boundary}` : ''}` } : {}),
+              }).catch(() => undefined)
+            }
+          })
+          return view.webContents
+        } }
+      }
+      if (record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
+        if (record.kind !== 'url-preview' && !details.postBody
+          && this.hasRecentTrustedGesture(record) && target) void this.confirmPopup(record, details.url)
+        this.emit(record, 'blocked-action', { action: 'popup', targetUrl: details.url,
+          reason: 'navigation-policy' })
       }
       return { action: 'deny' }
     })
@@ -3748,12 +5286,35 @@ export class NativeWorkbenchSurfaceManager {
     }
     contents.on(
       'did-start-navigation',
-      (_event, _targetUrl, _isInPlace, isMainFrame) => {
+      (_event, _targetUrl, isInPlace, isMainFrame) => {
         if (!isMainFrame || !(record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) return
+        if (!isInPlace) {
+          record.browserDownloadNavigation = undefined
+          record.browserDownloadedDocument = undefined
+          record.revisionInteracted = false
+          const navigation = record.browserNavigationOwner
+          if (!navigation || navigation.started || navigation.url !== _targetUrl) {
+            record.browserPreviousDocument = { url: contents.mainFrame.url || contents.getURL() || record.documentUrl,
+              ready: record.browserDocumentReady,
+              stopped: record.browserNavigationStopped, error: record.browserNavigationError }
+          }
+          if (navigation && !navigation.started && navigation.url === _targetUrl) {
+            navigation.started = true
+          } else {
+            // A link, history action, or user navigation replaces the old
+            // request even when it visits exactly the same URL again.
+            record.browserNavigationGeneration += 1
+            record.browserNavigationOwner = undefined
+            navigation?.supersede()
+          }
+        }
         record.browserNavigationStopped = false
-        if (
-          record.kind !== 'artifact-html'
-        ) {
+        if (record.kind === 'url-preview' && this.browserDocumentUrl(_targetUrl)) {
+          record.browserNavigationError = undefined
+          record.documentUrl = _targetUrl
+        }
+        if (!isInPlace) record.pointer?.navigationStarted()
+        if (!isInPlace && record.kind !== 'artifact-html') {
           record.browserDocumentReady = false
           record.browserRuntimeException = false
           record.missingResourceReported = false
@@ -3772,6 +5333,16 @@ export class NativeWorkbenchSurfaceManager {
           record.initialDocumentCommitted = true
         }
         if (isMainFrame && record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
+          const committed = record.kind === 'url-preview' && this.browserDocumentUrl(targetUrl)
+          if (committed && this.v2TopLevelNavigationAllowed(record, committed)) {
+            // A redirect commits a different URL from did-start-navigation's
+            // request. Future retained-document snapshots must describe the
+            // loaded page, including authenticated login redirect landings.
+            record.documentUrl = committed
+            record.initialDocumentCommitted = true
+          }
+          record.browserPreviousDocument = undefined
+          record.browserDownloadNavigation = undefined
           this.rejectPendingPermissions(record)
           if (httpResponseCode === 410) this.emit(record, 'capability-expired')
           if (
@@ -3794,8 +5365,28 @@ export class NativeWorkbenchSurfaceManager {
       },
     )
     contents.on('before-input-event', (event, input) => {
-      if (input.type === 'keyDown') record.lastTrustedGestureAt = Date.now()
-      if (input.type === 'keyDown' && input.key === 'Escape') {
+      if (input.type === 'keyDown') {
+        record.lastTrustedGestureAt = Date.now()
+        record.revisionInteracted = true
+      }
+      if (record.kind === 'url-preview' && input.type === 'keyDown' && !input.alt
+        && input.key.toLowerCase() === 'f' && (process.platform === 'darwin' ? input.meta : input.control)) {
+        event.preventDefault()
+        record.owner.webContents.focus()
+        this.emit(record, 'find-requested')
+        return
+      }
+      if (record.kind === 'url-preview' && input.type === 'keyDown' && !input.alt
+        && (input.key === 'F5' || input.key.toLowerCase() === 'r'
+          && (process.platform === 'darwin' ? input.meta : input.control))) {
+        event.preventDefault()
+        const ignoreCache = input.shift || input.key === 'F5' && input.control
+        void this.navigateSurface({ version: record.version as 2 | 3 | 4,
+          surfaceId: record.id, action: 'reload' }, undefined, ignoreCache)
+        return
+      }
+      if (input.type === 'keyDown' && input.key === 'Escape'
+        && (record.kind !== 'url-preview' || record.annotationPickerActive || record.browserFindQuery)) {
         event.preventDefault()
         this.emit(record, 'escape')
         return
@@ -3818,26 +5409,27 @@ export class NativeWorkbenchSurfaceManager {
       }
     })
     contents.on('before-mouse-event', (_event, input) => {
-      if (input.type === 'mouseDown') record.lastTrustedGestureAt = Date.now()
+      if (input.type === 'mouseDown') {
+        record.lastTrustedGestureAt = Date.now()
+        record.revisionInteracted = true
+      }
     })
     contents.on('did-start-loading', () => {
-      if (
-        record.kind !== 'artifact-html'
-      ) {
-        record.browserDocumentReady = false
-        record.browserRuntimeException = false
-        record.missingResourceReported = false
-        record.blockedNetworkReported = false
-        record.privilegedOriginReported = false
-        this.invalidateBrowserAnchors(record)
-      }
+      // Main-document navigation owns readiness. Loading also fires for
+      // fragments and child frames, which keep the existing document usable.
+      if (!contents.isLoadingMainFrame()) return
       this.emit(record, 'loading')
       this.emitNavigationState(record)
     })
-    contents.on('did-stop-loading', () => this.emitNavigationState(record))
+    contents.on('did-stop-loading', () => {
+      this.restoreBrowserDocumentAfterDownload(record)
+      this.emitNavigationState(record)
+    })
     contents.on('page-title-updated', () => this.emitNavigationState(record))
-    contents.on('did-navigate-in-page', () => {
+    contents.on('did-navigate-in-page', (_event, targetUrl, isMainFrame) => {
+      if (!isMainFrame) return
       if ((record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) {
+        if (record.kind === 'url-preview' && this.browserDocumentUrl(targetUrl)) record.documentUrl = targetUrl
         record.annotationDocumentGeneration += 1
         this.invalidateBrowserAnchors(record)
         void this.cancelAnnotationInteraction(record, 'surface-navigation', true)
@@ -3850,6 +5442,7 @@ export class NativeWorkbenchSurfaceManager {
       const generation = record.annotationDocumentGeneration
       const isCurrent = () => !record.disposed && !record.crashed
         && !record.browserNavigationStopped
+        && !record.browserNavigationError
         && !contents.isDestroyed() && this.surfaces.get(record.id) === record
         && record.annotationDocumentGeneration === generation
       record.browserViewportReady = this.initializeHiddenBrowserViewport(record, () => {
@@ -3858,7 +5451,10 @@ export class NativeWorkbenchSurfaceManager {
       // Observe failures immediately; did-finish-load must not publish readiness
       // for a failed or superseded initialization.
       void record.browserViewportReady.catch(error => {
-        if (isCurrent()) this.failRecord(record, 'error', { message: errorMessage(error) })
+        if (!isCurrent()) return
+        if (record.kind === 'url-preview') {
+          this.noteBrowserNavigationFailure(record, record.documentUrl, 'ERR_BROWSER_INITIALIZATION_FAILED')
+        } else this.failRecord(record, 'error', { message: errorMessage(error) })
       })
     })
     contents.on('did-finish-load', () => {
@@ -3866,17 +5462,43 @@ export class NativeWorkbenchSurfaceManager {
       void record.browserViewportReady.then(() => {
         if (record.disposed || record.crashed || contents.isDestroyed()
           || record.browserNavigationStopped
+          || record.browserNavigationError
           || this.surfaces.get(record.id) !== record
           || record.annotationDocumentGeneration !== generation) return
         if (record.kind !== 'artifact-html') record.browserDocumentReady = true
         record.initialDocumentCommitted = true
+        void record.pointer?.documentReady()
         record.authenticationAttempts.clear()
         this.emit(record, 'ready')
         this.emitNavigationState(record)
+        this.emitBrowserFindState(record)
       }, () => { /* The dom-ready observer reports initialization failure. */ })
     })
-    contents.on('did-fail-load', (_event, errorCode, errorDescription, _url, isMainFrame) => {
-      if (!isMainFrame || record.disposed || errorCode === -3) return
+    contents.on('did-fail-load', (_event, errorCode, errorDescription, failedUrl, isMainFrame, processId, routingId) => {
+      if (record.disposed) return
+      if (errorCode === -3) {
+        if (isMainFrame) this.restoreBrowserDocumentAfterDownload(record)
+        return
+      }
+      if (!isMainFrame) {
+        const frame = webFrameMain.fromId(processId, routingId) ?? null
+        if (record.kind === 'url-preview' && this.pdfPolicies.get(record.previewSession)?.isViewerResourceRequest({
+          url: failedUrl, method: 'GET', resourceType: 'subFrame', webContentsId: contents.id, frame,
+        })) this.noteBrowserNavigationFailure(record, this.httpUrl(contents.getURL())?.href
+          ?? record.documentUrl, 'ERR_PDF_VIEWER_FAILED', errorCode)
+        return
+      }
+      if (record.kind === 'url-preview') {
+        // Programmatic navigation owns its promise and generation. Let that
+        // path reject with the right target, and ignore late failures from a
+        // navigation that has already been superseded.
+        if (!record.browserNavigationPromise && !record.browserDocumentReady
+          && (!failedUrl || failedUrl === record.documentUrl)) {
+          this.noteBrowserNavigationFailure(record, failedUrl || record.documentUrl,
+            errorDescription || 'ERR_FAILED', errorCode)
+        }
+        return
+      }
       if (
         record.kind !== 'artifact-html'
       ) {
@@ -3894,7 +5516,22 @@ export class NativeWorkbenchSurfaceManager {
       this.failRecord(record, 'crashed', { reason: detail.reason })
     })
     contents.on('unresponsive', () => {
-      this.failRecord(record, 'unresponsive', { reason: 'unresponsive' })
+      if (record.kind === 'url-preview'
+        && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4) {
+        record.browserUnresponsive = true
+        this.emitNavigationState(record)
+      } else this.failRecord(record, 'unresponsive', { reason: 'unresponsive' })
+    })
+    contents.on('responsive', () => {
+      record.browserUnresponsive = false
+      this.emitNavigationState(record)
+    })
+    contents.once('destroyed', () => {
+      if (record.disposed) return
+      if (record.kind === 'url-preview') this.emit(record, 'browser-closed', {
+        sessionKey: record.scopeId, targetRef: record.targetRef,
+      })
+      void this.destroyRecord(record)
     })
   }
 
@@ -3913,6 +5550,10 @@ export class NativeWorkbenchSurfaceManager {
     } catch {
       return null
     }
+  }
+
+  private browserDocumentUrl(value: string): string | undefined {
+    return value === BROWSER_BLANK_URL ? value : this.httpUrl(value)?.href
   }
 
   private externalProtocolUrl(value: string): URL | null {
@@ -3946,7 +5587,7 @@ export class NativeWorkbenchSurfaceManager {
       this.rejectPendingPermissions(record)
       this.cancelPendingAuthentication(record)
       record.authenticationAttempts.clear()
-      await record.view.webContents.loadURL(target.href).catch(() => undefined)
+      await record.contents.loadURL(target.href).catch(() => undefined)
     } else if (result.response === 1) {
       await shell.openExternal(target.href, { activate: true }).catch(() => undefined)
     }
@@ -3977,6 +5618,7 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
     targetUrl: string,
   ): boolean {
+    if (targetUrl === BROWSER_BLANK_URL) return record.kind === 'url-preview' && record.mode === 'full'
     try {
       const target = new URL(targetUrl)
       if (target.protocol !== 'http:' && target.protocol !== 'https:') return false
@@ -4044,13 +5686,23 @@ export class NativeWorkbenchSurfaceManager {
       record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION
       || record.disposed
       || record.crashed
-      || record.view.webContents.isDestroyed()
+      || record.contents.isDestroyed()
     ) return
-    const contents = record.view.webContents
+    const contents = record.contents
+    if (record.openerTargetRef && !record.popupAnnounced && this.httpUrl(contents.getURL())) {
+      record.popupAnnounced = true
+      this.emit(record, 'browser-opened', { url: contents.getURL(), title: contents.getTitle(),
+        sessionKey: record.scopeId, targetRef: record.targetRef })
+    }
     this.emit(record, 'navigation-state', {
-      url: contents.getURL(),
-      title: contents.getTitle(),
-      loading: contents.isLoading(),
+      targetRef: record.targetRef, sessionKey: record.scopeId,
+      url: record.browserNavigationError?.url || record.browserDownloadedDocument?.url || contents.getURL() || record.documentUrl,
+      title: record.browserDownloadedDocument ? `Download: ${record.browserDownloadedDocument.name}` : contents.getTitle(),
+      loading: !record.browserNavigationError && !record.browserDownloadedDocument && contents.isLoading(),
+      navigationError: record.browserNavigationError ?? null,
+      pageState: record.browserUnresponsive || this.unresponsiveWindows.has(record.owner) ? 'unresponsive'
+        : record.browserNavigationError ? 'navigation_failed' : record.browserDocumentReady ? 'ready'
+          : record.browserDownloadedDocument ? 'download' : 'loading',
       canGoBack: contents.navigationHistory.canGoBack(),
       canGoForward: contents.navigationHistory.canGoForward(),
     })
@@ -4062,7 +5714,9 @@ export class NativeWorkbenchSurfaceManager {
       if (other !== record) this.hideRecord(other)
     }
     this.activeSurfaceId = record.id
-    record.view.setBounds(record.rect)
+    const bounds = this.resolveEffectiveSurfaceRect(record)
+    if (bounds) record.view.setBounds(bounds)
+    this.emitBrowserFindState(record)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
     const overlay = this.annotationOverlays.get(record.owner)
     if (
@@ -4080,6 +5734,15 @@ export class NativeWorkbenchSurfaceManager {
   }
 
   private hideRecord(record: NativeWorkbenchSurfaceRecord): void {
+    if (this.htmlFullscreen?.record === record) {
+      void record.contents.executeJavaScript('document.exitFullscreen().catch(() => {})').catch(() => undefined)
+      this.leaveBrowserFullscreen(record)
+    }
+    // Hiding cancels the native picker while Vue flushes an annotation draft.
+    // Retain the document throughout that handoff, even if it is shown again.
+    if (record.annotationPickerActive || record.annotationCandidate || record.annotationFallbackActive) {
+      record.revisionInteracted = true
+    }
     void this.cancelAnnotationInteraction(record, 'surface-hidden', true)
     // A queued hide can arrive after a replacement has already installed a
     // new record under the same surface id. Never let the stale record clear
@@ -4095,11 +5758,14 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
     visible: boolean,
   ): void {
+    visible = visible && !record.browserNavigationError
     try {
-      if (!record.view.webContents.isDestroyed()) {
-        record.view.webContents.setAudioMuted(!visible)
+      if (!record.contents.isDestroyed()) {
+        record.contents.setAudioMuted(!visible)
       }
       record.view.setVisible(visible && !record.annotationFallbackActive)
+      void record.pointer?.sync()
+      this.updateWorkingPreviewVisibility(record, visible && !record.annotationFallbackActive)
       const overlay = this.annotationOverlays.get(record.owner)
       if (
         overlay?.binding?.record === record
@@ -4110,6 +5776,16 @@ export class NativeWorkbenchSurfaceManager {
 
   refreshBounds(owner: BrowserWindow): void {
     this.reapplyActiveBounds(owner)
+  }
+
+  private leaveBrowserFullscreen(record: NativeWorkbenchSurfaceRecord): void {
+    const fullscreen = this.htmlFullscreen
+    if (fullscreen?.record !== record) return
+    this.htmlFullscreen = null
+    if (!record.owner.isDestroyed()) {
+      if (!fullscreen.ownerWasFullscreen) record.owner.setFullScreen(false)
+      this.reapplyActiveBounds(record.owner)
+    }
   }
 
   private reapplyActiveBounds(owner: BrowserWindow): void {
@@ -4123,11 +5799,12 @@ export class NativeWorkbenchSurfaceManager {
       return
     }
     record.rect = this.resolveSurfaceRect(record)
-    if (!record.rect) {
+    const bounds = this.resolveEffectiveSurfaceRect(record)
+    if (!bounds) {
       this.setPhysicalVisibility(record, false)
       return
     }
-    record.view.setBounds(record.rect)
+    record.view.setBounds(bounds)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(owner))
     const overlay = this.annotationOverlays.get(owner)
     if (
@@ -4200,10 +5877,18 @@ export class NativeWorkbenchSurfaceManager {
     owner.webContents.on('zoom-changed', () => this.reapplyActiveBounds(owner))
     owner.webContents.on('unresponsive', () => {
       this.unresponsiveWindows.add(owner)
-      this.failOwnedSurfaces(owner, 'owner-unresponsive')
+      for (const record of [...this.surfaces.values()]) {
+        if (record.owner !== owner) continue
+        if (record.kind === 'url-preview'
+          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4) this.emitNavigationState(record)
+        else this.failRecord(record, 'crashed', { reason: 'owner-unresponsive' })
+      }
     })
     owner.webContents.on('responsive', () => {
       this.unresponsiveWindows.delete(owner)
+      for (const record of this.surfaces.values()) {
+        if (record.owner === owner && record.kind === 'url-preview') this.emitNavigationState(record)
+      }
     })
     owner.webContents.on('render-process-gone', () => {
       this.unresponsiveWindows.add(owner)
@@ -4246,5 +5931,14 @@ export class NativeWorkbenchSurfaceManager {
       record.owner.webContents.getZoomFactor(),
     )
     return clampNativeWorkbenchSurfaceRect(dipRect, record.owner.getContentBounds())
+  }
+
+  private resolveEffectiveSurfaceRect(record: NativeWorkbenchSurfaceRecord): NativeWorkbenchSurfaceRect | null {
+    if (!record.rect || record.owner.isDestroyed()) return null
+    if (this.htmlFullscreen?.record === record) {
+      const { width, height } = record.owner.getContentBounds()
+      return { x: 0, y: 0, width, height }
+    }
+    return record.rect
   }
 }

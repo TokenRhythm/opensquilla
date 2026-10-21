@@ -1,4 +1,5 @@
 import { ref, type Ref } from 'vue'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import type {
   ChatMessage,
   ChatPendingItem,
@@ -7,6 +8,12 @@ import type { ChatSlashCommand } from '@/composables/chat/useChatSlashCommands'
 
 export interface UseChatComposerShortcutsOptions {
   inputText: Ref<string>
+  localPathReferences?: Ref<string[]>
+  restoreInput?: (text: string, paths?: readonly string[]) => void
+  /** Visible textarea body, when local references are kept outside the editor. */
+  textareaText?: Ref<string>
+  /** Plain-text offsets from the active inline editor; null when it has no selection. */
+  getEditorSelection?: () => { start: number; end: number; length: number } | null
   composing: Ref<boolean>
   messages: Ref<ChatMessage[]>
   pendingQueue: Ref<ChatPendingItem[]>
@@ -23,11 +30,12 @@ export interface UseChatComposerShortcutsOptions {
   popPendingTail: () => boolean
   enqueuePendingInput: (text: string) => boolean | Promise<boolean>
   sendCurrentInput: () => void
+  /** Consume a large paste delivered only as a post-insertion input event. */
+  handleLongPaste?: (text: string, event?: InputEvent) => boolean
   /**
    * Undo an uncommitted message edit, returning whether it had one to undo.
-   * Escape has to offer this before it clears the composer: edit mode has no
-   * other exit, and clearing the draft on its own leaves the truncated
-   * transcript on screen (#1372).
+   * Escape exits edit mode and restores its saved draft/transcript (#1372).
+   * An ordinary draft is never discarded by this shortcut.
    */
   cancelMessageEdit?: () => boolean
   isSafariWebKit?: () => boolean
@@ -59,12 +67,18 @@ const DELETE_INPUT_TYPES = new Set([
 export function useChatComposerShortcuts(options: UseChatComposerShortcutsOptions) {
   const inputHistoryIdx = ref<number | null>(null)
   const inputHistoryDraft = ref('')
+  let inputHistoryDraftPaths: string[] = []
   let deleteUndoSnapshot: TextareaSnapshot | null = null
   let pendingUndoRepair: TextareaSnapshot | null = null
 
-  function resetInputHistory() {
+  function endInputHistoryNavigation() {
     inputHistoryIdx.value = null
     inputHistoryDraft.value = ''
+    inputHistoryDraftPaths = []
+  }
+
+  function resetInputHistory() {
+    endInputHistoryNavigation()
     clearTextareaUndoState()
   }
 
@@ -74,7 +88,21 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
 
   function onTextareaInput(event?: Event) {
     updateTextareaUndoStateAfterInput(event)
+    // Editing a recalled message makes it the draft: Up/Down must not replace
+    // it with another history entry (#1954). Keep the undo state just updated.
+    endInputHistoryNavigation()
     options.autoResizeTextarea()
+    const inputType = event && 'inputType' in event ? event.inputType : undefined
+    if (
+      (inputType === 'insertFromPaste' || inputType === 'insertFromPasteAsQuotation')
+      && event
+      && options.handleLongPaste?.(
+        event.target instanceof HTMLTextAreaElement
+          ? event.target.value
+          : (options.textareaText ?? options.inputText).value,
+        event as InputEvent,
+      )
+    ) return
     if (options.composing.value || (event && 'isComposing' in event && event.isComposing)) return
     options.handleSlashInput()
   }
@@ -89,10 +117,13 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     // short draft (pop) — and on Win/Linux, where Alt+Arrow has no native
     // binding, those boundaries are reached in the same common cases.
     const field = e.target instanceof HTMLTextAreaElement ? e.target : null
-    const caretAtStart = !!field && field.selectionStart === 0 && field.selectionEnd === 0
-    const caretAtEnd = !!field
-      && field.selectionStart === field.value.length
-      && field.selectionEnd === field.value.length
+    const selection = field
+      ? { start: field.selectionStart, end: field.selectionEnd, length: field.value.length }
+      : options.getEditorSelection?.()
+    const caretAtStart = !!selection && selection.start === 0 && selection.end === 0
+    const caretAtEnd = !!selection
+      && selection.start === selection.length
+      && selection.end === selection.length
 
     if (options.slashOpen.value) {
       if (e.key === 'ArrowDown') {
@@ -125,23 +156,12 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     }
 
     if (e.key === 'Escape' && !options.isStreaming.value) {
-      // An uncommitted edit outranks clearing the draft, and is offered before
-      // the guards below rather than inside them. Those guards exist for the
-      // draft-clearing behaviour: an empty composer, or a non-empty pending
-      // queue, used to mean Escape did nothing here. While an edit is live
-      // that would leave the truncated transcript on screen with no way out,
-      // which is the defect this is fixing, one queued message away.
-      // Streaming still belongs to Stop.
+      // Cancel edits even with an empty input or pending queue. Otherwise keep
+      // the draft, its persistence and native undo history intact. Streaming
+      // still belongs to the document-level Stop shortcut.
       if (options.cancelMessageEdit?.()) {
         e.preventDefault()
         resetInputHistory()
-        return
-      }
-      if (options.pendingQueue.value.length === 0 && options.inputText.value) {
-        e.preventDefault()
-        clearTextareaUndoState()
-        options.inputText.value = ''
-        options.autoResizeTextarea()
         return
       }
     }
@@ -263,7 +283,7 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
 
   function restoreTextarea(field: HTMLTextAreaElement, snap: TextareaSnapshot) {
     field.value = snap.value
-    options.inputText.value = snap.value
+    ;(options.textareaText ?? options.inputText).value = snap.value
     if (typeof field.setSelectionRange === 'function') {
       field.setSelectionRange(snap.selectionStart, snap.selectionEnd)
     }
@@ -277,18 +297,31 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
   function cycleHistory(dir: number): boolean {
     const history = options.messages.value
       .filter(message => message.role === 'user' && typeof message.text === 'string')
-      .map(message => message.text)
+    if (inputHistoryIdx.value !== null
+      && (inputHistoryIdx.value < 0 || inputHistoryIdx.value >= history.length)) {
+      // Editing or refreshing history may remove the recalled entry. Retire
+      // its cursor without replacing the current draft with an older snapshot.
+      resetInputHistory()
+      return false
+    }
     if (history.length === 0) return false
+
+    const restore = (text: string, paths?: readonly string[]) => {
+      if (options.restoreInput) options.restoreInput(text, paths)
+      else options.inputText.value = text
+    }
 
     if (dir < 0) {
       clearTextareaUndoState()
       if (inputHistoryIdx.value === null) {
         inputHistoryDraft.value = options.inputText.value || ''
+        inputHistoryDraftPaths = copyLocalPathReferences(options.localPathReferences?.value, inputHistoryDraft.value)
         inputHistoryIdx.value = history.length - 1
       } else {
         inputHistoryIdx.value = Math.max(0, inputHistoryIdx.value - 1)
       }
-      options.inputText.value = history[inputHistoryIdx.value]
+      const message = history[inputHistoryIdx.value]!
+      restore(message.text, message.localPathReferences)
       options.autoResizeTextarea()
       return true
     }
@@ -298,11 +331,13 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     const next = inputHistoryIdx.value + 1
     if (next >= history.length) {
       inputHistoryIdx.value = null
-      options.inputText.value = inputHistoryDraft.value
+      restore(inputHistoryDraft.value, inputHistoryDraftPaths)
       inputHistoryDraft.value = ''
+      inputHistoryDraftPaths = []
     } else {
       inputHistoryIdx.value = next
-      options.inputText.value = history[next]
+      const message = history[next]!
+      restore(message.text, message.localPathReferences)
     }
     options.autoResizeTextarea()
     return true

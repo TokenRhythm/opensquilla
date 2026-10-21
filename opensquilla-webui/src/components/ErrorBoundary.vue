@@ -20,7 +20,7 @@
           class="btn btn--ghost"
           data-testid="error-boundary-copy"
           @click="copyDetails"
-        >{{ copied ? t('errorBoundary.copied') : t('errorBoundary.copyDetails') }}</button>
+        >{{ t('errorBoundary.copyDetails') }}</button>
         <button
           v-if="canRevealLog"
           type="button"
@@ -61,7 +61,6 @@ const emit = defineEmits<{
 const hasError = ref(false)
 const errorMessage = ref('')
 const errorDetails = ref('')
-const copied = ref(false)
 const actionError = ref('')
 
 // Only shown on desktop, where a real log folder exists and can be revealed.
@@ -73,7 +72,6 @@ onErrorCaptured((err: unknown) => {
   hasError.value = true
   errorMessage.value = errorBoundaryMessage(err)
   errorDetails.value = errorBoundaryDetails(err)
-  copied.value = false
   actionError.value = ''
   emit('error-captured', err)
   console.error('[ErrorBoundary]', errorDetails.value || errorMessage.value || 'Unknown error')
@@ -88,7 +86,6 @@ function clearError() {
   hasError.value = false
   errorMessage.value = ''
   errorDetails.value = ''
-  copied.value = false
   actionError.value = ''
 }
 
@@ -96,10 +93,8 @@ async function copyDetails() {
   if (!errorDetails.value) return
   try {
     await copyTextWithFallback(errorDetails.value)
-    copied.value = true
     actionError.value = ''
   } catch {
-    copied.value = false
     actionError.value = t('errorBoundary.copyFailed')
   }
 }

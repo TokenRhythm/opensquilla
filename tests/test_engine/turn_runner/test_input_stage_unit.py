@@ -32,6 +32,12 @@ _INTERNAL_EVENT_MODE_VALUE = (
     "The next input is an internal scheduler event, not a human user"
     " message. Treat it as system-originated context."
 )
+_GOAL_CONTINUATION_MODE_VALUE = (
+    "The next input is an internal Goal continuation. It is an actionable work"
+    " round, not a heartbeat or status poll. Inspect the durable Goal, make"
+    " concrete progress, and use update_goal when the Goal is complete or"
+    " blocked. Do not emit NO_REPLY or HEARTBEAT_OK for this input."
+)
 _SUBAGENT_TASK_PROTOCOL_VALUE = (
     "You are a spawned subagent. Execute only the delegated task and return "
     "a compact result for the parent agent to use. Prefer a direct answer; "
@@ -380,6 +386,34 @@ def _build_corpus() -> list[_Case]:
                 runtime_message="hello",
                 semantic_input="hello",
                 extra_prompt_context=None,
+                persisted_call_shape=None,
+                persisted_returned_content=None,
+                raises=None,
+            ),
+        )
+    )
+
+    # Case 10 — Goal continuation is hidden but user-like/actionable.
+    cases.append(
+        _Case(
+            case_id="goal_continuation_is_actionable",
+            inp_kwargs=dict(
+                message="Inspect the Goal and continue the remaining work.",
+                semantic_message="ignored semantic override",
+                input_mode="goal_continuation",
+                persist_input=False,
+                input_provenance=None,
+                session_key="agent:main:s10",
+                tool_context=None,
+            ),
+            session_behavior={},
+            expected=_Snapshot(
+                runtime_message=(
+                    "[GOAL CONTINUATION]\n"
+                    "Inspect the Goal and continue the remaining work."
+                ),
+                semantic_input="Inspect the Goal and continue the remaining work.",
+                extra_prompt_context={"Goal Continuation Mode": _GOAL_CONTINUATION_MODE_VALUE},
                 persisted_call_shape=None,
                 persisted_returned_content=None,
                 raises=None,

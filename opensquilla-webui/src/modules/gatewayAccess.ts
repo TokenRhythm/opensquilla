@@ -4,6 +4,8 @@ import type { DesktopResumeSource } from '@/platform/types'
 export type GatewayAvailability = 'unavailable' | 'preparing' | 'available'
 export type GatewayConnectionHealth = 'healthy' | 'suspect'
 export type GatewayConnectionPhase = 'healthy' | 'checking' | 'suspect' | 'reconnecting'
+export type SupportBundleUnavailableReason = 'disconnected' | 'permission' | 'differentGateway' | null
+export type HostExecuteUnavailableReason = 'disconnected' | 'permission' | null
 
 export interface GatewayRunModePolicy {
   readonly allowedRunModes?: unknown
@@ -34,9 +36,19 @@ export interface GatewayAccess {
   /** The local supervisor is preparing the runtime; no connection has failed. */
   readonly isRuntimeStarting: boolean
   readonly connectionError: string | null
+  /** Automatic recovery has stopped because this connection was rejected. */
+  readonly connectionBlocked?: boolean
+  /** Host and port of the healthy connection, without credentials or URL suffixes. */
+  readonly connectedGatewayHost?: string | null
   readonly requiresCredential: boolean
   readonly isAvailable: boolean
+  /** Whether the current healthy connection may create and control a host PTY. */
+  readonly canExecuteHost: boolean
+  /** Why host execution is unavailable, suitable for capability-menu copy. */
+  readonly hostExecuteUnavailableReason: HostExecuteUnavailableReason
   readonly isLocalOwner: boolean
+  /** A support bundle requires owner authority and the current HTTP target. */
+  readonly supportBundleUnavailableReason: SupportBundleUnavailableReason
   readonly isAuthenticated: boolean
   /** Current anonymous session namespace, verified from this connection's Hello. */
   readonly guestSessionOwnerId: string | null
@@ -44,6 +56,7 @@ export interface GatewayAccess {
   readonly deliveryIdentity: string | null
   readonly canManageProjectWorkspaces: boolean
   readonly canChooseProject: boolean
+  readonly canCreateProjectWorkspace?: boolean
   readonly runModePolicy: GatewayRunModePolicy | null
   readonly streamIdleTimeoutMs: number | null
   readonly concurrentHistoryReads: boolean

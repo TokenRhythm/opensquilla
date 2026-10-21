@@ -244,6 +244,98 @@ your install to see the current catalog.
 
 Read: [`providers-and-models.md`](providers-and-models.md)
 
+## Video Generation
+
+Video generation is disabled by default. Select TokenRhythm or OpenRouter and
+one of its text-to-video models in Settings, or configure them in TOML. If the
+same Provider is already configured, its credential is reused without entering
+another key:
+
+```toml
+[video_generation]
+enabled = true
+provider = "tokenrhythm"
+primary = "wan3.0-video"
+duration_seconds = 8
+aspect_ratio = "16:9"
+allowed_aspect_ratios = ["16:9", "9:16"]
+resolution = "720p"
+allowed_resolutions = ["720p", "1080p"]
+timeout_seconds = 600
+max_output_bytes = 104857600 # 100 MiB
+```
+
+An explicit generation request overrides `duration_seconds`. If the request
+omits it, this configured default is used; leaving the default unset delegates
+duration selection to the provider/model adapter. Provider/model duration
+constraints still apply. The retired `max_duration_seconds` setting is ignored
+when loading older configurations and removed when they are saved or migrated.
+
+OpenRouter uses a raw model ID such as `google/veo-3.1-fast`; TokenRhythm uses
+its native model ID. The `wan3.0-video` example is documented by TokenRhythm;
+model access still depends on the account. Existing Gemini, xAI, Qwen, and
+Qwen Token Plan routes remain readable and usable for compatibility, but are
+not offered for new selections in Settings. Settings preserves an existing
+route until you explicitly select its replacement. Existing configurations
+with `primary` but no `provider` continue to use OpenRouter. A new installation
+does not select a provider automatically.
+
+Each `video_generation.providers.<provider>` section accepts `base_url`,
+`api_key_env`, and an optional direct `api_key`. A direct API key and an
+environment-variable reference are alternative credential sources; you do not
+need to configure both. Settings shows the resolved credential source and
+offers an optional dedicated credential editor. Environment-variable names
+refer to values available to the Gateway process, rather than containing a key.
+You can explicitly return to shared credentials by removing the video key and
+video environment-variable reference.
+
+Without a dedicated video credential, a matching configured primary Provider
+or profile supplies the key. A video API URL that has not been explicitly set
+also follows that Provider's endpoint. Explicit video endpoints and credentials
+retain their own bindings. A default environment key or same-origin image
+credential can be used when no matching Provider is configured. The default
+environment names for the two selectable providers are `OPENROUTER_API_KEY`
+and `TOKENRHYTHM_API_KEY`.
+
+For a dedicated compatible proxy, choose its URL and an explicit environment
+reference, or enter a dedicated key in Settings. For example:
+
+```toml
+[video_generation]
+enabled = true
+provider = "openrouter"
+primary = "google/veo-3.1-fast"
+
+[video_generation.providers.openrouter]
+base_url = "https://video.example.com/api/v1"
+api_key_env = "VIDEO_PROXY_API_KEY"
+```
+
+Custom endpoints must use HTTPS, except for an HTTP loopback service. A video
+provider cannot target another built-in provider's official origin. Default
+provider environment keys and model-service credentials do not follow a
+custom endpoint to a different origin unless the key reference was explicitly
+configured for that endpoint. A matching primary model-service or profile
+credential can be reused when its endpoint has the same origin. No video key
+is needed when the same provider's image generation key already covers that
+origin when no matching model-service Provider is configured. A direct video
+key entered in Settings is stored in the local Gateway configuration, tied to
+its endpoint, and redacted from settings reads. The tools appear only when video
+generation is enabled and the selected model and credential are available. An
+existing accepted job can still expose `video_status` for recovery
+after the generation setting is disabled. The official OpenRouter model catalog
+is checked before submission.
+
+The defaults allow agent-selected clips within an 8 second maximum. When neither
+the tool call nor the config specifies a duration, each adapter selects a
+provider-appropriate duration within the configured maximum and sends it explicitly.
+The schema permits an operator maximum up to 60
+seconds. The timeout can be 30–1800 seconds; the output cap can be 1–500 MiB.
+The video cap replaces the ordinary 30 MiB artifact per-file limit for these
+outputs. The separate aggregate artifact disk budget remains 512 MiB by
+default; configure `[attachments].artifact_disk_budget_bytes` if needed.
+See [video generation and recovery](artifacts-and-media.md#video-generation).
+
 ## Router Configuration
 
 Router modes:
@@ -337,7 +429,7 @@ until an appropriate tool inspects or converts them.
 # rendered-types-only admission gate on every surface.
 accept_opaque = true
 # Per-file ceiling for opaque attachments (bytes).
-opaque_max_bytes = 31457280            # 30 MiB
+opaque_max_bytes = 52428800            # 50 MiB
 # Aggregate byte ceiling for the disk-backed staged-upload store. When reached,
 # new uploads get HTTP 507 UPLOAD_STORE_FULL (retryable; staged entries
 # expire within the 10-minute TTL); a payload larger than the cap itself is a
@@ -362,9 +454,11 @@ Env overrides use the `OPENSQUILLA_ATTACHMENTS_` prefix
 
 Size policy at a glance: inline attachments up to 2 MB ride the RPC message;
 larger files stage through `POST /api/v1/files/upload`. Staged text (validated as
-whole-payload UTF-8), PDF, Office and opaque files allow up to 30 MiB each; images
-allow 5 MiB and email retains its 2 MB limit. Each turn accepts at most 10 uploaded
-attachments and 60 MiB total. Staged uploads are stored on disk with their hashes
+whole-payload UTF-8), PDF, Office and opaque files allow up to 50 MiB each; images
+allow 5 MiB and email retains its 2 MB limit. Each turn accepts at most 16 uploaded
+attachments/project references combined and 60 MiB of attachment payloads total.
+Known live project references count toward the item limit, not uploaded bytes.
+Staged uploads are stored on disk with their hashes
 and survive a Gateway restart within their original 10-minute lifetime.
 
 Behavior notes:
@@ -383,6 +477,19 @@ Behavior notes:
 - Desktop project-file references point to the current project file rather than
   an uploaded snapshot. Every use, including queued execution, checks the current
   workspace binding and file permissions. Selecting a file grants no extra access.
+- Desktop's **Reference local path (no upload)** action inserts a local path
+  reference from a system file picker. The message carries the path string,
+  not the file contents or an attachment. It is available only for a
+  Desktop-owned local Gateway, including before the first message, and does
+  not read or upload file contents. Files outside the workspace and files
+  larger than the upload limit can be selected. The tool's execution
+  environment and existing permissions still determine whether the path is
+  readable or editable; no path mapping or automatic upload occurs. The path
+  may be sent to the selected model.
+- In the Desktop composer, dropping a native non-image OS file uses the same
+  local path-input route without creating a session or attachment. Images, browser
+  Files, pasted Blobs, and drops without a native path retain the byte-upload
+  route; remote or non-owned Gateways do not receive a local Windows path.
 - When known context capacity is exhausted by older history, attachment admission
   can compact that history once and retry with a fresh budget, including images.
   Unknown capacity, a failed compaction, or new material that cannot fit still
@@ -391,12 +498,14 @@ Behavior notes:
 The WebUI and Desktop composer can recover unsent attachments from local browser
 storage when IndexedDB is available. Drafts are scoped to the authenticated
 Gateway/account or verified Desktop profile and conversation. They expire 24 hours
-after their latest save and allow at most 10 items and 60 MiB per draft, with a
+after their latest save and allow at most 16 items and 60 MiB per draft, with a
 120 MiB aggregate limit across at most 20 drafts. Storage or quota failures are
 reported in the composer. An expired staged upload can be re-uploaded only when
 the draft retained its file bytes; otherwise the user must select it again.
 Native file-selection capabilities are never saved in drafts. Removing a draft
 only removes the unsent selection, not accepted or queued attachment material.
+Known live project references retain display metadata but use no file-content
+quota in drafts. Actual stored Blobs always count, even on malformed mixed records.
 
 ## Memory Configuration
 
@@ -606,13 +715,13 @@ below are optional; absent keys keep the defaults.
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `execution_enabled` | `true` | Emergency kill switch. When false, no new Goal execution is accepted and unfinished active Goals pause. |
-| `max_turns` | `50` | Per-resume-window turn limit (`1`-`500`). The current turn finishes first; an otherwise active Goal then pauses with `turn_limit`. |
+| `max_turns` | `256` | Per-resume-window turn limit (`1`-`500`). The current turn finishes first; an otherwise active Goal then pauses with `turn_limit`. |
 | `runtime_budget_seconds` | `3600` | Per-resume-window active running-time limit (`60`-`86400` seconds). Queue time, pauses, and Gateway downtime do not count. An otherwise active Goal pauses with `runtime_limit`. |
 
 ```toml
 [goal]
 execution_enabled = true
-max_turns = 50
+max_turns = 256
 runtime_budget_seconds = 3600
 ```
 

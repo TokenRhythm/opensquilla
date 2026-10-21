@@ -64,11 +64,16 @@ async function clickRelaunchToUpdate(app) {
 const isolationRoot = await mkdtemp(join(tmpdir(), 'opensquilla-electron-mock-update-test-'))
 const userDataDir = join(isolationRoot, 'chromium-user-data')
 const isolatedHome = join(isolationRoot, 'home')
+const isolatedRoaming = join(isolatedHome, 'AppData', 'Roaming')
+const isolatedLocal = join(isolatedHome, 'AppData', 'Local')
+const isolatedTemp = join(isolatedLocal, 'Temp')
 let app
 
 try {
   await mkdir(userDataDir, { recursive: true })
   await mkdir(isolatedHome, { recursive: true })
+  await mkdir(isolatedRoaming, { recursive: true })
+  await mkdir(isolatedTemp, { recursive: true })
 
   // Seed a keyless, entirely synthetic profile so this update test reaches the
   // Control UI without depending on a developer's real desktop credential.
@@ -99,9 +104,18 @@ try {
       packageRoot,
     ],
     env: {
-      ...process.env,
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !(
+        /(^OPENSQUILLA_|TOKEN|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|PASSWORD|^ELECTRON_RUN_AS_NODE$)/i.test(key)
+      ))),
       HOME: isolatedHome,
       USERPROFILE: isolatedHome,
+      APPDATA: isolatedRoaming,
+      LOCALAPPDATA: isolatedLocal,
+      TEMP: isolatedTemp,
+      TMP: isolatedTemp,
+      TMPDIR: isolatedTemp,
+      OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
+      OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION: mockVersion,
@@ -142,36 +156,21 @@ try {
   const updateBannerCount = await page.locator('[data-testid="update-banner"]').count()
   assert.equal(updateBannerCount, 0, 'desktop native update should suppress the web release banner')
 
-  // Startup profile consolidation can still hold the writer gate when the
-  // one-second mock timer fires. Exercise the renderer update flow after
-  // readiness; automatic scheduling has its own deterministic contract tests.
-  await page.evaluate(() => window.opensquillaDesktop.checkForUpdates())
-
-  const availableState = await waitFor(async () => {
-    return await page.evaluate(async () => {
-      const api = window.opensquillaDesktop
-      if (!api.getUpdateState) return null
-      const state = await api.getUpdateState()
-      return state?.status === 'available' ? state : null
-    })
-  }, 'mock update available renderer state')
-  assert.equal(availableState.latestVersion, mockVersion)
-
-  const updateIndicator = page.locator('[data-testid="desktop-update-indicator"]')
-  await updateIndicator.waitFor({ state: 'visible', timeout: 30_000 })
-  // The desktop header can still be settling while the newly discovered update
-  // changes its width. Force the already-visible control so this test exercises
-  // the update flow instead of Playwright's transient layout-stability heuristic.
-  await updateIndicator.click({ force: true })
-  await page.locator('[data-testid="desktop-update-download"]').click()
-
+  // Readiness is reached through the production startup scheduler and shared
+  // background downloader. Do not click Check/Download or install to seed it.
   const downloadedState = await waitFor(async () => {
-    return await page.evaluate(async () => {
-      const state = await window.opensquillaDesktop.getUpdateState()
-      return state?.status === 'downloaded' ? state : null
-    })
-  }, 'mock update downloaded renderer state')
+    const state = await page.evaluate(() => window.opensquillaDesktop.getUpdateState())
+    return state?.status === 'downloaded' ? state : null
+  }, 'automatically downloaded update renderer state')
   assert.equal(downloadedState.latestVersion, mockVersion)
+  assert.equal(downloadedState.canAutoDownload, true)
+  assert.equal(downloadedState.canInstall, true)
+  assert.match(downloadedState.releaseNotesUrl, /github\.com\/TokenRhythm\/opensquilla\/releases\/tag\//)
+
+  const updateIndicator = page.locator('[data-testid="sidebar-desktop-update"]')
+  await updateIndicator.waitFor({ state: 'visible', timeout: 30_000 })
+  await updateIndicator.click()
+  await page.locator('[data-testid="settings-update-relaunch"]').waitFor({ state: 'visible' })
 
   let relaunchEntry
   if (process.platform === 'darwin') {
@@ -184,10 +183,10 @@ try {
     const clicked = await clickRelaunchToUpdate(app)
     assert.equal(clicked, true, 'Relaunch to Update menu item should be clickable')
   } else {
-    const relaunchButton = page.locator('[data-testid="desktop-update-relaunch"]')
+    const relaunchButton = page.locator('[data-testid="settings-update-relaunch"]')
     await relaunchButton.waitFor({ state: 'visible', timeout: 30_000 })
     await relaunchButton.click()
-    relaunchEntry = 'desktop-update-relaunch'
+    relaunchEntry = 'settings-update-relaunch'
   }
 
   await delay(500)
@@ -201,16 +200,13 @@ try {
       'mock install keeps the pending relaunch menu available for repeated inspection',
     )
   } else {
-    // Native applying temporarily hides the indicator. Reopen its popover
-    // once the mock install returns, as a user would for another inspection.
+    // Native applying temporarily hides the sidebar reminder. The settings
+    // update section remains open after the mock operation finishes.
     await waitFor(async () => (await page.evaluate(
       () => window.opensquillaDesktop.getUpdateState(),
     ))?.status === 'downloaded', 'mock install to return to downloaded')
     await updateIndicator.waitFor({ state: 'visible', timeout: 30_000 })
-    if (await updateIndicator.getAttribute('aria-expanded') !== 'true') {
-      await updateIndicator.click({ force: true })
-    }
-    await page.locator('[data-testid="desktop-update-relaunch"]').waitFor({
+    await page.locator('[data-testid="settings-update-relaunch"]').waitFor({
       state: 'visible',
       timeout: 30_000,
     })

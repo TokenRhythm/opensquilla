@@ -24,6 +24,10 @@ export function useSetupBehaviorForm() {
     autoSessionTitles.value = enabled
   }
 
+  function acceptSaved(enabled: boolean) {
+    baseline.value = enabled
+  }
+
   function patches(): Record<string, unknown> {
     if (!isDirty.value) return {}
     return { 'naming.enabled': autoSessionTitles.value }
@@ -42,6 +46,7 @@ export function useSetupBehaviorForm() {
     isDirty,
     initFromConfig,
     setAutoSessionTitles,
+    acceptSaved,
     patches,
     createPanel,
   }

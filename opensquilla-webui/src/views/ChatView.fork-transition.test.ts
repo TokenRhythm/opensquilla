@@ -31,9 +31,9 @@ describe('chat fork hand-off contract', () => {
   })
 
   it('keeps a read-only parent projection visible until child history is ready', () => {
-    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || visibleRenderedMessages"')
+    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || findDisplayMessages"')
     expect(chatViewSource).toContain(':session-key="forkTransition?.parentKey || sessionKey"')
-    expect(chatViewSource).toContain(':inert="forkTransition ? true : undefined"')
+    expect(chatViewSource).toContain(':inert="forkTransition || sessionViewCache.showingPreview.value ? true : undefined"')
     expect(chatViewSource).toContain('Render-only snapshot; never becomes the child session\'s canonical messages.')
     expect(chatViewSource).toContain('loadedKey !== transition.targetKey')
     expect(chatViewSource).toContain("if (status === 'ready')")
@@ -71,6 +71,23 @@ describe('chat fork hand-off contract', () => {
     expect(transitionSource).toContain("targetKey === parentKey ? 'returning' : 'opening'")
     expect(chatViewSource).toContain('forkRouteHandoffAction(newSession, transition)')
     expect(chatViewSource).toContain("if (handoffAction === 'returning')")
+  })
+
+  it('carries the parent project binding onto the fork child before navigating', () => {
+    // Without this, the optimistic sidebar row synthesized for the child (the
+    // sessions.list snapshot does not carry it yet) has no workspaceId and
+    // floats to the section's top level instead of nesting under the project.
+    expect(chatViewSource).toContain(
+      'freshTaskDraft.materializedWorkspaceBySession.value[parentKey]',
+    )
+    expect(chatViewSource).toContain(
+      'freshTaskDraft.bindMaterializedProjectTask(childKey, forkWorkspaceId)',
+    )
+    const bindIndex = chatViewSource.indexOf(
+      'freshTaskDraft.bindMaterializedProjectTask(childKey, forkWorkspaceId)',
+    )
+    expect(bindIndex).toBeGreaterThan(chatViewSource.indexOf('const childKey = res.key'))
+    expect(bindIndex).toBeLessThan(chatViewSource.indexOf('query: { session: childKey }'))
   })
 
   it('invalidates every asynchronous fork continuation when the view unmounts', () => {

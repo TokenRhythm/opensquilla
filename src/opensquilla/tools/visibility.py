@@ -46,6 +46,8 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "grep_search",
         "image",
         "image_generate",
+        "video_generate",
+        "video_status",
         "audio_provider_capabilities",
         "dubbing_download",
         "dubbing_generate",
@@ -87,7 +89,7 @@ _CHANNEL_HARD_DENY_NON_OWNER: frozenset[str] = frozenset(
 # Bounded authoring needs the installed skill instructions as well as file
 # tools. These read-only catalog tools do not mount skill directories or grant
 # script execution; skill_view keeps its registered-resource containment gate.
-# Skill installation, editing, and meta execution retain their existing policy.
+# Skill installation and editing retain their existing policy.
 _CHANNEL_WORKSPACE_SKILL_ALLOW: frozenset[str] = frozenset({"skill_list", "skill_view"})
 
 GUEST_SAFE_BASE_TOOL_ALLOWLIST: frozenset[str] = frozenset(

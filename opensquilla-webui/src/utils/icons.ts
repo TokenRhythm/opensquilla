@@ -11,8 +11,9 @@ export type IconName =
   | 'expand' | 'collapse'
   | 'panel-left-open' | 'panel-left-close' | 'panel-right-open' | 'panel-right-close'
   | 'sidebar-visible' | 'sidebar-hidden'
-  | 'clock' | 'microphone'
+  | 'clock' | 'microphone' | 'terminal'
   | 'cloud' | 'folder' | 'fileText' | 'fileCode' | 'image' | 'table' | 'externalLink'
+  | 'sparkles' | 'settings-2' | 'clock-3' | 'chart-no-axes-column' | 'folder-outline'
   | 'keyboard' | 'languages' | 'shield' | 'lock'
   | 'target'
   | 'thumbs-up' | 'thumbs-down'
@@ -25,6 +26,14 @@ interface IconDef {
 }
 
 const ICONS: Record<IconName, IconDef> = {
+  // Lucide 1.17.0 (ISC); see THIRD_PARTY_NOTICES.md. Named variants keep the
+  // sidebar treatment independent of existing icons in other product surfaces.
+  sparkles: { path: '<path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"/><path d="M20 2v4"/><path d="M22 4h-4"/><circle cx="4" cy="20" r="2"/>' },
+  'settings-2': { path: '<path d="M14 17H5"/><path d="M19 7h-9"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>' },
+  'clock-3': { path: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6h4"/>' },
+  'chart-no-axes-column': { path: '<path d="M5 21v-6"/><path d="M12 21V3"/><path d="M19 21V9"/>' },
+  'folder-outline': { path: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>' },
+  terminal:   { path: '<path d="m4 5 6 7-6 7"/><path d="M13 19h7"/>', strokeWidth: 1.5 },
   chat:       { path: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>' },
   home:       { path: '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>' },
   channels:   { path: '<rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>' },

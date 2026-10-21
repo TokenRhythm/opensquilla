@@ -17,10 +17,6 @@ from opensquilla.gateway.adapters.memory_profile_import_contract import (
     MEMORY_PROFILE_IMPORT_CONTRACT_METHODS,
     register_memory_profile_import_contract,
 )
-from opensquilla.gateway.adapters.meta_run_center_contract import (
-    META_RUN_CENTER_CONTRACT_METHODS,
-    register_meta_run_center_contract,
-)
 from opensquilla.gateway.adapters.migration_operations_contract import (
     MIGRATION_OPERATIONS_CONTRACT_METHODS,
     register_migration_operations_contract,
@@ -63,6 +59,7 @@ EXPECTED_SESSION_CONTROL_METHODS = (
 )
 EXPECTED_WORKSPACE_METHODS = (
     "workspaces.list",
+    "workspaces.create",
     "workspaces.open",
     "workspaces.update",
     "workspaces.pin",
@@ -72,19 +69,6 @@ EXPECTED_WORKSPACE_METHODS = (
     "sandbox.path.create-directory",
     "sandbox.path.pick",
     "workspaces.references.read",
-)
-EXPECTED_META_RUN_CENTER_METHODS = (
-    "meta.list",
-    "meta.inspect",
-    "meta.drafts.list",
-    "meta.drafts.discard",
-    "meta.run",
-    "meta.runs.confirm_preflight",
-    "meta.runs.recovery",
-    "meta.runs.replay",
-    "meta.setup.plan",
-    "meta.setup.install",
-    "meta.setup.status",
 )
 EXPECTED_MIGRATION_OPERATIONS_METHODS = (
     "migration.sources.list",
@@ -97,7 +81,6 @@ def test_strict_contract_groups_own_the_expected_methods() -> None:
     assert MEMORY_PROFILE_IMPORT_CONTRACT_METHODS == EXPECTED_MEMORY_PROFILE_IMPORT_METHODS
     assert SESSION_CONTROL_CONTRACT_METHODS == EXPECTED_SESSION_CONTROL_METHODS
     assert WORKSPACE_CATALOG_CONTRACT_METHODS == EXPECTED_WORKSPACE_METHODS
-    assert META_RUN_CENTER_CONTRACT_METHODS == EXPECTED_META_RUN_CENTER_METHODS
     assert MIGRATION_OPERATIONS_CONTRACT_METHODS == EXPECTED_MIGRATION_OPERATIONS_METHODS
 
 
@@ -111,7 +94,6 @@ def test_strict_contract_groups_own_the_expected_methods() -> None:
         ),
         (EXPECTED_SESSION_CONTROL_METHODS, register_session_control_contract),
         (EXPECTED_WORKSPACE_METHODS, register_workspace_catalog_contract),
-        (EXPECTED_META_RUN_CENTER_METHODS, register_meta_run_center_contract),
         (
             EXPECTED_MIGRATION_OPERATIONS_METHODS,
             register_migration_operations_contract,
@@ -145,12 +127,10 @@ def test_strict_contract_factories_use_generated_identity_scope_and_provenance(
 @pytest.mark.parametrize(
     "method",
     (
-        "models.routing.set",
         *EXPECTED_APPROVAL_METHODS,
         *EXPECTED_MEMORY_PROFILE_IMPORT_METHODS,
         *EXPECTED_SESSION_CONTROL_METHODS,
         *EXPECTED_WORKSPACE_METHODS,
-        *EXPECTED_META_RUN_CENTER_METHODS,
         *EXPECTED_MIGRATION_OPERATIONS_METHODS,
     ),
 )
@@ -173,16 +153,7 @@ _WORKSPACE = {
 }
 
 _VALID_REGISTRATION_RESULTS: dict[str, dict[str, Any]] = {
-    "meta.list": {"skills": []},
-    "meta.inspect": {
-        "name": "synthetic-meta",
-        "layer": "bundled",
-        "instance_id": "synthetic-instance",
-        "install_id": "",
-        "ready": True,
-        "status": "ready",
-        "dependencies": [],
-    },
+    "workspaces.create": {"workspace": _WORKSPACE},
     "workspaces.open": {"workspace": _WORKSPACE},
     "workspaces.update": {"workspace": _WORKSPACE},
     "workspaces.pin": {"workspace": _WORKSPACE},
@@ -240,8 +211,7 @@ _VALID_REGISTRATION_RESULTS: dict[str, dict[str, Any]] = {
 @pytest.mark.parametrize(
     ("methods", "register"),
     (
-        (EXPECTED_WORKSPACE_METHODS[1:6], register_workspace_catalog_contract),
-        (EXPECTED_META_RUN_CENTER_METHODS, register_meta_run_center_contract),
+        (EXPECTED_WORKSPACE_METHODS[1:7], register_workspace_catalog_contract),
         (
             EXPECTED_MIGRATION_OPERATIONS_METHODS,
             register_migration_operations_contract,
@@ -281,8 +251,7 @@ async def test_final_contract_bindings_call_each_implementation_exactly_once(
 @pytest.mark.parametrize(
     ("methods", "register"),
     (
-        (EXPECTED_WORKSPACE_METHODS[1:6], register_workspace_catalog_contract),
-        (EXPECTED_META_RUN_CENTER_METHODS, register_meta_run_center_contract),
+        (EXPECTED_WORKSPACE_METHODS[1:7], register_workspace_catalog_contract),
         (
             EXPECTED_MIGRATION_OPERATIONS_METHODS,
             register_migration_operations_contract,
@@ -315,8 +284,7 @@ async def test_final_contract_bindings_fail_closed_on_invalid_success_payload(
 
 def test_final_contract_bindings_preserve_non_guest_policy() -> None:
     for method in (
-        *EXPECTED_WORKSPACE_METHODS[1:6],
-        *EXPECTED_META_RUN_CENTER_METHODS,
+        *EXPECTED_WORKSPACE_METHODS[1:7],
         *EXPECTED_MIGRATION_OPERATIONS_METHODS,
     ):
         assert GATEWAY_METHOD_CONTRACTS[method].guest_allowed is False

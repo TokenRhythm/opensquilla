@@ -46,15 +46,29 @@ def test_issue_490_row_estimate_is_cache_aware(monkeypatch: pytest.MonkeyPatch) 
     assert su.total_cost == pytest.approx(0.807416, abs=1e-4)
 
 
-def test_unknown_cache_rate_labels_cache_blind(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("legacy_snapshot", [False, True])
+def test_unknown_model_price_is_unavailable_even_with_known_tokens(
+    monkeypatch: pytest.MonkeyPatch, legacy_snapshot: bool
+) -> None:
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
-    su = SessionUsage()
-    su.add(1_000_000, 0, model_id="kimi-latest", cache_read_tokens=900_000, provider="moonshot")
+    if legacy_snapshot:
+        su = SessionUsage(
+            input_tokens=1_000_000,
+            model_id="kimi-latest",
+            cache_read_tokens=900_000,
+            provider="moonshot",
+        )
+    else:
+        su = SessionUsage()
+        su.add(1_000_000, 0, model_id="kimi-latest", cache_read_tokens=900_000, provider="moonshot")
     row = su.model_breakdown[0]
-    assert row["estimateBasis"] == "cache_blind"
+    assert row["estimateBasis"] is None
     assert row["priceSource"] == "default"
-    # Cache-blind fallback prices the full input at the default rate.
-    assert row["costUsd"] == pytest.approx(3.0)
+    assert row["costUsd"] == 0.0
+    assert row["costSource"] == su.cost_source == "unavailable"
+    assert su.total_cost == 0.0
+    # The list-price/threshold heuristic remains separate from reported spend.
+    assert su.cost == pytest.approx(3.0)
 
 
 def test_billed_plus_unbilled_same_model_is_mixed_not_collapsed(
@@ -101,7 +115,7 @@ def test_local_free_row_labels_free_basis(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
-def test_generic_custom_free_row_preserves_zero_estimate_provenance(
+def test_generic_custom_unpriced_row_has_no_free_estimate_provenance(
     monkeypatch: pytest.MonkeyPatch, provider: str
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
@@ -111,8 +125,31 @@ def test_generic_custom_free_row_preserves_zero_estimate_provenance(
     row = su.model_breakdown[0]
     assert row["costUsd"] == 0.0
     assert row["costSource"] == "unavailable"
-    assert row["estimateBasis"] == "free"
+    assert row["estimateBasis"] is None
     assert row["priceSource"] == "custom_free"
+    assert su.cost_source == "unavailable"
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_explicit_zero_price_stays_free_in_session_projection(monkeypatch, provider):
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            f"{provider}/fixture-model": {
+                "input_cost_per_mtok": 0.0,
+                "output_cost_per_mtok": 0.0,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog.shared_catalog", lambda: catalog)
+    su = SessionUsage()
+    su.add(100, 10, model_id="fixture-model", provider=provider)
+    [row] = su.model_breakdown
+    assert row["costSource"] == su.cost_source == "free"
+    assert row["estimateBasis"] == "free" and row["priceSource"] == "user_override"
+    assert su.total_cost == row["costUsd"] == 0.0
 
 
 def test_unbilled_counters_accumulate_only_when_call_is_unbilled(
@@ -257,6 +294,97 @@ class _CachedUsageProvider:
 
     async def list_models(self) -> list[Any]:
         return []
+
+
+@pytest.mark.parametrize("provider_id", ["custom", "custom_anthropic", "tokenrhythm"])
+async def test_agent_turn_end_unpriced_usage_stays_unknown(monkeypatch, provider_id):
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    model = "fixture-unpriced-model"
+    tracker = UsageTracker()
+    agent = Agent(
+        provider=_CachedUsageProvider(input_tokens=10, output_tokens=5, model=model),
+        config=AgentConfig(model_id=model, provider_id=provider_id),
+        usage_tracker=tracker,
+        session_key="unpriced-session",
+    )
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if event.kind == "done")
+    assert done.cost_usd == 0.0
+    assert done.cost_source == "unavailable"
+    assert done.estimate_basis is None
+    snapshot = tracker.session_snapshot("unpriced-session")
+    assert snapshot is not None and snapshot.cost_usd == 0.0
+    assert snapshot.cost_source == "unavailable"
+
+
+@pytest.mark.parametrize("with_tracker", [False, True])
+@pytest.mark.parametrize("explicit_zero", [False, True])
+async def test_billed_call_cannot_hide_an_unpriced_call_in_the_same_turn(
+    monkeypatch, with_tracker, explicit_zero
+):
+    from opensquilla.engine import ToolResult
+    from opensquilla.provider import (
+        ToolDefinition,
+        ToolInputSchema,
+        ToolUseEndEvent,
+        ToolUseStartEvent,
+    )
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    if explicit_zero:
+        catalog.set_user_overrides({"custom/fixture-model": {
+            "input_cost_per_mtok": 0.0, "output_cost_per_mtok": 0.0,
+        }})
+    monkeypatch.setattr("opensquilla.provider.model_catalog.shared_catalog", lambda: catalog)
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+
+    class TwoCallProvider:
+        provider_name = "custom"
+        calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield ToolUseStartEvent(tool_use_id="check", tool_name="check")
+                yield ToolUseEndEvent(tool_use_id="check", tool_name="check", arguments={})
+                yield ProviderDone(
+                    input_tokens=10, output_tokens=2, stop_reason="tool_use",
+                    billed_cost=0.01, cost_source="provider_billed", model="fixture-model",
+                )
+            else:
+                yield ProviderText(text="Complete")
+                yield ProviderDone(
+                    input_tokens=10, output_tokens=2, stop_reason="stop", model="fixture-model"
+                )
+
+    async def handler(call):
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="Complete"
+        )
+
+    provider = TwoCallProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(provider_id="custom", model_id="fixture-model", max_iterations=3),
+        tool_definitions=[
+            ToolDefinition(
+                name="check", description="Synthetic check", input_schema=ToolInputSchema()
+            )
+        ],
+        tool_handler=handler,
+        usage_tracker=UsageTracker() if with_tracker else None,
+        session_key="mixed-price-session",
+    )
+    events = [event async for event in agent.run_turn("hello")]
+    done = next(event for event in events if event.kind == "done")
+    assert provider.calls == 2
+    assert done.cost_usd == done.billed_cost == 0.01
+    assert done.cost_source == ("provider_billed" if explicit_zero else "mixed")
+    assert done.missing_cost_entries == (0 if explicit_zero else 1)
+    [row] = done.model_usage_breakdown
+    assert row["missing_cost_entries"] == done.missing_cost_entries
+    assert row["request_count"] == 2
 
 
 async def test_agent_turn_end_estimate_is_cache_aware(monkeypatch: pytest.MonkeyPatch) -> None:

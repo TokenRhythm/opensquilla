@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import ChatComposerAddMenu from './ChatComposerAddMenu.vue'
 import addMenuSource from './ChatComposerAddMenu.vue?raw'
 import { resolveComposerAddMenuPlacement } from '@/utils/chat/composerAddMenuPlacement'
+import zhHans from '@/locales/zh-Hans.json'
 
 const chatViewStyles = readFileSync(
   'src/styles/chat-view.css',
@@ -22,7 +23,16 @@ const i18n = createI18n({
       chat: {
         add: 'Add',
         attachFiles: 'Attach files',
-        composer: { contentGroup: 'Content', workStyleGroup: 'Work style' },
+        composer: {
+          contentGroup: 'Content',
+          workStyleGroup: 'Work style',
+          pluginsGroup: 'Plugins',
+          browserUse: 'Browser Use',
+          browserUseDescription: 'Use the browser to complete a task',
+          searchCapabilities: 'Search capabilities or actions',
+        },
+        referenceLocalPaths: 'Reference local path (no upload)',
+        referenceLocalPathsHint: 'Only inserts paths; permissions still apply.',
         planMode: {
           label: 'Plan mode',
           readOnly: 'Research and discuss before implementation. Tests and builds follow normal permissions.',
@@ -36,6 +46,7 @@ const i18n = createI18n({
         },
       },
     },
+    'zh-Hans': zhHans,
   },
 })
 
@@ -43,6 +54,7 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
   const attachFiles = vi.fn()
   const activatePlanMode = vi.fn()
   const activateGoalMode = vi.fn()
+  const selectBrowserUse = vi.fn()
   const close = vi.fn()
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -58,6 +70,7 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
       planModeBusy: false,
       onActivatePlanMode: activatePlanMode,
       onActivateGoalMode: activateGoalMode,
+      onSelectBrowserUse: selectBrowserUse,
       onAttachFiles: attachFiles,
       onClose: close,
       ...overrides,
@@ -66,15 +79,39 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
   mountedApps.push(app)
   app.use(i18n)
   app.mount(host)
-  return { activateGoalMode, activatePlanMode, attachFiles, close, host }
+  return { activateGoalMode, activatePlanMode, attachFiles, selectBrowserUse, close, host }
 }
 
 afterEach(() => {
   while (mountedApps.length) mountedApps.pop()?.unmount()
   document.body.innerHTML = ''
+  i18n.global.locale.value = 'en'
 })
 
 describe('ChatComposerAddMenu', () => {
+  it('offers an independent, accessible local path action only when available', async () => {
+    const referenceLocalPaths = vi.fn()
+    const { host, attachFiles, close } = mountMenu({ localPathsAvailable: true,
+      onReferenceLocalPaths: referenceLocalPaths })
+    await nextTick()
+    const button = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(item => item.textContent?.includes('Reference local path'))!
+    expect(button.title).toBe('Only inserts paths; permissions still apply.')
+    button.click()
+    expect(referenceLocalPaths).toHaveBeenCalledOnce()
+    expect(attachFiles).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('disables the local action while preserving the original attachment action', async () => {
+    const { host } = mountMenu({ localPathsAvailable: true, localPathsDisabled: true })
+    await nextTick()
+    const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    const attach = items.find(item => item.textContent?.includes('Attach files'))
+    const local = items.find(item => item.textContent?.includes('Reference local path'))
+    expect(attach?.disabled).toBe(false)
+    expect(local?.disabled).toBe(true)
+  })
   it('escapes the Composer stacking context and supports collision-aware placement', () => {
     expect(chatViewStyles).toContain('.chat-composer-dock > .chat-composer')
     expect(chatViewStyles).toContain('z-index: auto')
@@ -84,6 +121,10 @@ describe('ChatComposerAddMenu', () => {
     expect(addMenuSource).toContain('z-index: 30')
     expect(addMenuSource).toContain('--composer-add-menu-lift')
     expect(addMenuSource).toContain('avoidElement')
+    expect(addMenuSource).not.toContain('border-bottom: 1px solid var(--border)')
+    expect(addMenuSource).not.toContain('.composer-add-menu__search:focus-within')
+    expect(addMenuSource).toContain('box-shadow: none')
+    expect(addMenuSource).not.toContain('inset 0 -2px 0 var(--text-muted)')
   })
 
   it('lifts above the Goal boundary and remains stable when remeasured', () => {
@@ -115,20 +156,20 @@ describe('ChatComposerAddMenu', () => {
 
     const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
     expect(items.map(item => item.textContent?.trim())).toEqual([
-      'Attach files',
       'Plan modeTurn plan mode on',
       'Goal modeStart a long-running goal',
+      'Attach files',
     ])
 
-    items[1].click()
+    items[0].click()
     expect(activatePlanMode).toHaveBeenCalledOnce()
     expect(close).toHaveBeenCalledOnce()
 
-    items[2].click()
+    items[1].click()
     expect(activateGoalMode).toHaveBeenCalledOnce()
     expect(close).toHaveBeenCalledTimes(2)
 
-    items[0].click()
+    items[2].click()
     expect(attachFiles).toHaveBeenCalledOnce()
   })
 
@@ -136,14 +177,43 @@ describe('ChatComposerAddMenu', () => {
     const { host } = mountMenu()
     await nextTick()
     const groups = [...host.querySelectorAll('[role="group"]')]
-    expect(groups.map(group => group.getAttribute('aria-label'))).toEqual(['Content', 'Work style'])
-    expect(groups[0].querySelectorAll('[role="menuitem"]')).toHaveLength(1)
-    expect(groups[1].querySelectorAll('[role="menuitem"]')).toHaveLength(2)
+    expect(groups.map(group => group.getAttribute('aria-label'))).toEqual(['Work style', 'Content'])
+    expect(groups[0].querySelectorAll('[role="menuitem"]')).toHaveLength(2)
+    expect(groups[1].querySelectorAll('[role="menuitem"]')).toHaveLength(1)
 
     const unavailable = mountMenu({ planModeAvailable: false, goalModeAvailable: false }).host
     await nextTick()
     expect(unavailable.querySelectorAll('[role="group"]')).toHaveLength(1)
     expect(unavailable.textContent).not.toContain('Work style')
+  })
+
+  it('offers Browser Use in Plugins and emits the selection action', async () => {
+    const { host, selectBrowserUse, close } = mountMenu({ browserUseAvailable: true })
+    await nextTick()
+    const groups = [...host.querySelectorAll('[role="group"]')]
+    const plugins = groups.find(group => group.getAttribute('aria-label') === 'Plugins')!
+    const workStyle = groups.find(group => group.getAttribute('aria-label') === 'Work style')!
+    expect(plugins.textContent).toContain('Browser Use')
+    expect(workStyle.textContent).not.toContain('Browser Use')
+    expect(plugins.textContent).toContain('Use the browser to complete a task')
+
+    const item = [...plugins.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(button => button.textContent?.includes('Browser Use'))
+    expect(item?.querySelector('.composer-capability__name')?.textContent).toBe('Browser Use[BETA]')
+    expect(item?.querySelector('.composer-capability__badge')?.textContent).toBe('[BETA]')
+    item?.click()
+    expect(selectBrowserUse).toHaveBeenCalledOnce()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the localized Browser Use title with the same beta marker', async () => {
+    i18n.global.locale.value = 'zh-Hans'
+    const { host } = mountMenu({ browserUseAvailable: true })
+    await nextTick()
+
+    const title = host.querySelector('.composer-capability__badge')?.parentElement
+    expect(title?.textContent).toBe('浏览器操作[BETA]')
+    expect(title?.closest('[role="menuitem"]')?.textContent).toContain('使用浏览器完成任务')
   })
 
   it('does not use the Add menu as an exit control for active Plan mode', async () => {

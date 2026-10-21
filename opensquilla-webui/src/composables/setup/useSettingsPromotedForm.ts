@@ -17,7 +17,7 @@ export function parseContextWindowInput(value: unknown): number | null {
 
 interface PromotedConfigData {
   llm_request_timeout_seconds?: number
-  llm?: { provider?: string; model?: string }
+  llm?: { provider?: string; model?: string; thinking?: string }
   // Per-provider/per-model overrides. Model ids contain dots and colons, so
   // this subtree is written with deep-merge patches, never dot-path patches.
   models?: Record<string, Record<string, { context_window?: number }>>
@@ -31,6 +31,8 @@ interface PromotedConfigData {
 
 export function useSettingsPromotedForm() {
   const llmTimeoutSeconds = ref(DEFAULT_LLM_TIMEOUT_SECONDS)
+  // Global thinking level for the direct/primary model ('' = unset default).
+  const llmThinking = ref('')
   // Per-model context-window override, kept as the raw input string ('' = auto).
   const contextWindowTokens = ref('')
   const memoryAutoCapture = ref(true)
@@ -55,11 +57,13 @@ export function useSettingsPromotedForm() {
 
   // Seed from the initial state so the pristine form is never dirty while config loads.
   const timeoutBaseline = ref(llmTimeoutSeconds.value)
+  const thinkingBaseline = ref(llmThinking.value)
   const contextWindowBaseline = ref(contextWindowTokens.value)
   const captureBaseline = ref(memoryAutoCapture.value)
   const audioBaseline = ref(audioSerialized.value)
 
   const timeoutDirty = computed(() => llmTimeoutSeconds.value !== timeoutBaseline.value)
+  const thinkingDirty = computed(() => llmThinking.value !== thinkingBaseline.value)
   const contextWindowDirty = computed(() => contextWindowTokens.value !== contextWindowBaseline.value)
   const captureDirty = computed(() => memoryAutoCapture.value !== captureBaseline.value)
   const audioDirty = computed(() => audioSerialized.value !== audioBaseline.value)
@@ -81,16 +85,18 @@ export function useSettingsPromotedForm() {
     initAudioFromConfig(config)
   }
 
-  function initProviderFromConfig(config: PromotedConfigData) {
+  function initProviderFromConfig(config: PromotedConfigData, preserveThinking = false) {
     const timeout = Number(config.llm_request_timeout_seconds)
     llmTimeoutSeconds.value = Number.isFinite(timeout) && timeout >= 1 ? timeout : DEFAULT_LLM_TIMEOUT_SECONDS
+    if (!preserveThinking) acceptLlmThinking(config.llm?.thinking)
     // Seed the context-window field from the saved provider+model override.
     contextWindowTokens.value = contextWindowOverrideFor(
       config,
       String(config.llm?.provider || ''),
       String(config.llm?.model || ''),
     )
-    commitProviderBaselines()
+    timeoutBaseline.value = llmTimeoutSeconds.value
+    contextWindowBaseline.value = contextWindowTokens.value
   }
 
   function initMemoryCaptureFromConfig(config: PromotedConfigData) {
@@ -112,11 +118,6 @@ export function useSettingsPromotedForm() {
     audioApiKey.value = ''
 
     audioBaseline.value = audioSerialized.value
-  }
-
-  function commitProviderBaselines() {
-    timeoutBaseline.value = llmTimeoutSeconds.value
-    contextWindowBaseline.value = contextWindowTokens.value
   }
 
   function setLlmTimeoutSeconds(value: number) {
@@ -155,6 +156,28 @@ export function useSettingsPromotedForm() {
     return { llm_request_timeout_seconds: llmTimeoutSeconds.value }
   }
 
+  function acceptLlmThinking(value: unknown) {
+    llmThinking.value = String(value ?? '').trim()
+    thinkingBaseline.value = llmThinking.value
+  }
+
+  function setLlmThinking(value: string) {
+    llmThinking.value = value
+  }
+
+  function resetLlmThinking() {
+    llmThinking.value = thinkingBaseline.value
+  }
+
+  // Dot-path patch for the global thinking level. Clearing the select ('')
+  // writes null, which deletes the llm.thinking key back to the unset default
+  // (the same clear semantics the context-window override uses). Rides the
+  // provider-save snapshot so it persists with the same save action.
+  function thinkingPatch(): Record<string, unknown> | null {
+    if (!thinkingDirty.value) return null
+    return { 'llm.thinking': llmThinking.value.trim() || null }
+  }
+
   // Deep-merge patch for the per-model context-window override. Model ids
   // contain dots and colons (e.g. "qwen3:8b", "deepseek/deepseek-v4-pro"), so
   // this CANNOT ride the dot-path `patches` form — the caller must send it via
@@ -191,6 +214,7 @@ export function useSettingsPromotedForm() {
 
   return {
     llmTimeoutSeconds,
+    llmThinking,
     contextWindowTokens,
     memoryAutoCapture,
     audioEnabled,
@@ -202,6 +226,7 @@ export function useSettingsPromotedForm() {
     audioLanguageCode,
     audioKeyConfigured,
     timeoutDirty,
+    thinkingDirty,
     contextWindowDirty,
     captureDirty,
     audioDirty,
@@ -210,11 +235,15 @@ export function useSettingsPromotedForm() {
     initMemoryCaptureFromConfig,
     initAudioFromConfig,
     setLlmTimeoutSeconds,
+    setLlmThinking,
+    acceptLlmThinking,
+    resetLlmThinking,
     setContextWindowTokens,
     reseedContextWindow,
     setMemoryAutoCapture,
     updateAudioField,
     providerPatches,
+    thinkingPatch,
     contextWindowPatch,
     memoryPatches,
     audioPayload,

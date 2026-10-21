@@ -17,7 +17,7 @@ from opensquilla.sandbox.run_context import (
     run_context_for_subagent,
     run_context_from_origin_payload,
 )
-from opensquilla.session.keys import normalize_agent_id, parse_agent_id
+from opensquilla.session.keys import is_sidechat_key, normalize_agent_id, parse_agent_id
 from opensquilla.tools.policy import apply_tool_policy_layer
 from opensquilla.tools.types import (
     CRON_AGENT_ALLOW,
@@ -77,6 +77,11 @@ class RouteEnvelope:
     metadata: dict[str, Any] = field(default_factory=dict)
     interaction_mode: InteractionMode = InteractionMode.INTERACTIVE
     sandbox_run_context_fresh: bool = False
+    # Trusted producer declaration of optional services that must be ready
+    # before the runtime may reserve this turn.  This is deliberately a
+    # separate field from ``metadata``: channel/web payloads are untrusted and
+    # must never be able to manufacture a readiness or lifecycle claim.
+    required_services: tuple[str, ...] = field(default=(), kw_only=True)
     # Process-local services attached only after durable acceptance. Keeping
     # them out of ``metadata`` prevents serialization of live handles.
     runtime_services: dict[str, Any] = field(
@@ -131,6 +136,7 @@ def build_channel_route_envelope(
     channel_type: str | None = None,
     session_id: str | None = None,
     session_epoch: int | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for a normalized inbound channel message."""
     metadata = dict(msg.metadata or {})
@@ -181,6 +187,7 @@ def build_channel_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -198,6 +205,7 @@ def build_cli_route_envelope(
     interaction_mode: InteractionMode | str = InteractionMode.INTERACTIVE,
     elevated: str | None = None,
     run_mode: str | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for local CLI input."""
     resolved_interaction_mode = _interaction_mode(interaction_mode)
@@ -228,6 +236,7 @@ def build_cli_route_envelope(
         metadata=metadata,
         interaction_mode=resolved_interaction_mode,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -244,6 +253,7 @@ def build_web_route_envelope(
     tool_source_kind: str | None = None,
     principal_is_owner: bool | None = None,
     principal_host_execute: bool | None = None,
+    required_services: tuple[str, ...] = (),
 ) -> RouteEnvelope:
     """Build a route for Web/RPC-originated input."""
     resolved_channel_id = channel_id or (f"web:{conn_id}" if conn_id else "web")
@@ -276,6 +286,7 @@ def build_web_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.INTERACTIVE,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -287,6 +298,7 @@ def build_cron_route_envelope(
     delivery: Any | None = None,
     session_id: str | None = None,
     session_epoch: int | None = None,
+    required_services: tuple[str, ...] = ("cron",),
 ) -> RouteEnvelope:
     """Build a route for scheduler-originated agent work or delivery."""
     resolved_delivery = delivery if delivery is not None else getattr(job, "delivery", None)
@@ -363,6 +375,7 @@ def build_cron_route_envelope(
         metadata=metadata,
         interaction_mode=InteractionMode.UNATTENDED,
         session_epoch=session_epoch,
+        required_services=tuple(required_services),
     )
 
 
@@ -722,8 +735,14 @@ def tool_context_from_envelope(
         usage_root_turn_id=envelope.metadata.get("usage_root_turn_id"),
         plan_revision=envelope.runtime_services.get("plan_revision"),
         plan_run=envelope.runtime_services.get("plan_run"),
-        goal_context=envelope.runtime_services.get("goal_context"),
-        goal_service=envelope.runtime_services.get("goal_service"),
+        goal_context=(
+            None if is_sidechat_key(envelope.session_key)
+            else envelope.runtime_services.get("goal_context")
+        ),
+        goal_service=(
+            None if is_sidechat_key(envelope.session_key)
+            else envelope.runtime_services.get("goal_service")
+        ),
         generated_artifact_adopter=generated_artifact_adopter,
         artifact_source_paths=getattr(generated_artifact_adopter, "source_paths", {}),
         desktop_browser=desktop_browser,

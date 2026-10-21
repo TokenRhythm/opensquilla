@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { EventEmitter } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 import vm from 'node:vm'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import ts from '@typescript/typescript6'
 import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
+import { DesktopQuitBudget } from '../dist/desktop-quit.js'
 import { mainWindowCloseAction } from '../dist/desktop-window-lifecycle.js'
 import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from '../dist/windows-update-coordinator.js'
 import { WindowsUpdateSecurityError } from '../dist/windows-update-security.js'
@@ -21,11 +23,11 @@ import {
 const source = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8')
 const parsed = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
 const names = [
-  'windowsInstallerActionsSupported', 'windowsUpdateDownloadDirectory',
+  'windowsInstallerActionsSupported', 'desktopUpdateAutomaticDownloadSupported', 'windowsUpdateDownloadDirectory',
   'clearWindowsUpdateCache', 'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache',
   'revalidateReadyWindowsInstaller', 'restoreDownloadedUpdateRetryState',
   'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'applyWindowsInstaller',
-  'downloadDesktopUpdate', 'showUpdateError', 'handleMainWindowClose', 'desktopGatewayConnectionSuspendedForExit',
+  'downloadDesktopUpdate', 'runDesktopUpdateDownload', 'showUpdateError', 'handleMainWindowClose', 'desktopGatewayConnectionSuspendedForExit',
 ]
 const declarations = new Map(parsed.statements.filter(ts.isFunctionDeclaration)
   .filter((statement) => statement.name).map((statement) => [statement.name.text, statement]))
@@ -45,6 +47,136 @@ assert.equal(beforeQuitCallbacks.length, 1, 'exercise the single actual producti
 const extracted = names.map((name) => declarations.get(name).getText(parsed)).join('\n')
 const compiled = ts.transpileModule(`${extracted}\nconst beforeQuit = ${beforeQuitCallbacks[0]};\nglobalThis.subject = { applyWindowsInstaller, restoreWindowsUpdateCache, windowsInstallerActionsSupported, downloadDesktopUpdate, revalidateReadyWindowsInstaller, beforeQuit, handleMainWindowClose };`,
   { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+
+// Load the native fixture's actual extraction list and host template as well.
+// A separate set of VM globals cannot catch a missing binding in that host.
+{
+  const runner = ts.createSourceFile('runner.mjs', await readFile(
+    new URL('./test-windows-update-electron.mjs', import.meta.url), 'utf8',
+  ), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  let nativeNames
+  const protectedVisibilityChecks = []
+  function findNames(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(runner) === 'names') {
+      assert.ok(ts.isArrayLiteralExpression(node.initializer))
+      nativeNames = node.initializer.elements.map(value => {
+        assert.ok(ts.isStringLiteral(value))
+        return value.text
+      })
+    }
+    if (ts.isCallExpression(node) && node.expression.getText(runner) === 'assert.equal'
+      && node.arguments[0]?.getText(runner) === 'deferred.visible') {
+      protectedVisibilityChecks.push(node.getText(runner))
+    }
+    ts.forEachChild(node, findNames)
+  }
+  findNames(runner)
+  assert.ok(nativeNames?.includes('holdQuitForTaskConfirmation'))
+  assert.equal(protectedVisibilityChecks.length, 2)
+  const failureCleanup = runner.statements.find(statement => ts.isFunctionDeclaration(statement)
+    && statement.name?.text === 'closeFixtureAfterFailure')
+  assert.ok(failureCleanup)
+  for (const gatesPresent of [false, true]) {
+    const order = []
+    const child = { pid: 54328 }
+    const close = new Function('closeElectronWithDeadline', `return ${failureCleanup.getText(runner)}`)(
+      async options => {
+        assert.equal(options.timeoutMs, 10_000, 'fixture gates share the existing cleanup deadline')
+        assert.equal(options.app.process(), child)
+        await options.app.close()
+        return { closed: true }
+      },
+    )
+    const result = await close({
+      process: () => child,
+      evaluate: async callback => vm.runInNewContext(`(${callback.toString()})()`, gatesPresent ? {
+        windowsUpdateFixture: {
+          releaseVerification: () => order.push('verification'),
+          releaseDrain: () => order.push('drain'),
+        },
+      } : {}),
+      close: async () => { order.push('close') },
+    })
+    assert.deepEqual(result, { closed: true })
+    assert.deepEqual(order, gatesPresent ? ['verification', 'drain', 'close'] : ['close'])
+  }
+  const scheduler = parsed.statements.find(statement => ts.isVariableStatement(statement)
+    && statement.declarationList.declarations.some(declaration => declaration.name.getText(parsed) === 'desktopUpdateCheckScheduler'))
+  assert.ok(scheduler)
+  const nativeDeclarations = ts.transpileModule([
+    ...nativeNames.map(name => declarations.get(name).getText(parsed)),
+    scheduler.getText(parsed),
+    `app.on('before-quit', ${beforeQuitCallbacks[0]});`,
+  ].join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  const template = await readFile(
+    new URL('./fixtures/windows-update-electron/main.template.mjs', import.meta.url), 'utf8',
+  )
+  const host = ts.createSourceFile('host.mjs', template, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
+  const body = host.statements.filter(statement => !ts.isImportDeclaration(statement))
+    .map(statement => statement.getFullText(host)).join('\n')
+    .replace('// PRODUCTION_DECLARATIONS', nativeDeclarations)
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+  for (const deferredQuit of [false, true]) {
+    const logs = [], exits = []
+    const app = new EventEmitter()
+    app.whenReady = () => new Promise(() => {})
+    app.quit = () => app.emit('before-quit', electronEvent())
+    app.exit = code => { exits.push(code) }
+    app.getVersion = () => '0.5.4'
+    const fixture = await new AsyncFunction(
+      'app', 'protocol', 'spawn', 'once', 'appendFileSync', 'readFileSync', 'join', 'pathToFileURL', 'process',
+      `${body}\nreturn {
+        startSyntheticGateway, liveLifecycleOwnedGatewayProcesses,
+        setUpdating(value) { updateApplying = value },
+        pendingQuit() { return quitRequestedDuringUpdateDrain },
+        confirmationPending() { return quitConfirmationPromise },
+        phase() { return appExitPhase },
+        closeWindow(window, event) { mainWindow = window; handleMainWindowClose(window, event) },
+      };`,
+    )(
+      app, { registerSchemesAsPrivileged() {} },
+      () => {
+        const child = new EventEmitter()
+        Object.assign(child, { pid: 54327, exitCode: null, signalCode: null })
+        child.stdin = { end() { child.exitCode = 0; child.emit('exit', 0) } }
+        queueMicrotask(() => child.emit('spawn'))
+        return child
+      },
+      once, (_path, line) => logs.push(JSON.parse(line)),
+      () => JSON.stringify({ packageRoot: fileURLToPath(new URL('..', import.meta.url)), nodePath: 'synthetic-node' }),
+      join, pathToFileURL, { platform: 'win32', env: {} },
+    )
+    await fixture.startSyntheticGateway()
+    if (deferredQuit) {
+      const window = {
+        visible: true, isDestroyed: () => false,
+        hide() { this.visible = false },
+      }
+      fixture.setUpdating(true)
+      const closeEvent = electronEvent()
+      fixture.closeWindow(window, closeEvent)
+      app.quit()
+      await fixture.confirmationPending()
+      assert.equal(closeEvent.defaultPrevented, true)
+      assert.equal(window.visible, true, 'protected update must retain its parent window')
+      for (const check of protectedVisibilityChecks) {
+        vm.runInNewContext(check, { assert, deferred: { visible: window.visible } })
+      }
+      assert.equal(fixture.pendingQuit(), true)
+      assert.equal(fixture.liveLifecycleOwnedGatewayProcesses().length, 1)
+      assert.deepEqual(exits, [])
+      fixture.setUpdating(false)
+    }
+    app.quit()
+    await until(() => exits.length > 0, 'native fixture ordinary quit')
+    assert.deepEqual(exits, [0])
+    assert.equal(fixture.liveLifecycleOwnedGatewayProcesses().length, 0)
+    assert.equal(fixture.phase(), 'committed')
+    assert.equal(fixture.confirmationPending(), null)
+    assert.ok(logs.findIndex(row => row.event === 'gateway_exit')
+      < logs.findIndex(row => row.event === 'phase' && row.to === 'committed'))
+  }
+}
 
 function deferred() {
   let resolve
@@ -100,7 +232,8 @@ function fixture(options = {}) {
     windowsUpdateCacheRestoreAttempted: true,
     windowsUpdateCoordinator: new WindowsUpdateCoordinator(1000),
     windowsUpdateRecoveryGeneration: 0,
-    updateApplying: false, isQuitting: false, appExitPhase: 'running',
+    desktopUpdateDownloadTask: null, desktopUpdateDownloadOrigin: null,
+    updateApplying: false, isQuitting: false, appExitPhase: 'running', gatewayLateReadyObservation: null,
     updateInstallHandoffReady: false, updateDownloadInProgress: false,
     manualInstallerActionInProgress: false, updateGatewayShutdownProcess: null,
     downloadedUpdateVersion: null, quitRequestedDuringUpdateDrain: false,
@@ -156,9 +289,15 @@ function electronEvent() {
 function lifecycleFixture(options = {}) {
   const f = fixture(options)
   const calls = { quitEvents: [], exits: [], hidden: 0, normalDrains: 0, schedulerStops: 0 }
-  const window = { hide: () => { calls.hidden += 1 } }
+  const window = { isDestroyed: () => false, hide: () => { calls.hidden += 1 } }
   Object.assign(f.context, {
-    mainWindowCloseAction,
+    mainWindowCloseAction, DesktopQuitBudget,
+    quitConfirmationPromise: null, quitConfirmed: false, quitFromSignal: false,
+    quitUnconfirmedProcessTrees: new Set(),
+    gatewayProcessCleanupContexts: new Map(),
+    holdQuitForTaskConfirmation: () => false,
+    cancelGatewayUnexpectedExitRestart: () => {},
+    showDesktopQuitFailure: () => { assert.fail('synthetic normal quit cleanup must succeed') },
     systemSessionEnding: false,
     windowsTray: {},
     currentOnboardingWindow: () => null,
@@ -167,8 +306,8 @@ function lifecycleFixture(options = {}) {
     focusOnboardingWindow: () => { assert.fail('no onboarding exists in this lifecycle fixture') },
     promptForMainWindowClose: () => { assert.fail('close during a deferred/draining exit must not reopen a prompt') },
     desktopUpdateCheckScheduler: { stop: () => { calls.schedulerStops += 1 } },
-    artifactPreviewLeaseBroker: { clear: () => {}, revokeAll: async () => {} },
-    nativeWorkbenchSurfaces: { destroyAll: async () => {} },
+    artifactPreviewLeaseBroker: { clear: () => {}, revokeAll: async () => {}, shutdown: async () => {} },
+    nativeWorkbenchSurfaces: { hasBrowserTabs: () => false, destroyAll: async () => {} },
     desktopBrowser: { close: async () => {} },
     destroyWindowsTray: () => { f.context.windowsTray = null },
     stopGateway: () => {},
@@ -177,7 +316,13 @@ function lifecycleFixture(options = {}) {
     quitWriterAdmission: null,
     gatewayProcess: null,
     gatewayState: { owned: false },
-    drainOwnedGatewayForQuit: async () => { calls.normalDrains += 1; return true },
+    quitOwnedGateway: async (child) => {
+      calls.normalDrains += 1
+      const index = f.live.indexOf(child)
+      assert.ok(index >= 0, 'normal quit must own the child it stops')
+      f.live.splice(index, 1)
+      return true
+    },
     dialog: { showErrorBox: () => { assert.fail('synthetic normal quit drain must succeed') } },
     app: { ...f.context.app,
       quit: () => {
@@ -445,7 +590,7 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   assert.equal(f.context.quitRequestedDuringUpdateDrain, true)
   assert.equal(f.context.appExitPhase, 'deferred')
   assert.equal(f.closeWindow().defaultPrevented, true)
-  assert.equal(f.lifecycleCalls.hidden, 1)
+  assert.equal(f.lifecycleCalls.hidden, 0, 'close must keep the protected update visible')
   assert.equal(f.calls.stops, 0)
   assert.equal(f.lifecycleCalls.normalDrains, 0)
   assert.deepEqual(f.lifecycleCalls.exits, [])
@@ -474,7 +619,8 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   drain.resolve()
   await update
   assert.equal(f.context.quitRequestedDuringUpdateDrain, false)
-  await until(() => f.lifecycleCalls.quitEvents.some((event) => !event.defaultPrevented), 'remembered Quit after asynchronous spawn failure')
+  await until(() => f.lifecycleCalls.exits.length === 1, 'remembered Quit after asynchronous spawn failure')
+  assert.deepEqual(f.lifecycleCalls.exits, [0])
   assert.equal(f.calls.launches, 1)
   assert.equal(f.context.updateInstallHandoffReady, false, 'failed spawn cannot commit installer handoff')
   assert.equal(f.calls.resumes, 0, 'user Quit after a drain suppresses Gateway recovery')
@@ -496,7 +642,7 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   await f.subject.applyWindowsInstaller()
   assert.equal(f.calls.stops, 1)
   assert.equal(f.calls.launches, 0)
-  assert.equal(f.lifecycleCalls.hidden, 2)
+  assert.equal(f.lifecycleCalls.hidden, 0, 'repeated close must keep the protected update visible')
   drain.resolve()
   await until(() => f.child !== null, 'spawn event after deferred Quit')
   assert.equal(f.context.updateInstallHandoffReady, false)

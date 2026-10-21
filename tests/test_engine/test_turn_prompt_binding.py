@@ -44,7 +44,6 @@ from opensquilla.provider import (
     TextDeltaEvent,
 )
 from opensquilla.provider.request_proof import estimate_provider_media_tokens
-from opensquilla.session.compaction import estimate_entry_model_replay_tokens
 from opensquilla.session.context_view import (
     build_compaction_context_records,
     build_provider_compaction_context,
@@ -408,7 +407,7 @@ async def test_router_capacity_projects_inline_images_after_route() -> None:
     await manager.create(key)
     payloads = [_capacity_image_bytes("blue"), _capacity_image_bytes("red")]
     envelope = _inline_images("inspect both images", *payloads)
-    historical_user = await manager.append_message(key, "user", envelope)
+    await manager.append_message(key, "user", envelope)
     await manager.append_message(key, "assistant", "historical answer")
     current = await manager.append_message(key, "user", "current image turn")
     entries = await manager.get_transcript(key)
@@ -423,7 +422,10 @@ async def test_router_capacity_projects_inline_images_after_route() -> None:
         preserve_image_attachments=True,
     )
 
-    raw_tokens = estimate_entry_model_replay_tokens(historical_user)
+    # The old estimator included the persisted Base64 envelope.  Capacity is
+    # now measured from the provider-visible projection, so compare against
+    # the canonical raw envelope only to prove that pixels were discounted.
+    raw_tokens = estimate_tokens(envelope)
     media_reserve = sum(
         estimate_provider_media_tokens("image", len(payload)) for payload in payloads
     )
@@ -441,7 +443,10 @@ async def test_router_capacity_projects_inline_images_after_route() -> None:
         preserve_image_attachments=False,
     )
     assert text_route_context["history_capacity_estimate_complete"] is True
-    assert text_route_context["history_capacity_estimated_tokens"] >= raw_tokens
+    assert text_route_context["history_capacity_estimated_tokens"] < raw_tokens
+    assert text_route_context["history_capacity_estimated_tokens"] < context[
+        "history_capacity_estimated_tokens"
+    ]
 
     ordinary_json = json.dumps(
         {
@@ -480,6 +485,197 @@ async def test_router_capacity_projects_inline_images_after_route() -> None:
     assert ordinary_context["history_capacity_estimated_tokens"] >= estimate_tokens(
         ordinary_json
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mime",
+    ["application/zip", "application/octet-stream", "application/x-unknown"],
+)
+async def test_router_capacity_projects_opaque_inline_attachments(
+    mime: str,
+) -> None:
+    manager = _FakeSessionManager()
+    key = f"agent:main:router-capacity-opaque-{mime.rsplit('/', 1)[-1]}"
+    await manager.create(key)
+    data = base64.b64encode(b"opaque attachment payload" * 5_000).decode("ascii")
+    envelope = json.dumps(
+        {
+            "text": "inspect this file",
+            "attachments": [{"type": mime, "name": "payload.bin", "data": data}],
+        },
+        separators=(",", ":"),
+    )
+    await manager.append_message(key, "user", envelope)
+    await manager.append_message(key, "assistant", "historical answer")
+    current = await manager.append_message(key, "user", "current")
+    entries = await manager.get_transcript(key)
+    runner = _new_runner(manager)
+
+    context = await runner._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=2,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+    raw_tokens = estimate_tokens(envelope)
+    assert context["history_capacity_estimate_complete"] is True
+    assert context["history_capacity_estimated_tokens"] < raw_tokens
+
+    replay = runner._project_history_replay(
+        entries,
+        excluded_entry_indexes={2},
+        trim_last_user=True,
+        bound_slice_applied=True,
+        image_replay_entry_indexes={0},
+        media_root=runner._attachment_media_root(),
+        session_id=key,
+        require_capacity_proof=True,
+    )
+    replay_text = json.dumps(
+        [message.model_dump(mode="json") for message in replay.messages],
+        ensure_ascii=False,
+    )
+    assert data not in replay_text
+    assert "historical attachment" in replay_text
+
+
+@pytest.mark.asyncio
+async def test_router_capacity_covers_materialized_opaque_history_without_writes(
+    tmp_path: Path,
+) -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-materialized-opaque"
+    await manager.create(key)
+    payload = b"synthetic zip content" * 512
+    data = base64.b64encode(payload).decode("ascii")
+    envelope = json.dumps({
+        "text": "Inspect the archive.",
+        "attachments": [{
+            "type": "application/zip", "name": "archive.zip", "size": len(payload),
+            "data": data,
+        }],
+    })
+    await manager.append_message(key, "user", envelope)
+    current = await manager.append_message(key, "user", "Current turn")
+    entries = await manager.get_transcript(key)
+    runner = _new_runner(manager)
+    workspace = tmp_path / "workspace"
+
+    capacity = await runner._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=1,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+    replay = runner._project_history_replay(
+        entries,
+        excluded_entry_indexes={1},
+        trim_last_user=True,
+        bound_slice_applied=True,
+        image_replay_entry_indexes={0},
+        session_id=key,
+        require_capacity_proof=True,
+    )
+    assert capacity["history_capacity_estimate_complete"] is True
+    assert data not in str(replay.messages)
+    assert not workspace.exists()
+
+    actual = TurnRunner._maybe_unpack_attachments(
+        envelope,
+        materialize_historical_attachments=True,
+        media_root=tmp_path / "media",
+        workspace_dir=workspace,
+        session_id=key,
+    )
+    assert isinstance(actual, str)
+    assert data not in actual
+    actual_projection = HistoryReplayProjection(
+        messages=(Message(role="user", content=actual),)
+    )
+    actual_capacity = project_history_replay_capacity(actual_projection)
+    assert capacity["history_capacity_estimated_tokens"] >= actual_capacity.estimated_tokens
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attachment",
+    [
+        {
+            "type": "application/zip",
+            "name": "broken.zip",
+            "data": "invalid***" + "A" * 80_000,
+        },
+        {
+            "type": "application/octet-stream",
+            "name": "missing.bin",
+            "size": 1,
+            "sha256_ref": "0" * 64,
+        },
+        {
+            "type": "application/x-unknown",
+            "name": "unavailable.bin",
+            "data": "invalid***" + "A" * 80_000,
+            "missing_reason": "attachment persistence disabled",
+        },
+    ],
+    ids=["invalid-base64", "missing-ref", "invalid-with-missing-reason"],
+)
+async def test_router_capacity_opaque_material_never_replays_storage_data(
+    attachment: dict[str, Any],
+) -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:router-capacity-invalid-opaque"
+    await manager.create(key)
+    envelope = json.dumps(
+        {"text": "inspect the historical file", "attachments": [attachment]},
+        separators=(",", ":"),
+    )
+    historical = _TranscriptEntry(
+        "user", envelope, "historical", token_count=estimate_tokens(envelope),
+    )
+    current = _TranscriptEntry("user", "current", "current")
+    entries = [historical, _TranscriptEntry("assistant", "answer", "answer"), current]
+    manager._transcripts[key] = entries
+    runner = _new_runner(manager)
+
+    replay = runner._project_history_replay(
+        entries,
+        excluded_entry_indexes={2},
+        trim_last_user=True,
+        bound_slice_applied=True,
+        image_replay_entry_indexes={0},
+        media_root=runner._attachment_media_root(),
+        session_id=key,
+        require_capacity_proof=True,
+    )
+    capacity = await runner._router_history_capacity_context(
+        key,
+        entries,
+        exclude_last_user=True,
+        bound_user_message_id=current.message_id,
+        bound_index=2,
+        max_history_turns=1,
+        preserve_image_attachments=True,
+    )
+
+    replay_text = json.dumps(
+        [message.model_dump(mode="json") for message in replay.messages],
+        ensure_ascii=False,
+    )
+    assert replay.estimate_complete is True
+    assert capacity["history_capacity_estimate_complete"] is True
+    assert "historical attachment" in replay_text
+    data = attachment.get("data")
+    if isinstance(data, str):
+        assert data not in replay_text
+        assert capacity["history_capacity_estimated_tokens"] < estimate_tokens(envelope)
 
 
 def test_router_capacity_does_not_discount_tool_argument_data_url() -> None:
@@ -572,18 +768,13 @@ async def test_router_capacity_applies_route_history_limit_and_bound_slice() -> 
             "data": "this is not valid base64 ***",
         },
         {
-            "type": "application/x-unknown",
-            "name": "unknown.bin",
-            "data": base64.b64encode(b"unknown").decode("ascii"),
-        },
-        {
             "type": "image/png",
             "name": "missing.png",
             "size": 1,
             "sha256_ref": "0" * 64,
         },
     ],
-    ids=["invalid-base64", "unknown-mime", "missing-sha256-ref"],
+    ids=["invalid-base64", "missing-sha256-ref"],
 )
 async def test_router_capacity_invalid_inline_image_fails_closed(
     attachment: dict[str, Any],
@@ -787,6 +978,19 @@ async def test_router_capacity_preserves_plain_token_floor_but_clears_inline_med
     assert inline_media["history_capacity_estimate_complete"] is True
     assert inline_media["history_capacity_estimated_tokens"] < inline_raw_floor
 
+    surplus = await project(
+        _TranscriptEntry(
+            "user",
+            inline_envelope,
+            "inline-media-surplus",
+            token_count=inline_raw_floor + 777,
+        )
+    )
+    assert surplus["history_capacity_estimate_complete"] is True
+    assert surplus["history_capacity_estimated_tokens"] >= (
+        inline_media["history_capacity_estimated_tokens"] + 700
+    )
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("persist_raw_floor", [False, True])
@@ -830,21 +1034,30 @@ async def test_router_capacity_mixed_envelope_discounts_only_typed_image_data(
         preserve_image_attachments=True,
     )
 
-    # The image data becomes a typed media block, while the PDF base64 remains
-    # in the conservative residual token floor for this mixed row.
-    residual_envelope = envelope.replace(
-        json.dumps(image_data),
-        json.dumps(f"[history_image_omitted: {len(image_data)} chars]"),
-    )
+    # The image data becomes a typed media block and the PDF becomes a bounded
+    # marker. Neither attachment's Base64 contributes to admission.
     expected_image_reserve = estimate_provider_media_tokens(
         "image",
         len(base64.b64decode(image_data, validate=True)),
     )
     assert context["history_capacity_estimate_complete"] is True
-    assert (
-        estimate_tokens(residual_envelope) + expected_image_reserve
-        <= context["history_capacity_estimated_tokens"]
+    assert expected_image_reserve <= context["history_capacity_estimated_tokens"] < raw_floor
+    replay = _new_runner(manager)._project_history_replay(
+        entries,
+        excluded_entry_indexes={2},
+        trim_last_user=True,
+        bound_slice_applied=True,
+        image_replay_entry_indexes={0},
+        media_root=_new_runner(manager)._attachment_media_root(),
+        session_id=key,
+        require_capacity_proof=True,
     )
+    replay_text = json.dumps(
+        [message.model_dump(mode="json") for message in replay.messages],
+        ensure_ascii=False,
+    )
+    assert document_data not in replay_text
+    assert "historical attachment" in replay_text
     assert context["history_capacity_estimated_tokens"] < raw_floor
 
 

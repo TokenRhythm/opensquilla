@@ -470,6 +470,11 @@ def test_direct_migrator_rejects_config_path_without_writing(tmp_path: Path) -> 
 def test_apply_imports_home_with_transforms(tmp_path: Path) -> None:
     source = _build_source_home(tmp_path, with_enabled_column=True)
     target = tmp_path / "target-home"
+    if os.name == "nt":
+        # The public target fits MAX_PATH, but staging adds a transaction UUID
+        # and the atomic receipt writer adds another temporary filename.
+        target = tmp_path / ("x" * max(1, 118 - len(str(tmp_path)) - 1)) / "target-home"
+        target.parent.mkdir()
 
     report = _run(source, target, apply=True)
 
@@ -508,6 +513,7 @@ def test_apply_imports_home_with_transforms(tmp_path: Path) -> None:
     # The report directory contains only narrow protocol/summary artifacts,
     # never a duplicate database or identity/memory document.
     output_dir = Path(report["output_dir"])
+    assert report["target"] == str(target)
     assert {
         path.relative_to(output_dir).as_posix()
         for path in output_dir.rglob("*")
@@ -515,7 +521,7 @@ def test_apply_imports_home_with_transforms(tmp_path: Path) -> None:
     } == {"layout-receipt.json", "report.json", "summary.md"}
 
     # No staging dir left behind.
-    assert not list(tmp_path.glob(".opensquilla-import-*"))
+    assert not list(target.parent.glob(f".{target.name}.profile-staging.*"))
 
     # RC4 keeps the source strictly read-only; target receipts are authoritative.
     assert not (source / IMPORT_MARKER_FILENAME).exists()
@@ -1415,17 +1421,44 @@ def test_candidate_metadata_size_is_bounded_and_never_follows_links(
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.toml").write_text("version = \"0.5.0rc3\"\n", encoding="utf-8")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "private.txt").write_text("must-not-be-read", encoding="utf-8")
-    (source / "linked").symlink_to(outside, target_is_directory=True)
-    monkeypatch.setattr(migration_module, "_CANDIDATE_METADATA_MAX_ENTRIES", 1)
-
-    candidate = inspect_opensquilla_home_candidate(source, kind="cli-home")
-
+    (source / "plain.txt").write_text("ordinary metadata entry", encoding="utf-8")
+    unrestricted = inspect_opensquilla_home_candidate(source, kind="cli-home")
+    assert unrestricted is not None
+    assert isinstance(unrestricted.size_bytes, int)
+    assert unrestricted.size_bytes > 0
+    with monkeypatch.context() as bounded:
+        bounded.setattr(migration_module, "_CANDIDATE_METADATA_MAX_ENTRIES", 1)
+        candidate = inspect_opensquilla_home_candidate(source, kind="cli-home")
     assert candidate is not None
     assert candidate.size_bytes is None
     assert candidate.version == "0.5.0rc3"
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.txt").write_text("must-not-be-read", encoding="utf-8")
+    linked = source / "linked"
+    if os.name == "nt":
+        # A real directory junction exercises the reparse boundary without
+        # requiring the Windows symbolic-link creation privilege.
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked), str(outside)],
+            check=True,
+            capture_output=True,
+        )
+        assert linked.is_junction()
+    else:
+        linked.symlink_to(outside, target_is_directory=True)
+    real_scandir = os.scandir
+
+    def reject_outside_enumeration(path):
+        assert Path(path).resolve() != outside, "candidate metadata followed the directory link"
+        return real_scandir(path)
+
+    monkeypatch.setattr(migration_module.os, "scandir", reject_outside_enumeration)
+    unrestricted = inspect_opensquilla_home_candidate(source, kind="cli-home")
+    assert unrestricted is not None
+    assert unrestricted.size_bytes is None
+    assert unrestricted.version == "0.5.0rc3"
 
 
 def test_portable_candidate_enumeration_has_a_hard_display_bound(

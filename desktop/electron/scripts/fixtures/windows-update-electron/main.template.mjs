@@ -10,6 +10,7 @@ import { pathToFileURL } from 'node:url'
 const config = JSON.parse(readFileSync(process.env.OPENSQUILLA_TEST_FIXTURE_CONFIG, 'utf8'))
 const moduleAt = name => import(pathToFileURL(join(config.packageRoot, 'dist', name)).href)
 const { DesktopWriterAdmission } = await moduleAt('desktop-writer-admission.js')
+const { DesktopQuitBudget, DesktopQuitConfirmation } = await moduleAt('desktop-quit.js')
 const { mainWindowCloseAction } = await moduleAt('desktop-window-lifecycle.js')
 const { WindowsUpdateCoordinator, WindowsUpdatePreparationError } = await moduleAt('windows-update-coordinator.js')
 const { WindowsUpdateSecurityError } = await moduleAt('windows-update-security.js')
@@ -29,15 +30,26 @@ let gatewayProcess = null
 const gatewayState = { owned: true, url: '' }
 let isQuitting = false
 let appExitPhase = 'running'
+const gatewayLateReadyObservation = null
 let updateApplying = false
 let updateInstallHandoffReady = false
 let updateDownloadInProgress = false
+let desktopUpdateDownloadTask = null
+let desktopUpdateDownloadOrigin = null
 let manualInstallerActionInProgress = false
 let updateGatewayShutdownProcess = null
 let quitRequestedDuringUpdateDrain = false
 let quitGatewayDrainPromise = null
 let quitDeferredForDesktopWriters = false
 let quitWriterAdmission = null
+let quitConfirmed = false
+const quitFromSignal = false
+let quitConfirmationPromise = null
+let quitConfirmationWantsExit = false
+const desktopQuitConfirmation = new DesktopQuitConfirmation()
+const gatewayProcessCleanupContexts = new Map()
+const gatewayProcessCleanupOperations = new WeakMap()
+const quitUnconfirmedProcessTrees = new Set()
 const systemSessionEnding = false
 let windowsTray = {}
 const desktopWriters = new DesktopWriterAdmission()
@@ -82,8 +94,14 @@ const promptForMainWindowClose = () => { throw new Error('unexpected close promp
 const createApplicationMenu = () => {}
 const createWindowsTray = () => { windowsTray = {} }
 const destroyWindowsTray = () => { windowsTray = null }
-const artifactPreviewLeaseBroker = { clear: () => {}, revokeAll: async () => {} }
-const nativeWorkbenchSurfaces = { destroyAll: async () => {} }
+const artifactPreviewLeaseBroker = {
+  clear: () => {}, revokeAll: async () => {}, shutdown: async () => {},
+}
+const nativeWorkbenchSurfaces = {
+  hasBrowserTabs: () => false,
+  closeBrowserTabs: async ({ confirm }) => await confirm({ tabCount: 0 }),
+  destroyAll: async () => {},
+}
 const desktopBrowser = { close: async () => {} }
 const desktopT = key => ({
   'update.signatureUnavailable': 'Windows could not verify the installer signature. Try again.',
@@ -118,7 +136,21 @@ async function stopSyntheticGateway(child) {
   return true
 }
 const stopGateway = () => { for (const child of owned) child.stdin.end() }
-const drainOwnedGatewayForQuit = child => stopSyntheticGateway(child)
+// The fixture owns idle Node children, not a Gateway HTTP server. Keep activity
+// and process stopping explicit while running the production quit controller.
+const ownedGatewayRecord = child => ({ pid: child.pid })
+const readVerifiedDesktopGatewayActivity = async record => {
+  if (![...owned].some(child => child.pid === record.pid && !hasGatewayProcessExited(child))) {
+    throw new Error('activity requested for an unowned synthetic Gateway')
+  }
+  return { kind: 'ok', activeCount: 0 }
+}
+const showDesktopQuitConfirmation = () => { throw new Error('idle fixture must not prompt for tasks') }
+const quitOwnedGateway = child => stopSyntheticGateway(child)
+const drainOwnedGatewayForLegacyQuit = child => stopSyntheticGateway(child)
+const cancelGatewayUnexpectedExitRestart = () => {}
+const waitForDesktopWriterOperations = () => desktopWriters.waitForAtMost(0)
+const showDesktopQuitFailure = () => { throw new Error('synthetic Gateway cleanup failed') }
 async function openOrResumeDesktopApp() {
   counts.resumes += 1
   await startSyntheticGateway()

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -70,6 +72,38 @@ async def test_close_kills_stdio_process_when_terminate_times_out(
     assert process.terminated is True
     assert process.killed is True
     assert process.wait_calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="Desktop POSIX service ownership")
+async def test_desktop_stdio_protocol_and_close_settle_owned_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla import desktop_process_cleanup as cleanup
+
+    monkeypatch.setattr(cleanup, "_active_scope", None)
+    control = tmp_path / "control"
+    nonce = "m" * 43
+    cleanup.configure_desktop_process_cleanup(
+        ownership_dir=control, instance_nonce=nonce, state_dir=tmp_path / "state",
+    )
+    client = MCPStdioClient(MCPServerConfig(
+        name="synthetic", transport="stdio", command=sys.executable,
+        args=[_SDK_SERVER_SCRIPT],
+    ))
+    owner = None
+    try:
+        await asyncio.wait_for(client.connect(), timeout=30)
+        owner = client._process_owner
+        assert owner is not None
+        result = await client.call_tool("ping", {"text": "owned round trip"})
+        assert result.content == "owned round trip" and not result.is_error
+    finally:
+        await client.close()
+    assert owner is not None and not owner.is_active()
+    assert await asyncio.to_thread(
+        cleanup.cleanup_desktop_processes, control, nonce, deadline=time.monotonic() + 5,
+    )
 
 
 @pytest.mark.asyncio

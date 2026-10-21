@@ -159,7 +159,41 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    assert len(registry.list_methods()) == 301
+    # V2 recovery, video discovery, message search, five interactive terminal
+    # methods, side create/close and workspace creation add sixteen to the
+    # previous 269-method surface.
+    assert len(registry.list_methods()) == 285
+    workspace_entry = registry.get_entry("workspaces.create")
+    assert workspace_entry is not None
+    assert workspace_entry.required_scope == "operator.write"
+    assert workspace_entry.generated_contract_name == "workspaces.create"
+    assert workspace_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    for method in (
+        "terminal.create", "terminal.write", "terminal.resize", "terminal.close",
+        "terminal.consume",
+    ):
+        terminal_entry = registry.get_entry(method)
+        assert terminal_entry is not None
+        assert terminal_entry.required_scope == "operator.write"
+    for method in ("sessions.sidechat.create", "sessions.sidechat.close"):
+        sidechat_entry = registry.get_entry(method)
+        assert sidechat_entry is not None
+        assert sidechat_entry.required_scope == "operator.write"
+        assert sidechat_entry.generated_contract_name == method
+        assert sidechat_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    assert registry.get_entry("sessions.messages.search") is not None
+    assert registry.get_entry("onboarding.videoGeneration.models.discover") is not None
+    for method in (
+        "transport.sessionFlow.update.v2",
+        "sessions.read.open.v2",
+        "sessions.read.state.v2",
+        "sessions.read.install.v2",
+        "sessions.read.close.v2",
+        "sessions.history.page.v2",
+    ):
+        assert registry.get_entry(method) is not None
+    assert registry.get_entry("router.feedback.submit") is None
+    assert registry.get_entry("router.selflearning.status") is None
     assert registry.get_entry("workspaces.references.read") is not None
     assert registry.get_entry("skills.candidates") is not None
     assert registry.get_entry("skills.setEnabled") is not None
@@ -168,6 +202,11 @@ def test_production_registry_uses_contract_wrappers_without_surface_drift() -> N
     assert registry.get_entry("skills.install.status") is not None
     assert registry.get_entry("telemetry.product_active.record") is not None
     assert registry.get_entry("sessions.executionLog.read") is not None
+    receipt_entry = registry.get_entry("turns.receipt.get")
+    assert receipt_entry is not None
+    assert receipt_entry.required_scope == "operator.read"
+    assert receipt_entry.generated_contract_name == "turns.receipt.get"
+    assert receipt_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
     assert tuple(PRODUCTION_HANDLER_NAMES) == SANDBOX_RUNTIME_CONTRACT_METHODS
     for method, implementation_name in PRODUCTION_HANDLER_NAMES.items():
         entry = registry.get_entry(method)

@@ -264,6 +264,9 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
     discoverImageGenerationModels(providerId, request) {
       return requestContract(rpc, setupContracts.imageModelsDiscover, { providerId }, request) as Promise<SetupDiscoveryResult>
     },
+    discoverVideoGenerationModels(providerId, request) {
+      return requestContract(rpc, setupContracts.videoModelsDiscover, { providerId }, request) as Promise<SetupDiscoveryResult>
+    },
     provider,
     profile,
     capability,

@@ -575,7 +575,7 @@ const probeResults = ref<Record<string, ProbeResult>>({})
 // alive and the Configuration sidenav dot stays lit.
 const editor = useChannelEditor(setupWorkflow, channelAdministration, channelSetup)
 const editMode = ref(false)
-const editorSaving = ref(false)
+const editorSaving = editor.saving
 /** Discard-guard verdict: true = discard the draft and proceed, false = the
  *  operator chose "keep editing" (restore the URL), 'superseded' = a NEWER
  *  guarded action took this question over — the stale handler must neither
@@ -588,7 +588,7 @@ const discardRequest = ref<{ resolve: (verdict: DiscardVerdict) => void } | null
 const composeEditor = useChannelEditor(setupWorkflow, channelAdministration, channelSetup)
 const composeMode = ref(false)
 const composeType = ref('')
-const composeSaving = ref(false)
+const composeSaving = composeEditor.saving
 const composeDiscardRequest = ref<{ resolve: (verdict: DiscardVerdict) => void } | null>(null)
 // Members (pairings + channel admins) for the drilled-in channel — state owned
 // here so it survives section scrolling; ChannelMembersPanel renders it.
@@ -1003,17 +1003,21 @@ async function approvePairing(name: string, pairing: ChannelPairing | null, asAd
         pairing.pairingId,
         asAdmin,
       )
+      const facts = homeFacts.value[name]
+      if (facts?.pending?.some(item => item.pairingId === pairing.pairingId)) {
+        // This approval is acknowledged even if the following read fails.
+        // Remove only its pending row; unknown counts remain unknown.
+        homeFacts.value = { ...homeFacts.value, [name]: {
+          ...facts,
+          pending: facts.pending.filter(item => item.pairingId !== pairing.pairingId),
+          members: facts.members === null ? null : facts.members + 1,
+        } }
+      }
       // The backend commits the approval even when the admin grant fails
       // (adminGranted:false + warnings) — surface that instead of falsely
       // toasting an admin success.
       if (asAdmin && res?.adminGranted === false) {
-        pushToast(t('console.channels.pairings.approveSuccess', { sender }), { tone: 'ok' })
-        pushToast(t('console.channels.pairings.adminGrantFailedAfterApprove', { sender }), { tone: 'danger' })
-      } else {
-        pushToast(
-          t(asAdmin ? 'console.channels.pairings.approveAdminSuccess' : 'console.channels.pairings.approveSuccess', { sender }),
-          { tone: 'ok' },
-        )
+        pushToast(t('console.channels.pairings.adminGrantFailedAfterApprove', { sender }), { tone: 'warn' })
       }
     } catch (err) {
       pushToast(t('console.channels.pairings.approveFailed', { sender, error: errorMessage(err) }), { tone: 'danger' })
@@ -1028,7 +1032,6 @@ async function rejectPairing(name: string, pairing: ChannelPairing | null): Prom
   await withPendingKey(pendingActions, `${name}:pairing`, async () => {
     try {
       await channelAdministration.revokePairing(name, pairing.pairingId)
-      pushToast(t('console.channels.home.rejectSuccess', { sender }), { tone: 'ok' })
     } catch (err) {
       pushToast(t('console.channels.home.rejectFailed', { sender, error: errorMessage(err) }), { tone: 'danger' })
     }
@@ -1132,22 +1135,12 @@ function testDraft(): void {
 
 async function saveDraft(): Promise<void> {
   if (editorSaving.value) return
-  editorSaving.value = true
-  try {
-    handleSaveResult(await editor.save())
-  } finally {
-    editorSaving.value = false
-  }
+  handleSaveResult(await editor.save())
 }
 
 async function saveDraftAnyway(): Promise<void> {
   if (editorSaving.value) return
-  editorSaving.value = true
-  try {
-    handleSaveResult(await editor.saveAnyway())
-  } finally {
-    editorSaving.value = false
-  }
+  handleSaveResult(await editor.saveAnyway())
 }
 
 function handleSaveResult(result: Awaited<ReturnType<typeof editor.save>>): void {
@@ -1167,12 +1160,24 @@ function handleSaveResult(result: Awaited<ReturnType<typeof editor.save>>): void
       const row = channels.value.find(ch => channelKey(ch) === outcome.name)
       pendingRestart.record(outcome.name, 'upsert', { wasLoaded: row ? adapterLoaded(row) : false })
     }
+    if (result.status === 'superseded') {
+      // Discard may have restored the old baseline while this upsert was in
+      // flight. Refresh a still-visible read view, but never replace a newer
+      // edit or a different channel's configuration.
+      if (selectedName.value === outcome.name && !editMode.value
+        && !editor.form.isDirty.value && !editor.saving.value) {
+        void editor.open(outcome.name)
+      }
+      void refresh()
+      return
+    }
     if (outcome.liveApplyFailed) {
       pushToast(t('setup.toast.channelStartFailed'), { tone: 'danger' })
-    } else {
-      pushToast(t(outcome.restartRequired ? 'setup.toast.channelSaved' : 'setup.toast.channelSavedLive'), { tone: 'ok' })
+    } else if (outcome.restartRequired) {
+      pushToast(t('setup.toast.channelSaved'), { tone: 'ok' })
     }
   }
+  if (result.status === 'superseded') return
   // Baseline already reset by the reseed; drop edit=1 → back to read mode.
   editMode.value = false
   void refresh()
@@ -1202,7 +1207,6 @@ function resolveComposeDiscard(ok: boolean): void {
 function exitCompose(): void {
   composeMode.value = false
   composeType.value = ''
-  composeSaving.value = false
   // Compose is closing: a still-pending discard question is moot, and its
   // handler must not fire the keep-editing URL restore.
   composeDiscardRequest.value?.resolve('superseded')
@@ -1254,22 +1258,12 @@ function composeTest(): void {
 
 async function composeSave(): Promise<void> {
   if (composeSaving.value) return
-  composeSaving.value = true
-  try {
-    await handleComposeSaveResult(await composeEditor.save())
-  } finally {
-    composeSaving.value = false
-  }
+  await handleComposeSaveResult(await composeEditor.save())
 }
 
 async function composeSaveAnyway(): Promise<void> {
   if (composeSaving.value) return
-  composeSaving.value = true
-  try {
-    await handleComposeSaveResult(await composeEditor.saveAnyway())
-  } finally {
-    composeSaving.value = false
-  }
+  await handleComposeSaveResult(await composeEditor.saveAnyway())
 }
 
 async function handleComposeSaveResult(result: Awaited<ReturnType<typeof composeEditor.save>>): Promise<void> {
@@ -1288,12 +1282,17 @@ async function handleComposeSaveResult(result: Awaited<ReturnType<typeof compose
     if (outcome.name && outcome.changed && outcome.restartRequired) {
       pendingRestart.record(outcome.name, 'upsert', { wasLoaded: false })
     }
+    if (result.status === 'superseded') {
+      void refresh()
+      return
+    }
     if (outcome.liveApplyFailed) {
       pushToast(t('setup.toast.channelStartFailed'), { tone: 'danger' })
-    } else {
-      pushToast(t(outcome.restartRequired ? 'setup.toast.channelSaved' : 'setup.toast.channelSavedLive'), { tone: 'ok' })
+    } else if (outcome.restartRequired) {
+      pushToast(t('setup.toast.channelSaved'), { tone: 'ok' })
     }
   }
+  if (result.status === 'superseded') return
   // Dismiss the takeover and land on the new channel's page.
   composeMode.value = false
   composeType.value = ''
@@ -1491,7 +1490,7 @@ async function removeChannel(ch: Channel): Promise<void> {
     try {
       const outcome = await channelSetup.remove(name)
       if (outcome.changed && outcome.restartRequired) pendingRestart.record(name, 'remove')
-      pushToast(t(outcome.restartRequired ? 'setup.toast.channelRemoved' : 'setup.toast.channelRemovedLive'), { tone: 'ok' })
+      if (outcome.restartRequired) pushToast(t('setup.toast.channelRemoved'), { tone: 'ok' })
       // The entry is gone; any in-flight draft is moot — close without guard.
       forceCloseDetail()
       await refresh()
@@ -1753,7 +1752,6 @@ async function restartChannel(ch: Channel): Promise<void> {
   await withAction(ch, 'restart', async () => {
     try {
       await channelAdministration.restart(channelKey(ch))
-      pushToast(t('console.channels.toastRestarted', { name: channelKey(ch) }), { tone: 'ok' })
       await refresh()
     } catch (err) {
       pushToast(t('console.channels.toastRestartFailed', { name: channelKey(ch), error: errorMessage(err) }), { tone: 'danger' })
@@ -1769,7 +1767,7 @@ async function toggleChannel(ch: Channel): Promise<void> {
       if (outcome.changed && outcome.restartRequired) pendingRestart.record(channelKey(ch), enabling ? 'enable' : 'disable')
       if (enabling && outcome.liveApplyFailed) {
         pushToast(t('setup.toast.channelStartFailed'), { tone: 'danger' })
-      } else {
+      } else if (outcome.restartRequired) {
         pushToast(t(enabling ? 'console.channels.toastEnabled' : 'console.channels.toastDisabled', { name: channelKey(ch) }), { tone: 'ok' })
       }
       await refresh()
@@ -1788,7 +1786,6 @@ function truncateId(id: string): string {
 async function copyBotId(id: string) {
   try {
     await navigator.clipboard.writeText(id)
-    pushToast(t('console.channels.detail.botIdCopied'), { tone: 'ok' })
   } catch {
     /* clipboard unavailable: the title still exposes the full id */
   }

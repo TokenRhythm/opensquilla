@@ -75,7 +75,7 @@ async function seedMultilineUserHistory(page: Page) {
 test('user message bubbles preserve authored line breaks', async ({ page }) => {
   await seedMultilineUserHistory(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
   const bubble = page.locator('.msg-user-bubble').first()
   await expect(bubble).toContainText('你好~\n我测试一下换行功能~\n你好~')
@@ -85,14 +85,14 @@ test('user message bubbles preserve authored line breaks', async ({ page }) => {
 test('system text preserves authored line breaks while unknown errors use safe local copy', async ({ page }) => {
   await seedMultilineUserHistory(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
   const systemText = page.locator('.msg-system__text').first()
   await expect(systemText).toContainText('连接提示第一行\n连接提示第二行')
   await expect(systemText).toHaveCSS('white-space', 'pre-wrap')
 
   const errorText = page.locator('.msg-error__text').first()
-  await expect(errorText).toHaveText('The task did not finish. Please try again later.')
+  await expect(errorText).toHaveText('This request did not finish.')
   await expect(page.locator('.chat-thread')).not.toContainText('错误详情第一行')
   await expect(page.locator('.chat-thread')).not.toContainText('错误详情第二行')
 })

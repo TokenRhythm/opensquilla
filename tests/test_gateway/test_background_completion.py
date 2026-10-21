@@ -1182,7 +1182,7 @@ async def test_gateway_close_drains_background_completion_before_stopping_channe
             order.append("background")
 
     class _Channels:
-        async def stop_all(self) -> None:
+        async def stop_all(self, *, timeout: float | None = None) -> None:
             order.append("channels")
 
     server = GatewayServer(app=SimpleNamespace(), config=SimpleNamespace())

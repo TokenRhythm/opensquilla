@@ -65,7 +65,7 @@ async def _probe() -> dict[str, Any]:
     from opensquilla.tools.builtin.code_exec import execute_code
     from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
-    workspace = Path(os.environ["OPENSQUILLA_STATE_DIR"]) / "workspace" / "code-execution"
+    workspace = Path(os.environ["OPENSQUILLA_STATE_DIR"]).resolve() / "workspace" / "code-execution"
     media_root = workspace.parent / "media"
     workspace.mkdir(parents=True, exist_ok=True)
     # Full grants host access; network_default is not an enforced Full-mode

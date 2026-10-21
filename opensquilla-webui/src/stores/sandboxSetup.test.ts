@@ -93,6 +93,15 @@ afterEach(() => {
 })
 
 describe('sandbox setup store', () => {
+  it('does not infer identity repair consent from an earlier failure', async () => {
+    ensureReady.mockResolvedValue(readyResult(false))
+    const store = createStore()
+    await store.startSafeSetup()
+    expect(ensureReady).toHaveBeenLastCalledWith(undefined)
+    await store.startSafeSetup({ repairIdentity: true })
+    expect(ensureReady).toHaveBeenLastCalledWith({ repairIdentity: true })
+  })
+
   it('deduplicates setup and persists Safe after live verification', async () => {
     const ensure = deferred<SandboxSetupResult>()
     ensureReady.mockReturnValue(ensure.promise)

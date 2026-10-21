@@ -449,7 +449,7 @@ def _capture_windows_leaves(
                             f"profile import read target is not a regular file: {child_path}"
                         )
                     try:
-                        path_before = os.stat(child_path, follow_symlinks=False)
+                        path_before = os.stat(native_io_path(child_path), follow_symlinks=False)
                     except OSError as exc:
                         raise BoundProfileReadError(
                             f"cannot inspect pinned profile import file: {child_path}"
@@ -468,7 +468,7 @@ def _capture_windows_leaves(
                         limit=(1 << 63) - 1,
                     )
                     try:
-                        path_after = os.stat(child_path, follow_symlinks=False)
+                        path_after = os.stat(native_io_path(child_path), follow_symlinks=False)
                     except OSError as exc:
                         raise BoundProfileReadError(
                             f"profile import file changed while it was pinned: {child_path}"

@@ -12,6 +12,54 @@ afterEach(() => {
 })
 
 describe('native Workbench platform bridge', () => {
+  it('negotiates editor v2 only with its state update bridge and separates record from batch submit', async () => {
+    let emit: ((payload: unknown) => void) | undefined
+    const base = {
+      createWorkbenchSurface: vi.fn(), setWorkbenchSurfaceRect: vi.fn(), activateWorkbenchSurface: vi.fn(),
+      destroyWorkbenchSurface: vi.fn(),
+      onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => { emit = callback; return () => {} },
+      getArtifactAnnotationCapabilities: async () => ({
+        version: 4, available: true, trustedOverlay: true, overlayEditorVersion: 2,
+      }),
+    }
+    setDesktopApi(base)
+    expect((await createDesktopPlatform().workbench.native!.getArtifactAnnotationCapabilities!()).overlayEditorVersion).toBeUndefined()
+    const update = vi.fn(async () => ({ ok: true }))
+    setDesktopApi({ ...base, updateArtifactAnnotationOverlay: update })
+    const native = createDesktopPlatform().workbench.native!
+    expect((await native.getArtifactAnnotationCapabilities!()).overlayEditorVersion).toBe(2)
+    const request = { version: 4 as const, surfaceId: 'document:1', annotationId: 'annotation_1',
+      editorState: { batchCount: 2, busy: false, error: 'Try again' } }
+    await native.updateArtifactAnnotationOverlay!(request)
+    expect(update).toHaveBeenCalledExactlyOnceWith(request)
+    const receive = vi.fn()
+    native.onSurfaceEvent(receive)
+    for (const type of ['annotation-submit', 'annotation-record-current', 'annotation-batch-submit']) {
+      emit!({ version: 4, surfaceId: 'document:1', type, detail: { annotationId: 'annotation_1', body: '正文' } })
+    }
+    emit!({ version: 4, surfaceId: 'document:1', type: 'annotation-batch-submit', detail: { body: 'missing id' } })
+    expect(receive.mock.calls.map(call => call[0].type)).toEqual([
+      'annotation-submit', 'annotation-record-current', 'annotation-batch-submit',
+    ])
+  })
+
+  it('forwards optional automation state while preserving older native clients', async () => {
+    const base = {
+      createWorkbenchSurface: vi.fn(),
+      setWorkbenchSurfaceRect: vi.fn(),
+      activateWorkbenchSurface: vi.fn(),
+      destroyWorkbenchSurface: vi.fn(),
+      onWorkbenchSurfaceEvent: vi.fn(),
+    }
+    setDesktopApi(base)
+    expect(createDesktopPlatform().workbench.native?.setBrowserAutomationState).toBeUndefined()
+    const update = vi.fn(async () => ({ ok: true }))
+    setDesktopApi({ ...base, setBrowserAutomationState: update })
+    const request = { sessionKey: 'session-fixture', taskId: 'task-fixture', active: true }
+    await createDesktopPlatform().workbench.native!.setBrowserAutomationState!(request)
+    expect(update).toHaveBeenCalledExactlyOnceWith(request)
+  })
+
   it('is absent on web and older desktop shells', () => {
     expect(createWebPlatform().workbench.native).toBeUndefined()
     expect(createWebPlatform().capabilities.hasNativeWorkbenchSurfaces).toBe(false)
@@ -130,6 +178,38 @@ describe('native Workbench platform bridge', () => {
       type: 'missing-resource',
       detail: { path: '/assets/app.css' },
     })
+    const navigationError = { url: 'https://example.test/unavailable', code: 'ERR_CONNECTION_REFUSED',
+      errorCode: -102, message: 'Connection refused.' }
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state',
+      detail: { pageState: 'navigation_failed', navigationError: { ...navigationError, ignored: 'value' } } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state',
+      detail: { pageState: 'navigation_failed', navigationError } })
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state', detail: { navigationError: null } })
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: { navigationError: null } }))
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state', detail: { navigationError: { code: 42 } } })
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: {} }))
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'find-requested' })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture', type: 'find-requested' })
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'find-state', detail: {
+      findQuery: 'synthetic', findMatches: 5, findActiveMatch: 3, findFinal: true,
+      zoomFactor: 1.25, ignored: 'value',
+    } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture',
+      type: 'find-state', detail: { findQuery: 'synthetic', findMatches: 5,
+        findActiveMatch: 3, findFinal: true, zoomFactor: 1.25 } })
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'find-state', detail: {
+      findMatches: -2, findActiveMatch: 2.5, zoomFactor: Number.POSITIVE_INFINITY,
+    } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture',
+      type: 'find-state', detail: {} })
+    const downloadId = 'download-12345678-1234-1234-1234-123456789abc'
+    emit?.({ version: 2, surfaceId: 'browser:fixture', type: 'download-state', detail: {
+      downloadId, downloadName: 'synthetic-note.txt', downloadState: 'completed',
+      receivedBytes: 100, totalBytes: 100, path: '/private/path',
+    } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 2, surfaceId: 'browser:fixture',
+      type: 'download-state', detail: { downloadId, downloadName: 'synthetic-note.txt',
+        downloadState: 'completed', receivedBytes: 100, totalBytes: 100 } })
   })
 
   it('fails closed when only part of the shell bridge exists', () => {
@@ -142,6 +222,48 @@ describe('native Workbench platform bridge', () => {
     const platform = createDesktopPlatform()
     expect(platform.workbench.native).toBeUndefined()
     expect(platform.capabilities.hasNativeWorkbenchSurfaces).toBe(false)
+  })
+
+  it.each([
+    {
+      name: 'current host',
+      getCapabilities: async () => ({ protocolVersions: [1, 2, 3, 4], modes: ['full'] }),
+      expected: { protocolVersions: [1, 2, 3, 4], modes: ['full'] },
+    },
+    {
+      name: 'host with browser reading and close controls',
+      getCapabilities: async () => ({ protocolVersions: [1, 2, 3, 4], modes: ['full'],
+        navigationActions: ['navigate', 'close', 'find', 'zoom', 'unknown'] }),
+      expected: { protocolVersions: [1, 2, 3, 4], modes: ['full'],
+        navigationActions: ['navigate', 'close', 'find', 'zoom'] },
+    },
+    {
+      name: 'legacy host with an explicit limit',
+      getCapabilities: async () => ({ protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 }),
+      expected: { protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 },
+    },
+    {
+      name: 'host without a capability bridge',
+      getCapabilities: undefined,
+      expected: { protocolVersions: [1], modes: ['offline'] },
+    },
+    {
+      name: 'unavailable capability bridge',
+      getCapabilities: async () => { throw new Error('unavailable') },
+      expected: { protocolVersions: [1], modes: ['offline'] },
+    },
+  ])('preserves supported capability fields for $name', async ({ getCapabilities, expected }) => {
+    setDesktopApi({
+      createWorkbenchSurface: async () => ({ ok: true }),
+      setWorkbenchSurfaceRect: async () => ({ ok: true }),
+      activateWorkbenchSurface: async () => ({ ok: true }),
+      destroyWorkbenchSurface: async () => ({ ok: true }),
+      onWorkbenchSurfaceEvent: () => () => undefined,
+      getWorkbenchCapabilities: getCapabilities,
+    })
+
+    const native = createDesktopPlatform().workbench.native!
+    await expect(native.getCapabilities?.()).resolves.toEqual(expected)
   })
 
   it('normalizes the v3 annotation bridge and rejects untrusted event fields', async () => {

@@ -112,9 +112,8 @@ A deferred reason can explain that automatic work is waiting for user ingress,
 other session work, or Plan mode.
 
 During complex work, the main agent uses the ordinary `update_plan` progress
-tool. `update_goal_progress` remains a compatibility adapter to the same task
-progress record; the Goal checklist is a projection, not a second authority.
-The agent may replace that checklist with
+tool. The Goal checklist is a projection of the task progress record, not a
+second authority. The agent may replace that checklist with
 up to 20 structured steps when a concise status view is useful. A step is at
 most 200 characters; the optional explanation is at most 1000 characters; at
 most one step may be `in_progress`. The checklist is a dynamic projection of the
@@ -295,7 +294,7 @@ Configure Goal execution in `config.toml`:
 ```toml
 [goal]
 execution_enabled = true
-max_turns = 50
+max_turns = 256
 runtime_budget_seconds = 3600
 ```
 
@@ -340,7 +339,12 @@ Three consecutive automatic turns with complete activity evidence but no body,
 tools, reasoning, or useful waits pause with `empty_continuations`. User turns,
 steering and meaningful activity reset the count; missing activity evidence is
 not treated as proof of an empty turn. Existing turn/runtime guardrails still
-apply. An ordinary failure or timeout blocks the Goal instead of replaying work.
+apply. Three consecutive successful automatic turns with the same visible
+result shape and no durable progress revision pause with `no_progress`; turns
+that contain tools or interaction waits are left to the normal continuation
+path because the compact activity snapshot cannot prove that their arguments
+and results were identical. An ordinary failure or timeout blocks the Goal
+instead of replaying work.
 
 ## Emergency stop and rollback
 

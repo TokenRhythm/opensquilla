@@ -82,4 +82,17 @@ describe('routerShapeCache — forward compatibility + normalization', () => {
   it('preserves the tier-scoped ensemble flag', () => {
     expect(decodeRouterShape(encodeRouterShape(shape()))?.configs.heavy?.ensembleEnabled).toBe(true)
   })
+
+  it('preserves explicit provider identities without inventing providers for old caches', () => {
+    const configured = shape()
+    configured.configs.light!.provider = ' Provider_A '
+    configured.configs.standard!.provider = 'provider_b'
+
+    const decoded = decodeRouterShape(encodeRouterShape(configured))!
+
+    expect(decoded.configs.light?.provider).toBe('provider_a')
+    expect(decoded.configs.standard?.provider).toBe('provider_b')
+    expect(decoded.configs.heavy).not.toHaveProperty('provider')
+    expect(decodeRouterShape(encodeRouterShape(shape()))?.configs.light).not.toHaveProperty('provider')
+  })
 })

@@ -226,7 +226,9 @@ def _patch_assemble_prompt(runner, base_prompt, prompt_metadata):
     def _assemble_prompt(
         self, agent_id, tool_defs, *, session_key=None, semantic_message=None,
         extra_context=None, prompt_metadata=None, bootstrap_context_mode=None,
-        fresh_user_session=False, workspace_dir=None,
+        fresh_user_session=False, workspace_dir=None, webui_rendering=False,
+        project_rules_snapshot=None, include_project_rules=True,
+        persistence_tools=None,
     ):  # noqa: ARG001
         if prompt_metadata is not None:
             prompt_metadata.update(pm_to_emit)
@@ -334,7 +336,7 @@ def _patch_memory_helpers(runner):
     def _load_memory_md(self, workspace_dir, max_chars=None):  # noqa: ARG001, ARG002
         return None
 
-    def _load_daily_notes(self, workspace_dir):  # noqa: ARG001, ARG002
+    def _load_daily_notes(self, workspace_dir, **_kwargs):  # noqa: ARG001, ARG002
         return {}
 
     runner._resolve_memory_source_dir = _resolve_memory_source_dir.__get__(
@@ -664,7 +666,7 @@ async def test_sync_manager_warm_called(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_agent_factory_forwards_registry_and_tool_context() -> None:
-    """meta_invoke dispatch needs the Agent to retain registry/context wiring."""
+    """Tool dispatch needs the Agent to retain registry/context wiring."""
 
     registry = ToolRegistry()
     tool_context = ToolContext(is_owner=True, workspace_dir="/tmp")

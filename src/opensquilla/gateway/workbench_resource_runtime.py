@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -48,6 +48,7 @@ from opensquilla.artifact_session import (
 )
 from opensquilla.artifact_session.models import head_restore_receipt_state_revision
 from opensquilla.artifacts import (
+    ArtifactBudgetError,
     ArtifactError,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
@@ -74,6 +75,13 @@ from opensquilla.gateway.session_services import (
 )
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.html_format import is_html, is_html_preview_path, validate_html
+from opensquilla.office_format import (
+    MAX_OFFICE_BYTES,
+    OFFICE_MIMES,
+    OfficeFormatError,
+    office_format,
+    validate_office_bytes,
+)
 from opensquilla.paths import media_root_from_config, native_io_path
 from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.keys import canonicalize_session_key
@@ -138,6 +146,54 @@ class _FormatProfile:
     selection_context: bool
     publishable: bool
     reason_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterialInspection:
+    ref: ArtifactRef
+    preview_pages: tuple[str, ...]
+    payload: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterialFailure:
+    office_reason: str | None = None
+
+
+class _ResourceMaterials:
+    """One RPC's identity-scoped checks, never a cross-request authorization cache.
+
+    Inventory keeps only metadata. Only a targeted preview retains its payload.
+    Distinct artifacts with identical hashes must each pass physical validation.
+    """
+
+    def __init__(self, store: ArtifactStore, session_id: str, *, keep_payload: bool = False):
+        self.store = store
+        self.session_id = session_id
+        self.keep_payload = keep_payload
+        self._checks: dict[str, _MaterialInspection | _MaterialFailure] = {}
+
+    async def inspect(self, artifact_id: str) -> _MaterialInspection:
+        result = self._checks.get(artifact_id)
+        if result is None:
+            try:
+                result = await asyncio.to_thread(
+                    _inspect_artifact_material, self.store, artifact_id,
+                    session_id=self.session_id, keep_payload=self.keep_payload,
+                )
+            except (ArtifactError, OSError, ValueError) as exc:
+                # Exception tracebacks can retain the entire failed ZIP payload.
+                # Cache only failure metadata, not an exception or its frames.
+                self._checks[artifact_id] = _MaterialFailure(
+                    exc.reason_code if isinstance(exc, OfficeFormatError) else None,
+                )
+                raise
+            self._checks[artifact_id] = result
+        if isinstance(result, _MaterialFailure):
+            if result.office_reason:
+                raise OfficeFormatError(result.office_reason)
+            raise ArtifactIntegrityError("artifact material failed integrity validation")
+        return result
 
 
 def _actor(ctx: RpcContext) -> Actor:
@@ -332,6 +388,7 @@ async def _attachment_occurrences(
     *,
     session_key: str,
     session_id: str,
+    attachment_id: str | None = None,
 ) -> tuple[_AttachmentOccurrence, ...]:
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
@@ -366,13 +423,22 @@ async def _attachment_occurrences(
             mime = _safe_mime(item.get("mime") or item.get("type"))
             sha = str(item.get("sha256_ref") or "").lower()
             durable = bool(_SHA256_RE.fullmatch(sha))
+            requested_id = attachment_id
+            occurrence_id = str(item.get("attachment_id") or "")
+            if not _ATTACHMENT_ID_RE.fullmatch(occurrence_id) and durable:
+                occurrence_id = legacy_attachment_id(
+                    session_id=session_id, message_id=message_id, index=index, sha256=sha,
+                )
+            if (requested_id is not None and _ATTACHMENT_ID_RE.fullmatch(occurrence_id)
+                    and occurrence_id != requested_id):
+                continue
             payload: bytes
             if durable:
                 from opensquilla.attachment_refs import transcript_material_path
 
                 try:
                     material_path = transcript_material_path(media_root, session_id, sha)
-                    payload = native_io_path(material_path).read_bytes()
+                    payload = await asyncio.to_thread(native_io_path(material_path).read_bytes)
                 except (OSError, ValueError):
                     continue
                 if hashlib.sha256(payload).hexdigest() != sha:
@@ -390,26 +456,27 @@ async def _attachment_occurrences(
             if isinstance(declared_size, int) and not isinstance(declared_size, bool):
                 if declared_size != len(payload):
                     continue
-            attachment_id = str(item.get("attachment_id") or "")
-            if not _ATTACHMENT_ID_RE.fullmatch(attachment_id):
-                attachment_id = legacy_attachment_id(
+            if not _ATTACHMENT_ID_RE.fullmatch(occurrence_id):
+                occurrence_id = legacy_attachment_id(
                     session_id=session_id,
                     message_id=message_id,
                     index=index,
                     sha256=sha,
                 )
             identity = (message_id, index, sha)
-            previous = seen.get(attachment_id)
+            if requested_id is not None and occurrence_id != requested_id:
+                continue
+            previous = seen.get(occurrence_id)
             if previous is not None and previous != identity:
                 raise _internal_product_error(
                     ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
                     "attachment resource identity collision",
                     operation="workbench.attachments.list",
                 )
-            seen[attachment_id] = identity
+            seen[occurrence_id] = identity
             occurrences.append(
                 _AttachmentOccurrence(
-                    attachment_id=attachment_id,
+                    attachment_id=occurrence_id,
                     message_id=message_id,
                     index=index,
                     name=name,
@@ -430,7 +497,8 @@ def _format_profile(
     *,
     payload: bytes | None = None,
 ) -> _FormatProfile:
-    if is_html(name, mime, payload):
+    if (office_format(name, mime) is None and Path(name).suffix.lower() not in _OFFICE_SUFFIXES
+            and is_html(name, mime, payload)):
         reason = None
         if payload is not None:
             try:
@@ -450,25 +518,23 @@ def _format_profile(
             reason_code=reason,
         )
     suffix = Path(name).suffix.lower()
-    if suffix == ".docx":
-        kind = ArtifactKind.DOCUMENT
-    elif suffix == ".xlsx":
-        kind = ArtifactKind.SPREADSHEET
-    elif suffix == ".pptx":
-        kind = ArtifactKind.PRESENTATION
-    else:
-        kind = ArtifactKind.OTHER
-    if suffix in _OFFICE_SUFFIXES:
-        # Office material remains discoverable and downloadable, but neither
-        # preview nor edit is advertised until a real renderer+adapter exists.
+    modern = office_format(name, mime)
+    kind = {
+        "docx": ArtifactKind.DOCUMENT, "xlsx": ArtifactKind.SPREADSHEET,
+        "pptx": ArtifactKind.PRESENTATION,
+    }.get(modern or "", ArtifactKind.OTHER)
+    if modern is not None or suffix in _OFFICE_SUFFIXES:
+        reason = None if modern else "office_format_unsupported"
+        if modern is not None and payload is not None:
+            try:
+                validate_office_bytes(payload, modern)
+            except OfficeFormatError as exc:
+                reason = exc.reason_code
+        supported = reason is None
         return _FormatProfile(
-            kind=kind,
-            preview=False,
-            editable=False,
-            agent_editable=False,
-            selection_context=False,
-            publishable=False,
-            reason_code="office_adapter_not_available",
+            kind=kind, preview=supported, editable=False,
+            agent_editable=supported, selection_context=supported,
+            publishable=supported, reason_code=reason,
         )
     normalized_mime = mime.split(";", 1)[0].strip().lower()
     preview = normalized_mime.startswith("image/") or normalized_mime == "application/pdf"
@@ -488,14 +554,25 @@ def _kind_for(name: str, mime: str) -> ArtifactKind:
 
 
 def _effective_edit_reason(profile: _FormatProfile, *, editable: bool) -> str | None:
-    if editable and profile.editable:
+    if editable and (profile.editable or profile.agent_editable):
         return None
     if profile.editable:
         return "html_bundle_edit_not_supported"
+    if profile.agent_editable:
+        return "resource_integrity_error"
     return profile.reason_code
 
 
 def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, None]:
+    modern = office_format(source.name, source.mime)
+    if modern is not None:
+        try:
+            validate_office_bytes(source.payload, modern)
+        except OfficeFormatError as exc:
+            raise artifact_product_error(
+                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED, reason_code=exc.reason_code,
+            ) from exc
+        return replace(source, mime=OFFICE_MIMES[modern]), None
     if not source.payload or len(source.payload) > _MAX_EDITABLE_HTML_BYTES:
         raise artifact_product_error(
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
@@ -566,12 +643,12 @@ async def adopt_generated_deliverable_if_editable(
     boundary can record a recoverable materialization failure.
     """
 
-    editable = await asyncio.to_thread(
-        _bundle_available,
-        store,
-        ref.id,
-        session_id=session_id,
-    )
+    try:
+        editable = await asyncio.to_thread(
+            _bundle_available, store, ref.id, session_id=session_id,
+        )
+    except OfficeFormatError:
+        return None
     if not editable:
         return None
     resolved, path = await asyncio.to_thread(
@@ -597,7 +674,7 @@ async def adopt_generated_deliverable_if_editable(
         payload=payload,
     )
     try:
-        _validated_import_source(source)
+        await asyncio.to_thread(_validated_import_source, source)
     except RpcHandlerError as exc:
         if exc.code == ArtifactProductErrorCode.RESOURCE_UNSUPPORTED.value:
             return None
@@ -647,7 +724,7 @@ def _attachment_payload(
             payload=occurrence.payload,
         )
         preview = profile.preview
-        editable = profile.editable
+        editable = profile.editable or profile.agent_editable
         preview_reason_code = profile.reason_code if not preview else None
         edit_reason_code = profile.reason_code if not editable else None
         if html_resource and occurrence.size > _MAX_EDITABLE_HTML_BYTES:
@@ -704,6 +781,7 @@ def _document_payload(
     publication: DocumentPublication | None,
     trusted_capabilities: bool,
     preview_pages: list[str] | None = None,
+    semantics: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     profile = _format_profile(document.name, head.media_type)
     effective_editable = trusted_capabilities and profile.editable
@@ -724,7 +802,7 @@ def _document_payload(
     if publication is not None:
         relations["deliverableId"] = publication.deliverable_artifact_id
         relations["publishedRevisionId"] = publication.revision_id
-    return {
+    payload: dict[str, Any] = {
         "resource": _resource_ref_payload("document", document.document_id),
         "name": document.name,
         "mime": head.media_type,
@@ -737,7 +815,9 @@ def _document_payload(
             f"?revisionId={quote(head.revision_id, safe='')}"
         ),
         "capabilities": {
-            "preview": profile.preview,
+            "preview": profile.preview and (
+                trusted_capabilities or not office_format(document.name, head.media_type)
+            ),
             "download": True,
             "selectionContext": effective_selection_context,
             "manualEdit": False,
@@ -745,14 +825,65 @@ def _document_payload(
             # Compatibility summary retained for clients predating the
             # independent Workbench capability axes.
             "edit": legacy_edit,
-            "publish": profile.publishable,
+            "publish": profile.publishable and (
+                trusted_capabilities or not office_format(document.name, head.media_type)
+            ),
             "editReasonCode": _effective_edit_reason(
                 profile,
-                editable=effective_editable,
+                editable=legacy_edit,
             ),
         },
         "relations": relations,
         **({"previewPages": preview_pages} if preview_pages is not None else {}),
+    }
+    # A Visualize widget is persisted as a Document so the inline canvas can
+    # recover its exact immutable head after reload or from a remote client.
+    # That persistence is an implementation detail, however, and must not
+    # turn the generated HTML into a user-facing Files entry.  Keep this
+    # metadata explicit so older clients can conservatively hide it while
+    # newer clients can offer targeted recovery/download actions.
+    if semantics:
+        payload.update(semantics)
+        if semantics.get("source") == "show-widget":
+            capabilities = payload.get("capabilities")
+            if isinstance(capabilities, dict):
+                capabilities.update({
+                    "selectionContext": False,
+                    "manualEdit": False,
+                    "agentEdit": False,
+                    "edit": False,
+                    "publish": False,
+                    "editReasonCode": "visualize_internal",
+                })
+    return payload
+
+
+def _document_resource_semantics(
+    store: ArtifactStore,
+    *,
+    session_id: str,
+    artifact_id: str,
+) -> dict[str, str]:
+    """Return product-facing semantics for a document's current head.
+
+    ``ArtifactStore`` visibility controls the byte store's public listing, but
+    a persisted widget also has an ArtifactSession Document.  The Workbench
+    inventory must therefore classify that Document separately.  The source
+    marker is retained on every immutable widget revision and is the stable
+    boundary between an inline Visualize widget and an explicit workspace
+    file.  Missing/corrupt material deliberately yields no special metadata;
+    the existing integrity/capability checks remain authoritative.
+    """
+    try:
+        ref = store.get_ref(session_id=session_id, artifact_id=artifact_id)
+    except (ArtifactError, OSError, ValueError):
+        return {}
+    if not ref.source.replace("_", "-").startswith("show-widget"):
+        return {}
+    return {
+        "source": "show-widget",
+        "visibility": "internal",
+        "presentation": "inline",
     }
 
 
@@ -764,7 +895,7 @@ def _deliverable_payload(
     importable: bool,
 ) -> dict[str, Any]:
     profile = _format_profile(ref.name, ref.mime)
-    effective_importable = importable and profile.editable
+    effective_importable = importable and (profile.editable or profile.agent_editable)
     relations: dict[str, Any] = {}
     if publication is not None:
         relations.update(
@@ -785,7 +916,7 @@ def _deliverable_payload(
         "createdAt": ref.created_at,
         "downloadUrl": ref.download_url,
         "capabilities": {
-            "preview": profile.preview,
+            "preview": profile.preview and (importable or not office_format(ref.name, ref.mime)),
             "download": True,
             # Published artifacts remain immutable until copied into a
             # Document; preview never grants selection or mutation authority.
@@ -844,6 +975,61 @@ async def _scoped_document(
     return document, current.revision
 
 
+async def _add_resource_source_paths(
+    ctx: RpcContext,
+    *,
+    session_key: str,
+    service: ArtifactSessionService,
+    resources: Sequence[dict[str, Any]],
+) -> None:
+    """Project existing source identities without registering or materializing files.
+
+    Paths are presentation metadata, not an alternative document identity. Only
+    return a workspace-relative path after validating the current workspace and
+    its read policy; stale bindings and private host paths remain undisclosed.
+    """
+    from opensquilla.artifact_session.working_files import get_working_files
+    from opensquilla.gateway.workspace_files import (
+        WorkspaceFiles,
+        WorkspaceFileUnavailableError,
+        _readable_file,
+    )
+
+    document_ids = {
+        str(resource.get("relations", {}).get("documentId") or "")
+        for resource in resources
+    } - {""}
+    if not document_ids:
+        return
+    working_files = {
+        document_id: binding
+        for document_id in document_ids
+        if (binding := await get_working_files(service, document_id)) is not None
+    }
+    if not working_files:
+        return
+    try:
+        workspace = await WorkspaceFiles(ctx.config, ctx.session_manager).workspace(session_key)
+    except WorkspaceFileUnavailableError:
+        return
+    paths: dict[str, str] = {}
+    for document_id, binding in working_files.items():
+        try:
+            if Path(binding.workspace) != workspace.root:
+                continue
+            relative = binding.entry.relative_to(workspace.root).as_posix()
+            if len(relative) > 4096:
+                continue
+            await asyncio.to_thread(_readable_file, workspace, relative)
+        except (OSError, ValueError, ArtifactValidationError):
+            continue
+        paths[document_id] = relative
+    for resource in resources:
+        document_id = str(resource.get("relations", {}).get("documentId") or "")
+        if document_id in paths:
+            resource["sourcePath"] = paths[document_id]
+
+
 async def _resource_inventory(
     ctx: RpcContext,
     *,
@@ -865,22 +1051,18 @@ async def _resource_inventory(
     }
     publication_by_artifact = {item.deliverable_artifact_id: item for item in publications}
     store = ArtifactStore(media_root_from_config(ctx.config))
+    materials = _ResourceMaterials(store, session_id)
     deliverable_importable: dict[str, bool] = {}
     for deliverable in deliverables:
-        if not _format_profile(deliverable.name, deliverable.mime).editable:
+        if not _format_profile(deliverable.name, deliverable.mime).agent_editable:
             deliverable_importable[deliverable.id] = False
             continue
         try:
-            importable = await asyncio.to_thread(
-                _bundle_available,
-                store,
-                deliverable.id,
-                session_id=session_id,
-            )
-        except (ArtifactError, OSError):
+            await materials.inspect(deliverable.id)
+        except (ArtifactError, OSError, OfficeFormatError):
             deliverable_importable[deliverable.id] = False
         else:
-            deliverable_importable[deliverable.id] = importable
+            deliverable_importable[deliverable.id] = True
     latest_publication_by_document: dict[str, DocumentPublication] = {}
     for publication in publications:
         latest_publication_by_document.setdefault(publication.document_id, publication)
@@ -894,6 +1076,17 @@ async def _resource_inventory(
                 "document head integrity check failed",
                 operation="workbench.resources.list",
             )
+        semantics = await asyncio.to_thread(
+            _document_resource_semantics,
+            store,
+            session_id=session_id,
+            artifact_id=head.artifact_id,
+        )
+        # ``show_widget`` Documents are durable recovery records for an inline
+        # canvas, not workspace files.  Keep targeted get/open available for
+        # the canvas, but exclude them from the default Files inventory.
+        if semantics.get("source") == "show-widget":
+            continue
         profile = _format_profile(document.name, head.media_type)
         trusted_capabilities = (
             profile.editable or profile.agent_editable or profile.selection_context
@@ -901,13 +1094,13 @@ async def _resource_inventory(
         preview_pages = None
         if trusted_capabilities:
             try:
-                preview_pages = await asyncio.to_thread(
-                    _bundle_preview_pages,
-                    store,
-                    head.artifact_id,
-                    session_id=session_id,
-                )
-            except (ArtifactError, OSError):
+                inspected = await materials.inspect(head.artifact_id)
+                _check_revision_material(head, inspected.ref)
+                if (office_format(document.name, head.media_type)
+                        != office_format(inspected.ref.name, inspected.ref.mime)):
+                    raise ArtifactIntegrityError("document format does not match its material")
+                preview_pages = list(inspected.preview_pages)
+            except (ArtifactError, OSError, OfficeFormatError):
                 trusted_capabilities = False
         document_resources.append(
             _document_payload(
@@ -917,11 +1110,12 @@ async def _resource_inventory(
                 publication=latest_publication_by_document.get(document.document_id),
                 trusted_capabilities=trusted_capabilities,
                 preview_pages=preview_pages,
+                semantics=semantics,
             )
         )
     attachment_resources = [
-        _attachment_payload(
-            item,
+        await asyncio.to_thread(
+            _attachment_payload, item,
             session_key=session_key,
             binding=binding_by_source.get(("attachment", item.attachment_id)),
             include_inline_url=include_inline_urls,
@@ -937,6 +1131,10 @@ async def _resource_inventory(
         )
         for item in deliverables
     ]
+    await _add_resource_source_paths(
+        ctx, session_key=session_key, service=service,
+        resources=[*document_resources, *deliverable_resources],
+    )
     return {
         "attachment": attachment_resources,
         "document": document_resources,
@@ -944,6 +1142,116 @@ async def _resource_inventory(
         # Reserved protocol type: inventory does not fetch or persist network content.
         "url": [],
     }
+
+
+async def _document_resource(
+    service: ArtifactSessionService, document: Document, head: Revision,
+    *, session_id: str, materials: _ResourceMaterials,
+) -> tuple[dict[str, Any], DocumentSourceBinding | None]:
+    binding, publications = await asyncio.gather(
+        service.get_document_source_binding_for_document(
+            session_id=session_id, document_id=document.document_id,
+        ),
+        service.list_document_publications(
+            session_id=session_id, document_id=document.document_id, limit=1,
+        ),
+    )
+    profile = _format_profile(document.name, head.media_type)
+    trusted = profile.editable or profile.agent_editable or profile.selection_context
+    pages = None
+    if trusted:
+        try:
+            inspected = await materials.inspect(head.artifact_id)
+            _check_revision_material(head, inspected.ref)
+            if (office_format(document.name, head.media_type)
+                    != office_format(inspected.ref.name, inspected.ref.mime)):
+                raise ArtifactIntegrityError("document format does not match its material")
+            pages = list(inspected.preview_pages)
+        except (ArtifactError, OSError, OfficeFormatError):
+            trusted = False
+    return _document_payload(
+        document, head, binding=binding,
+        publication=publications[0] if publications else None,
+        trusted_capabilities=trusted, preview_pages=pages,
+        semantics=await asyncio.to_thread(
+            _document_resource_semantics,
+            materials.store,
+            session_id=session_id,
+            artifact_id=head.artifact_id,
+        ),
+    ), binding
+
+
+async def _attachment_resource(
+    ctx: RpcContext, *, session_key: str, session_id: str,
+    service: ArtifactSessionService, resource_id: str, include_inline_urls: bool,
+) -> tuple[dict[str, Any], _AttachmentOccurrence]:
+    occurrences = await _attachment_occurrences(
+        ctx, session_key=session_key, session_id=session_id, attachment_id=resource_id,
+    )
+    if not occurrences:
+        raise _not_found("attachment", resource_id)
+    occurrence = occurrences[0]
+    binding = await service.get_document_source_binding_for_resource(
+        session_id=session_id, source_type=DocumentSourceType.ATTACHMENT,
+        source_resource_id=resource_id,
+    )
+    resource = await asyncio.to_thread(
+        _attachment_payload, occurrence, session_key=session_key, binding=binding,
+        include_inline_url=include_inline_urls,
+    )
+    return resource, occurrence
+
+
+async def _resource_by_ref(
+    ctx: RpcContext, *, session_key: str, session_id: str,
+    service: ArtifactSessionService, resource_type: str, resource_id: str,
+    materials: _ResourceMaterials,
+) -> dict[str, Any]:
+    """Resolve one authorized identity without validating unrelated session files."""
+    if resource_type == "document":
+        document, head = await _scoped_document(
+            service, session_key=session_key, session_id=session_id, document_id=resource_id,
+        )
+        resource, _binding = await _document_resource(
+            service, document, head, session_id=session_id, materials=materials,
+        )
+        return resource
+    if resource_type == "attachment":
+        resource, _occurrence = await _attachment_resource(
+            ctx, session_key=session_key, session_id=session_id, service=service,
+            resource_id=resource_id, include_inline_urls=True,
+        )
+        return resource
+    if resource_type != "deliverable":
+        raise _not_found(resource_type, resource_id)
+    try:
+        ref = await asyncio.to_thread(
+            materials.store.get_public_ref, session_id=session_id, artifact_id=resource_id,
+        )
+    except (ArtifactError, OSError, ValueError):
+        raise _not_found(resource_type, resource_id) from None
+    publication, binding = await asyncio.gather(
+        service.get_document_publication_for_artifact(
+            session_id=session_id, artifact_id=resource_id,
+        ),
+        service.get_document_source_binding_for_resource(
+            session_id=session_id, source_type=DocumentSourceType.DELIVERABLE,
+            source_resource_id=resource_id,
+        ),
+    )
+    profile = _format_profile(ref.name, ref.mime)
+    importable = profile.editable or profile.agent_editable
+    if importable:
+        try:
+            inspected = await materials.inspect(ref.id)
+            if inspected.ref != ref:
+                raise ArtifactIntegrityError("deliverable metadata changed while inspected")
+        except (ArtifactError, OSError, OfficeFormatError):
+            importable = False
+    return _deliverable_payload(
+        ref, publication=publication, binding=binding, importable=importable,
+    )
 
 
 async def _preview_material(
@@ -955,19 +1263,20 @@ async def _preview_material(
     resource_type: str,
     resource_id: str,
 ) -> tuple[dict[str, Any], bytes]:
-    inventory = await _resource_inventory(
-        ctx,
-        session_key=session_key,
-        session_id=session_id,
-        service=service,
-        include_inline_urls=True,
+    materials = _ResourceMaterials(
+        ArtifactStore(media_root_from_config(ctx.config)), session_id, keep_payload=True,
     )
-    resource = next(
-        (item for item in inventory[resource_type] if item["resource"]["id"] == resource_id),
-        None,
-    )
-    if resource is None:
-        raise _not_found(resource_type, resource_id)
+    occurrence = None
+    if resource_type == "attachment":
+        resource, occurrence = await _attachment_resource(
+            ctx, session_key=session_key, session_id=session_id, service=service,
+            resource_id=resource_id, include_inline_urls=True,
+        )
+    else:
+        resource = await _resource_by_ref(
+            ctx, session_key=session_key, session_id=session_id, service=service,
+            resource_type=resource_type, resource_id=resource_id, materials=materials,
+        )
     capabilities = resource.get("capabilities")
     if not isinstance(capabilities, dict) or capabilities.get("preview") is not True:
         reason = (
@@ -984,54 +1293,22 @@ async def _preview_material(
             reason_code=reason,
         )
 
-    if resource_type == "attachment":
-        occurrence = next(
-            (
-                item
-                for item in await _attachment_occurrences(
-                    ctx,
-                    session_key=session_key,
-                    session_id=session_id,
-                )
-                if item.attachment_id == resource_id
-            ),
-            None,
-        )
-        if occurrence is None:
-            raise _not_found(resource_type, resource_id)
+    if occurrence is not None:
         payload = occurrence.payload
     else:
         if resource_type == "document":
-            _document, revision = await _scoped_document(
-                service,
-                session_key=session_key,
-                session_id=session_id,
-                document_id=resource_id,
-            )
-            artifact_id = revision.artifact_id
+            # Use the exact head already authorized/projected above, not a
+            # second mutable-head lookup that could mix metadata and bytes.
+            artifact_id = resource["relations"]["headArtifactId"]
         elif resource_type == "deliverable":
-            ref = next(
-                (
-                    item
-                    for item in await _public_deliverables(ctx, session_id=session_id)
-                    if item.id == resource_id
-                ),
-                None,
-            )
-            if ref is None:
-                raise _not_found(resource_type, resource_id)
-            artifact_id = ref.id
+            artifact_id = resource_id
         else:
             raise _not_found(resource_type, resource_id)
-        store = ArtifactStore(media_root_from_config(ctx.config))
         try:
-            _ref, path = await asyncio.to_thread(
-                store.resolve_for_download,
-                artifact_id,
-                session_id=session_id,
-            )
-            payload = await asyncio.to_thread(native_io_path(path).read_bytes)
-        except (ArtifactNotFoundError, ArtifactIntegrityError, OSError, ValueError):
+            inspected = await materials.inspect(artifact_id)
+            assert inspected.payload is not None
+            payload = inspected.payload
+        except (ArtifactError, OSError, ValueError):
             raise _not_found(resource_type, resource_id) from None
 
     expected_sha = str(resource.get("sha256") or "")
@@ -1051,17 +1328,27 @@ async def _preview_material(
     return resource, payload
 
 
-def _preview_payload(resource: dict[str, Any], payload: bytes, *, mode: str) -> dict[str, Any]:
+def _preview_payload(
+    resource: dict[str, Any], payload: bytes, *, mode: str, office_validated: bool = False,
+) -> dict[str, Any]:
+    modern = office_format(str(resource.get("name") or ""), str(resource.get("mime") or ""))
     profile = _format_profile(
         str(resource.get("name") or ""),
         str(resource.get("mime") or ""),
-        payload=payload,
+        payload=None if modern and office_validated else payload,
     )
     if not profile.preview:
         raise artifact_product_error(
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
             reason_code=profile.reason_code or "format_preview_not_supported",
         )
+    if modern is not None:
+        return {
+            "protocolVersion": 1, "mode": "local-renderer", "resource": resource["resource"],
+            "launchUrl": resource.get("downloadUrl"), "sandboxProfile": "none",
+            "network": False, "format": profile.kind.value,
+            "adapter": {"id": "silurus-office", "version": "0.88.0", "format": modern},
+        }
     return {
         "protocolVersion": 1,
         "mode": mode,
@@ -1086,6 +1373,7 @@ async def _resolve_import_source(
             ctx,
             session_key=session_key,
             session_id=session_id,
+            attachment_id=resource_id,
         )
         occurrence = next(
             (item for item in occurrences if item.attachment_id == resource_id),
@@ -1103,29 +1391,16 @@ async def _resolve_import_source(
             payload=occurrence.payload,
         )
 
-    refs = await _public_deliverables(ctx, session_id=session_id)
-    ref = next((item for item in refs if item.id == resource_id), None)
-    if ref is None:
-        raise _not_found(source_type, resource_id)
     store = ArtifactStore(media_root_from_config(ctx.config))
     try:
-        importable = await asyncio.to_thread(
-            _bundle_available,
-            store,
-            ref.id,
-            session_id=session_id,
+        ref = await asyncio.to_thread(
+            store.get_public_ref, session_id=session_id, artifact_id=resource_id,
         )
-        if not importable:
-            raise artifact_product_error(
-                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-                reason_code="html_bundle_edit_not_supported",
-            )
-        resolved, path = await asyncio.to_thread(
-            store.resolve_for_download,
-            ref.id,
-            session_id=session_id,
+        inspected = await asyncio.to_thread(
+            _inspect_artifact_material, store, ref.id, session_id=session_id, keep_payload=True,
         )
-        payload = await asyncio.to_thread(native_io_path(path).read_bytes)
+        resolved, payload = inspected.ref, inspected.payload
+        assert payload is not None
     except (ArtifactNotFoundError, ArtifactIntegrityError, OSError, ValueError):
         raise _not_found(source_type, resource_id) from None
     return _ImportSource(
@@ -1161,7 +1436,8 @@ async def resolve_recovery_import_source(
             source_type=attempt.source_type.value,
             resource_id=attempt.source_resource_id,
         )
-        source, _adapter = _validated_import_source(source)
+        validated_source, _adapter = await asyncio.to_thread(_validated_import_source, source)
+        source = validated_source
     except RpcHandlerError:
         return None
     return DocumentImportRecoverySource(
@@ -1492,7 +1768,8 @@ async def _document_import(
             source_type=source_type,
             resource_id=resource_id,
         )
-        source, _adapter = _validated_import_source(source)
+        validated_source, _adapter = await asyncio.to_thread(_validated_import_source, source)
+        source = validated_source
         if expected_sha256 != source.sha256:
             raise _conflict(ArtifactConflictError("document import source hash changed"))
         document_name = requested_name or source.name
@@ -1562,7 +1839,8 @@ async def _document_import(
                 source_type=source_type,
                 resource_id=resource_id,
             )
-            source, _adapter = _validated_import_source(source)
+            validated_source, _adapter = await asyncio.to_thread(_validated_import_source, source)
+            source = validated_source
             if (
                 source.sha256 != attempt.source_sha256
                 or source.name != attempt.source_name
@@ -1724,19 +2002,14 @@ async def _resources_get(
     session_key, session_id, service = await _scope(query.session_key, ctx)
     resource_type = query.resource.resource_type
     resource_id = query.resource.resource_id
-    inventory = await _resource_inventory(
-        ctx,
-        session_key=session_key,
-        session_id=session_id,
-        service=service,
-        include_inline_urls=True,
+    resource = await _resource_by_ref(
+        ctx, session_key=session_key, session_id=session_id, service=service,
+        resource_type=resource_type, resource_id=resource_id,
+        materials=_ResourceMaterials(ArtifactStore(media_root_from_config(ctx.config)), session_id),
     )
-    resource = next(
-        (item for item in inventory[resource_type] if item["resource"]["id"] == resource_id),
-        None,
+    await _add_resource_source_paths(
+        ctx, session_key=session_key, service=service, resources=[resource],
     )
-    if resource is None:
-        raise _not_found(resource_type, resource_id)
     return {"resource": resource}
 
 
@@ -1749,6 +2022,7 @@ async def _current_document_open_response(
     document_id: str,
     materialized: bool,
     receipt: dict[str, Any] | None = None,
+    materials: _ResourceMaterials | None = None,
 ) -> dict[str, Any]:
     document, head = await _scoped_document(
         service,
@@ -1756,30 +2030,11 @@ async def _current_document_open_response(
         session_id=session_id,
         document_id=document_id,
     )
-    inventory = await _resource_inventory(
-        ctx,
-        session_key=session_key,
-        session_id=session_id,
-        service=service,
-        include_inline_urls=True,
-    )
-    resource = next(
-        (item for item in inventory["document"] if item["resource"]["id"] == document.document_id),
-        None,
-    )
-    if resource is None:
-        raise _internal_product_error(
-            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
-            "materialized document resource is unavailable",
-            operation="workbench.resources.open",
-        )
-    bindings = await service.list_document_source_bindings(
-        session_id=session_id,
-        limit=1000,
-    )
-    binding = next(
-        (item for item in bindings if item.document_id == document.document_id),
-        None,
+    resource, binding = await _document_resource(
+        service, document, head, session_id=session_id,
+        materials=materials or _ResourceMaterials(
+            ArtifactStore(media_root_from_config(ctx.config)), session_id,
+        ),
     )
     response: dict[str, Any] = {
         "disposition": "document",
@@ -1793,7 +2048,15 @@ async def _current_document_open_response(
         response["binding"] = _binding_payload(binding)
     if receipt is not None:
         response["receipt"] = receipt
-    if _format_profile(document.name, head.media_type).kind is ArtifactKind.HTML:
+    # A show_widget Document is an inline recovery snapshot.  It is
+    # intentionally not an editable workspace file, so targeted open must not
+    # materialize a working copy merely because HTML is normally agent-editable.
+    if resource.get("source") == "show-widget":
+        response["disposition"] = "readonly"
+        response["resolution"] = {"status": "readonly"}
+        response["reasonCode"] = "visualize_internal"
+        return response
+    if _format_profile(document.name, head.media_type).agent_editable:
         working = await ensure_document_working_files(
             ctx,
             service=service,
@@ -1802,7 +2065,13 @@ async def _current_document_open_response(
             document_id=document_id,
         )
         response["workingFile"] = str(working.entry)
-        response["pageContext"] = {"resourceId": f"document:{document_id}"}
+        response["pageContext"] = {
+            "resourceId": f"document:{document_id}",
+            "revisionId": head.revision_id, "sha256": head.artifact_sha256,
+        }
+    await _add_resource_source_paths(
+        ctx, session_key=session_key, service=service, resources=[resource],
+    )
     return response
 
 
@@ -2016,13 +2285,96 @@ def _open_idempotency_key(
     return "open-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+async def _resources_annotate(
+    command: WorkbenchResourceOpen, ctx: RpcContext,
+) -> dict[str, Any]:
+    from opensquilla.gateway.annotation_preparation import (
+        annotation_authority,
+        find_document_target,
+        refresh_annotation_baseline,
+        register_annotation_source,
+    )
+    from opensquilla.gateway.workspace_files import _readable_file
+
+    if ctx.principal is not None and not ctx.principal.is_owner:
+        raise ValueError("Annotation preparation requires the workspace owner")
+    session_key, session_id, service = await _scope(command.session_key, ctx)
+    store = ArtifactStore(media_root_from_config(ctx.config))
+    files, workspace, validate = await annotation_authority(ctx, session_key, session_id)
+    page_path = None
+    resource = command.resource
+    if command.workspace_file is not None:
+        source = command.workspace_file
+        if source["workspaceBinding"] != workspace.binding:
+            raise ArtifactConflictError("Annotation workspace binding changed")
+        path, _, revision = await asyncio.to_thread(_readable_file, workspace, source["path"])
+        if revision != source["expectedRevision"]:
+            raise ArtifactConflictError("Annotation source changed since the file was opened")
+        target, ambiguous = await find_document_target(
+            service, store, session_key=session_key, session_id=session_id,
+            workspace=workspace, path=path,
+        )
+        if ambiguous:
+            raise ArtifactConflictError("Annotation document target is ambiguous")
+        if target is None:
+            document_id = await register_annotation_source(
+                service, store, session_key=session_key, session_id=session_id,
+                workspace=workspace, path=path, validate=validate,
+            )
+        else:
+            document_id = target["documentId"]
+            page_path = target.get("pagePath")
+        resource = WorkbenchResourceRef("document", document_id)
+    assert resource is not None
+    opened = await _resources_open(
+        replace(command, resource=resource, workspace_file=None, intent="edit-current"), ctx,
+    )
+    if opened.get("disposition") != "document" or not opened.get("workingFile"):
+        return opened
+    document_id = opened["document"]["documentId"]
+    previous_revision_id = opened["revision"]["revisionId"]
+    await refresh_annotation_baseline(
+        service, store, document_id=document_id, session_key=session_key,
+        session_id=session_id, workspace=workspace, validate=validate,
+    )
+    if await files.workspace(session_key) != workspace:
+        raise ArtifactConflictError("Annotation workspace changed during preparation")
+    # Another prepare may have advanced the head before our baseline check.
+    # Return that current head even when this call did not create a revision.
+    opened = await _current_document_open_response(
+        ctx, session_key=session_key, session_id=session_id, service=service,
+        document_id=document_id, materialized=bool(opened.get("materialized")),
+    )
+    opened["baselineUpdated"] = opened["revision"]["revisionId"] != previous_revision_id
+    if opened["baselineUpdated"]:
+        opened["previousRevisionId"] = previous_revision_id
+    if page_path is not None:
+        from opensquilla.artifact_session.working_files import get_working_files
+
+        binding = await get_working_files(service, document_id)
+        assert binding is not None
+        bundle = await asyncio.to_thread(binding.bundle)
+        if not any(
+            item.path == page_path and item.mime in _HTML_MIMES for item in bundle.files
+        ):
+            raise ArtifactConflictError("Annotation page is no longer in the document")
+        opened["pageContext"]["pagePath"] = page_path
+    return opened
+
+
 async def _resources_open(
     command: WorkbenchResourceOpen,
     ctx: RpcContext,
 ) -> dict[str, Any]:
     """Resolve a resource to its current editable Document when supported."""
 
+    if command.intent == "annotate":
+        try:
+            return await _resources_annotate(command, ctx)
+        except ArtifactConflictError as exc:
+            raise _conflict(exc) from exc
     session_key, session_id, service = await _scope(command.session_key, ctx)
+    materials = _ResourceMaterials(ArtifactStore(media_root_from_config(ctx.config)), session_id)
     intent = command.intent
     if intent != "edit-current":
         raise ValueError("resource open intent must be edit-current")
@@ -2032,6 +2384,7 @@ async def _resources_open(
         if _SHA256_RE.fullmatch(expected_sha256) is None:
             raise ValueError("expected resource digest must be a SHA-256 value")
     requested_idempotency_key = command.idempotency_key
+    assert command.resource is not None
     resource_type = command.resource.resource_type
     resource_id = command.resource.resource_id
     if resource_type == "document":
@@ -2042,25 +2395,17 @@ async def _resources_open(
             service=service,
             document_id=resource_id,
             materialized=False,
+            materials=materials,
         )
         resource_sha256 = response["resource"].get("sha256")
         if expected_sha256 is not None and expected_sha256 != resource_sha256:
             raise _conflict(ArtifactConflictError("document head hash changed"))
         return response
 
-    inventory = await _resource_inventory(
-        ctx,
-        session_key=session_key,
-        session_id=session_id,
-        service=service,
-        include_inline_urls=True,
+    resource = await _resource_by_ref(
+        ctx, session_key=session_key, session_id=session_id, service=service,
+        resource_type=resource_type, resource_id=resource_id, materials=materials,
     )
-    resource = next(
-        (item for item in inventory[resource_type] if item["resource"]["id"] == resource_id),
-        None,
-    )
-    if resource is None:
-        raise _not_found(resource_type, resource_id)
     resource_sha256 = resource.get("sha256")
     if expected_sha256 is not None and expected_sha256 != resource_sha256:
         raise _conflict(ArtifactConflictError("workbench resource hash changed"))
@@ -2077,6 +2422,7 @@ async def _resources_open(
             service=service,
             document_id=related_document_id,
             materialized=False,
+            materials=materials,
         )
 
     binding = await service.get_document_source_binding_for_resource(
@@ -2092,6 +2438,7 @@ async def _resources_open(
             service=service,
             document_id=binding.document_id,
             materialized=False,
+            materials=materials,
         )
 
     capabilities = resource.get("capabilities")
@@ -2137,6 +2484,9 @@ async def _resources_open(
         document_id=document_id,
         materialized=True,
         receipt=receipt if isinstance(receipt, dict) else None,
+        # Import creates a new immutable artifact identity; its head is freshly
+        # projected. Mutation validation is never replaced by this read cache.
+        materials=materials,
     )
 
 
@@ -2160,7 +2510,11 @@ async def _preview_create(
     )
     return {
         "resource": resource,
-        "preview": _preview_payload(resource, payload, mode=mode),
+        # _preview_material already validates Office against the exact bytes and
+        # resource identity; don't unzip the same package again for a descriptor.
+        "preview": await asyncio.to_thread(
+            _preview_payload, resource, payload, mode=mode, office_validated=True,
+        ),
     }
 
 
@@ -2202,6 +2556,16 @@ async def _document_publish(
                 ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
                 reason_code=profile.reason_code or "format_publish_not_supported",
             )
+        if office_format(revision.filename, revision.media_type):
+            try:
+                await asyncio.to_thread(
+                    _bundle_available, ArtifactStore(media_root_from_config(ctx.config)),
+                    revision.artifact_id, session_id=session_id,
+                )
+            except OfficeFormatError as exc:
+                raise artifact_product_error(
+                    ArtifactProductErrorCode.RESOURCE_UNSUPPORTED, reason_code=exc.reason_code,
+                ) from exc
         candidate = ArtifactBlobRef(
             artifact_id=ArtifactStore.allocate_artifact_id(),
             sha256=revision.artifact_sha256,
@@ -2271,6 +2635,13 @@ async def _document_publish(
                 session_id=session_id,
             )
             source_payload = await asyncio.to_thread(native_io_path(source_path).read_bytes)
+            if modern := office_format(source_revision.filename, source_revision.media_type):
+                try:
+                    await asyncio.to_thread(validate_office_bytes, source_payload, modern)
+                except OfficeFormatError as exc:
+                    raise artifact_product_error(
+                        ArtifactProductErrorCode.RESOURCE_UNSUPPORTED, reason_code=exc.reason_code,
+                    ) from exc
             await _ensure_internal_candidate(
                 ctx,
                 session_key=session_key,
@@ -2388,8 +2759,41 @@ __all__ = [
 ]
 
 
+def _inspect_artifact_material(
+    store: ArtifactStore, artifact_id: str, *, session_id: str, keep_payload: bool = False,
+) -> _MaterialInspection:
+    ref = store.get_ref(session_id=session_id, artifact_id=artifact_id)
+    modern = office_format(ref.name, ref.mime)
+    try:
+        ref, payload, manifest = store.read_verified_material(
+            artifact_id, session_id=session_id,
+            max_bytes=MAX_OFFICE_BYTES if modern else None, validate_bundle=True,
+        )
+    except ArtifactBudgetError as exc:
+        if modern:
+            raise OfficeFormatError("office_size_unsupported") from exc
+        raise
+    if modern:
+        validate_office_bytes(payload, modern)
+    pages = tuple(
+        item.path for item in manifest.files
+        if is_html_preview_path(item.path)
+        and item.mime.split(";", 1)[0].strip().lower() in _HTML_MIMES
+    ) if manifest else (
+        (ref.name,) if is_html_preview_path(ref.name)
+        and ref.mime.split(";", 1)[0].strip().lower() in _HTML_MIMES else ()
+    )
+    return _MaterialInspection(ref, pages, payload if keep_payload else None)
+
+
+def _check_revision_material(revision: Revision, ref: ArtifactRef) -> None:
+    if (revision.artifact_id != ref.id or revision.artifact_sha256 != ref.sha256
+            or revision.byte_size != ref.size):
+        raise ArtifactIntegrityError("document revision material does not match its record")
+
+
 def _bundle_available(store: ArtifactStore, artifact_id: str, *, session_id: str) -> bool:
-    store.validate_preview_bundle(artifact_id, session_id=session_id)
+    _inspect_artifact_material(store, artifact_id, session_id=session_id)
     return True
 
 
@@ -2397,18 +2801,9 @@ def _bundle_preview_pages(
     store: ArtifactStore, artifact_id: str, *, session_id: str,
 ) -> list[str]:
     """Project only HTML members of the verified, bounded head material."""
-    manifest = store.validate_preview_bundle(artifact_id, session_id=session_id)
-    if manifest is None:
-        ref, _path = store.resolve_for_download(artifact_id, session_id=session_id)
-        return [ref.name] if (
-            is_html_preview_path(ref.name)
-            and ref.mime.split(";", 1)[0].strip().lower() in _HTML_MIMES
-        ) else []
-    return [
-        item.path for item in manifest.files
-        if is_html_preview_path(item.path)
-        and item.mime.split(";", 1)[0].strip().lower() in _HTML_MIMES
-    ]
+    return list(_inspect_artifact_material(
+        store, artifact_id, session_id=session_id,
+    ).preview_pages)
 
 
 async def ensure_document_working_files(

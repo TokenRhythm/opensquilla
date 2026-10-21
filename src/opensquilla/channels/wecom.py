@@ -480,9 +480,9 @@ class WeComChannel:
             if not ready.done():
                 ready.set_exception(WeComAuthError("WeCom AI Bot SDK connection failed"))
 
-        def received(payload: dict[str, Any]) -> None:
+        async def received(payload: dict[str, Any]) -> None:
             if self._ws_sdk is client and self._connected:
-                self._ingest_sdk_message(payload)
+                await self._ingest_sdk_message(payload)
 
         client.on("authenticated", authenticated)
         client.on("disconnected", disconnected)
@@ -509,19 +509,17 @@ class WeComChannel:
             self._reply_req_ids.clear()
             self._last_chat_req_ids.clear()
 
-    def _ingest_sdk_message(self, payload: dict[str, Any]) -> None:
+    async def _ingest_sdk_message(self, payload: dict[str, Any]) -> None:
         msg = self._parse_inbound_websocket_json(payload)
         if msg is None:
             return
         msg_id = str(msg.metadata.get("message_id", ""))
-        if msg_id and not self._dedupe.check_and_add(msg_id):
-            return
         self._remember_reply_req_id(msg_id, str(msg.metadata.get("wecom_req_id", "")))
         self._remember_chat_req_id(
             str(msg.metadata.get("chat_id", msg.channel_id)),
             str(msg.metadata.get("wecom_req_id", "")),
         )
-        self.enqueue(msg)
+        await self._dedupe.run_once(msg_id, lambda: self.enqueue(msg))
 
     async def _send_ws_request(
         self, cmd: str, body: dict[str, Any], *, req_id: str | None = None,
@@ -650,10 +648,10 @@ class WeComChannel:
     # Inbound queue
     # ------------------------------------------------------------------
 
-    def enqueue(self, message: IncomingMessage) -> None:
+    async def enqueue(self, message: IncomingMessage) -> None:
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, message, self._queue)
+        await durable_enqueue(self, message, self._queue)
 
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
@@ -730,16 +728,13 @@ class WeComChannel:
             return Response(status_code=200)
 
         msg_id = str(msg.metadata.get("message_id", ""))
-        if msg_id and not self._dedupe.check_and_add(msg_id):
-            log.info("wecom.dedup_drop", message_id=msg_id)
-            return Response(status_code=200)
 
         log.info(
             "wecom.inbound_received",
             message_id=msg_id,
             is_group=msg.metadata.get("is_group"),
         )
-        self.enqueue(msg)
+        await self._dedupe.run_once(msg_id, lambda: self.enqueue(msg))
         return Response(status_code=200)
 
     @staticmethod
@@ -1050,7 +1045,21 @@ class WeComChannel:
                 raise ValueError("WeCom artifact size changed before upload")
             return content
 
-        material = await asyncio.to_thread(read_bounded)
+        reader = asyncio.create_task(asyncio.to_thread(read_bounded))
+        try:
+            material = await asyncio.shield(reader)
+        except asyncio.CancelledError:
+            # The artifact caller owns a temporary file until this adapter
+            # returns. A cancelled coroutine must join the filesystem reader
+            # before allowing that caller to remove its material.
+            while not reader.done():
+                try:
+                    await asyncio.shield(reader)
+                except (asyncio.CancelledError, Exception):
+                    continue
+            if not reader.cancelled():
+                reader.exception()
+            raise
         media_type = self._wecom_media_type(path)
         uploaded = await client.upload_media(material, type=media_type, filename=path.name)
         media_id = str(uploaded.get("media_id") or "")

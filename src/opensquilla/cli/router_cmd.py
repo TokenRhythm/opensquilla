@@ -34,8 +34,7 @@ router_app = typer.Typer(help="Router calibration and inspection.")
 def _resolve_decisions_db_path() -> str:
     """Resolve the ``sessions.db`` holding the V017 ``router_decisions`` table.
 
-    Resolution order mirrors ``opensquilla skills meta`` so the CLI reads the
-    same rows the running gateway writes:
+    Resolution order:
 
       1. ``OPENSQUILLA_ROUTER_DECISIONS_DB`` env var (explicit override)
       2. ``GatewayConfig.state_dir`` / ``sessions.db``

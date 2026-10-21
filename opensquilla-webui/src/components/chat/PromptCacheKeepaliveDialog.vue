@@ -169,7 +169,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, nextTick, ref, watch } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
@@ -200,6 +200,11 @@ const status = ref<PromptCacheKeepaliveStatus | null>(null)
 const draftEnabled = ref(false)
 const draftTtlMinutes = ref(5)
 const draftIdleTimeoutMinutes = ref(60)
+let dialogGeneration = 0
+
+function isCurrentDialog(generation: number, sessionKey: string): boolean {
+  return generation === dialogGeneration && props.open && props.sessionKey === sessionKey
+}
 
 const validTtl = computed(() => (
   Number.isInteger(draftTtlMinutes.value)
@@ -229,19 +234,22 @@ const statusText = computed(() => {
 })
 
 function close() {
-  if (!saving.value) emit('close')
+  if (saving.value) return
+  dialogGeneration += 1
+  emit('close')
 }
 
 function formatTime(value: number): string {
   return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-async function load() {
-  if (!props.open || !props.sessionKey) return
+async function load(sessionKey: string, generation: number) {
+  if (!isCurrentDialog(generation, sessionKey)) return
   loading.value = true
   error.value = ''
   try {
-    const next = await promptCacheLease.status(props.sessionKey)
+    const next = await promptCacheLease.status(sessionKey)
+    if (!isCurrentDialog(generation, sessionKey)) return
     status.value = next
     draftEnabled.value = next.enabled
     draftTtlMinutes.value = Math.max(5, Math.round(next.ttlSeconds / 60))
@@ -250,20 +258,22 @@ async function load() {
       Math.round((next.idleTimeoutSeconds || 3_600) / 60),
     )
   } catch (cause) {
+    if (!isCurrentDialog(generation, sessionKey)) return
     const detail = cause instanceof Error ? cause.message : String(cause)
     error.value = /session not found/i.test(detail)
       ? t('chat.promptCacheKeepalive.sessionUnavailable')
       : detail
   } finally {
-    loading.value = false
+    if (isCurrentDialog(generation, sessionKey)) loading.value = false
   }
 }
 
 async function save() {
-  if (!validConfig.value) return
+  if (!props.open || !props.sessionKey || loading.value || saving.value || !validConfig.value) return
   saving.value = true
   error.value = ''
   const savedSessionKey = props.sessionKey
+  const generation = dialogGeneration
   try {
     const ttlSeconds = Number.isInteger(draftTtlMinutes.value)
       ? Math.round(draftTtlMinutes.value * 60)
@@ -277,25 +287,32 @@ async function save() {
       ttlSeconds,
       idleTimeoutSeconds,
     })
+    if (!isCurrentDialog(generation, savedSessionKey)) return
     status.value = next
     emit('saved', { sessionKey: savedSessionKey, status: next })
-    pushToast(t(next.enabled
-      ? 'chat.promptCacheKeepalive.enabledToast'
-      : 'chat.promptCacheKeepalive.disabledToast'), { tone: 'ok' })
+    if (next.enabled) pushToast(t('chat.promptCacheKeepalive.enabledToast'), { tone: 'ok' })
     emit('close')
   } catch (cause) {
+    if (!isCurrentDialog(generation, savedSessionKey)) return
     const detail = cause instanceof Error ? cause.message : String(cause)
     error.value = /session not found/i.test(detail)
       ? t('chat.promptCacheKeepalive.sessionUnavailable')
       : detail
   } finally {
-    saving.value = false
+    if (isCurrentDialog(generation, savedSessionKey)) saving.value = false
   }
 }
 
-watch(() => [props.open, props.sessionKey] as const, ([isOpen]) => {
-  if (isOpen) void nextTick(load)
+watch(() => [props.open, props.sessionKey] as const, ([isOpen, sessionKey]) => {
+  const generation = ++dialogGeneration
+  loading.value = Boolean(isOpen && sessionKey)
+  saving.value = false
+  status.value = null
+  error.value = ''
+  if (isOpen && sessionKey) void nextTick(() => load(sessionKey, generation))
 }, { immediate: true })
+
+onBeforeUnmount(() => { dialogGeneration += 1 })
 
 useDialogA11y(dialogRef, computed(() => props.open), close, {
   initialFocus: closeButtonRef,

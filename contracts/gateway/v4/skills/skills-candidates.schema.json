@@ -260,8 +260,7 @@
         },
         "kind": {
           "enum": [
-            "skill",
-            "meta"
+            "skill"
           ]
         },
         "disabled": {

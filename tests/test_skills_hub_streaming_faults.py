@@ -18,6 +18,11 @@ from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.source import SkillSourceFetchError
 from tests.test_skills_hub_streaming import MANIFEST, Response, StreamingClient
 
+# The first streamed chunk waits behind source resolution and worker scheduling;
+# keep the readiness guard bounded without treating normal Windows cold-start
+# latency as a cancellation failure.
+_STREAM_START_TIMEOUT_SECONDS = 10
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("declared_size", [None, 1])
@@ -283,7 +288,7 @@ async def test_download_cancel_joins_workers_before_staging_cleanup(tmp_path: Pa
         lockfile_path=tmp_path / "lock.json", journal_path=tmp_path / "journal.json",
     )
     task = asyncio.create_task(service.install("https://github.com/acme/demo", "github"))
-    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.wait_for(started.wait(), timeout=_STREAM_START_TIMEOUT_SECONDS)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

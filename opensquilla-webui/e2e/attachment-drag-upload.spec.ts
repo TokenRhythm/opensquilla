@@ -1,5 +1,6 @@
 import { expect, test, type Download, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
@@ -63,16 +64,16 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
           : {}
         if (method === 'connect') {
           ws.send(helloOkResponse({
-            auth: { principal: { isOwner: true, authenticated: true, authState: 'authenticated',
-              ...(options.durableDraftIdentity ? { role: 'operator',
-                scopes: ['operator.read', 'operator.write'], capabilities: ['chat.read', 'chat.write'] } : {}),
-            } },
+            // The helper supplies a complete authenticated principal by default.
+            // Explicit null is the protocol representation of missing identity proof.
+            ...(options.durableDraftIdentity === false ? { auth: null } : {}),
           }))
           return
         }
         if (method === 'chat.send') {
           const params = (frame.params || {}) as CapturedSend
           capturedSends.push(params)
+          const taskId = `attachment-task-${capturedSends.length}`
           if (options.replayHistoryAfterSend) {
             const messageIndex = capturedSends.length
             historyMessages.splice(0, historyMessages.length, {
@@ -87,11 +88,15 @@ async function mockRpc(page: Page, capturedSends: CapturedSend[], options: MockR
           ws.send(wsResponse(String(frame.id), {
             sessionKey: params.sessionKey,
             status: 'accepted',
+            task_id: taskId,
           }))
           if (options.replayHistoryAfterSend) {
             ws.send(wsEvent('session.event.done', {
               key: params.sessionKey || '',
               sessionKey: params.sessionKey || '',
+              task_id: taskId,
+              turn_id: taskId,
+              reason: 'completed',
               status: 'succeeded',
               stream_generation: 'e2e-stream-generation',
               stream_seq: capturedSends.length,
@@ -188,7 +193,7 @@ async function openMockedChat(page: Page, capturedSends: CapturedSend[], options
   }
   await page.goto(url)
   await expect(page.locator('.chat-textarea')).toBeVisible()
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
 }
 
 async function dropFiles(page: Page, files: Array<{ name: string; type: string; text?: string; size?: number; base64?: string }>) {
@@ -520,7 +525,7 @@ test.describe('attachment drag upload', () => {
       await dropFiles(page, [{ name: 'draft.txt', type: 'text/plain', text: 'recover these attachment bytes' }])
       await expect(page.locator('.attachment-chip')).toContainText('draft.txt')
       if (newTask) {
-        await expect(page.locator('.chat-textarea')).toHaveValue('')
+        await expectComposerValue(page.locator('.chat-textarea'), '')
         await expect.poll(() => page.evaluate(() => window.history.state.draftHasAttachments)).toBe(true)
       }
       await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
@@ -545,7 +550,7 @@ test.describe('attachment drag upload', () => {
       }
       await page.reload()
       await expect(page.locator('.chat-textarea')).toBeVisible()
-      await expect(page.locator('.conn-pill.connected')).toBeVisible()
+      await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
       if (!durableDraftIdentity) {
         await expect(page.locator('.attachment-chip')).toHaveCount(0)
         return
@@ -709,7 +714,7 @@ test.describe('attachment drag upload', () => {
 
     await page.keyboard.press(shortcut)
     await expect(page).toHaveURL(draftUrl)
-    await expect(page.locator('.chat-textarea')).toHaveValue('')
+    await expectComposerValue(page.locator('.chat-textarea'), '')
     await expect(preview).toHaveCount(0)
     await expect(page.locator('.attachment-chip')).toHaveCount(0)
     await expect(page.locator('.chat-textarea')).toBeFocused()

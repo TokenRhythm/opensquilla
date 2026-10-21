@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import itertools
 import json
 import os
 import runpy
@@ -22,8 +23,10 @@ SHARD_MODULE: dict[str, Any] = runpy.run_path(
 )
 SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["SHARD_NAMES"]
 WINDOWS_SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["WINDOWS_SHARD_NAMES"]
+SHARED_SHARD_NAMES: tuple[str, ...] = SHARD_MODULE["SHARED_SHARD_NAMES"]
 discover_test_files = SHARD_MODULE["discover_test_files"]
 files_for_shard = SHARD_MODULE["files_for_shard"]
+files_for_planned_windows_shards = SHARD_MODULE["files_for_planned_windows_shards"]
 historical_test_weights = SHARD_MODULE["historical_test_weights"]
 matching_specialized_shards = SHARD_MODULE["matching_specialized_shards"]
 assignment_governance = SHARD_MODULE["assignment_governance"]
@@ -44,6 +47,8 @@ validate_partition_payload = SHARD_MODULE["validate_partition_payload"]
 
 OFFLINE_MARKER_EXCLUSIONS = SHARD_MODULE["OFFLINE_MARKER_EXCLUSIONS"]
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Cancellation settlement uses the provisional floor until a Windows refresh.
+    "tests/test_gateway/test_task_runtime_cancellation_settlement.py",
     # Generator provenance checks use the provisional floor pending Windows samples.
     "tests/contracts/test_codegen_versions.py",
     # Security inventory, rendering, and functional probes use measured Windows
@@ -192,7 +197,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_channel_dispatch_chunking.py",
     "tests/test_gateway/test_channel_reply_delivery_guard.py",
     "tests/test_gateway/test_channel_session_and_busy_policy.py",
-    "tests/test_gateway/test_capability_runtime.py",
     "tests/test_gateway/test_contract_method_adapter.py",
     "tests/test_gateway/test_session_read_adapter.py",
     "tests/test_gateway/test_session_read_contract_registration.py",
@@ -203,8 +207,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_conversation_runtime_adapter.py",
     "tests/test_gateway/test_goal_plan_contract_adapters.py",
     "tests/test_scripts/test_stage_webui_artifact.py",
-    "tests/test_gateway/test_meta_setup_launch_e2e.py",
-    "tests/test_gateway/test_rpc_meta_setup.py",
     "tests/test_artifact_validation.py",
     "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
@@ -253,9 +255,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_observability/test_usage_telemetry.py",
     "tests/test_migrations/test_v023_router_deployment_telemetry.py",
     "tests/test_migrations/test_v024_usage_native_billing_receipts.py",
-    "tests/test_migrations/test_v030_meta_control_intents.py",
-    "tests/test_migrations/test_v031_meta_launch_drafts.py",
-    "tests/test_migrations/test_v032_meta_launch_discard_tombstones.py",
     "tests/test_live_mixed_provider_gateway.py",
     "tests/test_live_long_task_case_driver.py",
     "tests/test_live_long_task_release_gate.py",
@@ -287,24 +286,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_scheduler/test_job_lifecycle.py",
     "tests/test_session/test_storage_session_list_pagination.py",
     "tests/test_session/test_storage_transactions.py",
-    "tests/test_session/test_meta_launch_drafts.py",
     "tests/test_session/test_pending_chat_inputs.py",
     "tests/test_session/test_turn_acceptance_storage.py",
     "tests/test_session/test_assistant_message_identity.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
     "tests/test_skills/test_managed_toolchains.py",
-    "tests/test_skills/test_meta_readiness.py",
-    "tests/test_skills/test_meta_short_drama_delivery_audit.py",
-    "tests/test_skills/test_paper_citation_integrity_gate.py",
-    "tests/test_skills/test_paper_delivery_summary.py",
-    "tests/test_skills/test_paper_latex_sanitizer.py",
-    "tests/test_skills/test_paper_length_gate.py",
-    "tests/test_skills/test_paper_quality_gate.py",
-    "tests/test_skills/test_paper_refbib_metadata.py",
-    "tests/test_skills/test_paper_source_readiness_gate.py",
-    "tests/test_skills/test_short_drama_review_normalizer.py",
-    "tests/test_skills/test_subtitle_burner.py",
-    "tests/test_skills/test_title_card_image.py",
     "tests/test_skills/test_toolchain_runtime_integration.py",
     "tests/test_skills/test_toolchain_state_scope.py",
     "tests/test_tools/test_shell_managed_toolchains.py",
@@ -371,7 +357,7 @@ def test_every_pytest_file_belongs_to_exactly_one_windows_shard() -> None:
     assert set().union(*by_shard.values()) == discovered
     assert sum(len(paths) for paths in by_shard.values()) == len(discovered)
     assert all(len(matching_specialized_shards(path)) <= 1 for path in discovered)
-    assert "tests/fixtures/meta_skill_inputs/code_review_dirty_repo/tests/test_app.py" not in (
+    assert "tests/fixtures/synthetic_project/tests/test_app.py" not in (
         discovered
     )
     assert set(validated_files_for_shard(Path.cwd(), "core")) == by_shard["core"]
@@ -419,7 +405,7 @@ def test_only_fixture_consuming_shards_prebuild_the_core_wheel(
     consumers = {
         shard_family(shard)
         for shard in shard_names
-        if requires_isolated_core_wheel(root, files_for_shard(root, shard))
+        if requires_isolated_core_wheel(root, files_for_shard(root, shard, platform="windows"))
     }
 
     assert consumers == {"core", "desktop-installer-contracts"}
@@ -510,10 +496,24 @@ def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
     )
 
 
+@pytest.mark.parametrize("function_name", [
+    "test_real_node_metadata_imports_unchanged_image_on_python",
+    "test_electron_embedded_node_metadata_imports_unchanged_image",
+])
+def test_native_attachment_runtime_parity_is_marked_ci_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_native_attachment_import.py"), function_name,
+    )
+
+
 def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_desktop/test_gateway_functional_probes.py"),
         "test_mcp_probe_uses_real_stdio_server_and_gateway",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_provider_profile_gateway_e2e.py"),
+        "test_attachment_capacity_runner_reaches_provider_through_real_gateway",
     )
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_live_provider_profile_gateway_e2e.py"),
@@ -548,6 +548,10 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         "test_transaction_recovery_locks_parked_backup_before_restoring_target",
     )
     assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/functional/test_gateway_session_routing_e2e.py"),
+        "test_real_gateway_websocket_session_routing_contract",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/functional/test_gateway_silent_reply_process_e2e.py"),
         "test_real_gateway_suppresses_goal_sentinel_everywhere",
     )
@@ -563,6 +567,142 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         Path("tests/test_skills/test_hub_transaction_process_gates.py"),
         "test_unleased_build_services_does_not_sweep_another_process_reservation",
     )
+
+
+@pytest.mark.parametrize(
+    ("test_file", "function_name"),
+    [
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_slow_native_launch_preserves_loop_and_ownership",
+        ),
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_quiet_native_reader_is_reclaimed_after_initialization",
+        ),
+        (
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "test_runner_shutdown_waits_for_native_launch_cleanup",
+        ),
+        (
+            "tests/test_gateway/test_plan_rpc.py",
+            "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
+        ),
+        (
+            "tests/test_gateway/test_plan_rpc.py",
+            "test_explicit_implement_mode_is_pinned_at_queued_execution_boundary",
+        ),
+        (
+            "tests/test_engine/test_tool_concurrency.py",
+            "test_image_analysis_calls_have_dedicated_inflight_cap",
+        ),
+        (
+            "tests/test_gateway/test_manual_compaction_contract.py",
+            "test_absolute_deadline_closes_provider_and_emits_one_skipped_terminal",
+        ),
+        (
+            "tests/test_engine/test_compaction_parent_turn_deadline.py",
+            "test_parent_deadline_cancels_inflight_preflight_without_auxiliary_failure",
+        ),
+        (
+            "tests/test_engine/test_compaction_parent_turn_deadline.py",
+            "test_parent_deadline_after_writer_settles_preserves_actual_commit_outcome",
+        ),
+        (
+            "tests/test_engine/test_compaction_runtime_boundaries.py",
+            "test_parent_expiry_cancels_inflight_summary_without_failure_or_window",
+        ),
+        (
+            "tests/test_engine/test_compaction_runtime_boundaries.py",
+            "test_real_turn_reports_parent_timeout_without_auxiliary_failure",
+        ),
+        (
+            "tests/test_gateway/test_rpc_sessions.py",
+            "test_direct_send_rejects_dropping_durable_runner",
+        ),
+        (
+            "tests/test_engine/test_interactive_approval_retry.py",
+            "test_pending_approval_ignores_legacy_timeout_and_waits_for_decision",
+        ),
+        (
+            "tests/test_skills/test_staging_io_worker.py",
+            "test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup",
+        ),
+        (
+            "tests/test_observability/test_http_client.py",
+            "test_custom_ca_and_hostname_validation_are_preserved",
+        ),
+        (
+            "tests/test_observability/test_http_client.py",
+            "test_idle_tls_connection_does_not_block_certificate_validation",
+        ),
+        (
+            "tests/test_recovery/test_runtime_writer_guard.py",
+            "test_runtime_writer_lock_keeps_read_only_cli_available_and_rejects_agent",
+        ),
+        (
+            "tests/test_recovery/test_runtime_writer_guard.py",
+            "test_distinct_profile_and_gateway_state_dirs_run_concurrently_across_processes",
+        ),
+    ],
+)
+def test_bounded_latency_contracts_are_marked_ci_serial(
+    test_file: str, function_name: str,
+) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(Path(test_file), function_name)
+
+
+@pytest.mark.parametrize("function_name", [
+    "test_close_releases_stalled_send_lock_before_draining_accepted_record",
+    "test_prepare_shutdown_releases_send_lock_and_keeps_producer_records_open",
+    "test_shutdown_probe_rejects_broken_contracts",
+    "test_shutdown_probe_bounds_noncooperative_cleanup",
+])
+def test_telemetry_process_probes_are_explicitly_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_telemetry/test_client_runtime.py"), function_name,
+    )
+
+
+@pytest.mark.parametrize("function_name", [
+    "test_close_drains_native_before_reconnect",
+    "test_close_probe_rejects_broken_resource_contracts",
+    "test_close_probe_watchdog_terminates_noncooperative_close",
+])
+def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_session/test_recovery_reads.py"), function_name,
+    )
+
+
+@pytest.mark.ci_serial
+@pytest.mark.parametrize(("target", "serial_count"), [
+    ("tests/test_telemetry/test_client_runtime.py", 5),
+    ("tests/test_session/test_recovery_reads.py", 9),
+    ("tests/test_gateway/test_native_attachment_import.py", 3),
+    ("tests/test_observability/test_http_client.py", 2),
+    ("tests/test_recovery/test_runtime_writer_guard.py", 3),
+])
+def test_process_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
+    """Exercise actual pytest collection, not fixture-setup-time marker changes."""
+    def collect(marker: str | None) -> set[str]:
+        command = [sys.executable, "-m", "pytest", target, "--collect-only", "-q"]
+        if marker is not None:
+            command += ["-m", marker]
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        nodes = [line for line in result.stdout.splitlines() if line.startswith(f"{target}::")]
+        assert nodes and len(nodes) == len(set(nodes)), result.stdout
+        return set(nodes)
+
+    all_nodes = collect(None)
+    parallel = collect("not ci_serial")
+    serial = collect("ci_serial")
+    assert not parallel & serial
+    assert parallel | serial == all_nodes
+    assert len(serial) == serial_count
 
 
 def test_real_skill_install_cancellation_is_marked_ci_serial() -> None:
@@ -804,6 +944,7 @@ def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
     expected = {
         "tests/test_ci/test_router_artifact_manifest.py": "core",
         "tests/test_channels/test_feishu_sdk_websocket.py": "gateway-sqlite",
+        "tests/test_gateway/test_task_runtime_cancellation_settlement.py": "gateway-sqlite",
         "tests/test_gateway/test_task_runtime_terminal_cleanup.py": "gateway-sqlite",
         "tests/test_persistence/test_migrator.py": "gateway-sqlite",
         "tests/test_session/test_manager.py": "gateway-sqlite",
@@ -841,25 +982,91 @@ def test_windows_execution_partitions_cover_every_file_once_within_its_family() 
     assignments = partition_assignments()
     assert set(assignments) <= discovered
     physical_files = {
-        shard: set(validated_files_for_shard(root, shard)) for shard in WINDOWS_SHARD_NAMES
+        shard: set(validated_files_for_shard(root, shard, platform="windows"))
+        for shard in WINDOWS_SHARD_NAMES
     }
-    assert len(physical_files) == 8
+    assert len(physical_files) == 23
+    catalog = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    assert tuple(catalog["full_python_matrix"]["windows"]) == WINDOWS_SHARD_NAMES
+    assert tuple(catalog["full_python_matrix"]["ubuntu"]) == SHARED_SHARD_NAMES
+    assert tuple(catalog["python_shard_families"]) == SHARD_NAMES
     assert all(physical_files.values())
     assert set().union(*physical_files.values()) == discovered
     assert sum(map(len, physical_files.values())) == len(discovered)
     for family in SHARD_NAMES:
-        assert physical_files[f"{family}-1"] | physical_files[f"{family}-2"] == set(
-            files_for_shard(root, family)
-        )
+        family_files = [paths for shard, paths in physical_files.items()
+                        if shard_family(shard) == family]
+        assert len(family_files) == (11 if family == "gateway-sqlite" else 4)
+        assert set().union(*family_files) == set(files_for_shard(root, family))
     for path, physical in assignments.items():
         assert shard_family(physical) == shard_for_test(path)
-        assert windows_shard_for_test(path) == physical
+        expected = SHARD_MODULE["windows_partition_overrides"]().get(path, physical)
+        assert windows_shard_for_test(path) == expected
+
+
+def test_planned_windows_inventory_preserves_owners_for_matrix_subsets(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    # Retain every nonempty plan over the original ten physical labels, then
+    # add every singleton, pair, omitted-owner boundary, and full matrix
+    # plan. This preserves the original exhaustive check without expanding to
+    # a million inventory scans over all matrix combinations.
+    effective = {**partition_assignments(), **SHARD_MODULE["windows_partition_overrides"]()}
+    samples = {
+        shard: next(path for path, owner in effective.items() if owner == shard)
+        for shard in WINDOWS_SHARD_NAMES
+    }
+    for path in samples.values():
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+    legacy_shards = tuple(
+        f"{family}-{partition}"
+        for family in SHARD_NAMES
+        for partition in range(1, 5 if family == "gateway-sqlite" else 3)
+    )
+    plans = {
+        planned
+        for size in range(1, len(legacy_shards) + 1)
+        for planned in itertools.combinations(legacy_shards, size)
+    }
+    for size in (1, 2, len(WINDOWS_SHARD_NAMES) - 1, len(WINDOWS_SHARD_NAMES)):
+        plans.update(itertools.combinations(WINDOWS_SHARD_NAMES, size))
+    for planned in sorted(plans):
+        selected = files_for_planned_windows_shards(tmp_path, planned[0], json.dumps(planned))
+        assert set(selected) == {samples[shard] for shard in planned}, planned
+
+
+@pytest.mark.parametrize("planned", [
+    "", "not-json", "null", "{}", "[]", '["core-1", "core-1"]',
+    '["core-1", "unknown"]', '["core-1", 1]', '["core-2"]', '["core"]',
+])
+def test_planned_windows_inventory_cli_rejects_invalid_proof_before_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], planned: str,
+) -> None:
+    args = SHARD_MODULE["_parser"]().parse_args([
+        "list", "core-1", "--root", str(tmp_path), "--planned-windows-shards", planned,
+    ])
+    with pytest.raises(ValueError):
+        args.handler(args)
+    assert capsys.readouterr().out == ""
+
+
+def test_planned_windows_inventory_cli_propagates_collection_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = SHARD_MODULE["_parser"]().parse_args([
+        "list", "core-1", "--root", str(tmp_path),
+        "--planned-windows-shards", '["core-1"]',
+    ])
+    with pytest.raises(ValueError, match="cannot read pytest collection contract"):
+        args.handler(args)
+    assert capsys.readouterr().out == ""
 
 
 def test_windows_partitions_stay_fixed_when_duration_weights_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assignments = dict(partition_assignments())
+    assignments = {**partition_assignments(), **SHARD_MODULE["windows_partition_overrides"]()}
     before = partition_snapshot_fingerprint()
 
     def unexpected_weight_access() -> dict[str, float]:
@@ -887,6 +1094,122 @@ def test_windows_new_file_fallback_is_stable_and_keeps_environment_family() -> N
         assert shard_family(shard) == shard_for_test(path)
 
 
+def test_gateway_new_file_fallback_uses_all_eight_partitions() -> None:
+    paths = [f"tests/test_gateway/test_new_partition_fallback_{index}.py"
+             for index in range(64)]
+    assert not set(paths).intersection(partition_assignments())
+    assert {windows_shard_for_test(path) for path in paths} == {
+        f"gateway-sqlite-{partition}" for partition in range(1, 9)
+    }
+    assert all(
+        windows_shard_for_test(path)
+        == SHARD_MODULE["execution_shard_for_test"](path, platform="ubuntu")
+        for path in paths
+    )
+
+
+def test_windows_gateway_overlay_preserves_source_inventory_and_ubuntu_snapshot() -> None:
+    root = Path.cwd()
+    source = "gateway-sqlite-5"
+    extras = SHARD_MODULE["WINDOWS_EXTRA_SHARD_NAMES"]
+    original = set(validated_files_for_shard(root, source, platform="ubuntu"))
+    groups = {shard: set(validated_files_for_shard(root, shard, platform="windows"))
+              for shard in (source, *extras)}
+    source_snapshot = {path for path, shard in partition_assignments().items() if shard == source}
+    assert len(source_snapshot) == 92
+    assert [len(groups[shard] & source_snapshot) for shard in (source, *extras)] == [25, 22, 22, 23]
+    assert set().union(*groups.values()) == original
+    assert sum(map(len, groups.values())) == len(original)
+    serial_files = {
+        "tests/functional/test_gateway_stop_process_tree_e2e.py",
+        "tests/test_gateway/test_manual_compaction_contract.py",
+        "tests/test_gateway/test_plan_rpc.py",
+    }
+    assert serial_files <= groups[source]
+    # This is the actual round-5 partition hash, before the Windows-only move.
+    assert partition_snapshot_fingerprint(platform="ubuntu") == (
+        "0591c1457e43e3cb61ae8d367ff02757692644f1cd4356754282cca9a9dc4f71"
+    )
+    assert partition_snapshot_fingerprint() != partition_snapshot_fingerprint(platform="ubuntu")
+    for shard in SHARED_SHARD_NAMES:
+        if shard != source:
+            assert files_for_shard(root, shard, platform="windows") == files_for_shard(
+                root, shard, platform="ubuntu",
+            )
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_target", "unknown_target", "wrong_source", "new_file", "duplicate",
+    "duplicate_within", "unsorted", "not_list", "non_string",
+])
+def test_windows_gateway_overlay_rejects_invalid_ownership(mutation: str) -> None:
+    payload = json.loads(Path(".github/scripts/windows_test_partitions.json").read_text())
+    overrides = payload["windows_overrides"]
+    if mutation == "missing_target":
+        del overrides["gateway-sqlite-9"]
+    elif mutation == "unknown_target":
+        overrides["gateway-sqlite-12"] = overrides.pop("gateway-sqlite-9")
+    elif mutation == "wrong_source":
+        overrides["gateway-sqlite-9"] = payload["partitions"]["gateway-sqlite-4"][:1]
+    elif mutation == "new_file":
+        overrides["gateway-sqlite-9"] = ["tests/test_gateway/test_new_unreviewed.py"]
+    elif mutation == "duplicate":
+        overrides["gateway-sqlite-10"] = overrides["gateway-sqlite-9"][:1]
+    elif mutation == "duplicate_within":
+        overrides["gateway-sqlite-9"] = overrides["gateway-sqlite-9"][:1] * 2
+    elif mutation == "unsorted":
+        overrides["gateway-sqlite-9"].reverse()
+    elif mutation == "not_list":
+        overrides["gateway-sqlite-9"] = {}
+    elif mutation == "non_string":
+        overrides["gateway-sqlite-9"] = [None]
+    with pytest.raises(ValueError, match="windows_overrides"):
+        validate_partition_payload(payload)
+
+
+@pytest.mark.parametrize("host,target", [("Windows", "windows"), ("Linux", "ubuntu")])
+def test_execution_inventory_uses_native_or_explicit_platform(
+    host: str, target: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selector = SHARD_MODULE["execution_shard_for_test"]
+    monkeypatch.setattr(selector.__globals__["platform"], "system", lambda: host)
+    path, destination = next(iter(SHARD_MODULE["windows_partition_overrides"]().items()))
+    assert selector(path) == (destination if target == "windows" else "gateway-sqlite-5")
+    assert windows_shard_for_test(path) == destination
+    assert selector(path, platform="ubuntu") == "gateway-sqlite-5"
+    assert selector(path, platform="windows") == destination
+    for getter in (files_for_shard, validated_files_for_shard):
+        with pytest.raises(ValueError, match="Windows-only shard"):
+            getter(Path.cwd(), destination, platform="ubuntu")
+
+
+@pytest.mark.parametrize("target", ["windows", "ubuntu"])
+def test_planned_cli_uses_target_platform_for_overlay_owners(
+    target: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    path, destination = next(iter(SHARD_MODULE["windows_partition_overrides"]().items()))
+    shard = destination if target == "windows" else "gateway-sqlite-5"
+    args = SHARD_MODULE["_parser"]().parse_args([
+        "list", shard, "--platform", target, "--planned-windows-shards", json.dumps([shard]),
+    ])
+    assert args.handler(args) == 0
+    assert path in capsys.readouterr().out.splitlines()
+
+
+def test_overlay_change_is_bound_to_windows_partition_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = partition_snapshot_fingerprint()
+    ubuntu = partition_snapshot_fingerprint(platform="ubuntu")
+    overlay = dict(SHARD_MODULE["windows_partition_overrides"]())
+    overlay.pop(next(iter(overlay)))
+    monkeypatch.setitem(
+        partition_snapshot_fingerprint.__globals__, "windows_partition_overrides", lambda: overlay,
+    )
+    assert partition_snapshot_fingerprint() != before
+    assert partition_snapshot_fingerprint(platform="ubuntu") == ubuntu
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     [
@@ -898,7 +1221,7 @@ def test_windows_new_file_fallback_is_stable_and_keeps_environment_family() -> N
     ],
 )
 def test_windows_partition_snapshot_rejects_invalid_coverage(case: str, message: str) -> None:
-    partitions: dict[str, list[str]] = {shard: [] for shard in WINDOWS_SHARD_NAMES}
+    partitions: dict[str, list[str]] = {shard: [] for shard in SHARED_SHARD_NAMES}
     if case == "missing_partition":
         del partitions["core-2"]
     elif case == "duplicate_file":
@@ -919,13 +1242,14 @@ def test_windows_physical_metadata_binds_both_family_and_partition_snapshots(
 ) -> None:
     write_metadata = SHARD_MODULE["_write_run_metadata"]
     path = tmp_path / "metadata.json"
-    write_metadata(path, "gateway-sqlite-2", (), parallel_workers=3)
+    write_metadata(path, "gateway-sqlite-2", (), parallel_workers=3, execution_platform="windows")
     physical = json.loads(path.read_text(encoding="utf-8"))
     assert physical["shard"] == "gateway-sqlite-2"
     assert physical["family"] == "gateway-sqlite"
     assert physical["partition_sha256"] == partition_snapshot_fingerprint()
     assert physical["assignment_sha256"] == assignment_snapshot_fingerprint()
     assert physical["execution"]["parallel"]["workers"] == 3
+    assert physical["execution_shards"] == list(WINDOWS_SHARD_NAMES)
 
     write_metadata(path, "gateway-sqlite", (), parallel_workers=2)
     family = json.loads(path.read_text(encoding="utf-8"))
@@ -934,20 +1258,159 @@ def test_windows_physical_metadata_binds_both_family_and_partition_snapshots(
     assert "family" not in family
 
 
+def _bundle_platform_matrix() -> list[dict[str, str]]:
+    return [
+        {"suite": "windows-high-risk", "os": "windows-latest", "shard": shard}
+        for shard in (SHARD_MODULE["BUNDLE_OWNER"], *SHARD_MODULE["BUNDLE_SHARDS"])
+    ]
+
+
+def test_bundle_delegation_is_explicit_and_preserves_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delegate = SHARD_MODULE["_delegate_bundle_files"]
+    monkeypatch.setattr(delegate.__globals__["platform"], "system", lambda: "Windows")
+    owner = SHARD_MODULE["BUNDLE_OWNER"]
+    original = validated_files_for_shard(Path.cwd(), owner)
+    bundle = SHARD_MODULE["BUNDLE_TEST_FILE"]
+    matrix = _bundle_platform_matrix()
+    # The full platform plan also contains Ubuntu and unrelated platform suites.
+    matrix.append({"suite": "python-full", "os": "ubuntu-latest", "shard": owner})
+    executed = delegate(original, owner, json.dumps(matrix))
+    assert set(original) - set(executed) == {bundle}
+    assert len(executed) == len(original) - 1
+    assert validated_files_for_shard(Path.cwd(), owner) == original
+    assert bundle in files_for_shard(Path.cwd(), owner)
+
+    metadata_path = tmp_path / "metadata.json"
+    SHARD_MODULE["_write_run_metadata"](
+        metadata_path, owner, executed, parallel_workers=2, delegate_bundle=True,
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert bundle not in metadata["test_files"]
+    assert metadata["execution"]["parallel"]["item_parallel_files"] == []
+    assert metadata["delegated_case_files"] == [{
+        "path": bundle, "shards": ["bundle-1", "bundle-2", "bundle-3", "bundle-4"],
+    }]
+
+
+@pytest.mark.parametrize("mutation", [
+    "linux", "wrong_owner", "missing_file", "missing_matrix", "invalid_json",
+    "object_matrix", "missing_part", "duplicate_part", "wrong_suite", "wrong_os",
+    "extra_part", "missing_owner", "malformed_cell", "non_string_shard",
+])
+def test_bundle_delegation_rejects_incomplete_native_plan(
+    monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    delegate = SHARD_MODULE["_delegate_bundle_files"]
+    monkeypatch.setattr(
+        delegate.__globals__["platform"], "system",
+        lambda: "Linux" if mutation == "linux" else "Windows",
+    )
+    owner = SHARD_MODULE["BUNDLE_OWNER"]
+    files = (SHARD_MODULE["BUNDLE_TEST_FILE"], "tests/test_other.py")
+    matrix: Any = _bundle_platform_matrix()
+    if mutation == "wrong_owner":
+        owner = "core-1"
+    elif mutation == "missing_file":
+        files = ("tests/test_other.py",)
+    elif mutation == "object_matrix":
+        matrix = {"include": matrix}
+    elif mutation == "missing_part":
+        matrix.pop()
+    elif mutation == "duplicate_part":
+        matrix.append(dict(matrix[-1]))
+    elif mutation == "wrong_suite":
+        matrix[-1]["suite"] = "python-full"
+    elif mutation == "wrong_os":
+        matrix[-1]["os"] = "ubuntu-latest"
+    elif mutation == "extra_part":
+        matrix.append({"suite": "windows-high-risk", "os": "windows-latest", "shard": "bundle-5"})
+    elif mutation == "missing_owner":
+        matrix.pop(0)
+    elif mutation == "malformed_cell":
+        matrix[-1].pop("os")
+    elif mutation == "non_string_shard":
+        matrix[-1]["shard"] = []
+    raw = None if mutation == "missing_matrix" else json.dumps(matrix)
+    if mutation == "invalid_json":
+        raw = "{"
+    with pytest.raises(ValueError):
+        delegate(files, owner, raw)
+
+
+def test_platform_matrix_requires_explicit_bundle_delegation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = SHARD_MODULE["_run"]
+    monkeypatch.setitem(
+        run.__globals__, "validated_files_for_shard", lambda *_, **__: ("test.py",),
+    )
+    with pytest.raises(ValueError, match="requires --delegate-bundle"):
+        run(SimpleNamespace(
+            root=tmp_path, shard="core-1", delegate_bundle=False,
+            planned_platform_matrix=json.dumps(_bundle_platform_matrix()),
+        ))
+
+
+@pytest.mark.parametrize("delegate_bundle", [False, True])
+def test_bundle_delegation_changes_only_explicit_runner_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delegate_bundle: bool,
+) -> None:
+    run = SHARD_MODULE["_run"]
+    bundle = SHARD_MODULE["BUNDLE_TEST_FILE"]
+    files = (bundle, "tests/test_other.py")
+    for relative in files:
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("def test_case(): pass\n", encoding="utf-8")
+    monkeypatch.setitem(run.__globals__, "validated_files_for_shard", lambda *_, **__: files)
+    monkeypatch.setattr(run.__globals__["platform"], "system", lambda: "Windows")
+    selections: list[tuple[str, ...]] = []
+
+    def fake_pytest(root: Path, arguments: list[str], *, phase: str) -> int:
+        argfile = Path(next(arg[1:] for arg in arguments if arg.startswith("@")))
+        selected = tuple(argfile.read_text(encoding="utf-8").splitlines())
+        selections.append(selected)
+        junit = Path(next(
+            arg.split("=", 1)[1] for arg in arguments if arg.startswith("--junitxml=")
+        ))
+        suite = ET.Element("testsuite", tests="1" if phase == "parallel" else "0")
+        if phase == "parallel":
+            ET.SubElement(suite, "testcase", classname="tests.test_other", name="test_case")
+        ET.ElementTree(suite).write(junit, encoding="utf-8")
+        return 0 if phase == "parallel" else 5
+
+    monkeypatch.setitem(run.__globals__, "_run_pytest_subprocess", fake_pytest)
+    metadata = tmp_path / "reports" / "metadata.json"
+    assert run(SimpleNamespace(
+        root=tmp_path, shard=SHARD_MODULE["BUNDLE_OWNER"], delegate_bundle=delegate_bundle,
+        planned_platform_matrix=json.dumps(_bundle_platform_matrix()) if delegate_bundle else None,
+        junit=metadata.with_name("junit.xml"), summary=metadata.with_name("summary.txt"),
+        metadata=metadata, workers=2, pytest_args=[],
+    )) == 0
+    expected = ("tests/test_other.py",) if delegate_bundle else files
+    assert selections == [expected, expected]
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert payload["test_files"] == list(expected)
+    assert bool(payload.get("delegated_case_files")) == delegate_bundle
+
+
 def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     baseline, assignments, guardrails, overrides = assignment_governance()
     report = assignment_governance_summary(Path.cwd())
 
     expected_moved_paths = {
+        "tests/test_gateway/test_rpc_sessions.py",
+        "tests/test_recovery/test_session_merge.py",
+        "tests/test_engine/test_placeholder_escalation_and_wrapup.py",
         "tests/test_gateway/test_goal_rpc.py",
-        "tests/test_gateway/test_rpc_meta_runs.py",
         "tests/test_gateway/test_rpc_router_decisions.py",
         "tests/test_live_long_task_case_driver.py",
         "tests/test_live_multi_provider_matrix.py",
         "tests/test_observability/test_bundle.py",
         "tests/test_persistence/test_router_decision_writer.py",
         "tests/test_sandbox/test_windows_default_capability.py",
-        "tests/test_skills/test_meta_resume.py",
     }
     moved_paths = {
         path for path, shard in assignments.items() if baseline[path] != shard
@@ -956,7 +1419,7 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
     assert {str(override["path"]) for override in overrides} == expected_moved_paths
-    assert sum(override.get("affinity_exception") is True for override in overrides) == 5
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
@@ -1136,17 +1599,15 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     # These reviewed files need no shard-specific setup. Releasing them keeps
     # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
+        "tests/test_gateway/test_rpc_sessions.py": "core",
+        "tests/test_recovery/test_session_merge.py": "core",
         "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
-        "tests/test_gateway/test_rpc_meta_runs.py": "desktop-installer-contracts",
         "tests/test_gateway/test_rpc_router_decisions.py": (
             "desktop-installer-contracts"
         ),
         "tests/test_observability/test_bundle.py": "desktop-installer-contracts",
-        "tests/test_persistence/test_meta_run_writer.py": (
-            "desktop-installer-contracts"
-        ),
         "tests/test_persistence/test_router_decision_writer.py": "core",
     }
     assert shard_for_test("tests/test_recovery/test_atomic_and_locking.py") == (
@@ -1226,10 +1687,11 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert metadata_payload["execution"] == {
         "parallel": {
             "dist": "loadfile",
-            "marker": "not ci_serial",
+            "item_parallel_files": [],
+            "marker": "(not stress) and (not ci_serial)",
             "workers": 4,
         },
-        "serial": {"marker": "ci_serial", "workers": 1},
+        "serial": {"marker": "(not stress) and (ci_serial)", "workers": 1},
     }
     assert len(metadata_payload["assignment_sha256"]) == 64
     text = summary.read_text(encoding="utf-8")
@@ -1238,6 +1700,98 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     assert "serial_pytest_exit_code=5" in text
     assert "junit_status=failed" in text
     assert "synthetic shard failure" in text
+
+
+@pytest.mark.parametrize("fail_case", [False, True])
+def test_audited_bundle_cases_overlap_without_splitting_other_files(
+    tmp_path: Path, fail_case: bool,
+) -> None:
+    """Exercise the real runner, worker scheduling, serial phase and failure gate."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\nmarkers = ["ci_serial: serial CI contract"]\n',
+        encoding="utf-8",
+    )
+    audited_path = "tests/test_observability/test_bundle.py"
+    ordinary_path = next(
+        path for path, owner in partition_assignments().items()
+        if owner == "desktop-installer-contracts-1" and path != audited_path
+    )
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    common = (
+        "import json, os, time\n"
+        "from pathlib import Path\n"
+        "import pytest\n"
+        "EVIDENCE = Path(os.environ['EVIDENCE_DIR'])\n"
+        "WORKER = os.environ.get('PYTEST_XDIST_WORKER')\n"
+    )
+    bundle = tmp_path / audited_path
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text(
+        common
+        + "@pytest.mark.parametrize('case', range(6))\n"
+        "def test_parallel(case):\n"
+        "    assert WORKER is not None\n"
+        "    (EVIDENCE / f'bundle-{case}.json').write_text(json.dumps(WORKER))\n"
+        "    (EVIDENCE / f'worker-{WORKER}.ready').write_text('ready')\n"
+        "    deadline = time.monotonic() + 20\n"
+        "    while len(list(EVIDENCE.glob('worker-*.ready'))) < 2:\n"
+        "        assert time.monotonic() < deadline, 'audited cases did not overlap'\n"
+        "        time.sleep(0.01)\n"
+        "    assert not (case == 3 and os.environ['FAIL_CASE'] == '1'), 'synthetic failure'\n"
+        "@pytest.mark.ci_serial\n"
+        "def test_serial():\n"
+        "    assert WORKER is None\n"
+        "    assert len(list(EVIDENCE.glob('bundle-*.json'))) == 6\n"
+        "    (EVIDENCE / 'serial.txt').write_text('completed')\n",
+        encoding="utf-8",
+    )
+    ordinary = tmp_path / ordinary_path
+    ordinary.parent.mkdir(parents=True, exist_ok=True)
+    ordinary.write_text(
+        common
+        + "@pytest.mark.parametrize('case', range(3))\n"
+        "def test_keeps_file_group(case):\n"
+        "    assert WORKER is not None\n"
+        "    (EVIDENCE / f'ordinary-{case}.json').write_text(json.dumps(WORKER))\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    for key in (
+        "PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID",
+        "OPENSQUILLA_PYTEST_XDIST_SCOPE", "OPENSQUILLA_TEST_CORE_WHEEL",
+        "OPENSQUILLA_TEST_CORE_WHEEL_SHA256",
+    ):
+        env.pop(key, None)
+    env.update(EVIDENCE_DIR=str(evidence), FAIL_CASE=str(int(fail_case)))
+    reports = tmp_path / "reports"
+    result = subprocess.run(
+        [
+            sys.executable, str(SHARD_SCRIPT.resolve()), "run",
+            "desktop-installer-contracts-1", "--root", str(tmp_path),
+            "--junit", str(reports / "junit.xml"),
+            "--summary", str(reports / "summary.txt"),
+            "--metadata", str(reports / "metadata.json"),
+            "--workers", "2", "--", "-q", "-o", "addopts=",
+        ],
+        env=env, text=True, capture_output=True, check=False, timeout=90,
+    )
+    assert result.returncode == int(fail_case), result.stdout + result.stderr
+    bundle_workers = [json.loads(path.read_text()) for path in evidence.glob("bundle-*.json")]
+    assert len(bundle_workers) == 6
+    assert len(set(bundle_workers)) == 2
+    ordinary_workers = [json.loads(path.read_text()) for path in evidence.glob("ordinary-*.json")]
+    assert len(ordinary_workers) == 3
+    assert len(set(ordinary_workers)) == 1
+    assert (evidence / "serial.txt").read_text() == "completed"
+    cases = list(ET.parse(reports / "junit.xml").getroot().iter("testcase"))
+    assert len(cases) == 10
+    assert sum(case.find("failure") is not None for case in cases) == int(fail_case)
+    metadata = json.loads((reports / "metadata.json").read_text())
+    assert metadata["execution"]["parallel"]["item_parallel_files"] == [audited_path]
+    summary = (reports / "summary.txt").read_text()
+    assert f"parallel_pytest_exit_code={int(fail_case)}" in summary
+    assert "serial_pytest_exit_code=0" in summary
 
 
 def test_windows_shard_runner_uses_argfile_for_large_file_selection() -> None:
@@ -1527,30 +2081,49 @@ def test_windows_shard_runner_splits_parallel_and_serial_tests(tmp_path: Path) -
     assert metadata_payload["execution"]["parallel"]["workers"] == 2
 
 
+@pytest.mark.parametrize(("selected_shard", "marker_args", "expected_cases"), [
+    ("core-1", [], {"test_parallel", "test_serial"}),
+    ("gateway-sqlite-3", ["-m", ""], {
+        "test_parallel", "test_serial", "test_stress_parallel", "test_stress_serial",
+    }),
+    ("gateway-sqlite-4", ["-m", "stress"], {"test_stress_parallel", "test_stress_serial"}),
+])
 def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
-    tmp_path: Path,
+    tmp_path: Path, selected_shard: str, marker_args: list[str], expected_cases: set[str],
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
-        '[tool.pytest.ini_options]\nmarkers = ["ci_serial: serial CI contract"]\n',
+        '[tool.pytest.ini_options]\naddopts = "-m \'not stress\'"\n'
+        'markers = ["ci_serial: serial CI contract", "stress: capacity contract"]\n',
         encoding="utf-8",
     )
-    test_dir = tmp_path / "tests"
-    test_dir.mkdir()
-    selected_path = "tests/test_partition_probe.py"
-    selected_shard = windows_shard_for_test(selected_path)
+    family = shard_family(selected_shard)
+    prefix = "tests/test_gateway" if family == "gateway-sqlite" else "tests"
+    (tmp_path / prefix).mkdir(parents=True)
+    selected_path = next(
+        f"{prefix}/test_partition_probe_{index}.py"
+        for index in range(100)
+        if windows_shard_for_test(f"{prefix}/test_partition_probe_{index}.py") == selected_shard
+    )
     (tmp_path / selected_path).write_text(
         "import os\nimport pytest\n\n"
         "def test_parallel():\n"
         "    assert os.environ.get('PYTEST_XDIST_WORKER', '').startswith('gw')\n\n"
         "@pytest.mark.ci_serial\n"
         "def test_serial():\n"
+        "    assert 'PYTEST_XDIST_WORKER' not in os.environ\n\n"
+        "@pytest.mark.stress\n"
+        "def test_stress_parallel():\n"
+        "    assert os.environ.get('PYTEST_XDIST_WORKER', '').startswith('gw')\n\n"
+        "@pytest.mark.stress\n"
+        "@pytest.mark.ci_serial\n"
+        "def test_stress_serial():\n"
         "    assert 'PYTEST_XDIST_WORKER' not in os.environ\n",
         encoding="utf-8-sig",
     )
     unselected_path = next(
-        f"tests/test_partition_other_{index}.py"
+        f"{prefix}/test_partition_other_{index}.py"
         for index in range(100)
-        if windows_shard_for_test(f"tests/test_partition_other_{index}.py") != selected_shard
+        if windows_shard_for_test(f"{prefix}/test_partition_other_{index}.py") != selected_shard
     )
     (tmp_path / unselected_path).write_text(
         "def test_must_not_execute():\n    assert False, 'another physical partition'\n",
@@ -1571,6 +2144,8 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
             str(SHARD_SCRIPT.resolve()),
             "run",
             selected_shard,
+            "--platform",
+            "windows",
             "--root",
             str(tmp_path),
             "--junit",
@@ -1583,6 +2158,7 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
             "1",
             "--",
             "-q",
+            *marker_args,
         ],
         check=False,
         capture_output=True,
@@ -1593,12 +2169,13 @@ def test_windows_physical_runner_selects_partition_and_preserves_both_phases(
     metadata = json.loads((reports / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["test_files"] == [selected_path]
     assert metadata["partition_sha256"] == partition_snapshot_fingerprint()
-    assert metadata["family"] == "core"
+    assert metadata["family"] == family
+    base_marker = marker_args[1] if marker_args else "not stress"
+    for phase, selector in (("parallel", "not ci_serial"), ("serial", "ci_serial")):
+        expected_marker = f"({base_marker}) and ({selector})" if base_marker else selector
+        assert metadata["execution"][phase]["marker"] == expected_marker
     junit = ET.parse(reports / "junit.xml").getroot()
-    assert {test.get("name") for test in junit.iter("testcase")} == {
-        "test_parallel",
-        "test_serial",
-    }
+    assert {test.get("name") for test in junit.iter("testcase")} == expected_cases
     assert (reports / "junit.parallel.xml").is_file()
     assert (reports / "junit.serial.xml").is_file()
 

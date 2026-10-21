@@ -16,7 +16,13 @@ from opensquilla.execution_status import derive_is_error
 
 from .candidate_artifact import CandidateArtifactBuilder, CandidateArtifactLimitError
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
-from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+    structured_provider_error_code,
+)
 from .model_catalog import shared_catalog
 from .registry import AuthHeaderStyle
 from .request_proof import (
@@ -97,7 +103,7 @@ def _build_tool_payload(tool: ToolDefinition) -> dict[str, Any]:
     return {
         "name": tool.name,
         "description": tool.description,
-        "input_schema": tool.input_schema.model_dump(exclude_none=True),
+        "input_schema": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
     }
 
 
@@ -699,6 +705,8 @@ class AnthropicProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            http_status=safe_http_status(response.status_code),
+                            provider_code=structured_provider_error_code(response.text),
                             retry_after_s=retry_after_from_headers(
                                 response.status_code,
                                 getattr(response, "headers", None),

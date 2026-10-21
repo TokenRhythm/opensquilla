@@ -1,5 +1,11 @@
 import { expect, test } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-live-clock-a'
@@ -98,20 +104,18 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
           return
         }
         if (method === 'sessions.messages.subscribe') {
-          ws.send(response(frame.id, {
-            subscribed: true,
+          ws.send(response(frame.id, sessionMessagesSubscribePayload(key, {
             hydration_complete: false,
             replay_complete: true,
             stream_generation: STREAM_GENERATION,
             current_stream_seq: key === SESSION_A && taskRunning ? 2 : 0,
             run_status: 'idle',
-          }))
+          })))
           return
         }
         if (method === 'sessions.messages.snapshot') {
           const live = key === SESSION_A && taskRunning
-          ws.send(response(frame.id, {
-            key,
+          ws.send(response(frame.id, sessionMessagesSnapshotPayload(key, {
             task_id: live ? TASK_ID : null,
             stream_generation: STREAM_GENERATION,
             current_stream_seq: live ? 2 : 0,
@@ -133,13 +137,12 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
                   },
                 }]
               : [],
-          }))
+          })))
           return
         }
         if (method === 'sessions.messages.hydrate') {
           const live = key === SESSION_A && taskRunning
-          ws.send(response(frame.id, {
-            key,
+          ws.send(response(frame.id, sessionMessagesHydratePayload(key, {
             hydration_complete: true,
             run_status: live ? 'running' : 'idle',
             active_task: live
@@ -154,13 +157,12 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
               ? [{ task_id: TASK_ID, status: 'running', started_at: TASK_STARTED_AT }]
               : [],
             active_task_group_ids: [],
-          }))
+          })))
           return
         }
         if (method === 'chat.history') {
           const live = key === SESSION_A && taskRunning
-          ws.send(response(frame.id, {
-            messages: live
+          ws.send(response(frame.id, chatHistoryPayload(live
               ? [{
                   role: 'user',
                   text: 'Keep working while I switch sessions.',
@@ -168,10 +170,7 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
                   message_id: 'user-e2e-live-clock',
                   timestamp: Math.floor(TASK_STARTED_AT / 1_000),
                 }]
-              : [],
-            has_more: false,
-            canonical_complete: true,
-          }))
+              : [])))
           return
         }
         const payloads: Record<string, unknown> = {
@@ -227,7 +226,7 @@ test('keeps one task clock across A to B to A without sending again', async ({ p
   })
 
   await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
   await expect(page.locator('.chat-textarea')).toBeVisible()
 
   await page.locator('.chat-textarea').fill('Keep working while I switch sessions.')

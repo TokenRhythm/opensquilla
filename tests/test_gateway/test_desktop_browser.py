@@ -115,6 +115,7 @@ def _browser_dispatch(context):
 
 @pytest.mark.parametrize("mode", ["default", "plan"])
 @pytest.mark.parametrize("operation,arguments", [
+    ("open", {}),
     ("open", {"url": "https://example.invalid/research"}),
     ("act", {"targetRef": "target-one", "action": "click", "ref": "node-one"}),
     ("reload", {"targetRef": "target-one"}),
@@ -204,6 +205,7 @@ def test_invalid_screenshot_is_not_forwarded(result):
 @pytest.mark.parametrize(
     ("status", "native_code", "public_code"),
     [
+        (400, "INVALID_REQUEST", "BROWSER_REQUEST_INVALID"),
         (404, "TARGET_NOT_FOUND", "BROWSER_TARGET_NOT_FOUND"),
         (504, "TIMEOUT", "BROWSER_TIMEOUT"),
         (409, "PAGE_CHANGED", "BROWSER_PAGE_CHANGED"),

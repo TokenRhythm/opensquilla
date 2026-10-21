@@ -13,6 +13,31 @@ afterEach(() => {
 })
 
 describe('ChatMessageList history anchors', () => {
+  it('keeps simultaneous session anchors unique while preserving scoped message keys', () => {
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(defineComponent({ setup: () => () => h('div', ['parent', 'child'].map(session =>
+      h(ChatMessageList, {
+        sessionKey: `agent:main:webchat:${session}`,
+        messages: [{ id: 'same-row', messageId: 'same-message', role: 'user', displayRole: 'user',
+          roleLabel: 'user', text: session, timeStr: '', showHeader: false }],
+        shareMode: false, selectedMessageIds: new Set<string>(), stripTimePrefix: value => value,
+        renderMarkdown: value => value, fmtTok: value => String(value), subagentSummary: value => value,
+        subagentBody: value => value, toolCallGroups: () => [], isToolGroupOpen: () => false,
+        isToolItemOpen: () => false, toolGroupStatusText: () => '', toolStatusText: () => '',
+        toolSecondaryText: () => '', copyMessage: async () => true, downloadAttachment: async () => true,
+      }),
+    )) })).use(i18n)
+    apps.push(app)
+    app.mount(host)
+    const anchors = [...host.querySelectorAll<HTMLElement>('[data-chat-turn-key]')]
+    expect(anchors).toHaveLength(2)
+    expect(new Set(anchors.map(anchor => anchor.id)).size).toBe(2)
+    expect(anchors[0].id).toContain(encodeURIComponent('agent:main:webchat:parent'))
+    expect(anchors[1].id).toContain(encodeURIComponent('agent:main:webchat:child'))
+    expect(anchors.map(anchor => anchor.dataset.chatTurnKey)).toEqual(['same-message', 'same-message'])
+  })
+
   it('adds an applied result only after an authoritative mutation outcome arrives', async () => {
     const userMessage: ChatRenderedMessage = {
       id: 'rendered-user-annotation',
@@ -119,7 +144,7 @@ describe('ChatMessageList history anchors', () => {
     apps.push(app)
 
     const anchor = host.querySelector<HTMLElement>('.msg-user')
-    expect(anchor?.id).toBe('chat-turn-0')
+    expect(anchor?.id).toMatch(/^chat-turn-unbound-.+-0$/)
     expect(anchor?.dataset.chatTurnKey).toBe('message-user-1')
     expect(anchor?.tabIndex).toBe(-1)
   })
@@ -186,7 +211,8 @@ describe('ChatMessageList history anchors', () => {
       durability: 'durable',
       placement: 'transcript',
     })
-    expect(event?.textContent).toBe('Context organizedjust now')
+    expect(event?.textContent).toBe('Context organized')
+    expect(event?.querySelector('time')).toBeNull()
     expect(event?.querySelector('details')).toBeNull()
     const events = host.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
     expect(events[1]?.textContent).toContain(

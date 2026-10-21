@@ -15,8 +15,10 @@
         class="assistant-activity-status__row"
         :class="{
           'assistant-activity-status__row--current': step.isCurrent,
+          'assistant-activity-status__row--routine': isRoutineActivityPhaseStep(step),
+          'assistant-activity-status__row--animating': step.isCurrent && executing && activityVisible && step.providerRecovery?.phase !== 'retry_wait',
           'assistant-activity-status__row--maintenance': step.category === 'maintenance',
-          'assistant-activity-status__row--failed': step.state === 'failed',
+          'assistant-activity-status__row--failed': isFailure(step),
         }"
         :data-testid="step.category === 'maintenance' ? 'compaction-event' : undefined"
         :data-compaction-id="step.id"
@@ -24,94 +26,53 @@
         :data-source="step.source"
         :data-durability="step.durability"
       >
-        <span class="assistant-activity-status__dot" aria-hidden="true" />
-        <span
-          :role="step.category === 'maintenance' ? (step.state === 'failed' ? 'alert' : 'status') : undefined"
-          :aria-live="step.category === 'maintenance' ? (step.state === 'failed' ? 'assertive' : 'polite') : undefined"
+        <CompactionRecoveryMarker v-if="isTemporaryRecovery(step)" />
+        <span v-else-if="!isRoutineActivityPhaseStep(step)" class="assistant-activity-status__dot" aria-hidden="true" />
+        <ActivityMotion
+          class="assistant-activity-status__content"
+          :active="isRoutineActivityPhaseStep(step) && step.isCurrent && executing && activityVisible"
+          :role="step.category === 'maintenance' ? (isFailure(step) ? 'alert' : 'status') : undefined"
+          :aria-live="step.category === 'maintenance' ? (isFailure(step) ? 'assertive' : 'polite') : undefined"
           :aria-atomic="step.category === 'maintenance' ? 'true' : undefined"
         >
-          <span>{{ t(step.label.code, step.label.params) }}</span>
+          <span :aria-hidden="step.providerRecovery?.phase === 'retry_wait' ? 'true' : undefined">{{ statusText(step) }}</span>
+          <span v-if="step.providerRecovery?.phase === 'retry_wait'" class="sr-only">{{ statusText(step, true) }}</span>
+          <span v-if="step.category !== 'maintenance' && step.httpStatus && (step.providerRecovery?.phase === 'retry_wait' || step.state === 'failed')" class="assistant-activity-status__detail">{{ t('chat.httpStatus', { status: step.httpStatus }) }}</span>
           <span
-            v-if="step.durationSeconds !== undefined"
+            v-if="step.category !== 'maintenance' && !isRoutineActivityPhaseStep(step) && step.durationSeconds !== undefined"
             class="assistant-activity-status__duration"
             aria-hidden="true"
           >
             · {{ formatDuration(step.durationSeconds) }}
           </span>
-          <span
-            v-if="step.category === 'maintenance' && step.durability === 'request_scoped'"
-            class="assistant-activity-status__detail"
-          >
-            {{ t('chat.compact.requestScoped') }}
-          </span>
-        </span>
+        </ActivityMotion>
       </li>
     </TransitionGroup>
-    <template v-for="segment in segments" :key="segment.key">
+    <template v-for="segment in renderSegments()" :key="segment.key">
       <ActivityNarration
         v-if="segment.type === 'narration'"
         :item="segment.item"
       />
-      <details
-        v-else-if="segment.type === 'tools' && segment.items.length > 1"
-        class="assistant-activity-tool-batch"
-      >
-        <summary class="assistant-activity-tool-batch__summary">
-          <Icon
-            :name="segment.items[0]?.group.iconName || 'gear'"
-            :size="14"
-            aria-hidden="true"
-          />
-          <span class="assistant-activity-tool-batch__label">
-            {{ toolBatchSummary(segment.items) }}
-          </span>
-          <Icon
-            class="assistant-activity-tool-batch__chevron"
-            name="chevronRight"
-            :size="13"
-            aria-hidden="true"
-          />
-        </summary>
-        <div class="assistant-activity-tool-batch__body">
-          <ToolCallTimeline
-            :items="segment.items"
-            :variant="variant"
-            presentation="activity"
-            :state-scope="stateScope"
-            :is-tool-group-open="isToolGroupOpen"
-            :is-tool-item-open="isToolItemOpen"
-            :tool-group-status-text="toolGroupStatusText"
-            :tool-status-text="toolStatusText"
-            :tool-secondary-text="toolSecondaryText"
-            :tool-elapsed-text="toolElapsedText"
-            @toggle-group="$emit('toggleGroup', $event)"
-            @toggle-item="$emit('toggleItem', $event)"
-            @show-result="(content, title, context) => $emit('showResult', content, title, context)"
-          >
-            <template #interrupt="{ part }">
-              <slot name="interrupt" :part="part" />
-            </template>
-          </ToolCallTimeline>
-        </div>
-      </details>
       <ToolCallTimeline
         v-else
         :items="segment.items"
+        :executing="executing"
         :variant="variant"
         presentation="activity"
         :state-scope="stateScope"
+        :session-key="sessionKey"
         :is-tool-group-open="isToolGroupOpen"
         :is-tool-item-open="isToolItemOpen"
         :tool-group-status-text="toolGroupStatusText"
         :tool-status-text="toolStatusText"
         :tool-secondary-text="toolSecondaryText"
         :tool-elapsed-text="toolElapsedText"
-        @toggle-group="$emit('toggleGroup', $event)"
-        @toggle-item="$emit('toggleItem', $event)"
+        @toggle-group="(id, open) => $emit('toggleGroup', id, open)"
+        @toggle-item="(id, open) => $emit('toggleItem', id, open)"
         @show-result="(content, title, context) => $emit('showResult', content, title, context)"
       >
-        <template #interrupt="{ part }">
-          <slot name="interrupt" :part="part" />
+        <template #interrupt>
+          <InterruptSlotContent v-if="segment.type === 'interrupt'" :nodes="segment.content" />
         </template>
       </ToolCallTimeline>
     </template>
@@ -119,9 +80,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { Comment, Fragment, Text, computed, isVNode, type VNode } from 'vue'
 import { useI18n } from 'vue-i18n'
-import Icon from '@/components/Icon.vue'
+import { chatErrorPresentation } from '@/utils/chat/chatErrorPresentation'
+import { useProviderRecoveryClock } from '@/composables/chat/useProviderRecoveryClock'
+import ActivityMotion from '@/components/chat/ActivityMotion.vue'
+import CompactionRecoveryMarker from './CompactionRecoveryMarker.vue'
 import ActivityNarration from '@/components/chat/ActivityNarration.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import type {
@@ -132,44 +96,50 @@ import type {
 } from '@/types/chat'
 import {
   type AssistantActivityTimelineProjection,
+  type AssistantActivityStatusStep,
+  providerActivityLabel,
   isBeforeReasoningActivityStatusStep,
   isRoutineActivityPhaseStep,
   isVisibleActivityStatusStep,
 } from '@/utils/chat/assistantActivity'
 import { toolIconName, toolOperationKey } from '@/utils/chat/toolDisplay'
+import { useActivityDisclosureVisibility } from '@/composables/chat/useActivityDisclosureVisibility'
 
 const props = withDefaults(defineProps<{
   projection: AssistantActivityTimelineProjection
   timelineItems?: ChatStreamTimelineItem[]
-  isToolGroupOpen: (groupId: string) => boolean
-  isToolItemOpen: (renderKey: string) => boolean
+  isToolGroupOpen: (groupId: string) => boolean | undefined
+  isToolItemOpen: (renderKey: string) => boolean | undefined
   toolGroupStatusText: (group: ChatToolCallGroup) => string
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   toolElapsedText?: (call: ChatToolCallRenderItem) => string
   variant?: 'checklist'
   stateScope?: string
+  sessionKey?: string
   statusPosition?: 'all' | 'before-reasoning' | 'after-reasoning'
   showItems?: boolean
-  preserveItemGroups?: boolean
+  executing?: boolean
 }>(), {
   statusPosition: 'all',
   showItems: true,
+  executing: false,
 })
 
 defineEmits<{
-  toggleGroup: [groupId: string]
-  toggleItem: [renderKey: string]
+  toggleGroup: [groupId: string, open: boolean]
+  toggleItem: [renderKey: string, open: boolean]
   showResult: [content: string, title: string, context?: ToolResultContext]
 }>()
 
-defineSlots<{
+const slots = defineSlots<{
   interrupt?: (props: {
     part: Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>
-  }) => unknown
+  }) => VNode[]
 }>()
 
 const { t } = useI18n()
+const activityVisible = useActivityDisclosureVisibility()
 const statusSteps = computed(() => {
   const isLive = props.projection.lifecycle === 'working'
     || props.projection.lifecycle === 'answering'
@@ -182,13 +152,27 @@ const statusSteps = computed(() => {
       : meaningfulSteps
   if (!isLive) return positionedSteps
 
-  // During a live turn, routine phase narration is a single changing row.
-  // Completed model phases return once the terminal record is rendered.
-  return positionedSteps
-    .filter(step => !isRoutineActivityPhaseStep(step) || step.isCurrent)
-    .slice(-3)
+  // The shared visibility predicate keeps only the current routine phase.
+  // Terminal history retains actual content and exceptional transitions.
+  return positionedSteps.slice(-3)
 })
 
+const now = useProviderRecoveryClock(() => activityVisible.value && statusSteps.value.some(step => step.isCurrent && step.providerRecovery?.phase === 'retry_wait'))
+function isFailure(step: AssistantActivityStatusStep): boolean {
+  return step.state === 'failed' && (step.category !== 'maintenance' || step.source === 'manual')
+}
+function isTemporaryRecovery(step: AssistantActivityStatusStep): boolean {
+  return step.category === 'maintenance' && step.state === 'completed' && step.durability === 'request_scoped'
+}
+function statusText(step: AssistantActivityStatusStep, announce = false): string {
+  if (isTemporaryRecovery(step)) return String(t('chat.compact.compacted'))
+  if (step.category === 'maintenance' && step.state === 'failed' && !isFailure(step)) return String(t('chat.compact.incomplete'))
+  if (step.state === 'failed' && step.failureKind) return `${t(step.label.code, step.label.params)} · ${t(chatErrorPresentation({ failureKind: step.failureKind }).messageKey)}`
+  const descriptor = providerActivityLabel(step, now.value, announce)
+  const recovery = String(t(descriptor.code, descriptor.params))
+  return step.category === 'maintenance' && step.isCurrent && step.providerRecovery
+    ? `${t(step.label.code, step.label.params)} · ${recovery}` : recovery
+}
 function formatDuration(seconds: number): string {
   const whole = Math.max(0, Math.floor(seconds))
   if (whole < 60) return String(t('chat.activityDurationSeconds', { seconds: whole }))
@@ -228,29 +212,12 @@ function clusterItem(
 const items = computed<ChatStreamTimelineItem[]>(() => {
   if (props.showItems === false) return []
   if (props.timelineItems?.length) {
-    if (props.preserveItemGroups) return props.timelineItems
-    const clusterByCall = new Map(
-      props.projection.activityClusters.flatMap(cluster =>
-        cluster.calls.map(call => [call.renderKey, cluster] as const),
-      ),
-    )
-    const emitted = new Set<string>()
-    const result: ChatStreamTimelineItem[] = []
-
-    for (const item of props.timelineItems) {
-      if (item.type === 'text' || item.type === 'interrupt') {
-        result.push(item)
-        continue
-      }
-      for (const call of item.group.calls) {
-        const cluster = clusterByCall.get(call.renderKey)
-        if (!cluster || emitted.has(cluster.key)) continue
-        const projected = clusterItem(cluster)
-        if (projected) result.push(projected)
-        emitted.add(cluster.key)
-      }
-    }
-    return result
+    // The original items own call order, narration boundaries and aggregate
+    // failure evidence. RunTrace flattens their calls for presentation.
+    // Whitespace-only stream segments can have raw text but no rendered HTML.
+    // Keep them in the canonical stream, but do not let an empty narration
+    // claim both adjacent paragraph gaps in the activity presentation.
+    return props.timelineItems.filter(item => item.type !== 'text' || !!item.html.trim())
   }
 
   return props.projection.activityClusters.flatMap(cluster => clusterItem(cluster) ?? [])
@@ -272,6 +239,7 @@ type ActivitySegment =
       type: 'interrupt'
       key: string
       items: Array<Extract<ChatStreamTimelineItem, { type: 'interrupt' }>>
+      content?: VNode[]
     }
 
 const segments = computed<ActivitySegment[]>(() => {
@@ -295,27 +263,60 @@ const segments = computed<ActivitySegment[]>(() => {
   return result
 })
 
-function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
-  const groups = batchItems.filter(
-    (item): item is ToolTimelineItem => item.type === 'tool-group',
-  )
-  const labels = groups.map(item =>
-    [item.group.label, item.group.secondary].filter(Boolean).join(' · '),
-  )
-  const visible = labels.slice(0, 3)
-  if (labels.length > visible.length) {
-    const remainingCount = groups
-      .slice(visible.length)
-      .reduce((total, item) => total + item.group.calls.length, 0)
-    visible.push(String(t('chat.activity.more', { count: remainingCount })))
-  }
-  return visible.join(' · ')
+function hasSlotContent(nodes: unknown[]): boolean {
+  return nodes.some(node => {
+    if (typeof node === 'string' || typeof node === 'number') return !!String(node).trim()
+    if (Array.isArray(node)) return hasSlotContent(node)
+    if (!isVNode(node) || node.type === Comment) return false
+    if (node.type === Text) return typeof node.children === 'string' && !!node.children.trim()
+    if (node.type === Fragment) {
+      return Array.isArray(node.children) && hasSlotContent(node.children)
+    }
+    return true
+  })
 }
+
+/* Evaluate each interrupt slot once, during render. Empty history slots must
+   not introduce invisible tool batches between two visible reading blocks. */
+function renderSegments(): ActivitySegment[] {
+  return segments.value.flatMap<ActivitySegment>(segment => {
+    if (segment.type !== 'interrupt') return [segment]
+    const content = slots.interrupt?.({ part: segment.items[0]!.part }) ?? []
+    return hasSlotContent(content) ? [{ ...segment, content }] : []
+  })
+}
+
+function InterruptSlotContent({ nodes }: { nodes?: VNode[] }) {
+  return nodes
+}
+
 </script>
 
 <style scoped>
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 .assistant-activity-timeline {
+  display: flow-root;
   min-width: 0;
+}
+
+.assistant-activity-timeline :deep(.tool-timeline--checklist) {
+  gap: 0;
+}
+
+/* Keep tool rows dense; only narrative boundaries receive reading space. */
+.assistant-activity-timeline > .activity-narration + .activity-narration {
+  margin-top: 1rem;
+}
+
+/* Both trace wrappers use display:contents; put spacing on the first real
+   row box, and do not give an empty interrupt slot a visible gap. */
+.assistant-activity-timeline > .activity-narration + :deep(.tool-timeline > .tool-row-group > :first-child:not(:empty)) {
+  margin-top: 1rem;
+}
+
+.assistant-activity-timeline > .tool-timeline + .activity-narration,
+.assistant-activity-timeline > .assistant-activity-status + .activity-narration {
+  margin-top: 1rem;
 }
 
 .assistant-activity-status {
@@ -329,9 +330,9 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
 .assistant-activity-status__row {
   display: flex;
   align-items: center;
-  min-height: 1.75rem;
+  min-height: 2rem;
   gap: 0.625rem;
-  padding: 0.25rem 0.125rem;
+  padding: 0.375rem 0.125rem;
   color: color-mix(in srgb, var(--text) 62%, transparent);
   font-size: 0.8125rem;
   line-height: 1.45;
@@ -339,6 +340,27 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
 
 .assistant-activity-status__row--current {
   color: color-mix(in srgb, var(--text) 82%, transparent);
+}
+
+/* Routine progress shares thinking's text motion and reading origin.
+   The disclosure header owns elapsed time; no second ticking label or dot. */
+.assistant-activity-status__row--routine {
+  padding-inline: 0;
+  color: var(--text-dim);
+}
+
+.assistant-activity-status__row--routine .assistant-activity-status__content {
+  flex: 0 1 auto;
+}
+
+.assistant-activity-status__row--routine.activity-step-enter-from {
+  opacity: 1;
+  transform: none;
+}
+
+.assistant-activity-status__content {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .activity-step-enter-from {
@@ -380,7 +402,7 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
   background: transparent;
 }
 
-.assistant-activity-status__row--maintenance.assistant-activity-status__row--current
+.assistant-activity-status__row--maintenance.assistant-activity-status__row--animating
   .assistant-activity-status__dot {
   border-color: var(--accent);
   border-right-color: transparent;
@@ -402,71 +424,13 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
   to { transform: rotate(360deg); }
 }
 
-.assistant-activity-tool-batch {
-  min-width: 0;
-}
-
-.assistant-activity-tool-batch__summary {
-  display: flex;
-  align-items: center;
-  min-height: 1.75rem;
-  gap: 0.625rem;
-  padding: 0.25rem 0.125rem;
-  color: color-mix(in srgb, var(--text) 76%, transparent);
-  cursor: pointer;
-  list-style: none;
-}
-
-.assistant-activity-tool-batch__summary::-webkit-details-marker {
-  display: none;
-}
-
-.assistant-activity-tool-batch__summary:hover {
-  color: var(--text);
-}
-
-.assistant-activity-tool-batch__summary:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.assistant-activity-tool-batch__label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 0.8125rem;
-}
-
-.assistant-activity-tool-batch__chevron {
-  flex: 0 0 auto;
-  margin-left: auto;
-  opacity: 0.5;
-  transition: transform var(--dur-fast) var(--ease-standard);
-}
-
-.assistant-activity-tool-batch[open]
-  > .assistant-activity-tool-batch__summary
-  .assistant-activity-tool-batch__chevron {
-  transform: rotate(90deg);
-}
-
-.assistant-activity-tool-batch__body {
-  min-width: 0;
-  padding-left: 1.5rem;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .activity-step-enter-active,
   .activity-step-move {
     transition: none;
   }
 
-  .assistant-activity-tool-batch__chevron {
-    transition: none;
-  }
-
-  .assistant-activity-status__row--maintenance.assistant-activity-status__row--current
+  .assistant-activity-status__row--maintenance.assistant-activity-status__row--animating
     .assistant-activity-status__dot {
     animation: none;
   }

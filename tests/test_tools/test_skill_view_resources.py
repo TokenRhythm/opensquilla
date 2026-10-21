@@ -27,6 +27,7 @@ from opensquilla.skills.hub.source import SkillMeta
 from opensquilla.skills.injector import SkillInjector
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.skills.resources import SkillResources
+from opensquilla.tools.browser_policy import BROWSER_MCP_REQUIRED_TOOLS
 from opensquilla.tools.builtin import skill_tools as skill_tools_module
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import ToolContext, ToolError, current_tool_context
@@ -349,6 +350,68 @@ async def test_skill_list_reports_missing_env_any_groups(
     result = await _skill_list()
 
     assert "OPENROUTER_API_KEY or ARK_API_KEY (env var group)" in result
+
+
+@pytest.mark.asyncio
+async def test_browser_skill_direct_tools_respect_required_tool_surface(tmp_path: Path) -> None:
+    bundled = Path(__file__).resolve().parents[2] / "src/opensquilla/skills/bundled"
+    loader = SkillLoader(
+        bundled_dir=bundled,
+        workspace_dir=tmp_path / "workspace",
+        managed_dir=tmp_path / "managed",
+        personal_agents_dir=tmp_path / "personal",
+        project_agents_dir=tmp_path / "project",
+        snapshot_path=tmp_path / "skills.snapshot.json",
+    )
+    previous_loader = skill_tools_module._loader
+    try:
+        skill_tools_module.create_skill_tools(loader)
+        snapshot = loader.snapshot_for_turn("browser-required-tools")
+        browser = snapshot.get_by_name("browser-use")
+        assert browser is not None
+        required = set(browser.requires_tools)
+        assert required == {
+            f"mcp__desktop-browser__{name}" for name in BROWSER_MCP_REQUIRED_TOOLS
+        }
+        tool_names = required | {"skill_list", "skill_view"}
+
+        token = current_tool_context.set(ToolContext(
+            skill_catalog=snapshot,
+            authorized_tool_names=frozenset(tool_names),
+        ))
+        try:
+            assert "  - browser-use:" in await _skill_list()
+            assert "# Browser Use" in await _skill_view("browser-use")
+        finally:
+            current_tool_context.reset(token)
+
+        missing = "mcp__desktop-browser__browser_open"
+        token = current_tool_context.set(ToolContext(
+            skill_catalog=snapshot,
+            authorized_tool_names=frozenset(tool_names - {missing}),
+        ))
+        try:
+            listed = await _skill_list()
+            viewed = await _skill_view("browser-use")
+            assert "  - browser-use:" in listed
+            assert f"[unavailable] Required tools unavailable in this turn: {missing}" in listed
+            assert "Skill unavailable: browser-use." in viewed
+            assert f"Required tools unavailable in this turn: {missing}" in viewed
+            assert "# Browser Use" not in viewed
+        finally:
+            current_tool_context.reset(token)
+
+        token = current_tool_context.set(ToolContext(
+            skill_catalog=snapshot,
+            authorized_tool_names=frozenset(),
+        ))
+        try:
+            assert "[unavailable] Required tools unavailable" in await _skill_list()
+            assert "Skill unavailable: browser-use." in await _skill_view("browser-use")
+        finally:
+            current_tool_context.reset(token)
+    finally:
+        skill_tools_module._loader = previous_loader
 
 
 @pytest.mark.asyncio

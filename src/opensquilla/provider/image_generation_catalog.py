@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from opensquilla.provider.image_generation_policy import (
+    DEFAULT_IMAGE_GENERATION_PRIMARY,
     IMAGE_GENERATION_OFFICIAL_BASE_URLS,
 )
 
@@ -30,8 +31,8 @@ _IMAGE_GENERATION_PROVIDER_CATALOG = (
         label="OpenAI Images",
         env_key="OPENAI_API_KEY",
         default_base_url=IMAGE_GENERATION_OFFICIAL_BASE_URLS["openai"],
-        default_model="openai/gpt-image-1",
-        suggested_models=("openai/gpt-image-1",),
+        default_model=DEFAULT_IMAGE_GENERATION_PRIMARY,
+        suggested_models=(DEFAULT_IMAGE_GENERATION_PRIMARY,),
     ),
     ImageGenerationProviderCatalogEntry(
         provider_id="openrouter",

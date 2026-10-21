@@ -225,6 +225,42 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
 
 
 @pytest.mark.asyncio
+async def test_chat_history_v4_bounds_large_legacy_body_and_emits_content_ref() -> None:
+    body = "x" * (26 * 1024 * 1024 + 17)
+    entry = TranscriptEntry(
+        id=404,
+        session_id="large-session",
+        session_key="agent:main:webchat:large-history",
+        role="assistant",
+        content=body,
+        created_at=404,
+        message_id="large-message",
+    )
+    manager = _FakePagedSessionManager(
+        [entry],
+        page={
+            "entries": [entry],
+            "has_more": False,
+            "canonical_complete": True,
+        },
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": entry.session_key, "limit": 1},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=manager,
+        ),
+    )
+
+    message = result["messages"][0]
+    assert len(message["text"].encode("utf-8")) <= 16 * 1024
+    assert message["contentRef"]["byteLength"] == len(body.encode("utf-8"))
+    assert len(json.dumps(result, ensure_ascii=False).encode("utf-8")) < 1 * 1024 * 1024
+
+
+@pytest.mark.asyncio
 async def test_chat_history_keeps_legacy_null_id_rows_without_an_unusable_cursor() -> None:
     entry = TranscriptEntry(
         id=None,
@@ -1939,10 +1975,10 @@ async def test_chat_history_prefers_bounded_canonical_page_when_available() -> N
     assert result["canonical_complete"] is False
     assert result["compaction_summaries"] == []
     assert mgr.page_calls == [
-        (
-            "agent:main:webchat:test",
-            {"limit": 2, "before": (4, 4), "after": None},
-        )
+            (
+                "agent:main:webchat:test",
+                {"limit": 2, "before": (4, 4), "after": None, "content_mode": "bounded"},
+            )
     ]
     assert mgr.used_canonical is False
 
@@ -2424,8 +2460,9 @@ async def test_chat_history_exposes_subagent_completion_provenance() -> None:
             "provenance_kind": "internal_system",
             "provenance_source_session_key": "agent:main:subagent:abc123",
             "provenance_source_tool": "subagent_completion",
+            "contentPreviewComplete": True,
         }
-    ]
+        ]
 
 
 @pytest.mark.asyncio

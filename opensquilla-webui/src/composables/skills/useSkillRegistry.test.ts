@@ -10,7 +10,6 @@ import {
   useSkillRegistry as useSkillRegistryModel,
 } from './useSkillRegistry'
 import { createSkillMutationGate } from './useSkillMutationGate'
-import { useSkillProposals as useSkillProposalsModel } from './useSkillProposals'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 
 const pushToast = vi.hoisted(() => vi.fn())
@@ -66,19 +65,6 @@ function catalogFromCall(
       ...(request.name ? { name: request.name } : {}),
       ...(request.installId ? { installId: request.installId } : {}),
     }),
-    proposals: async () => ({
-      proposals: (await call('exec.proposals.list')).proposals || [],
-      autoEnabledSkills: (await call('exec.proposals.auto_enabled.list')).skills || [],
-      settings: (await call('exec.proposals.settings.get')).settings || null,
-    }),
-    updateProposalSettings: changes => call('exec.proposals.settings.set', { ...changes }),
-    proposal: proposalId => call('exec.proposals.show', { proposal_id: proposalId }),
-    acceptProposal: (proposalId, options) => call('exec.proposals.accept', {
-      proposal_id: proposalId,
-      ...(options?.force ? { force: true } : {}),
-    }),
-    rejectProposal: proposalId => call('exec.proposals.reject', { proposal_id: proposalId }),
-    disableAutoEnabledSkill: name => call('exec.proposals.auto_enabled.disable', { name }),
   }
 }
 
@@ -93,13 +79,6 @@ function useSkillRegistry(
   ...rest: Parameters<typeof useSkillRegistryModel> extends [unknown, ...infer Tail] ? Tail : never
 ) {
   return useSkillRegistryModel(asCatalog(source), ...rest)
-}
-
-function useSkillProposals(
-  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
-  ...rest: Parameters<typeof useSkillProposalsModel> extends [unknown, ...infer Tail] ? Tail : never
-) {
-  return useSkillProposalsModel(asCatalog(source), ...rest)
 }
 
 afterEach(() => {
@@ -575,6 +554,7 @@ describe('useSkillRegistry install state', () => {
     expect(call.mock.calls.map(([method]) => method)).toEqual(['skills.deps.install'])
     pending.get('skills.deps.install')?.({ success: true })
     await dependency
+    expect(pushToast).not.toHaveBeenCalled()
 
     const uninstall = registry.uninstallSkill('demo')
     expect(gate.owner.value).toBe('uninstall')
@@ -619,37 +599,6 @@ describe('useSkillRegistry install state', () => {
     finishInstall?.({ success: true, installed: true })
     await queue
     expect(gate.owner.value).toBeNull()
-  })
-
-  it('shares proposal mutation ownership with the install queue', async () => {
-    let finishProposal: ((value: { settings: Record<string, unknown> }) => void) | undefined
-    const proposalPending = new Promise<{ settings: Record<string, unknown> }>((resolve) => {
-      finishProposal = resolve
-    })
-    const call = vi.fn(async (method: string) => {
-      if (method === 'exec.proposals.settings.set') return proposalPending
-      if (method === 'skills.install') return { success: true, installed: true }
-      throw new Error(`Unexpected method ${method}`)
-    })
-    const gate = createSkillMutationGate()
-    const proposals = useSkillProposals({ call } as never, vi.fn(async () => {}), gate)
-    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true), gate)
-
-    const proposal = proposals.toggleAutoPropose('enabled', true)
-    expect(gate.owner.value).toBe('proposal')
-    await registry.installSkill('@acme/during-proposal', 'clawhub')
-    expect(call.mock.calls.map(([method]) => method)).toEqual(['exec.proposals.settings.set'])
-
-    finishProposal?.({ settings: { enabled: true } })
-    await proposal
-
-    expect(gate.acquire('install_queue')).toBe(true)
-    await proposals.setAutoEnableRisk('low')
-    expect(call.mock.calls.map(([method]) => method)).toEqual(['exec.proposals.settings.set'])
-    gate.release('install_queue')
-
-    await registry.installSkill('@acme/after-proposal', 'clawhub')
-    expect(call.mock.calls[call.mock.calls.length - 1]?.[0]).toBe('skills.install')
   })
 
   it('keeps terminal results and retries only the selected source item', async () => {
@@ -907,6 +856,72 @@ describe('useSkillRegistry install state', () => {
     expect(registry.registryLoading.value).toBe(false)
   })
 
+  it('joins repeated submissions of the same source and trimmed query', async () => {
+    let finish!: (value: unknown) => void
+    const pending = new Promise(resolve => { finish = resolve })
+    const call = vi.fn().mockReturnValue(pending)
+    const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+    registry.registryQuery.value = ' paper '
+    const first = registry.searchRegistry('clawhub')
+    registry.registryQuery.value = 'paper'
+    const repeated = registry.searchRegistry('clawhub')
+    expect(repeated).toBe(first)
+    expect(call).toHaveBeenCalledTimes(1)
+    expect(call).toHaveBeenCalledWith('skills.search', {
+      query: 'paper', source: 'clawhub', limit: 20,
+    })
+    expect(registry.registryLoading.value).toBe(true)
+    finish({ results: [{ name: 'Current result' }] })
+    await Promise.all([first, repeated])
+    expect(registry.registryResults.value).toEqual([{ name: 'Current result' }])
+    expect(registry.registryLoading.value).toBe(false)
+    await registry.searchRegistry('clawhub')
+    expect(call).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['query', 'source', 'reset'] as const)(
+    'keeps the new in-flight request joinable after an old %s request settles', async change => {
+      let finishFirst!: (value: unknown) => void
+      let finishSecond!: (value: unknown) => void
+      const first = new Promise(resolve => { finishFirst = resolve })
+      const second = new Promise(resolve => { finishSecond = resolve })
+      const call = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second)
+      const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+      registry.registryQuery.value = 'paper'
+      const oldSearch = registry.searchRegistry('clawhub')
+      if (change === 'query') registry.registryQuery.value = 'writing'
+      if (change === 'reset') registry.resetRegistrySearch()
+      const source = change === 'source' ? 'skillhub' : 'clawhub'
+      const newSearch = registry.searchRegistry(source)
+      expect(call).toHaveBeenCalledTimes(2)
+      finishFirst({ results: [{ name: 'Obsolete result' }] })
+      await oldSearch
+      const joined = registry.searchRegistry(source)
+      expect(joined).toBe(newSearch)
+      expect(call).toHaveBeenCalledTimes(2)
+      expect(registry.registryLoading.value).toBe(true)
+      expect(registry.registryResults.value).toEqual([])
+      finishSecond({ results: [{ name: 'Current result' }] })
+      await joined
+      expect(registry.registryResults.value).toEqual([{ name: 'Current result' }])
+    },
+  )
+
+  it('allows the same search to retry after failure', async () => {
+    const call = vi.fn()
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce({ results: [{ name: 'Retry result' }] })
+    const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+    registry.registryQuery.value = 'paper'
+    await registry.searchRegistry('clawhub')
+    expect(registry.registrySearchError.value).toBe('temporary failure')
+    expect(registry.registryLoading.value).toBe(false)
+    await registry.searchRegistry('clawhub')
+    expect(call).toHaveBeenCalledTimes(2)
+    expect(registry.registrySearchError.value).toBe('')
+    expect(registry.registryResults.value).toEqual([{ name: 'Retry result' }])
+  })
+
   it('clears the previous source results and diagnostics while preserving the search query', async () => {
     const call = vi.fn(async () => ({
       results: [{ name: 'ClawHub result', source: 'clawhub' }],
@@ -1036,6 +1051,7 @@ describe('useSkillRegistry install state', () => {
     expect(outcome.missingStill.env_any).toEqual([
       ['OPENROUTER_API_KEY', 'ARK_API_KEY'],
     ])
+    expect(pushToast).toHaveBeenCalledExactlyOnceWith('binary installed', { tone: 'warn' })
   })
 })
 

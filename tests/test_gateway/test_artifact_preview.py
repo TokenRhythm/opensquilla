@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,9 +205,39 @@ def test_selected_working_page_reads_live_source_not_published_snapshot(tmp_path
         assert client.get(payload["launch_url"]).content == b"<h1>Changed editorial</h1>"
         selected.unlink()
         assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
+        assert len(service._leases_by_id) == 1
+    immutable = ArtifactStore(tmp_path).resolve_preview_resource(
+        ref.id, session_id=_SESSION_ID, logical_path="layouts/editorial.html",
+    )
+    assert immutable.path.read_bytes() == b"<h1>Editorial</h1>"
+
+
+def test_selected_working_page_rejects_symlink_source(tmp_path: Path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "site/layouts").mkdir(parents=True)
+    (workspace / "site/index.html").write_text("<h1>Live home</h1>")
+    selected = workspace / "site/layouts/editorial.html"
+    selected.write_text("<h1>Live editorial</h1>")
+    service.register_working_files(
+        session_id=_SESSION_ID, artifact_id=ref.id,
+        binding=WorkingFiles(
+            document_id="doc-site", workspace=str(workspace), relative_root="site",
+            entrypoint="index.html", base_revision_id="revision-initial",
+        ),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 201
+        selected.unlink()
         private = workspace / "private.html"
         private.write_text("<h1>Private page</h1>")
-        selected.symlink_to(private)
+        try:
+            selected.symlink_to(private)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symbolic-link privilege is unavailable")
+            raise
         assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
         assert len(service._leases_by_id) == 1
     immutable = ArtifactStore(tmp_path).resolve_preview_resource(
@@ -347,6 +378,68 @@ def test_working_publication_keeps_existing_preview_lease_current(tmp_path: Path
     assert renewed.status_code == 200
     assert renewed.json()["lease_id"] == payload["lease_id"]
     assert new_payload["workingDocumentId"] == working.document_id
+
+
+@pytest.mark.parametrize("binding_before_create", [True, False])
+def test_snapshot_lease_keeps_html_and_bundle_assets_immutable(
+    tmp_path: Path, binding_before_create: bool,
+) -> None:
+    original = b'<link rel="stylesheet" href="style.css"><h1>Delivered title</h1>'
+    css = b"h1 { color: blue }"
+    ref = ArtifactStore(tmp_path).publish_bundle(
+        ArtifactBundle(entrypoint="index.html", files=(
+            ArtifactBundleSourceFile(path="index.html", mime="text/html", data=original),
+            ArtifactBundleSourceFile(path="style.css", mime="text/css", data=css),
+        )), session_id=_SESSION_ID, session_key=_SESSION_KEY,
+        name="index.html", mime="text/html", source="snapshot-test",
+    )
+    app, service = _app(tmp_path)
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    (workspace / "index.html").write_bytes(original)
+    (workspace / "style.css").write_bytes(css)
+    working = WorkingFiles(
+        document_id="doc-snapshot", workspace=str(workspace.parent), relative_root="workspace",
+        entrypoint="index.html", base_revision_id="revision-initial",
+    )
+    if binding_before_create:
+        service.register_working_files(session_id=_SESSION_ID, artifact_id=ref.id, binding=working)
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        created = client.post(
+            f"/api/v1/artifacts/{ref.id}/preview-leases",
+            headers={**_AUTH_HEADERS, "x-opensquilla-preview-working-document": "1"},
+            json={"version": 1, "mode": "offline", "client": "web", "snapshot": True},
+        )
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert payload["snapshot"] is True
+        assert "workingDocumentId" not in payload
+        assert payload["source"]["kind"] == "bundle"
+        changed = b'<link rel="stylesheet" href="style.css"><h1>Current title</h1>'
+        (workspace / "index.html").write_bytes(changed)
+        (workspace / "style.css").write_bytes(b"h1 { color: red }")
+        # Registration both before and after lease creation must not turn a
+        # historical delivery into a live source preview.
+        service.register_working_files(session_id=_SESSION_ID, artifact_id=ref.id, binding=working)
+        assert client.get(payload["launch_url"]).content == original
+        css_url = payload["launch_url"].rsplit("/", 1)[0] + "/style.css"
+        assert client.get(css_url).content == css
+        current = _create(client, ref.id).json()
+        assert client.get(current["launch_url"]).content == changed
+        current_css_url = current["launch_url"].rsplit("/", 1)[0] + "/style.css"
+        assert client.get(current_css_url).content == b"h1 { color: red }"
+
+
+@pytest.mark.parametrize("snapshot", ["true", 1, None, {}])
+def test_snapshot_lease_rejects_non_boolean_flag(tmp_path: Path, snapshot: object) -> None:
+    ref = _publish_html(tmp_path)
+    app, _ = _app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        result = client.post(
+            f"/api/v1/artifacts/{ref.id}/preview-leases", headers=_AUTH_HEADERS,
+            json={"version": 1, "mode": "offline", "client": "web", "snapshot": snapshot},
+        )
+    assert result.status_code == 400
 
 
 def test_legacy_single_file_with_local_dependencies_is_explicitly_partial(
@@ -668,20 +761,64 @@ def test_create_rejects_cross_origin_before_allocating_lease(tmp_path: Path) -> 
     assert len(service._leases_by_id) == 1
 
 
-def test_lease_limit_is_scoped_per_session(tmp_path: Path) -> None:
-    ref = _publish_html(tmp_path)
-    app, _service = _app(tmp_path)
+@pytest.mark.parametrize("preview_client", ["web", "desktop"])
+def test_many_previews_keep_independent_origins_and_lifecycles(
+    tmp_path: Path, preview_client: str,
+) -> None:
+    contents = [f"<!doctype html><h1>Preview {index}</h1>".encode() for index in range(12)]
+    artifacts = [_publish_html(tmp_path, content) for content in contents]
+    now = [1_700_000_000.0]
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path), clock=lambda: now[0])
+    service.set_listener_port(43123)
+    app, _service = _app(tmp_path, service=service)
 
     with TestClient(
         app,
         base_url="http://127.0.0.1:18791",
         client=("127.0.0.1", 51000),
     ) as client:
-        responses = [_create(client, ref.id) for _ in range(9)]
+        payloads = []
+        for artifact in artifacts:
+            response = _create(
+                client, artifact.id, mode="full", preview_client=preview_client,
+                origin=None if preview_client == "desktop" else "http://127.0.0.1:18791",
+            )
+            assert response.status_code == 201, response.text
+            payloads.append(response.json())
 
-    assert [response.status_code for response in responses[:8]] == [201] * 8
-    assert responses[8].status_code == 429
-    assert responses[8].json()["code"] == "PREVIEW_LEASE_LIMIT"
+        assert len({payload["lease_id"] for payload in payloads}) == len(artifacts)
+        assert len({payload["preview_origin"] for payload in payloads}) == len(artifacts)
+        assert len({urlsplit(payload["launch_url"]).hostname for payload in payloads}) == len(
+            artifacts,
+        )
+
+        resource_app = create_artifact_preview_resource_app(service)
+        with TestClient(resource_app) as resource_client:
+            for payload, content in zip(payloads, contents, strict=True):
+                resource = resource_client.get(payload["launch_url"])
+                assert resource.status_code == 200
+                assert resource.content == content
+
+            now[0] += 1
+            controls = {**_AUTH_HEADERS, "Origin": "http://127.0.0.1:18791"}
+            renewed = client.post(
+                f"/api/v1/artifact-preview-leases/{payloads[-1]['lease_id']}/renew",
+                headers=controls,
+            )
+            assert renewed.status_code == 200
+            assert renewed.json()["lease_id"] == payloads[-1]["lease_id"]
+            assert renewed.json()["expires_at"] != payloads[-1]["expires_at"]
+
+            revoked = client.delete(
+                f"/api/v1/artifact-preview-leases/{payloads[0]['lease_id']}",
+                headers=controls,
+            )
+            assert revoked.status_code == 204
+            assert resource_client.get(payloads[0]["launch_url"]).status_code == 410
+            for payload, content in zip(payloads[1:], contents[1:], strict=True):
+                resource = resource_client.get(payload["launch_url"])
+                assert resource.status_code == 200
+                assert resource.content == content
 
 
 def test_renew_and_delete_require_the_original_session_scope(tmp_path: Path) -> None:

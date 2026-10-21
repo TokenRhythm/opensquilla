@@ -28,6 +28,30 @@ def test_usage_fields_returns_zero_when_usage_missing() -> None:
     assert _usage_fields({}) == (0, 0, 0, 0, 0, 0.0)
 
 
+@pytest.mark.parametrize("amount", [0, "0", "0.000000000"])
+def test_openrouter_explicit_zero_is_confirmed_without_estimation(amount) -> None:
+    usage = _UsageSnapshotAccumulator()
+    usage.update({"prompt_tokens": 10, "completion_tokens": 2, "cost": amount})
+    cost, source, receipt = _billing_result(
+        provider_kind="openrouter", base_url="https://openrouter.ai/api/v1",
+        usage=usage, billing=_ProviderBillingAccumulator(), model="free/model",
+    )
+    assert cost == 0
+    assert source == "provider_billed"
+    assert receipt is not None and receipt.status == "confirmed"
+    assert receipt.amount_nanos == receipt.usd_equivalent_nanos == 0
+
+
+@pytest.mark.parametrize("extra", [{}, {"cost": -1}, {"cost": "invalid"}, {"cost": None}])
+def test_openrouter_missing_or_invalid_cost_does_not_become_confirmed_zero(extra) -> None:
+    usage = _UsageSnapshotAccumulator()
+    usage.update({"prompt_tokens": 10, "completion_tokens": 2, **extra})
+    assert _billing_result(
+        provider_kind="openrouter", base_url="https://openrouter.ai/api/v1",
+        usage=usage, billing=_ProviderBillingAccumulator(), model="test/model",
+    ) == (0.0, "none", None)
+
+
 def test_usage_fields_ignores_malformed_token_details() -> None:
     usage = {
         "prompt_tokens": 100,

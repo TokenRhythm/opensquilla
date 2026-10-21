@@ -24,7 +24,8 @@ export type ChatRpcSubscriptionHandlers = {
 }
 
 export interface ChatRpcSubscriptionOptions {
-  /** Return the currently visible session key for logical event fencing. */
+  /** Return the owned session key. An explicit empty key has no event owner;
+   * omitting the provider retains the legacy Conversation-wide subscription. */
   getSessionKey?: () => string
   /** Shared runtime owner; avoids a second event source for this composition root. */
   runtime: Pick<ConversationSessionRuntime<ConversationEvent, never>, 'events'>
@@ -41,29 +42,43 @@ export function useChatRpcSubscriptions(
   let detachState: (() => void) | null = null
   let detachDecodeError: (() => void) | null = null
   let detachRecovery: (() => void) | null = null
+  let subscribed = false
+  let revision = 0
 
-  function subscribe(): () => void {
-    unsubscribe()
-    // The empty-key handle preserves the existing Conversation-wide reducer
-    // view when no key provider is supplied. ChatView supplies its current
-    // session key, so positively tagged events from another session are fenced
-    // before they reach the reducer.
-    activeKey = String(options.getSessionKey?.() || '')
+  function attachCurrentOwner() {
+    if (!subscribed || (options.getSessionKey && !activeKey)) return
+    const version = revision
+    const key = activeKey
+    const current = () => subscribed && revision === version && activeKey === key
+    // No provider is the deliberate legacy global subscriber. A draft/side
+    // host supplying an empty key must never silently become that subscriber.
     activeHandle = hub.open(activeKey)
     detachEvent = activeHandle.observe(handlers.onEvent)
     if (handlers.onConnectionState) {
-      detachState = hub.observeConnectionState(handlers.onConnectionState)
+      detachState = hub.observeConnectionState(state => { if (current()) handlers.onConnectionState!(state) })
     }
     if (handlers.onDecodeError) {
-      detachDecodeError = hub.observeDecodeError(handlers.onDecodeError)
+      detachDecodeError = hub.observeDecodeError(error => { if (current()) handlers.onDecodeError!(error) })
     }
     if (handlers.onRecoveryRequired) {
-      detachRecovery = hub.observeRecoveryRequired(handlers.onRecoveryRequired)
+      detachRecovery = hub.observeRecoveryRequired(async scope => {
+        if (!current() || (key && !scope.global && !scope.keys.includes(key))) return false
+        const recovered = await handlers.onRecoveryRequired!(scope)
+        return current() && recovered
+      })
     }
+  }
+
+  function subscribe(): () => void {
+    unsubscribe()
+    subscribed = true
+    activeKey = String(options.getSessionKey?.() || '')
+    attachCurrentOwner()
     return unsubscribe
   }
 
-  function unsubscribe() {
+  function detachCurrentOwner() {
+    revision++
     detachEvent?.()
     detachEvent = null
     detachState?.()
@@ -76,15 +91,18 @@ export function useChatRpcSubscriptions(
     activeHandle = null
   }
 
+  function unsubscribe() {
+    subscribed = false
+    detachCurrentOwner()
+  }
+
   /** Switch the logical owner without touching the physical source. */
   function setSessionKey(key: string) {
-    activeKey = String(key || '')
-    if (!activeHandle) return
-    detachEvent?.()
-    detachEvent = null
-    activeHandle.close()
-    activeHandle = hub.open(activeKey)
-    detachEvent = activeHandle.observe(handlers.onEvent)
+    const nextKey = String(key || '')
+    if (nextKey === activeKey) return
+    detachCurrentOwner()
+    activeKey = nextKey
+    attachCurrentOwner()
   }
 
   /** Open an additional logical stream without acquiring another WebSocket. */

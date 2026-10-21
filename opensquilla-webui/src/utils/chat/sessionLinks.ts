@@ -1,12 +1,13 @@
 import type { Platform } from '@/platform/types'
-import { sessionGatewayLink, sessionGatewayUrl } from '@/types/references'
+import { sessionApplicationLink, sessionGatewayUrl } from '@/types/references'
 
-/** Desktop's renderer origin/router are separate from its owned Gateway's Control UI. */
-export async function currentSessionGatewayLink(
+/** One browser-openable session link. Preserve the WebUI's public origin and base;
+ * Desktop's private renderer origin instead needs its owned Gateway's Control UI. */
+export async function currentSessionLink(
   sessionKey: string,
   platform: Pick<Platform, 'capabilities' | 'gateway'>,
 ): Promise<string> {
-  if (!platform.capabilities.isDesktop) return sessionGatewayLink(sessionKey)
+  if (!platform.capabilities.isDesktop) return sessionApplicationLink(sessionKey)
   const connection = await platform.gateway.getConnection?.()
   const endpoint = connection?.httpUrl || connection?.wsUrl
   if (connection?.status !== 'ready' || !endpoint) {
@@ -16,7 +17,9 @@ export async function currentSessionGatewayLink(
   if (!['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) {
     throw new Error('Gateway URL is unavailable')
   }
-  // Desktop configures its Gateway Control UI at /control. Its local
-  // opensquilla-app://desktop renderer instead uses / as the router base.
-  return sessionGatewayUrl(sessionKey, endpoint, '/control')
+  // The private renderer's router base is independent of the Gateway mount.
+  // Keep /control for older shells; an explicitly empty mount means root,
+  // which the URL helper accepts as '/' without consulting the renderer DOM.
+  const basePath = connection.controlUiBasePath ?? '/control'
+  return sessionGatewayUrl(sessionKey, endpoint, basePath === '' ? '/' : basePath)
 }

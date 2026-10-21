@@ -25,6 +25,8 @@ import { useChatPlans } from './useChatPlans'
 import { useChatCompaction } from './useChatCompaction'
 import { useChatStream } from './useChatStream'
 import type { SkillLoadReceipt } from '@/types/skillLoads'
+import type { InterruptViewState } from '@/types/parts'
+import { isVisibleActivityStatusStep, projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 
 function createHarness(options: {
   messages?: ChatMessage[]
@@ -57,6 +59,7 @@ function createHarness(options: {
   const sessionKey = ref('agent:main:test')
   const lastStreamSeq = ref(0)
   const currentEpoch = ref(0)
+  const aborted = ref(false)
   const onTaskSettled = vi.fn()
   const activeTaskGroups = ref(new Set<string>())
   const activeStreamTaskId = ref('')
@@ -65,7 +68,7 @@ function createHarness(options: {
   const streamRuntime = options.withCompactionRuntime ? useChatStream({
     messages,
     lastHeaderRole: ref(''),
-    aborted: ref(false),
+    aborted,
     autoScroll: ref(false),
     runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
     applySessionRunState,
@@ -85,6 +88,7 @@ function createHarness(options: {
     appendDelta: vi.fn(),
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
+    applyToolInputPreview: vi.fn(() => true),
     appendToolDelta: vi.fn(),
     appendToolEnd: vi.fn(),
     appendToolResult: vi.fn(),
@@ -144,7 +148,7 @@ function createHarness(options: {
     taskOwnership: options.taskOwnership,
     onTaskSettled,
     activeStreamTaskId,
-    aborted: ref(false),
+    aborted,
     messages,
     pendingQueue,
     usageAccum: ref({
@@ -218,6 +222,7 @@ function createHarness(options: {
     sessionKey,
     lastStreamSeq,
     currentEpoch,
+    aborted,
     onTaskSettled,
     stream,
     streamRuntime,
@@ -244,6 +249,97 @@ function createHarness(options: {
     stop: () => { detach(); scope.stop(); compaction?.cleanup(); streamRuntime?.cleanup() },
   }
 }
+
+describe.each(['write_file', 'execute_code'] as const)('live %s input preview delivery', toolName => {
+  const path = toolName === 'write_file' ? 'page.html' : ''
+  const draft = (patch: Record<string, unknown> = {}) => ({
+    key: 'agent:main:test', task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 1,
+    preview_id: 'p1', attempt_id: 'a1', tool_use_id: 'write-1', generation_epoch: 0,
+    revision: 1, state: 'generating', tool_name: toolName, path, content: '<html>', truncated: false,
+    ...patch,
+  })
+  it('buffers until task acceptance, then rejects stale identities, duplicate cursor, replay, and cancellation', () => {
+    const h = createHarness()
+    h.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+    try {
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
+      expect(h.stream.applyToolInputPreview).not.toHaveBeenCalled()
+      h.api.bindActiveStreamTask('task-live')
+      expect(h.stream.applyToolInputPreview).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ content: '<html>', toolUseId: 'write-1', toolName }), 1, false)
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
+      for (const invalid of [{ key: 'other' }, { task_id: 'other', turn_id: 'other' }, { epoch: -1 }, { generation_epoch: 1 },
+        { task_id: undefined, turn_id: undefined }, { stream_seq: undefined }]) {
+        h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 99, ...invalid }))
+      }
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 2, revision: 2 }), { replayed: true })
+      expect(h.stream.applyToolInputPreview).toHaveBeenCalledTimes(1)
+      h.aborted.value = true
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 3, revision: 3 }))
+      expect(h.stream.applyToolInputPreview).toHaveBeenCalledTimes(1)
+      expect(h.stream.streamHasVisibleOutput.value).toBe(false)
+    } finally { h.stop() }
+  })
+  it('clears generation drafts and never resurrects an ended task from a late preview', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    h.activeStreamTaskId.value = 'task-live'
+    try {
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft())
+      expect(h.streamRuntime?.toolInputPreviews.value).toHaveLength(1)
+      h.api.handlers.onAnswerGenerationReset({ key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', stream_seq: 2,
+        old_generation_epoch: 0, new_generation_epoch: 1, authoritative_text_snapshot: '', authoritative_reasoning_snapshot: '', preserve_completed_tools: true })
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 99, revision: 2 }))
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 3, preview_id: 'p2', generation_epoch: 1 }))
+      expect(h.streamRuntime?.toolInputPreviews.value).toHaveLength(1)
+      h.api.handlers.onWireEventFixture('session.event.done', { key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', stream_seq: 4, generation_epoch: 1 })
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 5, preview_id: 'late', generation_epoch: 1 }))
+      expect(h.streamRuntime?.toolInputPreviews.value).toEqual([])
+    } finally { h.stop() }
+  })
+  it.each(['discarded', 'committed'] as const)('applies a replayed %s to the matching authoritative snapshot draft', async state => {
+    const h = createHarness({ withCompactionRuntime: true })
+    try {
+      h.api.restoreLiveTurnSnapshot({ sessionKey: h.sessionKey.value, taskId: 'task-live', events: [{
+        semanticKind: 'tool-input-preview', payload: {
+          key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 1, generation_epoch: 0,
+          toolInputPreview: { previewId: 'p1', attemptId: 'a1', toolUseId: 'write-1', generationEpoch: 0,
+            revision: 1, state: 'generating', toolName, path, content: '<html>', truncated: false },
+        },
+      }] })
+      h.streamRuntime!.toggleToolItem('write-1', true)
+      expect(h.streamRuntime!.toolInputPreviews.value).toHaveLength(1)
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 2, revision: 2, state, attempt_id: 'other' }), { replayed: true })
+      expect(h.streamRuntime!.toolInputPreviews.value[0]?.state).toBe('generating')
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ stream_seq: 3, revision: 2, state }), { replayed: true })
+      if (state === 'discarded') {
+        expect(h.streamRuntime!.toolInputPreviews.value).toEqual([])
+      } else {
+        expect(h.streamRuntime!.toolInputPreviews.value[0]?.state).toBe('committed')
+        h.api.handlers.onWireEventFixture('session.event.tool_use_start', {
+          key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live', epoch: 0, stream_seq: 4,
+          generation_epoch: 0, id: 'write-1', name: toolName,
+          arguments: toolName === 'write_file' ? { path, content: '<html>final' } : { code: '<html>final' },
+        }, { replayed: true })
+        await new Promise(resolve => setTimeout(resolve, 60))
+        expect(h.streamRuntime!.toolInputPreviews.value).toEqual([])
+        expect(h.streamRuntime!.foldedTurn.value.toolCalls).toHaveLength(1)
+        expect(h.streamRuntime!.isToolItemOpen('write-1')).toBe(true)
+      }
+    } finally { h.stop() }
+  })
+  it.each(['discarded', 'committed'] as const)('does not reopen a stream for a replayed %s without a live draft', state => {
+    const h = createHarness({ withCompactionRuntime: true })
+    h.activeStreamTaskId.value = 'task-live'
+    try {
+      expect(h.streamRuntime!.isStreaming.value).toBe(false)
+      h.api.handlers.onWireEventFixture('session.event.tool_input_preview', draft({ state }), { replayed: true })
+      expect(h.streamRuntime!.isStreaming.value).toBe(false)
+      expect(h.streamRuntime!.toolInputPreviews.value).toEqual([])
+    } finally { h.stop() }
+  })
+})
 
 describe('cross-window primary input hydration', () => {
   const key = 'agent:main:test'
@@ -554,6 +650,19 @@ describe('router card recovery projection', () => {
     }).renderedMessages
   }
 
+  it.each([false, true])('preserves wire replay=%s as display provenance without settling the turn', replayed => {
+    const h = setup()
+    try {
+      h.api.handlers.onWireEventFixture('session.event.router_decision', decision(10), { replayed })
+      expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
+      const card = h.messages.value.find(message => message.role === 'router')!
+      expect(card.routerReplayed === true).toBe(replayed)
+      expect(card.routerSettled).toBeUndefined()
+      expect(card.restoredFromHistory).toBeUndefined()
+      expect(h.queueRouterDecision).toHaveBeenCalledWith(expect.any(Object), undefined, replayed)
+    } finally { h.stop() }
+  })
+
   it('keeps the provisional row mounted when it acquires real event and call identities', () => {
     const h = setup()
     const emit = h.api.handlers.onWireEventFixture
@@ -674,7 +783,7 @@ describe('router card recovery projection', () => {
     } finally { h.stop() }
   })
 
-  it('keeps buffered replay attempts isolated while an in-place recovery installs its snapshot', () => {
+  it.each([false, true])('keeps buffered replay attempts isolated with wire replay=%s during snapshot recovery', replayed => {
     const h = setup(true)
     const emit = h.api.handlers.onWireEventFixture
     const firstText = { ...envelope(12), text: 'first', model_call_id: '1.0', iteration: 1 }
@@ -694,7 +803,7 @@ describe('router card recovery projection', () => {
       emit('session.event.router_control_replay', envelope(20))
       emit('session.event.ensemble_progress', progress(21, 'second'))
       emit('session.event.text_delta', { ...envelope(22), text: 'second', model_call_id: '2.0', iteration: 2 })
-      emit('session.event.router_decision', decision(23))
+      emit('session.event.router_decision', decision(23), { replayed })
 
       expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
       expect(h.lastStreamSeq.value).toBe(12)
@@ -706,6 +815,7 @@ describe('router card recovery projection', () => {
       expect(cards.map(card => card.messageId)).toEqual([`router-${key}-10`, `router-${key}-23`])
       expect(cards.map(card => card.ensemble?.models.map(model => model.model))).toEqual([['first'], ['second']])
       expect(cards.map(card => card.routerModelCallId)).toEqual(['1.0', '2.0'])
+      expect(cards.map(card => card.routerReplayed === true)).toEqual([true, replayed])
       expect(h.lastStreamSeq.value).toBe(23)
       expect(rendered.value.filter(message => message.isRouterStrip)).toHaveLength(2)
       expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
@@ -1125,6 +1235,93 @@ describe('useChatRpcEventHandlers decoded conversation ingress', () => {
 })
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it.each([false, true])('retains pending approvals across same-session snapshot replacement (running=%s)', running => {
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
+      ['pending-approval', { resolution: null, busy: false, error: '' }],
+      ['settled-approval', { resolution: 'denied', busy: false, error: '' }],
+    ]))
+    const stream = useChatStream({
+      messages: ref<ChatMessage[]>([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll: ref(false),
+      interruptState, applySessionRunState: vi.fn(), renderMarkdown: text => text,
+      stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text, scrollToBottom: vi.fn(),
+    })
+    const h = createHarness({ stream })
+    try {
+      for (const approvalId of ['pending-approval', 'settled-approval']) {
+        stream.appendInterruptFrame({ interruptKind: 'approval', approvalId, at: Date.now(), data: {
+          approvalId, namespace: 'exec', toolName: 'shell', command: 'echo marker',
+          approvalKind: '', args: null, warning: '', agent: 'main', sessionKey: h.sessionKey.value, deadline: 0,
+        } })
+      }
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: h.sessionKey.value, taskId: running ? 'restored-task' : null,
+        events: running ? [{ semanticKind: 'text-delta', payload: {
+          key: h.sessionKey.value, task_id: 'restored-task', text: 'restored answer',
+        } }] : [],
+      })
+      expect(stream.foldedTurn.value.parts.filter(part => part.type === 'interrupt'))
+        .toMatchObject([{ approval: { approvalId: 'pending-approval' }, resolution: null }])
+      expect(stream.isStreaming.value).toBe(running)
+      // Session retirement remains a full reset, never a cross-session carry.
+      stream.resetLiveTurnState()
+      expect(stream.foldedTurn.value.parts).toEqual([])
+    } finally { h.stop(); stream.cleanup() }
+  })
+
+  it.each(['state-changed', 'thinking-delta', 'run-heartbeat', 'text-delta'] as const)(
+    'preserves a detached reader when an early %s event opens the live reducer', semanticKind => {
+      const autoScroll = ref(false)
+      const scrollToBottom = vi.fn()
+      const stream = useChatStream({
+        messages: ref<ChatMessage[]>([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll,
+        applySessionRunState: vi.fn(), renderMarkdown: text => text,
+        stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text,
+        scrollToBottom,
+      })
+      const h = createHarness({ stream })
+      h.activeStreamTaskId.value = 'restored-task'
+      try {
+        const payload = {
+          key: h.sessionKey.value, task_id: 'restored-task', turn_id: 'restored-task',
+          stream_seq: 1, to_state: 'thinking', text: 'restored progress', phase: 'llm_tool_arguments',
+        }
+        // A queued event may arrive before snapshot/metadata restoration has
+        // started; no call-site option can distinguish every such entry point.
+        h.api.onConversationEvent({ kind: 'conversation', event: {
+          kind: 'known', semanticKind, payload, meta: {},
+          sessionKey: payload.key, taskId: payload.task_id, turnId: payload.turn_id,
+          streamGeneration: null, streamSeq: 1, connectionSeq: null, generationEpoch: null,
+        } })
+        expect(stream.isStreaming.value).toBe(true)
+        expect(autoScroll.value).toBe(false)
+        expect(scrollToBottom).not.toHaveBeenCalled()
+        if (semanticKind === 'text-delta') expect(stream.foldedTurn.value.rawText).toBe('restored progress')
+      } finally { h.stop(); stream.cleanup() }
+    },
+  )
+
+  it.each([false, true])('preserves reader follow=%s when restoring a live snapshot', follow => {
+    const autoScroll = ref(follow)
+    const stream = useChatStream({
+      messages: ref<ChatMessage[]>([]), lastHeaderRole: ref(''), aborted: ref(false), autoScroll,
+      applySessionRunState: vi.fn(), renderMarkdown: text => text,
+      stripDirectiveTags: text => text, stripGeneratedArtifactMarkers: text => text,
+      scrollToBottom: vi.fn(),
+    })
+    const h = createHarness({ stream })
+    try {
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: h.sessionKey.value, taskId: 'restored-task', currentStreamSeq: 1,
+        events: [{ semanticKind: 'text-delta', payload: {
+          key: h.sessionKey.value, task_id: 'restored-task', stream_seq: 1, text: 'restored answer',
+        } }],
+      })
+      expect(stream.isStreaming.value).toBe(true)
+      expect(stream.foldedTurn.value.rawText).toBe('restored answer')
+      expect(autoScroll.value).toBe(follow)
+    } finally { h.stop(); stream.cleanup() }
+  })
+
   it('starts restored activity at the earliest server event timestamp', () => {
     const harness = createHarness()
     harness.stream.isStreaming.value = false
@@ -1510,9 +1707,10 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
       })
 
       expect(queueRouterDecision).toHaveBeenCalledOnce()
-      const [payload, identityStreamSeq] = queueRouterDecision.mock.calls[0]!
+      const [payload, identityStreamSeq, replayed] = queueRouterDecision.mock.calls[0]!
       expect(payload).not.toHaveProperty('stream_seq')
       expect(identityStreamSeq).toBe(17)
+      expect(replayed).toBe(true)
       expect(lastStreamSeq.value).toBe(900)
     } finally {
       stop()
@@ -3681,6 +3879,54 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
+  it.each(['requesting', 'preparing'] as const)('hands %s feedback to actual reasoning without a provider activity event', phase => {
+    const h = createHarness({ withCompactionRuntime: true })
+    try {
+      const payload = { key: h.sessionKey.value, task_id: 'thinking-task', turn_id: 'thinking-task' }
+      h.activeStreamTaskId.value = 'thinking-task'
+      if (phase === 'requesting') {
+        h.api.handlers.onWireEventFixture('session.event.provider_activity', {
+          ...payload, stream_seq: 1, phase: 'requesting', schema_version: 1,
+        })
+      } else {
+        h.api.handlers.onRunHeartbeat({ ...payload, stream_seq: 1, phase: 'llm_tool_arguments' })
+      }
+      h.api.handlers.onWireEventFixture('session.event.thinking', {
+        ...payload, stream_seq: 2, text: 'Reviewing the generated file.', block_id: 'reasoning-1',
+      })
+      const runtime = h.streamRuntime!
+      const history = runtime.foldedTurn.value.statusHistory
+      expect(history[history.length - 1]?.action).toBe('provider:reasoning')
+      const reasoning = runtime.foldedTurn.value.reasoningBlocks
+      expect(reasoning[reasoning.length - 1]?.text).toBe('Reviewing the generated file.')
+      expect(projectAssistantActivityTimeline([], { lifecycle: 'working', statusHistory: history })
+        .statusSteps.filter(isVisibleActivityStatusStep)).toEqual([])
+
+      h.api.handlers.onWireEventFixture('session.event.provider_activity', {
+        ...payload, stream_seq: 3, phase: 'reasoning', schema_version: 1,
+        activity_id: 'provider-call-1', started_at: Date.now(), reason: 'initial',
+      })
+      h.api.handlers.onWireEventFixture('session.event.thinking', {
+        ...payload, stream_seq: 4, text: ' Checking the content.', block_id: 'reasoning-1',
+      })
+      expect(runtime.foldedTurn.value.statusHistory.filter(entry => entry.action === 'provider:reasoning')).toHaveLength(1)
+    } finally { h.stop() }
+  })
+
+  it('does not restore reasoning feedback from a finished turn', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    try {
+      h.activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      h.api.handlers.onWireEventFixture('session.event.thinking', {
+        key: h.sessionKey.value, task_id: 'finished-task', turn_id: 'finished-task',
+        stream_seq: 1, text: 'Late reasoning', block_id: 'old-reasoning',
+      })
+      expect(h.streamRuntime!.isStreaming.value).toBe(false)
+      expect(h.streamRuntime!.foldedTurn.value.statusHistory).toEqual([])
+      expect(h.streamRuntime!.foldedTurn.value.reasoningBlocks).toEqual([])
+    } finally { h.stop() }
+  })
+
   it('maps structured provider activity without rendering provider error text', () => {
     const { api, stream, updateRouterExecutionModel, stop } = createHarness()
 
@@ -4246,6 +4492,40 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
 })
 
 describe('recovery buffer consumption ownership', () => {
+  it('keeps a truncated replay summary incomplete through Done until committed history supplies its reader', () => {
+    vi.useFakeTimers()
+    const h = createHarness({ withCompactionRuntime: true, supportsTurnCommitted: true })
+    const payload = { key: h.sessionKey.value, task_id: 'task-preview', turn_id: 'turn-preview' }
+    h.activeStreamTaskId.value = 'task-preview'
+    try {
+      h.api.handlers.onWireEventFixture('session.event.text_delta', {
+        ...payload, stream_seq: 1, text: 'stored 8 KiB summary', text_truncated: true,
+        text_bytes: 8 * 1024 * 1024,
+      }, { replayed: true })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('stored 8 KiB summary')
+      expect(h.streamRuntime!.streamPreviewComplete.value).toBe(false)
+      h.api.handlers.onWireEventFixture('session.event.text_delta', {
+        ...payload, stream_seq: 2, text: ' + current live text',
+      })
+      h.api.handlers.onWireEventFixture('session.event.done', {
+        ...payload, stream_seq: 3, reason: 'completed', text: 'short summary',
+      })
+      expect(h.messages.value.find(message => message.role === 'assistant')).toMatchObject({
+        text: 'stored 8 KiB summary + current live text', previewComplete: false, contentAvailability: 'preparing',
+      })
+      expect(h.api.awaitingCommitTaskIds.value.has('task-preview')).toBe(true)
+      h.api.handlers.onWireEventFixture('session.event.turn_committed', {
+        ...payload, schema_version: 1, session_key: h.sessionKey.value,
+        stream_seq: 4, status: 'succeeded', terminal_reason: 'completed', finished_at: 123,
+      })
+      expect(h.scheduleHistorySync).toHaveBeenCalledWith(true)
+    } finally {
+      h.streamRuntime!.cleanup()
+      h.stop()
+      vi.useRealTimers()
+    }
+  })
+
   function token(sequence: number) {
     return {
       kind: 'conversation' as const,

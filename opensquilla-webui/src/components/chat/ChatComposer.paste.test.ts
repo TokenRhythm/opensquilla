@@ -18,7 +18,7 @@
 // vModelText skipped the update.
 //
 // The tests model the real Chromium order (paste → beforeinput → input, with
-// textarea.value mutated between beforeinput and input) and assert the
+// textarea.textContent mutated between beforeinput and input) and assert the
 // user-visible contract: the pasted text reaches the parent model and the
 // send button becomes ready.
 
@@ -43,8 +43,6 @@ const BASE_PROPS = {
   sessionRoutingMode: 'llm_ensemble',
   sessionRoutingBusy: false,
   routerVisualEffectsEnabled: true,
-  codingModeEnabled: false,
-  codingModeSettingsBusy: false,
   voiceBusy: false,
   voiceRecording: false,
   voiceReady: true,
@@ -64,7 +62,7 @@ function mountComposer() {
   })
   app.use(i18n)
   app.mount(el)
-  const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
+  const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')
   if (!textarea) throw new Error('textarea not rendered')
   return { updates, textarea, el }
 }
@@ -91,8 +89,6 @@ const ComposerWrapper = defineComponent({
       :session-routing-mode="'llm_ensemble'"
       :session-routing-busy="false"
       :router-visual-effects-enabled="true"
-      :coding-mode-enabled="false"
-      :coding-mode-settings-busy="false"
       :voice-busy="false"
       :voice-recording="false"
       :voice-ready="true"
@@ -117,18 +113,18 @@ function mountWrapper() {
     sent: string[]
     text: string
   }
-  const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
+  const textarea = el.querySelector<HTMLDivElement>('.chat-inline-editor')
   if (!textarea) throw new Error('textarea not rendered')
   return { textarea, el, instance }
 }
 
 /** Model the real Chromium paste order: paste → beforeinput → input. The
- * browser's default insertion mutates textarea.value between beforeinput
+ * browser's default insertion mutates textarea.textContent between beforeinput
  * and input — the DOM value only exists at the input stage. */
-async function simulateRealPaste(textarea: HTMLTextAreaElement, text: string) {
+async function simulateRealPaste(textarea: HTMLDivElement, text: string) {
   textarea.dispatchEvent(new Event('paste'))
   textarea.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertFromPaste' }))
-  textarea.value = text // browser default insertion (between beforeinput and input)
+  textarea.textContent = text // browser default insertion (between beforeinput and input)
   textarea.dispatchEvent(new InputEvent('input', { inputType: 'insertFromPaste' }))
   await nextTick()
 }
@@ -182,7 +178,7 @@ describe('ChatComposer paste → model sync', () => {
     const { textarea, instance } = mountWrapper()
 
     textarea.dispatchEvent(new Event('compositionstart'))
-    textarea.value = '输入'
+    textarea.textContent = '输入'
     textarea.dispatchEvent(new InputEvent('input', { inputType: 'insertCompositionText' }))
     await nextTick()
     expect(instance.text).toBe('')

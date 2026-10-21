@@ -43,9 +43,8 @@ async function mountPanel(api: ReturnType<typeof desktopApi>) {
 }
 
 function findRestartButton(el: HTMLElement): HTMLButtonElement {
-  const button = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
-    .find((candidate) => candidate.textContent?.includes('Restart runtime'))
-  if (!button) throw new Error('Restart runtime button was not rendered')
+  const button = el.querySelector<HTMLButtonElement>('[data-testid="runtime-restart-gateway"]')
+  if (!button) throw new Error('Restart local Gateway button was not rendered')
   return button
 }
 
@@ -127,6 +126,60 @@ describe('DesktopRuntimePanel runtime restart', () => {
     expect(migrationPeekLastResult).not.toHaveBeenCalled()
     expect(el.querySelector('[data-testid="runtime-migration-restart"]')).toBeNull()
     expect(el.textContent).not.toContain('Data transfer')
+    app.unmount()
+  })
+
+  it('keeps a startup error visible outside the initially collapsed address and log details', async () => {
+    const { app, el } = await mountPanel(desktopApi({
+      getGatewayStatus: async () => ({
+        url: 'http://127.0.0.1:1',
+        port: 1,
+        owned: true,
+        status: 'error',
+        logPath: 'C:/isolated-profile/gateway.log',
+        error: 'Port already in use',
+      }),
+    }))
+
+    const details = el.querySelector<HTMLDetailsElement>('[data-testid="runtime-details"]')!
+    const error = el.querySelector('[role="alert"]')!
+    expect(details.open).toBe(false)
+    expect(error.textContent).toBe('Port already in use')
+    expect(details.contains(error)).toBe(false)
+    expect(details.textContent).toContain('C:/isolated-profile/gateway.log')
+    expect(details.textContent).toContain('http://127.0.0.1:1')
+    expect(el.querySelector('[role="status"]')?.textContent).toContain('Error')
+    app.unmount()
+  })
+
+  it('keeps a status read failure visible and clears it after a successful manual refresh', async () => {
+    const getGatewayStatus = vi.fn()
+      .mockRejectedValueOnce(new Error('Native bridge unavailable'))
+      .mockResolvedValue({ url: '', port: 0, owned: true, status: 'stopped', logPath: '' })
+    const { app, el } = await mountPanel(desktopApi({ getGatewayStatus }))
+    const details = el.querySelector<HTMLDetailsElement>('[data-testid="runtime-details"]')!
+    expect(details.open).toBe(false)
+    expect(el.querySelector('[role="alert"]')?.textContent).toContain('Native bridge unavailable')
+    expect(el.querySelector('[role="status"]')?.textContent).toContain('Unknown')
+    el.querySelector<HTMLButtonElement>('[data-testid="runtime-refresh-status"]')!.click()
+    await settle()
+    expect(getGatewayStatus).toHaveBeenCalledTimes(2)
+    expect(el.querySelector('[role="alert"]')).toBeNull()
+    expect(el.querySelector('[role="status"]')?.textContent).toContain('Stopped')
+    app.unmount()
+  })
+
+  it('does not load desktop updates or duplicate the relocated log action', async () => {
+    const getUpdateState = vi.fn(async () => ({ status: 'idle' }))
+    const isAutoUpdateEnabled = vi.fn(async () => true)
+    const revealGatewayLog = vi.fn(async () => true)
+    const { app, el } = await mountPanel(desktopApi({ getUpdateState, isAutoUpdateEnabled, revealGatewayLog }))
+    expect(getUpdateState).not.toHaveBeenCalled()
+    expect(isAutoUpdateEnabled).not.toHaveBeenCalled()
+    expect(el.textContent).not.toContain('Desktop updates')
+    expect(el.textContent).not.toContain('Reveal log')
+    expect(el.querySelector('[data-testid="support-open-local-logs"]')).toBeNull()
+    expect(revealGatewayLog).not.toHaveBeenCalled()
     app.unmount()
   })
 })

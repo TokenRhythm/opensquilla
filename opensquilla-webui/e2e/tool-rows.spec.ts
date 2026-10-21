@@ -6,7 +6,7 @@ const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 test.describe('Tool rows and activity ribbon', () => {
   test('idle chat renders no live activity, elapsed labels, or result sheet', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.work-card')).toHaveCount(0)
     await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
@@ -19,7 +19,7 @@ test.describe('Tool rows and activity ribbon', () => {
     test.setTimeout(240000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const textarea = page.locator('.chat-textarea')
     await textarea.fill('Use your web search tool to find one recent headline about space exploration, then answer in one sentence.')
@@ -114,7 +114,7 @@ test.describe('Tool rows and activity ribbon', () => {
     test.setTimeout(240000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     const textarea = page.locator('.chat-textarea')
     await textarea.fill('Fetch the exact URL http://127.0.0.1:9/missing with your web fetch tool and report what error you get. Do not try any other URL.')

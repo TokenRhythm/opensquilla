@@ -9,6 +9,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 _VERSION = "0.5.4"
 _TAG = f"v{_VERSION}"
 _ASSETS = (
@@ -49,6 +51,7 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
             import json
             import os
             import shutil
+            import subprocess
             import sys
             from pathlib import Path
 
@@ -58,14 +61,13 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
             root = Path(os.environ["FAKE_OSS_ROOT"])
 
             def native_path(value: str) -> Path:
-                if (
-                    os.name == "nt"
-                    and len(value) >= 3
-                    and value[0] == "/"
-                    and value[1].isalpha()
-                    and value[2] == "/"
-                ):
-                    value = f"{value[1].upper()}:{value[2:]}"
+                if os.name == "nt" and value.startswith("/"):
+                    # Git Bash realpath may use /tmp, not only /c drive paths.
+                    # Use the same runtime's mount mapping for local paths.
+                    value = subprocess.check_output(
+                        [os.environ["FAKE_OSS_CYGPATH"], "-w", value],
+                        text=True,
+                    ).strip()
                 return Path(value)
 
             def mapped(value: str) -> Path:
@@ -80,7 +82,7 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
 
             if args[:2] == ["api", "put-object"]:
                 destination = root / option("--bucket") / option("--key")
-                if destination.exists():
+                if destination.exists() and os.environ.get("FAKE_OSS_VERSIONED") != "true":
                     raise SystemExit(9)
                 assert option("--forbid-overwrite") == "true"
                 source = native_path(option("--body").removeprefix("file://"))
@@ -166,6 +168,16 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
             "PYTHON_BIN": (fake_bin / "opensquilla-test-python").as_posix(),
         }
     )
+    if os.name == "nt":
+        bash = Path(_bash_executable())
+        cygpath_candidates = (
+            bash.parent / "cygpath.exe",
+            bash.parent.parent / "usr" / "bin" / "cygpath.exe",
+        )
+        cygpath = next((path for path in cygpath_candidates if path.is_file()), None)
+        if cygpath is None:
+            raise RuntimeError("Git for Windows cygpath.exe is required for this workflow test")
+        env["FAKE_OSS_CYGPATH"] = str(cygpath)
     return subprocess.run(
         [
             _bash_executable(),
@@ -175,13 +187,18 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
         ],
         cwd=Path.cwd(),
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,
     )
 
 
-def test_prestage_is_version_scoped_write_once_and_idempotent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("versioned", [False, True])
+def test_prestage_is_version_scoped_write_once_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, versioned: bool
+) -> None:
+    monkeypatch.setenv("FAKE_OSS_VERSIONED", str(versioned).lower())
     assets = tmp_path / "release-assets"
     _write_release_assets(assets)
 
@@ -208,6 +225,9 @@ def test_prestage_is_version_scoped_write_once_and_idempotent(tmp_path: Path) ->
     changed = _run(tmp_path, assets)
     assert changed.returncode != 0
     assert "Refusing to replace immutable OSS Draft asset" in changed.stderr
+    assert (remote / f"OpenSquilla-{_VERSION}-mac-arm64.dmg").read_bytes() == (
+        f"synthetic-OpenSquilla-{_VERSION}-mac-arm64.dmg".encode()
+    )
 
 
 def test_prestage_rejects_non_exact_release_asset_set(tmp_path: Path) -> None:

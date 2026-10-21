@@ -133,6 +133,7 @@ class _SearchCallingProvider(_ToolCallingProvider):
 
 async def _canonical_search_fixture() -> str:
     from opensquilla.search.canonical import run_canonical_web_search
+    from opensquilla.search.runtime_config import SearchRuntimeConfig, resolve_search_runtime
     from opensquilla.search.types import SearchOptions, SearchResult
 
     class SearchProvider:
@@ -145,6 +146,9 @@ async def _canonical_search_fixture() -> str:
 
     result = await run_canonical_web_search(
         SearchOptions(query="synthetic", provider="tavily"),
+        runtime=resolve_search_runtime(
+            SearchRuntimeConfig(provider="tavily", api_key="synthetic-search-key")
+        ),
         provider_factory=lambda name: SearchProvider(),
     )
     return json.dumps(result, ensure_ascii=False)

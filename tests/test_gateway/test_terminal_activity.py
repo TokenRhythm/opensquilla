@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from opensquilla.gateway.terminal_activity import (
     build_terminal_activity_snapshot,
     terminal_activity_snapshot,
@@ -326,3 +328,124 @@ def test_v2_compaction_updates_in_place_and_normalizes_wire_states() -> None:
         "ended_at": 10_012,
         "source": "automatic",
     }]
+
+
+def test_wait_status_is_scoped_to_retry_wait_and_survives_history():
+    events = [
+        event("provider_activity", 1, phase="retry_wait", reason="provider_overloaded",
+              http_status=503, retry_after_ms=35000),
+        event("provider_activity", 2, phase="retrying",
+              reason="provider_overloaded", http_status=503),
+        event("provider_activity", 3, phase="requesting", http_status=429),
+        event("done", 4),
+    ]
+    snapshot = build_terminal_activity_snapshot(events, task_id="t", turn_id="t", terminal_at=20000)
+    assert snapshot is not None
+    wait, retrying, requesting = snapshot["entries"]
+    assert wait["http_status"] == 503
+    assert wait["reason"] == "provider_overloaded"
+    assert "http_status" not in retrying
+    assert "http_status" not in requesting
+    assert terminal_activity_snapshot(snapshot, task_id="t", turn_id="t") == snapshot
+
+
+def test_fallback_models_survive_history_as_each_physical_hop():
+    snapshot = build_terminal_activity_snapshot([
+        event("provider_activity", 1, phase="fallback", from_model="model/A", model="model/B"),
+        event("provider_activity", 2, phase="fallback", from_model="model/B", model="model/C"),
+        event("provider_activity", 3, phase="fallback", model="本地 模型"),
+        event("provider_activity", 4, phase="fallback"),  # Older events have no model facts.
+        event("provider_activity", 5, phase="requesting", model="model/C", from_model="model/B"),
+        event("done", 6),
+    ], task_id="t", turn_id="t", terminal_at=20000)
+    assert snapshot is not None
+    entries = snapshot["entries"]
+    assert [(entry.get("from_model"), entry.get("model")) for entry in entries] == [
+        ("model/A", "model/B"), ("model/B", "model/C"),
+        (None, "本地 模型"), (None, None), (None, "model/C"),
+    ]
+    assert terminal_activity_snapshot(snapshot, task_id="t", turn_id="t") == snapshot
+
+
+@pytest.mark.parametrize("model", ["", "x" * 257, "model\nerror", "model\u202eerror", 42])
+def test_fallback_snapshot_omits_invalid_live_models_and_rejects_invalid_stored_models(model):
+    snapshot = build_terminal_activity_snapshot([
+        event("provider_activity", 1, phase="fallback", from_model=model, model=model),
+        event("done", 2),
+    ], task_id="t", turn_id="t", terminal_at=20000)
+    assert snapshot is not None
+    entry = snapshot["entries"][0]
+    assert "from_model" not in entry and "model" not in entry
+    assert terminal_activity_snapshot(snapshot, task_id="t", turn_id="t") == snapshot
+    snapshot.pop("checksum")
+    entry["from_model"] = model
+    assert terminal_activity_snapshot(snapshot, task_id="t", turn_id="t") is None
+
+
+
+@pytest.mark.parametrize("status", ["failed", "skipped"])
+def test_compaction_failure_detail_survives_history_without_stale_wait(status):
+    events = [
+        event("compaction", 1, compaction_id="compact-1", status="observed",
+              recovery={"phase": "retry_wait", "reason": "rate_limited", "http_status": 429,
+                        "retry_after_ms": 35000, "raw_body": "SECRET"}),
+        event("compaction", 2, compaction_id="compact-1", status=status,
+              skip_reason="summary_failed",
+              failure_detail={"failure_kind": "rate_limited", "http_status": 429,
+                              "reason_code": "PRIVATE"}),
+        event("done", 3),
+    ]
+    snapshot = build_terminal_activity_snapshot(events, task_id="t", turn_id="t", terminal_at=20000)
+    assert snapshot is not None
+    maintenance, = snapshot["entries"]
+    assert maintenance["failure_detail"] == {"failure_kind": "rate_limited", "http_status": 429}
+    assert maintenance["state"] == status
+    assert maintenance["reason"] == "summary_failed"
+    assert "recovery" not in maintenance
+    assert "SECRET" not in repr(snapshot) and "PRIVATE" not in repr(snapshot)
+    assert terminal_activity_snapshot(snapshot, task_id="t", turn_id="t") == snapshot
+
+
+@pytest.mark.parametrize("reason", ["within_budget", "within_compaction_budget"])
+def test_benign_compaction_skip_never_inherits_failure(reason):
+    snapshot = build_terminal_activity_snapshot([
+        event("compaction", 1, compaction_id="compact-benign", status="failed",
+              failure_detail={"failure_kind": "rate_limited", "http_status": 429}),
+        event("compaction", 2, compaction_id="compact-benign", status="skipped", reason=reason,
+              failure_detail={"failure_kind": "rate_limited", "http_status": 429}),
+        event("done", 3),
+    ], task_id="t", turn_id="t", terminal_at=20000)
+    assert snapshot is not None
+    maintenance, = snapshot["entries"]
+    assert maintenance["state"] == "skipped"
+    assert "failure_detail" not in maintenance
+    # An older or externally supplied snapshot is sanitized at read time too.
+    maintenance["failure_detail"] = {"failure_kind": "rate_limited", "http_status": 429}
+    restored = terminal_activity_snapshot(snapshot, task_id="t", turn_id="t")
+    assert restored is not None
+    assert "failure_detail" not in restored["entries"][0]
+
+
+def test_compaction_success_clears_failed_attempt_status():
+    snapshot = build_terminal_activity_snapshot([
+        event("compaction", 1, compaction_id="compact-2", status="observed",
+              recovery={"phase": "retry_wait", "reason": "rate_limited", "http_status": 429}),
+        event("compaction", 2, compaction_id="compact-2", status="completed"),
+        event("done", 3),
+    ], task_id="t", turn_id="t", terminal_at=20000)
+    assert snapshot is not None
+    maintenance, = snapshot["entries"]
+    assert "recovery" not in maintenance
+    assert "failure_detail" not in maintenance
+
+
+def test_compaction_heartbeat_does_not_erase_waiting_facts():
+    snapshot = build_terminal_activity_snapshot([
+        event("compaction", 1, compaction_id="compact-3", status="observed",
+              recovery={"phase": "retry_wait", "reason": "rate_limited", "http_status": 429}),
+        event("compaction", 2, compaction_id="compact-3", status="observed", heartbeat=True),
+        event("done", 3),
+    ], task_id="t", turn_id="t", terminal_at=20000)
+    assert snapshot is not None
+    maintenance, = snapshot["entries"]
+    assert maintenance["recovery"]["http_status"] == 429

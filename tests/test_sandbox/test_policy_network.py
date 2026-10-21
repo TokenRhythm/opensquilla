@@ -124,7 +124,7 @@ def test_network_hint_does_not_widen_non_network_non_exec_actions(
     assert policy.network is NetworkMode.NONE
 
 
-def test_shell_exec_policy_allows_meta_skill_workspace_env(tmp_path: Path) -> None:
+def test_shell_exec_policy_allows_workspace_env(tmp_path: Path) -> None:
     policy = build_policy(
         SecurityLevel.STANDARD,
         "shell.exec",

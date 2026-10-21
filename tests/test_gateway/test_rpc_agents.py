@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 
 from opensquilla.agents.registry import AgentRegistry
@@ -12,8 +15,188 @@ class _FailingModelSelector:
         raise RuntimeError("provider unavailable")
 
 
-def _ctx(config: GatewayConfig, registry: AgentRegistry) -> RpcContext:
+def _ctx(config: GatewayConfig, registry: AgentRegistry | None) -> RpcContext:
     return RpcContext(conn_id="test", config=config, agent_registry=registry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+@pytest.mark.parametrize("name", ["USER.md", "MEMORY.md", "memory.md"])
+async def test_agent_file_rpc_preserves_legacy_results_and_invalidates_sources(
+    tmp_path, registry_enabled, name,
+):
+    config = GatewayConfig(workspace_dir=str(tmp_path / "source"))
+    registry = AgentRegistry(config, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(config, registry)
+    invalidated = Mock()
+    memory_invalidated = Mock()
+    ctx.turn_runner = SimpleNamespace(
+        invalidate_profile_snapshot=invalidated, invalidate_memory_snapshot=memory_invalidated,
+    )
+    dispatcher = get_dispatcher()
+    listed = await dispatcher.dispatch("list", "agents.files.list", {"agentId": "ops"}, ctx)
+    absent = next(item for item in listed.payload["files"] if item["name"] == name)
+    assert absent == {
+        "name": name, "path": name, "exists": False, "missing": True, "status": "missing",
+    }
+    created = await dispatcher.dispatch("create", "agents.files.set", {
+        "agentId": "ops", "name": name, "content": "first",
+    }, ctx)
+    assert created.error is None
+    assert created.payload == {"name": name, "path": name, "size": 5}
+    invalidated.assert_called_once_with("ops")
+    if name == "USER.md":
+        memory_invalidated.assert_not_called()
+    else:
+        memory_invalidated.assert_called_once_with("ops")
+    read = await dispatcher.dispatch("read", "agents.files.get", {
+        "agentId": "ops", "name": name,
+    }, ctx)
+    assert read.payload == {"name": name, "content": "first"}
+    assert (tmp_path / "source" / "agents" / "ops" / name).read_text() == "first"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+async def test_agent_file_rpc_memory_write_evicts_cache_without_reading_notes(
+    tmp_path, monkeypatch, registry_enabled,
+):
+    from opensquilla.engine.runtime import MemorySnapshot, TurnRunner
+
+    source = tmp_path / "source"
+    config = GatewayConfig(workspace_dir=str(source))
+    registry = AgentRegistry(config, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(config, registry)
+    runner = TurnRunner(provider_selector=None, config=config)
+    old = MemorySnapshot(memory_md="old", daily_notes={"today.md": "old notes"})
+    other = MemorySnapshot(memory_md="other Agent", daily_notes={})
+    runner._memory_snapshots[("main", "session-a")] = old
+    runner._memory_snapshots[("main", "session-b")] = old
+    runner._memory_snapshots[("other", "session-a")] = other
+    denied_notes = Mock(side_effect=PermissionError("notes are not readable"))
+    monkeypatch.setattr(runner, "_load_daily_notes", denied_notes)
+    ctx.turn_runner = runner
+
+    result = await get_dispatcher().dispatch("write", "agents.files.set", {
+        "agentId": "main", "name": "MEMORY.md", "content": "updated",
+    }, ctx)
+
+    assert result.error is None
+    assert result.payload == {"name": "MEMORY.md", "path": "MEMORY.md", "size": 7}
+    assert (source / "MEMORY.md").read_text() == "updated"
+    assert runner._memory_snapshots == {("other", "session-a"): other}
+    denied_notes.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+async def test_agent_file_rpc_failed_write_invalidates_possible_partial_source(
+    tmp_path, monkeypatch, registry_enabled,
+):
+    from opensquilla.gateway import rpc_agents
+
+    source = tmp_path / "source"
+    config = GatewayConfig(workspace_dir=str(source))
+    registry = AgentRegistry(config, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(config, registry)
+    invalidated = Mock()
+    ctx.turn_runner = SimpleNamespace(invalidate_profile_snapshot=invalidated)
+
+    def fail_write(*_args):
+        source.mkdir()
+        (source / "USER.md").write_text("partial", encoding="utf-8")
+        raise OSError("write failed")
+
+    if registry is not None:
+        async def fail_set(*args):
+            return fail_write(*args)
+        monkeypatch.setattr(registry, "set_agent_file", fail_set)
+    else:
+        monkeypatch.setattr(rpc_agents, "_write_workspace_agent_file", fail_write)
+    result = await get_dispatcher().dispatch("write", "agents.files.set", {
+        "agentId": "main", "name": "USER.md", "content": "complete",
+    }, ctx)
+    assert result.error is not None
+    invalidated.assert_called_once_with("main")
+    assert (source / "USER.md").read_text() == "partial"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+async def test_agent_file_rpc_reads_do_not_create_missing_workspace(tmp_path, registry_enabled):
+    workspace = tmp_path / "missing" / "workspace"
+    cfg = GatewayConfig(workspace_dir=str(workspace))
+    registry = AgentRegistry(cfg, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(cfg, registry)
+    dispatcher = get_dispatcher()
+
+    listed = await dispatcher.dispatch("list", "agents.files.list", {"agentId": "main"}, ctx)
+    read = await dispatcher.dispatch(
+        "read", "agents.files.get", {"agentId": "main", "name": "AGENTS.md"}, ctx,
+    )
+
+    assert listed.error is None
+    assert listed.payload["files"]
+    assert all(item["status"] == "missing" for item in listed.payload["files"])
+    assert read.error is not None
+    assert not workspace.parent.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+@pytest.mark.parametrize("agents_content", [b"", b"# Project rules\r\nKeep existing rules.\r\n"])
+async def test_agent_file_rpc_reads_preserve_workspace(tmp_path, registry_enabled, agents_content):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    originals = {"AGENTS.md": agents_content, "custom.txt": b"User content\x00"}
+    for name, content in originals.items():
+        (workspace / name).write_bytes(content)
+    cfg = GatewayConfig(workspace_dir=str(workspace))
+    registry = AgentRegistry(cfg, persist_changes=False) if registry_enabled else None
+    ctx = _ctx(cfg, registry)
+    dispatcher = get_dispatcher()
+
+    listed = await dispatcher.dispatch("list", "agents.files.list", {"agentId": "main"}, ctx)
+    read = await dispatcher.dispatch(
+        "read", "agents.files.get", {"agentId": "main", "name": "AGENTS.md"}, ctx,
+    )
+
+    assert listed.error is None
+    entries = {item["name"]: item for item in listed.payload["files"]}
+    assert entries["AGENTS.md"]["status"] == "present"
+    assert entries["SOUL.md"]["status"] == "missing"
+    assert read.error is None
+    assert read.payload["content"] == agents_content.decode().replace("\r\n", "\n")
+    assert {path.name: path.read_bytes() for path in workspace.iterdir()} == originals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_enabled", [False, True])
+@pytest.mark.parametrize("existing", [False, True])
+async def test_agent_file_rpc_set_creates_only_requested_file(tmp_path, registry_enabled, existing):
+    workspace = tmp_path / "missing" / "workspace"
+    originals = {"AGENTS.md": b"", "custom.txt": b"Keep this file\r\n"} if existing else {}
+    if existing:
+        workspace.mkdir(parents=True)
+        for name, content in originals.items():
+            (workspace / name).write_bytes(content)
+    cfg = GatewayConfig(workspace_dir=str(workspace))
+    registry = AgentRegistry(cfg, persist_changes=False) if registry_enabled else None
+
+    response = await get_dispatcher().dispatch(
+        "write", "agents.files.set",
+        {"agentId": "main", "name": "USER.md", "content": "Name: Mira\n"},
+        _ctx(cfg, registry),
+    )
+
+    assert response.error is None
+    assert response.payload == {
+        "name": "USER.md", "path": "USER.md", "size": 11,
+    }
+    assert {path.name for path in workspace.iterdir()} == {*originals, "USER.md"}
+    for name, content in originals.items():
+        assert (workspace / name).read_bytes() == content
+    assert (workspace / "USER.md").read_text(encoding="utf-8") == "Name: Mira\n"
 
 
 @pytest.mark.asyncio
@@ -198,173 +381,22 @@ async def test_models_rpc_non_tokenrhythm_enrichment_ignores_warm_shared_catalog
 
 
 @pytest.mark.asyncio
-async def test_agents_rpc_create_accepts_explicit_id() -> None:
+@pytest.mark.parametrize("method", ["agents.create", "agents.update", "agents.delete"])
+async def test_retired_agent_admin_rpc_cannot_mutate_existing_profiles(method: str) -> None:
     cfg = GatewayConfig()
     registry = AgentRegistry(cfg, persist_changes=False)
+    await registry.create_agent(agent_id="ops", model="openai/test")
+    before = cfg.model_dump()
+
+    assert method not in get_dispatcher().methods()
 
     result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.create",
-        {"id": "ops", "name": "Operations", "model": "openai/test"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is None, result.error
-    assert result.payload["id"] == "ops"
-    assert result.payload["name"] == "Operations"
-    assert cfg.agents[0].model == "openai/test"
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_delete_removes_config_entry() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-    await registry.create_agent(agent_id="ops")
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.delete",
-        {"id": "ops"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is None, result.error
-    assert result.payload is None
-    assert cfg.agents == []
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_create_duplicate_returns_agent_exists_code() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-    await registry.create_agent(agent_id="ops")
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.create",
-        {"id": "ops"},
-        _ctx(cfg, registry),
+        "r1", method, {"id": "ops", "name": "Changed"}, _ctx(cfg, registry)
     )
 
     assert result.error is not None
-    assert result.error.code == "agent.exists"
-    assert result.error.details == {"agentId": "ops"}
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_delete_main_returns_builtin_immutable() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.delete",
-        {"id": "main"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is not None
-    assert result.error.code == "agent.builtin_immutable"
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_update_main_returns_builtin_immutable() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.update",
-        {"id": "main", "name": "renamed"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is not None
-    assert result.error.code == "agent.builtin_immutable"
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_update_missing_returns_agent_not_found() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.update",
-        {"id": "ghost", "model": "openai/test"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is not None
-    assert result.error.code == "agent.not_found"
-    assert result.error.details == {"agentId": "ghost"}
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_delete_missing_returns_agent_not_found() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.delete",
-        {"id": "ghost"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is not None
-    assert result.error.code == "agent.not_found"
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_update_workspace_field_persists() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-    await registry.create_agent(agent_id="ops")
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.update",
-        {"id": "ops", "workspace": "/tmp/ops"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is None, result.error
-    assert cfg.agents[0].workspace == "/tmp/ops"
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_update_enabled_toggle_persists() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-    await registry.create_agent(agent_id="ops")
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.update",
-        {"id": "ops", "enabled": False},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is None, result.error
-    assert cfg.agents[0].enabled is False
-
-
-@pytest.mark.asyncio
-async def test_agents_rpc_update_agent_dir_camelcase_persists() -> None:
-    cfg = GatewayConfig()
-    registry = AgentRegistry(cfg, persist_changes=False)
-    await registry.create_agent(agent_id="ops")
-
-    result = await get_dispatcher().dispatch(
-        "r1",
-        "agents.update",
-        {"id": "ops", "agentDir": ".opensquilla/ops-dir"},
-        _ctx(cfg, registry),
-    )
-
-    assert result.error is None, result.error
-    assert cfg.agents[0].agent_dir == ".opensquilla/ops-dir"
+    assert result.error.code == "METHOD_NOT_FOUND"
+    assert cfg.model_dump() == before
 
 
 @pytest.mark.asyncio
@@ -392,6 +424,8 @@ async def test_models_configured_scope_adds_ready_profile_defaults_without_disco
         "configured", "models.list", {"scope": "configured"}, ctx,
     )
     assert configured.error is None
+    # Keep the exact response shape accepted by previously shipped clients.
+    assert set(configured.payload) == {"models", "errors"}
     assert [(m["provider"], m["id"]) for m in configured.payload["models"]] == [
         ("ollama", "test-model-good"), ("openai", "same-model"),
         ("anthropic", "same-model"),
@@ -401,6 +435,31 @@ async def test_models_configured_scope_adds_ready_profile_defaults_without_disco
     }
     assert [e["provider"] for e in configured.payload["errors"]] == ["deepseek"]
     assert "synthetic" not in str(configured.payload)
+
+
+@pytest.mark.asyncio
+async def test_models_cache_only_is_network_free_and_exposes_cache_miss(monkeypatch):
+    from opensquilla.provider.selector import ProviderConfig
+
+    async def unexpected(**_kwargs):
+        pytest.fail("cache-only must not query an upstream provider")
+
+    monkeypatch.setattr("opensquilla.onboarding.probe.discover_provider_models", unexpected)
+    selector = _DetailedModelSelector()
+    selector.current_config = ProviderConfig(
+        provider="custom", model="example-model", base_url="http://127.0.0.1:9999/v1",
+    )
+    cfg = GatewayConfig()
+    cfg.llm.provider = "custom"
+    cfg.llm.model = "example-model"
+    cfg.llm.base_url = "http://127.0.0.1:9999/v1"
+    result = await get_dispatcher().dispatch(
+        "cache", "models.list", {"scope": "configured", "cacheOnly": True},
+        RpcContext(conn_id="test", config=cfg, provider_selector=selector),
+    )
+    assert result.error is None
+    assert result.payload["catalog"]["cacheHit"] is False
+    assert result.payload["catalog"]["stale"] is True
 
 
 @pytest.mark.asyncio

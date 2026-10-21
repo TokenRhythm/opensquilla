@@ -64,6 +64,7 @@ function i18n() {
     messages: {
       en: {
         chrome: { searchChats: 'Search tasks' },
+        chat: { copySessionLink: 'Copy session link' },
         sessions: { filter: { chats: 'Tasks' } },
         shared: {
           sidebar: {
@@ -84,6 +85,7 @@ function i18n() {
         workspaces: {
           projects: 'Projects',
           createProject: 'Create project',
+          addProject: 'Add project',
           projectInfo: '{path}; {count} tasks',
           taskCount: '{count} tasks',
           newTask: 'New project task',
@@ -92,6 +94,7 @@ function i18n() {
           pin: 'Pin project',
           unpin: 'Unpin project',
           editProject: 'Edit project',
+          openDirectory: 'Open in file manager',
           deleteHistory: 'Delete project task history',
           removeProject: 'Remove project',
           menuDeleteHistory: 'Delete history',
@@ -159,6 +162,7 @@ afterEach(() => {
   document.body.innerHTML = ''
   localStorage.clear()
   confirm.mockClear()
+  vi.useRealTimers()
 })
 
 describe('SidebarConversations project workspaces', () => {
@@ -167,7 +171,7 @@ describe('SidebarConversations project workspaces', () => {
     const createProject = host.querySelector<HTMLButtonElement>('[data-testid="sidebar-create-project"]')
     const createTask = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
 
-    expect(createProject?.getAttribute('aria-label')).toBe('Create project')
+    expect(createProject?.getAttribute('aria-label')).toBe('Add project')
     expect(createTask?.getAttribute('aria-label')).toBe('New project task')
 
     createProject?.click()
@@ -376,6 +380,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('shows a project session hover card outside the sidebar with its project name', async () => {
+    vi.useFakeTimers()
     const { host } = await mountSidebar([projectRow(), taskRow()])
     const row = host.querySelector<HTMLElement>(
       '[data-session-key="agent:main:webchat:task-a"]',
@@ -385,6 +390,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
 
     const preview = document.body.querySelector('.sidebar-session-preview')
@@ -397,6 +403,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('does not mount the hover card when the sidebar fills a narrow viewport', async () => {
+    vi.useFakeTimers()
     const previousWidth = window.innerWidth
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 548 })
     try {
@@ -409,6 +416,7 @@ describe('SidebarConversations project workspaces', () => {
       })
 
       row?.dispatchEvent(new MouseEvent('mouseenter'))
+      await vi.advanceTimersByTimeAsync(400)
       await nextTick()
 
       expect(document.body.querySelector('.sidebar-session-preview')).toBeNull()
@@ -418,6 +426,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('keeps a long mixed-language title and tooltip relationship intact', async () => {
+    vi.useFakeTimers()
     const title = '请执行一项 Deep Research 任务：分析 Fortinet 的长期经营表现与竞争格局'
     const { host } = await mountSidebar([projectRow(), taskRow({ title })])
     const row = host.querySelector<HTMLElement>(
@@ -428,6 +437,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
 
     const trigger = row?.querySelector('.sidebar-history-item')
@@ -442,6 +452,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('keeps the hover card but omits the project row for an unbound session', async () => {
+    vi.useFakeTimers()
     const { host } = await mountSidebar([
       taskRow({
         key: 'recent-task',
@@ -456,6 +467,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new MouseEvent('mouseenter'))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
 
     const preview = document.body.querySelector('.sidebar-session-preview')
@@ -465,6 +477,7 @@ describe('SidebarConversations project workspaces', () => {
   })
 
   it('opens the session card on keyboard focus and closes it on focus loss', async () => {
+    vi.useFakeTimers()
     const { host } = await mountSidebar([projectRow(), taskRow()])
     const row = host.querySelector<HTMLElement>(
       '[data-session-key="agent:main:webchat:task-a"]',
@@ -474,6 +487,7 @@ describe('SidebarConversations project workspaces', () => {
     })
 
     row?.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+    await vi.advanceTimersByTimeAsync(400)
     await nextTick()
     expect(document.body.querySelector('.sidebar-session-preview')).toBeTruthy()
 
@@ -598,7 +612,7 @@ describe('SidebarConversations project workspaces', () => {
     expect(disclosure).toBeTruthy()
     expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
     expect(info).toBeTruthy()
-    expect(info?.innerHTML).toContain('M3 6.5')
+    expect(info?.querySelector('svg')).not.toBeNull()
     expect(host.textContent).toContain('D:\\repos\\project-a')
     expect(host.textContent).toContain('2 tasks')
 
@@ -614,6 +628,53 @@ describe('SidebarConversations project workspaces', () => {
       host.querySelector('[data-testid="project-workspace-disclosure"]')?.getAttribute('aria-expanded'),
     ).toBe('false')
     expect(host.querySelector('[data-session-key="agent:main:webchat:task-a"]')).toBeNull()
+  })
+
+  it('toggles compatibility projects when header and task identities are mixed during catalog hydration', async () => {
+    const workspace = 'D:\\repos\\project-a'
+    const { host, events } = await mountSidebar([
+      projectRow({ workspaceId: undefined, key: `workspace:${workspace}`, workspace }),
+      // During catalog hydration the compatibility header can lack an id even
+      // while session rows from the gateway already carry one.
+      taskRow({ workspaceId: 'project-a', workspace }),
+    ])
+    const disclosure = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-disclosure"]')
+    const task = () => host.querySelector('[data-session-key="agent:main:webchat:task-a"]')
+
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
+    expect(task()).not.toBeNull()
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('false')
+    expect(task()).toBeNull()
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
+    expect(task()).not.toBeNull()
+    expect(events.select).not.toHaveBeenCalled()
+  })
+
+  it('toggles a fully path-only compatibility project', async () => {
+    const workspace = 'D:\\repos\\project-a'
+    const { host, events } = await mountSidebar([
+      projectRow({ workspaceId: undefined, key: `workspace:${workspace}`, workspace }),
+      taskRow({ workspaceId: undefined, workspace }),
+    ])
+    const disclosure = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-disclosure"]')
+    const task = () => host.querySelector('[data-session-key="agent:main:webchat:task-a"]')
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('false')
+    expect(task()).toBeNull()
+
+    disclosure?.click()
+    await nextTick()
+    expect(disclosure?.getAttribute('aria-expanded')).toBe('true')
+    expect(task()).not.toBeNull()
+    expect(events.select).not.toHaveBeenCalled()
   })
 
   it('creates a project task and expands its project from the persistent plus action', async () => {
@@ -690,13 +751,13 @@ describe('SidebarConversations project workspaces', () => {
     await nextTick()
     const menu = document.body.querySelector<HTMLElement>('.sidebar-project-menu')
     expect(menu?.classList.contains('sidebar-row-menu')).toBe(true)
-    expect(menu?.querySelectorAll('.sidebar-row-menu__item')).toHaveLength(4)
+    expect(menu?.querySelectorAll('.sidebar-row-menu__item')).toHaveLength(5)
     expect(menu?.style.left).toBe('196px')
     expect(menu?.style.transform).toBe('none')
     expect(
       Array.from(menu?.querySelectorAll('.sidebar-row-menu__item') || [])
         .map(item => item.textContent?.trim()),
-    ).toEqual(['Pin project', 'Edit project', 'Delete history', 'Remove'])
+    ).toEqual(['Pin project', 'Edit project', 'Open in file manager', 'Delete history', 'Remove'])
     expect(
       menu?.querySelector('[data-project-action="delete-history"]')
         ?.classList.contains('sidebar-row-menu__item--danger'),

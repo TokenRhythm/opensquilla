@@ -12,6 +12,23 @@ function attachment(overrides: Partial<DisplayAttachment> = {}): DisplayAttachme
 afterEach(() => vi.restoreAllMocks())
 
 describe('optional content byte ceilings', () => {
+  it('loads a session-owned SHA reference through the existing private attachment transport', async () => {
+    const requestBinary = vi.fn(async () => httpBinaryResponse('12345'))
+    const content = createV4AttachmentContentAccess(httpTransportTestDouble({ requestBinary }))
+    const controller = new AbortController()
+    const sha256_ref = 'a'.repeat(64)
+    const result = await content.fetchAttachment(attachment({ sha256_ref }),
+      { sessionKey: 'session-a', maxBytes: 5, signal: controller.signal })
+    expect(result.ok).toBe(true)
+    expect(requestBinary).toHaveBeenCalledWith(`/api/v1/attachments/${sha256_ref}`,
+      { sessionKey: 'session-a', signal: controller.signal, timeoutMs: 0 })
+    requestBinary.mockClear()
+    for (const reference of ['../other', 'a'.repeat(63), 'https://evil.test/', 'a'.repeat(64) + '?x=1']) {
+      expect((await content.fetchAttachment(attachment({ sha256_ref: reference }), { sessionKey: 'session-a' })).ok).toBe(false)
+    }
+    expect((await content.fetchAttachment(attachment({ sha256_ref }))).ok).toBe(false)
+    expect(requestBinary).not.toHaveBeenCalled()
+  })
   it('passes artifact limits through the public content capability without limiting downloads', async () => {
     const http = httpTransportTestDouble({ requestBinary: vi.fn(async () => httpBinaryResponse('12345')) })
     const content = createV4ArtifactContentAccess(http)

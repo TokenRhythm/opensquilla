@@ -1,13 +1,198 @@
 import { describe, expect, it } from 'vitest'
+import i18n, { loadLocaleMessages } from '@/i18n'
 
 import {
   toolDisplayInputText,
+  toolActionLabel,
+  toolCallGroups,
+  toolIconName,
+  toolOperationKey,
   toolGroupStatusText,
   toolResultCount,
   toolSecondaryText,
   toolStatusText,
 } from '@/utils/chat/toolDisplay'
 import type { ChatToolCall, ToolPresentation } from '@/types/chat'
+
+describe('registered browser, preview and skill tool presentation', () => {
+  it('localizes the known actions with the matching type icon', async () => {
+    await loadLocaleMessages('zh-Hans')
+    const previousLocale = i18n.global.locale.value
+    try {
+      i18n.global.locale.value = 'zh-Hans'
+      for (const [name, label, icon] of [
+        ['mcp__desktop-browser__browser_open', '打开浏览器', 'monitor'],
+        ['open_workspace_preview', '打开预览', 'monitor'],
+        ['skill_view', '读取技能', 'skills'],
+      ]) {
+        expect(toolActionLabel(name)).toBe(label)
+        expect(toolIconName(name)).toBe(icon)
+      }
+    } finally {
+      i18n.global.locale.value = previousLocale
+    }
+  })
+
+  it('does not label unrelated MCP tools or similar names as these actions', () => {
+    for (const name of [
+      'mcp__other-browser__browser_open', 'mcp__desktop-browser__browser_open_extra',
+      'mcp__custom__open_workspace_preview', 'custom_skill_view',
+    ]) {
+      expect(toolActionLabel(name)).toBe('Tool call')
+      expect(toolIconName(name)).toBe('gear')
+    }
+  })
+
+  it('keeps raw identities, error state, disclosure and separate groups', () => {
+    const names = ['mcp__desktop-browser__browser_open', 'open_workspace_preview', 'skill_view']
+    const calls = names.map((name, index): ChatToolCall => ({
+      toolId: `known-${index}`, name, displayName: name,
+      inputRaw: '{"path":"game/index.html"}', inputPreview: '',
+      isRunning: false, status: 'error', isError: true, isOpen: false,
+      result: 'Original error detail', resultPreview: 'Original error detail',
+    }))
+    const groups = toolCallGroups(calls, 'owner')
+    expect(groups.map(group => group.label)).toEqual(['Open browser', 'Open preview', 'Read skill'])
+    expect(groups.map(group => group.iconName)).toEqual(['monitor', 'monitor', 'skills'])
+    expect(groups.map(group => group.operationKey)).toEqual(names.map(toolOperationKey))
+    groups.forEach((group, index) => {
+      expect(group.isError).toBe(true)
+      expect(group.status).toBe('error')
+      expect(group.calls).toHaveLength(1)
+      expect(group.calls[0]).toMatchObject(calls[index])
+    })
+  })
+})
+
+describe('unknown tool presentation', () => {
+  it('keeps the exact tool identifier separate from the localized generic action', async () => {
+    const name = 'mcp__acme-v2__diagram_probe'
+    const call: ChatToolCall = {
+      toolId: 'probe-1', name, displayName: name, inputRaw: '{"action":"private_action"}', inputPreview: '',
+      isRunning: false, status: 'success', isError: false, result: 'done', resultPreview: 'done', isOpen: false,
+    }
+    const previousLocale = i18n.global.locale.value
+    try {
+      for (const [locale, label] of [
+        ['en', 'Tool call'], ['zh-Hans', '调用工具'], ['ja', 'ツール呼び出し'],
+        ['fr', 'Appel d’outil'], ['de', 'Werkzeugaufruf'], ['es', 'Llamada a herramienta'],
+      ] as const) {
+        await loadLocaleMessages(locale)
+        i18n.global.locale.value = locale
+        const group = toolCallGroups([call], 'owner')[0]
+        expect(group.label).toBe(label)
+        expect(group.secondary).toBe(name)
+        expect(group.calls[0]).toMatchObject(call)
+        expect(group.operationKey).toBe(toolOperationKey(name))
+      }
+    } finally {
+      i18n.global.locale.value = previousLocale
+    }
+  })
+})
+
+describe('stored tool result retrieval presentation', () => {
+  const call = (overrides: Partial<ChatToolCall> = {}): ChatToolCall => ({
+    toolId: 'retrieve-1', name: 'retrieve_tool_result', displayName: 'retrieve_tool_result',
+    inputRaw: '{"handle":"result-opaque-id","mode":"query","query":"report.html"}',
+    inputPreview: '{"handle":"result-opaque-id","mode":"query","query":"report.html"}',
+    isRunning: false, status: 'success', isError: false,
+    result: '[tool_result_retrieval]\nhandle: result-opaque-id\ntool_name: web_fetch\n---\npage body',
+    resultPreview: 'page body', isOpen: false, ...overrides,
+  })
+
+  it('localizes exact and namespaced tool names before generic name heuristics', async () => {
+    await loadLocaleMessages('zh-Hans')
+    const previousLocale = i18n.global.locale.value
+    try {
+      i18n.global.locale.value = 'zh-Hans'
+      for (const name of [
+        'retrieve_tool_result', 'functions.retrieve_tool_result', 'tools/retrieve_tool_result',
+        'tools:retrieve_tool_result', 'mcp__web_search__retrieve_tool_result',
+      ]) {
+        expect(toolActionLabel(name)).toBe('读取工具结果')
+        expect(toolIconName(name)).toBe('logs')
+        expect(toolOperationKey(name)).toBe('tool.retrieve.tool.result')
+      }
+      expect(toolActionLabel('custom_retrieve_tool_result')).not.toBe('读取工具结果')
+      expect(toolActionLabel('retrieve_tool_result_stats')).not.toBe('读取工具结果')
+      expect(toolActionLabel('retrieve-tool-result')).not.toBe('读取工具结果')
+    } finally {
+      i18n.global.locale.value = previousLocale
+    }
+  })
+
+  it('does not mistake an opaque handle, query or returned body for a source identity', () => {
+    expect(toolSecondaryText(call())).toBe('')
+    expect(toolSecondaryText(call({ name: 'functions.retrieve_tool_result' }))).toBe('')
+    expect(toolSecondaryText(call({
+      inputRaw: '', inputPreview: '', resultPreview: 'https://example.test/report.html',
+    }))).toBe('')
+    expect(toolSecondaryText(call({
+      presentation: { category: 'generic', primaryArguments: ['handle'], argumentDisplay: 'primary', lifecycleDisplay: 'boundary' },
+    }))).toBe('')
+  })
+
+  it('keeps retrieval status and raw details while grouping by the recognized operation', () => {
+    const failed = call({ status: 'error', isError: true })
+    const group = toolCallGroups([failed], 'owner')[0]
+    expect(group.label).toBe('Read tool result')
+    expect(group.iconName).toBe('logs')
+    expect(group.secondary).toBe('')
+    expect(group.isError).toBe(true)
+    expect(group.calls[0].inputRaw).toBe(failed.inputRaw)
+    expect(group.calls[0].result).toBe(failed.result)
+  })
+})
+
+describe('managed process tool presentation', () => {
+  const call = (overrides: Partial<ChatToolCall> = {}): ChatToolCall => ({
+    toolId: 'poll-1', name: 'process', displayName: 'process',
+    inputRaw: '{"action":"poll","execution_id":"exec-1"}', inputPreview: '',
+    isRunning: false, status: 'success', isError: false,
+    result: '', resultPreview: '', isOpen: false, ...overrides,
+  })
+
+  it('localizes the process action in Chinese without changing command status', async () => {
+    await loadLocaleMessages('zh-Hans')
+    const previousLocale = i18n.global.locale.value
+    try {
+      i18n.global.locale.value = 'zh-Hans'
+      expect(toolActionLabel('process', { action: 'poll' })).toBe('检查后台命令')
+      expect(toolActionLabel('process', '{"action":"wait"}')).toBe('等待后台命令')
+      expect(toolActionLabel('process', { action: 'log' })).toBe('读取后台输出')
+      expect(toolActionLabel('process', { action: 'kill' })).toBe('停止后台命令')
+      expect(toolActionLabel('process', { action: 'unknown' })).toBe('管理后台命令')
+      expect(toolActionLabel('custom_process_reader', { action: 'poll' })).not.toBe('检查后台命令')
+      expect(toolIconName('process')).toBe('terminal')
+      expect(toolStatusText(call({ status: 'error', isError: true }))).toBe('失败')
+    } finally {
+      i18n.global.locale.value = previousLocale
+    }
+  })
+
+  it('prefers the actual managed command and falls back to the execution handle', () => {
+    expect(toolSecondaryText(call({ result: JSON.stringify({
+      status: 'ok', action: 'poll', session: { command: 'python -m http.server 8080' },
+    }) }))).toBe('python -m http.server 8080')
+    expect(toolSecondaryText(call())).toBe('exec-1')
+    expect(toolSecondaryText(call({ inputRaw: '{"action":"wait","execution_ids":["a","b"]}' }))).toBe('a · b')
+    expect(toolSecondaryText(call({ inputRaw: '{"action":"list"}', result: '{"sessions":[]}' }))).toBe('')
+  })
+
+  it('keeps hidden arguments and arbitrary result text out of the compact target', () => {
+    expect(toolSecondaryText(call({ inputRaw: '{"action":"poll"}', result: 'private output' }))).toBe('')
+    expect(toolSecondaryText(call({
+      result: '{"session":{"command":"private command"}}',
+      presentation: { category: 'generic', primaryArguments: [], argumentDisplay: 'primary', lifecycleDisplay: 'boundary' },
+    }))).toBe('')
+  })
+
+  it('uses a specific label for one action and a neutral label for mixed process actions', () => {
+    expect(toolCallGroups([call()], 'owner')[0].label).toBe('Check background command')
+    expect(toolCallGroups([call(), call({ inputRaw: '{"action":"kill"}' })], 'owner')[0].label).toBe('Manage background command')
+  })
+})
 
 describe('toolDisplayInputText', () => {
   it('keeps only server-declared primary arguments', () => {

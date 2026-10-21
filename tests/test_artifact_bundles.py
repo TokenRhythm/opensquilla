@@ -804,7 +804,7 @@ def test_bundle_digest_controls_dedupe_and_fork_copies_sidecars(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_publish_artifact_defaults_to_auto_bundle_and_reports_partial(
+async def test_publish_artifact_rejects_partial_delivery_material(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -823,21 +823,14 @@ async def test_publish_artifact_defaults_to_auto_bundle_and_reports_partial(
 
     token = current_tool_context.set(ctx)
     try:
-        result = json.loads(await publish_artifact(path="index.html"))
+        with pytest.raises(ToolError, match="unavailable dependencies"):
+            await publish_artifact(path="index.html")
     finally:
         current_tool_context.reset(token)
 
-    assert result["status"] == "published"
-    assert result["bundle"]["collection_status"] == "partial"
-    assert result["bundle"]["warning_codes"] == ["missing_dependency"]
-    assert "bundle" not in ctx.published_artifacts[0]
-    store = ArtifactStore(tmp_path / "media")
-    manifest = store.describe_preview_bundle(
-        result["artifact"]["id"],
-        session_id="session-1",
-    )
-    assert manifest is not None
-    assert {item.path for item in manifest.files} == {"app.js", "index.html"}
+    assert ctx.published_artifacts == []
+    assert ctx.artifact_source_paths == {}
+    assert not (tmp_path / "media" / "artifacts").exists()
 
 
 @pytest.mark.parametrize(

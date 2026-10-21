@@ -1,5 +1,6 @@
 import { test, expect, type Page, type Route } from '@playwright/test'
 import { chatHistoryPayload } from './support/session-read-fixtures'
+import { installSidebarFixture } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eartifactpreview'
@@ -21,49 +22,21 @@ const DEFAULT_ARTIFACTS = [
   },
 ]
 
-// Seed one finished assistant turn carrying image artifacts with thumbnail
-// variants, rewriting chat.history in flight.
+// Seed a complete existing conversation, including subscribe/snapshot/hydrate.
+// Image loading must not depend on a real Gateway owning this synthetic key.
 async function seedHistory(page: Page, artifacts: object[] = DEFAULT_ARTIFACTS) {
-  await page.routeWebSocket(/\/ws$/, ws => {
-    const server = ws.connectToServer()
-    const historyIds = new Set<string>()
-    ws.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'req' && frame.method === 'chat.history') {
-          historyIds.add(String(frame.id))
-        }
-      } catch {}
-      server.send(message)
-    })
-    server.onMessage(message => {
-      try {
-        const frame = JSON.parse(String(message))
-        if (frame?.type === 'res' && frame.id !== undefined && historyIds.has(String(frame.id))) {
-          historyIds.delete(String(frame.id))
-          frame.ok = true
-          delete frame.error
-          frame.payload = chatHistoryPayload([
-            {
-              role: 'user',
-              text: 'Render an image.',
-              id: 'msg-preview-user',
-              timestamp: Math.floor(Date.now() / 1000) - 120,
-            },
-            {
-              role: 'assistant',
-              text: 'Here it is.',
-              id: 'msg-preview-assistant',
-              timestamp: Math.floor(Date.now() / 1000) - 60,
-              artifacts,
-            },
-          ])
-          ws.send(JSON.stringify(frame))
-          return
-        }
-      } catch {}
-      ws.send(message)
-    })
+  await installSidebarFixture(page, {
+    'chat.history': chatHistoryPayload([
+      { role: 'user', text: 'Render an image.', id: 'msg-preview-user',
+        timestamp: Math.floor(Date.now() / 1000) - 120 },
+      { role: 'assistant', text: 'Here it is.', id: 'msg-preview-assistant',
+        timestamp: Math.floor(Date.now() / 1000) - 60, artifacts },
+    ]),
+    'sessions.list': { sessions: [{
+      key: SESSION_KEY, title: 'Synthetic image previews', sessionKind: 'chat',
+      surface: 'webchat', conversationKind: 'direct', effectiveAgentId: 'main',
+      updatedAt: 1_800_000_000, messageCount: 2, status: 'ok', runStatus: 'idle',
+    }], count: 1, ts: 1_800_000_000, has_more: false },
   })
 }
 
@@ -84,7 +57,7 @@ async function openSeeded(
   }, { workbenchEnabled: options.workbenchEnabled !== false })
   await seedHistory(page, artifacts)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
 }
 
@@ -172,9 +145,14 @@ test.describe('Artifact preview performance and slow-network states', () => {
     // Focus enters the dialog and wraps in both directions.
     const close = dialog.getByRole('button', { name: /Close preview/ })
     const download = dialog.getByRole('button', { name: /Download/ })
+    const copy = dialog.getByTestId('copy-image')
     await expect(close).toBeFocused()
     await page.keyboard.press('Shift+Tab')
+    await expect(copy).toBeFocused()
+    await page.keyboard.press('Shift+Tab')
     await expect(download).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(copy).toBeFocused()
     await page.keyboard.press('Tab')
     await expect(close).toBeFocused()
 

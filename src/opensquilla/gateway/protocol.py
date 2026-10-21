@@ -158,6 +158,7 @@ _INTERNAL_TERMINAL_RESET_FIELDS = frozenset(
         "terminal_error_message",
         "terminal_error_code",
         "terminal_failure_kind",
+        "terminal_http_status",
     }
 )
 
@@ -394,6 +395,12 @@ class PolicyInfo(BaseModel):
     client_ws_keepalive_timeout_ms: int = 0
     transport_probe_nonce: bool = False
     transport_flow: dict[str, Any] | None = None
+    turn_receipt_lookup: Literal["turns.receipt.read.v1"] | None = None
+    # Additive startup contract.  Older clients ignore this field; clients
+    # that understand startup.services.v1 can render core readiness separately
+    # from integrations that are still starting or degraded.
+    startup_services_v1: bool = False
+    services: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class HelloOk(BaseModel):

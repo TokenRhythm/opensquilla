@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ARTIFACT_WORKBENCH_KEY, type WorkingFileMetadata, type WorkingFileRequest } from '@/modules/artifactWorkbench'
+import { ARTIFACT_WORKBENCH_KEY, HtmlBundleExportError, type WorkingFileMetadata, type WorkingFileRequest } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { usePlatform } from '@/platform'
@@ -12,15 +12,24 @@ import { ImageClipboardError } from '@/utils/imageClipboard'
 import { copyTextWithFallback, downloadBlob, isMacPlatform } from '@/utils/browser'
 import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import { isPreviewPagePath } from '@/utils/workbench/previewPagePath'
+import { htmlBundleExportTarget } from '@/utils/workbench/htmlBundleExport'
 import Icon from '@/components/Icon.vue'
 
 const props = withDefaults(defineProps<{
   artifact?: ArtifactPayload
+  /** Tab menus deliberately retain only download/reveal plus tab actions. */
+  compact?: boolean
+  /** Retain the panel's established download even without a local source file. */
+  downloadAction?: string
+  extraActions?: readonly { id: string; label: string; disabled?: boolean; separator?: boolean }[]
   sessionKey?: string
   trigger?: boolean
   previewable?: boolean
+  requireSameOrigin?: boolean
+  /** New media-card shortcuts must not turn a spoofed MIME into a script opener. */
+  nativeOpenMediaOnly?: boolean
 }>(), { sessionKey: '', trigger: false, previewable: true })
-const emit = defineEmits<{ open: [artifact: ArtifactPayload] }>()
+const emit = defineEmits<{ open: [artifact: ArtifactPayload]; action: [id: string] }>()
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const platform = usePlatform()
@@ -42,7 +51,14 @@ let epoch = 0
 
 const source = computed(() => selected.value?.source === 'workspace-preview'
   && typeof selected.value.documentId === 'string')
+const hasDeliveredVersion = computed(() => !!selected.value?.id && !source.value
+  && selected.value.workbenchOpenIntent !== 'history'
+  && ['html', 'docx', 'pptx', 'xlsx'].includes(artifactWorkbenchPreviewKind(selected.value)))
 const readable = computed(() => source.value ? !!metadata.value : !!selected.value)
+const bundleTarget = computed(() => selected.value ? htmlBundleExportTarget(selected.value) : null)
+const canOpenCopy = computed(() => !source.value && !!platform.files.openArtifact
+  && (!props.nativeOpenMediaOnly || /\.(?:png|jpe?g|gif|webp|svg|bmp|ico|tiff?|avif|heic|heif|jxl|apng|mp3|wav|m4a|aac|flac|ogg|oga|opus|mp4|m4v|mov|webm|ogv|mkv|avi|wmv)$/i
+    .test(String(selected.value?.name || '').trim())))
 const html = computed(() => !!selected.value && artifactWorkbenchPreviewKind({
   ...selected.value,
   ...(metadata.value ? { name: metadata.value.name, mime: metadata.value.mime } : {}),
@@ -72,7 +88,8 @@ const imageClipboard = useImageClipboard({
       if (blob.size > maxBytes) throw new ImageClipboardError('tooLarge')
       return blob
     }
-    const result = await workbench.content.fetchArtifact(artifact, { sessionKey: session, signal, maxBytes })
+    const result = await workbench.content.fetchArtifact(artifact, { sessionKey: session, signal, maxBytes,
+      ...(props.requireSameOrigin ? { requireSameOrigin: true } : {}) })
     if (!result.ok) throw new ImageClipboardError(result.errorCode === 'too_large' ? 'tooLarge' : 'failed')
     return result.blob
   },
@@ -85,7 +102,8 @@ const revealLabel = computed(() => t(isMacPlatform() ? 'resourceActions.revealFi
   : typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent)
     ? 'resourceActions.revealExplorer' : 'resourceActions.reveal'))
 const signature = computed(() => [props.sessionKey, props.artifact?.id, props.artifact?.documentId,
-  props.artifact?.previewPagePath, props.artifact?.download_url].join('\0'))
+  props.artifact?.document_id, props.artifact?.revisionId, props.artifact?.sha256,
+  props.artifact?.previewPagePath, props.artifact?.download_url, props.requireSameOrigin, props.nativeOpenMediaOnly].join('\0'))
 
 function close() {
   visible.value = false
@@ -109,7 +127,7 @@ function currentRequest(artifact: ArtifactPayload, signal: AbortSignal): Working
 }
 
 async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact) {
-  if (!artifact || !workbench) return
+  if ((!artifact || !workbench) && !props.extraActions?.length) return
   if (event instanceof KeyboardEvent && event.key !== 'ContextMenu'
     && !(event.shiftKey && event.key === 'F10')) return
   event.preventDefault()
@@ -118,9 +136,9 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   const attempt = ++generation
   pending = new AbortController()
   const signal = pending.signal
-  session = props.sessionKey || String(artifact.session_key || artifact.sessionKey || '')
+  session = props.sessionKey || String(artifact?.session_key || artifact?.sessionKey || '')
   epoch = gateway?.subscriptionEpoch ?? 0
-  selected.value = { ...artifact }
+  selected.value = artifact ? { ...artifact } : null
   metadata.value = null
   localInstance.value = null
   invoker = (event.target instanceof Element
@@ -140,7 +158,7 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   const initialFocus = menu.value?.querySelector<HTMLButtonElement>('button:not(:disabled)') ?? menu.value
   initialFocus?.focus()
   try {
-    if (source.value) {
+    if (source.value && artifact && workbench) {
       const info = await workbench.content.workingFileMetadata?.(currentRequest(artifact, signal))
       if (attempt !== generation) return
       metadata.value = info ?? null
@@ -153,7 +171,7 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
       }
     }
   } catch {
-    if (attempt === generation) pushToast(t('resourceActions.unavailable'), { tone: 'danger' })
+    if (attempt === generation && !props.downloadAction) pushToast(t('resourceActions.unavailable'), { tone: 'danger' })
   } finally {
     if (attempt === generation) {
       loading.value = false
@@ -167,7 +185,7 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   }
 }
 
-async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open' | 'reveal' | 'copy-open') {
+async function perform(action: 'preview' | 'history' | 'save' | 'export-zip' | 'path' | 'contents' | 'open' | 'reveal' | 'copy-open') {
   const artifact = selected.value
   if (!artifact || !workbench || !pending) return
   const isSource = source.value
@@ -182,7 +200,23 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
   close()
   try {
     assertCurrent()
+    if (action === 'export-zip') {
+      const target = bundleTarget.value
+      if (!target || !workbench.content.exportHtmlBundle) return
+      const result = await workbench.content.exportHtmlBundle({ target, sessionKey: capturedSession, signal: pending.signal })
+      assertCurrent()
+      if (platform.files.saveArtifact) {
+        const data = await result.blob.arrayBuffer()
+        assertCurrent()
+        const saved = await platform.files.saveArtifact({ data, name: result.filename, mime: 'application/zip' })
+        assertCurrent()
+        if (saved.status === 'saved') pushToast(t('resourceActions.saved'), { tone: 'ok' })
+      } else downloadBlob(result.blob, result.filename)
+      return
+    }
+    if (action === 'copy-open' && !canOpenCopy.value) return
     if (action === 'preview') { emit('open', artifact); return }
+    if (action === 'history') { emit('open', { ...artifact, workbenchOpenIntent: 'history' }); return }
     if (action === 'open' || action === 'reveal') {
       if (!request || !localInstance.value || !platform.files.sourceFileAction) return
       await platform.files.sourceFileAction({ gatewayInstanceId: localInstance.value,
@@ -195,7 +229,6 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
       assertCurrent()
       if (!info) throw new Error(t('resourceActions.unavailable'))
       await copyTextWithFallback(info.sourcePath)
-      pushToast(t('chat.copied'), { tone: 'ok' })
       return
     }
     let blob: Blob
@@ -203,7 +236,8 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
       if (!workbench.content.fetchWorkingFile) throw new Error(t('resourceActions.unavailable'))
       blob = await workbench.content.fetchWorkingFile(request)
     } else {
-      const result = await workbench.content.fetchArtifact(artifact, { sessionKey: capturedSession, signal: pending.signal })
+      const result = await workbench.content.fetchArtifact(artifact, { sessionKey: capturedSession, signal: pending.signal,
+        ...(props.requireSameOrigin ? { requireSameOrigin: true } : {}) })
       if (!result.ok) throw new Error(result.message)
       blob = result.blob
     }
@@ -220,7 +254,6 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
       catch { throw new Error(t('resourceActions.textOnly')) }
       if (text.includes('\0')) throw new Error(t('resourceActions.textOnly'))
       await copyTextWithFallback(text)
-      pushToast(t('chat.copied'), { tone: 'ok' })
       return
     }
     const name = metadata.value?.name || String(artifact.name || 'file')
@@ -237,7 +270,12 @@ async function perform(action: 'preview' | 'save' | 'path' | 'contents' | 'open'
     } else { downloadBlob(blob, name) }
   } catch (error) {
     if (attempt === generation && !(error instanceof DOMException && error.name === 'AbortError')) {
-      pushToast(error instanceof Error ? error.message : t('resourceActions.failed'), { tone: 'danger' })
+      const exportKey = error instanceof HtmlBundleExportError ? {
+        unavailable: 'resourceActions.zipUnavailable', incomplete: 'resourceActions.zipIncomplete',
+        'too-large': 'resourceActions.zipTooLarge', 'source-forbidden': 'resourceActions.zipSourceForbidden',
+        'source-changed': 'resourceActions.zipSourceChanged', failed: 'resourceActions.zipFailed',
+      }[error.code] : null
+      pushToast(exportKey ? t(exportKey) : error instanceof Error ? error.message : t('resourceActions.failed'), { tone: 'danger' })
     }
   }
 }
@@ -254,7 +292,12 @@ function onKeydown(event: KeyboardEvent) {
     : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
   buttons[next]?.focus()
 }
-defineExpose({ show })
+function performExtra(id: string) {
+  cancel()
+  emit('action', id)
+}
+
+defineExpose({ show, cancel })
 </script>
 
 <template>
@@ -267,22 +310,32 @@ defineExpose({ show })
     <div v-if="visible" class="resource-actions-backdrop" @pointerdown.self="cancel">
       <div ref="menu" class="resource-actions-menu" role="menu" tabindex="-1" :aria-label="t('resourceActions.more')"
         :style="{ left: `${point.left}px`, top: `${point.top}px` }" @keydown="onKeydown" @contextmenu.prevent>
-        <button v-if="previewable" role="menuitem" type="button" @click="perform('preview')">{{ t('resourceActions.preview') }}</button>
+        <button v-if="previewable && !compact" role="menuitem" type="button" @click="perform('preview')">{{ t('resourceActions.preview') }}</button>
+        <button v-if="previewable && !compact && hasDeliveredVersion" role="menuitem" type="button" @click="perform('history')">{{ t('workbench.artifactDocument.viewDeliveredVersion') }}</button>
         <template v-if="localInstance && metadata">
-          <button role="menuitem" type="button" @click="perform('open')">{{ t('resourceActions.openSource') }}</button>
+          <button v-if="!compact" role="menuitem" type="button" @click="perform('open')">{{ t('resourceActions.openSource') }}</button>
           <button role="menuitem" type="button" @click="perform('reveal')">{{ revealLabel }}</button>
         </template>
-        <button v-if="!source && platform.files.openArtifact" role="menuitem" type="button" @click="perform('copy-open')">{{ t('resourceActions.openCopy') }}</button>
+        <button v-if="canOpenCopy && !compact" role="menuitem" type="button" @click="perform('copy-open')">{{ t('resourceActions.openCopy') }}</button>
+        <button v-if="!compact && bundleTarget && workbench?.content.exportHtmlBundle" role="menuitem" type="button"
+          :title="t(source ? 'resourceActions.zipWorking' : 'resourceActions.zipSnapshot')"
+          @click="perform('export-zip')">{{ t('resourceActions.downloadZip') }}</button>
+        <button v-if="readable || downloadAction" role="menuitem" type="button"
+          :title="source && !downloadAction ? t('resourceActions.singleFile') : undefined"
+          @click="downloadAction ? performExtra(downloadAction) : perform('save')">
+            {{ t(compact ? 'chat.download' : platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}
+        </button>
         <template v-if="readable">
-          <button role="menuitem" type="button" :title="source ? t('resourceActions.singleFile') : undefined" @click="perform('save')">
-            {{ t(platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}
-          </button>
-          <button v-if="source && !html" role="menuitem" type="button" @click="perform('path')">{{ t(localInstance ? 'resourceActions.copyPath' : 'resourceActions.copyGatewayPath') }}</button>
-          <button v-if="svg" role="menuitem" type="button" :disabled="imageClipboard.busy.value"
+          <button v-if="!compact && source && !html" role="menuitem" type="button" @click="perform('path')">{{ t(localInstance ? 'resourceActions.copyPath' : 'resourceActions.copyGatewayPath') }}</button>
+          <button v-if="!compact && svg" role="menuitem" type="button" :disabled="imageClipboard.busy.value"
             @click="copySvgSource">{{ t('imageClipboard.copySource') }}</button>
-          <button v-else-if="!html" role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
+          <button v-else-if="!compact && !html" role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
         </template>
-        <small v-if="source && !readable" role="status">{{ t(loading ? 'common.loading' : 'resourceActions.unavailable') }}</small>
+        <template v-for="action in extraActions" :key="action.id">
+          <hr v-if="action.separator" class="resource-actions-separator" role="separator" />
+          <button role="menuitem" type="button" :disabled="action.disabled" @click="performExtra(action.id)">{{ action.label }}</button>
+        </template>
+        <small v-if="source && !readable && !downloadAction" role="status">{{ t(loading ? 'shared.loading' : 'resourceActions.unavailable') }}</small>
       </div>
     </div>
   </Teleport>
@@ -294,5 +347,7 @@ defineExpose({ show })
 .resource-actions-menu { position: fixed; display: flex; flex-direction: column; min-width: 220px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow-y: auto; padding: 5px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-surface); color: var(--text); box-shadow: var(--shadow-lg); }
 .resource-actions-menu button { border: 0; border-radius: var(--radius-sm); padding: 8px 12px; background: transparent; color: inherit; text-align: start; font: inherit; font-size: 0.8125rem; cursor: pointer; }
 .resource-actions-menu button:hover, .resource-actions-menu button:focus-visible { background: var(--bg-hover); outline: 1px solid var(--accent); }
+.resource-actions-separator { width: 100%; margin: 4px 0; border: 0; border-top: 1px solid var(--border); }
+.resource-actions-menu button:disabled { opacity: .5; cursor: default; }
 .resource-actions-menu small { padding: 8px 12px; color: var(--text-muted); max-width: 280px; }
 </style>

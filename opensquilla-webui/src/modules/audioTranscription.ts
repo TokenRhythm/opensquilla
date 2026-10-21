@@ -14,8 +14,14 @@ export class AudioTranscriptionError extends Error {
   }
 }
 
+export interface AudioTranscriptionOwner {
+  sessionKey?: string
+  sessionId?: string
+  sessionEpoch?: number
+}
+
 export interface AudioTranscription {
-  transcribe(input: {
+  transcribe(input: AudioTranscriptionOwner & {
     recording: Blob
     mimeType: string
     signal?: AbortSignal

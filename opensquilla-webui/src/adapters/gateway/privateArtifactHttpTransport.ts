@@ -95,6 +95,21 @@ export function runtimeAttachmentHttpBaseOrigin(): string {
   return runtimeArtifactHttpBaseOrigin()
 }
 
+/** Only retained, content-addressed session material can use the reference fallback. */
+export function attachmentReferenceHttpPath(sha256: unknown, locator?: { messageId: string; toolUseId: string }): string {
+  if (typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(sha256)) return ''
+  const path = `/api/v1/attachments/${sha256.toLowerCase()}`
+  if (!locator) return path
+  if (!locator.messageId.trim() || !locator.toolUseId.trim()) return ''
+  const query = new URLSearchParams({ messageId: locator.messageId, toolUseId: locator.toolUseId })
+  return `${path}?${query}`
+}
+
+export function attachmentPreviewHttpPath(sha256: unknown, locator?: { messageId: string; toolUseId: string }): string {
+  const path = attachmentReferenceHttpPath(sha256, locator)
+  return path ? `${path}${path.includes('?') ? '&' : '?'}preview=1` : ''
+}
+
 function urlsShareArtifactOrigin(candidate: URL, base: URL): boolean {
   if (candidate.origin !== 'null' || base.origin !== 'null') {
     return candidate.origin === base.origin
@@ -328,7 +343,7 @@ export function createArtifactPreviewLeaseHttp<T>(
   artifactId: string,
   mode: ArtifactPreviewMode,
   client: PlatformId,
-  context: ArtifactPreviewHttpContext & { pagePath?: string },
+  context: ArtifactPreviewHttpContext & { pagePath?: string; snapshot?: boolean },
 ): Promise<T> {
   const url = new URL(
     `${ARTIFACT_CONTENT_PATH}${encodeURIComponent(artifactId)}/preview-leases`,
@@ -336,7 +351,8 @@ export function createArtifactPreviewLeaseHttp<T>(
   ).toString()
   return http.requestJson<T>(url, {
     method: 'POST',
-    json: { version: 1, mode, client, ...(context.pagePath ? { pagePath: context.pagePath } : {}) },
+    json: { version: 1, mode, client, ...(context.pagePath ? { pagePath: context.pagePath } : {}),
+      ...(context.snapshot === true ? { snapshot: true } : {}) },
     sessionKey: context.sessionKey,
     timeoutMs: 0,
   })
@@ -361,7 +377,7 @@ export function renewArtifactPreviewLeaseHttp<T>(
   return http.requestJson<T>(artifactPreviewLeaseControlUrl(leaseId, context, '/renew'), {
     method: 'POST',
     sessionKey: context.sessionKey,
-    timeoutMs: 0,
+    timeoutMs: 15_000,
   })
 }
 

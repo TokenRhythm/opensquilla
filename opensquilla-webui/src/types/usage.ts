@@ -1,5 +1,10 @@
 export interface ModelBreakdownItem {
   model?: string
+  provider?: string
+  capability?: string
+  meters?: UsageMeterSummary[]
+  tokenUnknownItemCount?: number
+  missingCostEntries?: number
   inputTokens?: number
   outputTokens?: number
   cacheReadTokens?: number
@@ -24,6 +29,8 @@ export interface NativeBilledCurrencyTotal {
   usdEquivalentNanos: string
   receiptCount: number
   normalizationRatesNativePerUsd: string[]
+  usdEquivalentExact?: string
+  normalizationSources?: Array<{ source: string; revision: string; rate: string }>
 }
 
 export type NativeBilledByCurrency = Record<string, NativeBilledCurrencyTotal>
@@ -38,6 +45,12 @@ export interface UsageSession {
   displayName?: string
   subject?: string
   derivedTitle?: string
+  taskGroupId?: string
+  sessionEpoch?: number
+  parentSessionId?: string | null
+  parentSessionEpoch?: number | null
+  sessionKind?: string
+  attributionStatus?: string
   createdAt?: number | string
   updatedAt?: number | string
   startedAt?: number | string
@@ -47,6 +60,7 @@ export interface UsageSession {
   cacheReadTokens: number | null
   cacheWriteTokens: number | null
   costUsd: number | null
+  costUsdExact?: string
   billedCostUsd: number | null
   estimatedCostUsd: number | null
   estimatedEventCount: number | null
@@ -71,6 +85,8 @@ export interface UsageDay {
 }
 
 export interface UsageCoverage {
+  attribution?: { status: string; missingEventCount: number; reasonCodes: string[] }
+  measurements?: { tokenUnknownItemCount: number; unknownMeterCount: number }
   status: string
   timeAttribution: string
   pricing: string
@@ -90,6 +106,11 @@ export interface UsageCoverage {
 }
 
 export interface UsageSnapshot {
+  /** Alternative projections of the same calls; never add them to totals. */
+  taskGroups?: UsageTaskGroup[]
+  capabilities?: UsageCapability[]
+  meters?: UsageMeterSummary[]
+  settlementSummary?: UsageSettlementSummary
   source: 'usage_ledger' | 'usage_status'
   mode: UsageAggregationMode
   asOfMs: number
@@ -114,6 +135,57 @@ export interface UsageSnapshot {
    * predates them or the snapshot came from the legacy usage.status fallback).
    */
   fxRatesNativePerUsd?: Record<string, string>
+}
+
+export interface UsageMeterSummary {
+  metric: string
+  unit: string
+  dimensions: Record<string, string>
+  quantity: string
+  unknownCount: number
+  measurementCount: number
+}
+
+export interface UsageSettlementSummary {
+  provider_confirmed: number
+  provider_estimate: number
+  local_estimate: number
+  unknown: number
+}
+
+export type UsageRunRelation = 'self' | 'inline_subagent' | 'subsession' | 'sidechat' | 'unattributed'
+export type UsageBranch = 'self' | 'inlineSubagents' | 'subsessions' | 'sideChats' | 'unattributed'
+
+export interface UsageTaskRun {
+  runId: string
+  sessionId: string
+  sessionEpoch: number
+  parentRunId: string | null
+  relation: UsageRunRelation
+  title: string
+  totals: UsageTotals
+}
+
+export interface UsageTaskGroup {
+  taskGroupId: string
+  rootSessionId: string
+  rootSessionEpoch: number
+  sessionKey: string | null
+  title: string
+  firstUsageAtMs?: number | null
+  lastUsageAtMs?: number | null
+  modelBreakdown?: ModelBreakdownItem[]
+  attributionStatus: string
+  totals: UsageTotals
+  branches: Record<UsageBranch, UsageTotals>
+  runs: UsageTaskRun[]
+}
+
+export interface UsageCapability {
+  capability: string
+  totals: UsageTotals
+  meters: UsageMeterSummary[]
+  tokenUnknownItemCount: number
 }
 
 export interface TableColumn {
@@ -158,6 +230,10 @@ export interface BreakdownRow {
   tokens: number
   cost: number
   share: number
+  capability?: string
+  meters?: UsageMeterSummary[]
+  tokenUnknownItemCount?: number
+  missingCostEntries?: number
   costSource?: string
   costSourceCounts?: Record<string, number>
   costEphemeral?: boolean
@@ -168,6 +244,10 @@ export interface BreakdownRow {
 }
 
 export interface UsageTotals {
+  taskCount?: number
+  costUsdExact?: string
+  billedCostUsdExact?: string
+  estimatedCostUsdExact?: string
   input: number
   output: number
   cost: number

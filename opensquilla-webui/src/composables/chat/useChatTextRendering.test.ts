@@ -1,8 +1,37 @@
 // @vitest-environment happy-dom
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Parser } from 'marked'
 
 import { useChatTextRendering } from './useChatTextRendering'
+
+afterEach(() => vi.restoreAllMocks())
+
+describe('useChatTextRendering failure isolation', () => {
+  it('keeps the complete real 8 MiB single-line body readable when the Markdown lexer overflows', () => {
+    const body = '0123456789abcdef'.repeat(512 * 1024)
+    const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
+    const html = renderMarkdown(body)
+    const host = document.createElement('div')
+    host.innerHTML = html
+    expect(host.textContent === body).toBe(true)
+    expect(host.querySelector('.chat-markdown-plain')).not.toBeNull()
+    expect(markdownCacheStats()).toEqual({ entries: 0, bytes: 0 })
+    expect(renderMarkdown('**Next message**')).toContain('<strong>Next message</strong>')
+  })
+
+  it('falls back to inert original text with line breaks and Unicode, then restores normal highlighting', () => {
+    const { renderMarkdown } = useChatTextRendering()
+    vi.spyOn(Parser, 'parse').mockImplementationOnce(() => { throw new RangeError('parser overflow') })
+    const body = '<img src=x onerror="alert(1)">\n<script>alert(2)</script>\n中🙂 & **bold** $x^2$'
+    const host = document.createElement('div')
+    host.innerHTML = renderMarkdown(body, { highlight: false })
+    expect(host.textContent).toBe(body)
+    expect(host.querySelector('img,script')).toBeNull()
+    expect(host.textContent).not.toContain('\uE000')
+    expect(renderMarkdown('```js\nconst answer = 42\n```')).toContain('hljs-keyword')
+  })
+})
 
 // URI sanitizer regressions run against the real browser DOM in
 // e2e/markdown-reference-safety.spec.ts; happy-dom's Node.prototype.nodeName
@@ -15,14 +44,37 @@ describe('useChatTextRendering math', () => {
     const inline = renderMarkdown('Inline $x^2$ formula')
     const display = renderMarkdown('Block:\n\n$$\\frac{a}{b}$$')
 
-    expect(inline).toContain('class="katex"')
+    // Native browser coverage asserts the outer KaTeX/display wrappers and SVG.
+    // happy-dom drops an outer sanitized span; verify semantic output here.
+    expect(inline).toContain('class="katex-mathml"')
+    expect(inline).toContain('encoding="application/x-tex">x^2</annotation>')
     expect(inline).not.toContain('$x^2$')
-    expect(display).toContain('class="katex-display"')
+    expect(display).toContain('<mfrac>')
     expect(display).not.toContain('$$\\frac{a}{b}$$')
   })
 })
 
 describe('useChatTextRendering cache bounds', () => {
+  it('reuses a large settled answer across projections while keeping render modes separate', () => {
+    const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
+    const parse = vi.spyOn(Parser, 'parse')
+    const body = ('## Answer\n\n```js\nconst answer = 42\n```\n\n' + 'long answer '.repeat(12_000))
+      .slice(0, 128 * 1024)
+    const highlighted = renderMarkdown(body)
+    expect(renderMarkdown(body)).toBe(highlighted)
+    expect(parse).toHaveBeenCalledTimes(1)
+    expect(highlighted).toContain('hljs-keyword')
+    expect(markdownCacheStats().entries).toBe(1)
+    expect(markdownCacheStats().bytes).toBeLessThanOrEqual(1024 * 1024)
+
+    const plain = renderMarkdown(body, { highlight: false })
+    expect(plain).not.toContain('hljs-keyword')
+    expect(renderMarkdown(body, { highlight: false })).toBe(plain)
+    expect(parse).toHaveBeenCalledTimes(2)
+    expect(renderMarkdown(body)).toBe(highlighted)
+    expect(parse).toHaveBeenCalledTimes(2)
+  })
+
   it('never retains growing live prefixes', () => {
     const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
     for (let index = 1; index <= 200; index += 1) {

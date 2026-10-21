@@ -2,6 +2,7 @@ import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync,
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { assertRouterIntegrity, gatewayInputs, writeGatewayBuildRecord } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -9,6 +10,11 @@ const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const pyinstallerWorkDir = join(packageRoot, '.pyinstaller')
+const tokenizerCacheDir = join(pyinstallerWorkDir, 'tiktoken-cache')
+// Match the locked tiktoken cl100k_base constructor and its content checksum.
+const tokenizerUrl = 'https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken'
+const tokenizerSha256 = '223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7'
+const tokenizerCacheKey = createHash('sha1').update(tokenizerUrl).digest('hex')
 const entryPath = join(scriptDir, 'gateway-entry.py')
 const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_ca_trust.py')
 // The WebUI package owns its generated output.  Desktop packaging consumes
@@ -17,6 +23,12 @@ const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_c
 const controlUiDistDir = join(repoRoot, 'opensquilla-webui', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
+// The V4 router ships its implementation as a copied runtime_src tree and
+// imports it only after validating the bundle.  PyInstaller cannot resolve
+// that delayed `src.router.*` import from the normal repository search path;
+// make the runtime root an explicit analysis path so the packaged Gateway
+// contains the same router implementation as the source Gateway.
+const routerRuntimeSrcDir = join(routerBundleDir, 'runtime_src')
 const addDataSeparator = process.platform === 'win32' ? ';' : ':'
 const gitLfsPointerHeader = 'version https://git-lfs.github.com/spec/v1'
 const gatewayUvArgs = [
@@ -297,6 +309,14 @@ function externalizeControlUiArtifact() {
   }
 }
 
+const gatewayBuildStarted = performance.now()
+function recordStage(stage, started) {
+  console.log(`[gateway-build-timing] ${JSON.stringify({
+    stage,
+    seconds: Number(((performance.now() - started) / 1000).toFixed(3)),
+  })}`)
+}
+
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
 assertRouterIntegrity(routerBundleDir)
@@ -314,6 +334,28 @@ const freezeRegistry = spawnSync('uv', [
 if (freezeRegistry.error) throw freezeRegistry.error
 if (freezeRegistry.status !== 0) {
   throw new Error(`Migration registry build failed: ${freezeRegistry.stderr || freezeRegistry.stdout}`)
+}
+
+// Package the cache as well as the dynamically discovered encoding plugin.
+// A fresh/offline Desktop must not depend on the user's first-run network.
+const prepareTokenizer = spawnSync('uv', [
+  ...gatewayUvArgs, 'python', '-c', [
+    'import hashlib, pathlib, sys, urllib.request',
+    'target, url, expected = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]',
+    'data = target.read_bytes() if target.is_file() else b""',
+    'if hashlib.sha256(data).hexdigest() != expected:',
+    '    with urllib.request.urlopen(url, timeout=60) as response:',
+    '        data = response.read()',
+    '    if hashlib.sha256(data).hexdigest() != expected:',
+    '        raise ValueError("cl100k_base encoding checksum mismatch")',
+    '    target.parent.mkdir(parents=True, exist_ok=True)',
+    '    target.write_bytes(data)',
+    'print("Verified offline cl100k_base encoding asset.")',
+  ].join('\n'), join(tokenizerCacheDir, tokenizerCacheKey), tokenizerUrl, tokenizerSha256,
+], { cwd: repoRoot, encoding: 'utf8', windowsHide: true, timeout: 120000 })
+if (prepareTokenizer.error) throw prepareTokenizer.error
+if (prepareTokenizer.status !== 0) {
+  throw new Error(`Tokenizer asset preparation failed: ${prepareTokenizer.stderr || prepareTokenizer.stdout}`)
 }
 
 const lightgbmBinaryArgs = addBinaryArg(
@@ -355,6 +397,13 @@ const args = [
   'reportlab',
   '--collect-data',
   'certifi',
+  '--paths',
+  routerRuntimeSrcDir,
+  // `src.router` is a data-backed runtime tree, not an application module.
+  // Excluding the top-level namespace prevents PyInstaller's meta-path
+  // importer from shadowing the bundle path at runtime.
+  '--exclude-module',
+  'src',
   '--hidden-import',
   'certifi',
   '--collect-binaries',
@@ -397,6 +446,8 @@ const args = [
   '--hidden-import',
   'tiktoken',
   '--hidden-import',
+  'tiktoken_ext.openai_public',
+  '--hidden-import',
   'onnxruntime',
   '--hidden-import',
   'mcp',
@@ -404,6 +455,8 @@ const args = [
   'yoyo.backends.core.sqlite3',
   '--runtime-hook',
   caRuntimeHookPath,
+  '--add-data',
+  `${join(tokenizerCacheDir, tokenizerCacheKey)}${addDataSeparator}tiktoken-cache`,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
   '--add-data',
@@ -413,6 +466,8 @@ const args = [
   entryPath,
 ]
 
+recordStage('prepare', gatewayBuildStarted)
+const freezeStarted = performance.now()
 const result = spawnSync('uv', args, {
   cwd: repoRoot,
   env: {
@@ -430,9 +485,13 @@ if (result.error) {
 if (result.status !== 0) {
   process.exit(result.status ?? 1)
 }
+recordStage('pyinstaller', freezeStarted)
 
+const externalizeStarted = performance.now()
 patchMacLightgbmRuntime()
 externalizeControlUiArtifact()
+recordStage('externalize-ui', externalizeStarted)
+const inventoryStarted = performance.now()
 const dependencyInventory = spawnSync('uv', [
   ...gatewayUvArgs, 'python', join(repoRoot, 'scripts', 'release_dependency_inventory.py'),
   '--repo', repoRoot, '--kind', 'pyinstaller',
@@ -441,4 +500,8 @@ const dependencyInventory = spawnSync('uv', [
 ], { cwd: repoRoot, stdio: 'inherit', windowsHide: true })
 if (dependencyInventory.error) throw dependencyInventory.error
 if (dependencyInventory.status !== 0) process.exit(dependencyInventory.status ?? 1)
+recordStage('dependency-inventory', inventoryStarted)
+const provenanceStarted = performance.now()
 writeGatewayBuildRecord(repoRoot, runtimeGatewayDir, buildInputs)
+recordStage('provenance', provenanceStarted)
+recordStage('total', gatewayBuildStarted)

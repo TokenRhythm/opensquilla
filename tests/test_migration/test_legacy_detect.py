@@ -55,6 +55,7 @@ def test_live_cli_home_is_never_offered(
     fake_home = tmp_path / "userhome"
     legacy = _make_home(fake_home / ".opensquilla")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("APPDATA", raising=False)
 
     assert detect_legacy_home(legacy) is None
 
@@ -67,6 +68,7 @@ def test_default_target_honors_state_dir_env(
     fake_home = tmp_path / "userhome"
     legacy = _make_home(fake_home / ".opensquilla")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("APPDATA", raising=False)
 
     # Relocated install (e.g. a desktop spawn): ~/.opensquilla is a candidate.
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "relocated-home"))
@@ -240,6 +242,7 @@ def test_portable_fallback_offers_newest_candidate(
     fake_home = tmp_path / "userhome"
     fake_home.mkdir()  # no ~/.opensquilla: the cli-home probe finds nothing
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("APPDATA", raising=False)
     base = tmp_path / "appdata-local"
     older = _make_home(base / "OpenSquilla" / "portable" / "dummy-release-a")
     newer = _make_home(base / "OpenSquilla" / "portable" / "dummy-release-b")
@@ -261,6 +264,7 @@ def test_portable_fallback_keeps_distinct_paths_when_identity_is_unavailable(
     fake_home = tmp_path / "userhome"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("APPDATA", raising=False)
     base = tmp_path / "appdata-local"
     older = _make_home(base / "OpenSquilla" / "portable" / "dummy-release-a")
     newer = _make_home(base / "OpenSquilla" / "portable" / "dummy-release-b")
@@ -283,6 +287,7 @@ def test_portable_candidate_that_is_the_target_is_skipped(
     fake_home = tmp_path / "userhome"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("APPDATA", raising=False)
     base = tmp_path / "appdata-local"
     live = _make_home(base / "OpenSquilla" / "portable" / "dummy-release-a")
     monkeypatch.setenv("LOCALAPPDATA", str(base))
@@ -298,6 +303,7 @@ def test_old_portable_marker_does_not_hide_candidates(
     fake_home = tmp_path / "userhome"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.delenv("APPDATA", raising=False)
     base = tmp_path / "appdata-local"
     imported = _make_home(base / "OpenSquilla" / "portable" / "dummy-release-a")
     monkeypatch.setenv("LOCALAPPDATA", str(base))

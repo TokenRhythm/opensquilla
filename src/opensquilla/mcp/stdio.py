@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opensquilla import __version__
 from opensquilla.mcp.sdk_client import SDKMCPClient
 from opensquilla.mcp.types import MCPServerConfig
+
+if TYPE_CHECKING:
+    from opensquilla.process_tree import ProcessTreeOwner
 
 
 class MCPStdioClient(SDKMCPClient):
@@ -23,6 +26,7 @@ class MCPStdioClient(SDKMCPClient):
     def __init__(self, config: MCPServerConfig) -> None:
         super().__init__(config)
         self._process: asyncio.subprocess.Process | None = None
+        self._process_owner: ProcessTreeOwner | None = None
         self._readahead = b""
 
     def _make_sdk_client(self) -> Any:
@@ -49,13 +53,27 @@ class MCPStdioClient(SDKMCPClient):
         # Shield spawn until the child reference is retained and cleanup installed.
         try:
             with anyio.CancelScope(shield=True):
-                self._process = await asyncio.create_subprocess_exec(
+                from opensquilla.desktop_process_cleanup import desktop_process_scope
+
+                spawn: Callable[..., Awaitable[asyncio.subprocess.Process]] = (
+                    asyncio.create_subprocess_exec
+                )
+                desktop_owned = desktop_process_scope(None) is not None
+                if desktop_owned:
+                    from opensquilla.process_tree import create_owned_subprocess_exec
+
+                    spawn = create_owned_subprocess_exec
+                self._process = await spawn(
                     self.config.command,
                     *self.config.args,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     env={**os.environ, **self.config.env},
                 )
+                if desktop_owned:
+                    from opensquilla.process_tree import capture_process_tree_owner
+
+                    self._process_owner = capture_process_tree_owner(self._process, isolated=True)
             process = self._process
             assert process is not None
             assert process.stdin is not None
@@ -110,12 +128,14 @@ class MCPStdioClient(SDKMCPClient):
                 await self._terminate_process()
 
     async def _terminate_process(self) -> None:
-        """Terminate and reap the direct child, including during cancellation."""
+        """Terminate and reap the child and any retained Desktop process ownership."""
         import anyio
 
         with anyio.CancelScope(shield=True):
             process = self._process
+            owner = self._process_owner
             self._process = None
+            self._process_owner = None
             self._readahead = b""
             if process is None:
                 return
@@ -131,7 +151,14 @@ class MCPStdioClient(SDKMCPClient):
 
             drain = asyncio.create_task(drain_stdout())
             try:
-                if process.returncode is None:
+                if owner is not None:
+                    complete = await owner.terminate(
+                        graceful_timeout=self._CLOSE_TIMEOUT_SECONDS,
+                        kill_timeout=self._CLOSE_TIMEOUT_SECONDS,
+                    )
+                    if not complete:
+                        raise RuntimeError("MCP owned process cleanup could not be confirmed")
+                elif process.returncode is None:
                     try:
                         process.terminate()
                     except ProcessLookupError:

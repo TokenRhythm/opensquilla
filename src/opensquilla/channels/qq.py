@@ -308,17 +308,14 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
 
     async def on_c2c_message_create(self, message: Any) -> None:  # noqa: D401
         """Dispatched by ``botpy`` for direct (C2C) messages."""
-        self._enqueue_message(message, is_group=False)
+        await self._enqueue_message(message, is_group=False)
 
     async def on_group_at_message_create(self, message: Any) -> None:  # noqa: D401
         """Dispatched by ``botpy`` for group ``@bot`` messages."""
-        self._enqueue_message(message, is_group=True)
+        await self._enqueue_message(message, is_group=True)
 
-    def _enqueue_message(self, raw: Any, *, is_group: bool) -> None:
+    async def _enqueue_message(self, raw: Any, *, is_group: bool) -> None:
         msg_id = getattr(raw, "id", None) or ""
-        if msg_id and not self._dedupe.check_and_add(msg_id):
-            log.debug("qq.dedup_drop", msg_id=msg_id, is_group=is_group)
-            return
 
         author = getattr(raw, "author", None)
         if is_group:
@@ -360,7 +357,7 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         )
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, msg, self._inbound_queue)
+        await self._dedupe.run_once(msg_id, lambda: durable_enqueue(self, msg, self._inbound_queue))
         self._msg_count += 1
         self._last_message_at = datetime.now(UTC)
         log.debug(

@@ -19,12 +19,6 @@ describe('skill task prefill', () => {
     expect(prepareSkillTaskPrefill({ name: candidate.name, instance_id: 'other' }, [candidate])).toBeNull()
     expect(prepareSkillTaskPrefill({ name: candidate.name, active: false }, [candidate])).toBeNull()
   })
-  it('prefills the existing meta command without launching the workflow', () => {
-    expect(prepareSkillTaskPrefill({ name: 'meta-synthetic', kind: 'meta', status: 'needs_setup' }, []))
-      .toEqual({ prefill: '/meta meta-synthetic ', selectedSkillPrefill: [], autosend: false })
-    expect(prepareSkillTaskPrefill({ name: 'meta-synthetic\n/new', kind: 'meta' }, [])).toBeNull()
-    expect(prepareSkillTaskPrefill({ name: 'meta-synthetic', kind: 'meta', disabled: true }, [])).toBeNull()
-  })
   it('accepts only one complete reference from route state and copies it', () => {
     const skill = { name: candidate.name, instanceId: candidate.instanceId, digest: candidate.digest }
     const state = { selectedSkillPrefill: [skill] }

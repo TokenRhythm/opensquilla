@@ -2654,7 +2654,10 @@ async def test_apply_supports_storage_paths_longer_than_legacy_windows_limits(
     deep_root = tmp_path.joinpath(
         *(f"profile-import-segment-{index:02d}" for index in range(14))
     )
-    _prepare_baseline(deep_root)
+    assert len(str(deep_root)) > 260
+    # Only fixture I/O uses the native spelling; the service still receives
+    # the original long logical paths on systems without LongPathsEnabled.
+    _prepare_baseline(Path(profile_import_io.native_io_path(deep_root)))
     service = _service(
         deep_root,
         [
@@ -2673,7 +2676,8 @@ async def test_apply_supports_storage_paths_longer_than_legacy_windows_limits(
     )
     await service.apply(preview.preview_id, preview.candidate_hash, "long-path-apply")
 
-    assert "Likes tea." in _paths(deep_root).user_path.read_text(encoding="utf-8")
+    user_path = Path(profile_import_io.native_io_path(_paths(deep_root).user_path))
+    assert "Likes tea." in user_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -2826,3 +2830,33 @@ async def test_maintenance_removes_expired_raw_and_committed_transaction_tempora
     assert not transaction_temporary.exists()
     assert not raw_temporary.exists()
     assert not locator_temporary.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound long-path contract")
+def test_long_profile_read_preserves_no_follow_and_identity_checks(tmp_path, monkeypatch):
+    deep_root = tmp_path.joinpath(
+        *(f"profile-import-segment-{index:02d}" for index in range(14))
+    )
+    assert len(str(deep_root)) > 260
+    _prepare_baseline(Path(profile_import_io.native_io_path(deep_root)))
+    paths = _paths(deep_root)
+    native_target = profile_import_io.native_io_path(paths.user_path)
+    real_stat = profile_import_io.os.stat
+    checks = []
+
+    def changed_identity(path, *args, **kwargs):
+        value = real_stat(path, *args, **kwargs)
+        if os.fspath(path) == native_target:
+            checks.append(kwargs.get("follow_symlinks"))
+            if len(checks) == 2:
+                fields = list(value)
+                fields[stat.ST_INO] += 1
+                return os.stat_result(fields)
+        return value
+
+    monkeypatch.setattr(profile_import_io.os, "stat", changed_identity)
+    with pytest.raises(ProfileImportWriteError) as failure:
+        profile_import_files.read_text_image(paths.agent_workspace_dir, paths.user_path)
+    assert checks == [False, False]
+    assert "changed while it was pinned" in str(failure.value.__cause__)
+    assert Path(native_target).read_text(encoding="utf-8") == "# User\nAlice\n"

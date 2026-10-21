@@ -5,6 +5,8 @@ import type {
   GatewayConnectionHealth,
   GatewayConnectionPhase,
   GatewayRunModePolicy,
+  HostExecuteUnavailableReason,
+  SupportBundleUnavailableReason,
 } from '@/modules/gatewayAccess'
 import { SESSIONS_MESSAGES_HYDRATE_METHOD } from '@/contracts/generated/v4/sessionsMessagesHydrate'
 import {
@@ -22,9 +24,12 @@ interface GatewayAccessSource {
   readonly resumeSource?: import('@/platform/types').DesktopResumeSource | null
   readonly runtimeStarting?: boolean
   readonly error: string | null
+  readonly lifecycle?: 'stopped' | 'connecting' | 'connected' | 'recovering' | 'blocked'
   readonly isLocalOwner: boolean
+  getConnectionEndpoint(): string | null
   readonly canManageProjectWorkspaces: boolean
   readonly canChooseProject: boolean
+  readonly canCreateProjectWorkspace?: boolean
   readonly auth: Record<string, unknown> | null
   readonly policy: Record<string, unknown> | null
   readonly connectionGeneration: number
@@ -52,6 +57,50 @@ function connectionEndpoint(): string {
     return localStorage.getItem(WS_URL_KEY) || defaultGatewayEndpoint()
   } catch {
     return defaultGatewayEndpoint()
+  }
+}
+
+function connectedGatewayHost(source: GatewayAccessSource): string | null {
+  if (
+    source.state !== 'connected' || source.health !== 'healthy' || source.isResuming
+    || (source.phase !== undefined && source.phase !== 'healthy')
+  ) return null
+  try {
+    const endpoint = source.getConnectionEndpoint()
+    if (!endpoint) return null
+    const target = new URL(endpoint)
+    return ['ws:', 'wss:'].includes(target.protocol) ? target.host : null
+  } catch {
+    return null
+  }
+}
+
+function supportBundleUnavailableReason(source: GatewayAccessSource): SupportBundleUnavailableReason {
+  if (
+    source.state !== 'connected' || source.health !== 'healthy' || source.isResuming
+    || (source.phase !== undefined && source.phase !== 'healthy')
+  ) return 'disconnected'
+  if (!source.isLocalOwner) return 'permission'
+  try {
+    const endpoint = source.getConnectionEndpoint()
+    if (!endpoint) return 'differentGateway'
+    const target = new URL(endpoint)
+    if (
+      !['ws:', 'wss:'].includes(target.protocol)
+      || target.username || target.password || target.hash
+    ) return 'differentGateway'
+    const page = new URL(globalThis.location.href)
+    // The private Desktop scheme is proxied by the main process to its current
+    // authoritative Gateway. It must never be compared to the remote WS origin.
+    if (
+      page.protocol === 'opensquilla-app:' && page.hostname === 'desktop'
+      && !(page.port || page.username || page.password)
+    ) return null
+    target.protocol = target.protocol === 'wss:' ? 'https:' : 'http:'
+    return ['http:', 'https:'].includes(page.protocol) && target.origin === page.origin
+      ? null : 'differentGateway'
+  } catch {
+    return 'differentGateway'
   }
 }
 
@@ -143,6 +192,23 @@ function streamIdleTimeoutMs(policy: GatewayAccessSource['policy']): number | nu
     : null
 }
 
+function hostExecuteUnavailableReason(source: GatewayAccessSource): HostExecuteUnavailableReason {
+  // Terminal RPCs are connection-owned and require a live, healthy WebSocket.
+  // Keep the projection fail-closed while a new Hello is pending or transport
+  // recovery is still checking liveness.
+  if (
+    source.state !== 'connected' || source.health !== 'healthy' || source.isResuming
+    || (source.phase !== undefined && source.phase !== 'healthy')
+  ) return 'disconnected'
+  const principal = objectValue(source.auth?.principal)
+  // `_state=connected` can precede the Hello frame on a fresh socket. Treat
+  // that short bootstrap window as unavailable rather than as a permission
+  // denial so the menu does not flash an incorrect authorization message.
+  if (!principal) return 'disconnected'
+  const capabilities = authoritySet(principal?.capabilities)
+  return capabilities?.includes('host.execute') ? null : 'permission'
+}
+
 /** Project v4 transport/hello state into semantic application capabilities. */
 export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAccess {
   return {
@@ -168,14 +234,29 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     get connectionError() {
       return source.error
     },
+    get connectionBlocked() {
+      return source.lifecycle === 'blocked'
+    },
+    get connectedGatewayHost() {
+      return connectedGatewayHost(source)
+    },
     get requiresCredential() {
       return source.error === 'authentication_failed' || source.error === 'authentication_mismatch'
     },
     get isAvailable() {
       return source.state === 'connected'
     },
+    get canExecuteHost() {
+      return hostExecuteUnavailableReason(source) === null
+    },
+    get hostExecuteUnavailableReason() {
+      return hostExecuteUnavailableReason(source)
+    },
     get isLocalOwner() {
       return source.isLocalOwner
+    },
+    get supportBundleUnavailableReason() {
+      return supportBundleUnavailableReason(source)
     },
     get isAuthenticated() {
       return authenticated(source.auth)
@@ -191,6 +272,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     },
     get canChooseProject() {
       return source.canChooseProject
+    },
+    get canCreateProjectWorkspace() {
+      return source.canCreateProjectWorkspace === true
     },
     get runModePolicy() {
       return runModePolicy(source.auth)

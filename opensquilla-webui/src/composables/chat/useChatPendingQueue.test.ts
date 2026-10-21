@@ -1,4 +1,4 @@
-import { nextTick, ref } from 'vue'
+import { effectScope, nextTick, reactive, ref, toRaw, watch } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -7,10 +7,14 @@ import {
 } from './useChatPendingQueue'
 import { useChatAttachments } from './useChatAttachments'
 import { useChatCompaction } from './useChatCompaction'
+import { useLocalPathDraft } from './useLocalPathDraft'
+import { useVisualizeDraft } from '@/visualize/useVisualizeDraft'
+import type { VisualizeReceipt } from '@/visualize/types'
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
-import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
+import type { Attachment, ChatPendingItem } from '@/types/chat'
+import { ParkedPendingQueueCache } from '@/utils/chat/parkedPendingQueueCache'
 import {
   createPendingInputWal,
   type PendingInputWal,
@@ -32,11 +36,6 @@ function makeQueue(
     'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
   >,
   isBlocked: () => boolean = () => false,
-  dispatchHiddenControl?: (
-    item: ChatPendingItem,
-    ownerSessionKey: string,
-  ) => Promise<'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'>,
-  onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean,
   overrides: QueueTestOverrides = {},
 ) {
   const sessionKey = ref('agent:main:webchat:test')
@@ -73,8 +72,6 @@ function makeQueue(
     resetInputHistory: vi.fn(),
     hasComposer: () => true,
     dispatchPendingItem,
-    dispatchHiddenControl,
-    onHiddenControlDispatchResult,
     pendingInputWal: defaultWal,
     pendingInputQueue: compatibilityQueue,
     ...safeOverrides,
@@ -99,7 +96,207 @@ function pendingUiId(
   return id!
 }
 
+describe('annotation queue recovery', () => {
+  it('never takes an annotation context back as plain composer text', async () => {
+    const h = makeQueue(undefined, () => true)
+    h.inputText.value = 'Keep this unsent message'
+    await h.queue.enqueuePendingPayload({ text: '', pageContext: { resourceId: 'document:one', annotations: [{ text: 'Make this larger' }] }, draftIds: ['one'] })
+    expect(h.queue.popPendingTail()).toBe(false)
+    expect(h.queue.popAllPendingIntoComposer()).toBe(false)
+    expect(h.inputText.value).toBe('Keep this unsent message')
+    expect(h.queue.pendingQueue.value[0].pageContext?.annotations?.[0].text).toBe('Make this larger')
+    h.queue.cleanup()
+  })
+
+  it('restores the full snapshot only after durable cancellation without consuming the composer', async () => {
+    const h = makeQueue(undefined, () => true)
+    h.inputText.value = 'unrelated'
+    await h.queue.enqueuePendingPayload({ text: '', pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change it', locatorHint: 'h1' }] }, draftIds: ['one'] })
+    const restore = vi.fn()
+    expect(await h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), restore)).toBe(true)
+    expect(restore).toHaveBeenCalledWith(expect.objectContaining({ pageContext: expect.objectContaining({ annotations: [{ text: 'Change it', locatorHint: 'h1' }] }) }))
+    expect(h.inputText.value).toBe('unrelated')
+    expect(h.queue.pendingQueue.value).toEqual([])
+    h.queue.cleanup()
+  })
+
+  it('restores annotation text, paths, attachments and skills alongside the existing composer', async () => {
+    const draft = useLocalPathDraft()
+    const selectedSkills = ref([{ name: 'existing-skill', instanceId: 'existing', digest: 'one' }])
+    const queuedSkill = { name: 'queued-skill', instanceId: 'queued', digest: 'two' }
+    const queuedAttachment: Attachment = { kind: 'inline', local_id: 1, name: 'queued.txt', mime: 'text/plain', data: 'cXVldWVk' }
+    const currentAttachment: Attachment = { kind: 'inline', local_id: 2, name: 'current.txt', mime: 'text/plain', data: 'Y3VycmVudA==' }
+    const queuedPath = 'C:\\资料\\queued.docx'
+    const currentPath = 'C:\\资料\\current.xlsx'
+    const h = makeQueue(undefined, () => true, { inputText: draft.inputText,
+      localPathReferences: draft.localPaths, restoreInput: draft.restoreInput, selectedSkills })
+    try {
+      expect(await h.queue.enqueuePendingPayload({ text: `Queued explanation\n${queuedPath}`, localPathReferences: [queuedPath],
+        selectedSkills: [queuedSkill], attachments: [queuedAttachment], intent: 'queued-intent',
+        pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change the title' }] } })).toBe(true)
+      draft.restoreInput(`Current explanation\n${currentPath}`, [currentPath])
+      h.pendingAttachments.value = [currentAttachment]
+      h.pendingSessionIntent.value = 'current-intent'
+      const restore = vi.fn()
+      expect(await h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), restore)).toBe(true)
+      expect(draft.composerText.value).toBe('Queued explanation\nCurrent explanation')
+      expect(draft.localPaths.value).toEqual([queuedPath, currentPath])
+      expect(h.pendingAttachments.value.map(item => item.name)).toEqual(['queued.txt', 'current.txt'])
+      expect(selectedSkills.value.map(item => item.name)).toEqual(['existing-skill', 'queued-skill'])
+      expect(h.pendingSessionIntent.value).toBe('current-intent')
+      expect(restore).toHaveBeenCalledOnce()
+      expect(h.sendCurrentInput).not.toHaveBeenCalled()
+      expect(h.queue.pendingQueue.value).toEqual([])
+    } finally { h.queue.cleanup() }
+  })
+
+  it.each(['session', 'composer'] as const)('retains the canceled annotation queue item if %s ownership changes during cancellation', async changed => {
+    const { wal } = memoryWal()
+    const h = makeQueue(undefined, () => true, { pendingInputWal: wal })
+    try {
+      await h.queue.enqueuePendingPayload({ text: 'Queued explanation',
+        pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change the title' }] } })
+      h.inputText.value = 'Existing composer'
+      const originalPut = vi.mocked(wal.put).getMockImplementation()!
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const writing = vi.spyOn(wal, 'put').mockImplementation(async record => {
+        if (record.state === 'cancelling') await gate
+        await originalPut(record)
+      })
+      const restore = vi.fn()
+      const result = h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), restore)
+      await vi.waitFor(() => expect(writing).toHaveBeenCalled())
+      if (changed === 'session') h.sessionKey.value = 'agent:main:webchat:other'
+      else h.inputText.value = 'New composer typed while canceling'
+      release()
+      expect(await result).toBe(false)
+      expect(restore).not.toHaveBeenCalled()
+      expect(h.inputText.value).toBe(changed === 'session' ? 'Existing composer' : 'New composer typed while canceling')
+      expect(h.queue.pendingQueue.value[0]).toMatchObject({ text: 'Queued explanation', pendingRetainAfterCancel: true })
+    } finally { h.queue.cleanup() }
+  })
+
+  it('keeps the full canceled queue payload when restoring the annotation snapshot fails', async () => {
+    const h = makeQueue(undefined, () => true)
+    try {
+      await h.queue.enqueuePendingPayload({ text: 'Keep all material',
+        pageContext: { resourceId: 'document:one', annotations: [{ text: 'Change the title' }] } })
+      h.inputText.value = 'Current composer'
+      await expect(h.queue.restoreQueuedAnnotations(pendingUiId(h.queue, 0), () => {
+        throw new Error('Annotation storage unavailable')
+      })).rejects.toThrow('Annotation storage unavailable')
+      expect(h.inputText.value).toBe('Current composer')
+      expect(h.queue.pendingQueue.value[0]).toMatchObject({ text: 'Keep all material', pendingRetainAfterCancel: true })
+    } finally { h.queue.cleanup() }
+  })
+})
+
+describe('queued project initialization intent', () => {
+  const turnCommand = { name: 'project.init' as const, args: 'preserve existing notes' }
+
+  it('persists command intent through WAL, Gateway staging, and hydration', async () => {
+    const wal = memoryWal()
+    const call = vi.fn(async () => ({ requestFingerprint: 'init-fingerprint', revision: 1 }))
+    const h = makeQueue(undefined, () => true, {
+      rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
+      pendingInputWal: wal.wal, supportsTurnCommand: async () => true,
+    })
+    h.inputText.value = '/init preserve existing notes'
+    try {
+      expect(await h.queue.enqueuePendingInput(h.inputText.value, undefined, { turnCommand })).toBe(true)
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged'))
+      expect(call).toHaveBeenCalledWith('sessions.pending_inputs.enqueue', expect.objectContaining({ turnCommand }))
+      expect((await wal.wal.list(h.sessionKey.value))[0]?.turnCommand).toEqual(turnCommand)
+    } finally { h.queue.cleanup() }
+    const restored = makeQueue(undefined, () => true, { pendingInputWal: wal.wal })
+    try {
+      await restored.queue.hydratePendingQueue()
+      expect(restored.queue.pendingQueue.value[0]?.turnCommand).toEqual(turnCommand)
+    } finally { restored.queue.cleanup() }
+  })
+
+  it('keeps a saved command local when the current Gateway lacks its catalog capability', async () => {
+    const wal = memoryWal()
+    const call = vi.fn()
+    const h = makeQueue(undefined, () => true, {
+      rpc: { call }, hasRpcMethod: () => true, pendingInputWal: wal.wal,
+      supportsTurnCommand: async () => false,
+    })
+    try {
+      await h.queue.enqueuePendingInput('/init', undefined, { turnCommand })
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only'))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect((await wal.wal.list(h.sessionKey.value))[0]?.turnCommand).toEqual(turnCommand)
+    } finally { h.queue.cleanup() }
+  })
+
+  it('keeps a command locally owned if support is revoked during its admission WAL write', async () => {
+    const wal = memoryWal()
+    const call = vi.fn()
+    const supports = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false)
+    const h = makeQueue(undefined, () => true, {
+      rpc: { call }, hasRpcMethod: () => true, pendingInputWal: wal.wal,
+      supportsTurnCommand: supports,
+    })
+    try {
+      await h.queue.enqueuePendingInput('/init', undefined, { turnCommand })
+      await vi.waitFor(() => expect(supports).toHaveBeenCalledTimes(2))
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('local_only'))
+      expect(call.mock.calls.some(([method]) => method === 'sessions.pending_inputs.enqueue')).toBe(false)
+      expect((await wal.wal.list(h.sessionKey.value))[0]).toMatchObject({
+        state: 'local_only', mayHaveServerCopy: false, turnCommand,
+      })
+    } finally { h.queue.cleanup() }
+  })
+})
+
 describe('manual compaction with the real pending composer queue', () => {
+  it('persists explicit path metadata in the WAL and restores chips without duplicate paths', async () => {
+    const path = 'C:\\资料\\book.pdf'
+    const otherPath = 'C:\\draft.html'
+    const draft = useLocalPathDraft()
+    const wal = memoryWal()
+    const h = makeQueue(undefined, () => false, {
+      inputText: draft.inputText, localPathReferences: draft.localPaths,
+      restoreInput: draft.restoreInput, pendingInputWal: wal.wal,
+    })
+    try {
+      draft.restoreInput(`Read\n${path}`, [path])
+      expect(await h.queue.enqueuePendingInput(draft.inputText.value)).toBe(true)
+      expect(draft.inputText.value).toBe('')
+      expect((await wal.wal.list(h.sessionKey.value))[0]?.localPathReferences).toEqual([path])
+      draft.restoreInput(`Compare\n${otherPath}`, [otherPath])
+      expect(h.queue.popAllPendingIntoComposer()).toBe(true)
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value).toEqual([]))
+      expect(draft.composerText.value).toBe('Compare\nRead')
+      expect(draft.localPaths.value).toEqual([otherPath, path])
+      expect(draft.inputText.value).toBe(`Compare\nRead\n${otherPath}\n${path}`)
+    } finally { h.queue.cleanup() }
+  })
+
+  it('retains path chips across queue hydration and tail editing', async () => {
+    const path = '/tmp/book.pdf'
+    const wal = memoryWal()
+    const first = makeQueue(undefined, () => false, { pendingInputWal: wal.wal })
+    await first.queue.enqueuePendingPayload({ text: `Read\n${path}`, localPathReferences: [path] })
+    first.queue.cleanup()
+    const draft = useLocalPathDraft()
+    const second = makeQueue(undefined, () => false, {
+      inputText: draft.inputText, localPathReferences: draft.localPaths,
+      restoreInput: draft.restoreInput, pendingInputWal: wal.wal,
+    })
+    try {
+      await second.queue.hydratePendingQueue()
+      expect(second.queue.pendingQueue.value[0]?.localPathReferences).toEqual([path])
+      expect(second.queue.popPendingTail()).toBe(true)
+      await vi.waitFor(() => expect(second.queue.pendingQueue.value).toEqual([]))
+      expect(draft.composerText.value).toBe('Read')
+      expect(draft.localPaths.value).toEqual([path])
+      expect(draft.inputText.value).toBe(`Read\n${path}`)
+    } finally { second.queue.cleanup() }
+  })
+
   it.each(['summary_replay_incomplete', 'summary_does_not_fit', 'cancelled', 'compaction_deadline_exceeded', 'gateway_restarted'])(
     'returns queued drafts to the composer after %s without sending them', async reason => {
       let compact: ReturnType<typeof useChatCompaction> | undefined
@@ -115,7 +312,7 @@ describe('manual compaction with the real pending composer queue', () => {
         expect(await h.queue.enqueuePendingInput(h.inputText.value)).toBe(true)
         h.inputText.value = 'Still editing'
         expect(h.queue.pendingQueue.value).toHaveLength(1)
-        compact.showCompactionToast({ source: 'manual', status: 'failed', reason, compaction_id: 'cmp-draft' })
+        compact.showCompactionToast({ source: 'manual', status: 'failed', reason, refused: true, compaction_id: 'cmp-draft' })
         await nextTick()
         expect(compact.isCompactInFlightForCurrentSession()).toBe(false)
         await vi.waitFor(() => expect(h.queue.pendingQueue.value).toEqual([]))
@@ -214,6 +411,97 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
   return { records, handoffs, wal }
 }
 
+describe('parked queue Vue boundary', () => {
+  const cache = () => new ParkedPendingQueueCache({
+    unwrapObject: toRaw, isPinned: () => false, isUrlRetained: () => false,
+  })
+
+  it.each([false, true])('preserves commit identity across raw/proxy boundaries (commit proxy=%s)', commitProxy => {
+    const target = cache()
+    const raw: ChatPendingItem = { pendingUiId: 'proxy-draft', pendingInputId: 'proxy-draft',
+      text: 'x'.repeat(9 * 1024 * 1024), intent: null, attachments: [] }
+    const proxy = reactive(raw)
+    const committed = commitProxy ? proxy : raw
+    target.rememberCommitted(committed, target.snapshotForCommit(committed))
+    target.set('synthetic-session', [commitProxy ? raw : proxy])
+    expect(target.size).toBe(0)
+  })
+
+  it('counts nested raw/proxy aliases and their shared Blob once per session', () => {
+    const attachment: Attachment = { kind: 'staged', local_id: 1, name: 'synthetic.txt', mime: 'text/plain',
+      file: new File(['synthetic bytes'], 'synthetic.txt') }
+    const raw: ChatPendingItem = { pendingUiId: 'shared-blob', text: 'draft', intent: null,
+      attachments: [attachment, attachment] }
+    const plain = cache()
+    plain.set('synthetic-session', [raw, raw])
+    const mixed = cache()
+    mixed.set('synthetic-session', [raw, reactive(raw)])
+    expect(mixed.usage()).toEqual(plain.usage())
+    expect(mixed.usage().blobBytes).toBe(attachment.file!.size)
+    expect(toRaw(mixed.get('synthetic-session')![1]!)).toBe(raw)
+  })
+})
+
+it('bounds 500 parked sessions and restores an evicted draft with its original WAL identities', async () => {
+  const { wal, records } = memoryWal()
+  const h = makeQueue(undefined, () => true, { pendingInputWal: wal })
+  const firstSession = h.sessionKey.value
+  let firstId = ''
+  try {
+    for (let i = 0; i < 500; i++) {
+      expect(await h.queue.enqueuePendingPayload({ text: `Synthetic draft ${i}`, draftIds: [`draft-${i}`] })).toBe(true)
+      if (i === 0) firstId = h.queue.pendingQueue.value[0]!.pendingInputId!
+      const next = `agent:main:webchat:cache-${i + 1}`
+      await h.queue.switchPendingQueue(next)
+      h.sessionKey.value = next
+      await nextTick()
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    }
+    expect(h.queue.getParkedQueueUsage()).toMatchObject({ sessions: 16, protectedSessions: 0 })
+    expect(records.size).toBe(500)
+    const original = structuredClone(records.get(firstId))
+    await h.queue.switchPendingQueue(firstSession)
+    h.sessionKey.value = firstSession
+    await nextTick()
+    await h.queue.hydratePendingQueue(firstSession)
+    expect(h.queue.pendingQueue.value).toHaveLength(1)
+    expect(h.queue.pendingQueue.value[0]).toMatchObject({
+      pendingInputId: firstId, text: 'Synthetic draft 0', draftIds: ['draft-0'],
+      pendingClientRequestId: original!.clientRequestId,
+      pendingClientMessageId: original!.clientMessageId,
+    })
+    expect(wal.delete).not.toHaveBeenCalled()
+  } finally { h.queue.cleanup() }
+})
+
+it('retains an inactive in-flight delivery under cache pressure without changing its object identity', async () => {
+  const h = makeQueue(undefined, () => true)
+  const firstSession = h.sessionKey.value
+  try {
+    expect(await h.queue.enqueuePendingPayload({ text: 'Synthetic in-flight input' })).toBe(true)
+    const id = h.queue.pendingQueue.value[0]!.pendingUiId!
+    const active = h.queue.beginPendingDelivery(id)!
+    expect(active).toBeTruthy()
+    for (let i = 0; i < 25; i++) {
+      const next = `agent:main:webchat:pinned-${i}`
+      await h.queue.switchPendingQueue(next)
+      h.sessionKey.value = next
+      await nextTick()
+      expect(await h.queue.enqueuePendingPayload({ text: `Other synthetic draft ${i}` })).toBe(true)
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    }
+    expect(h.queue.getParkedQueueUsage().protectedSessions).toBe(1)
+    await h.queue.switchPendingQueue(firstSession)
+    h.sessionKey.value = firstSession
+    await nextTick()
+    await h.queue.hydratePendingQueue(firstSession)
+    expect(h.queue.pendingQueue.value[0]).toBe(active)
+    expect(h.queue.pendingQueue.value[0]?.text).toBe('Synthetic in-flight input')
+    h.queue.settlePendingDelivery(active, 'deferred')
+    expect(h.queue.pendingQueue.value[0]?.deliveryState).toBeUndefined()
+  } finally { h.queue.cleanup() }
+})
+
 class TestBroadcastChannel {
   static readonly channels = new Map<string, Set<TestBroadcastChannel>>()
 
@@ -244,9 +532,7 @@ class TestBroadcastChannel {
 describe('useChatPendingQueue delivery state', () => {
   it('keeps first-turn creation intent out of durable follow-ups until acceptance consumes it', async () => {
     const { wal, records } = memoryWal()
-    const { inputText, pendingSessionIntent, queue } = makeQueue(
-      undefined, () => false, undefined, undefined,
-      { pendingInputWal: wal, isStreaming: ref(true) },
+    const { inputText, pendingSessionIntent, queue } = makeQueue(undefined, () => false, { pendingInputWal: wal, isStreaming: ref(true) }
     )
     pendingSessionIntent.value = 'new_chat'
     inputText.value = 'follow-up while the first acknowledgement is pending'
@@ -270,7 +556,7 @@ describe('useChatPendingQueue delivery state', () => {
     vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
       commit = () => { void persist(record).then(resolve) }
     }))
-    const { queue, inputText } = makeQueue(undefined, () => true, undefined, undefined, {
+    const { queue, inputText } = makeQueue(undefined, () => true, {
       pendingInputWal: wal, connectionState: ref('disconnected'), deliveryIdentity: ref('synthetic-owner'),
     })
     try {
@@ -299,7 +585,7 @@ describe('useChatPendingQueue delivery state', () => {
         ? { items: [] }
         : { requestFingerprint: 'synthetic-fingerprint', revision: 1 }
     )) as LegacyQueueRpc['call'] }
-    const { queue, inputText } = makeQueue(dispatch, () => false, undefined, undefined, {
+    const { queue, inputText } = makeQueue(dispatch, () => false, {
       rpc, hasRpcMethod: () => true, pendingInputWal: wal, connectionState, deliveryIdentity,
     })
     try {
@@ -326,7 +612,7 @@ describe('useChatPendingQueue delivery state', () => {
 
   it('retains offline messages across reload without sending under a different identity', async () => {
     const { wal, records } = memoryWal()
-    const original = makeQueue(undefined, () => true, undefined, undefined, {
+    const original = makeQueue(undefined, () => true, {
       pendingInputWal: wal, connectionState: ref('disconnected'),
       deliveryIdentity: ref('synthetic-gateway:owner'),
     })
@@ -338,7 +624,7 @@ describe('useChatPendingQueue delivery state', () => {
     const deliveryIdentity = ref<string | null>('synthetic-gateway:guest')
     const dispatch = vi.fn(async () => 'accepted' as const)
     const rpc = { call: vi.fn(async () => ({ items: [] })) as LegacyQueueRpc['call'] }
-    const { queue } = makeQueue(dispatch, () => false, undefined, undefined, {
+    const { queue } = makeQueue(dispatch, () => false, {
       pendingInputWal: wal, connectionState: ref('connected'), deliveryIdentity,
       rpc, hasRpcMethod: () => true,
     })
@@ -374,7 +660,7 @@ describe('useChatPendingQueue delivery state', () => {
       const dispatch = vi.fn(async () => 'accepted' as const)
       const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
         ? { items: [] } : { requestFingerprint: 'restored-fingerprint', revision: 1 })
-      const { queue } = makeQueue(dispatch, () => false, undefined, undefined, {
+      const { queue } = makeQueue(dispatch, () => false, {
         pendingInputWal: wal, connectionState: ref('connected'), deliveryIdentity: ref('synthetic-owner'),
         rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => supportsQueue,
       })
@@ -405,7 +691,7 @@ describe('useChatPendingQueue delivery state', () => {
       }
       return { items: [] }
     })
-    const { queue, inputText } = makeQueue(undefined, () => false, undefined, undefined, {
+    const { queue, inputText } = makeQueue(undefined, () => false, {
       rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => supportsQueue,
       connectionState, deliveryIdentity: ref('synthetic-owner'),
     })
@@ -438,7 +724,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { wal } = memoryWal()
     let complete!: () => void
     vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => { complete = resolve }))
-    const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+    const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, {
       pendingInputWal: wal, connectionState: ref('disconnected'), deliveryIdentity: ref('synthetic-owner'),
     })
     try {
@@ -458,7 +744,7 @@ describe('useChatPendingQueue delivery state', () => {
     const deliveryIdentity = ref<string | null>('synthetic-owner')
     let release: (() => void) | undefined
     const call = vi.fn(async (_method: string) => ({ items: [] }))
-    const { queue, inputText } = makeQueue(undefined, () => true, undefined, undefined, {
+    const { queue, inputText } = makeQueue(undefined, () => true, {
       pendingInputWal: wal, connectionState, deliveryIdentity,
       rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
     })
@@ -504,7 +790,7 @@ describe('useChatPendingQueue delivery state', () => {
       const onPendingPersistenceError = vi.fn()
       const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
         ? { items: [] } : { requestFingerprint: 'unexpected-enqueue', revision: 1 })
-      const { queue, inputText, pendingAttachments, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+      const { queue, inputText, pendingAttachments, sessionKey } = makeQueue(undefined, () => true, {
         pendingInputWal: wal, connectionState, deliveryIdentity,
         prepareAttachmentsForSend: prepare, onPendingPersistenceError,
         rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
@@ -553,7 +839,7 @@ describe('useChatPendingQueue delivery state', () => {
       pendingInputId: id, clientRequestId: `request-${id}`, clientMessageId: `message-${id}`,
       message: `Private ${id}`, requestFingerprint: `fingerprint-${id}`, revision: 1,
     })) }))
-    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+    const { queue } = makeQueue(undefined, () => true, {
       pendingInputWal: wal, connectionState, deliveryIdentity,
       rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
     })
@@ -578,7 +864,7 @@ describe('useChatPendingQueue delivery state', () => {
       pendingInputId: 'server-row', clientRequestId: 'server-request', clientMessageId: 'server-message',
       message: 'Server-owned draft', requestFingerprint: 'server-fingerprint', revision: 1,
     }] }))
-    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+    const { queue } = makeQueue(undefined, () => true, {
       connectionState: ref('connected'), deliveryIdentity,
       rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
     })
@@ -607,7 +893,7 @@ describe('useChatPendingQueue delivery state', () => {
       const composerRevision = ref(0)
       const connectionState = ref('disconnected')
       let release: (() => void) | undefined
-      const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, undefined, undefined, {
+      const { queue, inputText, sessionKey } = makeQueue(undefined, () => true, {
         pendingInputWal: wal, connectionState, deliveryIdentity, composerRevision,
       })
       try {
@@ -664,12 +950,7 @@ describe('useChatPendingQueue delivery state', () => {
     vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => {
       releaseFirstPut = resolve
     }))
-    const { inputText, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const { inputText, queue } = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     inputText.value = 'survives a refresh'
 
@@ -719,12 +1000,7 @@ describe('useChatPendingQueue delivery state', () => {
     vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => {
       releaseFirstPut = resolve
     }))
-    const { inputText, pendingAttachments, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const { inputText, pendingAttachments, queue } = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     const original: Attachment = {
       kind: 'staged',
@@ -767,9 +1043,7 @@ describe('useChatPendingQueue delivery state', () => {
     vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => {
       releaseFirstPut = resolve
     }))
-    const { inputText, pendingAttachments, pendingSessionIntent, queue } = makeQueue(
-      undefined, () => false, undefined, undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const { inputText, pendingAttachments, pendingSessionIntent, queue } = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     inputText.value = 'edit the original project file'
     pendingSessionIntent.value = 'new_chat'
@@ -800,12 +1074,7 @@ describe('useChatPendingQueue delivery state', () => {
     vi.mocked(wal.put).mockImplementationOnce(() => new Promise<void>(resolve => {
       releaseFirstPut = resolve
     }))
-    const { inputText, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const { inputText, queue } = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     inputText.value = 'queued draft'
 
@@ -818,6 +1087,49 @@ describe('useChatPendingQueue delivery state', () => {
     expect(queue.pendingQueue.value[0]?.text).toBe('queued draft')
     queue.cleanup()
   })
+
+  it.each(['replace', 'remove', 'unchanged'] as const)(
+    'only consumes the submitted Visualize draft after delayed WAL persistence: %s',
+    async change => {
+      const { wal, records } = memoryWal()
+      const persist = vi.mocked(wal.put).getMockImplementation()!
+      let release!: () => void
+      vi.mocked(wal.put).mockImplementationOnce(record => new Promise<void>(resolve => {
+        release = () => { void persist(record).then(resolve) }
+      }))
+      const composerRevision = ref(0), deliveryIdentity = ref<string | null>('owner')
+      const h = makeQueue(undefined, () => true, {
+        pendingInputWal: wal, composerRevision, deliveryIdentity, connectionState: ref('disconnected'),
+      })
+      const scope = effectScope()
+      const draft = scope.run(() => {
+        const value = useVisualizeDraft({ sessionKey: h.sessionKey, deliveryIdentity,
+          generation: ref(0), available: () => true })
+        // Mirrors ChatView's synchronous composer revision for chip-only changes.
+        watch(value.snapshot, () => { composerRevision.value++ }, { flush: 'sync' })
+        return value
+      })!
+      const receipt = { documentId: 'doc', revisionId: 'rev', name: 'choices.html' } as VisualizeReceipt
+      try {
+        h.inputText.value = 'Explain this choice'
+        draft.attach(h.sessionKey.value, receipt, { summary: 'Original conditions', data: { selected: 'A' } })
+        const submitted = draft.capture()!
+        const queued = Promise.resolve(h.queue.enqueuePendingInput(submitted.message(h.inputText.value)))
+        if (change === 'replace') draft.attach(h.sessionKey.value, receipt, { summary: 'New conditions', data: { selected: 'B' } })
+        else if (change === 'remove') draft.clear()
+        release()
+        expect(await queued).toBe(true)
+        submitted.accepted()
+        expect(h.inputText.value).toBe(change === 'unchanged' ? '' : 'Explain this choice')
+        expect(draft.snapshot.value?.summary ?? null).toBe(change === 'replace' ? 'New conditions' : null)
+        const persisted = [...records.values()][0]!
+        expect(persisted.text).toContain('Original conditions')
+        expect(persisted.text).toContain('"selected":"A"')
+        expect(persisted.text).not.toContain('New conditions')
+        expect(persisted.text).not.toContain('"selected":"B"')
+      } finally { scope.stop(); h.queue.cleanup() }
+    },
+  )
 
   it('hydrates after the route supplies a session key post-setup', async () => {
     const delayedSessionKey = ref('')
@@ -834,16 +1146,11 @@ describe('useChatPendingQueue delivery state', () => {
       createdAt: 1,
       updatedAt: 1,
     }])
-    const { queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { queue } = makeQueue(undefined, () => false, {
         sessionKey: delayedSessionKey,
         pendingInputWal: wal,
         hasRpcMethod: () => false,
-      },
+      }
     )
     expect(queue.pendingQueue.value).toEqual([])
 
@@ -871,12 +1178,7 @@ describe('useChatPendingQueue delivery state', () => {
       createdAt: 1,
       updatedAt: 2,
     }])
-    const { queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const { queue } = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     await vi.waitFor(() => {
       expect(queue.pendingQueue.value[0]).toMatchObject({
@@ -901,12 +1203,7 @@ describe('useChatPendingQueue delivery state', () => {
     const { wal } = memoryWal()
     vi.mocked(wal.put).mockRejectedValueOnce(new Error('quota exceeded'))
     const onPendingPersistenceError = vi.fn()
-    const { inputText, pendingAttachments, pendingSessionIntent, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, onPendingPersistenceError },
+    const { inputText, pendingAttachments, pendingSessionIntent, queue } = makeQueue(undefined, () => false, { pendingInputWal: wal, onPendingPersistenceError }
     )
     inputText.value = 'keep this exact draft'
     const attachment: Attachment = {
@@ -930,15 +1227,10 @@ describe('useChatPendingQueue delivery state', () => {
 
   it('fails closed with the complete composer payload when IndexedDB is unavailable', () => {
     const onPendingPersistenceError = vi.fn()
-    const { inputText, pendingAttachments, pendingSessionIntent, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { inputText, pendingAttachments, pendingSessionIntent, queue } = makeQueue(undefined, () => false, {
         pendingInputWal: null,
         onPendingPersistenceError,
-      },
+      }
     )
     const attachment: Attachment = {
       kind: 'staged',
@@ -966,7 +1258,7 @@ describe('useChatPendingQueue delivery state', () => {
     const selectedSkills = ref(skills)
     const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
       name: 'notes.md', mime: 'text/markdown', size: 14 }
-    const original = makeQueue(undefined, () => true, undefined, undefined, {
+    const original = makeQueue(undefined, () => true, {
       selectedSkills,
       pendingInputWal: wal, connectionState: ref('disconnected'),
       deliveryIdentity: ref('fixture-gateway:owner'),
@@ -983,7 +1275,7 @@ describe('useChatPendingQueue delivery state', () => {
     original.queue.cleanup()
     const call = vi.fn(async (method: string) => method === 'sessions.pending_inputs.list'
       ? { items: [] } : { requestFingerprint: 'fixture-fingerprint', revision: 1 })
-    const restored = makeQueue(undefined, () => true, undefined, undefined, {
+    const restored = makeQueue(undefined, () => true, {
       pendingInputWal: wal, connectionState: ref('connected'),
       deliveryIdentity: ref('fixture-gateway:owner'),
       rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
@@ -1012,7 +1304,7 @@ describe('useChatPendingQueue delivery state', () => {
       attachments: [], workspaceFiles: [workspaceFile], revision: 1,
       requestFingerprint: 'fixture-fingerprint',
     }] }))
-    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+    const { queue } = makeQueue(undefined, () => true, {
       rpc: { call: call as LegacyQueueRpc['call'] }, hasRpcMethod: () => true,
     })
     try {
@@ -1042,16 +1334,11 @@ describe('useChatPendingQueue delivery state', () => {
         rpcCall(method, params) as Promise<T>
       ),
     }
-    const { inputText, pendingAttachments, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { inputText, pendingAttachments, queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
     inputText.value = 'queue with attachment'
     pendingAttachments.value = [{
@@ -1122,17 +1409,12 @@ describe('useChatPendingQueue delivery state', () => {
       if (staged?.expires_at === 0) staged.file_uuid = 'upload-token-after-restart'
       return true
     })
-    const { inputText, pendingAttachments, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { inputText, pendingAttachments, queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         prepareAttachmentsForSend,
-      },
+      }
     )
     inputText.value = 'recover attachment'
     pendingAttachments.value = [{
@@ -1179,16 +1461,11 @@ describe('useChatPendingQueue delivery state', () => {
         rpcCall(method, params) as Promise<T>
       ),
     }
-    const { inputText, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { inputText, queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
     inputText.value = 'stage exactly once'
 
@@ -1236,16 +1513,11 @@ describe('useChatPendingQueue delivery state', () => {
         rpcCall(method, params) as Promise<T>
       ),
     }
-    const { queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -1279,8 +1551,8 @@ describe('useChatPendingQueue delivery state', () => {
             clientMessageId: 'message-literal-slash',
             requestFingerprint: 'sha256:literal-slash',
             revision: 1,
-            message: '/coding',
-            displayText: '//coding',
+            message: '/compact',
+            displayText: '//compact',
             attachments: [],
           }],
         }
@@ -1293,7 +1565,7 @@ describe('useChatPendingQueue delivery state', () => {
         return rpcCall(method) as Promise<T>
       },
     }
-    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+    const { queue } = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       rpc,
       hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
@@ -1301,10 +1573,10 @@ describe('useChatPendingQueue delivery state', () => {
 
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
     expect(queue.pendingQueue.value[0]).toMatchObject({
-      text: '//coding',
+      text: '//compact',
       pendingPersistenceState: 'staged',
     })
-    expect(records.get('pending-literal-slash')?.text).toBe('//coding')
+    expect(records.get('pending-literal-slash')?.text).toBe('//compact')
     queue.cleanup()
   })
 
@@ -1333,7 +1605,7 @@ describe('useChatPendingQueue delivery state', () => {
         return rpcCall(method) as Promise<T>
       },
     }
-    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+    const { queue } = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       rpc,
       hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
@@ -1398,16 +1670,11 @@ describe('useChatPendingQueue delivery state', () => {
         rpcCall(method, params) as Promise<T>
       ),
     }
-    const { queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
 
     await vi.waitFor(() => {
@@ -1441,16 +1708,11 @@ describe('useChatPendingQueue delivery state', () => {
         rpcCall(method, params) as Promise<T>
       ),
     }
-    const { inputText, queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { inputText, queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
     inputText.value = 'cancel after lost acknowledgement'
 
@@ -1492,16 +1754,11 @@ describe('useChatPendingQueue delivery state', () => {
         initialRpcCall(method, params) as Promise<T>
       ),
     }
-    const initial = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const initial = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc: initialRpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
     initial.inputText.value = 'cancel across a Gateway downgrade'
 
@@ -1517,12 +1774,7 @@ describe('useChatPendingQueue delivery state', () => {
     expect(records.get(pendingInputId!)?.mayHaveServerCopy).toBe(true)
     initial.queue.cleanup()
 
-    const legacy = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const legacy = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     await vi.waitFor(() => {
       expect(legacy.queue.pendingQueue.value[0]).toMatchObject({
@@ -1564,16 +1816,11 @@ describe('useChatPendingQueue delivery state', () => {
         restoredRpcCall(method, params) as Promise<T>
       ),
     }
-    const restored = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const restored = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc: restoredRpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
 
     await vi.waitFor(() => {
@@ -1595,19 +1842,9 @@ describe('useChatPendingQueue delivery state', () => {
       TestBroadcastChannel as unknown as typeof BroadcastChannel,
     )
     const { wal, records } = memoryWal()
-    const first = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const first = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
-    const second = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const second = makeQueue(undefined, () => false, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     try {
       first.inputText.value = 'cancel this in every tab'
@@ -1676,7 +1913,7 @@ describe('useChatPendingQueue delivery state', () => {
       updatedAt: 1,
     }])
     const dispatch = vi.fn(async () => 'accepted' as const)
-    const { queue, inputText } = makeQueue(dispatch, () => false, undefined, undefined, {
+    const { queue, inputText } = makeQueue(dispatch, () => false, {
       pendingInputWal: wal,
     })
     await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
@@ -1689,9 +1926,32 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('retains invalid restored annotations as retryable without uploading or enqueueing', async () => {
+    const enqueue = vi.fn(async () => ({ requestFingerprint: 'fingerprint', revision: 1 }))
+    const prepareAttachmentsForSend = vi.fn(async () => true)
+    const { records, wal } = memoryWal()
+    const onPendingPersistenceError = vi.fn()
+    const { queue } = makeQueue(undefined, () => true, {
+      pendingInputWal: wal, prepareAttachmentsForSend, onPendingPersistenceError,
+      pendingInputQueue: { supportsQueue: () => true, supportsReorder: () => false, enqueue,
+        list: async () => [], cancel: async () => {}, reorder: async () => ({ items: [] }) },
+    })
+    const pageContext = { annotations: Array.from({ length: 17 }, () => ({ text: 'Keep every change' })) }
+    await queue.enqueuePendingPayload({ text: 'Keep my companion message', pageContext })
+    await vi.waitFor(() => expect(queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('retryable'))
+    expect(enqueue).not.toHaveBeenCalled()
+    expect(prepareAttachmentsForSend).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(onPendingPersistenceError).toHaveBeenCalledWith('server_rejected'))
+    expect([...records.values()][0]).toMatchObject({
+      text: 'Keep my companion message', pageContext, state: 'retryable', mayHaveServerCopy: false,
+    })
+    queue.cleanup()
+  })
+
+
   it('stages annotation-only input through the ordinary queue without changing the visible body', async () => {
     const enqueue = vi.fn(async () => ({ requestFingerprint: 'fingerprint', revision: 1 }))
-    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+    const { queue } = makeQueue(undefined, () => true, {
       pendingInputQueue: { supportsQueue: () => true, supportsReorder: () => false, enqueue,
         list: async () => [], cancel: async () => {}, reorder: async () => ({ items: [] }) },
     })
@@ -1773,16 +2033,11 @@ describe('useChatPendingQueue delivery state', () => {
         return rpcCall(method) as Promise<T>
       },
     }
-    const { queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
 
     await vi.waitFor(() => {
@@ -1863,16 +2118,11 @@ describe('useChatPendingQueue delivery state', () => {
         return rpcCall(method) as Promise<T>
       },
     }
-    const initial = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const initial = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
     await vi.waitFor(() => {
       expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
@@ -1907,16 +2157,11 @@ describe('useChatPendingQueue delivery state', () => {
     expect(cancelCalls).toBe(2)
     initial.queue.cleanup()
 
-    const restored = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const restored = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
     await vi.waitFor(() => {
       expect(restored.queue.pendingQueue.value[0]).toMatchObject({
@@ -1970,16 +2215,11 @@ describe('useChatPendingQueue delivery state', () => {
         return rpcCall(method) as Promise<T>
       },
     }
-    const { queue } = makeQueue(
-      undefined,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { queue } = makeQueue(undefined, () => false, {
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
-      },
+      }
     )
 
     await vi.waitFor(() => {
@@ -1997,50 +2237,17 @@ describe('useChatPendingQueue delivery state', () => {
     inputText.value = 'newer operator draft'
 
     await expect(
-      queue.enqueueRecoveredInput('/meta meta-paper-write -- recovered'),
+      queue.enqueuePendingPayload({ text: 'Recovered draft' }),
     ).resolves.toBe(true)
     expect(inputText.value).toBe('newer operator draft')
     expect(queue.pendingQueue.value).toMatchObject([{
-      text: '/meta meta-paper-write -- recovered',
+      text: 'Recovered draft',
       attachments: [],
       intent: null,
     }])
     queue.cleanup()
   })
 
-  it('deduplicates a hidden control by durable session/request identity', () => {
-    const { queue } = makeQueue()
-    const item = {
-      text: 'provider confirmation',
-      displayText: 'Confirmed',
-      clientRequestId: 'stable-hidden-request',
-      sessionKey: 'agent:main:webchat:test',
-    }
-
-    expect(queue.enqueueHiddenControl(item)).toBe(true)
-    expect(queue.enqueueHiddenControl(item)).toBe(true)
-    expect(queue.pendingQueue.value).toHaveLength(1)
-    queue.cleanup()
-  })
-
-  it('fails closed when a hidden-control cancellation cannot be persisted', () => {
-    let canPersistCancellation = false
-    const onResult = vi.fn(() => canPersistCancellation)
-    const { queue } = makeQueue(undefined, () => false, undefined, onResult)
-    queue.enqueueHiddenControl({
-      text: 'provider confirmation',
-      displayText: 'Confirmed',
-      clientRequestId: 'must-remain-sendable',
-      sessionKey: 'agent:main:webchat:test',
-    })
-
-    queue.clearPendingQueue()
-    expect(queue.pendingQueue.value).toHaveLength(1)
-    canPersistCancellation = true
-    expect(queue.removePendingChip(pendingUiId(queue, 0))).toBe(true)
-    expect(queue.pendingQueue.value).toEqual([])
-    queue.cleanup()
-  })
 
   it('leases one item for steer and consumes it only after confirmed acceptance', async () => {
     const { inputText, queue } = makeQueue()
@@ -2133,18 +2340,13 @@ describe('useChatPendingQueue delivery state', () => {
     }
     const sessionKey = ref(sessionB)
     const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
-    const { queue } = makeQueue(
-      dispatchPendingItem,
-      () => false,
-      undefined,
-      undefined,
-      {
+    const { queue } = makeQueue(dispatchPendingItem, () => false, {
         sessionKey,
         pendingInputWal: wal,
         rpc,
         hasRpcMethod: method => method.startsWith('sessions.pending_inputs.'),
         connectionState: ref('connected'),
-      },
+      }
     )
 
     const returnToBAndSignalReady = async () => {
@@ -2313,7 +2515,7 @@ describe('useChatPendingQueue delivery state', () => {
 
       expect(dispatchPendingItem).toHaveBeenCalledWith(expect.objectContaining({
         text: 'next queued item',
-      }), 'agent:main:webchat:test')
+      }), 'agent:main:webchat:test', expect.any(Function))
       expect(inputText.value).toBe('draft written while steering')
       expect(queue.pendingQueue.value).toEqual([])
     } finally {
@@ -2350,7 +2552,7 @@ describe('useChatPendingQueue delivery state', () => {
 
       expect(dispatchPendingItem).toHaveBeenCalledWith(expect.objectContaining({
         text: 'second queued message',
-      }), 'agent:main:webchat:test')
+      }), 'agent:main:webchat:test', expect.any(Function))
       expect(queue.pendingQueue.value.map(item => item.text)).toEqual([
         'first queued message',
       ])
@@ -2461,6 +2663,7 @@ describe('useChatPendingQueue delivery state', () => {
           attachments: [expect.objectContaining({ name: 'queued-image.png' })],
         }),
         'agent:main:webchat:test',
+        expect.any(Function),
       )
       expect(queue.pendingQueue.value).toEqual([])
     } finally {
@@ -2469,43 +2672,27 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
-  it.each(['visible', 'hidden'] as const)(
-    'never dispatches an A-session %s lease after switching to B before nextTick',
-    async kind => {
-      vi.useFakeTimers()
-      const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
-      const dispatchHiddenControl = vi.fn(async () => 'accepted' as const)
-      const { inputText, queue, sessionKey } = makeQueue(
-        dispatchPendingItem,
-        () => false,
-        dispatchHiddenControl,
-      )
-      try {
-        if (kind === 'hidden') {
-          queue.enqueueHiddenControl({
-            text: 'A hidden control',
-            displayText: 'A control',
-          })
-        } else {
-          inputText.value = 'A visible follow-up'
-          await queue.enqueuePendingInput(inputText.value)
-        }
-        queue.schedulePendingDrainAfterTerminal()
+  it('never dispatches an A-session lease after switching to B before nextTick', async () => {
+    vi.useFakeTimers()
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const { inputText, queue, sessionKey } = makeQueue(dispatchPendingItem)
+    try {
+      inputText.value = 'A visible follow-up'
+      await queue.enqueuePendingInput(inputText.value)
+      queue.schedulePendingDrainAfterTerminal()
 
-        vi.advanceTimersByTime(50)
-        queue.switchPendingQueue('agent:main:webchat:B')
-        sessionKey.value = 'agent:main:webchat:B'
-        await nextTick()
+      vi.advanceTimersByTime(50)
+      queue.switchPendingQueue('agent:main:webchat:B')
+      sessionKey.value = 'agent:main:webchat:B'
+      await nextTick()
 
-        expect(dispatchPendingItem).not.toHaveBeenCalled()
-        expect(dispatchHiddenControl).not.toHaveBeenCalled()
-        expect(queue.pendingQueue.value).toEqual([])
-      } finally {
-        queue.cleanup()
-        vi.useRealTimers()
-      }
-    },
-  )
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+      expect(queue.pendingQueue.value).toEqual([])
+    } finally {
+      queue.cleanup()
+      vi.useRealTimers()
+    }
+  })
 
   it('does not remove a steering item through remove or clear', async () => {
     const { inputText, queue } = makeQueue()
@@ -2525,23 +2712,6 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
-  it('lets an operator retry or remove a terminal hidden-control failure', () => {
-    const { queue } = makeQueue()
-    queue.enqueueHiddenControl({
-      text: 'provider confirmation',
-      displayText: 'Confirmed',
-    })
-    const hidden = queue.pendingQueue.value[0]!
-    hidden.deliveryState = 'retryable'
-
-    expect(queue.beginPendingDelivery(hidden.pendingUiId)).toBeNull()
-    expect(queue.beginPendingDelivery(hidden.pendingUiId, true)).toBe(hidden)
-    queue.settlePendingDelivery(hidden, 'retryable_failure')
-    expect(hidden.deliveryState).toBe('retryable')
-    expect(queue.removePendingChip(hidden.pendingUiId)).toBe(true)
-    expect(queue.pendingQueue.value).toEqual([])
-    queue.cleanup()
-  })
 
   it('keeps steer-owned items out of composer recovery paths', async () => {
     const { inputText, queue } = makeQueue()
@@ -2588,7 +2758,7 @@ describe('useChatPendingQueue delivery state', () => {
       updatedAt: 1,
     })
 
-    const first = makeQueue(undefined, () => false, undefined, undefined, {
+    const first = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       hasRpcMethod: () => false,
     })
@@ -2598,7 +2768,7 @@ describe('useChatPendingQueue delivery state', () => {
     await first.queue.enqueuePendingInput(first.inputText.value, { ownerRequestId })
     first.queue.cleanup()
 
-    const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+    const reloaded = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       hasRpcMethod: () => false,
     })
@@ -2635,7 +2805,7 @@ describe('useChatPendingQueue delivery state', () => {
 
   it('persists a local-only reorder across remount with WAL revision CAS', async () => {
     const { wal } = memoryWal()
-    const first = makeQueue(undefined, () => false, undefined, undefined, {
+    const first = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       hasRpcMethod: () => false,
     })
@@ -2652,7 +2822,7 @@ describe('useChatPendingQueue delivery state', () => {
     expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
     first.queue.cleanup()
 
-    const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+    const reloaded = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       hasRpcMethod: () => false,
     })
@@ -2661,7 +2831,7 @@ describe('useChatPendingQueue delivery state', () => {
     reloaded.queue.cleanup()
   })
 
-  it('does not switch a pending queue after a delayed handoff is superseded', async () => {
+  it('switches immediately while the old queue owns a delayed WAL reorder', async () => {
     const { records, wal } = memoryWal()
     let releaseCommit: (() => void) | undefined
     vi.mocked(wal.commitOrder!).mockImplementation(async (
@@ -2685,7 +2855,7 @@ describe('useChatPendingQueue delivery state', () => {
       })
       return { records: committed }
     })
-    const source = makeQueue(undefined, () => false, undefined, undefined, {
+    const source = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       hasRpcMethod: () => false,
     })
@@ -2699,21 +2869,176 @@ describe('useChatPendingQueue delivery state', () => {
     expect(source.queue.beginPendingReorder(1)).toBe(true)
     expect(source.queue.reorderPendingItem(1, 0)).toBe(true)
     const reorder = source.queue.endPendingReorder()
-    let current = true
+    const originalSession = source.sessionKey.value
     const handoff = source.queue.switchPendingQueue(
       'agent:main:webchat:B',
-      () => current,
+      () => true,
     )
-
-    current = false
+    expect(handoff).toBeUndefined()
+    source.sessionKey.value = 'agent:main:webchat:B'
+    expect(source.queue.isReordering.value).toBe(false)
+    source.inputText.value = 'B draft stays untouched'
+    expect(source.queue.pendingQueue.value).toEqual([])
+    await source.queue.enqueuePendingPayload({ text: 'B follow-up' })
     await Promise.resolve()
     expect(releaseCommit).toBeTypeOf('function')
     releaseCommit?.()
     await reorder
-    await handoff
-
+    expect(source.queue.pendingQueue.value.map(item => item.text)).toEqual(['B follow-up'])
+    expect(source.inputText.value).toBe('B draft stays untouched')
+    source.queue.switchPendingQueue(originalSession)
+    source.sessionKey.value = originalSession
+    await source.queue.hydratePendingQueue(originalSession)
     expect(source.queue.pendingQueue.value.map(item => item.text)).toEqual(['B', 'A'])
+    expect(source.queue.isReordering.value).toBe(false)
     source.queue.cleanup()
+  })
+
+  it.each(['accepted', 'unknown'] as const)('pins a %s server reorder to its original queue across A to B to A', async outcome => {
+    const sessionA = 'agent:main:webchat:test'
+    const sessionB = 'agent:main:webchat:B'
+    const initial = ['A1', 'A2', 'B1', 'B2'].map((text, index): PendingInputWalRecord => ({
+      schemaVersion: 1, pendingInputId: `pending-${text}`, sessionKey: index < 2 ? sessionA : sessionB,
+      clientRequestId: `request-${text}`, clientMessageId: `message-${text}`,
+      text, attachments: [], intent: null, state: 'staged', mayHaveServerCopy: true,
+      requestFingerprint: `fingerprint-${text}`, serverRevision: 1,
+      position: index % 2, walRevision: 1, createdAt: index + 1, updatedAt: index + 1,
+    }))
+    const { wal, records } = memoryWal(initial)
+    let resolveA!: () => void
+    let rejectA!: () => void
+    let unavailableA = false
+    const serverRows = (key: string) => [...records.values()].filter(row => row.sessionKey === key)
+      .sort((a, b) => (a.position || 0) - (b.position || 0)).map(row => ({
+        pendingInputId: row.pendingInputId, clientRequestId: row.clientRequestId,
+        clientMessageId: row.clientMessageId, message: row.text, attachments: [],
+        requestFingerprint: row.requestFingerprint, revision: row.serverRevision, position: row.position,
+      }))
+    const queuePort: PendingInputQueuePort = {
+      supportsQueue: () => true, supportsReorder: () => true,
+      enqueue: vi.fn(async () => ({})), cancel: vi.fn(async () => {}),
+      list: vi.fn(async key => {
+        if (key === sessionA && unavailableA) throw new Error('offline after ambiguous result')
+        return serverRows(key)
+      }),
+      reorder: vi.fn(async (request: Parameters<PendingInputQueuePort['reorder']>[0]) => {
+        if (request.key === sessionA) await new Promise<void>((resolve, reject) => {
+          resolveA = resolve
+          rejectA = () => reject(new Error('lost reorder response'))
+        })
+        return { items: request.items.map((item, position) => ({
+          ...serverRows(request.key).find(row => row.pendingInputId === item.pendingInputId)!,
+          position, revision: item.expectedRevision! + 1,
+        })) }
+      }),
+    }
+    const source = makeQueue(undefined, () => false, {
+      pendingInputWal: wal, pendingInputQueue: queuePort, connectionState: ref('connected'),
+    })
+    try {
+      await source.queue.hydratePendingQueue()
+      expect(source.queue.beginPendingReorder(1)).toBe(true)
+      source.queue.reorderPendingItem(1, 0)
+      const oldCommit = source.queue.endPendingReorder()
+      expect(source.queue.switchPendingQueue(sessionB)).toBeUndefined()
+      source.sessionKey.value = sessionB
+      await source.queue.hydratePendingQueue(sessionB)
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(['B1', 'B2'])
+      expect(source.queue.beginPendingReorder(1)).toBe(true)
+      source.queue.reorderPendingItem(1, 0)
+      await source.queue.endPendingReorder()
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(['B2', 'B1'])
+      if (outcome === 'accepted') resolveA()
+      else { unavailableA = true; rejectA() }
+      await oldCommit
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(['B2', 'B1'])
+      expect(source.queue.isReordering.value).toBe(false)
+      source.queue.switchPendingQueue(sessionA)
+      source.sessionKey.value = sessionA
+      if (outcome === 'unknown') {
+        expect(source.queue.isReordering.value).toBe(true)
+        expect(source.queue.beginPendingDelivery(pendingUiId(source.queue, 0))).toBeNull()
+        unavailableA = false
+      }
+      await source.queue.hydratePendingQueue(sessionA)
+      await vi.waitFor(() => expect(source.queue.isReordering.value).toBe(false))
+      expect(source.queue.pendingQueue.value.map(row => row.text)).toEqual(
+        outcome === 'accepted' ? ['A2', 'A1'] : ['A1', 'A2'],
+      )
+      expect(queuePort.reorder).toHaveBeenCalledTimes(2)
+    } finally { source.queue.cleanup() }
+  })
+
+  it.each(['commit', 'recovery'] as const)('fences a delayed %s response across delivery identities without blocking the new owner', async stage => {
+    const session = 'agent:main:webchat:test'
+    const identity = ref<string | null>('gateway-a')
+    const initial = ['A1', 'A2'].map((text, position): PendingInputWalRecord => ({
+      schemaVersion: 1, pendingInputId: text, sessionKey: session,
+      clientRequestId: `request-${text}`, clientMessageId: `message-${text}`,
+      text, attachments: [], intent: null, state: 'staged', mayHaveServerCopy: true,
+      deliveryIdentity: 'gateway-a', requestFingerprint: `fingerprint-${text}`,
+      serverRevision: 1, position, walRevision: 1, createdAt: position + 1, updatedAt: position + 1,
+    }))
+    const { wal, records } = memoryWal(initial)
+    const serverRow = (text: string, position: number, revision = 1) => ({
+      pendingInputId: text, clientRequestId: `request-${text}`, clientMessageId: `message-${text}`,
+      message: text, attachments: [], requestFingerprint: `fingerprint-${text}`, position, revision,
+    })
+    // Authoritative Gateway rows are separate from WAL: the reorder commits even
+    // when its response is lost, and returning to that owner must reconcile it.
+    let ownerRows = [serverRow('A1', 0), serverRow('A2', 1)]
+    let release!: () => void
+    let attempted = false
+    let held = false
+    const port: PendingInputQueuePort = {
+      supportsQueue: () => true, supportsReorder: () => true,
+      enqueue: vi.fn(async () => ({})), cancel: vi.fn(async () => {}),
+      list: vi.fn(async () => {
+        if (identity.value === 'gateway-b') return [serverRow('B1', 0)]
+        const captured = structuredClone(ownerRows)
+        if (stage === 'recovery' && attempted && !held) {
+          held = true
+          await new Promise<void>(resolve => { release = resolve })
+        }
+        return captured
+      }),
+      reorder: vi.fn(async () => {
+        attempted = true
+        ownerRows = [serverRow('A2', 0, 2), serverRow('A1', 1, 2)]
+        if (stage === 'recovery') throw new Error('committed but response lost')
+        await new Promise<void>(resolve => { release = resolve })
+        return { items: structuredClone(ownerRows) }
+      }),
+    }
+    const source = makeQueue(undefined, () => true, {
+      pendingInputWal: wal, pendingInputQueue: port, connectionState: ref('connected'), deliveryIdentity: identity,
+    })
+    try {
+      await source.queue.hydratePendingQueue()
+      expect(source.queue.beginPendingReorder(1)).toBe(true)
+      source.queue.reorderPendingItem(1, 0)
+      const oldCommit = source.queue.endPendingReorder()
+      await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+      identity.value = 'gateway-b'
+      await nextTick()
+      await source.queue.hydratePendingQueue()
+      expect(source.queue.isReordering.value).toBe(false)
+      expect(source.queue.pendingQueue.value.some(item => item.text === 'B1')).toBe(true)
+      release()
+      await oldCommit
+      expect(records.get('A1')?.serverRevision).toBe(1)
+      expect(records.get('A2')?.serverRevision).toBe(1)
+      expect(source.queue.isReordering.value).toBe(false)
+      identity.value = 'gateway-a'
+      await nextTick()
+      await source.queue.hydratePendingQueue()
+      await vi.waitFor(() => expect(source.queue.isReordering.value).toBe(false))
+      expect(records.get('A1')?.serverRevision).toBe(2)
+      expect(records.get('A2')?.serverRevision).toBe(2)
+      expect(source.queue.pendingQueue.value.filter(item => item.text.startsWith('A')).map(item => item.text)).toEqual(['A2', 'A1'])
+      expect(source.queue.pendingQueue.value.some(item => item.text === 'B1')).toBe(true)
+      expect(port.reorder).toHaveBeenCalledTimes(1)
+    } finally { source.queue.cleanup() }
   })
 
   it('does not accept a durable response handoff after navigation supersedes it', async () => {
@@ -2759,7 +3084,7 @@ describe('useChatPendingQueue delivery state', () => {
     vi.mocked(wal.listHandoffs!).mockImplementationOnce(() => (
       new Promise(resolve => { releaseList = resolve })
     ))
-    const source = makeQueue(undefined, () => false, undefined, undefined, {
+    const source = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       hasRpcMethod: () => false,
     })
@@ -2814,12 +3139,7 @@ describe('useChatPendingQueue delivery state', () => {
     vi.mocked(wal.acceptHandoff!).mockRejectedValueOnce(new Error('IndexedDB failed'))
     let blocked = true
     const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
-    const source = makeQueue(
-      dispatchPendingItem,
-      () => blocked,
-      undefined,
-      undefined,
-      { pendingInputWal: wal, hasRpcMethod: () => false },
+    const source = makeQueue(dispatchPendingItem, () => blocked, { pendingInputWal: wal, hasRpcMethod: () => false }
     )
     try {
       source.inputText.value = 'source item must still drain'
@@ -2841,6 +3161,7 @@ describe('useChatPendingQueue delivery state', () => {
       expect(dispatchPendingItem).toHaveBeenCalledWith(
         expect.objectContaining({ text: 'source item must still drain' }),
         'agent:main:webchat:test',
+        expect.any(Function),
       )
     } finally {
       source.queue.cleanup()
@@ -2901,7 +3222,7 @@ describe('useChatPendingQueue delivery state', () => {
         else handoffSignal?.addEventListener('abort', abort, { once: true })
       })
     })
-    const source = makeQueue(undefined, () => false, undefined, undefined, {
+    const source = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       hasRpcMethod: () => false,
     })
@@ -2979,7 +3300,7 @@ describe('useChatPendingQueue delivery state', () => {
     const rpc: LegacyQueueRpc = {
       call: rpcCall as unknown as LegacyQueueRpc['call'],
     }
-    const first = makeQueue(undefined, () => false, undefined, undefined, {
+    const first = makeQueue(undefined, () => false, {
       pendingInputWal: wal,
       rpc,
       hasRpcMethod: method => [
@@ -3015,12 +3336,12 @@ describe('explicit skill pending input durability', () => {
   it('persists selected identities before clearing and restores them after remount', async () => {
     const { wal, records } = memoryWal()
     const selectedSkills = ref([{ ...skill }])
-    const harness = makeQueue(undefined, () => false, undefined, undefined, { pendingInputWal: wal, selectedSkills })
+    const harness = makeQueue(undefined, () => false, { pendingInputWal: wal, selectedSkills })
     harness.inputText.value = 'Make a table'
     expect(await harness.queue.enqueuePendingInput('Make a table')).toBe(true)
     expect(selectedSkills.value).toEqual([])
     expect([...records.values()][0]?.selectedSkills).toEqual([skill])
-    const restored = makeQueue(undefined, () => false, undefined, undefined, { pendingInputWal: wal })
+    const restored = makeQueue(undefined, () => false, { pendingInputWal: wal })
     await restored.queue.hydratePendingQueue('agent:main:webchat:test')
     expect(restored.queue.pendingQueue.value[0]?.selectedSkills).toEqual([skill])
   })
@@ -3030,7 +3351,7 @@ describe('explicit skill pending input durability', () => {
     let finish!: () => void
     wal.put = vi.fn(() => new Promise<void>(resolve => { finish = resolve }))
     const selectedSkills = ref([{ ...skill }])
-    const harness = makeQueue(undefined, () => false, undefined, undefined, { pendingInputWal: wal, selectedSkills })
+    const harness = makeQueue(undefined, () => false, { pendingInputWal: wal, selectedSkills })
     harness.inputText.value = 'Make a table'
     const enqueue = harness.queue.enqueuePendingInput('Make a table')
     const other = { ...skill, name: 'synthetic-paper', instanceId: 'instance-two' }
@@ -3063,7 +3384,7 @@ it('does not replace a queued skill identity with a conflicting server projectio
     }]),
     cancel: vi.fn(async () => {}), reorder: vi.fn(async () => ({ items: [] })),
   }
-  const result = makeQueue(undefined, () => true, undefined, undefined, {
+  const result = makeQueue(undefined, () => true, {
     pendingInputWal: wal, pendingInputQueue: port,
   })
   try {
@@ -3073,4 +3394,153 @@ it('does not replace a queued skill identity with a conflicting server projectio
       pendingPersistenceState: 'retryable',
     })
   } finally { result.queue.cleanup() }
+})
+
+it('completes a handoff with an unrelated parked queue', async () => {
+  const { wal } = memoryWal()
+  const h = makeQueue(undefined, () => true, { pendingInputWal: wal })
+  let visits = 0
+  let guard: ReturnType<typeof vi.spyOn> | undefined
+  try {
+    await h.queue.enqueuePendingPayload({ text: 'synthetic unrelated draft' })
+    const originalSession = h.sessionKey.value
+    await h.queue.switchPendingQueue('agent:main:webchat:other')
+    h.sessionKey.value = 'agent:main:webchat:other'
+    await nextTick()
+    await wal.putHandoff!({ schemaVersion: 1, ownerRequestId: 'synthetic-handoff',
+      requestSessionKey: h.sessionKey.value, clientRequestId: 'synthetic-handoff',
+      clientMessageId: 'synthetic-message', composerText: 'synthetic fork', recoveryAttachments: [],
+      params: { sessionKey: h.sessionKey.value, message: 'synthetic fork' },
+      state: 'submitting', createdAt: 1, updatedAt: 1 })
+    const original = ParkedPendingQueueCache.prototype.set
+    guard = vi.spyOn(ParkedPendingQueueCache.prototype, 'set').mockImplementation(function(this: ParkedPendingQueueCache, key, items) {
+      if (key === originalSession && ++visits > 4) throw new Error('Synchronous handoff loop revisited the same unrelated queue more than four times')
+      return original.call(this, key, items)
+    })
+    await expect(h.queue.recoverPendingQueueHandoff(h.sessionKey.value,
+      'agent:main:webchat:child', 'synthetic-handoff')).resolves.toBeUndefined()
+    expect(visits).toBe(1)
+    await h.queue.switchPendingQueue(originalSession)
+    h.sessionKey.value = originalSession
+    await nextTick()
+    expect(h.queue.pendingQueue.value).toEqual([expect.objectContaining({ text: 'synthetic unrelated draft' })])
+  } finally { guard?.mockRestore(); h.queue.cleanup() }
+})
+
+it('retains attachment URLs while an accepted handoff releases a parked queue under pressure', async () => {
+  const parent = 'agent:main:webchat:test'
+  const target = 'agent:main:webchat:pinned-0'
+  const ownerRequestId = 'synthetic-attachment-handoff'
+  const records: PendingInputWalRecord[] = [parent, ...Array.from({ length: 16 }, (_, i) => (
+    `agent:main:webchat:pinned-${i}`
+  ))].map((sessionKey, index) => ({
+    schemaVersion: 1, pendingInputId: `synthetic-pending-${index}`, sessionKey,
+    clientRequestId: `synthetic-request-${index}`, clientMessageId: `synthetic-message-${index}`,
+    ownerRequestId: index === 0 ? ownerRequestId : `synthetic-pinned-owner-${index}`,
+    text: 'Synthetic protected draft', intent: null, state: 'local_only', mayHaveServerCopy: false,
+    attachments: index === 0 ? [{ kind: 'staged', local_id: 1, name: 'synthetic.txt',
+      mime: 'text/plain', dataUrl: 'blob:previous-renderer',
+      file: new File(['Synthetic attachment'], 'synthetic.txt') }] : [],
+    createdAt: 1, updatedAt: 1,
+  }))
+  const { wal } = memoryWal(records)
+  let urlCount = 0
+  const create = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:handoff-${++urlCount}`)
+  const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+  const h = makeQueue(undefined, () => true, {
+    pendingInputWal: wal, connectionState: ref('disconnected'),
+  })
+  try {
+    await h.queue.hydratePendingQueue(parent)
+    for (const sessionKey of [...records.slice(1).map(record => record.sessionKey), 'agent:main:webchat:empty']) {
+      await h.queue.switchPendingQueue(sessionKey)
+      h.sessionKey.value = sessionKey
+      await nextTick()
+      await h.queue.hydratePendingQueue(sessionKey)
+    }
+    expect(h.queue.getParkedQueueUsage()).toMatchObject({ sessions: 17, protectedSessions: 17 })
+    await wal.putHandoff!({ schemaVersion: 1, ownerRequestId, requestSessionKey: parent,
+      clientRequestId: ownerRequestId, clientMessageId: 'synthetic-handoff-message',
+      composerText: 'Synthetic fork', recoveryAttachments: [],
+      params: { sessionKey: parent, message: 'Synthetic fork' },
+      state: 'submitting', createdAt: 1, updatedAt: 1 })
+    await h.queue.recoverPendingQueueHandoff(parent, target, ownerRequestId)
+    expect(h.queue.getParkedQueueUsage().sessions).toBe(16)
+    await h.queue.switchPendingQueue(target)
+    h.sessionKey.value = target
+    await nextTick()
+    const moved = h.queue.pendingQueue.value.find(item => item.pendingInputId === 'synthetic-pending-0')!
+    expect(moved).toBeDefined()
+    expect(moved.ownerSessionKey).toBe(target)
+    expect(moved.attachments[0]?.dataUrl).toMatch(/^blob:handoff-/)
+    expect(revoke).not.toHaveBeenCalledWith(moved.attachments[0]!.dataUrl)
+  } finally { h.queue.cleanup(); create.mockRestore(); revoke.mockRestore() }
+})
+
+
+it.each([
+  ['recover', 'before'], ['recover', 'after'],
+  ['adopt', 'before'], ['adopt', 'after'],
+] as const)('keeps a %s handoff durable without restoring a disposed queue (%s commit)', async (path, timing) => {
+  const parent = 'agent:main:webchat:test'
+  const child = 'agent:main:webchat:disposed-child'
+  const ownerRequestId = 'synthetic-disposed-handoff'
+  const { wal, records, handoffs } = memoryWal([{
+    schemaVersion: 1, pendingInputId: 'synthetic-disposed-pending', sessionKey: parent,
+    clientRequestId: 'synthetic-disposed-pending-request', clientMessageId: 'synthetic-disposed-pending-message',
+    ownerRequestId, text: 'Synthetic handoff follow-up', intent: null, state: 'local_only',
+    attachments: [{ kind: 'staged', local_id: 1, name: 'synthetic.txt', mime: 'text/plain',
+      dataUrl: 'blob:synthetic-previous-page', file: new File(['Synthetic handoff bytes'], 'synthetic.txt') }],
+    createdAt: 1, updatedAt: 1,
+  }])
+  await wal.putHandoff!({ schemaVersion: 1, ownerRequestId, requestSessionKey: parent,
+    clientRequestId: ownerRequestId, clientMessageId: 'synthetic-disposed-message',
+    composerText: 'Synthetic fork', recoveryAttachments: [],
+    params: { sessionKey: parent, message: 'Synthetic fork' },
+    state: 'submitting', createdAt: 1, updatedAt: 1 })
+  const createUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => 'blob:synthetic-disposed')
+  const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+  const h = makeQueue(undefined, () => true, {
+    pendingInputWal: wal, connectionState: ref('disconnected'),
+  })
+  let replacement: ReturnType<typeof makeQueue> | undefined
+  try {
+    await h.queue.hydratePendingQueue(parent)
+    const accept = wal.acceptHandoff!
+    let release!: () => void
+    let waiting = false
+    wal.acceptHandoff = async (...args) => {
+      const committed = timing === 'after' ? await accept(...args) : null
+      waiting = true
+      await new Promise<void>(resolve => { release = resolve })
+      return committed || accept(...args)
+    }
+    const recovering = path === 'recover'
+      ? h.queue.recoverPendingQueueHandoff(parent, child, ownerRequestId)
+      : h.queue.adoptPendingQueue(child, ownerRequestId)
+    await vi.waitFor(() => expect(waiting).toBe(true))
+    h.queue.cleanup()
+    const snapshot = JSON.stringify(h.queue.pendingQueue.value)
+    const createdBefore = createUrl.mock.calls.length
+    expect(createdBefore).toBeGreaterThan(0)
+    release()
+    await recovering
+    expect(JSON.stringify(h.queue.pendingQueue.value)).toBe(snapshot)
+    expect(h.queue.getParkedQueueUsage().sessions).toBe(0)
+    expect(createUrl).toHaveBeenCalledTimes(createdBefore)
+    expect(records.get('synthetic-disposed-pending')).toMatchObject({ sessionKey: child, ownerRequestId: undefined })
+    expect(handoffs.get(ownerRequestId)).toMatchObject({ state: 'accepted', acceptedSessionKey: child })
+
+    wal.acceptHandoff = accept
+    replacement = makeQueue(undefined, () => true, {
+      pendingInputWal: wal, connectionState: ref('disconnected'),
+    })
+    replacement.sessionKey.value = child
+    await replacement.queue.hydratePendingQueue(child)
+    expect(replacement.queue.pendingQueue.value).toHaveLength(1)
+    const restored = replacement.queue.pendingQueue.value[0]!
+    expect(restored).toMatchObject({ text: 'Synthetic handoff follow-up', ownerSessionKey: child })
+    expect(restored.ownerRequestId).toBeUndefined()
+    expect(await restored.attachments[0]!.file!.text()).toBe('Synthetic handoff bytes')
+  } finally { h.queue.cleanup(); replacement?.queue.cleanup(); createUrl.mockRestore(); revokeUrl.mockRestore() }
 })

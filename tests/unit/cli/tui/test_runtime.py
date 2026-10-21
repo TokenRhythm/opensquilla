@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import Any
 
 import pytest
@@ -15,7 +16,7 @@ from opensquilla.cli.tui.backend.contracts import (
     TuiRuntimeHooks,
     TuiSubmittedInput,
 )
-from opensquilla.cli.tui.backend.runtime import run_tui_runtime
+from opensquilla.cli.tui.backend.runtime import TuiTelemetryDelivery, run_tui_runtime
 from opensquilla.cli.tui.backend.state import TuiRuntimeState
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.commands import Surface
@@ -307,8 +308,153 @@ async def test_user_activity_observes_input_without_content(activity_fails: bool
         config=_runtime_config(concurrent_input_during_turn=False),
         hooks=_runtime_hooks(on_user_activity=activity),
     )
-    assert observed == ["active", "active"]
+    assert observed == ["active"]
     assert dispatched == ["synthetic task", "/help"]
+
+
+@pytest.mark.asyncio
+async def test_blocked_activity_does_not_delay_dispatch_or_accumulate_tasks() -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    values = ["synthetic task", *[f"/help {index}" for index in range(100)]]
+    for value in (*values, None):
+        inputs.put_nowait(value)
+    surface = _FakeSurface(inputs)
+    observed = 0
+    cancelled = asyncio.Event()
+    dispatched: list[str] = []
+
+    async def activity() -> None:
+        nonlocal observed
+        observed += 1
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def dispatch(value: str) -> bool:
+        dispatched.append(value)
+        return True
+
+    await asyncio.wait_for(run_tui_runtime(
+        dispatch=dispatch,
+        surface_factory=_surface_factory(surface),
+        config=_runtime_config(
+            concurrent_input_during_turn=False,
+            classify_input=lambda value: (
+                TuiInputKind.COMMAND if value.startswith("/") else TuiInputKind.NORMAL
+            ),
+        ),
+        hooks=_runtime_hooks(on_user_activity=activity),
+    ), timeout=2)
+
+    assert dispatched == values
+    assert observed == 1
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_activity_coalesces_pending_requests_without_losing_next_utc_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.tui.backend import runtime as runtime_module
+
+    today = date(2026, 1, 1)
+    monkeypatch.setattr(runtime_module, "_activity_day", lambda: today)
+    release = asyncio.Event()
+    observed: list[date] = []
+
+    async def activity() -> None:
+        observed.append(today)
+        if len(observed) == 1:
+            await release.wait()
+
+    delivery = TuiTelemetryDelivery(activity)
+    try:
+        delivery.observe()
+        await _wait_until(lambda: bool(observed))
+        today = date(2026, 1, 2)
+        for _ in range(100):
+            delivery.observe()
+        assert observed == [date(2026, 1, 1)]
+        release.set()
+        await _wait_until(lambda: len(observed) == 2)
+        for _ in range(100):
+            delivery.observe()
+        await asyncio.sleep(0)
+        assert observed == [date(2026, 1, 1), date(2026, 1, 2)]
+        today = date(2026, 1, 3)
+        delivery.observe()
+        await _wait_until(lambda: len(observed) == 3)
+    finally:
+        release.set()
+        await delivery.close()
+
+
+@pytest.mark.parametrize("times_out", [False, True])
+async def test_failed_activity_attempts_are_throttled_and_contained(
+    monkeypatch: pytest.MonkeyPatch, times_out: bool,
+) -> None:
+    from opensquilla.cli.tui.backend import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ACTIVITY_DELIVERY_TIMEOUT_S", 0.01)
+    observed = 0
+    finished = asyncio.Event()
+
+    async def activity() -> None:
+        nonlocal observed
+        observed += 1
+        try:
+            if times_out:
+                await asyncio.Event().wait()
+            raise RuntimeError("synthetic telemetry failure")
+        finally:
+            finished.set()
+
+    delivery = TuiTelemetryDelivery(activity)
+    try:
+        delivery.observe()
+        await asyncio.wait_for(finished.wait(), timeout=2)
+        await asyncio.sleep(0)
+        for _ in range(100):
+            delivery.observe()
+        await asyncio.sleep(0)
+        assert observed == 1
+    finally:
+        await delivery.close()
+
+
+@pytest.mark.asyncio
+async def test_activity_shutdown_does_not_wait_for_cancellation_resistant_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.cli.tui.backend import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ACTIVITY_CLOSE_TIMEOUT_S", 0.01)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def activity() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        finally:
+            finished.set()
+
+    delivery = TuiTelemetryDelivery(activity)
+    delivery.observe()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await asyncio.wait_for(delivery.close(), timeout=1)
+        assert cancelled.is_set()
+        assert not finished.is_set()
+    finally:
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=2)
 
 
 @pytest.mark.asyncio
@@ -1496,8 +1642,10 @@ async def test_runtime_runs_command_inline_without_echo_or_queue(command: str) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["/strategy", "/router on", "/ensemble", "/meta foo"])
-async def test_standalone_gateway_only_commands_never_become_turns(command: str) -> None:
+@pytest.mark.parametrize(
+    "command", ["/strategy", "/router on", "/ensemble", "/meta foo", "/coding on"],
+)
+async def test_standalone_unsupported_commands_never_become_turns(command: str) -> None:
     inputs: asyncio.Queue[str | None] = asyncio.Queue()
     surface = _FakeSurface(inputs)
     state = TuiRuntimeState()

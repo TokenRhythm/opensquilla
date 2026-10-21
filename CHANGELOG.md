@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-09-30
+
+### Added
+
+- Browser Use (Beta) in Desktop: built-in browser tools and a browser Workbench
+  for browsing and interacting with pages during a task.
+- Scoped thinking controls in model configuration.
+
+### Changed
+
+- Manual and automatic compaction share model-aware request budgets, including
+  instructions, tools, and attachments. Failed summaries can fall back to bounded
+  request-local history while preserving the saved transcript and live tool state.
+  Legacy independent compaction capacity and model overrides no longer control it.
+- Large text pastes become text attachments. Gateway diagnostics are consolidated
+  in Settings, and conversation/activity presentation is clearer.
+
+### Removed
+
+- The Web UI and Desktop background-music player and its settings are removed.
+  Existing music preferences are ignored, and personal music files stay on disk
+  without entering new builds. Chat audio playback and voice input are unchanged.
+- Removed experimental router self-learning and its feedback submission API.
+  Existing installations use their configured base router; obsolete training
+  settings are ignored and cleaned on migration, while historical training files
+  remain untouched. Dream memory consolidation retains its existing settings
+  and manages its own schedule. Matching updated clients and Gateway are required.
+  Thumbs up/down remain as page-local answer ratings, with no submission or training;
+  selections reset when the page reloads.
+
+### Fixed
+
+- More reliable Gateway connections, task recovery, Stop/Queue/Steer handling,
+  Goal continuation, provider streams, and bounded conversation-history recovery.
+- Bounded database and history work reduces blocking during delivery recovery;
+  Desktop startup, second-instance activation, Windows Safe setup prompts, and
+  macOS terminal descendant cleanup are more reliable.
+- Newly created chats and first-message sidebar labels remain visible; model
+  catalogs remain authoritative and responsive while refreshing.
+- Desktop local-file selection no longer silently loses a selection after an
+  unchanged session refresh. Explicit file references display short filenames
+  in the composer and sent messages, including after reload or editing, while
+  retaining full paths for the Agent and copying. Images and file permissions
+  are unchanged.
+- Workbench previews remain available after opening more than eight files or
+  pages, without requiring users to close another preview or dropping older tabs.
+- Temporary preview renewal failures preserve the current page while retrying;
+  failed lease revocations are retried in the background after closing a preview.
+- CLI and onboarding config loads continue with validated in-memory migrations
+  when an automatic migration backup or rewrite cannot be written.
+
 ## [0.5.5] - 2026-09-23
 
 ### Added

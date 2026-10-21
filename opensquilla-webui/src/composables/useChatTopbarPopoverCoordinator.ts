@@ -15,7 +15,6 @@ export type ChatTopbarPopoverId =
   | 'system-status'
   | 'language'
   | 'theme'
-  | 'bgm'
   | 'desktop-update'
 
 export interface ChatTopbarPopoverCoordinator {

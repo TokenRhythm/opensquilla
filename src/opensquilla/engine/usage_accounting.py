@@ -28,12 +28,20 @@ from typing import Any, Protocol, runtime_checkable
 
 import structlog
 
-from opensquilla.engine.pricing import estimate_cost, resolve_model_price
+from opensquilla.engine.pricing import estimate_cost, resolve_model_price, token_price_snapshot
 from opensquilla.provider.types import ProviderBillingReceipt
+from opensquilla.usage_metering import (
+    UsageMeter,
+    UsagePriceSnapshot,
+    UsageSettlementRevision,
+    coerce_meter,
+    coerce_settlement,
+)
 from opensquilla.usage_reasons import (
     normalize_usage_unknown_reason,
     provider_error_usage_reason,
 )
+from opensquilla.usage_request import bind_request_accounting
 
 _NANOS_PER_USD = Decimal("1000000000")
 _CANCELLED_USAGE_TERMINAL_GRACE_SECONDS = 0.25
@@ -161,6 +169,10 @@ class UsageCallItem:
     estimate_basis: str | None
     price_source: str | None
     billing_receipt: ProviderBillingReceipt | None = None
+    meters: tuple[UsageMeter, ...] = ()
+    price_snapshot: UsagePriceSnapshot | None = None
+    settlement: UsageSettlementRevision | None = None
+    token_usage_known: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +217,7 @@ class UsageAccountingScope:
 
     A scope object is intentionally shared by copied asyncio contexts.  A
     synchronous increment cannot interleave on the event loop, so concurrent
-    tool/meta tasks still receive distinct call indices without a lock.
+    tool tasks still receive distinct call indices without a lock.
     """
 
     sink: UsageEventSink
@@ -256,9 +268,12 @@ def bind_usage_accounting_scope(scope: UsageAccountingScope | None) -> Iterator[
     if scope is None:
         yield
         return
+    from opensquilla.provider.metered_http import accounted_request
+
     token = _ACTIVE_USAGE_SCOPE.set(scope)
     try:
-        yield
+        with bind_request_accounting(accounted_request):
+            yield
     finally:
         _ACTIVE_USAGE_SCOPE.reset(token)
 
@@ -417,8 +432,8 @@ async def account_provider_stream(
 ) -> AsyncGenerator[Any, None]:
     """Account exactly one physical ``provider.chat`` invocation.
 
-    The current scope is inherited through ``ContextVar`` by tool and meta
-    tasks.  Without a scope this is a byte-for-byte streaming pass-through.
+    Child tasks inherit the current scope through ``ContextVar``.
+    Without a scope this is a byte-for-byte streaming pass-through.
     """
 
     scope = current_usage_accounting_scope()
@@ -698,14 +713,21 @@ def _item_from_row(
     default_provider: str,
     default_model: str,
     resolve_estimates: bool,
+    allow_heuristic_estimates: bool,
 ) -> UsageCallItem:
     provider = str(row.get("provider") or default_provider or "")
     model = str(row.get("model") or default_model or "")
+    token_usage_known = bool(row.get("token_usage_known", True)) and (
+        _row_value(row, "input_tokens", "inputTokens") is not None
+        and _row_value(row, "output_tokens", "outputTokens") is not None
+    )
+    supplied_settlement = coerce_settlement(row.get("settlement"))
+    snapshot = row.get("price_snapshot")
+    if snapshot is not None and not isinstance(snapshot, UsagePriceSnapshot):
+        raise ValueError("price_snapshot must be a UsagePriceSnapshot")
     input_tokens = _usage_int(_row_value(row, "input_tokens", "inputTokens"))
     output_tokens = _usage_int(_row_value(row, "output_tokens", "outputTokens"))
-    reasoning_tokens = _usage_int(
-        _row_value(row, "reasoning_tokens", "reasoningTokens")
-    )
+    reasoning_tokens = _usage_int(_row_value(row, "reasoning_tokens", "reasoningTokens"))
     cache_read_tokens = _usage_int(
         _row_value(
             row,
@@ -715,9 +737,7 @@ def _item_from_row(
             "cachedTokens",
         )
     )
-    cache_write_tokens = _usage_int(
-        _row_value(row, "cache_write_tokens", "cacheWriteTokens")
-    )
+    cache_write_tokens = _usage_int(_row_value(row, "cache_write_tokens", "cacheWriteTokens"))
     billed = _usage_float(
         _row_value(
             row,
@@ -727,41 +747,48 @@ def _item_from_row(
             "billedCostUsd",
         )
     )
-    receipt = _coerce_billing_receipt(
-        _row_value(row, "billing_receipt", "billingReceipt")
+    receipt = _coerce_billing_receipt(_row_value(row, "billing_receipt", "billingReceipt"))
+    row_source = (
+        str(_row_value(row, "cost_source", "costSource", default="none") or "none").strip().lower()
     )
-    row_source = str(
-        _row_value(row, "cost_source", "costSource", default="none") or "none"
-    ).strip().lower()
     receipt_pending = receipt is not None and receipt.status == "pending"
     confirmed_receipt = receipt is not None and receipt.status == "confirmed"
     # Explicit source retains compatibility with provider adapters and test
     # doubles that have not yet attached the additive receipt object. Amount is
     # only the final legacy fallback; confirmed zero relies on source/receipt.
-    provider_billed = (
-        not receipt_pending
-        and (
-            confirmed_receipt
-            or row_source in {"provider_billed", "openrouter_usage"}
-            or billed > 0.0
-        )
+    provider_billed = not receipt_pending and (
+        confirmed_receipt or row_source in {"provider_billed", "openrouter_usage"} or billed > 0.0
     )
 
     estimate_usd = 0.0
     estimate_basis: str | None = None
     price_source: str | None = None
-    if not provider_billed and resolve_estimates:
+    if (
+        not provider_billed
+        and resolve_estimates
+        and token_usage_known
+        and supplied_settlement is None
+    ):
         resolved = resolve_model_price(model, provider)
-        estimate = estimate_cost(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=cache_write_tokens,
-            price=resolved.entry,
-        )
-        estimate_usd = max(0.0, float(estimate.cost_usd or 0.0))
-        estimate_basis = estimate.basis
         price_source = resolved.source
+        # Routing heuristics retain their legacy fallback, but a default rate
+        # and an unpriced custom endpoint are not accounting price evidence.
+        if resolved.has_accounting_price or allow_heuristic_estimates:
+            estimate = estimate_cost(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                price=resolved.entry,
+            )
+            estimate_usd = max(0.0, float(estimate.cost_usd or 0.0))
+            estimate_basis = estimate.basis
+            snapshot = token_price_snapshot(
+                resolved,
+                provider=provider,
+                model=model,
+                cache_blind=estimate.basis == "cache_blind",
+            )
 
     billed_nanos = (
         max(0, int(receipt.usd_equivalent_nanos or 0))
@@ -777,21 +804,85 @@ def _item_from_row(
         source = "provider_billed"
     elif estimated_nanos:
         source = "opensquilla_estimate"
-    elif estimate_basis == "free":
-        source = "free"
+    elif estimate_basis is not None:
+        source = "free" if estimate_basis == "free" else "opensquilla_estimate"
     elif not resolve_estimates:
         # Turn-level billed accounting must stay purely receipt-driven.  In
         # particular, a pending receipt whose compatibility source still says
         # ``provider_billed`` must not be reclassified as a confirmed bill
         # merely because estimate resolution was intentionally skipped.
-        source = (
-            "free"
-            if row_source == "free" and not receipt_pending
-            else "unavailable"
+        source = "free" if row_source == "free" and not receipt_pending else "unavailable"
+    else:
+        source = "unavailable"
+
+    if supplied_settlement is not None and (
+        not provider_billed or supplied_settlement.authority == "provider_confirmed"
+    ):
+        fields = supplied_settlement.cost_fields()
+        billed_nanos = fields["billed_cost_nanos"]
+        estimated_nanos = fields["estimated_cost_nanos"]
+        source = fields["cost_source"]
+        settlement = supplied_settlement
+    elif receipt is not None and confirmed_receipt:
+        from opensquilla.provider.fx import settlement_fx_evidence
+
+        settlement = UsageSettlementRevision(
+            "initial",
+            "provider_confirmed",
+            "final",
+            receipt.currency,
+            str(Decimal(receipt.amount_nanos or 0) / _NANOS_PER_USD),
+            str(Decimal(receipt.usd_equivalent_nanos or 0) / _NANOS_PER_USD),
+            **settlement_fx_evidence(
+                receipt.currency,
+                str(Decimal(receipt.fx_native_per_usd_nanos) / _NANOS_PER_USD),
+            ),
+        )
+    elif provider_billed:
+        settlement = UsageSettlementRevision(
+            "initial",
+            "provider_confirmed",
+            "final",
+            "USD",
+            str(Decimal(billed_nanos) / _NANOS_PER_USD),
+            str(Decimal(billed_nanos) / _NANOS_PER_USD),
+        )
+    elif source in {"opensquilla_estimate", "free"}:
+        amount = str(Decimal(estimated_nanos) / _NANOS_PER_USD)
+        settlement = UsageSettlementRevision(
+            "initial",
+            "local_estimate",
+            "pending" if receipt_pending else "final",
+            "USD",
+            amount,
+            amount,
+            price_snapshot_id=snapshot.snapshot_id if snapshot else None,
         )
     else:
-        source = "unavailable" if row_source == "none" else row_source
-
+        settlement = UsageSettlementRevision(
+            "initial", "unknown", "pending" if receipt_pending else "unknown"
+        )
+    raw_meters = row.get("usage_meters")
+    meters = (
+        tuple(coerce_meter(value) for value in raw_meters)
+        if raw_meters is not None
+        else (
+            UsageMeter(
+                "input_tokens",
+                "token",
+                str(input_tokens) if token_usage_known else None,
+                known=token_usage_known,
+            ),
+            UsageMeter(
+                "output_tokens",
+                "token",
+                str(output_tokens) if token_usage_known else None,
+                known=token_usage_known,
+            ),
+            UsageMeter("cache_read_tokens", "token", str(cache_read_tokens)),
+            UsageMeter("cache_write_tokens", "token", str(cache_write_tokens)),
+        )
+    )
     return UsageCallItem(
         ordinal=ordinal,
         provider=provider,
@@ -807,6 +898,10 @@ def _item_from_row(
         estimate_basis=estimate_basis,
         price_source=price_source,
         billing_receipt=receipt,
+        meters=meters,
+        price_snapshot=snapshot,
+        settlement=settlement,
+        token_usage_known=token_usage_known,
     )
 
 
@@ -817,6 +912,7 @@ def normalize_provider_usage(
     default_model: str,
     completed_at_ms: int,
     resolve_estimates: bool = True,
+    allow_heuristic_estimates: bool = False,
 ) -> UsageCallResult:
     """Normalize a provider ``DoneEvent`` without depending on persistence.
 
@@ -827,6 +923,8 @@ def normalize_provider_usage(
     exactly without a second rounding path.  ``resolve_estimates=False`` keeps
     normalization receipt-only so turn budget accounting never performs price
     resolution on the provider stream's synchronous error path.
+    ``allow_heuristic_estimates`` is only for the transient turn budget gate;
+    persisted usage and user-visible cost reports must retain its default.
     """
 
     raw_breakdown = getattr(event, "model_usage_breakdown", None)
@@ -845,14 +943,18 @@ def normalize_provider_usage(
             {
                 "provider": provider,
                 "model": model,
-                "input_tokens": getattr(event, "input_tokens", 0),
-                "output_tokens": getattr(event, "output_tokens", 0),
+                "input_tokens": getattr(event, "input_tokens", None),
+                "output_tokens": getattr(event, "output_tokens", None),
                 "reasoning_tokens": getattr(event, "reasoning_tokens", 0),
                 "cached_tokens": getattr(event, "cached_tokens", 0),
                 "cache_write_tokens": getattr(event, "cache_write_tokens", 0),
                 "billed_cost": getattr(event, "billed_cost", 0.0),
                 "cost_source": getattr(event, "cost_source", "none"),
                 "billing_receipt": getattr(event, "billing_receipt", None),
+                "usage_meters": getattr(event, "usage_meters", None),
+                "price_snapshot": getattr(event, "price_snapshot", None),
+                "settlement": getattr(event, "settlement", None),
+                "token_usage_known": getattr(event, "token_usage_known", True),
             }
         ]
 
@@ -863,6 +965,7 @@ def normalize_provider_usage(
             default_provider=provider,
             default_model=model,
             resolve_estimates=resolve_estimates,
+            allow_heuristic_estimates=allow_heuristic_estimates,
         )
         for ordinal, row in enumerate(rows)
     )

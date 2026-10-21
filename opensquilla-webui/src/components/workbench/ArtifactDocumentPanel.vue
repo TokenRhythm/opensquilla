@@ -1,5 +1,6 @@
 <template>
   <section
+    ref="documentRoot"
     class="artifact-document"
     :data-document-source="workspace?.source || 'loading'"
     :data-download-only="downloadOnly ? 'true' : 'false'"
@@ -28,6 +29,9 @@
           {{ tab.count }}
         </span>
       </button>
+      <span v-if="currentRevision && documentFeatures" class="artifact-document__current-version">
+        {{ t('workbench.artifactDocument.currentVersion', { generation: currentRevision.generation }) }}
+      </span>
       <span v-if="documentSnapshot.loading" class="artifact-document__loading" role="status">
         {{ t('workbench.artifactDocument.syncing') }}
       </span>
@@ -46,53 +50,23 @@
       {{ mutationError }}
     </p>
 
-    <div
-      v-if="annotationFallback"
-      class="artifact-document__annotation-fallback"
-      role="dialog"
-      aria-modal="true"
-      :aria-labelledby="`${instanceId}-annotation-fallback-title`"
-    >
-      <form
-        class="artifact-document__annotation-fallback-card"
-        @submit.prevent="submitAnnotationFallback"
-      >
-        <strong :id="`${instanceId}-annotation-fallback-title`">
-          {{ t('workbench.artifactAnnotation.fallbackTitle') }}
-        </strong>
-        <p>{{ t('workbench.artifactAnnotation.fallbackDetail') }}</p>
-        <textarea
-          ref="annotationFallbackInput"
-          v-model="annotationFallbackBody"
-          :aria-describedby="`${instanceId}-annotation-newline-hint`"
-          :maxlength="promptAnnotationMaxBodyLength"
-          :placeholder="t('workbench.artifactAnnotation.placeholder')"
-          @input="updateAnnotationFallback"
-          @keydown="onAnnotationFallbackKeydown"
-        />
-        <span class="artifact-document__annotation-fallback-actions">
-          <small
-            :id="`${instanceId}-annotation-newline-hint`"
-            class="artifact-document__annotation-shortcut-hint"
-          >
-            {{ annotationNewlineHint }}
-          </small>
-          <button type="button" class="btn" @click="cancelAnnotationFallback">
-            {{ t('common.cancel') }}
-          </button>
-          <button
-            type="submit"
-            class="btn btn--primary"
-            :disabled="!annotationFallbackBody.trim() || annotationFallbackTooLong"
-          >
-            {{ t('workbench.artifactAnnotation.keepDraft') }}
-          </button>
-        </span>
-      </form>
+    <div v-if="annotationFallback && activeTab === 'preview' && !suspended" ref="annotationFallbackDialog"
+      class="artifact-document__comment" :style="commentStyle" role="dialog"
+      aria-modal="false"
+      :aria-label="t('workbench.annotationUnified.start')">
+      <AnnotationCommentCard :key="annotationFallback.annotationId" :body="annotationFallbackBody"
+        :label="annotationFallback.label || t('workbench.annotationUnified.start')"
+        :show-target="!annotationFallback.anchor?.visible"
+        :count="annotationCount" :busy="annotationBusy" :error="annotationError" :stale="annotationFallback.stale"
+        @update="body => { annotationFallbackBody = body; updateAnnotationFallback() }"
+        @record="submitAnnotationFallback"
+        @cancel="cancelAnnotationFallback"
+        @reselect="emit('workbench-event', { type: 'artifact-annotation-summary', payload: { type: 'reselect', annotationId: annotationFallback.annotationId } })" />
     </div>
 
     <div
       v-show="activeTab === 'preview'"
+      ref="previewViewport"
       :id="panelId('preview')"
       class="artifact-document__panel artifact-document__panel--preview"
       data-document-section="preview"
@@ -111,7 +85,7 @@
           @click="downloadHead"
         >
           <Icon name="download" :size="15" />
-          <span>{{ t('workbench.artifactDocument.downloadLatest') }}</span>
+          <span>{{ documentFeatures ? t('workbench.artifactDocument.downloadLatest') : t('chat.download') }}</span>
         </button>
         <small>{{ t('workbench.artifactDocument.noEditingClaim') }}</small>
       </div>
@@ -132,6 +106,11 @@
         :session-key="sessionKey"
         :show-header="showHeader"
         :suspended="suspended || activeTab !== 'preview'"
+        :office-annotation-enabled="officeAnnotationEnabled"
+        :office-selection-to-locate="officeSelectionToLocate"
+        :office-selection-mode="officeSelectionMode"
+        :office-selection-locked="annotationFallback?.reason === 'office-selection'"
+        :reading-state="previewReading?.identity === artifactReadingIdentity(headArtifact, sessionKey) ? previewReading.reading : undefined"
         @workbench-event="forwardWorkbenchEvent"
       />
     </div>
@@ -191,6 +170,16 @@
               {{ formatDate(revision.createdAt) }}
             </time>
             <span class="artifact-document__actions">
+              <button
+                v-if="workspace?.source === 'document-api' && documentModel?.capabilities.revisions"
+                type="button"
+                class="artifact-document__action"
+                data-artifact-action="view-revision"
+                :disabled="mutationBusy"
+                @click="viewRevision(revision.revisionId)"
+              >
+                {{ t('workbench.artifactDocument.viewRevision') }}
+              </button>
               <button
                 type="button"
                 class="artifact-document__action"
@@ -261,20 +250,23 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, useId, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import Icon from '@/components/Icon.vue'
+import AnnotationCommentCard from './AnnotationCommentCard.vue'
+import { placeAnnotationCard, type AnnotationSide } from '@/workbench/annotationPlacement'
+import type { PromptAnnotation } from '@/types/promptAnnotations'
+import type { OfficeSelection } from '@/types/officeSelection'
+import type { OfficeSelectionAnchor } from '@/workbench/officeSelectionInteraction'
 import type {
   ArtifactDocumentActions,
   ArtifactDocumentWorkspaceSnapshot,
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/artifacts'
 import {
-  PROMPT_ANNOTATION_MAX_BODY_LENGTH,
   promptAnnotationBodyWithinLimit,
 } from '@/types/promptAnnotations'
-import { isMacPlatform } from '@/utils/browser'
 import { isOfficeArtifact } from '@/utils/chat/artifacts'
 import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import type {
@@ -283,6 +275,7 @@ import type {
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
 import ArtifactSourcePreview from './ArtifactSourcePreview.vue'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
+import { artifactReadingIdentity, type ArtifactReadingCheckpoint } from './resourceReadingState'
 
 type DocumentTab = 'preview' | 'source' | 'versions' | 'changes'
 type PreviewHandle = { reload: () => Promise<void> }
@@ -306,15 +299,27 @@ const props = withDefaults(defineProps<{
   previewLaunchUrl?: string
   previewMode?: 'full' | 'offline'
   previewNetworkAllowed?: boolean
-  previewSandboxProfile?: 'default' | 'opaque-offline'
+  previewSandboxProfile?: 'default' | 'opaque-offline' | 'none'
   publishing?: boolean
   sessionKey?: string
   showHeader?: boolean
   suspended?: boolean
+  previewReading?: ArtifactReadingCheckpoint
+  officeAnnotationEnabled?: boolean
+  annotationDrafts?: PromptAnnotation[]
+  queuedAnnotationIds?: string[]
+  annotationPagePath?: string
+  annotationBusy?: boolean
+  annotationError?: string
+  officeSelectionMode?: boolean
+  officeSelectionToLocate?: { selection: OfficeSelection; revisionId?: string; stale?: boolean; requestId: string | number }
   annotationFallback?: {
     annotationId: string
     body: string
     reason?: string
+    label?: string
+    stale?: boolean
+    anchor?: OfficeSelectionAnchor | null
   } | null
 }>(), {
   documentSnapshot: () => ({
@@ -344,6 +349,9 @@ const props = withDefaults(defineProps<{
   showHeader: false,
   suspended: false,
   annotationFallback: null,
+  annotationDrafts: () => [],
+  queuedAnnotationIds: () => [],
+  officeSelectionMode: undefined,
 })
 
 const emit = defineEmits<{
@@ -352,16 +360,68 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const instanceId = useId()
-const promptAnnotationMaxBodyLength = PROMPT_ANNOTATION_MAX_BODY_LENGTH
-const annotationNewlineHint = computed(() => t(
-  'workbench.artifactAnnotation.newlineHint',
-  { shortcut: isMacPlatform() ? '⇧ Return' : 'Shift + Enter' },
-))
 const annotationFallbackBody = ref('')
-const annotationFallbackInput = ref<HTMLTextAreaElement | null>(null)
-const annotationFallbackTooLong = computed(() => (
-  !promptAnnotationBodyWithinLimit(annotationFallbackBody.value)
-))
+const annotationFallbackDialog = ref<HTMLElement | null>(null)
+let annotationReturnFocus: HTMLElement | null = null
+let annotationFocusGeneration = 0
+const documentRoot = ref<HTMLElement | null>(null)
+const previewViewport = ref<HTMLElement | null>(null)
+const commentStyle = ref<Record<string, string>>({ visibility: 'hidden', position: 'absolute', width: '352px' })
+let layoutObserver: ResizeObserver | null = null
+let layoutFrame = 0
+let commentSide: AnnotationSide | undefined
+const annotationCount = computed(() => props.annotationDrafts.filter(item => item.body.trim()
+  && !props.queuedAnnotationIds.includes(item.annotationId)
+  && (item.selection || (item.pagePath || '') === (props.annotationPagePath || ''))).length)
+function placeComment() {
+  const root = documentRoot.value?.getBoundingClientRect()
+  const preview = previewViewport.value?.getBoundingClientRect()
+  if (!root || !preview || !preview.width || !preview.height) return
+  const anchor = props.annotationFallback?.anchor
+  const contentViewport = previewViewport.value?.querySelector<HTMLElement>('.office-preview__viewport')
+    ?.getBoundingClientRect() ?? preview
+  // Format adapters may further constrain the editable area (for example, the
+  // spreadsheet grid excludes sheet tabs). Intersect with the live panel bounds.
+  const targetViewport = anchor?.viewport
+  const viewport = window.visualViewport
+  const leftEdge = Math.max(preview.left, contentViewport.left, targetViewport?.left ?? preview.left,
+    viewport?.offsetLeft || 0)
+  const topEdge = Math.max(preview.top, contentViewport.top, targetViewport?.top ?? preview.top,
+    viewport?.offsetTop || 0)
+  const rightEdge = Math.min(preview.right, contentViewport.right,
+    targetViewport ? targetViewport.left + targetViewport.width : preview.right,
+    (viewport?.offsetLeft || 0) + (viewport?.width || window.innerWidth))
+  const bottomEdge = Math.min(preview.bottom, contentViewport.bottom,
+    targetViewport ? targetViewport.top + targetViewport.height : preview.bottom,
+    (viewport?.offsetTop || 0) + (viewport?.height || window.innerHeight))
+  const availableWidth = Math.max(0, rightEdge - leftEdge)
+  const availableHeight = Math.max(0, bottomEdge - topEdge)
+  const height = annotationFallbackDialog.value?.scrollHeight || 48
+  const placement = placeAnnotationCard({
+    // Unknown targets retain an editable card and target summary at the upper
+    // edge. Only a resolved target may claim an exact contextual placement.
+    anchor: anchor?.rect ?? { left: leftEdge, top: topEdge, width: 0, height: 0 },
+    viewport: { left: leftEdge, top: topEdge, width: availableWidth, height: availableHeight },
+    width: 352, height, preferredSide: commentSide,
+  })
+  commentSide = placement.side
+  commentStyle.value = {
+    position: 'absolute', visibility: availableWidth > 0 && availableHeight > 0 ? 'visible' : 'hidden',
+    width: `${placement.width}px`, maxHeight: `${Math.max(0, availableHeight - 16)}px`,
+    left: `${placement.left - root.left}px`,
+    top: `${placement.top - root.top}px`,
+  }
+}
+function scheduleCommentPlacement() {
+  if (layoutFrame) return
+  layoutFrame = requestAnimationFrame(() => { layoutFrame = 0; placeComment() })
+}
+watch(() => [props.annotationFallback?.anchor, annotationFallbackBody.value], () => { void nextTick(placeComment) }, { deep: true })
+watch(annotationFallbackDialog, (dialog, old) => {
+  if (old) layoutObserver?.unobserve(old)
+  if (dialog) layoutObserver?.observe(dialog)
+  scheduleCommentPlacement()
+})
 const activeTab = ref<DocumentTab>(props.initialSection)
 const sourceActivated = ref(props.initialSection === 'source')
 const previewRef = ref<PreviewHandle | null>(null)
@@ -374,15 +434,56 @@ watch(activeTab, tab => {
 })
 
 watch(() => props.annotationFallback, (fallback, previous) => {
+  const focusGeneration = ++annotationFocusGeneration
   if (!fallback) {
     annotationFallbackBody.value = ''
+    const target = annotationReturnFocus
+    const dialog = annotationFallbackDialog.value
+    annotationReturnFocus = null
+    void nextTick(() => {
+      if (focusGeneration !== annotationFocusGeneration || !target?.isConnected) return
+      const active = target.ownerDocument.activeElement
+      // Closing a dialog removes its focused control. Restore the preview's
+      // scoped keyboard handling, without stealing focus moved elsewhere.
+      if (!active || active === target.ownerDocument.body || dialog?.contains(active)) {
+        target.focus({ preventScroll: true })
+      }
+    })
     return
   }
+  if (!previous && typeof document !== 'undefined') {
+    annotationReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  }
   if (fallback.annotationId !== previous?.annotationId) {
+    commentSide = undefined
     annotationFallbackBody.value = fallback.body
   }
-  void nextTick(() => annotationFallbackInput.value?.focus())
+  void nextTick(() => {
+    if (focusGeneration === annotationFocusGeneration) placeComment()
+  })
 }, { immediate: true })
+onMounted(() => {
+  if (typeof ResizeObserver !== 'undefined') {
+    layoutObserver = new ResizeObserver(scheduleCommentPlacement)
+    if (documentRoot.value) layoutObserver.observe(documentRoot.value)
+    if (previewViewport.value) layoutObserver.observe(previewViewport.value)
+    if (annotationFallbackDialog.value) layoutObserver.observe(annotationFallbackDialog.value)
+  }
+  window.addEventListener('resize', scheduleCommentPlacement)
+  window.addEventListener('scroll', scheduleCommentPlacement, true)
+  window.visualViewport?.addEventListener('resize', scheduleCommentPlacement)
+  window.visualViewport?.addEventListener('scroll', scheduleCommentPlacement)
+  scheduleCommentPlacement()
+})
+onBeforeUnmount(() => {
+  annotationFocusGeneration += 1; annotationReturnFocus = null
+  layoutObserver?.disconnect()
+  if (layoutFrame) cancelAnimationFrame(layoutFrame)
+  window.removeEventListener('resize', scheduleCommentPlacement)
+  window.removeEventListener('scroll', scheduleCommentPlacement, true)
+  window.visualViewport?.removeEventListener('resize', scheduleCommentPlacement)
+  window.visualViewport?.removeEventListener('scroll', scheduleCommentPlacement)
+})
 
 function annotationFallbackPayload() {
   return {
@@ -401,6 +502,7 @@ function updateAnnotationFallback() {
 function submitAnnotationFallback() {
   if (
     !props.annotationFallback
+    || props.annotationBusy || props.annotationFallback.stale
     || !annotationFallbackBody.value.trim()
     || !promptAnnotationBodyWithinLimit(annotationFallbackBody.value)
   ) return
@@ -410,27 +512,13 @@ function submitAnnotationFallback() {
   })
 }
 
-function onAnnotationFallbackKeydown(event: KeyboardEvent) {
-  if (event.isComposing || event.keyCode === 229) return
-  if (event.key === 'Escape') {
-    event.preventDefault()
-    cancelAnnotationFallback()
-    return
-  }
-  // Keep the legacy Ctrl/Cmd+Enter path working while making plain Enter the
-  // primary action. Shift+Enter remains the cross-platform newline chord.
-  if (event.key === 'Enter' && !event.shiftKey && !event.altKey) {
-    event.preventDefault()
-    submitAnnotationFallback()
-  }
-}
-
 function cancelAnnotationFallback() {
   if (!props.annotationFallback) return
   emit('workbench-event', {
     type: 'artifact-annotation-fallback-cancel',
     payload: {
       annotationId: props.annotationFallback.annotationId,
+      body: annotationFallbackBody.value,
       reason: 'user-cancelled',
     },
   })
@@ -441,6 +529,9 @@ const workspace = computed(() => documentFeatures.value
   : null)
 const documentModel = computed(() => workspace.value?.document || null)
 const revisions = computed(() => workspace.value?.revisions || [])
+const currentRevision = computed(() => revisions.value.find(
+  revision => revision.revisionId === documentModel.value?.headRevisionId,
+))
 const changeSets = computed(() => workspace.value?.changeSets || [])
 const appliedChangeSets = computed(() => changeSets.value.filter(
   changeSet => changeSet.status === 'applied',
@@ -450,7 +541,8 @@ const headArtifact = computed(() => documentFeatures.value
   : props.artifact)
 const downloadOnly = computed(() => {
   if (isOfficeArtifact(headArtifact.value)) {
-    return documentModel.value?.capabilities.preview !== true
+    return artifactWorkbenchPreviewKind(headArtifact.value) === 'unsupported'
+      || (documentModel.value !== null && documentModel.value.capabilities.preview !== true)
   }
   return artifactWorkbenchPreviewKind(headArtifact.value) === 'unsupported'
 })
@@ -502,7 +594,7 @@ const tabs = computed<Array<{ id: DocumentTab; label: string; count: number | nu
   }
   if (documentFeatures.value) {
     result.push(
-      { id: 'versions', label: t('workbench.artifactDocument.versions'), count: revisions.value.length },
+      { id: 'versions', label: t('workbench.artifactDocument.versionHistory', { count: revisions.value.length }), count: null },
       { id: 'changes', label: t('workbench.artifactDocument.changes'), count: appliedChangeSets.value.length },
     )
   }
@@ -544,6 +636,12 @@ function downloadHead() {
   })
 }
 
+
+function viewRevision(revisionId: string) {
+  const revision = revisions.value.find(item => item.revisionId === revisionId)
+  if (!revision || revision.documentId !== documentModel.value?.documentId) return
+  emit('workbench-event', { type: 'artifact-view-revision', payload: artifactPayloadFromRevision(revision) })
+}
 
 function downloadRevision(revisionId: string) {
   const revision = revisions.value.find(item => item.revisionId === revisionId)
@@ -677,6 +775,7 @@ defineExpose({ beforeClose, reload })
 </script>
 
 <style scoped>
+.artifact-document__comment { z-index: 40; min-width: 0; overflow: auto; overscroll-behavior: contain; }
 .artifact-document {
   position: relative;
   display: flex;
@@ -687,61 +786,6 @@ defineExpose({ beforeClose, reload })
   overflow: hidden;
   background: var(--bg-surface);
   color: var(--text);
-}
-
-.artifact-document__annotation-fallback {
-  position: absolute;
-  z-index: 20;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-  background: color-mix(in srgb, var(--bg) 82%, transparent);
-}
-
-.artifact-document__annotation-fallback-card {
-  display: grid;
-  gap: 10px;
-  width: min(420px, 100%);
-  padding: 18px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-lg);
-}
-
-.artifact-document__annotation-fallback-card p {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.artifact-document__annotation-fallback-card textarea {
-  min-height: 112px;
-  resize: vertical;
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg);
-  color: var(--text);
-  font: inherit;
-  line-height: 1.5;
-}
-
-.artifact-document__annotation-fallback-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.artifact-document__annotation-shortcut-hint {
-  margin-right: auto;
-  color: var(--text-dim);
-  font-size: 11px;
-  font-weight: 400;
-  white-space: nowrap;
 }
 
 .artifact-document__tabs {
@@ -770,6 +814,14 @@ defineExpose({ beforeClose, reload })
   font-size: 12px;
   white-space: nowrap;
   cursor: pointer;
+}
+
+.artifact-document__current-version {
+  margin-inline-start: auto;
+  padding: 0 8px 5px;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
 }
 
 .artifact-document__tab:hover,

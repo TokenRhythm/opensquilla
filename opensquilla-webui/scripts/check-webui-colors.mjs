@@ -121,6 +121,9 @@ const undefinedTokens = bareUsages.filter(
 // The floors distinguish INK (colour used as `color:` text) from FILL (dots,
 // bars, badge bodies — never text):
 //   • --text / --text-muted are body reading text → AA normal 4.5:1.
+//   • Syntax tokens are small reading text, including comments. They need
+//     AA 4.5:1 on --code-block-bg (inline code cards) and --bg-surface (the
+//     full code/tree viewer), not only on the theme's base background.
 //   • The colour-carrying INK — --accent, --accent-secondary and the status
 //     spectrum (ok/warn/danger/info/queued) — is used as `color:` text in 100+
 //     sites (links, nav, inline status, error copy). It MUST clear AA 4.5:1 on
@@ -207,6 +210,7 @@ function contrast(a, b) {
 const INK_TEXT = ['accent', 'accent-hover', 'accent-secondary', 'ok', 'warn', 'danger', 'info', 'queued']
 // Fill tokens: marks/dots/badge bodies, never text → 3:1 on --bg.
 const FILL_MARKS = ['ok-fill', 'warn-fill', 'danger-fill', 'info-fill', 'queued-fill']
+const SYNTAX_TEXT = ['syntax-comment', 'syntax-keyword', 'syntax-string', 'syntax-literal', 'syntax-title', 'syntax-attr']
 const CONTRAST_CHECKS = [
   { fg: 'text', bg: 'bg', min: 4.5 },
   { fg: 'text', bg: 'bg-surface', min: 4.5 },
@@ -220,6 +224,10 @@ const CONTRAST_CHECKS = [
     { fg, bg: 'bg-elevated', min: 3.0 },
   ]),
   ...FILL_MARKS.map((fg) => ({ fg, bg: 'bg', min: 3.0 })),
+  ...SYNTAX_TEXT.flatMap((fg) => [
+    { fg, bg: 'code-block-bg', min: 4.5 },
+    { fg, bg: 'bg-surface', min: 4.5 },
+  ]),
 ]
 const contrastFailures = []
 const unresolvable = []

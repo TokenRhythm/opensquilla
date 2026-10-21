@@ -252,14 +252,17 @@ def test_retry_after_hint_overrides_default_cooldown(monkeypatch) -> None:
     assert pools.acquire_for_session("openai", [_ENV_A], "s1") is not None
 
 
-def test_insufficient_credits_rotates_immediately_and_parks_long(monkeypatch) -> None:
+@pytest.mark.parametrize("kind", [
+    ProviderFailureKind.INSUFFICIENT_CREDITS, ProviderFailureKind.USAGE_LIMIT,
+])
+def test_insufficient_credits_rotates_immediately_and_parks_long(monkeypatch, kind) -> None:
     clock = _FakeClock()
     pools = ProfileCredentialPools(clock=clock)
     monkeypatch.setenv(_ENV_A, _SECRET_A)
     monkeypatch.setenv(_ENV_B, _SECRET_B)
     first = pools.acquire_for_session("openai", [_ENV_A, _ENV_B], "s1")
     assert first is not None
-    pools.report_failure("openai", "s1", ProviderFailureKind.INSUFFICIENT_CREDITS)
+    pools.report_failure("openai", "s1", kind)
     rotated = pools.acquire_for_session("openai", [_ENV_A, _ENV_B], "s1")
     assert rotated is not None and rotated.env_name != first.env_name
     # Far longer than a 429 window, still parked; eligible after the credits

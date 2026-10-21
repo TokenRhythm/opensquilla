@@ -359,6 +359,17 @@ def _env_for(suites: set[str]) -> dict[str, str]:
     env = {
         "RESULT_PLANNER": "success",
         "REQUIRED_SUITES": json.dumps(sorted(suites)),
+        "PLANNED_PYTHON_MATRIX": json.dumps({
+            "ubuntu": [],
+            "windows": (
+                sorted(GATE_MODULE["WINDOWS_PHYSICAL_SHARDS"])
+                if "windows-high-risk" in suites else []
+            ),
+        }),
+        "PLANNED_DESKTOP_MATRIX": json.dumps([
+            {"os": os_name, "shard": shard}
+            for os_name, shard in sorted(GATE_MODULE["DESKTOP_MATRIX_CELLS"])
+        ] if "desktop-recovery-e2e" in suites else []),
     }
     env.update(
         {
@@ -382,10 +393,14 @@ def _partial_env() -> dict[str, str]:
     }
 
 
-def test_partial_gate_keeps_shared_frontend_job_and_requires_full_coverage() -> None:
+def test_partial_gate_keeps_wheel_job_and_skips_reused_frontend_checks() -> None:
     env = _partial_env()
-    assert env["RESULT_FRONTEND"] == "success"  # Wheel roundtrip still runs.
+    assert env["RESULT_WHEEL_WEBUI"] == "success"
+    assert env["RESULT_FRONTEND"] == "skipped"
+    assert env["RESULT_FRONTEND_UNIT"] == "skipped"
+    assert env["RESULT_CONTRACT_LINUX"] == "skipped"
     assert env["RESULT_CONTRACT_WINDOWS"] == "skipped"
+    assert env["RESULT_CONTRACT_VERIFICATION_WINDOWS"] == "skipped"
     assert env["RESULT_CONTRACT_COMPARE"] == "skipped"
     assert check_ci_results(env) == []
 
@@ -399,10 +414,18 @@ def test_partial_gate_keeps_shared_frontend_job_and_requires_full_coverage() -> 
     ("QUEUE_REUSED_SUITES", '["frontend-validation","frontend-validation"]'),
     ("QUEUE_REUSED_SUITES", "null"), ("QUEUE_REUSED_SUITES", '[{}]'),
     ("RESULT_WINDOWS_FULL", "skipped"), ("RESULT_WINDOWS_FULL", "failure"),
+    ("RESULT_WINDOWS_BUNDLE", "failure"), ("RESULT_WINDOWS_BUNDLE", "skipped"),
+    ("RESULT_WINDOWS_BUNDLE_COVERAGE", "failure"),
+    ("RESULT_WINDOWS_BUNDLE_COVERAGE", "skipped"),
     ("RESULT_WINDOWS_NSIS", "skipped"), ("RESULT_WINDOWS_NSIS", "failure"),
     ("RESULT_WINDOWS_NSIS", "cancelled"), ("RESULT_WINDOWS_NSIS", ""),
     ("QUEUE_REUSED_SUITES", '["frontend-validation","windows-nsis-regression"]'),
     ("RESULT_FRONTEND", "failure"), ("RESULT_CONTRACT_WINDOWS", "failure"),
+    ("RESULT_FRONTEND_UNIT", "failure"), ("RESULT_CONTRACT_LINUX", "failure"),
+    ("RESULT_CONTRACT_VERIFICATION_WINDOWS", "failure"),
+    ("RESULT_WHEEL_WEBUI", "failure"), ("RESULT_DESKTOP_NATIVE", "failure"),
+    ("RESULT_WINDOWS_PROFILES_COVERAGE", "failure"),
+    ("RESULT_WINDOWS_PROFILES_COVERAGE", "skipped"),
     ("RESULT_CONTRACT_COMPARE", "failure"),
     ("RESULT_PLANNER", "cancelled"),
     ("QUEUE_PARTIAL", ""), ("QUEUE_PARTIAL", "false"), ("QUEUE_PARTIAL", "invalid"),
@@ -435,16 +458,20 @@ def test_partial_gate_rejects_omitted_windows_acceptance() -> None:
     assert any("partition" in error for error in check_ci_results(env))
 
 
+@pytest.mark.parametrize("variable", [
+    "RESULT_CONTRACT_VERIFICATION_LINUX", "RESULT_CONTRACT_VERIFICATION_WINDOWS",
+])
 @pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", ""])
-def test_frontend_requires_complete_verification_profile(result: str) -> None:
+def test_frontend_requires_complete_verification_profile(variable: str, result: str) -> None:
     env = _env_for(BASELINE_SUITES | {"frontend-validation"})
-    env["RESULT_CONTRACT_VERIFICATION_LINUX"] = result
+    env[variable] = result
     assert any("Complete Gateway Contract verification" in error for error in check_ci_results(env))
 
 
 def test_wheel_only_does_not_require_verification_profile() -> None:
     env = _env_for(BASELINE_SUITES | {"wheel-webui-roundtrip"})
     assert env["RESULT_CONTRACT_VERIFICATION_LINUX"] == "skipped"
+    assert env["RESULT_CONTRACT_VERIFICATION_WINDOWS"] == "skipped"
     assert check_ci_results(env) == []
 
 
@@ -566,23 +593,157 @@ def test_ci_result_gate_requires_both_python_full_jobs() -> None:
     assert any("Ubuntu full test matrix" in error for error in errors)
 
 
-@pytest.mark.parametrize("suite", ["frontend-validation", "wheel-webui-roundtrip"])
-def test_ci_result_gate_requires_shared_frontend_check_for_each_consumer(suite: str) -> None:
+@pytest.mark.parametrize("suite,variable", [
+    ("frontend-validation", "RESULT_FRONTEND"),
+    ("frontend-validation", "RESULT_FRONTEND_UNIT"),
+    ("frontend-validation", "RESULT_CONTRACT_LINUX"),
+    ("wheel-webui-roundtrip", "RESULT_WHEEL_WEBUI"),
+    ("desktop-recovery-e2e", "RESULT_DESKTOP_NATIVE"),
+    ("desktop-recovery-e2e", "RESULT_WINDOWS_PROFILES_COVERAGE"),
+    ("windows-high-risk", "RESULT_WINDOWS_BUNDLE"),
+    ("windows-high-risk", "RESULT_WINDOWS_BUNDLE_COVERAGE"),
+])
+@pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", "", None])
+def test_ci_result_gate_requires_each_independent_consumer_check(
+    suite: str, variable: str, result: str | None,
+) -> None:
     env = _env_for(BASELINE_SUITES | {suite})
-    env["RESULT_FRONTEND"] = "skipped"
+    if result is None:
+        env.pop(variable)
+    else:
+        env[variable] = result
 
     errors = check_ci_results(env)
 
-    assert any("Frontend validation and wheel WebUI roundtrip" in error for error in errors)
+    assert any(JOB_RESULT_LABELS[variable] in error and "success" in error for error in errors)
 
 
-def test_ci_result_gate_accepts_one_shared_frontend_check_for_both_suites() -> None:
+def test_ci_result_gate_accepts_independent_frontend_and_wheel_checks_for_both_suites() -> None:
     env = _env_for(
         BASELINE_SUITES | {"frontend-validation", "wheel-webui-roundtrip"}
     )
 
     assert env["RESULT_FRONTEND"] == "success"
+    assert env["RESULT_FRONTEND_UNIT"] == "success"
+    assert env["RESULT_WHEEL_WEBUI"] == "success"
     assert check_ci_results(env) == []
+
+
+@pytest.mark.parametrize("owner", [
+    "core-1", "desktop-installer-contracts-2",
+    "gateway-sqlite-9", "gateway-sqlite-10", "gateway-sqlite-11",
+])
+def test_windows_plan_without_bundle_owner_requires_both_bundle_jobs_skipped(owner: str) -> None:
+    env = _env_for(BASELINE_SUITES | {"windows-high-risk"})
+    env["PLANNED_PYTHON_MATRIX"] = json.dumps({"ubuntu": [], "windows": [owner]})
+    env["RESULT_WINDOWS_BUNDLE"] = "skipped"
+    env["RESULT_WINDOWS_BUNDLE_COVERAGE"] = "skipped"
+    assert check_ci_results(env) == []
+    for result_variable in ("RESULT_WINDOWS_BUNDLE", "RESULT_WINDOWS_BUNDLE_COVERAGE"):
+        altered = {**env, result_variable: "success"}
+        assert any(
+            JOB_RESULT_LABELS[result_variable] in error and "skipped" in error
+            for error in check_ci_results(altered)
+        )
+
+
+def test_partial_windows_owner_plan_requires_bundle_execution_and_coverage() -> None:
+    env = _env_for(BASELINE_SUITES | {"windows-high-risk"})
+    env["PLANNED_PYTHON_MATRIX"] = json.dumps({
+        "ubuntu": [], "windows": ["desktop-installer-contracts-1"],
+    })
+    assert check_ci_results(env) == []
+    env["RESULT_WINDOWS_BUNDLE_COVERAGE"] = "failure"
+    assert any("exact-once coverage" in error for error in check_ci_results(env))
+
+
+@pytest.mark.parametrize("raw", [
+    None, "", "not-json", "null", "[]", "{}", '{"windows":["core-1"]}',
+    '{"ubuntu":[],"windows":null}', '{"ubuntu":[],"windows":[]}',
+    '{"ubuntu":[],"windows":"core-1"}',
+    '{"ubuntu":[],"windows":["core-1","core-1"]}',
+    '{"ubuntu":[],"windows":["core"]}',
+    '{"ubuntu":[],"windows":["bundle-1"]}',
+    '{"ubuntu":[],"windows":["desktop-installer-contracts-5"]}',
+    '{"ubuntu":[],"windows":["gateway-sqlite-12"]}',
+    '{"ubuntu":[],"windows":["gateway-sqlite-9","gateway-sqlite-9"]}',
+    '{"ubuntu":[],"windows":[false]}', '{"ubuntu":[],"windows":[{}]}',
+    '{"ubuntu":[],"windows":["core-1"],"unknown":[]}',
+])
+def test_windows_gate_cannot_skip_bundle_from_missing_or_invalid_plan(raw: str | None) -> None:
+    env = _env_for(BASELINE_SUITES | {"windows-high-risk"})
+    if raw is None:
+        env.pop("PLANNED_PYTHON_MATRIX")
+    else:
+        env["PLANNED_PYTHON_MATRIX"] = raw
+    # Even all-green results cannot replace a valid owner/coverage plan.
+    assert any("Planned Python Windows matrix" in error for error in check_ci_results(env))
+    env["RESULT_WINDOWS_BUNDLE"] = "skipped"
+    env["RESULT_WINDOWS_BUNDLE_COVERAGE"] = "skipped"
+    errors = check_ci_results(env)
+    assert any("Windows bundle test matrix" in error for error in errors)
+    assert any("Windows bundle exact-once coverage" in error for error in errors)
+
+
+def test_windows_gate_physical_shards_match_planner_manifest() -> None:
+    manifest = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    assert GATE_MODULE["WINDOWS_PHYSICAL_SHARDS"] == set(
+        manifest["full_python_matrix"]["windows"]
+    )
+    assert GATE_MODULE["DESKTOP_MATRIX_CELLS"] == {
+        (cell["os"], cell["shard"]) for cell in manifest["full_desktop_matrix"]
+    }
+
+
+@pytest.mark.parametrize("os_name,shard", [
+    ("macos-latest", "profiles"), ("ubuntu-latest", "profiles"),
+    ("windows-latest", "ownership"), ("windows-latest", "workbench"),
+])
+def test_non_windows_profiles_plan_skips_the_windows_coverage_job(os_name: str, shard: str) -> None:
+    env = _env_for(BASELINE_SUITES | {"desktop-recovery-e2e"})
+    env["PLANNED_DESKTOP_MATRIX"] = json.dumps([{"os": os_name, "shard": shard}])
+    env["RESULT_WINDOWS_PROFILES_COVERAGE"] = "skipped"
+    assert check_ci_results(env) == []
+    env["RESULT_WINDOWS_PROFILES_COVERAGE"] = "success"
+    assert any("Windows profiles" in error and "skipped" in error
+               for error in check_ci_results(env))
+
+
+def test_targeted_windows_profiles_requires_browser_owner_six_flows_and_coverage() -> None:
+    env = _env_for(BASELINE_SUITES | {"desktop-recovery-e2e"})
+    matrix = [{"os": "windows-latest", "shard": shard} for shard in (
+        "profiles", *sorted(GATE_MODULE["WINDOWS_PROFILES_SHARDS"]),
+    )]
+    env["PLANNED_DESKTOP_MATRIX"] = json.dumps(matrix)
+    assert check_ci_results(env) == []
+    for omitted in matrix:
+        altered = {**env, "PLANNED_DESKTOP_MATRIX": json.dumps([
+            cell for cell in matrix if cell != omitted
+        ])}
+        assert any("Planned Desktop matrix" in error for error in check_ci_results(altered))
+
+
+@pytest.mark.parametrize("raw", [
+    None, "", "not-json", "null", "{}", "[]", "[{}]", "[null]",
+    '[{"os":"windows-latest","shard":"profiles"}]',
+    '[{"os":"macos-latest","shard":"profiles-onboarding-flow"}]',
+    '[{"os":"windows-latest","shard":"profiles-onboarding-flow"}]',
+    '[{"os":"windows-latest","shard":"profiles-unknown"}]',
+    '[{"os":"windows-latest","shard":false}]',
+    '[{"os":"windows-latest","shard":"ownership","unknown":0}]',
+    '[{"os":"windows-latest","shard":"ownership"},'
+    '{"os":"windows-latest","shard":"ownership"}]',
+])
+def test_profiles_gate_rejects_missing_malformed_or_partial_desktop_plan(raw: str | None) -> None:
+    env = _env_for(BASELINE_SUITES | {"desktop-recovery-e2e"})
+    if raw is None:
+        env.pop("PLANNED_DESKTOP_MATRIX")
+    else:
+        env["PLANNED_DESKTOP_MATRIX"] = raw
+    assert any("Planned Desktop matrix" in error for error in check_ci_results(env))
+    env["RESULT_WINDOWS_PROFILES_COVERAGE"] = "skipped"
+    assert any("Windows profiles" in error and "success" in error
+               for error in check_ci_results(env))
 
 
 def test_frontend_validation_requires_windows_contract_determinism() -> None:
@@ -611,6 +772,18 @@ def test_ci_result_gate_checks_frontend_artifact_independently() -> None:
 
     assert any("Frontend artifact" in error and "success" in error for error in errors)
     assert not any("WebUI chat recovery" in error for error in errors)
+
+
+def test_ci_result_gate_requires_the_planned_capacity_phase_even_when_browser_job_passes() -> None:
+    env = _env_for(BASELINE_SUITES | {"webui-chat-recovery", "webui-capacity"})
+    assert check_ci_results(env) == []
+    for result in ("failure", "cancelled", "skipped", ""):
+        env["RESULT_WEBUI_CAPACITY"] = result
+        errors = check_ci_results(env)
+        assert any("WebUI capacity" in error and "success" in error for error in errors)
+        assert not any("WebUI chat recovery" in error for error in errors)
+    env.pop("RESULT_WEBUI_CAPACITY")
+    assert any("WebUI capacity" in error for error in check_ci_results(env))
 
 
 def test_ci_result_gate_rejects_missing_suite_result_mapping(

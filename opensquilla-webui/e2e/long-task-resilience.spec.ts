@@ -15,6 +15,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-long-task-resilience'
@@ -185,6 +186,206 @@ test.describe('0.5.0 long-task resilience', () => {
   // worker, and local runs must exercise the same deterministic isolation.
   test.describe.configure({ mode: 'serial' })
 
+  test('recovers a terminal event lost while disconnected and sends the next turn once', async ({ page }) => {
+    const key = 'agent:main:webchat:synthetic-lost-terminal'
+    const sessionId = 'synthetic-lost-terminal-session'
+    const taskId = 'synthetic-lost-terminal-task'
+    const generation = 'synthetic-lost-terminal-generation'
+    const epoch = 7
+    const startedAt = 1_800_000_000_000
+    const partial = 'Synthetic partial answer.'
+    const answer = `${partial} Synthetic durable completion.`
+    const draft = 'Synthetic next request after terminal recovery.'
+    const sockets: WebSocketRoute[] = []
+    const reads: Array<{ method: string; connection: number; params: Record<string, unknown> }> = []
+    const sends: Array<Record<string, unknown>> = []
+    const pushedEvents: string[] = []
+    const errors: string[] = []
+    let complete = false
+    let sequence = 0
+    let nextTask: Record<string, unknown> | null = null
+
+    page.on('pageerror', error => errors.push(error.message))
+    page.on('console', message => {
+      if (message.type() === 'error') errors.push(message.text())
+    })
+    await preparePage(page)
+    await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
+    await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
+    await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
+      status: 204, contentType: 'image/png', body: '',
+    }))
+
+    const task = () => ({
+      task_id: taskId, turn_id: taskId, session_id: sessionId,
+      status: complete ? 'succeeded' : 'running', queue_mode: 'followup',
+      created_at: startedAt, started_at: startedAt,
+      ...(complete ? { finished_at: startedAt + 3_000, terminal_reason: 'completed' } : {}),
+    })
+    const metadata = () => ({
+      epoch, tasks: [task(), ...(nextTask ? [nextTask] : [])],
+      active_task: nextTask || (complete ? null : task()), last_task: nextTask || task(),
+      queued_task_ids: [], run_status: nextTask || !complete ? 'running' : 'idle',
+    })
+    const history = () => chatHistoryPayload([
+      {
+        role: 'user', text: 'Synthetic request completed during a transport outage.',
+        id: 'synthetic-lost-terminal-user', message_id: 'synthetic-lost-terminal-user',
+        timestamp: startedAt - 1_000, turn_id: taskId, turn_context: { turn_id: taskId },
+      },
+      ...(complete ? [{
+        role: 'assistant', text: answer, id: 'synthetic-lost-terminal-assistant',
+        message_id: 'synthetic-lost-terminal-assistant', timestamp: startedAt + 3_000,
+        turn_id: taskId, turn_context: { turn_id: taskId },
+      }] : []),
+      ...(nextTask ? [{
+        role: 'user', text: sends[0]?.message, id: 'synthetic-next-user',
+        message_id: 'synthetic-next-user', client_message_id: sends[0]?.clientMessageId,
+        timestamp: startedAt + 4_000, turn_id: 'synthetic-next-task',
+      }] : []),
+    ], {
+      turn_outcomes: complete ? [{
+        task_id: taskId, turn_id: taskId, status: 'succeeded', outcome: { kind: 'completed' },
+        started_at: startedAt, finished_at: startedAt + 3_000,
+        activity_snapshot: {
+          version: 2, task_id: taskId, turn_id: taskId, complete: true,
+          reasoning_utf16_length: 0,
+          entries: [{
+            type: 'phase', id: 'synthetic-lost-terminal-provider', order: 1,
+            kind: 'provider', phase: 'requesting', at: startedAt, ended_at: startedAt + 3_000,
+          }],
+        },
+      }] : [],
+    })
+    const push = (socket: WebSocketRoute, event: string, payload: Record<string, unknown>) => {
+      pushedEvents.push(event)
+      socket.send(eventFrame(event, payload))
+    }
+
+    await page.routeWebSocket(/\/ws$/, socket => {
+      const connection = sockets.push(socket)
+      // Hold the replacement handshake until the old browser socket has closed
+      // and the synthetic server has persisted completion without any push.
+      if (connection === 1) push(socket, 'connect.challenge', {})
+      socket.onMessage(raw => {
+        const frame = JSON.parse(String(raw)) as RpcRequest
+        if (frame.type === 'ping') {
+          socket.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
+        if (frame.type !== 'req') return
+        const method = String(frame.method || '')
+        const params = frame.params || {}
+        const respond = (payload: unknown) => socket.send(successResponse(frame.id, payload))
+        if (method === 'connect') {
+          socket.send(helloOkResponse({
+            protocol: 4,
+            server: { conn_id: `synthetic-lost-terminal-${connection}` },
+            features: {
+              methods: ['sessions.messages.subscribe', 'sessions.messages.snapshot',
+                'sessions.messages.hydrate', 'sessions.messages.unsubscribe'],
+              events: ['session.event.text_delta', 'session.event.done', 'task.succeeded'],
+            },
+            policy: { concurrent_history_reads: true },
+            auth: {
+              principal: { role: 'operator', authenticated: true, isOwner: true,
+                authState: 'authenticated', scopes: ['operator.read', 'operator.write'],
+                capabilities: ['chat.read', 'chat.write'] },
+              runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
+            },
+          }))
+          return
+        }
+        if (method === 'chat.send') {
+          sends.push({ ...params })
+          nextTask = { task_id: 'synthetic-next-task', turn_id: 'synthetic-next-task',
+            session_id: sessionId, status: 'running', started_at: startedAt + 4_000 }
+          respond({ sessionKey: key, task_id: 'synthetic-next-task', task_status: 'running' })
+          return
+        }
+        if (method === 'chat.history' || method.startsWith('sessions.messages.')) {
+          reads.push({ method, connection, params: { ...params } })
+        }
+        if (method === 'chat.history') { respond(history()); return }
+        if (method === 'sessions.messages.snapshot') {
+          // A terminal snapshot cache may be reclaimed after its complete
+          // transcript/activity snapshot is durable. Metadata/history own it.
+          respond(sessionMessagesSnapshotPayload(key, {
+            task_id: nextTask?.task_id || (complete ? null : taskId),
+            stream_generation: generation, current_stream_seq: sequence, events: [],
+          }))
+          return
+        }
+        if (method === 'sessions.messages.subscribe') {
+          const gap = complete && Number(params.since_stream_seq ?? 0) < sequence
+          respond(sessionMessagesSubscribePayload(key, {
+            stream_generation: generation, current_stream_seq: sequence,
+            replay_complete: !gap, replay_gap_reason: gap ? 'buffer_window_missed' : null,
+            projectWorkspaceDeferred: true, run_mode_lock: { locked: true, source: 'deferred' },
+            hydration_complete: false,
+            deferred_fields: ['workspaceId', 'projectWorkspace', 'tasks', 'active_task',
+              'last_task', 'run_status', 'active_task_group_ids', 'run_mode_lock',
+              'pendingUserInputs', 'collaboration', 'routing', 'currentPlan', 'activePlanRun',
+              'planPresentations', 'goal', 'goalSnapshotStreamSeq', 'epoch'],
+          }))
+          return
+        }
+        if (method === 'sessions.messages.hydrate') {
+          respond(sessionMessagesHydratePayload(key, metadata()))
+          return
+        }
+        if (method === 'sandbox.run_mode.preference.get') {
+          respond({ runMode: 'full', source: 'config' })
+          return
+        }
+        respond(basePayload(method))
+      })
+    })
+
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(key)}`)
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+    sequence = 1
+    push(sockets[0]!, 'session.event.text_delta', {
+      key, session_key: key, task_id: taskId, turn_id: taskId, epoch,
+      stream_generation: generation, stream_seq: sequence, text: partial,
+    })
+    await expect(page.getByText(partial, { exact: true })).toBeVisible()
+    const composer = page.locator('.chat-textarea')
+    await composer.fill(draft)
+
+    await sockets[0]!.close({ code: 1012, reason: 'Synthetic outage before terminal delivery' })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
+    complete = true
+    sequence = 3
+    // The committed terminal text and outcome exist only in subsequent reads:
+    // neither the lost done frame nor task.succeeded is pushed or replayed.
+    await expect.poll(() => sockets.length).toBe(2)
+    push(sockets[1]!, 'connect.challenge', {})
+    await expect.poll(() => reads.some(read => read.connection === 2
+      && read.method === 'sessions.messages.snapshot')).toBe(true)
+    await expect.poll(() => reads.some(read => read.connection === 2
+      && read.method === 'sessions.messages.hydrate')).toBe(true)
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
+    await expect(page.getByText(answer, { exact: true })).toHaveCount(1)
+    await expect(page.getByRole('button', { name: 'Stop current response' })).toHaveCount(0)
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    await expect(page.getByText('Working', { exact: true })).toHaveCount(0)
+    await expectComposerValue(composer, draft)
+    expect(sends).toEqual([])
+    expect(pushedEvents).not.toContain('session.event.done')
+    expect(pushedEvents).not.toContain('task.succeeded')
+
+    const send = page.locator('.chat-send-btn[aria-label="Send"]')
+    await expect(send).toBeEnabled()
+    await send.click()
+    await expect.poll(() => sends.length).toBe(1)
+    expect(sends[0]).toMatchObject({ sessionKey: key, message: draft })
+    await expect(page.locator('.chat-pending-card')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+    expect(errors).toEqual([])
+  })
+
   test('resets the stream cursor across a Gateway generation and automatically re-subscribes', async ({
     page,
   }) => {
@@ -194,6 +395,7 @@ test.describe('0.5.0 long-task resilience', () => {
     const generations = ['generation-before-restart', 'generation-after-restart']
     const sockets: WebSocketRoute[] = []
     const subscribeParams: Array<Record<string, unknown>> = []
+    const composerCommands: RpcRequest[] = []
     let replacementHandshakeAt = 0
     let replacementSubscribeAt = 0
     let releaseReplacementSubscription: (() => void) | null = null
@@ -213,6 +415,9 @@ test.describe('0.5.0 long-task resilience', () => {
         }
         if (frame.type !== 'req') return
         const method = String(frame.method || '')
+        if (['chat.send', 'chat.abort', 'sessions.pending_inputs.enqueue'].includes(method)) {
+          composerCommands.push(frame)
+        }
         if (method === 'connect') {
           if (socketIndex === 1) replacementHandshakeAt = performance.now()
           ws.send(hello())
@@ -270,7 +475,7 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => sockets.length).toBe(1)
     await expect.poll(() => initialSnapshotComplete).toBe(true)
     await expect(
@@ -287,6 +492,8 @@ test.describe('0.5.0 long-task resilience', () => {
       text: 'Incremental output before restart.',
     }))
     await expect(page.getByText('Incremental output before restart.', { exact: true })).toBeVisible()
+    const stop = page.getByRole('button', { name: 'Stop current response', exact: true })
+    await expect(stop).toBeEnabled()
 
     await sockets[0]!.close({ code: 1012, reason: 'deterministic Gateway restart' })
     await expect.poll(() => sockets.length, { timeout: 4_000 }).toBe(2)
@@ -299,18 +506,31 @@ test.describe('0.5.0 long-task resilience', () => {
       since_stream_seq: 51,
     })
     // The topbar reports the shared transport; the session owns its separate
-    // recovery notice and send gate until the subscription has recovered.
+    // recovery notice and action gates until the subscription has recovered.
+    // This task was authoritatively running before the disconnect: retain its
+    // Stop presentation, but do not retain permission to stop before rehydration.
     const recoveringSession = page.getByText('Gateway connected. Restoring live updates for this session…', { exact: true })
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     await expect(recoveringSession).toBeVisible()
-    await page.locator('.chat-textarea').fill('Draft retained while this session reconnects')
-    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
+    const composer = page.locator('.chat-textarea')
+    await composer.fill('Draft retained while this session reconnects')
+    await expect(stop).toBeDisabled()
+    await expect(stop).toHaveAttribute('aria-busy', 'true')
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toHaveCount(0)
+    await composer.press('Enter')
+    await composer.press('Escape')
+    // Even a dispatched click bypassing the browser's disabled control must
+    // not issue a cancellation without renewed server task ownership.
+    await stop.dispatchEvent('click')
+    await expectComposerValue(composer, 'Draft retained while this session reconnects')
+    expect(composerCommands).toEqual([])
 
     const release = releaseReplacementSubscription
     if (!release) throw new Error('replacement subscription was not captured')
     release()
     await expect(recoveringSession).toHaveCount(0, { timeout: 2_000 })
-    await expect(page.locator('.chat-textarea')).toHaveValue('Draft retained while this session reconnects')
+    await expect(stop).toBeEnabled()
+    await expectComposerValue(page.locator('.chat-textarea'), 'Draft retained while this session reconnects')
 
     const firstTokenAt = performance.now()
     sockets[1]!.send(eventFrame('session.event.text_delta', {
@@ -326,6 +546,7 @@ test.describe('0.5.0 long-task resilience', () => {
       page.getByText('First incremental token after restart.', { exact: true }),
     ).toBeVisible({ timeout: 2_000 })
     expect(performance.now() - firstTokenAt).toBeLessThanOrEqual(2_000)
+    expect(composerCommands).toEqual([])
   })
 
   test('keeps one router card across reconnect snapshot, done, and history refresh', async ({
@@ -474,14 +695,14 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(ROUTER_SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => initialSnapshotComplete).toBe(true)
     sockets[0]!.send(eventFrame('session.event.router_decision', routerPayload))
     await expect(page.locator('.router-fx')).toHaveCount(1)
 
     await sockets[0]!.close({ code: 1012, reason: 'deterministic reconnect' })
     await expect.poll(() => sockets.length, { timeout: 4_000 }).toBe(2)
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 4_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 4_000 })
     await expect(page.locator('.router-fx')).toHaveCount(1)
 
     sockets[1]!.send(eventFrame('session.event.done', {
@@ -507,7 +728,7 @@ test.describe('0.5.0 long-task resilience', () => {
 
     settledHistory = true
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.router-fx')).toHaveCount(1)
     await expect(page.getByText('The document is ready.', { exact: true })).toHaveCount(1)
   })
@@ -561,9 +782,11 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => snapshotComplete).toBe(true)
-    const liveLabel = page.locator('.assistant-activity--live .assistant-activity__live-label')
+    const activity = page.locator('.assistant-activity--live')
+    const liveLabel = activity.locator('.assistant-activity-status__row--current .assistant-activity-status__content > span:first-child')
+    const announcement = activity.locator('.assistant-activity__sr-only[role="status"]')
     const sendActivity = async (streamSeq: number, payload: Record<string, unknown>) => {
       if (!socket) throw new Error('provider activity websocket is not connected')
       // The provider timestamp and browser clock must share the fake epoch.
@@ -592,18 +815,31 @@ test.describe('0.5.0 long-task resilience', () => {
         configurable: true,
         value: state,
       })
-      const label = document.querySelector('.assistant-activity--live .assistant-activity__live-label')
-      if (!label) throw new Error('live provider activity label not found')
+      const body = document.querySelector('.assistant-activity--live .assistant-activity__body')
+      if (!body) throw new Error('live provider activity body not found')
       const observer = new MutationObserver(() => {
-        if (label.textContent?.trim() !== 'Thinking deeply' || state.visibleAt > 0) return
+        if (body.querySelector('.thinking-fold__label')?.textContent?.trim() !== 'Thinking' || state.visibleAt > 0) return
         state.visibleAt = performance.now()
         observer.disconnect()
       })
-      observer.observe(label, { childList: true, characterData: true, subtree: true })
+      observer.observe(body, { childList: true, characterData: true, subtree: true })
     })
     await sendActivity(2, { phase: 'reasoning', reason: 'reasoning_only' })
+    // Reasoning is shown through its actual content disclosure, rather than an
+    // empty duplicate phase row. The phase itself still has an announcement.
+    await expect(announcement).toHaveText('Thinking')
+    if (!socket) throw new Error('provider activity websocket is not connected')
+    socket.send(eventFrame('session.event.thinking', {
+      key: SESSION_KEY,
+      task_id: TASK_ID,
+      stream_generation: generation,
+      stream_seq: 3,
+      block_id: 'provider-reasoning',
+      text: 'Checking the available sources.',
+    }))
     await page.clock.runFor(50)
-    await expect(liveLabel).toHaveText('Thinking deeply', { timeout: 1_000 })
+    await expect(activity.locator('.thinking-fold__label')).toHaveText('Thinking', { timeout: 1_000 })
+    await expect(activity.locator('.thinking-fold__preview')).toHaveText('Checking the available sources.')
     const reasoningLatency = await page.evaluate(() => {
       const state = (window as unknown as {
         __reasoningPhaseTiming: { startedAt: number; visibleAt: number }
@@ -614,7 +850,7 @@ test.describe('0.5.0 long-task resilience', () => {
     expect(reasoningLatency).toBeLessThanOrEqual(1_000)
 
     const privateProviderBody = 'upstream-secret-debug-body-must-not-render'
-    await sendActivity(3, {
+    await sendActivity(4, {
       phase: 'retry_wait',
       reason: 'rate_limited',
       retry_attempt: 1,
@@ -623,32 +859,37 @@ test.describe('0.5.0 long-task resilience', () => {
       provider_error_body: privateProviderBody,
     })
     await page.clock.runFor(50)
-    await expect(liveLabel).toHaveText('Rate limited · retrying in 3s')
+    await expect(liveLabel).toHaveText('Model temporarily rate limited, retrying in about 3s')
+    await expect(announcement).toHaveText('Model temporarily rate limited, waiting to retry')
 
     if (!socket) throw new Error('provider activity websocket is not connected')
     socket.send(eventFrame('session.event.run_heartbeat', {
       key: SESSION_KEY,
       task_id: TASK_ID,
       stream_generation: generation,
-      stream_seq: 4,
+      stream_seq: 5,
     }))
     await page.clock.runFor(1_100)
-    await expect(liveLabel).toHaveText('Rate limited · retrying in 2s')
+    await expect(liveLabel).toHaveText('Model temporarily rate limited, retrying in about 2s')
+    await expect(announcement).toHaveText('Model temporarily rate limited, waiting to retry')
     await expect(page.locator('body')).not.toContainText(privateProviderBody)
 
     // Heartbeats prove transport liveness but must not disguise a provider
     // stall. Advance the browser clock without another semantic signal.
     await page.clock.runFor(20_100)
-    // Keep the current phase visible; stale status has its own detail and
-    // screen-reader announcement rather than overwriting the phase label.
-    const staleNote = page.locator('.assistant-activity--live .assistant-activity__stale-note')
-    await expect(staleNote).toHaveText('Still working — no recent signal')
-    await expect(liveLabel).toHaveClass(/is-stale/)
-    await expect(page.locator('.assistant-activity--live [role="status"]'))
-      .toContainText('Still working — no recent signal')
+    // Silence is not an error: retain the phase and Stop control without a
+    // yellow warning or invented retry progress after Retry-After expires.
+    const staleNote = activity.locator('.assistant-activity__stale-note')
+    await expect(staleNote).toHaveCount(0)
+    await expect(liveLabel).toHaveText('Model temporarily rate limited, waiting to retry')
+    await expect(liveLabel).toBeVisible()
+    await expect(announcement).toHaveText('Model temporarily rate limited, waiting to retry')
+    await expect(activity).not.toContainText('Still working — no recent signal')
+    await expect(activity.locator('.assistant-activity-status__row--current .activity-motion--active')).toHaveCount(0)
     await expect(page.getByRole('button', { name: /Stop .*response/ })).toBeEnabled()
+    await expect(page.locator('body')).not.toContainText(privateProviderBody)
 
-    await sendActivity(5, {
+    await sendActivity(6, {
       phase: 'retrying',
       reason: 'rate_limited',
       retry_attempt: 2,
@@ -657,9 +898,9 @@ test.describe('0.5.0 long-task resilience', () => {
     await page.clock.runFor(50)
     await expect(liveLabel).toHaveText('Retrying 2/3')
     await expect(staleNote).toHaveCount(0)
-    await expect(liveLabel).not.toHaveClass(/is-stale/)
+    await expect(liveLabel).toBeVisible()
 
-    await sendActivity(6, {
+    await sendActivity(7, {
       phase: 'fallback',
       reason: 'provider_overloaded',
       retry_attempt: 3,
@@ -667,12 +908,14 @@ test.describe('0.5.0 long-task resilience', () => {
     })
     await page.clock.runFor(50)
     // Fallback must be visible before any token from the backup leg arrives.
-    await expect(liveLabel).toHaveText('Switching to backup model')
+    await expect(liveLabel).toHaveText('Trying a backup model')
+    await expect(liveLabel).toBeVisible()
+    await expect(page.getByText('Backup-leg output arrived incrementally.', { exact: true })).toHaveCount(0)
     socket.send(eventFrame('session.event.text_delta', {
       key: SESSION_KEY,
       task_id: TASK_ID,
       stream_generation: generation,
-      stream_seq: 7,
+      stream_seq: 8,
       text: 'Backup-leg output arrived incrementally.',
     }))
     await page.clock.runFor(100)
@@ -681,7 +924,9 @@ test.describe('0.5.0 long-task resilience', () => {
     ).toBeVisible()
   })
 
-  test('keeps 200-message history windowed and the composer responsive under a deterministic delta flood', async ({
+  test('keeps 200-message history windowed and the composer responsive under a deterministic delta flood', {
+    tag: '@capacity',
+  }, async ({
     page, nativeGateway,
   }, testInfo) => {
     test.setTimeout(180_000)
@@ -697,7 +942,7 @@ test.describe('0.5.0 long-task resilience', () => {
         for (const entry of list.getEntries()) metrics.longTasksMs.push(entry.duration)
       }).observe({ type: 'longtask', buffered: true })
       document.addEventListener('input', event => {
-        if (!(event.target instanceof HTMLTextAreaElement)) return
+        if (!(event.target instanceof HTMLElement) || !event.target.matches('.chat-textarea')) return
         const startedAt = performance.now()
         requestAnimationFrame(() => metrics.inputPaintMs.push(performance.now() - startedAt))
       }, true)
@@ -769,7 +1014,7 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     await page.goto(origin + CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     const list = page.locator('.chat-message-list')
     const thread = page.locator('.chat-thread')
     await expect(list).toHaveAttribute('data-virtualized', 'true')
@@ -941,7 +1186,7 @@ test.describe('0.5.0 long-task resilience', () => {
     for (const sample of samples) {
       expectedDraft += sample
       await composer.pressSequentially(sample, { delay: 6 })
-      await expect(composer).toHaveValue(expectedDraft)
+      await expectComposerValue(composer, expectedDraft)
       await page.waitForTimeout(600)
     }
 
@@ -1042,7 +1287,7 @@ test.describe('0.5.0 long-task resilience', () => {
       text_snapshot: markdownPayload,
     })
     await terminalTyping
-    await expect(composer).toHaveValue(expectedDraft)
+    await expectComposerValue(composer, expectedDraft)
     await expect(page.locator('.streaming-text-part')).toHaveCount(0, { timeout: 10_000 })
     await page.waitForTimeout(500)
     const scrollTopAfterTerminal = await thread.evaluate(element => element.scrollTop)
@@ -1470,7 +1715,7 @@ test.describe('0.5.0 long-task resilience', () => {
       }),
     }))
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.chat')).toBeVisible()
     await dropSyntheticFile(page, {
       name: attachmentName,
@@ -1483,7 +1728,7 @@ test.describe('0.5.0 long-task resilience', () => {
     await composer.fill(queuedText)
     await composer.press('Enter')
     await expect(page.locator('.chat-pending-card').filter({ hasText: queuedText })).toBeVisible()
-    await expect(composer).toHaveValue('')
+    await expectComposerValue(composer, '')
     await expect.poll(() => enqueueCalls).toBe(1)
     await expect.poll(() => row?.message || '').toBe(queuedText)
     await expect.poll(() => row?.attachments.length || 0).toBe(1)
@@ -1519,7 +1764,7 @@ test.describe('0.5.0 long-task resilience', () => {
 
     const listCallsBeforeReload = pendingListCalls
     await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => pendingListCalls).toBeGreaterThan(listCallsBeforeReload)
     await expect(page.locator('.chat-pending-card').filter({ hasText: queuedText })).toBeVisible()
     await expect(page.locator('.chat-pending-attachments')).toContainText('1')
@@ -1530,7 +1775,7 @@ test.describe('0.5.0 long-task resilience', () => {
     await installGateway(secondPage)
     try {
       await secondPage.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-      await expect(secondPage.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+      await expect(secondPage.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
       await expect(
         secondPage.locator('.chat-pending-card').filter({ hasText: queuedText }),
       ).toBeVisible()
@@ -1572,7 +1817,7 @@ test.describe('0.5.0 long-task resilience', () => {
       expect(row).toBeNull()
 
       await page.reload()
-      await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+      await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
       await expect(page.locator('.msg-user').filter({ hasText: queuedText })).toHaveCount(1)
       await expect(page.locator('.msg-user .msg-attachments .msg-file-chip')).toHaveCount(1)
       await expect(page.locator('.msg-user .msg-file-chip')).toContainText(attachmentName)

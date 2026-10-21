@@ -184,8 +184,7 @@ describe('ordinary usage is not ensemble evidence', () => {
     expect(details).toContain('fast')
     expect(details).toContain('$0.001')
     expect(details).toContain('↑10 ↓5')
-    expect(el.querySelector('.msg-action--vote')?.getAttribute('title')).toBe(i18n.global.t('chat.routeFeedback.up'))
-    expect(el.querySelector('.msg-action--vote')?.getAttribute('title')).not.toBe(i18n.global.t('chat.routeFeedback.upEnsemble'))
+    expect(el.querySelector('.msg-action--vote')).toBeNull()
   })
 
   it.each([false, true])('does not invent a strip in fixed mode (history=%s)', async restored => {
@@ -215,6 +214,39 @@ function progress(callId: string | undefined = '1.0'): ChatMessage {
 }
 
 describe('trace-less ensemble settlement', () => {
+  it('preserves replay presentation through an unsettled ensemble receipt replacement and remount', async () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({
+      matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    })))
+    const api = render([{ ...progress(), routerReplayed: true }])
+    api.isStreaming.value = true
+    const original = api.strips()[0]!
+    const el = await mountConversation(api)
+    expect(el.querySelector('.router-fx')?.getAttribute('data-phase')).toBe('static')
+
+    api.messages.value.push(assistant(ordinaryUsage({ routed_tier: 'c3' })))
+    await nextTick()
+
+    expect(api.strips()).toHaveLength(1)
+    expect(api.strips()[0]).toMatchObject({
+      routerTurnKey: original.routerTurnKey,
+      routerReplayed: true,
+      routerStatic: false,
+      routerSettled: false,
+    })
+    expect(el.querySelector('.router-fx')?.getAttribute('data-phase')).toBe('static')
+    expect(el.querySelector('.router-fx-selector')).toBeNull()
+    expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeNull()
+
+    const remounted = await mountConversation(api)
+    expect(remounted.querySelector('.router-fx')?.getAttribute('data-phase')).toBe('static')
+    expect(remounted.querySelector('.router-fx-selector')).toBeNull()
+    expect(remounted.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('true')
+    expect(api.messages.value[0]?.restoredFromHistory).toBeUndefined()
+    expect(api.messages.value[1]?.routerReplayed).toBeUndefined()
+  })
+
   it('retains only the matching progress and waits until the turn finishes', async () => {
     const api = render([progress()])
     api.isStreaming.value = true

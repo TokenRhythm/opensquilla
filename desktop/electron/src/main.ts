@@ -1,5 +1,6 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, screen, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
+import { parse as parseToml } from 'smol-toml'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
@@ -7,9 +8,11 @@ import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, w
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
-import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
+import { chooseLocalFilePaths } from './native-path-picker.js'
+import { saveArtifactFile, saveAttachmentFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SaveAttachmentRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -23,7 +26,29 @@ import {
   primaryProfilePaths,
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
+import { configuredDesktopDataDirectory, inspectDesktopStartupMetadata } from './desktop-startup-preflight.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import {
+  DESKTOP_QUIT_TERMINATION_MS,
+  DesktopQuitBudget,
+  DesktopQuitConfirmation,
+  type DesktopQuitActivity,
+  quitGatewayWithinBudget,
+} from './desktop-quit.js'
+import {
+  cleanupDesktopProcessTrees,
+  type DesktopProcessCleanupLaunch,
+} from './desktop-process-cleanup.js'
+import {
+  buildDesktopQuitDialogHtml,
+  parseDesktopQuitDialogResponse,
+  type DesktopQuitDialogDecision,
+} from './desktop-quit-dialog.js'
+import {
+  acknowledgeDesktopActivation, clearDesktopActivationAcknowledgements,
+  createDesktopActivationRequest, disposeDesktopActivationRequest,
+  hasDesktopActivationAcknowledgement,
+} from './desktop-single-instance.js'
 import { terminateWindowsProcessTree } from './windows-process-tree.js'
 import {
   createDesktopGatewayInstanceNonce,
@@ -31,8 +56,11 @@ import {
   desktopGatewayOwnershipMatchesLaunch,
   desktopProfileFingerprint,
   loadDesktopGatewayOwnershipRecord,
+  readVerifiedDesktopGatewayActivity,
+  requestVerifiedDesktopGatewayQuit,
   requestVerifiedDesktopGatewayShutdown,
-  verifyDesktopGatewayLaunchOwnership,
+  verifyDesktopGatewayOwnership,
+  verifyDesktopGatewayLaunchOwnershipDetailed,
   waitForDesktopGatewayOwnershipRelease,
   type DesktopGatewayOwnershipRecord,
 } from './desktop-gateway-ownership.js'
@@ -41,6 +69,7 @@ import {
 } from './desktop-gateway-ownership-verification.js'
 import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
+  GatewayReadinessTimeoutError,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
@@ -51,6 +80,7 @@ import {
 } from './onboarding-flow-coordinator.js'
 import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
 import { renderUnconfiguredDesktopConfig } from './desktop-unconfigured-profile.js'
+import { desktopControlUiBasePath } from './desktop-control-ui-config.js'
 import {
   applyDesktopTelemetryConsentPayload,
   desktopPrivacyTomlLines,
@@ -172,9 +202,12 @@ import {
   parseNativeWorkbenchAnnotationModeRequest,
   parseNativeWorkbenchAnnotationOverlayCloseRequest,
   parseNativeWorkbenchAnnotationOverlayShowRequest,
+  parseNativeWorkbenchAnnotationOverlayUpdateRequest,
 } from './native-workbench-annotation-contract.js'
-import { DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
+import { DesktopBrowserError, DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import { installDesktopReloadShortcuts } from './desktop-reload-shortcuts.js'
+import { createBrowserReloadGuard } from './desktop-browser-reload-guard.js'
 import {
   buildRendererConsoleLogEntry,
   isLiveMainFrameConsoleMessage,
@@ -259,6 +292,7 @@ interface DesktopGatewayConnection {
   instanceId: string | null
   profileFingerprint: string
   httpUrl: string | null
+  controlUiBasePath?: string
   wsUrl: string | null
   authToken: string | null
   error: string | null
@@ -480,6 +514,77 @@ interface DesktopRecoveryViewState {
 
 type BootPhaseId = 'profile' | 'gateway-start' | 'gateway-health' | 'control' | 'ready'
 
+// Keep the startup timeline more precise than the five user-facing boot
+// milestones.  These stages are diagnostic boundaries only: they must never
+// grant readiness or change the lifecycle ordering.  In particular,
+// websocket-connected and tool-ready are hand-off observations owned by the
+// renderer/Gateway; the main process records the boundary it can actually see
+// rather than pretending that publishing a descriptor proves a live socket.
+type DesktopStartupStage =
+  | 'profile-inspect'
+  | 'profile-reconcile'
+  | 'orphan-owner'
+  | 'gateway-spawn'
+  | 'core-ready'
+  | 'ownership'
+  | 'legacy-ready'
+  | 'websocket-connected'
+  | 'tool-ready'
+
+interface DesktopStartupStageAttempt {
+  id: number
+  startedAt: number
+  lastStage: DesktopStartupStage | null
+  finished: boolean
+}
+
+let desktopStartupStageAttemptSequence = 0
+let desktopStartupStageAttempt: DesktopStartupStageAttempt | null = null
+
+function beginDesktopStartupStageAttempt(): DesktopStartupStageAttempt {
+  const attempt: DesktopStartupStageAttempt = {
+    id: ++desktopStartupStageAttemptSequence,
+    startedAt: Date.now(),
+    lastStage: null,
+    finished: false,
+  }
+  desktopStartupStageAttempt = attempt
+  desktopStartupLog('startup_stage_attempt_started', { attemptId: attempt.id })
+  return attempt
+}
+
+function observeDesktopStartupStage(
+  stage: DesktopStartupStage,
+  detail: Record<string, unknown> = {},
+): void {
+  const attempt = desktopStartupStageAttempt
+  if (!attempt || attempt.finished || attempt.lastStage === stage) return
+  attempt.lastStage = stage
+  desktopStartupLog('startup_stage', {
+    attemptId: attempt.id,
+    stage,
+    stageElapsedMs: Math.max(0, Date.now() - attempt.startedAt),
+    ...detail,
+  })
+}
+
+function finishDesktopStartupStageAttempt(
+  attempt: DesktopStartupStageAttempt,
+  outcome: 'success' | 'fail' | 'cancel',
+  detail: Record<string, unknown> = {},
+): void {
+  if (attempt.finished) return
+  attempt.finished = true
+  desktopStartupLog('startup_stage_attempt_finished', {
+    attemptId: attempt.id,
+    outcome,
+    durationMs: Math.max(0, Date.now() - attempt.startedAt),
+    lastStage: attempt.lastStage,
+    ...detail,
+  })
+  if (desktopStartupStageAttempt === attempt) desktopStartupStageAttempt = null
+}
+
 interface BootStatus {
   phaseId: BootPhaseId
   label: string
@@ -539,7 +644,7 @@ let appExitPhase: DesktopExitPhase = 'running'
 let systemSessionEnding = false
 let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
 let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
-let mainWindowClosePrompt: Promise<void> | null = null
+let mainWindowClosePrompt: Promise<DesktopQuitDialogDecision> | null = null
 let pendingDesktopDeepLinkOpen = false
 let pendingDesktopSessionKey: string | null = null
 let desktopDeepLinkActivationReady = false
@@ -551,7 +656,7 @@ let desktopPreferencesWritePromise: Promise<void> = Promise.resolve()
 
 type DesktopNativeThemeSource = 'light' | 'dark' | 'system'
 
-const DESKTOP_LIGHT_BACKGROUND_COLOR = '#F7F7F8'
+const DESKTOP_LIGHT_BACKGROUND_COLOR = '#FFFFFF'
 const DESKTOP_DARK_BACKGROUND_COLOR = '#18181A'
 
 function desktopWindowBackgroundColor(): string {
@@ -580,6 +685,12 @@ function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: De
 let gatewayProcess: ChildProcessWithoutNullStreams | null = null
 let gatewayProfileKey: string | null = null
 let isQuitting = false
+let quitConfirmed = false
+let quitConfirmationPromise: Promise<void> | null = null
+let quitConfirmationWantsExit = false
+const desktopQuitConfirmation = new DesktopQuitConfirmation()
+let quitFromSignal = false
+let appExitStatusKey = 'tray.running'
 let gatewayShutdownRequestInterceptorInstalled = false
 // A child remains lifecycle-owned until its exit event, even after stopGateway
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
@@ -591,6 +702,15 @@ const gatewayProcessOwnershipContexts = new WeakMap<ChildProcessWithoutNullStrea
   profileFingerprint: string
   port: number
 }>()
+// A root exiting does not release its independent task process groups. Retain
+// each launch authority until its scoped cleanup has been confirmed.
+const gatewayProcessCleanupContexts = new Map<ChildProcessWithoutNullStreams, DesktopProcessCleanupLaunch>()
+const gatewayProcessCleanupConfirmed = new WeakSet<ChildProcessWithoutNullStreams>()
+const gatewayProcessCleanupOperations = new WeakMap<ChildProcessWithoutNullStreams, {
+  budget: DesktopQuitBudget
+  promise: Promise<boolean>
+}>()
+const gatewayProcessCleanupRetirements = new Map<ChildProcessWithoutNullStreams, Promise<boolean>>()
 // Opt stopGateway into the Windows HTTP graceful-drain path even while isQuitting
 // is set, for the update/uninstall flows that keep the main process alive and
 // await the child's exit (so the fire-and-forget drain is not racing app teardown).
@@ -814,6 +934,10 @@ let bootStatus: BootStatus = {
 let bootError: BootError | null = null
 let forceOnboardingOnNextStartup = false
 let onboardingPromptProfileKey: string | null = null
+// A fresh profile is offered onboarding before its first Gateway spawn. Keep
+// this separate from onboardingPromptProfileKey, which also covers migration
+// and reset flows that must retain the existing ready-before-invitation path.
+let freshOnboardingProfileKey: string | null = null
 let recoveryInspection: RecoveryProtocolResult | null = null
 let primaryRecoveryInspection: RecoveryProtocolResult | null = null
 let recoveryOperationBusy = false
@@ -833,12 +957,15 @@ const gatewayProcessTreeTerminations = new WeakMap<
 const gatewayHardTerminatedProcesses = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
+let gatewayLateReadyObservation: { isCurrent: () => boolean; resumeIfCurrent: () => void } | null = null
 let desktopOpenFlowPromise: Promise<void> | null = null
 let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
 let gatewayConnectionRevision = 0
 let gatewayConnectionInstanceId: string | null = null
+let ownedGatewayControlUiBasePath = '/control'
 
 function invalidateDesktopOpenFlow(): number {
+  gatewayLateReadyObservation = null
   cancelGatewayUnexpectedExitRestart('desktop open flow invalidated')
   desktopOpenFlowRevision += 1
   return desktopOpenFlowRevision
@@ -869,7 +996,8 @@ const gatewayState: GatewayState = {
 }
 
 function desktopGatewayConnectionSuspendedForExit(): boolean {
-  return appExitPhase === 'draining' || appExitPhase === 'committed'
+  return appExitPhase === 'draining' || appExitPhase === 'terminating'
+    || appExitPhase === 'failed' || appExitPhase === 'committed'
 }
 
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
@@ -887,6 +1015,10 @@ function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
     instanceId: gatewayConnectionInstanceId,
     profileFingerprint: desktopProfileFingerprint(activeDesktopProfile().home),
     httpUrl: gatewayState.url || null,
+    // Only an owned launch supplies an authoritative Control UI mount. An
+    // external Gateway may use a different profile; leave legacy fallback to
+    // the renderer instead of publishing this profile's stale mount prefix.
+    ...(gatewayState.owned ? { controlUiBasePath: ownedGatewayControlUiBasePath } : {}),
     wsUrl: ready ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : null,
     authToken: authToken ? desktopGatewayAuthToken(authToken) : null,
     error: gatewayState.error || null,
@@ -1003,8 +1135,11 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
 const desktopBrowser = new DesktopBrowserServer(
   (request, signal) => nativeWorkbenchSurfaces.executeBrowser(request, signal),
   entry => desktopLog(entry.event, { operation: entry.operation, outcome: entry.outcome,
-    code: entry.code, durationMs: entry.durationMs }),
+    code: entry.code, durationMs: entry.durationMs, operationId: entry.operationId,
+    targetRef: entry.targetRef, navigationCode: entry.navigationCode }),
+  (request, signal) => nativeWorkbenchSurfaces.executeBrowserMcp(request, signal),
 )
+const guardBrowserReload = createBrowserReloadGuard(() => nativeWorkbenchSurfaces.closeBrowserTabs())
 
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
@@ -1497,6 +1632,7 @@ async function proxyDesktopRendererRequest(
     method,
     headers,
     body,
+    signal: request.signal,
     redirect: 'manual',
     bypassCustomProtocolHandlers: true,
   })
@@ -1525,7 +1661,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "base-uri opensquilla-app://desktop",
       "object-src 'none'",
       "frame-ancestors 'none'",
-      "script-src 'self' opensquilla-app://desktop 'unsafe-inline'",
+      "script-src 'self' opensquilla-app://desktop 'unsafe-inline' 'wasm-unsafe-eval'",
       "style-src 'self' opensquilla-app://desktop 'unsafe-inline'",
       "img-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "font-src 'self' opensquilla-app://desktop data:",
@@ -1544,7 +1680,11 @@ function secureDesktopRendererDocument(response: Response): Response {
 }
 
 async function handleDesktopRendererRequest(request: Request): Promise<Response> {
-  const route = routeDesktopRendererRequest(request.url, request.method)
+  const route = routeDesktopRendererRequest(
+    request.url,
+    request.method,
+    gatewayState.owned ? ownedGatewayControlUiBasePath : '',
+  )
   if (route.kind === 'reject') return new Response('Not found', { status: 404 })
   if (route.kind === 'gateway') return proxyDesktopRendererRequest(request, route.pathAndQuery)
 
@@ -1558,7 +1698,12 @@ async function handleDesktopRendererRequest(request: Request): Promise<Response>
   const response = await electronNet.fetch(pathToFileURL(assetPath).href, {
     bypassCustomProtocolHandlers: true,
   })
-  return route.kind === 'spa' ? secureDesktopRendererDocument(response) : response
+  // Module workers get their CSP from the script response rather than the
+  // parent document. Keep local diagram workers under the same narrow WASM
+  // permission while continuing to disallow JavaScript string evaluation.
+  return route.kind === 'spa' || /\.m?js$/i.test(route.relativePath)
+    ? secureDesktopRendererDocument(response)
+    : response
 }
 
 function installDesktopRendererProtocol(): void {
@@ -2262,25 +2407,9 @@ function configuredDesktopStateDirectory(
   configRaw: string | null,
 ): string {
   if (configRaw !== null) {
-    for (const rawLine of configRaw.split(/\r?\n/)) {
-      if (/^\s*\[/.test(rawLine)) break
-      const match = rawLine.match(/^\s*state_dir\s*=\s*(["'])(.*?)\1\s*(?:#.*)?$/)
-      if (!match) continue
-      let configured = match[2] ?? ''
-      if (match[1] === '"') {
-        try {
-          const parsed: unknown = JSON.parse(`${match[1]}${configured}${match[1]}`)
-          if (typeof parsed === 'string') configured = parsed
-        } catch {
-          return join(profile.home, 'state')
-        }
-      }
-      if (configured === '~') configured = homedir()
-      else if (configured.startsWith('~/') || configured.startsWith('~\\')) {
-        configured = join(homedir(), configured.slice(2))
-      }
-      return resolve(profile.home, configured)
-    }
+    const configured = configuredDesktopDataDirectory(profile.home, parseToml(configRaw).state_dir, 'state')
+    if (!configured) throw new Error('The configured Desktop state directory is not a supported path.')
+    return configured
   }
   return join(profile.home, 'state')
 }
@@ -2291,10 +2420,6 @@ function desktopTelemetryDirectory(profile: DesktopProfilePaths, configRaw: stri
 
 function desktopConsentMirrorPath(profile: DesktopProfilePaths, configRaw: string | null): string {
   return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-consent-mirror.json')
-}
-
-function desktopEarlyTelemetrySpoolPath(profile: DesktopProfilePaths, configRaw: string | null): string {
-  return join(desktopTelemetryDirectory(profile, configRaw), 'desktop-early-spool')
 }
 
 function mirroredScopeConsent(
@@ -2345,16 +2470,19 @@ async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promi
   const credential = credentialRaw === null
     ? null
     : normalizeDesktopCredential(JSON.parse(credentialRaw) as Partial<DesktopConnection>)
+  const telemetryDirectory = desktopTelemetryDirectory(profile, configRaw)
+  const spoolRoot = join(telemetryDirectory, 'desktop-early-spool')
+  const consentMirrorPath = join(telemetryDirectory, 'desktop-consent-mirror.json')
   desktopTelemetryRuntimeGate.openAfterConsentSync()
   desktopReliabilityTelemetry.synchronize({
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    spoolRoot,
+    consentMirrorPath,
   })
   desktopGrowthTelemetry.synchronize({
     profileKey: profile.home,
-    telemetryDirectory: desktopTelemetryDirectory(profile, configRaw),
-    spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
-    consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
+    telemetryDirectory,
+    spoolRoot,
+    consentMirrorPath,
   }, credential?.configAuthority === 'generated' ? credential.growthOnboardingReceipt : null)
   refreshDesktopReliabilityForegroundState()
 }
@@ -3705,6 +3833,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   en: {
     'menu.edit': 'Edit',
     'menu.view': 'View',
+    'menu.reload': 'Reload',
+    'menu.forceReload': 'Force Reload',
     'menu.window': 'Window',
     'menu.checkForUpdates': 'Check for Updates…',
     'menu.relaunchToUpdate': 'Relaunch to Update',
@@ -3712,13 +3842,30 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.open': 'Open OpenSquilla',
     'tray.running': 'OpenSquilla is running in the background',
     'tray.quit': 'Quit OpenSquilla',
+    'quit.title': 'Quit OpenSquilla?',
+    'quit.active': 'Quitting will stop running tasks.',
+    'quit.unknown': 'Task status is unavailable. Quitting may interrupt running tasks.',
+    'quit.pagesDetail': 'Quitting will close open web pages ({count}). Unsaved changes may be lost.',
+    'quit.keepRunning': 'Cancel',
+    'quit.confirm': 'Quit',
+    'quit.exiting': 'Quitting OpenSquilla…',
+    'quit.saving': 'Saving configuration before quitting…',
+    'quit.migrating': 'Finishing data migration before quitting…',
+    'quit.cleaning': 'Finishing data cleanup before quitting…',
+    'quit.updating': 'Waiting for the update to finish…',
+    'quit.legacy': 'Waiting for an older Gateway to finish its tasks…',
+    'quit.terminating': 'Terminating unresponsive processes…',
+    'quit.failed': 'Quit failed: the local Gateway has not stopped safely',
+    'quit.failedDetail': 'OpenSquilla has stopped accepting desktop operations. Try Quit again to retry stopping its local processes.',
+    'quit.manualRecovery': 'Quit failed: process cleanup needs manual recovery',
+    'quit.manualRecoveryDetail': 'The Gateway has exited, but OpenSquilla could not confirm that all task processes stopped. Retrying cannot safely identify those processes. Save your work in other apps, then sign out of Windows or restart Windows before reopening OpenSquilla.',
     'tray.backgroundTitle': 'OpenSquilla is still running',
     'tray.backgroundDetail': 'Tasks, schedules, and connected channels continue in the background. Open or quit OpenSquilla from the system tray.',
-    'closePrompt.title': 'Close OpenSquilla?',
-    'closePrompt.message': 'What should happen when the main window closes?',
-    'closePrompt.detail': 'Background mode keeps tasks, schedules, and connected channels running. Explicit Quit safely stops the local runtime.',
-    'closePrompt.background': 'Keep running in background',
-    'closePrompt.quit': 'Quit OpenSquilla',
+    'closePrompt.title': 'Close window?',
+    'closePrompt.message': 'Keep tasks and web pages open by running in the background.',
+    'closePrompt.active': 'Keep tasks running in the background, or quit to stop them.',
+    'closePrompt.unknown': 'Keep running in the background. Quitting may interrupt tasks.',
+    'closePrompt.background': 'Run in background',
     'closePrompt.cancel': 'Cancel',
     'closePrompt.remember': 'Remember my choice',
     'update.newVersionTitle': 'A new version is available',
@@ -3842,6 +3989,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   'zh-Hans': {
     'menu.edit': '编辑',
     'menu.view': '视图',
+    'menu.reload': '重新加载',
+    'menu.forceReload': '强制重新加载',
     'menu.window': '窗口',
     'menu.checkForUpdates': '检查更新…',
     'menu.relaunchToUpdate': '重启以更新',
@@ -3849,13 +3998,30 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.open': '打开 OpenSquilla',
     'tray.running': 'OpenSquilla 正在后台运行',
     'tray.quit': '退出 OpenSquilla',
+    'quit.title': '退出 OpenSquilla？',
+    'quit.active': '退出将停止正在运行的任务。',
+    'quit.unknown': '暂时无法确认任务状态，退出可能中断任务。',
+    'quit.pagesDetail': '退出将关闭 {count} 个网页，未保存的内容可能丢失。',
+    'quit.keepRunning': '取消',
+    'quit.confirm': '退出',
+    'quit.exiting': '正在退出 OpenSquilla…',
+    'quit.saving': '正在保存配置，完成后退出…',
+    'quit.migrating': '正在迁移数据，完成后退出…',
+    'quit.cleaning': '正在清理数据，完成后退出…',
+    'quit.updating': '正在等待更新完成…',
+    'quit.legacy': '正在等待旧版 Gateway 完成任务…',
+    'quit.terminating': '正在终止未响应的进程…',
+    'quit.failed': '退出失败：本地 Gateway 尚未安全停止',
+    'quit.failedDetail': 'OpenSquilla 已停止接收桌面操作。请再次点击退出，重试停止它的本地进程。',
+    'quit.manualRecovery': '退出失败：需要手动完成进程清理',
+    'quit.manualRecoveryDetail': 'Gateway 已退出，但无法确认所有任务进程均已停止。再次退出也无法安全识别这些进程。请先保存其他应用中的工作，然后注销 Windows 或重启 Windows，再打开 OpenSquilla。',
     'tray.backgroundTitle': 'OpenSquilla 仍在运行',
     'tray.backgroundDetail': '任务、定时任务和已连接渠道会继续在后台运行。可从系统托盘打开或退出 OpenSquilla。',
-    'closePrompt.title': '关闭 OpenSquilla？',
-    'closePrompt.message': '关闭主窗口时要执行什么操作？',
-    'closePrompt.detail': '后台模式会继续运行任务、定时任务和已连接渠道；显式退出会安全停止本地运行时。',
-    'closePrompt.background': '继续在后台运行',
-    'closePrompt.quit': '退出 OpenSquilla',
+    'closePrompt.title': '关闭窗口？',
+    'closePrompt.message': '后台运行可保留任务和打开的网页。',
+    'closePrompt.active': '后台运行可继续任务，退出将停止任务。',
+    'closePrompt.unknown': '后台运行可保留任务，退出可能中断任务。',
+    'closePrompt.background': '后台运行',
     'closePrompt.cancel': '取消',
     'closePrompt.remember': '记住我的选择',
     'update.newVersionTitle': '有新版本可用',
@@ -3979,6 +4145,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   ja: {
     'menu.edit': '編集',
     'menu.view': '表示',
+    'menu.reload': '再読み込み',
+    'menu.forceReload': '強制再読み込み',
     'menu.window': 'ウインドウ',
     'menu.checkForUpdates': 'アップデートを確認…',
     'menu.relaunchToUpdate': '再起動してアップデート',
@@ -3988,11 +4156,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.quit': 'OpenSquilla を終了',
     'tray.backgroundTitle': 'OpenSquilla は引き続き実行中です',
     'tray.backgroundDetail': 'タスク、スケジュール、接続済みチャンネルはバックグラウンドで続行します。システムトレイから開くか終了できます。',
-    'closePrompt.title': 'OpenSquilla を閉じますか？',
-    'closePrompt.message': 'メインウィンドウを閉じるときの動作を選択してください。',
-    'closePrompt.detail': 'バックグラウンドモードではタスク、スケジュール、接続済みチャンネルが継続します。明示的に終了するとローカルランタイムを安全に停止します。',
+    'quit.title': 'OpenSquilla を終了しますか？',
+    'quit.active': '終了すると、実行中のタスクが停止します。',
+    'quit.unknown': 'タスクの状態を確認できません。終了するとタスクが中断される可能性があります。',
+    'quit.pagesDetail': '開いているページ（{count} 件）を閉じます。未保存の変更は失われる可能性があります。',
+    'quit.keepRunning': 'キャンセル',
+    'quit.confirm': '終了',
+    'closePrompt.title': 'ウィンドウを閉じますか？',
+    'closePrompt.message': 'バックグラウンドではタスクと開いているページを維持します。',
+    'closePrompt.active': 'バックグラウンドではタスクを続行し、終了すると停止します。',
+    'closePrompt.unknown': 'バックグラウンドではタスクを維持します。終了すると中断される可能性があります。',
     'closePrompt.background': 'バックグラウンドで続行',
-    'closePrompt.quit': 'OpenSquilla を終了',
     'closePrompt.cancel': 'キャンセル',
     'closePrompt.remember': 'この選択を記憶する',
     'update.newVersionTitle': '新しいバージョンが利用可能です',
@@ -4113,6 +4287,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   fr: {
     'menu.edit': 'Édition',
     'menu.view': 'Affichage',
+    'menu.reload': 'Recharger',
+    'menu.forceReload': 'Forcer le rechargement',
     'menu.window': 'Fenêtre',
     'menu.checkForUpdates': 'Rechercher les mises à jour…',
     'menu.relaunchToUpdate': 'Relancer pour mettre à jour',
@@ -4122,11 +4298,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.quit': 'Quitter OpenSquilla',
     'tray.backgroundTitle': 'OpenSquilla fonctionne toujours',
     'tray.backgroundDetail': 'Les tâches, planifications et canaux connectés continuent en arrière-plan. Ouvrez ou quittez OpenSquilla depuis la zone de notification.',
-    'closePrompt.title': 'Fermer OpenSquilla ?',
-    'closePrompt.message': 'Que doit-il se passer à la fermeture de la fenêtre principale ?',
-    'closePrompt.detail': 'Le mode arrière-plan maintient les tâches, planifications et canaux connectés. Quitter explicitement arrête le runtime local en toute sécurité.',
-    'closePrompt.background': 'Continuer en arrière-plan',
-    'closePrompt.quit': 'Quitter OpenSquilla',
+    'quit.title': 'Quitter OpenSquilla ?',
+    'quit.active': 'Quitter arrêtera les tâches en cours.',
+    'quit.unknown': 'État des tâches indisponible. Quitter peut interrompre des tâches.',
+    'quit.pagesDetail': 'Les pages ouvertes ({count}) seront fermées. Les modifications non enregistrées peuvent être perdues.',
+    'quit.keepRunning': 'Annuler',
+    'quit.confirm': 'Quitter',
+    'closePrompt.title': 'Fermer la fenêtre ?',
+    'closePrompt.message': 'Les tâches et les pages restent actives en arrière-plan.',
+    'closePrompt.active': 'Continuez les tâches en arrière-plan, ou quittez pour les arrêter.',
+    'closePrompt.unknown': 'Continuez en arrière-plan. Quitter peut interrompre des tâches.',
+    'closePrompt.background': 'En arrière-plan',
     'closePrompt.cancel': 'Annuler',
     'closePrompt.remember': 'Mémoriser mon choix',
     'update.newVersionTitle': 'Une nouvelle version est disponible',
@@ -4247,6 +4429,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   de: {
     'menu.edit': 'Bearbeiten',
     'menu.view': 'Ansicht',
+    'menu.reload': 'Neu laden',
+    'menu.forceReload': 'Neu laden ohne Cache',
     'menu.window': 'Fenster',
     'menu.checkForUpdates': 'Nach Updates suchen…',
     'menu.relaunchToUpdate': 'Zum Aktualisieren neu starten',
@@ -4256,11 +4440,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.quit': 'OpenSquilla beenden',
     'tray.backgroundTitle': 'OpenSquilla wird weiter ausgeführt',
     'tray.backgroundDetail': 'Aufgaben, Zeitpläne und verbundene Kanäle laufen im Hintergrund weiter. Öffnen oder beenden Sie OpenSquilla über den Infobereich.',
-    'closePrompt.title': 'OpenSquilla schließen?',
-    'closePrompt.message': 'Was soll beim Schließen des Hauptfensters geschehen?',
-    'closePrompt.detail': 'Im Hintergrundmodus laufen Aufgaben, Zeitpläne und verbundene Kanäle weiter. Beim expliziten Beenden wird die lokale Laufzeit sicher gestoppt.',
-    'closePrompt.background': 'Im Hintergrund weiter ausführen',
-    'closePrompt.quit': 'OpenSquilla beenden',
+    'quit.title': 'OpenSquilla beenden?',
+    'quit.active': 'Beim Beenden werden laufende Aufgaben gestoppt.',
+    'quit.unknown': 'Aufgabenstatus nicht verfügbar. Beenden kann Aufgaben unterbrechen.',
+    'quit.pagesDetail': 'Geöffnete Webseiten ({count}) werden geschlossen. Ungespeicherte Änderungen können verloren gehen.',
+    'quit.keepRunning': 'Abbrechen',
+    'quit.confirm': 'Beenden',
+    'closePrompt.title': 'Fenster schließen?',
+    'closePrompt.message': 'Aufgaben und Webseiten bleiben im Hintergrund geöffnet.',
+    'closePrompt.active': 'Aufgaben im Hintergrund fortsetzen oder durch Beenden stoppen.',
+    'closePrompt.unknown': 'Im Hintergrund fortsetzen. Beenden kann Aufgaben unterbrechen.',
+    'closePrompt.background': 'Im Hintergrund',
     'closePrompt.cancel': 'Abbrechen',
     'closePrompt.remember': 'Auswahl merken',
     'update.newVersionTitle': 'Eine neue Version ist verfügbar',
@@ -4381,6 +4571,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   es: {
     'menu.edit': 'Edición',
     'menu.view': 'Ver',
+    'menu.reload': 'Recargar',
+    'menu.forceReload': 'Forzar recarga',
     'menu.window': 'Ventana',
     'menu.checkForUpdates': 'Buscar actualizaciones…',
     'menu.relaunchToUpdate': 'Reiniciar para actualizar',
@@ -4390,11 +4582,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.quit': 'Salir de OpenSquilla',
     'tray.backgroundTitle': 'OpenSquilla sigue en ejecución',
     'tray.backgroundDetail': 'Las tareas, programaciones y canales conectados continúan en segundo plano. Abre o cierra OpenSquilla desde la bandeja del sistema.',
-    'closePrompt.title': '¿Cerrar OpenSquilla?',
-    'closePrompt.message': '¿Qué debe ocurrir al cerrar la ventana principal?',
-    'closePrompt.detail': 'El modo en segundo plano mantiene las tareas, programaciones y canales conectados. Salir explícitamente detiene el entorno local de forma segura.',
-    'closePrompt.background': 'Seguir ejecutando en segundo plano',
-    'closePrompt.quit': 'Salir de OpenSquilla',
+    'quit.title': '¿Salir de OpenSquilla?',
+    'quit.active': 'Salir detendrá las tareas en curso.',
+    'quit.unknown': 'No se puede consultar el estado de las tareas. Salir puede interrumpirlas.',
+    'quit.pagesDetail': 'Se cerrarán las páginas abiertas ({count}). Los cambios sin guardar podrían perderse.',
+    'quit.keepRunning': 'Cancelar',
+    'quit.confirm': 'Salir',
+    'closePrompt.title': '¿Cerrar la ventana?',
+    'closePrompt.message': 'Las tareas y páginas siguen activas en segundo plano.',
+    'closePrompt.active': 'Continúa las tareas en segundo plano o sal para detenerlas.',
+    'closePrompt.unknown': 'Continúa en segundo plano. Salir puede interrumpir las tareas.',
+    'closePrompt.background': 'En segundo plano',
     'closePrompt.cancel': 'Cancelar',
     'closePrompt.remember': 'Recordar mi elección',
     'update.newVersionTitle': 'Hay una nueva versión disponible',
@@ -4920,8 +5118,10 @@ function createApplicationMenu(): void {
         // Disable reload while the onboarding wizard is open: its state lives only
         // in the renderer of a one-shot data: URL, so a reload would silently wipe
         // the in-progress setup (typed key, provider, step, tier edits).
-        { role: 'reload', enabled: currentOnboardingWindow() === null },
-        { role: 'forceReload', enabled: currentOnboardingWindow() === null },
+        { label: desktopT('menu.reload'), accelerator: 'CmdOrCtrl+R', enabled: currentOnboardingWindow() === null,
+          click: () => reloadDesktopWindow(false) },
+        { label: desktopT('menu.forceReload'), accelerator: 'CmdOrCtrl+Shift+R', enabled: currentOnboardingWindow() === null,
+          click: () => reloadDesktopWindow(true) },
         { role: 'toggleDevTools' },
         { type: 'separator' },
         { role: 'resetZoom' },
@@ -4988,13 +5188,25 @@ function focusMainWindow(): boolean {
 }
 
 function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
-  if (appExitPhase === next) return
+  if (next !== 'running') gatewayLateReadyObservation = null
   const connectionWasSuspended = desktopGatewayConnectionSuspendedForExit()
   desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
   appExitPhase = next
   if (connectionWasSuspended !== desktopGatewayConnectionSuspendedForExit()) {
     publishGatewayConnection()
   }
+  appExitStatusKey = next === 'running' ? 'tray.running'
+    : next === 'failed' ? 'quit.failed'
+      : next === 'terminating' ? 'quit.terminating'
+        : updateApplying ? 'quit.updating'
+          : next === 'deferred' ? (desktopCleanupBusy ? 'quit.cleaning'
+            : recoveryOperationBusy ? 'quit.migrating' : 'quit.saving')
+          : 'quit.exiting'
+  rebuildWindowsTrayMenu()
+}
+
+function setQuitStatus(key: string): void {
+  appExitStatusKey = key
   rebuildWindowsTrayMenu()
 }
 
@@ -5006,6 +5218,7 @@ function destroyWindowsTray(): void {
 
 function rebuildWindowsTrayMenu(): void {
   if (!windowsTray) return
+  windowsTray.setToolTip(desktopT(appExitStatusKey))
   windowsTray.setContextMenu(Menu.buildFromTemplate([
     {
       label: desktopT('tray.open'),
@@ -5013,12 +5226,13 @@ function rebuildWindowsTrayMenu(): void {
       click: () => revealDesktopApp(),
     },
     {
-      label: desktopT('tray.running'),
+      label: desktopT(appExitStatusKey),
       enabled: false,
     },
     { type: 'separator' },
     {
       label: desktopT('tray.quit'),
+      enabled: appExitPhase === 'running' || appExitPhase === 'failed',
       click: () => app.quit(),
     },
   ]))
@@ -5193,52 +5407,24 @@ function registerDesktopDeepLinkProtocolClient(): void {
   }
 }
 
-async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
+async function promptForMainWindowClose(
+  window: BrowserWindow,
+  activity: DesktopQuitActivity,
+  tabCount: number,
+): Promise<DesktopQuitDialogDecision> {
   if (mainWindowClosePrompt) return await mainWindowClosePrompt
-  mainWindowClosePrompt = (async () => {
-    const result = await dialog.showMessageBox(window, {
-      type: 'question',
-      title: desktopT('closePrompt.title'),
-      message: desktopT('closePrompt.message'),
-      detail: desktopT('closePrompt.detail'),
-      buttons: [
-        desktopT('closePrompt.background'),
-        desktopT('closePrompt.quit'),
-        desktopT('closePrompt.cancel'),
-      ],
-      defaultId: 0,
-      cancelId: 2,
-      checkboxLabel: desktopT('closePrompt.remember'),
-      checkboxChecked: false,
-      noLink: true,
-    })
-    if (window.isDestroyed() || appExitPhase !== 'running') return
-    if (result.response === 0) {
-      if (result.checkboxChecked) {
-        await saveDesktopPreferences({
-          mainWindowCloseBehavior: 'background',
-        }).catch((error) => {
-          desktopLog('desktop_preferences_save_failed', {
-            error: error instanceof Error ? error.message : String(error),
-          })
-        })
-      }
-      hideMainWindow(window)
-      return
-    }
-    if (result.response === 1) {
-      if (result.checkboxChecked) {
-        await saveDesktopPreferences({
-          mainWindowCloseBehavior: 'quit',
-        }).catch((error) => {
-          desktopLog('desktop_preferences_save_failed', {
-            error: error instanceof Error ? error.message : String(error),
-          })
-        })
-      }
-      app.quit()
-    }
-  })().finally(() => {
+  const pagesDetail = tabCount > 0
+    ? desktopT('quit.pagesDetail').replace('{count}', String(tabCount)) : ''
+  mainWindowClosePrompt = showDesktopQuitConfirmation({
+    parent: window,
+    title: desktopT('closePrompt.title'),
+    message: desktopT(activity === 'idle' ? 'closePrompt.message' : activity === 'active' ? 'closePrompt.active' : 'closePrompt.unknown'),
+    detail: pagesDetail,
+    keepRunning: desktopT('closePrompt.cancel'),
+    background: desktopT('closePrompt.background'),
+    confirm: desktopT('quit.confirm'),
+    remember: desktopT('closePrompt.remember'),
+  }).finally(() => {
     mainWindowClosePrompt = null
   })
   return await mainWindowClosePrompt
@@ -5255,19 +5441,38 @@ function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): vo
   })
   if (action === 'allow') return
   event.preventDefault()
+  // A second native close must not hide the parent while we check activity or
+  // wait for the interruption dialog, even though the exit is not committed.
+  if (quitConfirmationPromise) return
   if (action === 'focus-onboarding') {
     focusOnboardingWindow()
-    return
-  }
-  if (action === 'hide') {
-    hideMainWindow(window)
     return
   }
   if (action === 'quit') {
     app.quit()
     return
   }
-  void promptForMainWindowClose(window)
+  if (action === 'hide') {
+    // Closing to the background preserves tasks and pages, regardless of
+    // whether the Gateway is busy or temporarily unavailable. A protected
+    // update or confirmed quit still owns the visible progress window.
+    if (window.isDestroyed() || systemSessionEnding || updateApplying || quitConfirmed) return
+    hideMainWindow(window)
+    return
+  }
+  if (appExitPhase === 'running') holdQuitForTaskConfirmation(event, window)
+}
+
+function reloadDesktopWindow(ignoreCache: boolean): void {
+  if (currentOnboardingWindow()) return
+  const window = currentMainWindow()
+  if (!window || window.isDestroyed()) return
+  if (nativeWorkbenchSurfaces.reloadFocusedBrowser(window, ignoreCache)) return
+  void guardBrowserReload(() => {
+    if (window.isDestroyed() || window.webContents.isDestroyed()) return
+    if (ignoreCache) window.webContents.reloadIgnoringCache()
+    else window.webContents.reload()
+  })
 }
 
 function installEditingContextMenu(window: BrowserWindow): void {
@@ -7172,7 +7377,8 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
   // An explicit empty primary prevents provider defaults or inherited API keys
   // from silently configuring a fresh profile. The config also records that the
   // first-run invitation has been offered; later launches use Settings instead.
-  if (!(await pathExists(desktopConfigPath()))) {
+  const configExists = await pathExists(desktopConfigPath())
+  if (!configExists) {
     const finishWriter = beginDesktopWriterOperation('initialize unconfigured desktop profile')
     const profile = activeDesktopProfile()
     try {
@@ -7188,6 +7394,9 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
       }
       if (initialized.stable_code === 'unconfigured_profile_initialized') {
         onboardingPromptProfileKey = desktopProfileKey(profile)
+        if (!pendingProviderSetup && !forceOnboardingOnNextStartup && existing === null) {
+          freshOnboardingProfileKey = desktopProfileKey(profile)
+        }
       }
     } finally {
       finishWriter()
@@ -7209,7 +7418,9 @@ function dismissOnboardingFlow(flow: OnboardingFlow): void {
   const window = flow.window
   if (window && !window.isDestroyed()) window.close()
   resolve?.(null)
-  focusMainWindow()
+  // During app.quit(), the parent may have destroyed its webContents while
+  // still closing this child. Revealing that half-closed native window is unsafe.
+  if (!isQuitting && appExitPhase !== 'committed') focusMainWindow()
 }
 
 async function runOnboarding(): Promise<DesktopConnection | null> {
@@ -7429,9 +7640,15 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
     const detail = error instanceof Error ? error.message : String(error)
     throw new Error(`runtime_root_missing: ${detail}`)
   }
+  const entry = join(repoRoot, 'desktop', 'electron', 'scripts', 'gateway-entry.py')
+  if (!(await pathIsFile(entry))) {
+    throw new Error(`runtime_root_missing: Desktop Gateway entry not found at ${entry}`)
+  }
   return await validateGatewayRuntime({
     command: 'uv',
-    args: ['run', 'opensquilla', 'gateway', 'run'],
+    // Match the packaged dispatcher, including its lightweight offline recovery
+    // path, while continuing to execute Python from the selected checkout.
+    args: ['run', 'python', entry, 'gateway', 'run'],
     cwd: repoRoot,
     mode: 'dev',
   })
@@ -8089,6 +8306,11 @@ async function runRecoveryCli(
   writerReserved = false,
 ): Promise<RecoveryProtocolResult> {
   const mutating = commandArgs[0] !== 'inspect'
+  if (commandArgs[0] === 'inspect') {
+    observeDesktopStartupStage('profile-inspect', { command: commandArgs[0] })
+  } else if (mutating) {
+    observeDesktopStartupStage('profile-reconcile', { command: commandArgs[0] })
+  }
   const kindAwareCommands = new Set(['inspect', 'reconcile', 'choose-workspace'])
   const effectiveArgs = kindAwareCommands.has(commandArgs[0] || '')
     && !commandArgs.includes('--profile-kind')
@@ -8540,6 +8762,10 @@ async function consolidateLegacyRecoveryProfilesBeforeStartup(
       for (const profile of [...recoveryProfiles, primary]) {
         await recoverVerifiedOrphanGatewayBeforeSpawn(profile)
       }
+      observeDesktopStartupStage('profile-reconcile', {
+        command: 'consolidate-profile',
+        recoveryProfileCount: recoveryProfiles.length,
+      })
       const result = await runDesktopProfileConsolidationCli(primary)
       validateDesktopProfileConsolidationPaths(result, primary)
       desktopLog('desktop_profile_consolidation_completed', {
@@ -8729,12 +8955,22 @@ async function healthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
 async function readinessCheck(url: string, timeoutMs = 1000): Promise<boolean> {
   try {
     const boundedTimeoutMs = Math.max(1, Math.min(1000, Math.floor(timeoutMs)))
-    const response = await fetch(`${url}/readyz`, {
+    // The durable core probe is the Desktop startup boundary.  Optional MCP,
+    // channel and browser services may still be starting after this returns;
+    // waiting for the legacy aggregate probe would reintroduce that coupling.
+    let response = await fetch(`${url}/readyz/core`, {
       signal: AbortSignal.timeout(boundedTimeoutMs),
     })
+    // Keep compatibility with an older externally managed Gateway that does
+    // not expose the additive core probe yet.
+    if (response.status === 404) {
+      response = await fetch(`${url}/readyz`, {
+        signal: AbortSignal.timeout(boundedTimeoutMs),
+      })
+    }
     if (!response.ok) return false
     const payload = await response.json().catch(() => null)
-    return Boolean(payload && payload.ready === true)
+    return Boolean(payload && (payload.core_ready === true || payload.ready === true))
   } catch {
     return false
   }
@@ -8803,10 +9039,19 @@ function classifyGatewayExitMessage(message: string, outputTail: string): string
 async function waitForGateway(
   url: string,
   earlyExitMessage?: () => string | null,
+  preflight?: (remainingMs: number) => Promise<boolean>,
 ): Promise<void> {
   const startedAt = Date.now()
   const result = await waitForGatewayReadiness({
-    probe: (remainingMs) => readinessCheck(url, remainingMs),
+    probe: async (remainingMs) => {
+      // A healthy loopback endpoint is not sufficient during a fresh spawn:
+      // another Gateway can win the port probe→bind race while our child is
+      // still loading/migrating.  Run the caller's exact-instance challenge
+      // before any readiness request so a foreign listener cannot satisfy the
+      // startup boundary.
+      if (preflight && !await preflight(remainingMs)) return false
+      return await readinessCheck(url, remainingMs)
+    },
     exitMessage: earlyExitMessage,
     primaryTimeoutMs: 45_000,
     lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000,
@@ -8824,7 +9069,7 @@ async function waitForGateway(
     return
   }
   if (result.status === 'exited') throw new Error(result.message)
-  throw new Error(`Gateway did not become ready at ${url}`)
+  throw new GatewayReadinessTimeoutError(url)
 }
 
 function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null): boolean {
@@ -8832,6 +9077,7 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
 }
 
 function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
+  if (child === gatewayProcess) gatewayLateReadyObservation = null
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
   // The close handler classifies the child's final status. Keep the explicit
@@ -8896,6 +9142,14 @@ async function reuseHealthyGatewayState(
   if (ready) {
     gatewayState.status = 'ready'
     gatewayState.error = undefined
+    desktopStartupLog('gateway_ready', { operation: 'reused' })
+    observeDesktopStartupStage('core-ready', { operation: 'reused' })
+    observeDesktopStartupStage('ownership', {
+      operation: 'reused',
+      verified: gatewayState.owned,
+      boundary: gatewayState.owned ? 'existing-child' : 'external-gateway',
+    })
+    observeDesktopStartupStage('legacy-ready', { operation: 'reused', source: 'descriptor' })
     sendBootStatus('control')
     publishGatewayConnection()
     return gatewayState
@@ -8911,14 +9165,39 @@ async function reuseHealthyGatewayState(
 
 async function verifyOwnedGatewayLaunch(
   child: ChildProcessWithoutNullStreams,
+  options: { emitDiagnostic?: boolean; timeoutMs?: number } = {},
 ): Promise<boolean> {
   const context = gatewayProcessOwnershipContexts.get(child)
-  if (!context) return false
-  return await verifyDesktopGatewayLaunchOwnership(context.ownershipDir, {
+  if (!context) {
+    if (options.emitDiagnostic !== false) {
+      desktopLog('gateway_ownership_not_verified', {
+        phase: 'launch', pid: child.pid, stage: 'launch', reason: 'launch_context_missing', elapsedMs: 0,
+      })
+    }
+    return false
+  }
+  const authority = {
     instanceNonce: context.nonce,
     profileFingerprint: context.profileFingerprint,
     port: context.port,
-  })
+  }
+  const result = await verifyDesktopGatewayLaunchOwnershipDetailed(
+    context.ownershipDir,
+    authority,
+    options.timeoutMs === undefined
+      ? {}
+      : {
+          // Keep the identity challenge inside the shared readiness deadline;
+          // otherwise a 1.5s fetch could outlive the final readiness probe.
+          verify: async record => await verifyDesktopGatewayOwnership(record, {
+            timeoutMs: Math.max(1, Math.min(1500, Math.floor(options.timeoutMs ?? 1))),
+          }),
+        },
+  )
+  if (!result.ok && options.emitDiagnostic !== false) {
+    desktopLog('gateway_ownership_not_verified', { phase: 'launch', pid: child.pid, port: context.port, ...result })
+  }
+  return result.ok
 }
 
 async function discardUnverifiedOwnedGatewayChild(
@@ -8964,9 +9243,15 @@ async function resumeOwnedGatewayStartup(
   }
   gatewayState.status = 'starting'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_starting', { operation: 'resume' })
   sendBootStatus('gateway-health')
   advanceGatewayStartTelemetry('health')
-  await waitForGateway(url, childExitMessage)
+  await waitForGateway(
+    url,
+    childExitMessage,
+    remainingMs => verifyOwnedGatewayLaunch(child, { emitDiagnostic: false, timeoutMs: remainingMs }),
+  )
+  observeDesktopStartupStage('core-ready', { operation: 'resume', pid: child.pid })
   if (!isCurrent()) throw new Error('Desktop startup was superseded during health verification.')
 
   // Health alone never grants ownership. The same exact child and profile that
@@ -8987,6 +9272,7 @@ async function resumeOwnedGatewayStartup(
     }
     return null
   }
+  observeDesktopStartupStage('ownership', { operation: 'resume', pid: child.pid, verified: true })
   if (
     gatewayProcess !== child
     || hasGatewayProcessExited(child)
@@ -8996,18 +9282,105 @@ async function resumeOwnedGatewayStartup(
     throw new Error(childExitMessage() || 'Desktop gateway changed during ownership verification.')
   }
 
+  return publishResumedOwnedGateway(child)
+}
+
+function publishResumedOwnedGateway(child: ChildProcessWithoutNullStreams): GatewayState {
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_ready', { operation: 'resume', pid: child.pid })
   markGatewayProcessReady(child)
+  observeDesktopStartupStage('legacy-ready', { operation: 'resume', source: 'descriptor' })
   sendBootStatus('control')
   publishGatewayConnection()
   return gatewayState
+}
+
+// Foreground startup still ends at 120 seconds. A live owned child can finish
+// necessary profile work later; observe it without restarting or killing it.
+const GATEWAY_LATE_READY_OBSERVATION_MS = 10 * 60_000
+
+function observeLateOwnedGatewayReadiness(
+  deadline = performance.now() + GATEWAY_LATE_READY_OBSERVATION_MS,
+): void {
+  if (gatewayLateReadyObservation?.isCurrent()) return
+  const remainingMs = deadline - performance.now()
+  if (remainingMs <= 0) return
+  const authority = currentBootResumeAuthority()
+  if (!authority) return
+  const launch = gatewayProcessOwnershipContexts.get(authority.child)
+  if (!launch || !gatewayState.url || gatewayState.status === 'ready') return
+  const url = gatewayState.url
+  const port = gatewayState.port
+  const instanceId = gatewayConnectionInstanceId
+  const authorityIsCurrent = (): boolean => (
+    bootResumeAuthorityIsCurrent(authority)
+    && gatewayState.status !== 'ready'
+    && gatewayState.url === url
+    && gatewayState.port === port
+    && gatewayConnectionInstanceId === instanceId
+    && gatewayProcessOwnershipContexts.get(authority.child) === launch
+  )
+  const observation = {
+    isCurrent: (): boolean => (
+      gatewayLateReadyObservation === observation
+      && authorityIsCurrent()
+    ),
+    // A failed update preparation may resume this exact launch. Create a new
+    // observation so canceled callbacks stay invalid, retaining the old budget.
+    resumeIfCurrent: (): void => {
+      if (gatewayLateReadyObservation && gatewayLateReadyObservation !== observation) return
+      if (gatewayLateReadyObservation === observation) gatewayLateReadyObservation = null
+      if (authorityIsCurrent()) observeLateOwnedGatewayReadiness(deadline)
+    },
+  }
+  gatewayLateReadyObservation = observation
+  const isCurrent = observation.isCurrent
+  if (!isCurrent()) {
+    // The foreground deadline can expire while update verification is still
+    // running. Retain only this timeout's intent and budget; do not probe yet.
+    if (updateApplying && appExitPhase === 'deferred' && !isQuitting) return
+    gatewayLateReadyObservation = null
+    return
+  }
+  void waitForGatewayReadiness({
+    probe: async remainingMs => {
+      if (!isCurrent() || !await readinessCheck(url, remainingMs)) return false
+      if (!isCurrent() || !await verifyOwnedGatewayLaunch(authority.child)) return false
+      return isCurrent()
+    },
+    exitMessage: () => isCurrent() ? null : 'Late Gateway readiness was superseded.',
+    primaryTimeoutMs: remainingMs,
+    lateGraceMs: 0,
+    pollIntervalMs: 2_000,
+  }).then(async result => {
+    if (result.status !== 'ready' || !isCurrent()) return
+    // Explicit Resume may have restored boot.html before timing out again.
+    // The existing helper is a no-op when the local renderer is already open.
+    await loadDesktopRendererIntoCurrentWindow()
+    if (!isCurrent()) return
+    bootError = null
+    publishResumedOwnedGateway(authority.child)
+    sendBootStatus('ready')
+    finishAppStartSuccess()
+  }).catch(error => {
+    if (isCurrent()) desktopLog('gateway_late_readiness_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }).finally(() => {
+    if (gatewayLateReadyObservation === observation) gatewayLateReadyObservation = null
+  })
 }
 
 const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
 const desktopGatewayOwnershipVerification = new DesktopGatewayOwnershipVerificationCoordinator({
   onPidRecycled: (record) => {
     desktopLog('gateway_ownership_pid_recycled', { pid: record.pid, port: record.port })
+  },
+  onVerificationFailed: (record, diagnostic, exitReason) => {
+    desktopLog('gateway_ownership_not_verified', {
+      phase: 'orphan', pid: record.pid, port: record.port, exitReason, ...diagnostic,
+    })
   },
 })
 
@@ -9035,6 +9408,9 @@ async function verifyDesktopGatewayOwnershipWhenReady(
 async function recoverVerifiedOrphanGatewayBeforeSpawn(
   profile = activeDesktopProfile(),
 ): Promise<void> {
+  observeDesktopStartupStage('orphan-owner', {
+    profileKind: profile.kind,
+  })
   const ownershipDir = desktopGatewayOwnershipDir(profile)
   const loaded = loadDesktopGatewayOwnershipRecord(ownershipDir)
   if (loaded.status !== 'valid') {
@@ -9057,7 +9433,6 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
       // A stale record after SIGKILL is harmless: the OS has already released the
       // profile lock and the next admitted Gateway will replace the record. Do
       // not unlink it or infer authority over whatever now owns the PID/port.
-      desktopLog('gateway_ownership_not_verified', { pid: current.pid, port: current.port })
       return
     }
 
@@ -9152,10 +9527,16 @@ async function startGateway(): Promise<GatewayState> {
     publishGatewayConnection()
   }
 
+  if (!await joinGatewayProcessRetirements()) {
+    throw new Error('Previous Desktop gateway process cleanup could not be confirmed.')
+  }
+  if (!isCurrent()) throw new Error('Desktop startup was superseded by a newer open request.')
+
   const activeProfile = activeDesktopProfile()
   const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
     beginGatewayStartTelemetry('external', 'health')
+    observeDesktopStartupStage('gateway-spawn', { operation: 'external', spawned: false })
     if (!isCurrent()) throw new Error('Desktop startup was superseded before Gateway override validation.')
     sendBootStatus('gateway-health')
     gatewayState.url = overrideUrl.replace(/\/$/, '')
@@ -9165,6 +9546,7 @@ async function startGateway(): Promise<GatewayState> {
     gatewayConnectionInstanceId = randomUUID()
     gatewayState.status = 'starting'
     gatewayState.error = undefined
+    desktopStartupLog('gateway_starting', { operation: 'external', port: gatewayState.port })
     publishGatewayConnection()
     const overrideReady = await readinessCheck(gatewayState.url)
     if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
@@ -9175,6 +9557,10 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
     }
+    observeDesktopStartupStage('core-ready', { operation: 'external' })
+    observeDesktopStartupStage('ownership', { operation: 'external', verified: false })
+    observeDesktopStartupStage('legacy-ready', { operation: 'external', source: 'descriptor' })
+    desktopStartupLog('gateway_ready', { operation: 'external', port: gatewayState.port })
     publishGatewayConnection()
     return gatewayState
   }
@@ -9186,15 +9572,51 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('profile')
   const connection = await prepareDesktopStartupConnection()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during profile setup.')
+  let startupConnection = connection
+  const shouldRunFreshOnboarding = (
+    startupConnection === null
+    && freshOnboardingProfileKey === startupProfileKey
+    && !forceOnboardingOnNextStartup
+  )
+  if (shouldRunFreshOnboarding) {
+    // Consume the fresh marker before opening the window. A successful save or
+    // an explicit skip/close must never cause the ready path to invite twice.
+    freshOnboardingProfileKey = null
+    onboardingPromptProfileKey = null
+    try {
+      startupConnection = await runOnboarding()
+      // Closing the window while a save is already admitted resolves the flow
+      // immediately, while the atomic write continues in the coordinator.
+      // Never spawn a Gateway against a profile that is still being written.
+      await onboardingFlows.waitForAbandonedSave()
+      if (startupConnection === null) startupConnection = await loadDesktopCredential()
+    } catch (error) {
+      // The invitation is optional. A renderer/load failure must not turn a
+      // usable unconfigured Gateway into a boot failure; leave the prompt key
+      // for the ready path so the user can retry after the client is up.
+      desktopLog('onboarding_preboot_unavailable', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      startupConnection = await loadDesktopCredential()
+      if (startupConnection === null) onboardingPromptProfileKey = startupProfileKey
+    }
+    if (!isCurrent()) {
+      if (startupConnection === null && !forceOnboardingOnNextStartup) {
+        freshOnboardingProfileKey = startupProfileKey
+        onboardingPromptProfileKey = startupProfileKey
+      }
+      throw new Error('Desktop startup was superseded during fresh onboarding.')
+    }
+  }
   forceOnboardingOnNextStartup = false
-  const apiKey = connection ? decryptApiKey(connection) : ''
+  const apiKey = startupConnection ? decryptApiKey(startupConnection) : ''
   // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
   // by onboarding without a key, so only treat a missing key as fatal when the
   // provider actually needs one — otherwise every keyless credential wedges boot.
-  if (connection && providerDefaults(connection.provider).requiresApiKey && !apiKey) {
+  if (startupConnection && providerDefaults(startupConnection.provider).requiresApiKey && !apiKey) {
     throw new Error('Saved desktop API key could not be read.')
   }
-  const searchApiKey = connection ? decryptSearchApiKey(connection) : ''
+  const searchApiKey = startupConnection ? decryptSearchApiKey(startupConnection) : ''
   // Config is seeded (when missing) inside runOnboarding / the onboarding save,
   // and is otherwise the RPC-owned source of truth — so it is intentionally NOT
   // regenerated here on every boot.
@@ -9230,6 +9652,10 @@ async function startGateway(): Promise<GatewayState> {
     // capability disabled instead of weakening the transport boundary.
     desktopLog('desktop_browser_transport_unavailable')
   }
+  const controlUiBasePath = desktopControlUiBasePath(
+    await readOptionalDesktopText(join(activeProfile.home, 'config.toml')),
+    process.env,
+  )
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
   // close writer/lifecycle admission before draining current children; an
@@ -9269,12 +9695,19 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.url = url
   gatewayState.port = port
   gatewayState.owned = true
+  ownedGatewayControlUiBasePath = controlUiBasePath
   gatewayState.status = 'starting'
   gatewayState.logPath = logPath
   gatewayState.error = undefined
   gatewayConnectionInstanceId = randomUUID()
+  desktopStartupLog('gateway_starting', { operation: 'spawn', port })
   publishGatewayConnection()
 
+  observeDesktopStartupStage('gateway-spawn', {
+    operation: 'spawn',
+    port,
+    runtimeMode: runtime.mode,
+  })
   const childPath = desktopChildPath()
   const gatewayInstanceNonce = createDesktopGatewayInstanceNonce()
   const gatewayOwnershipDir = desktopGatewayOwnershipDir(activeProfile)
@@ -9282,8 +9715,8 @@ async function startGateway(): Promise<GatewayState> {
   const childEnv = desktopChildEnvironment(activeProfile, {
     PATH: childPath,
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
-    ...(connection?.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
-    ...(connection?.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
+    ...(startupConnection?.apiKeyEnv && apiKey ? { [startupConnection.apiKeyEnv]: apiKey } : {}),
+    ...(startupConnection?.searchApiKeyEnv && searchApiKey ? { [startupConnection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
@@ -9292,12 +9725,14 @@ async function startGateway(): Promise<GatewayState> {
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
-    ...(connection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
+    ...(startupConnection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
   })
 
+  const gatewaySpawnRequestedAt = Date.now()
+  desktopStartupLog('gateway_spawn_requested', { port, runtimeMode: runtime.mode })
   const child = spawn(
     runtime.command,
     [...runtime.args, '--port', String(port), '--listen', '127.0.0.1', '--config', desktopConfigPath()],
@@ -9310,9 +9745,21 @@ async function startGateway(): Promise<GatewayState> {
       windowsHide: true,
     }
   )
+  // Keep the Windows packaged startup tail observable at the process boundary.
+  // `ChildProcess.spawn` only proves that CreateProcess returned; the bundled
+  // PyInstaller executable and Python imports may still take seconds before
+  // the first Gateway log line.  Do not log payload bytes: the timing record
+  // separates this pre-log interval from the instrumented Gateway phases.
+  let gatewayFirstOutputAt: number | null = null
+  let gatewayFirstOutputStream: 'stdout' | 'stderr' | null = null
   let childSpawnSucceeded = false
   child.once('spawn', () => {
     childSpawnSucceeded = true
+    desktopStartupLog('gateway_child_spawned', {
+      pid: child.pid,
+      port,
+      spawnToChildMs: Math.max(0, Date.now() - gatewaySpawnRequestedAt),
+    })
   })
   gatewayProcess = child
   gatewayProcessOwnershipContexts.set(child, {
@@ -9321,6 +9768,20 @@ async function startGateway(): Promise<GatewayState> {
     profileFingerprint: gatewayProfileFingerprint,
     port,
   })
+  if (process.platform !== 'win32') {
+    gatewayProcessCleanupContexts.set(child, {
+      ...runtime,
+      args: [...runtime.args],
+      ownershipDir: gatewayOwnershipDir,
+      instanceNonce: gatewayInstanceNonce,
+      env: desktopChildEnvironment(activeProfile, {
+        PATH: childPath,
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+  }
   gatewayProfileKey = desktopProfileKey(activeProfile)
   desktopLog('gateway_spawned', {
     elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
@@ -9335,13 +9796,38 @@ async function startGateway(): Promise<GatewayState> {
 
   let gatewayOutputTail = ''
   let childExitMessage: string | null = null
+  const markGatewayFirstOutput = (stream: 'stdout' | 'stderr', chunk: Buffer | string): void => {
+    if (gatewayFirstOutputAt !== null) return
+    gatewayFirstOutputAt = Date.now()
+    gatewayFirstOutputStream = stream
+    desktopStartupLog('gateway_process_output_first', {
+      pid: child.pid,
+      port,
+      stream,
+      bytes: Buffer.byteLength(String(chunk), 'utf8'),
+      spawnToOutputMs: Math.max(0, gatewayFirstOutputAt - gatewaySpawnRequestedAt),
+    })
+  }
   const rememberGatewayOutput = (chunk: Buffer | string) => {
     gatewayOutputTail = appendGatewayOutputTail(gatewayOutputTail, chunk)
   }
-  child.stdout.on('data', rememberGatewayOutput)
-  child.stderr.on('data', rememberGatewayOutput)
+  child.stdout.on('data', (chunk) => {
+    markGatewayFirstOutput('stdout', chunk)
+    rememberGatewayOutput(chunk)
+  })
+  child.stderr.on('data', (chunk) => {
+    markGatewayFirstOutput('stderr', chunk)
+    rememberGatewayOutput(chunk)
+  })
   child.stdout.pipe(logStream, { end: false })
   child.stderr.pipe(logStream, { end: false })
+  child.once('exit', () => {
+    // A stopped launcher can report a signal or nonzero exit after its Gateway
+    // drains. The retained scope still needs cleanup proof before replacement.
+    if (!isQuitting && !updateApplying && gatewayStoppingProcesses.has(child)) {
+      retireStoppedGatewayProcessCleanup(child)
+    }
+  })
   // Classify startup failures only after stdio has closed. Node may emit
   // 'exit' before the final stdout/stderr chunks, which can otherwise drop the
   // stable OPENSQUILLA_PROFILE_IN_USE marker printed immediately before exit.
@@ -9427,6 +9913,7 @@ async function startGateway(): Promise<GatewayState> {
       }
       return
     }
+    gatewayProcessCleanupContexts.delete(child)
     if (isCurrentGateway) gatewayProcess = null
     closeLogStream()
     if (!isCurrentGateway) return
@@ -9443,7 +9930,12 @@ async function startGateway(): Promise<GatewayState> {
 
   sendBootStatus('gateway-health')
   advanceGatewayStartTelemetry('health')
-  await waitForGateway(url, () => childExitMessage)
+  await waitForGateway(
+    url,
+    () => childExitMessage,
+    remainingMs => verifyOwnedGatewayLaunch(child, { emitDiagnostic: false, timeoutMs: remainingMs }),
+  )
+  observeDesktopStartupStage('core-ready', { operation: 'spawn', pid: child.pid })
   // Guard against adopting a foreign gateway that won the probe→bind race: if our
   // spawned child has already exited, it lost the exclusive bind and the healthy
   // endpoint belongs to someone else (e.g. a CLI `opensquilla gateway run` on the
@@ -9463,6 +9955,7 @@ async function startGateway(): Promise<GatewayState> {
       'OPENSQUILLA_GATEWAY_PORT_IN_USE: Gateway port is already in use by an unverified listener.',
     )
   }
+  observeDesktopStartupStage('ownership', { operation: 'spawn', pid: child.pid, verified: true })
   if (hasGatewayProcessExited(child) || gatewayProcess !== child || !isCurrent()) {
     throw new Error(childExitMessage
       || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway changed during ownership verification.')
@@ -9470,7 +9963,17 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('control')
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_ready', {
+    operation: 'spawn',
+    pid: child.pid,
+    spawnToReadyMs: Math.max(0, Date.now() - gatewaySpawnRequestedAt),
+    spawnToOutputMs: gatewayFirstOutputAt === null
+      ? null
+      : Math.max(0, gatewayFirstOutputAt - gatewaySpawnRequestedAt),
+    firstOutputStream: gatewayFirstOutputStream,
+  })
   markGatewayProcessReady(child)
+  observeDesktopStartupStage('legacy-ready', { operation: 'spawn', source: 'descriptor' })
   publishGatewayConnection()
   return gatewayState
 }
@@ -9539,13 +10042,12 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // Electron disables Chromium's built-in PDF plugin by default. The
-      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
-      // keep the renderer sandboxed while enabling that viewer.
+      // Keep document viewing enabled without changing renderer isolation.
       plugins: true,
     },
   })
   mainWindow = window
+  desktopStartupLog('window_created')
   installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
@@ -9553,6 +10055,14 @@ async function createMainWindow(): Promise<BrowserWindow> {
     window.webContents,
     () => nativeWorkbenchSurfaces.refreshBounds(window),
   )
+  if (process.platform !== 'darwin') {
+    installDesktopReloadShortcuts(
+      window.webContents,
+      window.webContents,
+      () => currentOnboardingWindow() === null,
+      () => reloadDesktopWindow(false),
+    )
+  }
   installEditingContextMenu(window)
 
   const rendererConsoleLogLimiter = new RendererConsoleLogLimiter()
@@ -9566,6 +10076,11 @@ async function createMainWindow(): Promise<BrowserWindow> {
     void nativeWorkbenchSurfaces.destroyAll()
     void artifactPreviewLeaseBroker.revokeAll()
   }
+
+  let rendererRecoveryGeneration = 0
+  let cancelRendererRecovery: (() => void) | null = null
+  let rendererRecoveryFailureWindowStartedAt = 0
+  let rendererRecoveryFailureCount = 0
 
   // Forward renderer console errors to desktop.log. The Control UI runs
   // in the renderer, so a purely front-end failure (a thrown error, an unhandled
@@ -9592,6 +10107,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // failure of all — the whole UI freezes with nothing in any log — so stamping
   // the reason and exit code gives a first, always-present breadcrumb.
   window.webContents.on('render-process-gone', (_event, details) => {
+    rendererRecoveryGeneration += 1
+    const recoveryGeneration = rendererRecoveryGeneration
     flushRendererConsoleSuppression()
     releaseRendererOwnedArtifactPreviews()
     if (rendererUnresponsiveAt !== null) {
@@ -9604,6 +10121,72 @@ async function createMainWindow(): Promise<BrowserWindow> {
       exitCode: details.exitCode,
     })
     desktopLog(entry.event, entry.detail)
+
+    // A crashed renderer leaves the native window and its Gateway owner alive,
+    // so recover the document in place. This is deliberately bounded: one
+    // reload per crash generation and at most three failed recoveries per
+    // minute. A later generation cannot let an older did-finish-load callback
+    // publish readiness or reset the failure budget.
+    // A new crash invalidates the old load. Retire its listener and timer
+    // before starting the latest generation with the same failure budget.
+    cancelRendererRecovery?.()
+    if (isQuitting || appExitPhase !== 'running' || window.isDestroyed()) {
+      desktopLog('renderer_recovery_suppressed', {
+        generation: recoveryGeneration,
+        reason: 'lifecycle_not_running',
+      })
+      return
+    }
+    const now = Date.now()
+    if (now - rendererRecoveryFailureWindowStartedAt >= 60_000) {
+      rendererRecoveryFailureWindowStartedAt = now
+      rendererRecoveryFailureCount = 0
+    }
+    if (rendererRecoveryFailureCount >= 3) {
+      desktopLog('renderer_recovery_exhausted', {
+        generation: recoveryGeneration,
+        failures: rendererRecoveryFailureCount,
+      })
+      return
+    }
+    rendererRecoveryFailureCount += 1
+    desktopLog('renderer_recovery_scheduled', {
+      generation: recoveryGeneration,
+      attempt: rendererRecoveryFailureCount,
+    })
+    let finished = false
+    let onReady: () => void = () => undefined
+    const timeout = setTimeout(() => finish('timeout'), 30_000)
+    const finish = (outcome: 'ready' | 'timeout' | 'stale' | 'reload-failed'): void => {
+      if (finished) return
+      finished = true
+      clearTimeout(timeout)
+      window.webContents.removeListener('did-finish-load', onReady)
+      cancelRendererRecovery = null
+      if (outcome === 'ready' && recoveryGeneration === rendererRecoveryGeneration) {
+        rendererRecoveryFailureCount = 0
+        desktopLog('renderer_recovery_ready', {
+          generation: recoveryGeneration,
+          rendererPid: window.webContents.getOSProcessId(),
+        })
+      } else if (outcome !== 'stale') {
+        desktopLog('renderer_recovery_failed', { generation: recoveryGeneration, outcome })
+      }
+    }
+    onReady = (): void => {
+      if (recoveryGeneration !== rendererRecoveryGeneration) {
+        finish('stale')
+        return
+      }
+      finish('ready')
+    }
+    cancelRendererRecovery = () => finish('stale')
+    window.webContents.once('did-finish-load', onReady)
+    try {
+      window.webContents.reload()
+    } catch {
+      finish('reload-failed')
+    }
   })
 
   window.webContents.on('unresponsive', () => {
@@ -9652,7 +10235,15 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // while keeping the full opensquillaDesktop IPC bridge. SPA route changes use
   // history.pushState and are unaffected.
   const guardMainWindowNavigation = (event: Electron.Event, targetUrl: string) => {
-    if (isAllowedMainWindowNavigation(targetUrl)) return
+    if (isAllowedMainWindowNavigation(targetUrl)) {
+      if (nativeWorkbenchSurfaces.hasBrowserTabs()) {
+        event.preventDefault()
+        void guardBrowserReload(() => {
+          if (!window.isDestroyed()) void window.webContents.loadURL(targetUrl).catch(() => undefined)
+        })
+      }
+      return
+    }
     event.preventDefault()
     if (/^https?:\/\//i.test(targetUrl) || targetUrl.startsWith('mailto:')) {
       void shell.openExternal(targetUrl)
@@ -9668,12 +10259,12 @@ async function createMainWindow(): Promise<BrowserWindow> {
       details.preventDefault()
     }
   })
-  window.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
-    // Native child views sit above the renderer DOM. A full document change
-    // must remove them before boot/recovery/another Control UI can become
-    // visible; same-document SPA navigation keeps the Workbench lifecycle in
-    // Vue and is intentionally left alone.
-    if (isMainFrame && !isInPlace) releaseRendererOwnedArtifactPreviews()
+  window.webContents.on('did-navigate', () => {
+    // did-start-navigation precedes the cancellable will-navigate event.
+    // Only a committed document may discard its predecessor's child views;
+    // a cancelled reload must preserve their unsaved state. SPA route changes
+    // do not emit did-navigate and retain the Workbench lifecycle in Vue.
+    releaseRendererOwnedArtifactPreviews()
   })
 
   window.on('close', (event) => handleMainWindowClose(window, event))
@@ -9717,6 +10308,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   }
 
   window.once('ready-to-show', () => {
+    desktopStartupLog('window_ready_to_show')
     if (!window.isDestroyed()) window.show()
   })
 
@@ -9905,8 +10497,11 @@ async function stopOwnedGatewayAndWait(): Promise<void> {
 }
 
 async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
-  const consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
   const active = activeDesktopProfile()
+  const metadata = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+  let consolidationFailure = metadata.canSkipMaintenance
+    ? null
+    : await consolidateLegacyRecoveryProfilesBeforeStartup()
   // On a hard Electron crash, the Python Gateway can remain healthy and keep
   // the profile writer lease. Prove and stop that exact prior Desktop instance
   // before profile inspection; otherwise the inspector reports profile_lock_busy
@@ -9917,6 +10512,26 @@ async function inspectActiveProfileBeforeStartup(): Promise<boolean> {
     await recoverVerifiedOrphanGatewayBeforeSpawn(active)
   }
   recoveryOperationError = null
+  if (metadata.canSkipMaintenance) {
+    // Orphan drain can await another process. Re-check metadata afterwards so a
+    // transaction or config edit during that wait takes the original path.
+    const current = inspectDesktopStartupMetadata(app.getPath('userData'), active.home)
+    if (current.canSkipMaintenance) {
+      recoveryInspection = null
+      primaryRecoveryInspection = null
+      desktopGrowthTelemetry.observeProfileInspection({
+        profileKey: active.home,
+        stableCode: resolvedPathsEqual(current.workspaceDirectory, join(active.home, 'workspace'))
+          ? 'canonical_workspace' : 'configured_workspace',
+        importedOrMigrated: false,
+      })
+      desktopLog('desktop_profile_startup_fastpath', { maintenanceHelpersSkipped: true })
+      publishRecoveryState()
+      createApplicationMenu()
+      return true
+    }
+    consolidationFailure = await consolidateLegacyRecoveryProfilesBeforeStartup()
+  }
   let inspection = await inspectDesktopProfile(active)
   const growthInspection = {
     profileKey: active.home,
@@ -10090,11 +10705,32 @@ async function openOrResumeDesktopApp(): Promise<void> {
       let operationIsCurrent = () => (
         desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
       )
-      await createMainWindow()
-      focusMainWindow()
+      const startupStageAttempt = beginDesktopStartupStageAttempt()
 
       try {
-        const profileReady = await inspectActiveProfileBeforeStartup()
+        // Anchor the diagnostic timeline before creating/focusing the window;
+        // window construction is part of user-visible startup and must not be
+        // hidden by moving the first timestamp later in the flow.
+        await createMainWindow()
+        focusMainWindow()
+        observeDesktopStartupStage('profile-inspect', { operation: 'startup' })
+        const profileInspectStartedAt = Date.now()
+        desktopStartupLog('profile_inspect_started')
+        let profileReady: boolean
+        try {
+          profileReady = await inspectActiveProfileBeforeStartup()
+        } catch (error) {
+          desktopStartupLog('profile_inspect_finished', {
+            ready: false,
+            failed: true,
+            durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+          })
+          throw error
+        }
+        desktopStartupLog('profile_inspect_finished', {
+          ready: profileReady,
+          durationMs: Math.max(0, Date.now() - profileInspectStartedAt),
+        })
         // Only trust config.state_dir after profile inspection/recovery has
         // bounded the active profile. Sync before publishing that inspection's
         // terminal result so existing opt-in users retain profile-start facts;
@@ -10112,6 +10748,9 @@ async function openOrResumeDesktopApp(): Promise<void> {
         if (!profileReady && operationIsCurrent()) {
           finishAppStartFailure(new Error('profile recovery required'), {
             stage: 'profile',
+            errorCode: 'profile_recovery_required',
+          })
+          finishDesktopStartupStageAttempt(startupStageAttempt, 'fail', {
             errorCode: 'profile_recovery_required',
           })
         }
@@ -10147,8 +10786,17 @@ async function openOrResumeDesktopApp(): Promise<void> {
               )
             )
             if (operationIsCurrent()) {
+              observeDesktopStartupStage('websocket-connected', {
+                boundary: 'main-publication',
+                observed: false,
+              })
+              observeDesktopStartupStage('tool-ready', {
+                boundary: 'desktop-ready',
+                observed: false,
+              })
               sendBootStatus('ready')
               finishAppStartSuccess()
+              finishDesktopStartupStageAttempt(startupStageAttempt, 'success')
               if (onboardingPromptProfileKey === desktopProfileKey() && !onboardingFlows.active) {
                 onboardingPromptProfileKey = null
                 // The client and Gateway are already ready. This optional,
@@ -10180,10 +10828,26 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (operationIsCurrent()) {
             if (currentMainWindow()) sendBootError(error)
             finishAppStartFailure(error)
+            finishDesktopStartupStageAttempt(startupStageAttempt, 'fail', {
+              error: error instanceof Error ? error.message : String(error),
+            })
+            if (error instanceof GatewayReadinessTimeoutError) observeLateOwnedGatewayReadiness()
           }
         }
       }
-      if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) return
+      if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) {
+        if (!startupStageAttempt.finished) {
+          finishDesktopStartupStageAttempt(startupStageAttempt, 'cancel', {
+            reason: 'startup_authority_changed',
+          })
+        }
+        return
+      }
+      if (!startupStageAttempt.finished) {
+        finishDesktopStartupStageAttempt(startupStageAttempt, 'cancel', {
+          reason: 'startup_authority_changed',
+        })
+      }
       if (gatewayProfileKey && gatewayProfileKey !== desktopProfileKey()) {
         if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
         else clearReusableGatewayState()
@@ -10428,6 +11092,8 @@ const { autoUpdater } = electronUpdater
 
 let autoUpdaterReady = false
 let updateDownloadInProgress = false
+let desktopUpdateDownloadTask: Promise<DesktopUpdateState> | null = null
+let desktopUpdateDownloadOrigin: 'automatic' | 'user' | null = null
 let manualInstallerActionInProgress = false
 let updateApplying = false
 // A user/system quit that arrives while an update is still draining writers or
@@ -10484,8 +11150,10 @@ interface DesktopUpdateState {
   canCheck: boolean
   canNativeInstall: boolean
   canInstall?: boolean
+  canAutoDownload: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  releaseNotesUrl: string | null
   source: DesktopUpdateSource | null
   fallbackUsed: boolean
 }
@@ -10648,6 +11316,10 @@ function windowsInstallerActionsSupported(): boolean {
   return process.platform === 'win32' && process.arch === 'x64'
     && desktopUpdateManaged() && desktopUpdateInstallMode() === 'manual'
     && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '0'
+}
+
+function desktopUpdateAutomaticDownloadSupported(): boolean {
+  return nativeAutoUpdateEnabled() || windowsInstallerActionsSupported()
 }
 
 function windowsUpdateDownloadDirectory(): string {
@@ -10814,8 +11486,13 @@ function desktopUpdateSnapshot(): DesktopUpdateState {
     canCheck: desktopUpdateManaged() || mockUpdateVersion() !== null,
     canNativeInstall: installMode === 'native',
     canInstall: installMode === 'native' || windowsInstallerActionsSupported(),
+    canAutoDownload: desktopUpdateAutomaticDownloadSupported(),
     installMode,
     releaseUrl: desktopUpdateReleaseUrl,
+    // The release page belongs to this exact candidate, never to the transport
+    // URL (which is the .exe on Windows) or a previously selected version.
+    releaseNotesUrl: desktopUpdateCandidate?.version === latestVersion
+      ? desktopUpdateCandidate.releaseUrl : null,
     source: desktopUpdateSource,
     fallbackUsed: desktopUpdateFallbackUsed,
   }
@@ -10943,10 +11620,12 @@ function showUpdateError(
   err: unknown,
   silentFallback: DesktopUpdateFailureFallback | null = null,
 ): void {
-  const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest() || updateDownloadInProgress
+  const wasDownload = desktopUpdateDownloadOrigin !== null
+  const shouldNotify = desktopUpdateCheckScheduler.consumeManualRequest()
+    || desktopUpdateDownloadOrigin === 'user'
   const errorCode = classifyDesktopUpdateError(err)
   updateDownloadInProgress = false
-  if (!shouldNotify) {
+  if (!shouldNotify && !wasDownload) {
     if (silentFallback && !['checking', 'downloading', 'applying'].includes(silentFallback.state.status)) {
       desktopUpdateCandidate = silentFallback.candidate
       setDesktopUpdateState({
@@ -10985,6 +11664,15 @@ async function runMockUpdateFlow(version: string): Promise<void> {
   if (mockUpdatePromptActive) return
   mockUpdatePromptActive = true
   try {
+    const parsed = parseOpenSquillaReleaseTag(version)
+    if (parsed) {
+      const tag = `v${parsed.base}${parsed.rc === null ? '' : `rc${parsed.rc}`}`
+      desktopUpdateCandidate = {
+        tag, version, baseVersion: parsed.base, prerelease: parsed.rc !== null,
+        releaseUrl: `https://github.com/${GITHUB_UPDATE_OWNER}/${GITHUB_UPDATE_REPO}/releases/tag/${tag}`,
+        feed: '', installer: '',
+      }
+    }
     if (downloadedUpdateVersion === version) {
       setDesktopUpdateState({
         status: 'downloaded',
@@ -11008,7 +11696,29 @@ async function runMockUpdateFlow(version: string): Promise<void> {
   }
 }
 
-async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
+function downloadDesktopUpdate(origin: 'automatic' | 'user' = 'user'): Promise<DesktopUpdateState> {
+  if (desktopUpdateDownloadTask) {
+    if (origin === 'user') desktopUpdateDownloadOrigin = 'user'
+    return desktopUpdateDownloadTask
+  }
+  if (origin === 'automatic' && (!desktopUpdateAutomaticDownloadSupported()
+    || desktopUpdateStatus !== 'available' || !desktopUpdateCandidate)) {
+    return Promise.resolve(desktopUpdateSnapshot())
+  }
+  desktopUpdateDownloadOrigin = origin
+  // Reserve the flight before any cache/signature/network await. A renderer
+  // retry joins background preparation instead of starting another download.
+  const task = Promise.resolve().then(() => runDesktopUpdateDownload(origin))
+    .finally(() => {
+      if (desktopUpdateDownloadTask !== task) return
+      desktopUpdateDownloadTask = null
+      desktopUpdateDownloadOrigin = null
+    })
+  desktopUpdateDownloadTask = task
+  return task
+}
+
+async function runDesktopUpdateDownload(origin: 'automatic' | 'user'): Promise<DesktopUpdateState> {
   try {
     await restoreWindowsUpdateCache(true)
   } catch (error) {
@@ -11024,7 +11734,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     manualInstallerActionInProgress = true
     try {
       await revalidateReadyWindowsInstaller()
-      shell.showItemInFolder(verifiedManualInstallerPath)
+      if (origin === 'user') shell.showItemInFolder(verifiedManualInstallerPath)
     } catch (err) {
       const errorCode = classifyDesktopUpdateError(err)
       if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
@@ -11063,7 +11773,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       error: null,
     })
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 100)
+      setTimeout(resolve, 600)
     })
     updateDownloadInProgress = false
     downloadedUpdateVersion = version
@@ -11090,8 +11800,9 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
     manualInstallerActionInProgress = true
     let finishTelemetry: ((outcome: 'success' | 'fail', errorCode: UpdateErrorCode | null) => void) | undefined
     try {
-      if (desktopUpdateStatus === 'checking') await checkForUpdates(true)
-      if (!desktopUpdateCandidate) await checkForUpdates(true)
+      if (origin === 'user' && (desktopUpdateStatus === 'checking' || !desktopUpdateCandidate)) {
+        await checkForUpdates(true)
+      }
       const candidate = desktopUpdateCandidate
       if (!candidate || !['available', 'error'].includes(desktopUpdateStatus)) return desktopUpdateSnapshot()
       const telemetryStartedAt = Date.now()
@@ -11215,6 +11926,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   initAutoUpdater()
   let candidate = desktopUpdateCandidate
   if (!candidate || !nativeUpdateReadyFor(candidate)) {
+    if (origin === 'automatic') return desktopUpdateSnapshot()
     await checkForUpdates(true)
     candidate = desktopUpdateCandidate
   }
@@ -11230,6 +11942,9 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
   })
   try {
     await downloadNativeDesktopUpdateWithFallback()
+    if (desktopUpdateSnapshot().status !== 'downloaded' || downloadedUpdateVersion !== candidate.version) {
+      throw new UpdateChannelError('manifest_invalid', 'The selected update has not reached verified readiness.')
+    }
     desktopReliabilityTelemetry.recordUpdateResult({
       outcome: 'success',
       durationMs: Math.max(0, Date.now() - telemetryStartedAt),
@@ -11259,9 +11974,9 @@ function initAutoUpdater(): void {
   if (autoUpdaterReady || !autoUpdateSupported()) return
   autoUpdaterReady = true
 
-  // Consent-based: the bundled gateway + ML runtime make updates large, so we
-  // never download without asking. We also keep installation on the explicit
-  // restart path so applyDownloadedUpdate() can drain the owned gateway first.
+  // OpenSquilla owns download scheduling after its exact candidate/feed checks,
+  // including source fallback. Installation remains an explicit user action so
+  // applyDownloadedUpdate() can drain the owned gateway first.
   autoUpdater.autoDownload = false
   autoUpdater.autoInstallOnAppQuit = false
   // electron-updater generates a persistent per-install staging UUID even
@@ -11296,8 +12011,13 @@ function initAutoUpdater(): void {
   })
 
   autoUpdater.on('update-downloaded', (info) => {
-    updateDownloadInProgress = false
     const version = String(info?.version ?? '')
+    if (!desktopUpdateCandidate || version !== desktopUpdateCandidate.version
+      || !nativeUpdateReadyFor(desktopUpdateCandidate)) {
+      showUpdateError(new UpdateChannelError('manifest_invalid', 'Downloaded update does not match the selected release.'))
+      return
+    }
+    updateDownloadInProgress = false
     downloadedUpdateVersion = version
     mockDownloadedUpdate = false
     createApplicationMenu()
@@ -11868,6 +12588,17 @@ function desktopUpdateCheckAllowed(): boolean {
 }
 
 async function runDesktopUpdateCheck(): Promise<void> {
+  await checkDesktopUpdateCandidate()
+  if (desktopUpdateStatus === 'available' && desktopUpdateAutomaticDownloadSupported()) {
+    // Do not await here: an explicit Download may already be awaiting this
+    // check. Both routes join the same flight once the verified candidate exists.
+    void downloadDesktopUpdate('automatic').catch((error) => {
+      console.error('[updater] background preparation failed', error)
+    })
+  }
+}
+
+async function checkDesktopUpdateCandidate(): Promise<void> {
   try {
     await restoreWindowsUpdateCache(desktopUpdateCheckScheduler.manualRequestPending)
   } catch (error) {
@@ -12087,7 +12818,8 @@ async function stopAndJoinAllLifecycleOwnedGateways(
   stopCurrentProcess: (child: ChildProcessWithoutNullStreams) => void = () => stopGateway(),
 ): Promise<boolean> {
   cancelGatewayUnexpectedExitRestart('Gateway stop/join requested')
-  return await stopAndJoinLifecycleProcesses({
+  const startedAt = Date.now()
+  const exited = await stopAndJoinLifecycleProcesses({
     currentProcess: () => (
       gatewayProcess && gatewayState.owned && !hasGatewayProcessExited(gatewayProcess)
         ? gatewayProcess
@@ -12096,7 +12828,32 @@ async function stopAndJoinAllLifecycleOwnedGateways(
     stopCurrentProcess,
     liveProcesses: liveLifecycleOwnedGatewayProcesses,
     waitForExit: (child) => waitForGatewayProcessExit(child),
+    onStopRequested: (child) => desktopStartupLog('gateway_stop_requested', {
+      pid: child.pid,
+      operationElapsedMs: Math.max(0, Date.now() - startedAt),
+    }),
+    onChildExited: (child, exited) => desktopStartupLog(
+      exited ? 'gateway_child_exited' : 'gateway_child_exit_wait',
+      {
+        pid: child.pid,
+        exited,
+        operationElapsedMs: Math.max(0, Date.now() - startedAt),
+      },
+    ),
+    onComplete: (exited) => desktopStartupLog('gateway_stop_join_complete', {
+      exited,
+      operationElapsedMs: Math.max(0, Date.now() - startedAt),
+    }),
   })
+  if (!exited) return false
+  // Include roots that exited before this call as well as failures retained
+  // from an earlier attempt. Protected profile writes cannot race retirement.
+  return await joinGatewayProcessRetirements()
+}
+
+async function joinGatewayProcessRetirements(): Promise<boolean> {
+  const retired = await Promise.all(gatewayProcessCleanupRetirements.values())
+  return retired.every(Boolean)
 }
 
 function restoreDownloadedUpdateRetryState(
@@ -12144,6 +12901,7 @@ async function applyWindowsInstaller(): Promise<void> {
   const profileKey = desktopProfileKey()
   let recoveryGeneration = 0
   let telemetryStartedAt = 0
+  let resumeLateReadinessAfterFailure: (() => void) | null = null
   const assertCanHandoff = () => {
     if (liveLifecycleOwnedGatewayProcesses().length > 0 || !writerAdmissionToken
       || desktopWriters.hasOtherOwner(writerAdmissionToken) || desktopWriters.activeCount !== 0) {
@@ -12154,12 +12912,30 @@ async function applyWindowsInstaller(): Promise<void> {
     canStart: () => windowsInstallerActionsSupported() && !isQuitting && appExitPhase === 'running'
       && !updateApplying && !updateDownloadInProgress && !manualInstallerActionInProgress && !desktopWriters.closed,
     started: () => {
+      if (gatewayLateReadyObservation?.isCurrent()) {
+        resumeLateReadinessAfterFailure = gatewayLateReadyObservation.resumeIfCurrent
+      }
       recoveryGeneration = ++windowsUpdateRecoveryGeneration
       telemetryStartedAt = Date.now()
       updateApplying = true
       setAppExitPhase('deferred', 'verifying Windows update before installation')
       setDesktopUpdateState({ status: 'applying', error: null, errorCode: null })
       createApplicationMenu()
+    },
+    stage: (event, detail) => {
+      // The shared stop/join helper emits per-child gateway_stop_requested and
+      // gateway child-exit breadcrumbs. Keep the update coordinator's
+      // update-level stages separate so one child does not produce duplicates.
+      if (
+        event === 'gateway_stop_requested'
+        || event === 'gateway_child_exited'
+        || event === 'gateway_child_exit_wait'
+      ) return
+      desktopStartupLog(event, {
+        operation: 'windows-update',
+        operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+        ...detail,
+      })
     },
     verify: async () => {
       installerPath = await revalidateReadyWindowsInstaller()
@@ -12241,7 +13017,14 @@ async function applyWindowsInstaller(): Promise<void> {
             : desktopUpdateErrorMessage(errorCode),
       })
       desktopLog('update_windows_installer_failed', { version: candidate.version, errorCode, error: String(error) })
-      if (quitResumed || !gatewayStopStarted || !previouslyOwned) return
+      if (quitResumed) return
+      if (!gatewayStopStarted) {
+        const resumeLateReadiness = gatewayLateReadyObservation?.resumeIfCurrent
+          ?? resumeLateReadinessAfterFailure
+        resumeLateReadiness?.()
+        return
+      }
+      if (!previouslyOwned) return
       // If termination timed out, wait for these exact children. Never start a
       // second Gateway or resurrect a profile after another lifecycle action.
       const resume = () => {
@@ -12306,13 +13089,22 @@ async function applyDownloadedUpdate(): Promise<void> {
   const pendingVersion = downloadedUpdateVersion
   if (pendingVersion === null) return
   const telemetryStartedAt = Date.now()
+  desktopStartupLog('update_started', { operation: 'auto-updater' })
   updateApplying = true
   setAppExitPhase('deferred', 'preparing downloaded update')
   // Never interrupt a reconcile/workspace/settings transaction after it has
   // been admitted. Close new writers and wait for existing operations to
   // finish naturally before the installer handoff.
   const updateWriterAdmission = desktopWriters.close('apply downloaded update')
+  desktopStartupLog('writers_admission_closed', {
+    operation: 'auto-updater',
+    operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+  })
   await waitForDesktopWriterOperations()
+  desktopStartupLog('writers_drained', {
+    operation: 'auto-updater',
+    operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+  })
   downloadedUpdateVersion = null
   createApplicationMenu()
   setDesktopUpdateState({
@@ -12360,6 +13152,10 @@ async function applyDownloadedUpdate(): Promise<void> {
     updateInstallHandoffReady = true
     setAppExitPhase('committed', 'handing off to desktop updater')
     autoUpdater.quitAndInstall(false, true)
+    desktopStartupLog('installer_handoff', {
+      operation: 'auto-updater',
+      operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+    })
   } catch (err) {
     desktopReliabilityTelemetry.clearUpdateHandoff()
     desktopReliabilityTelemetry.recordUpdateResult({
@@ -12423,12 +13219,33 @@ ipcMain.handle('desktop:deep-link-session:get', (event) => {
 ipcMain.handle('desktop:theme:set', (_event, payload: unknown) => (
   applyDesktopNativeTheme(normalizeDesktopNativeThemeSource(payload))
 ))
-ipcMain.handle('gateway:status', () => ({ ...gatewayState }))
+ipcMain.handle('gateway:status', () => {
+  if (gatewayState.status === 'ready') {
+    // This is the main-process boundary at which the renderer has requested
+    // the Gateway capability state. It is intentionally labelled as a
+    // boundary observation; actual tool registration remains Gateway-owned.
+    observeDesktopStartupStage('tool-ready', {
+      boundary: 'gateway-status-ipc',
+      observed: false,
+    })
+  }
+  return { ...gatewayState }
+})
 ipcMain.handle('gateway:connection', (event) => {
   if (!trustedMainWindowControlIpc(event)) {
     throw new Error('Untrusted Gateway connection request.')
   }
   const snapshot = desktopGatewayConnectionSnapshot()
+  if (snapshot.status === 'ready') {
+    // The Desktop can observe the trusted renderer asking for the connection
+    // descriptor, but the WebSocket handshake itself is owned by WebUI. Keep
+    // that distinction explicit in diagnostics instead of claiming a socket
+    // was established merely because IPC returned successfully.
+    observeDesktopStartupStage('websocket-connected', {
+      boundary: 'gateway-connection-ipc',
+      observed: false,
+    })
+  }
   if (snapshot.status === 'ready' && gatewayState.sandboxUpgrade === null) {
     void refreshSandboxUpgradeReport()
   }
@@ -12485,6 +13302,35 @@ ipcMain.handle('desktop:artifact:save', async (event, payload: SaveArtifactReque
     return choice.canceled ? null : choice.filePath || null
   })
 })
+ipcMain.handle('desktop:attachment:save', async (event, payload: SaveAttachmentRequest) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted attachment save request.')
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  event.sender.once('destroyed', abort)
+  try {
+    return await saveAttachmentFile(payload, {
+      signal: controller.signal,
+      connection: () => {
+        if (!trustedMainWindowControlIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+        const snapshot = desktopGatewayConnectionSnapshot()
+        if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken) return null
+        return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+          url: snapshot.httpUrl, authToken: snapshot.authToken }
+      },
+      choosePath: async name => {
+        const window = currentMainWindow()
+        if (!window) throw new Error('Main window unavailable')
+        const choice = await dialog.showSaveDialog(window, { defaultPath: name })
+        return choice.canceled ? null : choice.filePath || null
+      },
+    })
+  } catch {
+    // Local filesystem errors can contain host paths; keep them out of renderer IPC.
+    throw new Error('Attachment save failed')
+  } finally {
+    event.sender.removeListener('destroyed', abort)
+  }
+})
 ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileActionRequest) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted source file request.')
   await performSourceFileAction(payload, {
@@ -12515,6 +13361,40 @@ ipcMain.handle('desktop:workspace-file:action', async (event, payload: Workspace
     // receives controlled metadata; renderer errors remain path-free.
     throw new Error('Workspace file action failed')
   })
+})
+ipcMain.handle('desktop:files:choose-paths', async (event, request: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted local path request')
+  const connectionRevision = gatewayConnectionRevision
+  let invalidated = false
+  const invalidate = () => { invalidated = true }
+  const onNavigation = (_event: Electron.Event, _url: string, _inPlace: boolean, mainFrame: boolean) => {
+    if (mainFrame) invalidate()
+  }
+  event.sender.on('did-start-navigation', onNavigation)
+  event.sender.once('destroyed', invalidate)
+  try {
+    return await chooseLocalFilePaths(request, {
+      connection: () => {
+        if (invalidated || connectionRevision !== gatewayConnectionRevision
+          || event.sender.isDestroyed() || !trustedControlUiIpc(event)
+          || !gatewayState.owned || gatewayState.status !== 'ready' || !gatewayProcess) return null
+        const snapshot = desktopGatewayConnectionSnapshot()
+        const nonce = gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+        if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+        return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+          url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+      },
+      pick: async () => {
+        const window = BrowserWindow.fromWebContents(event.sender)
+        if (!window) throw new Error('Main window unavailable')
+        const choice = await dialog.showOpenDialog(window, { properties: ['openFile', 'multiSelections'] })
+        return choice.canceled ? [] : choice.filePaths
+      },
+    })
+  } finally {
+    event.sender.removeListener('did-start-navigation', onNavigation)
+    event.sender.removeListener('destroyed', invalidate)
+  }
 })
 // File paths enter this broker only from the native picker or isolated preload's
 // webUtils.getPathForFile(File); renderer-facing calls never accept a path string.
@@ -12615,10 +13495,24 @@ ipcMain.handle('desktop:workbench:annotation:close-overlay', async (event, paylo
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
 })
+ipcMain.handle('desktop:workbench:annotation:update-overlay', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
+  try {
+    return nativeWorkbenchSurfaces.updateArtifactAnnotationOverlay(
+      parseNativeWorkbenchAnnotationOverlayUpdateRequest(payload),
+    )
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+})
 ipcMain.handle('desktop:workbench:browser:target', (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
   const request = payload as { surfaceId?: unknown } | null
   return nativeWorkbenchSurfaces.getBrowserTarget(parseNativeWorkbenchSurfaceId(request?.surfaceId))
+})
+ipcMain.handle('desktop:workbench:browser:automation-state', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
+  return await nativeWorkbenchSurfaces.setBrowserAutomationState(payload)
 })
 ipcMain.handle('desktop:workbench:annotation:focus', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted annotation request.')
@@ -12683,9 +13577,10 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
         }
       }
     }
-    return await nativeWorkbenchSurfaces.createSurface(request)
+    return await nativeWorkbenchSurfaces.createSurfaceFromControlUi(request)
   } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    return { ok: false, message: error instanceof Error ? error.message : String(error),
+      ...(error instanceof DesktopBrowserError ? { code: error.code } : {}) }
   }
 })
 ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unknown) => {
@@ -12694,7 +13589,7 @@ ipcMain.handle('desktop:workbench:surface:navigate', async (event, payload: unkn
     return { ok: false, message: 'OpenSquilla Desktop is shutting down.' }
   }
   try {
-    return await nativeWorkbenchSurfaces.navigateSurface(
+    return await nativeWorkbenchSurfaces.navigateSurfaceFromControlUi(
       parseNativeWorkbenchNavigationRequest(payload),
     )
   } catch (error) {
@@ -14312,6 +15207,13 @@ ipcMain.handle('desktop:migration:run', async (
       throw new Error('A gateway is still serving this profile; stop it and retry.')
     }
 
+    if (!await confirmStoppedGatewayProcessScopes()) {
+      restartAllowed = false
+      const message = 'Gateway process cleanup could not be confirmed before the transfer.'
+      transitionGatewayConnection({ owned: false, status: 'error', error: message })
+      throw new Error(message)
+    }
+
     // The intent is outside the target tree, so it survives target replacement.
     // Startup can use it plus a new target-side receipt to finish credential
     // adoption even if Electron dies after the Python commit but before this IPC
@@ -14947,6 +15849,10 @@ function currentBootResumeAuthority(): BootResumeAuthority | null {
 
 function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
   return !isQuitting
+    && !updateApplying
+    && !desktopWriters.closed
+    && appExitPhase === 'running'
+    && !gatewayStoppingProcesses.has(authority.child)
     && gatewayProcess === authority.child
     && !hasGatewayProcessExited(authority.child)
     && gatewayState.owned
@@ -14956,6 +15862,9 @@ function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
 }
 
 async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?: BootErrorCode }> {
+  // The explicit Resume flow owns readiness publication from this point; an
+  // in-flight background probe may finish, but can no longer adopt its result.
+  gatewayLateReadyObservation = null
   invalidateSecretStorageBackendCache()
   const pendingStart = gatewayStartPromise
   const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
@@ -15024,6 +15933,7 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?
       error: message,
     })
     sendBootError(message)
+    if (error instanceof GatewayReadinessTimeoutError) observeLateOwnedGatewayReadiness()
     return { ok: false, error: message }
   }
 }
@@ -15049,6 +15959,8 @@ ipcMain.handle('desktop:boot:retry', async () => {
     return { ok: true }
   }
 
+  const restartStartedAt = Date.now()
+  desktopStartupLog('runtime_restart_started')
   // Otherwise force a real runtime restart. "Restart runtime" must relaunch the
   // child even when the current gateway is healthy, so join every lifecycle-
   // owned child before openOrResumeDesktopApp may respawn. This includes a
@@ -15056,6 +15968,10 @@ ipcMain.handle('desktop:boot:retry', async () => {
   // closed: spawning while any previous writer is live would race the profile
   // lock and recreate the startup failure this recovery action is meant to fix.
   const exited = await stopAndJoinAllLifecycleOwnedGateways()
+  desktopStartupLog('runtime_restart_child_exited', {
+    exited,
+    operationElapsedMs: Math.max(0, Date.now() - restartStartedAt),
+  })
   if (!exited) {
     const message = desktopGatewayStillRunningMessage()
     gatewayState.status = 'error'
@@ -15070,6 +15986,9 @@ ipcMain.handle('desktop:boot:retry', async () => {
   clearReusableGatewayState()
   bootError = null
 
+  desktopStartupLog('runtime_restart_starting', {
+    operationElapsedMs: Math.max(0, Date.now() - restartStartedAt),
+  })
   void openOrResumeDesktopApp()
   return { ok: true }
 })
@@ -15164,11 +16083,449 @@ ipcMain.handle('desktop:onboarding:cancel', (event) => {
 let quitGatewayDrainPromise: Promise<boolean> | null = null
 let quitDeferredForDesktopWriters = false
 let quitWriterAdmission: symbol | null = null
+const quitUnconfirmedProcessTrees = new Set<ChildProcessWithoutNullStreams>()
 
-async function drainOwnedGatewayForQuit(
+function ownedGatewayRecord(child: ChildProcessWithoutNullStreams): DesktopGatewayOwnershipRecord | null {
+  const context = gatewayProcessOwnershipContexts.get(child)
+  if (!context) return null
+  const loaded = loadDesktopGatewayOwnershipRecord(context.ownershipDir)
+  return loaded.status === 'valid' && desktopGatewayOwnershipMatchesLaunch(loaded.record, {
+    instanceNonce: context.nonce,
+    profileFingerprint: context.profileFingerprint,
+    port: context.port,
+  }) ? loaded.record : null
+}
+
+async function showDesktopQuitConfirmation(options: {
+  parent?: BrowserWindow
+  title: string
+  message: string
+  detail: string
+  keepRunning: string
+  confirm: string
+  background?: string
+  remember?: string
+}): Promise<DesktopQuitDialogDecision> {
+  const parent = options.parent && !options.parent.isDestroyed() ? options.parent : undefined
+  const contentWidth = options.background ? 520 : 480
+  const contentHeight = options.background ? (options.detail ? 288 : 256) : (options.detail ? 256 : 224)
+  const confirmationWindow = new BrowserWindow({
+    width: contentWidth,
+    height: contentHeight,
+    useContentSize: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    parent,
+    modal: Boolean(parent),
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  let resolve!: (decision: DesktopQuitDialogDecision) => void
+  const resultPromise = new Promise<DesktopQuitDialogDecision>(accept => { resolve = accept })
+  let settled = false
+  const settle = (decision: DesktopQuitDialogDecision): void => {
+    if (settled) return
+    settled = true
+    if (!confirmationWindow.isDestroyed()) confirmationWindow.close()
+    resolve(decision)
+  }
+  const responseListener = (event: Electron.IpcMainEvent, value: unknown): void => {
+    if (event.sender.id !== confirmationWindow.webContents.id) return
+    const response = parseDesktopQuitDialogResponse(value)
+    if (!response || (response === 'background' && !options.background)) return
+    const remember = Boolean(options.remember) && typeof value === 'object' && value !== null
+      && 'remember' in value && value.remember === true
+    settle({ response, remember })
+  }
+  ipcMain.on('desktop:quit-dialog-response', responseListener)
+  confirmationWindow.on('closed', () => {
+    ipcMain.removeListener('desktop:quit-dialog-response', responseListener)
+    settle({ response: 'cancel', remember: false })
+  })
+  confirmationWindow.webContents.on('will-navigate', event => event.preventDefault())
+  const positionWindow = (): void => {
+    if (parent && !parent.isDestroyed()) {
+      const owner = parent.getBounds()
+      const bounds = confirmationWindow.getBounds()
+      const area = screen.getDisplayMatching(owner).workArea
+      // Keep the decision visibly attached to its parent, including when the
+      // parent straddles displays or has been moved partly off screen.
+      const x = Math.round(owner.x + (owner.width - bounds.width) / 2)
+      const y = Math.round(owner.y + (owner.height - bounds.height) / 2)
+      confirmationWindow.setPosition(
+        Math.max(area.x, Math.min(x, area.x + Math.max(0, area.width - bounds.width))),
+        Math.max(area.y, Math.min(y, area.y + Math.max(0, area.height - bounds.height))),
+      )
+    } else confirmationWindow.center()
+  }
+  confirmationWindow.once('ready-to-show', () => {
+    if (!confirmationWindow.isDestroyed()) {
+      positionWindow()
+      confirmationWindow.show()
+      if (process.platform === 'darwin') {
+        // Attaching a frameless macOS sheet can change its content dimensions
+        // after construction. Restore the intended viewport after attachment
+        // so wrapped labels and the action row remain inside the visible card.
+        const [width, height] = confirmationWindow.getContentSize()
+        if (width !== contentWidth || height !== contentHeight) {
+          confirmationWindow.setContentSize(contentWidth, contentHeight)
+          positionWindow()
+        }
+      }
+      confirmationWindow.focus()
+    }
+  })
+  try {
+    const html = buildDesktopQuitDialogHtml({
+      lang: desktopLocale,
+      title: options.title,
+      message: options.message,
+      detail: options.detail,
+      keepRunning: options.keepRunning,
+      confirm: options.confirm,
+      background: options.background,
+      remember: options.remember,
+    })
+    await confirmationWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+  } catch (error) {
+    desktopLog('quit_confirmation_window_failed', { error: String(error) })
+    settle({ response: 'cancel', remember: false })
+  }
+  return await resultPromise
+}
+
+function holdQuitForTaskConfirmation(
+  event: Electron.Event,
+  closeWindow?: BrowserWindow,
+): boolean {
+  if (quitConfirmed) return false
+  if (quitConfirmationPromise) {
+    event.preventDefault()
+    // A tray/menu Quit queued during the close choice must not inherit a
+    // background decision while its preference write is still pending.
+    if (!closeWindow) quitConfirmationWantsExit = true
+    return true
+  }
+  const children = [...new Set([
+    ...liveLifecycleOwnedGatewayProcesses(), ...gatewayProcessCleanupContexts.keys(),
+  ])]
+  const hasPages = nativeWorkbenchSurfaces.hasBrowserTabs()
+  if (!closeWindow && (!children.length || quitFromSignal) && !hasPages
+    && desktopWriters.activeCount === 0) return false
+  event.preventDefault()
+  quitConfirmationWantsExit = !closeWindow
+  let retryQuit = false
+  let confirmationWriterAdmission: symbol | null = null
+  let waitingForWriters = false
+  const abandonQuit = (): void => {
+    if (confirmationWriterAdmission && quitWriterAdmission === confirmationWriterAdmission) {
+      const otherOwner = desktopWriters.hasOtherOwner(confirmationWriterAdmission)
+      desktopWriters.reopen(confirmationWriterAdmission)
+      quitWriterAdmission = null
+      if (waitingForWriters && !otherOwner && !isQuitting && systemSessionEnding
+        && !updateApplying && windowsSessionEndPreviousPhase === 'deferred') {
+        // A canceled Windows shutdown must not restore a quit attempt whose
+        // writer token and pending continuation have already been released.
+        windowsSessionEndPreviousPhase = 'running'
+      }
+      if (waitingForWriters && !otherOwner && !isQuitting && !systemSessionEnding
+        && !updateApplying && appExitPhase === 'deferred') {
+        setAppExitPhase('running', 'quit page snapshot changed while waiting for writers')
+      }
+    }
+    if (!isQuitting && !systemSessionEnding && !updateApplying && appExitPhase === 'running') {
+      quitConfirmed = false
+      quitFromSignal = false
+    }
+  }
+  const checkActivity = async (): Promise<DesktopQuitActivity> => {
+    // Signals retain the legacy task drain policy, but still need page consent.
+    if (quitFromSignal) return 'idle'
+    const activity = await Promise.all([...new Set([
+      ...liveLifecycleOwnedGatewayProcesses(), ...gatewayProcessCleanupContexts.keys(),
+    ])].map(async child => {
+      const exited = hasGatewayProcessExited(child)
+      if (exited) {
+        // Join verification already owned by a successful restart.
+        await gatewayProcessCleanupOperations.get(child)?.promise
+      }
+      const retainedScope = gatewayProcessCleanupContexts.has(child)
+      const record = exited ? null : ownedGatewayRecord(child)
+      const result = exited
+        ? retainedScope ? { kind: 'unreachable' as const } : { kind: 'ok' as const, activeCount: 0 }
+        : record ? await readVerifiedDesktopGatewayActivity(record, { timeoutMs: 1_000 })
+          : { kind: 'unreachable' as const }
+      desktopLog('quit_gateway_activity_checked', {
+        pid: Number.isSafeInteger(child.pid) ? child.pid : null,
+        kind: result.kind,
+        activeCount: result.kind === 'ok' ? result.activeCount : null,
+        ownershipMatched: exited ? null : record !== null,
+        retainedScope,
+        exited,
+        gatewayStatus: gatewayState.status,
+      })
+      return result
+    }))
+    if (activity.some(result => result.kind === 'ok' && result.activeCount > 0)) return 'active'
+    return activity.every(result => result.kind === 'ok') ? 'idle' : 'unknown'
+  }
+  quitConfirmationPromise = (async () => {
+    let closeDecision: DesktopQuitDialogDecision | null = null
+    // Capture exact page/document identities before asking about task and page
+    // interruption together. Cancel closes nothing; accepted pages use the same
+    // snapshot and unload grants without a second bulk-close prompt.
+    const accepted = await nativeWorkbenchSurfaces.closeBrowserTabs({
+      confirm: async ({ tabCount }) => {
+        if (systemSessionEnding || updateApplying || isQuitting) return false
+        const decision = await desktopQuitConfirmation.request({
+          check: checkActivity,
+          confirmWhenIdle: Boolean(closeWindow) || tabCount > 0,
+          confirm: async state => {
+            if (systemSessionEnding || updateApplying) return false
+            desktopLog('quit_confirmation_required', { activity: state })
+            const window = closeWindow ?? currentMainWindow() ?? currentOnboardingWindow()
+            if (window) {
+              if (window.isMinimized()) window.restore()
+              window.show()
+            }
+            if (closeWindow) {
+              closeDecision = await promptForMainWindowClose(closeWindow, state, tabCount)
+              return closeDecision.response === 'confirm'
+            }
+            const pagesDetail = tabCount > 0
+              ? desktopT('quit.pagesDetail').replace('{count}', String(tabCount)) : ''
+            const result = await showDesktopQuitConfirmation({
+              parent: window ?? undefined,
+              title: desktopT('quit.title'),
+              message: state === 'idle' ? pagesDetail : desktopT(state === 'active' ? 'quit.active' : 'quit.unknown'),
+              detail: state === 'idle' ? '' : pagesDetail,
+              keepRunning: desktopT('quit.keepRunning'),
+              confirm: desktopT('quit.confirm'),
+            })
+            return result.response === 'confirm'
+          },
+        })
+        if (systemSessionEnding || updateApplying || isQuitting || closeWindow?.isDestroyed()) return false
+        // Remembering a close choice is an ordinary protected preference write.
+        // Complete it before closing writer admission or applying the choice.
+        const chosen = closeDecision as DesktopQuitDialogDecision | null
+        if (chosen && chosen.response !== 'cancel' && chosen.remember) {
+          await saveDesktopPreferences({
+            mainWindowCloseBehavior: chosen.response === 'background' ? 'background' : 'quit',
+          }).catch(error => {
+            desktopLog('desktop_preferences_save_failed', {
+              error: error instanceof Error ? error.message : String(error),
+            })
+          })
+        }
+        if (systemSessionEnding || updateApplying || isQuitting || closeWindow?.isDestroyed()) return false
+        if (chosen?.response === 'background' && closeWindow) {
+          if (quitConfirmationWantsExit) retryQuit = true
+          else if (appExitPhase === 'running') hideMainWindow(closeWindow)
+          return false
+        }
+        if (!decision || systemSessionEnding || updateApplying || isQuitting) return false
+        // Keep the original page snapshot through protected writes as well.
+        // Once this wait finishes, no new writer can reopen a gap between page
+        // validation/close and the committed Gateway drain.
+        if (!quitWriterAdmission) {
+          quitWriterAdmission = desktopWriters.close('quit')
+          confirmationWriterAdmission = quitWriterAdmission
+        }
+        if (desktopWriters.activeCount > 0) {
+          waitingForWriters = true
+          setAppExitPhase('deferred', 'waiting for desktop writers')
+          desktopLog('quit_deferred_for_profile_writer', { activeWriters: desktopWriters.activeCount })
+          await waitForDesktopWriterOperations()
+        }
+        return !systemSessionEnding && !updateApplying && !isQuitting
+      },
+    })
+    if (!accepted) {
+      abandonQuit()
+      desktopLog('quit_cancelled_by_user')
+      return
+    }
+    if (systemSessionEnding || updateApplying) {
+      abandonQuit()
+      return
+    }
+    quitConfirmed = true
+    desktopLog('quit_confirmed')
+    app.quit()
+  })().catch(error => {
+    abandonQuit()
+    desktopLog('quit_confirmation_failed', { error: String(error) })
+  }).finally(() => {
+    quitConfirmationPromise = null
+    quitConfirmationWantsExit = false
+    if (retryQuit) app.quit()
+  })
+  return true
+}
+
+async function confirmOwnedGatewayProcessCleanup(
+  child: ChildProcessWithoutNullStreams,
+  budget: DesktopQuitBudget,
+  reportFailure = true,
+): Promise<boolean> {
+  if (process.platform === 'win32') return true
+  if (gatewayProcessCleanupConfirmed.has(child)) return true
+  const launch = gatewayProcessCleanupContexts.get(child)
+  if (reportFailure) quitUnconfirmedProcessTrees.add(child)
+  if (!launch) return false
+  let operation = gatewayProcessCleanupOperations.get(child)
+  if (!operation) {
+    const promise = cleanupDesktopProcessTrees({ launch, budget }).then(complete => {
+      if (complete) {
+        gatewayProcessCleanupConfirmed.add(child)
+        gatewayProcessCleanupContexts.delete(child)
+        gatewayProcessCleanupRetirements.delete(child)
+        quitUnconfirmedProcessTrees.delete(child)
+      }
+      desktopLog('quit_gateway_process_cleanup', { pid: child.pid, complete })
+      return complete
+    }).finally(() => { gatewayProcessCleanupOperations.delete(child) })
+    operation = { budget, promise }
+    gatewayProcessCleanupOperations.set(child, operation)
+  }
+  const result = await budget.termination(operation.promise)
+  if (!result.completed && operation.budget !== budget) operation.budget.tighten(0, 0)
+  return result.completed && result.value
+}
+
+function retireStoppedGatewayProcessCleanup(child: ChildProcessWithoutNullStreams): void {
+  if (process.platform === 'win32' || !gatewayProcessCleanupContexts.has(child)
+    || gatewayProcessCleanupRetirements.has(child)) return
+  const budget = new DesktopQuitBudget(0, DESKTOP_QUIT_TERMINATION_MS)
+  const retirement = confirmOwnedGatewayProcessCleanup(child, budget, false).catch(() => {
+    desktopLog('stopped_gateway_process_cleanup_failed', { pid: child.pid })
+    return false
+  }).finally(() => budget.dispose())
+  gatewayProcessCleanupRetirements.set(child, retirement)
+}
+
+async function confirmStoppedGatewayProcessScopes(): Promise<boolean> {
+  const children = [...gatewayProcessCleanupContexts.keys()]
+  if (children.some(child => !hasGatewayProcessExited(child))) return false
+  // Import already owns writer admission and has explicitly stopped its root.
+  // Verify every retained launch before replacing the state backing its proof.
+  const budget = new DesktopQuitBudget(0, DESKTOP_QUIT_TERMINATION_MS)
+  try {
+    const results = await Promise.all(children.map(child =>
+      confirmOwnedGatewayProcessCleanup(child, budget, false)))
+    return results.every(Boolean) && await joinGatewayProcessRetirements()
+  } catch {
+    return false
+  } finally {
+    budget.dispose()
+  }
+}
+
+async function terminateOwnedGatewayForQuit(
+  child: ChildProcessWithoutNullStreams,
+  budget: DesktopQuitBudget,
+): Promise<boolean> {
+  if (hasGatewayProcessExited(child)) return await confirmOwnedGatewayProcessCleanup(child, budget)
+  if (budget.remainingTotalMs <= 0) return false
+  gatewayHardTerminatedProcesses.add(child)
+  let treeStopped = true
+  if (process.platform === 'win32' && child.pid) {
+    quitUnconfirmedProcessTrees.add(child)
+    let termination = gatewayProcessTreeTerminations.get(child)
+    if (!termination) {
+      termination = terminateWindowsProcessTree({
+        pid: child.pid,
+        timeoutMs: budget.remainingTotalMs,
+        // Keep the root available for a retry if the tree helper fails. Killing
+        // only that root would discard our ability to identify its descendants.
+        fallback: () => {},
+        onFailure: failure => desktopLog('gateway_process_tree_termination_failed', { ...failure }),
+      })
+      gatewayProcessTreeTerminations.set(child, termination)
+      void termination.finally(() => {
+        if (gatewayProcessTreeTerminations.get(child) === termination) {
+          gatewayProcessTreeTerminations.delete(child)
+        }
+      })
+    }
+    treeStopped = await termination
+    if (treeStopped) quitUnconfirmedProcessTrees.delete(child)
+    else quitUnconfirmedProcessTrees.add(child)
+  } else {
+    // Fence new launches and stop the exact retained task owners before the
+    // root disappears; a blocked Gateway event loop cannot perform this step.
+    treeStopped = await confirmOwnedGatewayProcessCleanup(child, budget)
+    if (!treeStopped || budget.remainingTotalMs <= 0) return false
+    if (!hasGatewayProcessExited(child)) terminateGatewayProcess(child, 'SIGKILL')
+  }
+  const exited = await waitForGatewayProcessExit(child, budget.remainingTotalMs)
+  desktopLog('quit_gateway_termination', { pid: child.pid, exited, treeStopped })
+  return exited && treeStopped
+}
+
+async function quitOwnedGateway(
+  child: ChildProcessWithoutNullStreams,
+  budget: DesktopQuitBudget,
+): Promise<boolean> {
+  let legacyDrain = false
+  const result = await quitGatewayWithinBudget({
+    budget,
+    hasExited: () => hasGatewayProcessExited(child),
+    requestQuit: async remainingMs => {
+      const record = ownedGatewayRecord(child)
+      const result = record
+        ? await requestVerifiedDesktopGatewayQuit(record, { remainingMs })
+        : { kind: 'unreachable' as const }
+      desktopLog('quit_gateway_shutdown_requested', {
+        pid: child.pid,
+        ...result,
+        accepted: result.kind === 'quit_accepted',
+        alreadyStopping: false,
+      })
+      return result
+    },
+    legacyDrain: () => drainOwnedGatewayForLegacyQuit(child, '', true, true),
+    waitForExit: timeoutMs => waitForGatewayProcessExit(child, timeoutMs),
+    terminate: () => terminateOwnedGatewayForQuit(child, budget),
+    confirmExit: () => confirmOwnedGatewayProcessCleanup(child, budget),
+    onLegacyDrain: () => {
+      legacyDrain = true
+      setQuitStatus('quit.legacy')
+    },
+    onTerminating: () => setAppExitPhase('terminating', 'quit cleanup deadline reached'),
+  })
+  if (legacyDrain && result) {
+    // Older runtimes have neither the scoped helper nor its spawn fence. Keep
+    // their existing full drain instead of sending a new internal protocol.
+    gatewayProcessCleanupContexts.delete(child)
+  }
+  desktopLog('quit_gateway_exit', {
+    pid: child.pid,
+    exited: result,
+    elapsedMs: Math.round(budget.elapsedMs),
+    hardTerminated: gatewayHardTerminatedProcesses.has(child),
+  })
+  return result
+}
+
+async function drainOwnedGatewayForLegacyQuit(
   child: ChildProcessWithoutNullStreams,
   url: string,
   requestShutdown: boolean,
+  requireAccepted = false,
 ): Promise<boolean> {
   if (hasGatewayProcessExited(child)) {
     desktopLog('quit_gateway_exit', {
@@ -15178,6 +16535,7 @@ async function drainOwnedGatewayForQuit(
     return true
   }
   const accepted = requestShutdown ? await requestOwnedGatewayShutdown(child, url) : null
+  if (requireAccepted && accepted !== true) return false
   desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: !requestShutdown })
   let hardTerminated = gatewayHardTerminatedProcesses.has(child)
   let exited = false
@@ -15225,8 +16583,31 @@ async function drainOwnedGatewayForQuit(
   return exited || hasGatewayProcessExited(child)
 }
 
+function showDesktopQuitFailure(): void {
+  // A retained launch scope is retryable after root exit. Without that scope,
+  // a dead root PID cannot safely identify descendants for another tree kill.
+  const needsManualRecovery = [...quitUnconfirmedProcessTrees].some(child =>
+    hasGatewayProcessExited(child) && !gatewayProcessCleanupContexts.has(child))
+  const titleKey = needsManualRecovery ? 'quit.manualRecovery' : 'quit.failed'
+  isQuitting = true
+  setAppExitPhase('failed', needsManualRecovery
+    ? 'Gateway exited without confirmed process-tree cleanup'
+    : 'Gateway quit did not complete safely')
+  if (needsManualRecovery) setQuitStatus(titleKey)
+  gatewayState.status = 'error'
+  gatewayState.error = desktopT(titleKey)
+  publishGatewayConnection()
+  desktopLog('quit_gateway_still_running', {
+    pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
+    needsManualRecovery,
+  })
+  dialog.showErrorBox(
+    desktopT(titleKey),
+    desktopT(needsManualRecovery ? 'quit.manualRecoveryDetail' : 'quit.failedDetail'),
+  )
+}
+
 app.on('before-quit', (event) => {
-  desktopUpdateCheckScheduler.stop()
   // Windows session shutdown cannot wait on our normal asynchronous quit
   // drain. Let the OS-owned close proceed and synchronously signal the current
   // child so the window can never be converted back into background mode.
@@ -15265,9 +16646,10 @@ app.on('before-quit', (event) => {
   }
   if (quitGatewayDrainPromise) {
     event.preventDefault()
-    setAppExitPhase('draining', 'Gateway quit drain already in progress')
     return
   }
+  if (holdQuitForTaskConfirmation(event)) return
+  desktopUpdateCheckScheduler.stop()
   if (desktopWriters.activeCount > 0 || quitDeferredForDesktopWriters) {
     event.preventDefault()
     setAppExitPhase('deferred', 'waiting for desktop writers')
@@ -15291,6 +16673,7 @@ app.on('before-quit', (event) => {
     gatewayDrainInFlight: quitGatewayDrainPromise !== null,
   })
   isQuitting = true
+  cancelGatewayUnexpectedExitRestart('Desktop quit confirmed')
   // Defer the normal quit on every platform until every lifecycle-owned child
   // has exited. This includes a child already draining for restart, recovery,
   // cleanup, or update after stopGateway cleared the current process slot.
@@ -15298,28 +16681,40 @@ app.on('before-quit', (event) => {
     && !hasGatewayProcessExited(gatewayProcess)
     ? gatewayProcess
     : null
-  const children = liveLifecycleOwnedGatewayProcesses()
-  if (children.length > 0) {
+  const children = [...new Set([
+    ...liveLifecycleOwnedGatewayProcesses(),
+    ...(!quitFromSignal ? gatewayProcessCleanupContexts.keys() : []),
+  ])]
+  if (children.length > 0 || !quitFromSignal || quitUnconfirmedProcessTrees.size > 0) {
     event.preventDefault()
     setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
-    // Fence new preview work and join creates already in flight before making
-    // the Gateway unavailable. Native surface teardown stays best-effort: its
-    // candidate cleanup can depend on the Gateway and must not block shutdown.
-    const previewCleanup = artifactPreviewLeaseBroker.revokeAll()
-    void nativeWorkbenchSurfaces.destroyAll()
-    const drain = previewCleanup
-      .then(() => Promise.all(children.map((child) => drainOwnedGatewayForQuit(
+    const budget = new DesktopQuitBudget()
+    const previewCleanup = artifactPreviewLeaseBroker.shutdown({ signal: budget.signal })
+    const surfaceCleanup = nativeWorkbenchSurfaces.destroyAll()
+    // Cancellation starts alongside local cleanup. No preview or network wait
+    // receives a fresh timeout before the Gateway learns about the user's quit.
+    const childCleanup = Promise.all(children.map(child => quitFromSignal
+      ? drainOwnedGatewayForLegacyQuit(
         child,
         currentChild === child ? gatewayState.url || '' : '',
         currentChild === child,
-      ))))
-      .then((results) => results.every(Boolean))
+      )
+      : quitOwnedGateway(child, budget)))
+    const drain = Promise.all([
+      childCleanup,
+      budget.cleanup(Promise.allSettled([previewCleanup, surfaceCleanup])),
+    ])
+      .then(([results]) => results.every(Boolean)
+        && liveLifecycleOwnedGatewayProcesses().length === 0
+        && (quitFromSignal || gatewayProcessCleanupContexts.size === 0)
+        && quitUnconfirmedProcessTrees.size === 0)
       .catch((error) => {
         desktopLog('quit_gateway_drain_failed', {
           error: error instanceof Error ? error.message : String(error),
         })
         return false
       })
+      .finally(() => budget.dispose())
     quitGatewayDrainPromise = drain
     void drain.then((exited) => {
       if (exited) {
@@ -15330,23 +16725,10 @@ app.on('before-quit', (event) => {
         app.exit(0)
         return
       }
-      // Fail closed: keep Electron alive while a child we own is still live.
-      // A later Quit retries the same exact handles; it never guesses via a PID
-      // file, occupied port, or health response.
+      // Fail closed while owned processes remain live or their tree cleanup
+      // cannot be confirmed. Never guess ownership from a PID, port, or health.
       quitGatewayDrainPromise = null
-      isQuitting = false
-      setAppExitPhase('running', 'Gateway quit drain failed safely')
-      if (quitWriterAdmission) {
-        desktopWriters.reopen(quitWriterAdmission)
-        quitWriterAdmission = null
-      }
-      desktopLog('quit_gateway_still_running', {
-        pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
-      })
-      dialog.showErrorBox(
-        'OpenSquilla could not quit safely',
-        'The local Gateway is still shutting down. OpenSquilla stayed open to avoid leaving a background process; try Quit again.',
-      )
+      showDesktopQuitFailure()
     })
     return
   }
@@ -15360,9 +16742,10 @@ app.on('before-quit', (event) => {
 })
 
 function shutdownFromSignal(): void {
-  isQuitting = true
-  // before-quit owns the child handle until its single-flight drain finishes.
-  // Clearing it here would recreate the orphaned-gateway race on SIGINT/SIGTERM.
+  // before-quit owns the exit state and child handle. Its browser close decision
+  // can still be canceled, so a signal requests quit without committing shutdown.
+  // Once cleanup begins, repeated signals retain that operation's quit policy.
+  if (!quitGatewayDrainPromise) quitFromSignal = true
   app.quit()
 }
 
@@ -15398,37 +16781,54 @@ const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.
 // held. Without a retry the new process silently quits and no window appears
 // (issue #446). Retry synchronously for a short window, then — if still
 // unavailable — surface an explicit error instead of exiting silently.
+let existingDesktopActivationAccepted = false
 function acquireSingleInstanceLockWithRetry(): boolean {
   const deadline = Date.now() + 5_000
   // Atomics.wait blocks this thread without an event loop (app.whenReady has not
-  // fired) and, unlike a Date.now() spin, does not peg a CPU core. Larger sleep
-  // slices also cut the retry count — each failed requestSingleInstanceLock
-  // notifies the running instance (firing its second-instance handler).
+  // fired) without pegging a CPU core. Lock retries remain 400 ms apart because
+  // every failed request notifies the primary; receipt polls do not notify it.
   const sleepSignal = new Int32Array(new SharedArrayBuffer(4))
+  const activationRequest = initialDesktopDeepLinkArguments.length === 0
+    ? createDesktopActivationRequest() : null
+  const userData = app.getPath('userData')
   let attempt = 0
-  for (;;) {
-    attempt += 1
-    if (app.requestSingleInstanceLock()) {
-      desktopLog('single_instance_lock_acquired', {
-        elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
-        attempt,
-      })
-      return true
+  const acceptActivation = (): boolean => {
+    if (!activationRequest || !hasDesktopActivationAcknowledgement(userData, activationRequest)) return false
+    existingDesktopActivationAccepted = true
+    desktopLog('single_instance_activation_accepted', { attempt })
+    return true
+  }
+  try {
+    for (;;) {
+      if (attempt > 0 && acceptActivation()) return false
+      attempt += 1
+      if (app.requestSingleInstanceLock(activationRequest ? { desktopActivation: activationRequest } : undefined)) {
+        desktopLog('single_instance_lock_acquired', {
+          elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+          attempt,
+        })
+        return true
+      }
+      // Protocol launches already hand their target to the existing instance.
+      // Keep their one-delivery behavior, including compatibility with old apps.
+      if (initialDesktopDeepLinkArguments.length > 0) {
+        desktopLog('single_instance_deep_link_forwarded', { attempt })
+        return false
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        desktopLog('single_instance_lock_unavailable', { attempt })
+        return false
+      }
+      const nextAttemptAt = Date.now() + Math.min(400, remaining)
+      do {
+        if (acceptActivation()) return false
+        // A healthy primary normally acknowledges before a second activation.
+        Atomics.wait(sleepSignal, 0, 0, Math.min(50, Math.max(0, nextAttemptAt - Date.now())))
+      } while (Date.now() < nextAttemptAt)
     }
-    // A Windows/Linux protocol launch targets the current instance and does not need
-    // the normal close/relaunch race retry. The failed lock request has already
-    // delivered its command line through second-instance; exit the forwarding
-    // process immediately instead of sending the same deep link for five seconds.
-    if (initialDesktopDeepLinkArguments.length > 0) {
-      desktopLog('single_instance_deep_link_forwarded', { attempt })
-      return false
-    }
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) {
-      desktopLog('single_instance_lock_unavailable', { attempt })
-      return false
-    }
-    Atomics.wait(sleepSignal, 0, 0, Math.min(400, remaining))
+  } finally {
+    if (activationRequest) disposeDesktopActivationRequest(userData, activationRequest)
   }
 }
 
@@ -15449,10 +16849,10 @@ if (!gotSingleInstanceLock) {
   // to surface its window (the second-instance handler calls
   // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
   // silent no-op, then quit.
-  desktopLog('launch_aborted_lock_held', {
+  desktopLog(existingDesktopActivationAccepted ? 'launch_forwarded_to_existing_instance' : 'launch_aborted_lock_held', {
     deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
   })
-  if (initialDesktopDeepLinkArguments.length === 0) {
+  if (initialDesktopDeepLinkArguments.length === 0 && !existingDesktopActivationAccepted) {
     try {
       // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
       // to the persisted onboarding locale (a plain file read) for this dialog.
@@ -15491,14 +16891,22 @@ if (!gotSingleInstanceLock) {
   })
   handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
 
-  app.on('second-instance', (_event, commandLine) => {
+  app.once('will-quit', clearDesktopActivationAcknowledgements)
+  app.on('second-instance', (_event, commandLine, _workingDirectory, additionalData) => {
     const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
     desktopLog('second_instance', { hadDeepLink })
     if (hadDeepLink) return
     revealDesktopApp()
+    if (!canRevealDesktopApp(appExitPhase) || isQuitting) return
+    const revealed = currentOnboardingWindow() ?? currentMainWindow()
+    if (revealed && !revealed.isDestroyed() && revealed.isVisible()
+      && !revealed.isMinimized() && revealed.isFocused()) {
+      acknowledgeDesktopActivation(app.getPath('userData'), additionalData)
+    }
   })
 
   void app.whenReady().then(async () => {
+    desktopStartupLog('app_ready')
     // An OS wake is an observation, not permission to restart or reload.
     const notifySystemResume = () => {
       for (const window of BrowserWindow.getAllWindows()) {

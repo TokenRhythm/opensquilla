@@ -33,6 +33,12 @@ if (!Number.isInteger(outageMs) || outageMs < 5_000 || outageMs > 600_000) {
   throw new Error('outage-ms must be an integer between 5000 and 600000')
 }
 
+async function composerValue(locator) {
+  return await locator.evaluate((element) => {
+    const value = element?.value
+    return typeof value === 'string' ? value : element?.textContent ?? ''
+  })
+}
 async function waitFor(check, label, timeoutMs = 60_000) {
   const startedAt = Date.now()
   let lastError
@@ -72,6 +78,7 @@ const userDataDir = join(isolationRoot, 'chromium-user-data')
 const isolatedHome = join(isolationRoot, 'home')
 const isolatedRoaming = join(isolationRoot, 'AppData', 'Roaming')
 const isolatedLocal = join(isolationRoot, 'AppData', 'Local')
+const isolatedTemp = join(isolatedLocal, 'Temp')
 let desktopApp
 let flowSucceeded = false
 let outage = false
@@ -93,6 +100,7 @@ const routedServers = new WeakMap()
 const blackholedClients = new Set()
 let wakeBlackholeEvidence = null
 let wakeBlackholeFailure = null
+let backgroundPrecondition = null
 
 async function startSyntheticProvider() {
   let chatRequests = 0
@@ -273,6 +281,7 @@ try {
   await mkdir(isolatedHome, { recursive: true })
   await mkdir(isolatedRoaming, { recursive: true })
   await mkdir(isolatedLocal, { recursive: true })
+  await mkdir(isolatedTemp, { recursive: true })
   if (idleSend) syntheticProvider = await startSyntheticProvider()
 
   // Use a synthetic keyless profile so the lifecycle test reaches the Control
@@ -311,11 +320,18 @@ try {
       USERPROFILE: isolatedHome,
       APPDATA: isolatedRoaming,
       LOCALAPPDATA: isolatedLocal,
+      TEMP: isolatedTemp,
+      TMP: isolatedTemp,
+      TMPDIR: isolatedTemp,
+      OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
+      OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       OPENSQUILLA_AUTH_MODE: 'token',
       OPENSQUILLA_AUTH_TOKEN: 'synthetic-window-flow-operator-token',
+      // Keep the exactly-once user-send assertion independent of title requests.
+      OPENSQUILLA_NAMING_ENABLED: 'false',
       OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED: flowControl ? 'true' : 'false',
       ...(idleSend ? {
         // Match the synthetic first-send gate's model budget so bundled tool
@@ -442,7 +458,7 @@ try {
     'preload system-resume bridge')
   await delay(6_000)
   assert.equal(page.url(), resumeUrl, 'resume must not navigate or reload')
-  assert.equal(await composer.inputValue(), draft, 'resume must preserve the unsent draft')
+  assert.equal(await composerValue(composer), draft, 'resume must preserve the unsent draft')
   continuityDiagnostics = await readContinuityObservation(page, desktopApp)
   assert.equal(continuityDiagnostics.renderer?.state.sameComposer, true, 'resume must preserve composer identity')
   assert.equal(continuityDiagnostics.renderer?.state.focusedComposer, true, 'resume must preserve composer focus')
@@ -459,20 +475,27 @@ try {
     for (const client of routedClients) blackholedClients.add(client)
     const wakeStarted = Date.now()
     await page.evaluate(() => localStorage.removeItem('opensquilla.chat.sessionNavigationDiag'))
-    await desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') })
+    await desktopApp.evaluate(({ powerMonitor }) => {
+      powerMonitor.emit('resume')
+      // A healthy replacement can recover before the periodic signal below.
+      // Inject the duplicate while the first incident is still being probed.
+      powerMonitor.emit('resume')
+    })
     const duplicateWake = setInterval(() => {
       void desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') }).catch(() => {})
     }, 3_000)
     try {
+      // Diagnostics are stored newest-first; correlate the first incident in
+      // chronological order even if another native wake arrives after recovery.
       const readDiagnostics = () => page.evaluate(() => JSON.parse(
         localStorage.getItem('opensquilla.chat.sessionNavigationDiag') || '[]',
-      ).filter(entry => entry.source === 'rpc.transport'))
+      ).filter(entry => entry.source === 'rpc.transport').reverse())
       await waitFor(async () => (await readDiagnostics()).some(entry => entry.phase === 'probe_timeout'),
         'wake suspect diagnostic', 20_000)
       await waitFor(async () => await page.locator('[data-testid="connection-status"].connecting, [data-testid="chat-system-status-trigger"].connecting').count() > 0,
         'native suspect UI projection', 3_000)
       const suspectObservedMs = Date.now() - wakeStarted
-      assert.equal(await composer.inputValue(), draft, 'suspect must preserve draft')
+      assert.equal(await composerValue(composer), draft, 'suspect must preserve draft')
       await waitFor(async () => acceptedSockets > acceptedBefore
         && (await readDiagnostics()).some(entry => entry.phase === 'first_successful_rpc'),
       'wake replacement first successful RPC', 15_000)
@@ -500,7 +523,7 @@ try {
       }
       assert.ok(Date.now() - wakeStarted < 25_000, 'wake recovery should fit the candidate budget plus handshake')
       assert.equal(page.url(), resumeUrl, 'wake recovery must not reload renderer')
-      assert.equal(await composer.inputValue(), draft)
+      assert.equal(await composerValue(composer), draft)
       assert.equal(await page.evaluate(() => window.__stabilityComposer === document.querySelector('.chat-textarea')), true)
       wakeBlackholeEvidence = {
         topology: 'loopback', faultLayer: 'application-frame-route', physicalSleep: false,
@@ -536,7 +559,7 @@ try {
       await routedServers.get(client)?.close({ code: 1013, reason: 'Isolated network interruption' })
     }
     await delay(outageMs)
-    assert.equal(await composer.inputValue(), draft, 'offline editing must preserve the draft')
+    assert.equal(await composerValue(composer), draft, 'offline editing must preserve the draft')
     outage = false
     const recoverStarted = Date.now()
     await page.evaluate(() => window.dispatchEvent(new Event('online')))
@@ -544,7 +567,7 @@ try {
       'automatic warm recovery with no user action', 30_000)
     warmRecoveryMs = Date.now() - recoverStarted
     assert.equal(page.url(), resumeUrl)
-    assert.equal(await composer.inputValue(), draft)
+    assert.equal(await composerValue(composer), draft)
     continuityDiagnostics = await readContinuityObservation(page, desktopApp)
     assert.equal(continuityDiagnostics.renderer?.state.sameComposer, true, 'actual reconnect must preserve composer identity')
     assert.equal(continuityDiagnostics.renderer?.state.focusedComposer, true, 'actual reconnect must preserve composer focus')
@@ -581,6 +604,22 @@ try {
       window.__opensquillaWindowLifecycleMarker = value
     }, marker)
 
+    // This section measures close -> background -> activate, not whether the
+    // first launch automatically revealed its window. Establish a visible
+    // starting state once through the real activation handler, after the
+    // preceding resume/connection-fault assertions have already completed.
+    // Preserve the original state so an earlier unexpected hide remains
+    // visible in the evidence; activation must not recreate the renderer.
+    const activationStart = await mainWindowSnapshot(desktopApp)
+    assert.ok(activationStart && !activationStart.destroyed, 'background setup requires the existing main window')
+    backgroundPrecondition = {
+      activationRequests: 1,
+      visibleBeforeActivation: activationStart.visible,
+      minimizedBeforeActivation: activationStart.minimized,
+      focusedBeforeActivation: activationStart.focused,
+      boundary: 'Explicit activation establishes background-test setup; automatic launch visibility is not verified.',
+    }
+    await desktopApp.evaluate(({ app }) => { app.emit('activate') })
     const before = await waitFor(
       async () => {
         const snapshot = await mainWindowSnapshot(desktopApp)
@@ -588,6 +627,10 @@ try {
       },
       'visible main window',
     )
+    assert.equal(before.browserWindowId, activationStart.browserWindowId)
+    assert.equal(before.webContentsId, activationStart.webContentsId)
+    assert.equal(await page.evaluate(() => window.__opensquillaWindowLifecycleMarker), marker,
+      'background setup activation must preserve the existing renderer')
 
     await desktopApp.evaluate(({ BrowserWindow }) => {
       const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -630,7 +673,7 @@ try {
       console.log(JSON.stringify({ event: 'desktop_idle_send_phase', phase: 'hidden', backgroundMs }))
       await delay(backgroundMs)
       hiddenIdleMs = Date.now() - hiddenStarted
-      assert.equal(await composer.inputValue(), draft, 'hidden idle must retain the draft')
+      assert.equal(await composerValue(composer), draft, 'hidden idle must retain the draft')
       outage = false
     }
 
@@ -662,7 +705,7 @@ try {
       const sendButton = page.locator('.chat-send-btn.btn--primary')
       await waitFor(async () => !await sendButton.isDisabled(), 'send after native background return', 30_000)
       idleRecoveryMs = Date.now() - revealStarted
-      assert.equal(await composer.inputValue(), draft, 'native return must retain the unsent draft')
+      assert.equal(await composerValue(composer), draft, 'native return must retain the unsent draft')
       assert.equal(await page.evaluate(() => window.__stabilityComposer === document.querySelector('.chat-textarea')), true)
       await sendButton.click()
       await waitFor(() => idleSendReceipt, 'real Gateway background-return admission')
@@ -672,7 +715,7 @@ try {
       )?.includes('Synthetic background recovery complete.'), 'synthetic provider response')
       assert.equal(sentIdleMessages, 1, 'background return must submit the draft exactly once')
       assert.equal(syntheticProvider.chatRequests(), 1, 'accepted send must reach the local provider once')
-      assert.equal(await composer.inputValue(), '', 'accepted send must clear the draft')
+      assert.equal(await composerValue(composer), '', 'accepted send must clear the draft')
     }
 
     await desktopApp.evaluate(({ app, BrowserWindow }) => {
@@ -811,6 +854,7 @@ try {
       platform: runtimeIsolation.platform,
       behavior: preferences.mainWindowCloseBehavior,
       backgroundSupported,
+      backgroundPrecondition,
       browserWindowId: revealed.browserWindowId,
       webContentsId: revealed.webContentsId,
       rendererPreserved: true,
@@ -861,6 +905,7 @@ try {
     syntheticProviderRequests: syntheticProvider?.chatRequests() ?? null,
     continuityDiagnostics,
     wakeBlackholeFailure,
+    backgroundPrecondition,
     rpcTransport: await readRpcTransportObservation(continuityPage),
     windows,
     desktopLog,

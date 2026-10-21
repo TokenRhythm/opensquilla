@@ -37,7 +37,7 @@
     </header>
 
     <section
-      v-if="cronJobs.hasLoaded.value && !cronJobs.error.value"
+      v-if="cronJobs.hasLoaded.value"
       class="automation-launch"
       :class="{ 'automation-launch--compact': cronJobs.jobs.value.length > 0 }"
       :aria-labelledby="cronJobs.jobs.value.length > 0 ? 'automation-status-title' : 'automation-empty-title'"
@@ -125,18 +125,30 @@
         <Icon name="trash" :size="14" />{{ t('cronSkills.list.delete') }}
       </button>
     </div>
+    <p v-if="notificationTargetStatus" class="cron-refresh-status" role="status">{{ notificationTargetStatus }}</p>
+    <p v-if="cronJobs.error.value && cronJobs.hasLoaded.value" class="cron-refresh-status" role="status">
+      <span>{{ t('cronSkills.view.refreshFailed') }}</span>
+      <button type="button" class="btn btn--ghost" :disabled="cronJobs.loading.value" @click="cronJobs.loadData">{{ t('shared.errorState.retry') }}</button>
+    </p>
     <ErrorState
-      v-if="cronJobs.error.value"
+      v-if="cronJobs.error.value && !cronJobs.hasLoaded.value"
       :message="cronJobs.error.value"
       :on-retry="cronJobs.loadData"
     />
 
-    <div v-else-if="!cronJobs.hasLoaded.value || (cronJobs.loading.value && cronJobs.jobs.value.length === 0)" class="state">
+    <div v-if="cronJobs.waitingForCapacity.value" class="state" role="status">
+      <p>{{ t('cronSkills.jobs.waitingForCapacity') }}</p>
+      <button type="button" class="btn btn--ghost" :disabled="cronJobs.loading.value" @click="cronJobs.loadData">
+        {{ t('shared.errorState.retry') }}
+      </button>
+    </div>
+
+    <div v-else-if="!cronJobs.error.value && !cronJobs.hasLoaded.value" class="state">
       <LoadingSpinner />
     </div>
 
     <CronJobList
-      v-else-if="cronJobs.jobs.value.length > 0"
+      v-if="cronJobs.jobs.value.length > 0"
       :jobs="cronJobs.filteredSortedJobs.value"
       :total-jobs="cronJobs.jobs.value.length"
       :search-text="cronJobs.searchText.value"
@@ -167,7 +179,10 @@
       :job="selectedJob"
       :runs="cronRuns.runs.value"
       :loading="cronRuns.runsLoading.value"
+      :waiting="cronRuns.waitingForCapacity.value"
+      :error="cronRuns.error.value"
       @close="selectedId = null"
+      @retry="cronRuns.loadRuns(selectedId)"
       @open-chat="openRunChat"
     />
 
@@ -241,9 +256,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, nextTick, onActivated, ref } from 'vue'
+import { computed, inject, nextTick, onActivated, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { onBeforeRouteLeave, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -264,11 +279,13 @@ import { useDialogA11y } from '@/composables/useDialogA11y'
 import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 
 const router = useRouter()
+const route = useRoute()
 const { t } = useI18n()
 const { pushToast } = useToasts()
 const cronScheduler = inject(CRON_SCHEDULER_KEY)
 if (!cronScheduler) throw new Error('CronScheduler was not provided')
 const selectedId = ref<string | null>(null)
+const notificationTargetStatus = ref('')
 const deleteModalOpen = ref(false)
 const deleteTarget = ref<CronJob | null>(null)
 const templateGalleryOpen = ref(false)
@@ -281,9 +298,42 @@ const bulkMode = ref(false)
 const bulkWorking = ref(false)
 const selectedJobIds = ref<Set<string>>(new Set())
 
-const cronJobs = useCronJobs(cronScheduler)
+const cronJobs = useCronJobs(cronScheduler, {
+  openJob: async jobId => {
+    const failure = await router.push({ path: '/cron', query: jobId ? { job: jobId } : {} })
+    return !failure
+  },
+})
 const cronRuns = useCronRuns(cronScheduler, selectedId)
 const cronForm = useCronForm(cronScheduler, { afterSaved: cronJobs.loadData })
+
+// Notification navigation reuses the existing history rather than opening a
+// separate notification surface. Consume the query so closing/reopening the
+// same job still works, including when this view is kept alive.
+watch([
+  () => route.path,
+  () => route.query.job,
+  cronJobs.loading,
+  cronJobs.jobs,
+], async () => {
+  const jobId = typeof route.query.job === 'string' ? route.query.job.trim() : ''
+  if (route.path !== '/cron' || !jobId || cronJobs.loading.value || !cronJobs.hasLoaded.value || cronJobs.error.value) return
+  notificationTargetStatus.value = ''
+  cronJobs.searchText.value = ''
+  if (cronJobs.jobs.value.some(job => job.id === jobId)) {
+    selectedId.value = jobId
+    await nextTick()
+    document.querySelector('.cron-detail')?.scrollIntoView?.({ block: 'nearest' })
+  } else {
+    selectedId.value = null
+    notificationTargetStatus.value = t('cronSkills.jobs.toastTaskUnavailable')
+  }
+  if (route.path === '/cron' && route.query.job === jobId) {
+    const query = { ...route.query }
+    delete query.job
+    await router.replace({ path: '/cron', query })
+  }
+}, { immediate: true, flush: 'post' })
 
 onBeforeRouteLeave(() => cronForm.panelOpen.value ? cronForm.closePanel() : true)
 
@@ -517,6 +567,7 @@ async function bulkDeleteSelected() {
 }
 
 function showRunHistory(id: string) {
+  notificationTargetStatus.value = ''
   selectedId.value = id
 }
 
@@ -575,6 +626,16 @@ async function confirmDelete() {
 </script>
 
 <style>
+.cron-refresh-status {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 8px;
+  line-height: 20px;
+  margin: 0;
+}
 .cron-stage {
   margin: 0 auto;
   max-width: 1200px;

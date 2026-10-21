@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { ref } from 'vue'
 import { useChatComposerShortcuts } from './useChatComposerShortcuts'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import type { ChatSlashCommand } from './useChatSlashCommands'
 import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 
@@ -40,15 +41,21 @@ function field(value: string, caret: 'start' | 'end' | 'middle' | number, end?: 
 
 function harness(over: {
   inputText?: string
+  draft?: ReturnType<typeof useLocalPathDraft>
   messages?: ChatMessage[]
   pendingQueue?: ChatPendingItem[]
   canQueueMore?: boolean
   safari?: boolean
   slashOpen?: boolean
+  isStreaming?: boolean
   filteredSlashCmds?: ChatSlashCommand[]
+  getEditorSelection?: () => { start: number; end: number; length: number } | null
+  composing?: boolean
   cancelMessageEdit?: () => boolean
+  handleLongPaste?: (text: string) => boolean
 } = {}) {
-  const inputText = ref(over.inputText ?? '')
+  const inputText = over.draft?.inputText ?? ref(over.inputText ?? '')
+  const messages = ref<ChatMessage[]>(over.messages ?? [])
   const spies = {
     popPendingTail: vi.fn(() => true),
     enqueuePendingInput: vi.fn(() => true),
@@ -62,18 +69,23 @@ function harness(over: {
   }
   const api = useChatComposerShortcuts({
     inputText,
-    composing: ref(false),
-    messages: ref<ChatMessage[]>(over.messages ?? []),
+    localPathReferences: over.draft?.localPaths,
+    restoreInput: over.draft?.restoreInput,
+    textareaText: over.draft?.composerText,
+    composing: ref(over.composing ?? false),
+    getEditorSelection: over.getEditorSelection,
+    messages,
     pendingQueue: ref<ChatPendingItem[]>(over.pendingQueue ?? []),
     canQueueMore: ref(over.canQueueMore ?? true),
     slashOpen: ref(over.slashOpen ?? false),
     slashIdx: ref(0),
     filteredSlashCmds: ref(over.filteredSlashCmds ?? []),
-    isStreaming: ref(false),
+    isStreaming: ref(over.isStreaming ?? false),
     isSafariWebKit: () => over.safari ?? false,
+    handleLongPaste: over.handleLongPaste,
     ...spies,
   })
-  return { api, inputText, spies }
+  return { api, inputText, messages, spies }
 }
 
 function keydown(opts: {
@@ -105,27 +117,99 @@ function inputEvent(inputType: string, target: unknown): InputEvent {
 const QUEUE = [{ id: 'q1', text: 'queued' }] as unknown as ChatPendingItem[]
 
 describe('useChatComposerShortcuts', () => {
+  it('recalls explicit path chips with Up/Down while retaining full canonical text exactly once', () => {
+    const draft = useLocalPathDraft()
+    const selected = 'C:\\资料\\book.pdf'
+    const manual = 'C:\\manually-typed.pdf'
+    const { api } = harness({ draft, messages: [
+      { role: 'user', text: manual, ts: null },
+      { role: 'user', text: `Read\n${selected}`, localPathReferences: [selected], ts: null },
+    ] })
+    const press = (key: string) => api.onTextareaKeydown(keydown({ key, target: field(draft.composerText.value, 'start') }))
+    press('ArrowUp')
+    expect(draft.composerText.value).toBe('Read')
+    expect(draft.localPaths.value).toEqual([selected])
+    expect(draft.inputText.value).toBe(`Read\n${selected}`)
+    press('ArrowUp')
+    expect(draft.composerText.value).toBe(manual)
+    expect(draft.localPaths.value).toEqual([])
+    press('ArrowDown')
+    expect(draft.composerText.value).toBe('Read')
+    expect(draft.localPaths.value).toEqual([selected])
+    expect(draft.inputText.value).toBe(`Read\n${selected}`)
+    press('ArrowDown')
+    expect(draft.composerText.value).toBe('')
+    expect(draft.localPaths.value).toEqual([])
+    expect(draft.inputText.value).toBe('')
+  })
+
+  it('does not replace a reference-only draft when Up starts history navigation', () => {
+    const draft = useLocalPathDraft()
+    draft.restoreInput('/tmp/draft.pdf', ['/tmp/draft.pdf'])
+    const { api } = harness({ draft, messages: [{ role: 'user', text: 'previous', ts: null }] })
+    const event = keydown({ key: 'ArrowUp', target: field('', 'start') })
+    api.onTextareaKeydown(event)
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(draft.localPaths.value).toEqual(['/tmp/draft.pdf'])
+    expect(draft.inputText.value).toBe('/tmp/draft.pdf')
+  })
+
+  it('lets the post-insertion paste fallback consume a large paste', () => {
+    const handleLongPaste = vi.fn(() => true)
+    const { api, spies } = harness({ handleLongPaste })
+    const pasted = field('x'.repeat(20_000), 'end')
+
+    api.onTextareaInput(inputEvent('insertFromPaste', pasted))
+
+    expect(handleLongPaste).toHaveBeenCalledWith(pasted.value, expect.anything())
+    expect(spies.handleSlashInput).not.toHaveBeenCalled()
+  })
+
+  it('passes only the visible inline editor text to the long-paste fallback', () => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = '原有指令 ' + '资料'.repeat(10_000)
+    draft.appendLocalPaths('C:\\资料\\report.pdf')
+    const handleLongPaste = vi.fn(() => true)
+    const { api, spies } = harness({ draft, handleLongPaste })
+    const event = inputEvent('insertFromPasteAsQuotation', {})
+
+    api.onTextareaInput(event)
+
+    expect(handleLongPaste).toHaveBeenCalledExactlyOnceWith(draft.composerText.value, event)
+    expect(spies.handleSlashInput).not.toHaveBeenCalled()
+    expect(draft.localPaths.value).toEqual(['C:\\资料\\report.pdf'])
+  })
+
+  it('still updates slash suggestions when an inline paste is not consumed', () => {
+    const handleLongPaste = vi.fn(() => false)
+    const { api, spies } = harness({ inputText: '说明 /visual', handleLongPaste })
+    api.onTextareaInput(inputEvent('insertFromPaste', {}))
+
+    expect(handleLongPaste).toHaveBeenCalledWith('说明 /visual', expect.anything())
+    expect(spies.handleSlashInput).toHaveBeenCalledOnce()
+  })
+
   describe('Slash completion safety', () => {
-    const coding = {
-      name: '/coding',
-      cmd: '/coding',
-      label: '/coding',
-      desc: 'Toggle Coding mode',
+    const compact = {
+      name: '/compact',
+      cmd: '/compact',
+      label: '/compact',
+      desc: 'Toggle context compaction',
       aliases: [],
-      execution: { action: 'coding.mode' },
+      execution: { action: 'compact_context' },
     }
 
     it('uses Tab only to complete the active candidate', () => {
       const { api, spies } = harness({
         inputText: '/co',
         slashOpen: true,
-        filteredSlashCmds: [coding],
+        filteredSlashCmds: [compact],
       })
       const e = keydown({ key: 'Tab', target: field('/co', 'end') })
 
       api.onTextareaKeydown(e)
 
-      expect(spies.completeSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.completeSlashCmd).toHaveBeenCalledWith(compact)
       expect(spies.activateSlashCmd).not.toHaveBeenCalled()
       expect(e.preventDefault).toHaveBeenCalled()
     })
@@ -134,13 +218,13 @@ describe('useChatComposerShortcuts', () => {
       const { api, spies } = harness({
         inputText: '/co',
         slashOpen: true,
-        filteredSlashCmds: [coding],
+        filteredSlashCmds: [compact],
       })
       const e = keydown({ key: 'Enter', target: field('/co', 'end') })
 
       api.onTextareaKeydown(e)
 
-      expect(spies.activateSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.activateSlashCmd).toHaveBeenCalledWith(compact)
       expect(spies.completeSlashCmd).not.toHaveBeenCalled()
       expect(spies.sendCurrentInput).not.toHaveBeenCalled()
       expect(e.preventDefault).toHaveBeenCalled()
@@ -148,6 +232,21 @@ describe('useChatComposerShortcuts', () => {
   })
 
   describe('IME composition guard', () => {
+    it('leaves Chinese candidate confirmation to an inline editor while the composition ref is set', () => {
+      const candidate = { name: 'visualize', cmd: '/visualize', label: 'Visualize', desc: '', aliases: [] }
+      const { api, spies } = harness({ inputText: '你好 /可视化', composing: true, slashOpen: true,
+        filteredSlashCmds: [candidate], getEditorSelection: () => ({ start: 8, end: 8, length: 8 }) })
+      const event = keydown({ key: 'Enter', target: {} })
+
+      api.onTextareaKeydown(event)
+      api.onTextareaInput(inputEvent('insertCompositionText', {}))
+
+      expect(event.preventDefault).not.toHaveBeenCalled()
+      expect(spies.activateSlashCmd).not.toHaveBeenCalled()
+      expect(spies.sendCurrentInput).not.toHaveBeenCalled()
+      expect(spies.handleSlashInput).not.toHaveBeenCalled()
+    })
+
     it('does not send on Enter while the IME is composing (isComposing)', () => {
       const { api, spies } = harness({ inputText: '你好' })
       api.onTextareaKeydown(keydown({ key: 'Enter', isComposing: true, target: field('你好', 'end') }))
@@ -170,6 +269,54 @@ describe('useChatComposerShortcuts', () => {
   })
 
   describe('Alt+Arrow queue chords are caret-gated (preserve macOS paragraph nav)', () => {
+    it('uses inline editor offsets for boundary chords and keeps a selection or middle caret native', () => {
+      let selection: { start: number; end: number; length: number } | null = { start: 2, end: 2, length: 4 }
+      const { api, spies } = harness({ inputText: '中文草稿', pendingQueue: QUEUE,
+        getEditorSelection: () => selection })
+      const press = (key: string) => {
+        const event = keydown({ key, altKey: true, target: {} })
+        api.onTextareaKeydown(event)
+        return event
+      }
+
+      expect(press('ArrowDown').preventDefault).not.toHaveBeenCalled()
+      selection = { start: 0, end: 4, length: 4 }
+      expect(press('ArrowDown').preventDefault).not.toHaveBeenCalled()
+      expect(press('ArrowUp').preventDefault).not.toHaveBeenCalled()
+      selection = null
+      expect(press('ArrowDown').preventDefault).not.toHaveBeenCalled()
+      selection = { start: 4, end: 4, length: 4 }
+      expect(press('ArrowDown').preventDefault).toHaveBeenCalledOnce()
+      expect(spies.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('中文草稿')
+      selection = { start: 0, end: 0, length: 4 }
+      expect(press('ArrowUp').preventDefault).toHaveBeenCalledOnce()
+      expect(spies.popPendingTail).toHaveBeenCalledOnce()
+    })
+
+    it('prefers native textarea offsets when an inline editor selection is also provided', () => {
+      const getEditorSelection = vi.fn(() => ({ start: 4, end: 4, length: 4 }))
+      const { api, spies } = harness({ inputText: 'text', getEditorSelection })
+      const event = keydown({ key: 'ArrowDown', altKey: true, target: field('text', 'middle') })
+      api.onTextareaKeydown(event)
+      expect(getEditorSelection).not.toHaveBeenCalled()
+      expect(spies.enqueuePendingInput).not.toHaveBeenCalled()
+      expect(event.preventDefault).not.toHaveBeenCalled()
+    })
+
+    it('queues the full canonical text for a paths-only draft with an empty textarea', () => {
+      const draft = useLocalPathDraft()
+      draft.appendLocalPaths('C:\\Downloads\\report.pdf')
+      const { api, spies } = harness({ draft })
+      const event = keydown({ key: 'ArrowDown', altKey: true, target: field('', 'end') })
+
+      api.onTextareaKeydown(event)
+
+      expect(spies.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('C:\\Downloads\\report.pdf')
+      expect(event.preventDefault).toHaveBeenCalledOnce()
+      expect(draft.composerText.value).toBe('')
+      expect(draft.localPaths.value).toEqual(['C:\\Downloads\\report.pdf'])
+    })
+
     it('enqueues on Alt+ArrowDown only when the caret is at the end', () => {
       const { api, spies } = harness({ inputText: 'line1\nline2', canQueueMore: true })
 
@@ -202,6 +349,33 @@ describe('useChatComposerShortcuts', () => {
   })
 
   describe('Safari textarea undo guard', () => {
+    it('repairs only the visible body without replacing the canonical draft and dropping local paths', () => {
+      const draft = useLocalPathDraft()
+      draft.composerText.value = 'hello world'
+      draft.appendLocalPaths('C:\\Downloads\\report.pdf')
+      const { api } = harness({ draft, safari: true })
+      const ta = field('hello world', 6, 'hello world'.length)
+
+      api.onTextareaBeforeInput(inputEvent('deleteContentBackward', ta))
+      ta.value = 'hello '
+      ta.setSelectionRange(6, 6)
+      draft.composerText.value = ta.value
+      api.onTextareaInput(inputEvent('deleteContentBackward', ta))
+
+      api.onTextareaBeforeInput(inputEvent('historyUndo', ta))
+      ta.value = ''
+      ta.setSelectionRange(0, 0)
+      draft.composerText.value = ta.value
+      api.onTextareaInput(inputEvent('historyUndo', ta))
+
+      expect(ta.value).toBe('hello world')
+      expect(draft.composerText.value).toBe('hello world')
+      expect(draft.localPaths.value).toEqual(['C:\\Downloads\\report.pdf'])
+      expect(draft.inputText.value).toBe('hello world\nC:\\Downloads\\report.pdf')
+      expect(ta.selectionStart).toBe(6)
+      expect(ta.selectionEnd).toBe('hello world'.length)
+    })
+
     it('repairs Safari historyUndo when undoing a deletion clears the whole draft', () => {
       const { api, inputText } = harness({ inputText: 'hello world', safari: true })
       const ta = field('hello world', 6, 'hello world'.length)
@@ -299,6 +473,33 @@ describe('useChatComposerShortcuts', () => {
 })
 
 describe('Escape and message edits', () => {
+  it.each([
+    [0, 'ArrowUp'], [0, 'ArrowDown'], [1, 'ArrowUp'], [1, 'ArrowDown'],
+  ] as const)('preserves the draft when history shrinks to %i entries before %s', (count, key) => {
+    const draft = useLocalPathDraft()
+    const { api, messages } = harness({
+      draft,
+      messages: Array.from({ length: 5 }, (_, index) => ({
+        role: 'user', text: `Request ${index + 1}`, ts: null,
+      })),
+    })
+    api.onTextareaKeydown(keydown({ key: 'ArrowUp', target: field('', 'start') }))
+    expect(draft.composerText.value).toBe('Request 5')
+    messages.value = messages.value.slice(0, count)
+    draft.restoreInput('Current draft\nC:\\draft.pdf', ['C:\\draft.pdf'])
+
+    const event = keydown({ key, target: field(draft.composerText.value, 'end') })
+    expect(() => api.onTextareaKeydown(event)).not.toThrow()
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(draft.composerText.value).toBe('Current draft')
+    expect(draft.localPaths.value).toEqual(['C:\\draft.pdf'])
+
+    const down = keydown({ key: 'ArrowDown', target: field(draft.composerText.value, 'end') })
+    api.onTextareaKeydown(down)
+    expect(down.preventDefault).not.toHaveBeenCalled()
+    expect(draft.inputText.value).toBe('Current draft\nC:\\draft.pdf')
+  })
+
   it('resets history navigation so ArrowDown cannot overwrite the restored draft', () => {
     const { api, inputText, spies } = harness({
       messages: [{ role: 'user', text: 'earlier request', ts: null }],
@@ -316,6 +517,28 @@ describe('Escape and message edits', () => {
     api.onTextareaKeydown(down)
 
     expect(inputText.value).toBe('restored draft')
+    expect(down.preventDefault).not.toHaveBeenCalled()
+  })
+
+  it('keeps an edited history entry when ArrowUp or ArrowDown follows (#1954)', () => {
+    const { api, inputText } = harness({
+      messages: [
+        { role: 'user', text: 'first request', ts: null },
+        { role: 'user', text: 'second request', ts: null },
+      ],
+    })
+    api.onTextareaKeydown(keydown({ key: 'ArrowUp', target: field('', 'start') }))
+    expect(inputText.value).toBe('second request')
+    inputText.value = 'second request, edited'
+    api.onTextareaInput(inputEvent('insertText', field('second request, edited', 'end')))
+
+    const up = keydown({ key: 'ArrowUp', target: field('second request, edited', 'end') })
+    api.onTextareaKeydown(up)
+    const down = keydown({ key: 'ArrowDown', target: field('second request, edited', 'end') })
+    api.onTextareaKeydown(down)
+
+    expect(inputText.value).toBe('second request, edited')
+    expect(up.preventDefault).not.toHaveBeenCalled()
     expect(down.preventDefault).not.toHaveBeenCalled()
   })
 
@@ -372,15 +595,27 @@ describe('Escape and message edits', () => {
     expect(inputText.value).toBe('draft')
   })
 
-  it('still clears the draft when there is no edit to cancel', () => {
+  it('preserves an ordinary draft and leaves Escape unclaimed when no edit is live', () => {
     const { api, inputText, spies } = harness({ inputText: 'just a draft' })
 
     const e = keydown({ key: 'Escape', target: field('just a draft', 'end') })
     api.onTextareaKeydown(e)
 
     expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
-    expect(inputText.value).toBe('')
-    expect(e.preventDefault).toHaveBeenCalledOnce()
+    expect(inputText.value).toBe('just a draft')
+    expect(spies.autoResizeTextarea).not.toHaveBeenCalled()
+    expect(e.preventDefault).not.toHaveBeenCalled()
+  })
+
+  it('leaves streaming Escape to Stop without changing the queued draft', () => {
+    const { api, inputText, spies } = harness({ inputText: 'next request', isStreaming: true })
+    const e = keydown({ key: 'Escape', target: field('next request', 'end') })
+
+    api.onTextareaKeydown(e)
+
+    expect(inputText.value).toBe('next request')
+    expect(spies.cancelMessageEdit).not.toHaveBeenCalled()
+    expect(e.preventDefault).not.toHaveBeenCalled()
   })
 
   it('leaves the slash menu Escape alone', () => {
@@ -390,7 +625,7 @@ describe('Escape and message edits', () => {
       inputText: '/co',
       slashOpen: true,
       filteredSlashCmds: [
-        { name: '/coding', cmd: '/coding', label: '/coding', desc: '' },
+        { name: '/compact', cmd: '/compact', label: '/compact', desc: '' },
       ] as unknown as ChatSlashCommand[],
       cancelMessageEdit: () => true,
     })

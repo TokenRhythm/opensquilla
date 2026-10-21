@@ -50,6 +50,44 @@ describe('router attempt ownership', () => {
     turn_id: turnId, stream_seq: seq, tier: 'c1', model: 'provider/selected', source: 'squilla_router',
   })
 
+  it.each([false, true])('retains replay=%s when a pending decision is restored after its row was replaced', replayed => {
+    const { runtime, messagesRef } = makeRuntime()
+    runtime.queueRouterDecision(decision(10), undefined, replayed)
+    messagesRef.value = []
+    runtime.flushPendingRouterDecision()
+
+    expect(messagesRef.value).toHaveLength(1)
+    expect(messagesRef.value[0]?.routerReplayed === true).toBe(replayed)
+    expect(messagesRef.value[0]?.routerSettled).toBeUndefined()
+    expect(messagesRef.value[0]?.restoredFromHistory).toBeUndefined()
+  })
+
+  it('keeps replay provenance sticky across duplicate live delivery and pending restoration', () => {
+    const { runtime, messagesRef } = makeRuntime()
+    runtime.queueRouterDecision(decision(10))
+    expect(messagesRef.value[0]?.routerReplayed).toBeUndefined()
+    runtime.queueRouterDecision(decision(10), undefined, true)
+    runtime.queueRouterDecision(decision(10))
+    expect(messagesRef.value).toHaveLength(1)
+    expect(messagesRef.value[0]?.routerReplayed).toBe(true)
+    messagesRef.value = []
+    runtime.flushPendingRouterDecision()
+    expect(messagesRef.value[0]?.routerReplayed).toBe(true)
+  })
+
+  it('marks a provisional ensemble card as replayed when its accepted decision is restored', () => {
+    const { runtime, messagesRef } = makeRuntime()
+    runtime.appendEnsembleProgress(progress())
+    const provisionalClientId = messagesRef.value[0]?.clientId
+    runtime.queueRouterDecision(decision(10), undefined, true)
+    expect(messagesRef.value).toHaveLength(1)
+    expect(messagesRef.value[0]).toMatchObject({
+      messageId: 'router-sess-10', clientId: provisionalClientId, routerReplayed: true,
+    })
+    expect(messagesRef.value[0]?.ensemble?.models).toHaveLength(1)
+    expect(messagesRef.value[0]?.routerSettled).toBeUndefined()
+  })
+
   it('attaches untagged progress to the current tagged decision', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
     runtime.queueRouterDecision(decision(10))

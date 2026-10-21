@@ -32,6 +32,53 @@ from opensquilla.provider.types import (
 from opensquilla.silent_reply import sanitize_historical_silent_reply
 
 _RECORDED_TOOL_HISTORY_PREFIX = "[Recorded tool history]"
+CONTEXT_SUMMARY_MARKER = "[Context Summary]"
+
+
+def strip_context_summary_marker(content: str) -> str:
+    """Return the checkpoint body from a legacy transcript summary row."""
+    if content.startswith(CONTEXT_SUMMARY_MARKER):
+        return content[len(CONTEXT_SUMMARY_MARKER) :].lstrip("\r\n")
+    return content
+
+
+def subagent_terminal_history_notice(entry: Any) -> str | None:
+    """Project trusted terminal status, equally for stored rows and their copies."""
+    def value(name: str) -> Any:
+        return entry.get(name) if isinstance(entry, Mapping) else getattr(entry, name, None)
+
+    if value("role") != "system":
+        return None
+    if value("provenance_kind") != "internal_system":
+        return None
+    if value("provenance_source_tool") != "subagent_completion":
+        return None
+    content = value("content")
+    if not isinstance(content, str) or not content:
+        return None
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "subagent_completion":
+        return None
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"cancelled", "failed", "timeout", "abandoned"}:
+        return None
+    child_session_key = str(payload.get("child_session_key") or "unknown")[:200]
+    terminal_reason = str(payload.get("terminal_reason") or status)[:120]
+    return (
+        "[Trusted runtime status] "
+        f'Subagent {child_session_key} finished with status "{status}" '
+        f'(reason: "{terminal_reason}"). It is no longer running. '
+        "Do not wait for it or call sessions_yield for it. Continue from this terminal "
+        "state unless the user asks to start a replacement subagent."
+    )
+
+# Bump whenever the storage-to-provider history projection changes.  The value
+# is included in compaction admission fingerprints so a budget frozen under an
+# older attachment projection cannot be reused after deployment.
+HISTORY_REPLAY_PROJECTION_VERSION = "provider-visible-history-v2"
 
 _SYNTHETIC_USER_PREFIXES = (
     GENERATED_ARTIFACT_CONTEXT_PREFIX,
@@ -64,6 +111,9 @@ class HistoryReplayEntryProjection:
     estimate_complete: bool = True
     persisted_token_count: int = 0
     raw_token_floor_applies: bool = True
+    # Usage proven to exceed the original storage envelope. This is added to
+    # the projected estimate instead of being used as a replacement floor.
+    persisted_token_surplus: int = 0
     # ``None`` preserves the prior state, matching ignored/system rows.  A
     # terminal notice uses ``False`` so positional current-user trimming does
     # not remove a prompt that is no longer the transcript tail.
@@ -79,6 +129,7 @@ class HistoryReplayMessageProvenance:
     estimate_complete: bool = field(default=True, repr=False)
     persisted_token_count: int = field(default=0, repr=False)
     raw_token_floor_applies: bool = field(default=True, repr=False)
+    persisted_token_surplus: int = field(default=0, repr=False)
 
 
 @dataclass(frozen=True)
@@ -150,6 +201,7 @@ def project_history_replay(
                     entry_index=entry_index,
                     estimate_complete=projected.estimate_complete,
                     persisted_token_count=max(0, projected.persisted_token_count),
+                    persisted_token_surplus=max(0, projected.persisted_token_surplus),
                     raw_token_floor_applies=projected.raw_token_floor_applies,
                 ),
             )
@@ -168,6 +220,7 @@ def project_history_replay(
                     entry_index=entry_index,
                     estimate_complete=projected.estimate_complete,
                     persisted_token_count=max(0, projected.persisted_token_count),
+                    persisted_token_surplus=max(0, projected.persisted_token_surplus),
                     raw_token_floor_applies=projected.raw_token_floor_applies,
                 )
                 for _message in reconstructed
@@ -300,6 +353,7 @@ def project_history_replay_capacity(
     entry_estimates: dict[tuple[str, int], int] = {}
     entry_media_reserves: dict[tuple[str, int], int] = {}
     entry_token_floors: dict[tuple[str, int], int] = {}
+    entry_token_surpluses: dict[tuple[str, int], int] = {}
     for message_index, (message, source) in enumerate(zip(messages, provenance, strict=True)):
         media_before = media_reserve_tokens
         projected_message = _project_value(project_message_replay_budget(message))
@@ -326,9 +380,15 @@ def project_history_replay_capacity(
                 entry_token_floors.get(source_key, 0),
                 max(0, source.persisted_token_count),
             )
+        if source.persisted_token_surplus:
+            entry_token_surpluses[source_key] = max(
+                entry_token_surpluses.get(source_key, 0),
+                max(0, source.persisted_token_surplus),
+            )
 
     adjusted_entry_tokens = sum(
         max(tokens, entry_token_floors.get(source_key, 0))
+        + entry_token_surpluses.get(source_key, 0)
         + entry_media_reserves.get(source_key, 0)
         for source_key, tokens in entry_estimates.items()
     )

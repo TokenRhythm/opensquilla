@@ -97,11 +97,14 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    chooseLocalFilePaths?: PlatformFilesApi['chooseLocalFilePaths']
+    resolveNativeFilePath?: PlatformFilesApi['resolveNativeFilePath']
     chooseAttachments?: PlatformFilesApi['chooseAttachments']
     selectAttachmentFile?: PlatformFilesApi['selectAttachmentFile']
     importAttachmentSelection?: PlatformFilesApi['importAttachmentSelection']
     cancelAttachmentSelections?: PlatformFilesApi['cancelAttachmentSelections']
     saveArtifact?: PlatformFilesApi['saveArtifact']
+    saveAttachment?: PlatformFilesApi['saveAttachment']
     sourceFileAction?: PlatformFilesApi['sourceFileAction']
     workspaceFileAction?: PlatformFilesApi['workspaceFileAction']
     chooseProjectDirectory: (
@@ -130,9 +133,15 @@ declare global {
     closeArtifactAnnotationOverlay?: (
       payload: import('./platform/types').NativeArtifactAnnotationOverlayCloseRequest,
     ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    updateArtifactAnnotationOverlay?: (
+      payload: import('./platform/types').NativeArtifactAnnotationOverlayUpdateRequest,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
     getWorkbenchBrowserTarget?: (
       payload: { surfaceId: string },
     ) => Promise<import('./platform/types').NativeWorkbenchBrowserTarget>
+    setBrowserAutomationState?: (
+      payload: import('./platform/types').NativeBrowserAutomationState,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
     focusWorkbenchAnnotation?: (
       payload: { surfaceId: string; targetRef: string; locatorHint: string },
     ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>

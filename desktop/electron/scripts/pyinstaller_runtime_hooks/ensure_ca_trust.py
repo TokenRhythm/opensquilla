@@ -1,12 +1,34 @@
-"""Restore a usable default CA store in the frozen Desktop gateway."""
+"""Configure packaged trust and offline tokenizer assets for the frozen gateway."""
 
 from __future__ import annotations
 
-import importlib
 import os
-import ssl
-import sys
-from pathlib import Path
+
+# Keep the default hook unchanged apart from the flag check. Diagnostic setup
+# itself is measured separately: importing the package can have its own cost.
+_startup_timing = None
+if os.environ.get("OPENSQUILLA_STARTUP_TIMING") == "1":
+    try:
+        import time as _startup_time
+
+        _diagnostic_started = _startup_time.monotonic_ns()
+        from opensquilla import startup_timing as _startup_timing
+
+        _startup_timing.startup_phase_end("diagnostic_setup", _diagnostic_started)
+    except Exception:
+        _startup_timing = None
+_hook_imports_started = (
+    _startup_timing.startup_phase_start("frozen_hook_imports") if _startup_timing else None
+)
+
+# Imports stay inside the measured boundary.
+import importlib  # noqa: E402
+import ssl  # noqa: E402
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+if _startup_timing:
+    _startup_timing.startup_phase_end("frozen_hook_imports", _hook_imports_started)
 
 _CA_ENV_VARS = ("SSL_CERT_FILE", "SSL_CERT_DIR")
 _PACKAGING_ERROR = (
@@ -64,4 +86,29 @@ def ensure_frozen_default_ca_trust() -> None:
         raise RuntimeError(_PACKAGING_ERROR)
 
 
-ensure_frozen_default_ca_trust()
+def ensure_frozen_tokenizer_cache() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+    # Presence matters: an empty explicit cache setting disables caching.
+    if any(name in os.environ for name in ("TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR")):
+        return
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root is None:
+        return
+    cache = Path(bundle_root) / "tiktoken-cache"
+    if cache.is_dir():
+        os.environ["TIKTOKEN_CACHE_DIR"] = os.fspath(cache)
+
+
+ensure_frozen_tokenizer_cache()
+
+_ca_started = _startup_timing.startup_phase_start("frozen_ca_trust") if _startup_timing else None
+try:
+    ensure_frozen_default_ca_trust()
+except BaseException:
+    if _startup_timing:
+        _startup_timing.startup_phase_end("frozen_ca_trust", _ca_started, failed=True)
+    raise
+else:
+    if _startup_timing:
+        _startup_timing.startup_phase_end("frozen_ca_trust", _ca_started)

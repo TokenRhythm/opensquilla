@@ -168,6 +168,15 @@
             }
           ]
         },
+        "localPathReferences": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32768
+          },
+          "description": "Display-only explicit local paths matching the canonical message suffix; no file access authority."
+        },
         "selectedSkills": {
           "type": "array",
           "maxItems": 16,
@@ -177,10 +186,13 @@
         },
         "workspaceFiles": {
           "type": "array",
-          "maxItems": 10,
+          "maxItems": 16,
           "items": {
             "$ref": "#/$defs/WorkspaceFileReference"
           }
+        },
+        "turnCommand": {
+          "$ref": "#/$defs/TurnCommand"
         }
       }
     },
@@ -379,7 +391,27 @@
           "items": {
             "$ref": "#/$defs/PageAnnotation"
           }
+        },
+        "revisionId": {
+          "type": "string",
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$"
         }
+      },
+      "dependentRequired": {
+        "revisionId": [
+          "resourceId",
+          "sha256"
+        ],
+        "sha256": [
+          "resourceId",
+          "revisionId"
+        ]
       }
     },
     "PageAnnotation": {
@@ -411,6 +443,9 @@
           ],
           "maxLength": 16384,
           "description": "The Gateway enforces a 16384-byte UTF-8 limit."
+        },
+        "selection": {
+          "$ref": "#/$defs/OfficeSelection"
         }
       }
     },
@@ -473,6 +508,266 @@
         "size": {
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "OfficeSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "kind"
+      ],
+      "description": "Renderer evidence only. Resolve against the pinned package; indexes and bounds never authorize writes.",
+      "properties": {
+        "format": {
+          "enum": [
+            "docx",
+            "pptx",
+            "xlsx"
+          ]
+        },
+        "kind": {
+          "enum": [
+            "text",
+            "element",
+            "range"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 16384
+        },
+        "shapeId": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "sheetName": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "range": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "pageIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "slideIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "sheetIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000
+        },
+        "pageIndexes": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000
+          }
+        },
+        "slideIndexes": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000
+          }
+        },
+        "paragraphIds": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "shapeIds": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 256
+          }
+        },
+        "ranges": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "origin": {
+          "enum": [
+            "master",
+            "layout",
+            "slide",
+            "unknown"
+          ]
+        },
+        "elementType": {
+          "enum": [
+            "chart",
+            "image",
+            "picture",
+            "shape",
+            "table",
+            "media",
+            "group"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "story"
+          ],
+          "properties": {
+            "story": {
+              "enum": [
+                "body",
+                "header",
+                "footer",
+                "footnote",
+                "endnote",
+                "textbox"
+              ]
+            },
+            "storyInstance": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "path": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100000
+              }
+            }
+          }
+        },
+        "bounds": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "x": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "y": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "width": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "height": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "rotation": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "flipH": {
+              "type": "boolean"
+            },
+            "flipV": {
+              "type": "boolean"
+            },
+            "xPt": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "yPt": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "widthPt": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            },
+            "heightPt": {
+              "type": "number",
+              "minimum": -1000000000.0,
+              "maximum": 1000000000.0
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "xlsx"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "element",
+                  "range"
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "text",
+                  "element"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "TurnCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "args"
+      ],
+      "properties": {
+        "name": {
+          "const": "project.init"
+        },
+        "args": {
+          "type": "string"
         }
       }
     }

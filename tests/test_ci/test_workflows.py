@@ -1,27 +1,43 @@
 from __future__ import annotations
 
+import ast
+import copy
+import itertools
 import json
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 
 WORKFLOW_DIR = Path(".github/workflows")
 PR_TARGET_VALIDATOR = Path(".github/scripts/validate-pr-target-branch.sh")
 PR_BODY_LINT = Path(".github/scripts/validate_pr_body.py")
 TEST_PATH_RE = re.compile(r"tests/[A-Za-z0-9_./-]+\.py")
+WINDOWS_PROFILE_CASES = (
+    "onboarding-flow", "onboarding-first-chat", "profile-consolidation-flow",
+    "primary-repair-accessibility", "profile-import-flow", "desktop-cleanup-flow",
+)
+
+
+@lru_cache(maxsize=32)
+def _parsed_workflow(source: str) -> dict:
+    return yaml.safe_load(source)
 
 
 def _workflow(name: str) -> dict:
     path = WORKFLOW_DIR / name
     assert path.is_file(), f"missing workflow: {path}"
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    # Reparse when content changes; never share a mutable dict between callers.
+    return copy.deepcopy(_parsed_workflow(path.read_text(encoding="utf-8")))
 
 
 def _trigger_keys(data: dict) -> set[str]:
@@ -69,6 +85,7 @@ def test_release_cache_mode_lint_exception_is_narrow() -> None:
 def test_only_diagnostic_uploads_can_fail_without_failing_ci() -> None:
     expected = {
         "webui-chat-recovery": {"chat-traces"},
+        "webui-capacity": {"chat-traces"},
         "ubuntu-full": {"ubuntu-report"},
         "windows-full": {"windows-report"},
         "macos-recovery": {"macos-report"},
@@ -106,8 +123,11 @@ def test_local_diagnostic_generation_remains_required(tmp_path: Path, step_id: s
     assert steps.index(check) < steps.index(upload)
     assert "if" not in check  # Normal success path; earlier test/setup failures stay red.
     assert not check.get("continue-on-error")
-    env = {**os.environ, "CI_REPORT_DIR": tmp_path.as_posix()}
-    command = [_bash_executable(), "-euo", "pipefail", "-c", check["run"]]
+    env = {**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": "Windows"}
+    command = [
+        _bash_executable(), "-euo", "pipefail", "-c",
+        check["run"].replace("${{ matrix.shard }}", "ownership"),
+    ]
     assert subprocess.run(command, env=env, capture_output=True).returncode != 0
     for name in re.findall(r'CI_REPORT_DIR\}/([^"\n]+)', check["run"]):
         (tmp_path / name).write_text("generated report\n", encoding="utf-8")
@@ -130,7 +150,9 @@ def test_required_artifact_downloads_share_a_bounded_hard_gate() -> None:
     }
     assert not guard.get("continue-on-error")
     assert "sleep" not in json.dumps(action)
-    for workflow, count in [("ci.yml", 7), ("windows-nsis-upgrade-regression.yml", 1)]:
+    # Early installed-package consumers use the identity-bound wait helper;
+    # the shared frontend and three required proofs retain the transfer gate.
+    for workflow, count in [("ci.yml", 19), ("windows-nsis-upgrade-regression.yml", 4)]:
         steps = [s for j in _workflow(workflow)["jobs"].values() for s in j.get("steps", [])]
         downloads = [s for s in steps
                      if s.get("uses") == "./.github/actions/download-required-artifact"]
@@ -202,7 +224,7 @@ def test_partial_queue_wiring_preserves_canary_gate_and_does_not_mint_root_evide
 
 
 @pytest.mark.parametrize("workflow_name,job_name", [
-    ("windows-nsis-upgrade-regression.yml", "build"),
+    ("windows-nsis-upgrade-regression.yml", "windows-package-contracts"),
     ("ci.yml", "desktop-check"),
 ])
 def test_packaged_contract_probes_run_after_desktop_compilation(
@@ -231,7 +253,9 @@ def test_windows_acceptance_is_required_through_the_caller_and_all_native_jobs()
     jobs = _workflow("ci.yml")["jobs"]
     call = jobs["windows-nsis-regression"]
     assert call["uses"] == "./.github/workflows/windows-nsis-upgrade-regression.yml"
-    assert call["needs"] == "plan-ci"
+    assert call["needs"] == ["plan-ci", "frontend-artifact"]
+    assert call["with"]["frontend_artifact_name"] == "opensquilla-webui-dist"
+    assert call["with"]["acceptance_profile"] == "${{ needs.plan-ci.outputs.windows_nsis_profile }}"
     assert "needs.plan-ci.result == 'success'" in call["if"]
     assert "'windows-nsis-regression'" in call["if"]
     assert not call.get("continue-on-error")
@@ -242,11 +266,28 @@ def test_windows_acceptance_is_required_through_the_caller_and_all_native_jobs()
 
     native = _workflow("windows-nsis-upgrade-regression.yml")
     assert _trigger_keys(native) == {"workflow_call", "workflow_dispatch"}
+    triggers = native.get("on", native.get(True))
+    profile = triggers["workflow_call"]["inputs"]["acceptance_profile"]
+    assert profile == {
+        "description": (
+            "smoke: current legacy baseline and fresh installs; full: all historical fault cases"
+        ),
+        "type": "string", "default": "full",
+    }
+    # Standalone diagnostics deliberately expose no smoke override.
+    assert triggers["workflow_dispatch"] is None
+    profile_guard = native["jobs"]["build"]["steps"][0]
+    assert profile_guard["env"]["ACCEPTANCE_PROFILE"] == (
+        "${{ inputs.acceptance_profile || 'full' }}"
+    )
+    assert "-cnotin @('smoke', 'full')" in profile_guard["run"]
+    assert "throw" in profile_guard["run"]
     assert "concurrency" not in native  # Caller owns cancellation, never cancel the caller.
     result = native["jobs"]["acceptance-result"]
     assert result["if"] == "always()"
     assert set(result["needs"]) == {
-        "build", "wheelhouse-security", "upgrade-and-start", "candidate-probes",
+        "build", "windows-webui-build", "windows-package-contracts", "packaged-security",
+        "wheelhouse-security", "upgrade-and-start", "candidate-probes",
     }
     for job in native["jobs"].values():
         assert not job.get("continue-on-error")
@@ -256,18 +297,26 @@ def test_windows_acceptance_is_required_through_the_caller_and_all_native_jobs()
         "WHEELHOUSE_RESULT": "${{ needs.wheelhouse-security.result }}",
         "UPGRADE_RESULT": "${{ needs.upgrade-and-start.result }}",
         "PROBE_RESULT": "${{ needs.candidate-probes.result }}",
+        "WINDOWS_WEBUI_RESULT": "${{ needs.windows-webui-build.result }}",
+        "PACKAGED_SECURITY_RESULT": "${{ needs.packaged-security.result }}",
+        "PACKAGE_CONTRACT_RESULT": "${{ needs.windows-package-contracts.result }}",
+        "FRONTEND_ARTIFACT_NAME": "${{ inputs.frontend_artifact_name || '' }}",
     }
 
 
 @pytest.mark.parametrize(
-    "failed_job", ["BUILD_RESULT", "WHEELHOUSE_RESULT", "UPGRADE_RESULT", "PROBE_RESULT"],
+    "failed_job", ["BUILD_RESULT", "WHEELHOUSE_RESULT", "UPGRADE_RESULT", "PROBE_RESULT",
+                   "WINDOWS_WEBUI_RESULT", "PACKAGED_SECURITY_RESULT", "PACKAGE_CONTRACT_RESULT"],
 )
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "skipped", "", "neutral"])
 def test_windows_acceptance_executes_fail_closed_aggregate(failed_job: str, outcome: str) -> None:
     job = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]["acceptance-result"]
     guard = job["steps"][-1]
     env = {**os.environ, "BUILD_RESULT": "success", "WHEELHOUSE_RESULT": "success",
-           "UPGRADE_RESULT": "success", "PROBE_RESULT": "success", failed_job: outcome}
+           "UPGRADE_RESULT": "success", "PROBE_RESULT": "success",
+           "WINDOWS_WEBUI_RESULT": "success", "PACKAGED_SECURITY_RESULT": "success",
+           "PACKAGE_CONTRACT_RESULT": "success",
+           "FRONTEND_ARTIFACT_NAME": "opensquilla-webui-dist", failed_job: outcome}
     result = subprocess.run(
         [_bash_executable(), "-euo", "pipefail", "-c", guard["run"]],
         env=env, capture_output=True, text=True,
@@ -289,22 +338,144 @@ def test_cancelled_windows_acceptance_fails_even_with_successful_children() -> N
     assert result.returncode != 0
 
 
+@pytest.mark.parametrize("frontend_artifact,windows_result,success", [
+    ("", "skipped", True), ("", "success", False), ("", "failure", False),
+    ("", "", False), ("opensquilla-webui-dist", "success", True),
+    ("opensquilla-webui-dist", "skipped", False),
+    ("opensquilla-webui-dist", "cancelled", False),
+])
+def test_windows_frontend_platform_proof_is_required_only_for_shared_artifacts(
+    frontend_artifact: str, windows_result: str, success: bool,
+) -> None:
+    job = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]["acceptance-result"]
+    guard = job["steps"][-1]
+    env = {**os.environ, "BUILD_RESULT": "success", "WHEELHOUSE_RESULT": "success",
+           "UPGRADE_RESULT": "success", "PROBE_RESULT": "success",
+           "PACKAGED_SECURITY_RESULT": "success", "WINDOWS_WEBUI_RESULT": windows_result,
+           "PACKAGE_CONTRACT_RESULT": "success",
+           "FRONTEND_ARTIFACT_NAME": frontend_artifact}
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", guard["run"]],
+        env=env, capture_output=True, text=True,
+    )
+    assert (result.returncode == 0) is success, result.stderr
+
+
 def test_windows_acceptance_checks_out_and_verifies_the_callers_immutable_candidate() -> None:
     jobs = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]
-    for name in ("build", "wheelhouse-security", "upgrade-and-start"):
+    for name in ("build", "wheelhouse-security", "upgrade-and-start", "packaged-security",
+                 "acceptance-result"):
         checkout = next(s for s in jobs[name]["steps"] if s.get("uses") == "actions/checkout@v4")
         assert checkout["with"]["ref"] == "${{ github.sha }}"
         assert checkout["with"]["persist-credentials"] is False
     verify_name = "Verify fresh first interaction or retained upgrade and restart"
     verify = next(s for s in jobs["upgrade-and-start"]["steps"] if s.get("name") == verify_name)
     assert "(git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA" in verify["run"]
-    assert "$manifest.sourceSha -ne (git rev-parse HEAD).Trim()" in verify["run"]
-    assert "$manifest.installerSha256" in verify["run"]
+    assert "needs" not in jobs["upgrade-and-start"]
+    assert "'--candidate-artifact-name', 'nsis-regression-installer'" in verify["run"]
+    assert "'--candidate-source-sha', $env:GITHUB_SHA" in verify["run"]
+    assert verify["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert _workflow("windows-nsis-upgrade-regression.yml")["permissions"]["actions"] == "read"
     policy = json.loads(Path(".github/ci/trust-policy.v1.json").read_text(encoding="utf-8"))
     assert {
         ".github/workflows/windows-nsis-upgrade-regression.yml",
         ".github/scripts/verify-nsis-upgrade-regression.py",
+        ".github/scripts/wait_ci_candidate.py",
+        ".github/scripts/nsis_packaged_proof.py",
     } <= set(policy["merge_critical_inputs"])
+
+
+def test_installed_nsis_checks_use_three_independent_vms_and_early_preparation() -> None:
+    job = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]["packaged-security"]
+    assert job["runs-on"] == "windows-2022"
+    assert job["strategy"] == {
+        "fail-fast": False,
+        "matrix": {"probe": ["dependency-audit", "gateway-smoke", "first-interaction"]},
+    }
+    assert "needs" not in job and "if" not in job
+    assert job["timeout-minutes"] == 90  # Original 30-minute probe plus 60-minute producer wait.
+    steps = job["steps"]
+    prepare = next(s for s in steps if s.get("name") == "Prepare packaged-client interaction probe")
+    wait = next(s for s in steps if s.get("name") == "Wait for and verify the exact NSIS candidate")
+    check = next(s for s in steps if s.get("name") == "Verify independent installed packaged check")
+    assert steps.index(prepare) < steps.index(wait) < steps.index(check)
+    assert "npm ci" in prepare["run"] and "npm run build" in prepare["run"]
+    assert "if" not in prepare and "if" not in wait and "if" not in check
+    assert wait["env"] == {"GH_TOKEN": "${{ github.token }}"}
+    assert (
+        "python .github/scripts/nsis_packaged_proof.py wait --destination candidate" in wait["run"]
+    )
+    assert "if ($LASTEXITCODE -ne 0) { throw" in wait["run"]
+    assert check["env"]["PACKAGED_PROBE"] == "${{ matrix.probe }}"
+    assert check["env"]["OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE"] == "1"
+    assert check["env"]["OPENSQUILLA_SMOKE_PROVISION_SANDBOX"] == "1"
+    commands = check["run"]
+    assert commands.count("Invoke-ProofStage 'check'") == 1
+    assert commands.count("switch ($env:PACKAGED_PROBE)") == 1
+    assert "-cnotin @('dependency-audit', 'gateway-smoke', 'first-interaction')" in commands
+    for command in (
+        "python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory",
+        "npm run verify:gateway-smoke -- --provision-windows-sandbox",
+        "node scripts/test-packaged-first-send-renderer.mjs --executable",
+    ):
+        assert commands.count(command) == 1
+    assert "--iterations" not in commands
+    first_send = Path("desktop/electron/scripts/test-packaged-first-send-renderer.mjs").read_text(
+        encoding="utf-8",
+    )
+    assert "const DEFAULT_ITERATIONS = 20" in first_send
+    assert "'resources/runtime/gateway/dependency-inventory.json'" in commands
+    assert "--root $installRoot --installed-version $installedVersion" in commands
+    assert "(git rev-parse HEAD).Trim() -ne $env:GITHUB_SHA" in commands
+    assert "$env:RUNNER_ENVIRONMENT -ne 'github-hosted'" in commands
+    assert "Candidate installation deadline exceeded" in commands
+    assert "WaitForExit(180000)" in commands and "WaitForExit(120000)" in commands
+    assert commands.count("-WindowStyle Hidden -PassThru") == 2
+    assert "finally {" in commands and "Invoke-ProofStage 'uninstall'" in commands
+
+
+def test_nsis_aggregate_requires_each_mode_execution_proof_and_original_job_results() -> None:
+    jobs = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]
+    upload = next(s for s in jobs["packaged-security"]["steps"]
+                  if s.get("name") == "Upload required installed packaged execution proof")
+    assert upload["if"] == "always()"
+    assert upload["with"]["name"] == (
+        "nsis-packaged-proof-${{ matrix.probe }}-attempt-${{ github.run_attempt }}"
+    )
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["path"] == (
+        "${{ runner.temp }}/nsis-packaged-proof/${{ matrix.probe }}/"
+    )
+    steps = jobs["acceptance-result"]["steps"]
+    downloads = [s for s in steps
+                 if s.get("uses") == "./.github/actions/download-required-artifact"]
+    assert len(downloads) == 3
+    assert {s["with"]["name"] for s in downloads} == {
+        f"nsis-packaged-proof-{mode}-attempt-${{{{ github.run_attempt }}}}"
+        for mode in ("dependency-audit", "gateway-smoke", "first-interaction")
+    }
+    assert {s["with"]["path"] for s in downloads} == {
+        f"packaged-proofs/{mode}"
+        for mode in ("dependency-audit", "gateway-smoke", "first-interaction")
+    }
+    verify = next(s for s in steps if s.get("name") ==
+                  "Verify all three installed packaged checks against one candidate")
+    assert "python .github/scripts/nsis_packaged_proof.py verify" in verify["run"]
+    assert "--reports-dir packaged-proofs --output packaged-coverage.json" in verify["run"]
+    assert all(steps.index(s) < steps.index(verify) for s in downloads)
+    for step in [*downloads, verify, steps[-1]]:
+        assert step["if"] == "${{ !cancelled() }}"
+        assert not step.get("continue-on-error")
+    coverage = next(s for s in steps if s.get("name") == "Upload installed packaged coverage proof")
+    assert coverage["with"]["if-no-files-found"] == "error"
+    assert coverage["with"]["name"] == "nsis-packaged-coverage-attempt-${{ github.run_attempt }}"
+    assert coverage["with"]["path"] == "packaged-coverage.json"
+    assert steps[-1]["env"]["PACKAGED_SECURITY_RESULT"] == "${{ needs.packaged-security.result }}"
+    diagnostics = {s["with"]["name"]: s for s in jobs["packaged-security"]["steps"]
+                   if s.get("uses") == "actions/upload-artifact@v4"}
+    for artifact, mode in (("frozen-dependency-audit", "dependency-audit"),
+                           ("packaged-first-send-evidence", "first-interaction")):
+        assert diagnostics[artifact]["if"] == f"${{{{ always() && matrix.probe == '{mode}' }}}}"
 
 
 def test_dependency_audit_runs_outside_planner_and_reuse_on_every_ci_trigger() -> None:
@@ -573,6 +744,7 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "Release packaging contracts" in text
     assert "CI result" in text
     assert 'push)\n              before="${{ github.event.before }}"' in text
+    assert 'after="${{ github.event.after }}"' in text
     merge_group_case = text.split("            merge_group)", 1)[1].split(
         "              ;;", 1
     )[0]
@@ -738,16 +910,6 @@ def test_pr_change_selection_uses_merge_base_and_ignores_base_only_changes(
     assert select_changed_files(base_sha, unrelated_sha) == [".ci/run-all"]
 
 
-def test_queue_summary_explains_tree_mismatch_fallback() -> None:
-    text = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
-
-    assert 'if [[ "${REASON_CODE}" == "tree_mismatch" ]]' in text
-    assert "this entry runs the full fail-closed matrix" in text
-    assert "If main advanced" in text
-    assert "wait for a new green PR CI run before requeueing" in text
-    assert "future entry's exact base and tree" in text
-
-
 def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     workflow = _workflow("ci.yml")
     jobs = workflow["jobs"]
@@ -772,8 +934,10 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert set(jobs["plan-ci"]["outputs"]) == {
         "required_suites",
         "desktop_matrix",
+        "windows_profiles_split",
         "python_matrix",
         "platform_matrix",
+        "windows_nsis_profile",
         "python_targets",
         "full_fallback",
         "reason_codes",
@@ -987,11 +1151,10 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_skills/test_retired_workflows.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
@@ -1008,17 +1171,19 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_engine/test_skill_install_settlement.py",
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
+        "tests/test_skills/test_install_operation_io.py",
         "tests/test_skills/test_staging_io_worker.py",
         "tests/test_skill_install_source.py",
         "tests/test_skills_hub_streaming.py",
         "tests/test_skills_hub_streaming_faults.py",
         "tests/test_skills/test_hub_management_service.py",
+        "tests/test_skills/test_hub_rollback_serialization.py",
         "tests/test_skills/test_hub_scanner.py",
         "tests/test_skills/test_hub_transaction_recovery.py",
         "tests/test_skills/test_hub_transaction_process_gates.py",
         "tests/test_gateway/test_rpc_skills_install_visibility.py",
         "tests/test_gateway/test_rpc_skills_exact_identity.py",
-        "tests/test_gateway/test_rpc_skills_coding_gate.py",
+        "tests/test_gateway/test_retired_product_config.py",
         "tests/test_gateway/test_rpc_skills_reload.py",
         "tests/test_gateway/test_skill_management_service_injection.py",
         "tests/test_tools/test_skill_view_resources.py",
@@ -1031,22 +1196,6 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
     }
     assert "not live_skill_hub" in run
     assert "skill-hub" in jobs["ci-result"]["needs"]
-
-def test_default_ci_keeps_main_pushes_targeted_and_manual_runs_full() -> None:
-    ci_path = WORKFLOW_DIR / "ci.yml"
-    if not ci_path.exists():
-        return
-    text = ci_path.read_text(encoding="utf-8")
-
-    assert 'before="${{ github.event.before }}"' in text
-    assert 'after="${{ github.event.after }}"' in text
-    assert (
-        'git diff --no-renames --name-only "${before}" "${after}" > "${changed_files}"'
-        in text
-    )
-    assert 'workflow_dispatch' in text
-    assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
-
 
 def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> None:
     # Generated WebUI files belong to CI artifacts and release packages, not Git.
@@ -1064,7 +1213,7 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     )
     assert "generated Web UI dist must not be committed" in text
     assert "Build verified frontend artifact" in text
-    assert "> public/.DS_Store" in text
+    assert "> public-assets/.DS_Store" in text
     assert "Finder metadata survived WebUI artifact normalization" in text
     assert "npm run verify:release-dist" in text
     assert "Verify sdist-to-wheel frontend artifact round trip" in text
@@ -1074,7 +1223,7 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     assert "ignored Finder metadata leaked into the sdist" in text
     assert 'uv build --wheel --out-dir "${wheel_dir}" "${sdists[0]}"' in text
     assert "python scripts/verify_webui_artifact.py" in text
-    assert "--forbid-personal-bgm" in text
+    assert "--forbid-personal-bgm" not in text
     assert '--wheel "${wheels[0]}"' in text
     assert "Upload verified frontend artifact" in text
     assert "name: opensquilla-webui-dist" in text
@@ -1109,39 +1258,44 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     )
     unit_tests = next(
         step
-        for step in workflow["jobs"]["frontend-check"]["steps"]
+        for step in workflow["jobs"]["frontend-unit-tests"]["steps"]
         if step.get("name") == "Run frontend unit tests"
     )
     assert "npm run build:artifact" in producer["run"]
     assert "npm run build\n" not in producer["run"]
     assert typecheck["run"] == "npm run typecheck"
-    assert "'frontend-validation'" in typecheck["if"]
+    assert "'frontend-validation'" in workflow["jobs"]["frontend-check"]["if"]
+    assert "if" not in typecheck
     # Node is also needed to run the dependency-free staging seam when only
     # the wheel round-trip suite is selected.
     assert "if" not in setup_node
-    assert install_node["if"] == typecheck["if"]
-    assert unit_tests["if"] == typecheck["if"]
+    assert "if" not in install_node and "if" not in unit_tests
+    assert workflow["jobs"]["frontend-check"]["needs"] == ["plan-ci"]
+    assert workflow["jobs"]["frontend-unit-tests"]["needs"] == ["plan-ci"]
+    assert unit_tests["run"] == "npm run test:unit -- --shard=${{ matrix.shard }}/4"
     assert upload["with"]["retention-days"] >= 31
     assert upload["with"]["overwrite"] is True
     assert "opensquilla-webui-dist-attempt-${{ github.run_attempt }}" not in text
     wheel = next(
         step
-        for step in workflow["jobs"]["frontend-check"]["steps"]
+        for step in workflow["jobs"]["wheel-webui-roundtrip"]["steps"]
         if step.get("name") == "Verify sdist-to-wheel frontend artifact round trip"
     )
-    assert "'wheel-webui-roundtrip'" in wheel["if"]
+    assert "'wheel-webui-roundtrip'" in workflow["jobs"]["wheel-webui-roundtrip"]["if"]
+    assert workflow["jobs"]["wheel-webui-roundtrip"]["needs"] == ["plan-ci", "frontend-artifact"]
+    assert "if" not in wheel
     setup_python = next(
         step
-        for step in workflow["jobs"]["frontend-check"]["steps"]
+        for step in workflow["jobs"]["wheel-webui-roundtrip"]["steps"]
         if step.get("name") == "Set up Python"
     )
     setup_uv = next(
         step
-        for step in workflow["jobs"]["frontend-check"]["steps"]
+        for step in workflow["jobs"]["wheel-webui-roundtrip"]["steps"]
         if step.get("name") == "Set up uv"
     )
-    assert setup_python["if"] == wheel["if"]
-    assert setup_uv["if"] == wheel["if"]
+    assert "if" not in setup_python
+    assert "if" not in setup_uv
 
 
 def test_webui_text_and_docker_context_contracts_are_enforced_in_ci() -> None:
@@ -1201,7 +1355,19 @@ def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl()
         "windows-x64",
     }
     assert all(entry["paper_platform_key"] for entry in matrix)
-    macos = {entry["runner"]: entry for entry in matrix if entry["runner"].startswith("macos-")}
+    assert {(entry["runner"], entry["component"]) for entry in matrix} == {
+        (runner, component)
+        for runner in (
+            "ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel", "windows-2022",
+        )
+        for component in ("paper-tex", "media-ffmpeg")
+    }
+    assert len(matrix) == 10
+    macos = {
+        entry["runner"]: {**{key: value for key, value in entry.items() if key != "component"},
+                          "label": entry["label"].split(" / ", 1)[0]}
+        for entry in matrix if entry["runner"].startswith("macos-")
+    }
     assert macos == {
         "macos-15": {
             "label": "macOS Apple Silicon real artifacts",
@@ -1217,9 +1383,8 @@ def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl()
         },
     }
 
-    assert "OPENSQUILLA_GATEWAY_STATE_DIR" not in validate["env"]
-    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT" not in validate["env"]
-    assert validate["env"]["OPENSQUILLA_REQUIRE_MANAGED_TOOLCHAIN_E2E"] == "1"
+    assert "OPENSQUILLA_GATEWAY_STATE_DIR" not in validate.get("env", {})
+    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT" not in validate.get("env", {})
     setup_uv = next(step for step in validate["steps"] if step.get("name") == "Set up uv")
     assert setup_uv["with"]["enable-cache"] is True
 
@@ -1253,12 +1418,15 @@ def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl()
     assert "--component media-ffmpeg" in media_smoke
     assert "--expect-platform-key ${{ matrix.platform_key }}" in media_smoke
     assert "--check-runtime-hot-path" not in media_smoke
-    paper_compile = next(
-        step
-        for step in validate["steps"]
-        if step.get("name") == "Compile the default four-page paper with the managed toolchain"
-    )["run"]
-    assert "test_meta_default_compact_contract_compiles_real_content_to_four_pages" in paper_compile
+    for component in ("paper-tex", "media-ffmpeg"):
+        component_step = next(
+            step for step in validate["steps"]
+            if f"--component {component}" in step.get("run", "")
+        )
+        assert component_step["if"] == "${{ matrix.component == '" + component + "' }}"
+    for step in validate["steps"]:
+        assert not step.get("continue-on-error")
+        assert "|| true" not in step.get("run", "")
 
     musl = workflow["jobs"]["validate-musl-paper"]
     assert musl["runs-on"] == "ubuntu-24.04"
@@ -1641,18 +1809,19 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "tui-check" in jobs
     assert "required_suites" in jobs["frontend-artifact"]["if"]
     assert "'frontend-artifact'" in jobs["frontend-artifact"]["if"]
-    assert jobs["frontend-check"]["needs"] == [
-        "plan-ci",
-        "frontend-artifact",
-    ]
+    assert jobs["frontend-check"]["needs"] == ["plan-ci"]
+    assert jobs["frontend-unit-tests"]["needs"] == ["plan-ci"]
+    assert jobs["gateway-contract-linux"]["needs"] == ["plan-ci"]
+    assert jobs["wheel-webui-roundtrip"]["needs"] == ["plan-ci", "frontend-artifact"]
     assert "'frontend-validation'" in jobs["frontend-check"]["if"]
-    assert "'wheel-webui-roundtrip'" in jobs["frontend-check"]["if"]
+    assert "'wheel-webui-roundtrip'" in jobs["wheel-webui-roundtrip"]["if"]
     assert jobs["gateway-contract-windows"]["needs"] == ["plan-ci"]
     assert jobs["gateway-contract-compare"]["needs"] == [
         "plan-ci",
-        "frontend-check",
+        "gateway-contract-linux",
         "gateway-contract-verification-linux",
         "gateway-contract-windows",
+        "gateway-contract-verification-windows",
     ]
     assert "'frontend-validation'" in jobs["gateway-contract-windows"]["if"]
     assert "'frontend-validation'" in jobs["gateway-contract-compare"]["if"]
@@ -1686,9 +1855,62 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "'managed-toolchain'" in artifact_e2e["if"]
 
 
+def test_windows_bundle_runs_on_four_independent_runners_with_required_coverage() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    bundle = jobs["windows-bundle"]
+    proof = jobs["windows-bundle-coverage"]
+    assert bundle["needs"] == "plan-ci"
+    assert bundle["runs-on"] == "windows-latest"
+    assert bundle["strategy"] == {"fail-fast": False, "matrix": {"shard": [1, 2, 3, 4]}}
+    for job in (bundle, proof):
+        assert "'windows-high-risk'" in job["if"]
+        assert "fromJSON(needs.plan-ci.outputs.python_matrix).windows" in job["if"]
+        assert "'desktop-installer-contracts-1'" in job["if"]
+        assert "!cancelled()" in job["if"]
+        assert not job.get("continue-on-error")
+        assert all(not step.get("continue-on-error") for step in job["steps"])
+    run = next(step["run"] for step in bundle["steps"]
+               if step.get("name") == "Test bundle partition")
+    assert "bundle_test_shards.py run" in run
+    assert '--shard "${{ matrix.shard }}"' in run
+    assert "--maxfail" not in run
+    assert "set -euo pipefail" in run
+    upload = next(step for step in bundle["steps"]
+                  if step.get("uses") == "actions/upload-artifact@v4")
+    assert upload["if"] == "${{ always() }}"
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert proof["needs"] == ["plan-ci", "windows-bundle"]
+    assert proof["runs-on"] == "ubuntu-latest"
+    transfers = [step["with"]["name"] for step in proof["steps"]
+                 if step.get("uses") == "./.github/actions/download-required-artifact"]
+    assert transfers == [f"windows-bundle-{index}-attempt-${{{{ github.run_attempt }}}}"
+                         for index in range(1, 5)]
+    assert any("bundle_test_shards.py verify" in step.get("run", "")
+               for step in proof["steps"])
+    main_step = next(step for step in jobs["windows-full"]["steps"]
+                     if step.get("name") == "Test Windows shard")
+    assert main_step["env"]["PLANNED_PLATFORM_MATRIX"] == (
+        "${{ needs.plan-ci.outputs.platform_matrix }}"
+    )
+    assert 'if [[ "${shard}" == "desktop-installer-contracts-1" ]]' in main_step["run"]
+    assert '--delegate-bundle --planned-platform-matrix "${PLANNED_PLATFORM_MATRIX}"' in (
+        main_step["run"]
+    )
+    assert "delegate-bundle" not in json.dumps(jobs["ubuntu-full"])
+    gate = next(step for step in jobs["ci-result"]["steps"]
+                if step.get("name") == "Check required CI results")
+    for variable, job in (
+        ("RESULT_WINDOWS_BUNDLE", "windows-bundle"),
+        ("RESULT_WINDOWS_BUNDLE_COVERAGE", "windows-bundle-coverage"),
+    ):
+        assert job in jobs["ci-result"]["needs"]
+        assert gate["env"][variable] == "${{ needs." + job + ".result }}"
+    assert gate["env"]["PLANNED_PYTHON_MATRIX"] == "${{ needs.plan-ci.outputs.python_matrix }}"
+
+
 def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> None:
     jobs = _workflow("ci.yml")["jobs"]
-    linux_steps = jobs["frontend-check"]["steps"]
+    linux_steps = jobs["gateway-contract-linux"]["steps"]
     windows = jobs["gateway-contract-windows"]
     windows_steps = windows["steps"]
     comparison = jobs["gateway-contract-compare"]
@@ -1765,7 +1987,8 @@ def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> Non
     uploads = {
         step["with"]["name"]: step["with"]["path"]
         for producer in (
-            "frontend-check", "gateway-contract-verification-linux", "gateway-contract-windows"
+            "gateway-contract-linux", "gateway-contract-verification-linux",
+            "gateway-contract-windows", "gateway-contract-verification-windows"
         )
         for step in jobs[producer]["steps"]
         if step.get("uses") == "actions/upload-artifact@v4"
@@ -1781,7 +2004,7 @@ def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> Non
 def test_contract_generation_reuses_two_fresh_parallel_renders_for_production() -> None:
     jobs = _workflow("ci.yml")["jobs"]
     for job_id, step_name in (
-        ("frontend-check", "Verify deterministic Contract generation"),
+        ("gateway-contract-linux", "Verify deterministic Contract generation"),
         (
             "gateway-contract-windows",
             "Verify Windows Contract generation and real toolchain",
@@ -1816,17 +2039,27 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "readme-locale-check",
         "frontend-artifact",
         "frontend-check",
+        "frontend-unit-tests",
+        "gateway-contract-linux",
+        "wheel-webui-roundtrip",
         "gateway-contract-verification-linux",
         "gateway-contract-windows",
+        "gateway-contract-verification-windows",
         "gateway-contract-compare",
         "webui-chat-recovery",
+        "webui-capacity",
         "tui-check",
         "desktop-check",
         "ubuntu-quality",
         "ubuntu-full",
+        "python-stress",
         "windows-full",
+        "windows-bundle",
+        "windows-bundle-coverage",
         "macos-recovery",
         "desktop-recovery-e2e",
+        "windows-profiles-coverage",
+        "desktop-native-probes",
         "skill-hub",
         "release-packaging",
         "managed-toolchain-artifacts",
@@ -1839,6 +2072,15 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     assert gate_step["env"]["RESULT_FRONTEND_ARTIFACT"] == (
         "${{ needs.frontend-artifact.result }}"
     )
+    for variable, job_id in {
+        "RESULT_FRONTEND_UNIT": "frontend-unit-tests",
+        "RESULT_WHEEL_WEBUI": "wheel-webui-roundtrip",
+        "RESULT_CONTRACT_LINUX": "gateway-contract-linux",
+        "RESULT_CONTRACT_VERIFICATION_WINDOWS": "gateway-contract-verification-windows",
+        "RESULT_DESKTOP_NATIVE": "desktop-native-probes",
+        "RESULT_WEBUI_CAPACITY": "webui-capacity",
+    }.items():
+        assert gate_step["env"][variable] == "${{ needs." + job_id + ".result }}"
     assert gate_step["env"]["RESULT_CONTRACT_WINDOWS"] == (
         "${{ needs.gateway-contract-windows.result }}"
     )
@@ -1851,6 +2093,12 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     )
     assert gate_step["env"]["RESULT_DESKTOP_RECOVERY_E2E"] == (
         "${{ needs.desktop-recovery-e2e.result }}"
+    )
+    assert gate_step["env"]["RESULT_WINDOWS_PROFILES_COVERAGE"] == (
+        "${{ needs.windows-profiles-coverage.result }}"
+    )
+    assert gate_step["env"]["PLANNED_DESKTOP_MATRIX"] == (
+        "${{ needs.plan-ci.outputs.desktop_matrix }}"
     )
     assert gate_step["env"]["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] == (
         "${{ needs.managed-toolchain-artifacts.result }}"
@@ -1869,17 +2117,29 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "RESULT_README_LOCALE",
         "RESULT_FRONTEND_ARTIFACT",
         "RESULT_FRONTEND",
+        "RESULT_FRONTEND_UNIT",
+        "RESULT_CONTRACT_LINUX",
+        "RESULT_WHEEL_WEBUI",
         "RESULT_CONTRACT_WINDOWS",
+        "RESULT_CONTRACT_VERIFICATION_WINDOWS",
         "RESULT_CONTRACT_VERIFICATION_LINUX",
         "RESULT_CONTRACT_COMPARE",
         "RESULT_TUI",
         "RESULT_DESKTOP",
         "RESULT_UBUNTU",
         "RESULT_UBUNTU_FULL",
+        "RESULT_PYTHON_STRESS",
         "RESULT_WINDOWS_FULL",
+        "RESULT_WINDOWS_BUNDLE",
+        "RESULT_WINDOWS_BUNDLE_COVERAGE",
+        "PLANNED_PYTHON_MATRIX",
         "RESULT_MACOS_RECOVERY",
         "RESULT_DESKTOP_RECOVERY_E2E",
+        "RESULT_WINDOWS_PROFILES_COVERAGE",
+        "PLANNED_DESKTOP_MATRIX",
+        "RESULT_DESKTOP_NATIVE",
         "RESULT_WEBUI_CHAT_RECOVERY",
+        "RESULT_WEBUI_CAPACITY",
         "RESULT_RELEASE",
         "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",
         "RESULT_SKILL_HUB",
@@ -1922,6 +2182,29 @@ def test_desktop_case_arguments_work_with_nounset(
         expected += ["--connection-faults", "--flow-control", "--idle-send",
                      "--background-ms=65000"]
     assert command == expected
+
+
+def test_desktop_quit_success_evidence_excludes_browser_profiles(tmp_path: Path) -> None:
+    summary = next(
+        step for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Upload Desktop recovery summary"
+    )
+    prefix = "${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/"
+    patterns = [line.removeprefix(prefix) for line in summary["with"]["path"].splitlines()
+                if line.startswith(prefix)]
+    assert patterns == ["*.json", "*.png"]
+    # Only top-level results and layout evidence are retained on success.
+    # Profiles contain Chromium storage and fixture receipts and remain local.
+    expected = {"results.json", "ask-en-dark.json", "ask-en-dark.png"}
+    for name in [*expected, "attempt.log", "profile-test/events.json",
+                 "profile-test/preferences.json", "profile-test/chromium/Preferences",
+                 "profile-test/chromium/storage.json", "profile-test/capture.png"]:
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("synthetic fixture data", encoding="utf-8")
+    selected = {path.relative_to(tmp_path).as_posix()
+                for pattern in patterns for path in tmp_path.glob(pattern)}
+    assert selected == expected
 
 
 def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> None:
@@ -1987,14 +2270,32 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "history-hydration.spec.ts" in session_recovery["run"]
     # Select by a stable contract tag, not the scenario's human-readable title.
     # Renaming the test must not silently leave this release-platform gate empty.
-    assert '--grep "@session-hang-recovery"' in session_recovery["run"]
-    assert '--grep "@plan-goal-runtime"' in session_recovery["run"]
+    assert '--grep "@session-hang-recovery|@plan-goal-runtime"' in session_recovery["run"]
     for spec in ("plan-presentation.spec.ts", "task-progress.spec.ts", "goal-mode.spec.ts"):
         assert spec in session_recovery["run"]
         assert "@plan-goal-runtime" in Path("opensquilla-webui/e2e", spec).read_text(
             encoding="utf-8"
         )
     assert "--retries=0" in session_recovery["run"]
+    modern_recovery = next(
+        step for step in steps
+        if step.get("name") == "Run cross-platform modern session recovery contracts"
+    )
+    browser_commands = [
+        *session_recovery["run"].split("npm run test:e2e --")[1:],
+        *modern_recovery["run"].split("npm run test:e2e --")[1:],
+    ]
+    # Zero-retry failures need traces on the first attempt, inside the uploaded
+    # tree. Separate output directories prevent later suites deleting evidence.
+    browser_cases = (
+        "session-hang-recovery", "modern-session-recovery",
+    )
+    assert len(browser_commands) == len(browser_cases)
+    for command, case in zip(browser_commands, browser_cases, strict=True):
+        assert "--workers=1" in command
+        assert "--retries=0" in command
+        assert "--trace retain-on-failure" in command
+        assert f'--output "${{CI_REPORT_DIR}}/{case}-results"' in command
     recovery_spec = Path("opensquilla-webui/e2e/history-hydration.spec.ts").read_text(
         encoding="utf-8"
     )
@@ -2054,11 +2355,11 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert 'if classify_retryable_infrastructure_failure "${name}" "${first_log}"' in (
         run["run"]
     )
-    assert '"windows-delete-helper-handoff-timeout-v1"' in run["run"]
+    assert '"windows-delete-helper-handoff-timeout-v1"' not in run["run"]
     assert '"windows-isolated-acl-worker-timeout-v1"' in run["run"]
     assert '"windows-loopback-no-buffer-space-v1"' in run["run"]
     assert '"macos-electron-foreground-prerequisite-v1"' in run["run"]
-    assert '"cases": {"desktop-cleanup-flow"}' in run["run"]
+    assert '"cases": {"desktop-cleanup-flow"}' not in run["run"]
     assert '"cases": {"native-workbench-v2"}' in run["run"]
     assert '"classification": matches[0] if retryable else "non_retryable"' in (
         run["run"]
@@ -2091,17 +2392,190 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "node scripts/test-ci-case-telemetry.mjs" in desktop_unit["run"]
 
 
+def test_windows_profile_split_keeps_shared_setup_and_original_browser_router_checks() -> None:
+    job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
+    steps = {step["name"]: step for step in job["steps"] if "name" in step}
+    assert job["needs"] == ["plan-ci", "frontend-artifact"]
+    assert job["strategy"]["fail-fast"] is False
+    for name in (
+        "Download verified frontend artifact", "Install Python dependencies",
+        "Install Desktop dependencies", "Prepare and verify pinned Electron binary",
+        "Stage verified frontend artifact for Desktop", "Build Desktop TypeScript",
+    ):
+        assert "if" not in steps[name], f"dedicated profile runners need {name}"
+        assert not steps[name].get("continue-on-error")
+    browser_condition = (
+        "${{ (runner.os == 'Windows' || runner.os == 'macOS') && "
+        "matrix.shard == 'profiles' }}"
+    )
+    for name in (
+        "Run cross-platform production-dist browser session hang contract",
+        "Run cross-platform modern session recovery contracts",
+        "Restore Playwright browser", "Install WebUI recovery browser",
+    ):
+        assert steps[name]["if"] == browser_condition
+    router = steps["Verify compiled Desktop Router against Gateway provider mutations"]
+    assert router["if"] == "${{ !startsWith(matrix.shard, 'profiles-') }}"
+    assert router["env"]["OPENSQUILLA_REQUIRE_DESKTOP_ROUTER_BRIDGE"] == "1"
+    assert "test_router_provider_bridge.py" in router["run"]
+    assert "test_router_catalog_generation.py" in router["run"]
+    native = steps["Test native Windows audit write-view contracts"]
+    assert native["if"] == "${{ runner.os == 'Windows' && matrix.shard == 'ownership' }}"
+    assert "test_windows_signed_update_audit.py" in native["run"]
+    flow = steps["Run compiled Desktop recovery flows"]
+    assert flow["env"]["PLANNED_DESKTOP_MATRIX"] == (
+        "${{ needs.plan-ci.outputs.desktop_matrix }}"
+    )
+    assert "windows_profile_cases.py select" in flow["run"]
+    assert '--planned-desktop-matrix "${PLANNED_DESKTOP_MATRIX}"' in flow["run"]
+    assert flow["run"].count('for entry in "${entries[@]}"') == 1
+    assert flow["run"].count('run_case "${name}" "${script}" 1') == 1
+
+
+@pytest.mark.parametrize("runner_os,shard,selected,expected", [
+    ("Windows", "profiles", "", ()),
+    *[("Windows", f"profiles-{case}", f"{case}:scripts/test-{case}.mjs", (case,))
+      for case in WINDOWS_PROFILE_CASES],
+    ("macOS", "profiles", "", WINDOWS_PROFILE_CASES),
+    ("Linux", "all", "", (
+        "profile-consolidation-flow", "primary-repair-accessibility", "profile-import-flow",
+        "desktop-cleanup-flow", "gateway-ownership", "gateway-orphan-recovery-flow",
+        "window-background-flow", "desktop-quit-interaction", "theme-flow",
+        "native-workbench-surface", "desktop-zoom-shortcuts", "native-workbench-v2",
+        "desktop-browser",
+        "desktop-browser-electron", "live-html-business", "unsafe-legacy-recovery-no-write",
+    )),
+])
+def test_profile_dispatcher_selects_independent_cases_without_duplicate_legacy_runs(
+    tmp_path: Path, runner_os: str, shard: str, selected: str, expected: tuple[str, ...],
+) -> None:
+    flow = next(s["run"] for s in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+                if s.get("name") == "Run compiled Desktop recovery flows")
+    selection = flow[flow.index("select_windows_profile_cases() {"):]
+    selection = selection.split('for entry in "${entries[@]}"', 1)[0]
+    selection = selection.replace("${{ matrix.shard }}", shard)
+    # Substitute only the independently tested native selector. Execute the
+    # actual workflow dispatcher/arg handling, including Windows CRLF output.
+    script = '''python() {
+      [[ "$1" == '../../.github/scripts/windows_profile_cases.py' ]]
+      [[ "$2" == 'select' && "$3" == '--shard' && "$4" == "$TEST_SHARD" ]]
+      [[ "$5" == '--planned-desktop-matrix' && "$6" == "$PLANNED_DESKTOP_MATRIX" ]]
+      [[ "$7" == '--report-dir' && "$8" == "$CI_REPORT_DIR" ]]
+      printf 'selector-called\\n' >&2
+      if [[ -n "$SELECTED_ENTRY" ]]; then printf '%s\\r\\n' "$SELECTED_ENTRY"; fi
+    }
+    ''' + selection + '\nfor entry in "${entries[@]}"; do printf "%s\\n" "$entry"; done\n'
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", script],
+        env={**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": runner_os,
+             "TEST_SHARD": shard, "SELECTED_ENTRY": selected,
+             "PLANNED_DESKTOP_MATRIX": '[{"os":"windows-latest","shard":"profiles"}]'},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    specialized_scripts = {
+        "gateway-ownership": "desktop-gateway-ownership",
+        "gateway-orphan-recovery-flow": "desktop-gateway-orphan-recovery-flow",
+        "window-background-flow": "desktop-window-background-flow",
+        "desktop-quit-interaction": "desktop-quit-native-acceptance",
+        "theme-flow": "desktop-theme-flow",
+        "native-workbench-surface": "native-workbench-surface-electron",
+        "native-workbench-v2": "native-workbench-v2-electron",
+    }
+    assert result.stdout.splitlines() == [
+        f"{case}:scripts/test-{specialized_scripts.get(case, case)}.mjs" for case in expected
+    ]
+    assert result.stderr.count("selector-called") == (1 if runner_os == "Windows" else 0)
+    if runner_os == "Windows":
+        assert b"\r" not in (tmp_path / "profile-entries.txt").read_bytes()
+
+
+def test_profile_selector_failure_cannot_turn_into_an_empty_successful_owner(
+    tmp_path: Path,
+) -> None:
+    flow = next(s["run"] for s in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+                if s.get("name") == "Run compiled Desktop recovery flows")
+    selection = flow[flow.index("select_windows_profile_cases() {"):]
+    selection = selection.split('for entry in "${entries[@]}"', 1)[0]
+    selection = selection.replace("${{ matrix.shard }}", "profiles")
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c",
+         'python() { return 2; }\n' + selection + '\nprintf "UNSAFE_CONTINUATION\\n"\n'],
+        env={**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": "Windows",
+             "PLANNED_DESKTOP_MATRIX": "[]"},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "UNSAFE_CONTINUATION" not in result.stdout
+
+
+def test_zero_electron_owner_still_requires_a_manifest_and_telemetry_file(tmp_path: Path) -> None:
+    step = next(s for s in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+                if s.get("name") == "Check local desktop-summary files")
+    for name in ("environment.txt", "first-failure.txt"):
+        (tmp_path / name).write_text("retained required checks completed\n", encoding="utf-8")
+    telemetry = tmp_path / "desktop-e2e-cases.jsonl"
+    telemetry.touch()
+    command = [_bash_executable(), "-euo", "pipefail", "-c",
+               step["run"].replace("${{ matrix.shard }}", "profiles")]
+    env = {**os.environ, "CI_REPORT_DIR": tmp_path.as_posix(), "RUNNER_OS": "Windows"}
+    assert subprocess.run(command, env=env, capture_output=True).returncode != 0
+    (tmp_path / "windows-profile-manifest.json").write_text('{"selected": []}', encoding="utf-8")
+    assert subprocess.run(command, env=env, capture_output=True).returncode == 0
+    telemetry.unlink()
+    assert subprocess.run(command, env=env, capture_output=True).returncode != 0
+
+
+def test_windows_profile_coverage_requires_all_seven_artifacts_and_gates_ci() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    producer = jobs["desktop-recovery-e2e"]
+    coverage = jobs["windows-profiles-coverage"]
+    assert coverage["needs"] == ["plan-ci", "desktop-recovery-e2e"]
+    assert "!cancelled()" in coverage["if"]
+    assert "needs.plan-ci.outputs.windows_profiles_split == 'true'" in coverage["if"]
+    assert "needs.desktop-recovery-e2e.result == 'success'" not in coverage["if"]
+    required = next(s for s in producer["steps"]
+                    if s.get("name") == "Upload required Windows profiles execution evidence")
+    assert "always()" in required["if"] and "runner.os == 'Windows'" in required["if"]
+    assert "matrix.shard == 'profiles'" in required["if"]
+    assert "startsWith(matrix.shard, 'profiles-')" in required["if"]
+    assert not required.get("continue-on-error")
+    assert required["with"]["if-no-files-found"] == "error"
+    assert required["with"]["name"] == (
+        "windows-profiles-${{ matrix.shard }}-attempt-${{ github.run_attempt }}"
+    )
+    for filename in (
+        "windows-profile-manifest.json", "desktop-e2e-cases.jsonl", "first-failure.txt",
+    ):
+        assert filename in required["with"]["path"]
+    downloads = [s for s in coverage["steps"]
+                 if s.get("uses") == "./.github/actions/download-required-artifact"]
+    shards = ("profiles", *(f"profiles-{case}" for case in WINDOWS_PROFILE_CASES))
+    assert len(downloads) == len(shards) == 7
+    assert {s["with"]["name"] for s in downloads} == {
+        f"windows-profiles-{shard}-attempt-${{{{ github.run_attempt }}}}" for shard in shards
+    }
+    assert len({s["with"]["path"] for s in downloads}) == 7
+    assert all(s["if"] == "${{ !cancelled() }}" and not s.get("continue-on-error")
+               for s in downloads)
+    verify = next(s for s in coverage["steps"]
+                  if s.get("name") == "Verify all six Windows profile scripts execute exactly once")
+    assert verify["if"] == "${{ !cancelled() }}"
+    assert "windows_profile_cases.py verify" in verify["run"]
+    assert "--reports-dir" in verify["run"]
+    assert not verify.get("continue-on-error")
+    upload = next(s for s in coverage["steps"]
+                  if s.get("name") == "Upload Windows profiles coverage proof")
+    assert upload["if"] == "${{ always() }}"
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert not upload.get("continue-on-error")
+    assert "windows-profiles-coverage" in jobs["ci-result"]["needs"]
+
+
 @pytest.mark.parametrize("line_ending", ("\n", "\r\n"), ids=("lf", "crlf"))
 @pytest.mark.parametrize(
     ("case_name", "runner_os", "message", "expected_signature"),
     (
-        (
-            "desktop-cleanup-flow",
-            "Windows",
-            "Error: Timed out waiting for post-exit delete-all helper completion: ; "
-            "pending synthetic targets: synthetic-home\n",
-            "windows-delete-helper-handoff-timeout-v1",
-        ),
         (
             "native-workbench-v2",
             "Windows",
@@ -2225,6 +2699,56 @@ def test_desktop_retry_classifier_rejects_similar_windows_loopback_failures(
             sys.executable,
             "-",
             "native-workbench-v2",
+            "Windows",
+            str(log),
+            str(output),
+            str(evidence),
+        ],
+        input=classifier,
+        text=True,
+        check=False,
+    )
+
+    assert rejected.returncode == 1
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["classification"] == "non_retryable"
+    assert record["retryable"] is False
+    assert list(evidence.iterdir()) == []
+
+
+@pytest.mark.parametrize("line_ending", ("\n", "\r\n"), ids=("lf", "crlf"))
+@pytest.mark.parametrize(
+    "pending_targets",
+    ("primary-home, consolidation-backup, desktop-logs", "primary-home"),
+    ids=("all-targets", "one-target"),
+)
+def test_desktop_retry_classifier_rejects_unexplained_delete_helper_timeout(
+    tmp_path: Path, line_ending: str, pending_targets: str,
+) -> None:
+    run = next(
+        step["run"]
+        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
+        if step.get("name") == "Run compiled Desktop recovery flows"
+    )
+    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    log = tmp_path / "attempt-1.log"
+    output = tmp_path / "classifications.jsonl"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    # This was previously retried without proof that the helper failure came
+    # from runner infrastructure. Preserve the exact signature as a rejection.
+    log.write_bytes(
+        (
+            "Error: Timed out waiting for post-exit delete-all helper completion: ; "
+            f"pending synthetic targets: {pending_targets}{line_ending}"
+        ).encode()
+    )
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "-",
+            "desktop-cleanup-flow",
             "Windows",
             str(log),
             str(output),
@@ -2429,11 +2953,11 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
     assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
     assert "--workers=2" in run["run"]
-    selected_specs = {
-        argument
-        for argument in run["run"].split()
-        if argument.endswith(".spec.ts")
-    }
+    selector = runpy.run_path(".github/scripts/webui_browser_suites.py")
+    assert "webui_browser_suites.py" in run["run"]
+    assert "matrix.suite" in run["run"]
+    selected_specs = {spec for shard in selector["GENERAL_SHARDS"]
+                      for spec in selector["specs_for_suite"](shard)}
     required_specs = {
         "assistant-activity.spec.ts",
         "auth-connection-recovery.spec.ts",
@@ -2441,9 +2965,12 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "chat-send-lifecycle.real.spec.ts",
         "cross-window-sync.real.spec.ts",
         "composer-paste.spec.ts",
+        "durable-delivery.spec.ts",
         "ensemble-new-task-legacy-turn.spec.ts",
         "goal-mode.spec.ts",
+        "history-content-reading.spec.ts",
         "history-hydration.spec.ts",
+        "http-delivery.spec.ts",
         "idle-chat-recovery.spec.ts",
         "modern-session-recovery.spec.ts",
         "new-task-ensemble-race.spec.ts",
@@ -2451,9 +2978,18 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "plan-presentation.spec.ts",
         "task-progress.spec.ts",
         "provider-error-experience.spec.ts",
+        "retired-bgm-upgrade.spec.ts",
+        "support-bundle.spec.ts",
+        "console-clarity.spec.ts",
+        "mobile-tabs.spec.ts",
+        "header-responsive.spec.ts",
+        "topbar-global-controls.spec.ts",
+        "topbar-visual.spec.ts",
         "router-physical-model.spec.ts",
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",
+        "session-chat-reliability.real.spec.ts",
+        "session-delivery-feedback.spec.ts",
         "session-switch-transport.spec.ts",
         "share.spec.ts",
         "user-message-newlines.spec.ts",
@@ -2461,6 +2997,32 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     assert selected_specs == required_specs
     for spec in required_specs:
         assert (Path("opensquilla-webui/e2e") / spec).is_file()
+
+
+def test_webui_chat_recovery_prepares_fonts_for_isolated_vite_fixtures() -> None:
+    steps = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]["steps"]
+    install = next(
+        step for step in steps if step.get("name") == "Install frontend dependencies"
+    )
+    prepare = next(
+        step
+        for step in steps
+        if step.get("name") == "Prepare pinned offline Office preview assets"
+    )
+    browser = next(
+        step
+        for step in steps
+        if step.get("name") == "Run production-dist chat and Goal recovery browser contracts"
+    )
+
+    assert steps.index(install) < steps.index(prepare) < steps.index(browser)
+    assert prepare["working-directory"] == "opensquilla-webui"
+    assert prepare["run"].splitlines() == [
+        "npm run prepare:office-assets",
+        "npm run prepare:office-assets -- --offline",
+    ]
+    assert "if" not in prepare
+    assert not prepare.get("continue-on-error")
 
 
 def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
@@ -2471,17 +3033,19 @@ def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
         if step.get("name") == "Run production-dist long-list virtualization contracts"
     )
     assert run["working-directory"] == "opensquilla-webui"
-    assert "if" not in run
+    assert run["if"] == "${{ matrix.suite == 'virtualization' }}"
     assert not run.get("continue-on-error")
     assert "--workers=1" in run["run"]
     assert "--retries=0" in run["run"]
     assert "--output=test-results/virtualization" in run["run"]
-    selected_specs = {arg for arg in run["run"].split() if arg.endswith(".spec.ts")}
+    assert "--grep-invert=@capacity" in run["run"]
+    selector = runpy.run_path(".github/scripts/webui_browser_suites.py")
+    assert "webui_browser_suites.py virtualization" in run["run"]
+    selected_specs = set(selector["specs_for_suite"]("virtualization"))
     assert selected_specs == {
         "chat-virtualization.spec.ts",
         "conversation-minimap.spec.ts",
         "floating-composer.spec.ts",
-        "virtualized-logs.spec.ts",
         "long-task-resilience.spec.ts",
         "native-gateway.spec.ts",
         "sidebar-drag.spec.ts",
@@ -2490,6 +3054,45 @@ def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
     }
     for spec in selected_specs:
         assert (Path("opensquilla-webui/e2e") / spec).is_file()
+
+
+def test_browser_capacity_phase_cannot_be_skipped_behind_a_green_browser_job() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    job = jobs["webui-chat-recovery"]
+    admission = next(step for step in job["steps"] if step.get("id") == "capacity-inventory")
+    assert "if" not in admission
+    assert not admission.get("continue-on-error")
+    assert (
+        "tests/test_ci/test_webui_browser_suites.py"
+    ) in admission["run"]
+    # The browser job already gets pytest through its locked default dev
+    # group; this synchronous check must not require the optional xdist extra.
+    assert "uv run --no-sync pytest" in admission["run"]
+    assert "-n" not in admission["run"].split()
+    capacity_job = jobs["webui-capacity"]
+    assert "'webui-capacity'" in capacity_job["if"]
+    assert capacity_job["needs"] == ["plan-ci", "frontend-artifact"]
+    capacity = next(step for step in capacity_job["steps"] if step.get("id") == "webui-capacity")
+    assert "if" not in capacity
+    assert not capacity.get("continue-on-error")
+    assert capacity["working-directory"] == "opensquilla-webui"
+    for argument in ("--grep=@capacity", "--workers=1", "--retries=0"):
+        assert argument in capacity["run"]
+    targets = {arg for arg in capacity["run"].split() if arg.endswith(".spec.ts")}
+    marked = {
+        path.name for path in Path("opensquilla-webui/e2e").glob("*.spec.ts")
+        if re.search(r"\btag:[^\r\n]*['\"]@capacity['\"]", path.read_text(encoding="utf-8"))
+    }
+    assert marked == targets == {"long-task-resilience.spec.ts", "sidebar-virtualization.spec.ts"}
+    assert "webui-capacity" in jobs["ci-result"]["needs"]
+    assert "webui-chat-recovery" not in capacity_job["needs"]
+    gate = next(
+        step for step in jobs["ci-result"]["steps"]
+        if step.get("name") == "Check required CI results"
+    )
+    assert gate["env"]["RESULT_WEBUI_CAPACITY"] == (
+        "${{ needs.webui-capacity.result }}"
+    )
 
 
 def test_tui_check_owns_the_bun_contract() -> None:
@@ -2529,6 +3132,15 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     }
     checkout = next(step for step in steps if step.get("name") == "Check out repository")
     assert checkout["with"]["lfs"] is True
+    setup_node = next(step for step in steps if step.get("name") == "Set up Node.js")
+    assert setup_node["uses"] == "actions/setup-node@v4"
+    assert setup_node["with"] == {"node-version": "22.23.3"}
+    assert "if" not in setup_node
+    versions = next(step for step in steps if step.get("name") == "Record tool versions")
+    assert steps.index(checkout) < steps.index(setup_node) < steps.index(versions)
+    assert steps.index(versions) < steps.index(test_step)
+    assert "node --version" in versions["run"]
+    assert "node -p 'process.execPath'" in versions["run"]
     bun_step = next(step for step in steps if step.get("name") == "Set up Bun")
     assert bun_step["if"] == "${{ startsWith(matrix.shard, 'core-') }}"
     assert steps[0]["name"] == "Prepare diagnostic report"
@@ -2634,6 +3246,9 @@ def test_windows_high_risk_job_cannot_wash_test_failures_green() -> None:
 
 def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -> None:
     job = _workflow("ci.yml")["jobs"]["macos-recovery"]
+    setup_node = next(
+        step for step in job["steps"] if step.get("name") == "Set up Node.js"
+    )
     test_step = next(
         step
         for step in job["steps"]
@@ -2649,9 +3264,21 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
     assert job["name"] == "macOS profile recovery and native no-replace (3.12)"
     assert job["runs-on"] == "macos-latest"
     assert job["timeout-minutes"] == 30
+    assert setup_node["uses"] == "actions/setup-node@v4"
+    assert setup_node["with"] == {
+        "node-version-file": "opensquilla-webui/.node-version"
+    }
+    assert "if" not in setup_node
+    assert job["steps"].index(setup_node) < job["steps"].index(test_step)
     assert "tests/test_recovery" in test_step["run"]
     assert "tests/test_migration/test_opensquilla_home_migration.py" in test_step["run"]
     assert "tests/test_desktop/test_electron_startup_contract.py" in test_step["run"]
+    for path in (
+        "tests/test_scripts/test_verify_webui_artifact.py",
+        "tests/test_scripts/test_stage_webui_artifact.py",
+        "tests/test_packaging/test_webui_build_contract.py",
+    ):
+        assert path in test_step["run"]
     assert "set -euo pipefail" in test_step["run"]
     assert "pytest_args=(" in test_step["run"]
     assert 'uv run pytest "${pytest_args[@]}"' in test_step["run"]
@@ -2672,7 +3299,7 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
 
 
 def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
-    job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
+    job = _workflow("desktop-native-probes.yml")["jobs"]["native"]
     steps = job["steps"]
     source = next(step for step in steps if step.get("name") == (
         "Verify MCP transports and Desktop bridge on the native platform"
@@ -2680,9 +3307,15 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     frozen = next(step for step in steps if step.get("name") == (
         "Verify the frozen production MCP probe and bridge"
     ))
-    assert source["if"] == frozen["if"]
-    for shard in ("ownership", "ownership-workbench", "all"):
-        assert f"matrix.shard == '{shard}'" in source["if"]
+    assert source["if"] == "${{ matrix.probe == 'mcp' }}"
+    assert frozen["if"] == "${{ matrix.probe == 'frozen' }}"
+    cells = {(cell["os"], cell["probe"]) for cell in job["strategy"]["matrix"]["include"]}
+    assert cells == {
+        (os_name, probe)
+        for os_name in ("ubuntu-latest", "macos-latest", "windows-latest")
+        for probe in ("pty", "mcp", "frozen")
+    } | {("ubuntu-latest", "docker")}
+    assert job["strategy"]["fail-fast"] is False
     for target in ("tests/test_mcp", "tests/test_mcp_server",
                    "tests/test_desktop/test_gateway_functional_probes.py::"
                    "test_mcp_probe_uses_real_stdio_server_and_gateway"):
@@ -2691,19 +3324,18 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     assert "desktop/electron/scripts/verify-mcp-frozen.py" in frozen["run"]
     assert "set -euo pipefail" in source["run"]
     assert "set -euo pipefail" in frozen["run"]
-    assert steps.index(source) < steps.index(frozen)
+    assert "needs" not in job  # Each probe starts in an independent matrix cell.
     container = next(step for step in steps if step.get("name") == (
         "Build production Docker image and verify MCP"
     ))
-    assert "runner.os == 'Linux'" in container["if"]
-    for shard in ("ownership", "ownership-workbench", "all"):
-        assert f"matrix.shard == '{shard}'" in container["if"]
+    assert container["if"] == "${{ matrix.probe == 'docker' }}"
     assert 'git lfs pull --include="src/opensquilla/squilla_router/models/' in container["run"]
     assert "docker build --file Dockerfile" in container["run"]
     assert "docker run --rm -i --entrypoint python" in container["run"]
     assert "readonly" in container["run"]
     assert "docker image inspect --format '{{json .Size}}'" in container["run"]
-    assert 'sdk_version == "2.2.0"' in container["run"]
+    assert 'requires("opensquilla")' in container["run"]
+    assert "sdk_version in sdk_requirement.specifier" in container["run"]
     assert "create_mcp_server()" in container["run"]
     assert "MCPStdioClient(MCPServerConfig(" in container["run"]
     assert "set -euo pipefail" in container["run"]
@@ -2714,20 +3346,52 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     )[0], "docker-mcp-smoke", "exec")
 
 
+@pytest.mark.parametrize("sdk_version,allowed", [
+    ("2.2.0", True), ("2.3.0", True), ("2.1.0", False), ("3.0.0", False),
+])
+def test_container_mcp_sdk_version_obeys_installed_package_contract(
+    sdk_version: str, allowed: bool,
+) -> None:
+    steps = _workflow("desktop-native-probes.yml")["jobs"]["native"]["steps"]
+    container = next(step for step in steps if step.get("name") == (
+        "Build production Docker image and verify MCP"
+    ))
+    script = container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit("\nPY", 1)[0]
+    check = next(node for node in ast.parse(script).body
+                 if isinstance(node, ast.FunctionDef) and node.name == "check_sdk_version")
+    namespace = {
+        "version": lambda name: sdk_version,
+        "requires": lambda name: ["anyio>=4", "mcp>=2.2.0,<3"],
+        "Requirement": Requirement,
+    }
+    exec(compile(ast.Module(body=[check], type_ignores=[]), "docker-mcp-version", "exec"),
+         namespace)
+    if allowed:
+        assert namespace["check_sdk_version"]() == sdk_version
+    else:
+        with pytest.raises(AssertionError, match=re.escape(sdk_version)):
+            namespace["check_sdk_version"]()
+
+
 def test_native_desktop_cells_require_recommended_pty_before_managed_smoke() -> None:
-    job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
+    job = _workflow("desktop-native-probes.yml")["jobs"]["native"]
     steps = job["steps"]
-    install = next(step for step in steps if step.get("name") == "Install Python dependencies")
+    install = next(step for step in steps if step.get("name") == "Prepare native probe environment")
     probe = next(step for step in steps if step.get("name") == (
         "Verify recommended PTY and managed execution on the native platform"
     ))
     assert "--extra recommended" in install["run"]
     assert steps.index(install) < steps.index(probe)
-    for shard in ("ownership", "ownership-workbench", "all"):
-        assert f"matrix.shard == '{shard}'" in probe["if"]
+    assert probe["if"] == "${{ matrix.probe == 'pty' }}"
     run = probe["run"]
     assert "set -euo pipefail" in run
-    assert "gateway-entry.py --_desktop-pty-probe" in run
+    assert run.count("gateway-entry.py --_desktop-pty-probe") == 2
+    assert 'pty_probe_statuses=("${PIPESTATUS[@]}")' in run
+    assert '"${RUNNER_OS}" != "Windows"' in run
+    assert '"available": false, "ioMode": "error"' in run
+    assert '\"reason\": \"PTY probe timed out\"' in run
+    assert '"${#pty_probe_lines[@]}" -ne 1' in run
+    assert 'pty-capability-attempt-2.log' in run
     assert "test_unified_exec_real_pty_reports_tty_and_accepts_input" in run
     assert run.index("--_desktop-pty-probe") < run.index("uv run --no-sync pytest")
     assert "continue-on-error" not in probe
@@ -2803,7 +3467,9 @@ def test_ubuntu_quality_keeps_targeted_pr_tests_and_full_ci_uses_balanced_matrix
     }
     assert ubuntu_full["timeout-minutes"] == 20
     assert ".github/scripts/windows_test_shards.py run" in full_test_step["run"]
-    assert '"${{ matrix.shard }}" == "gateway-sqlite"' in full_test_step["run"]
+    assert 'family="${{ matrix.shard }}"' in full_test_step["run"]
+    assert 'family="${family%-*}"' in full_test_step["run"]
+    assert '"${family}" == "gateway-sqlite"' in full_test_step["run"]
     assert "worker_args+=(--workers=2)" in full_test_step["run"]
     assert "maxfail_args+=(--maxfail=3)" in full_test_step["run"]
     assert '"${maxfail_args[@]}"' in full_test_step["run"]
@@ -3025,7 +3691,75 @@ def test_container_release_smoke_serves_control_ui_entry_assets() -> None:
     assert 'path.endswith(".css")' in script
     assert 'docker exec "${container_id}" curl --fail --silent --show-error' in script
     build = next(step for step in steps if step.get("name") == "Build multi-arch image")
-    assert build["with"]["build-args"] == "OPENSQUILLA_FORBID_PERSONAL_BGM=1\n"
+    assert "build-args" not in build["with"]
+
+
+@pytest.mark.parametrize(
+    "verifier,event,tag,expects_legacy_flag",
+    [
+        ("legacy", "workflow_dispatch", "v0.5.0", True),
+        ("current", "workflow_dispatch", "v0.5.5", False),
+        ("absent", "workflow_dispatch", "v0.4.0", False),
+        ("current", "push", "v0.5.5", False),
+        ("current", "workflow_dispatch", "", False),
+    ],
+)
+def test_release_wheel_verification_uses_checked_out_contract(
+    tmp_path: Path, verifier: str, event: str, tag: str, expects_legacy_flag: bool,
+) -> None:
+    from zipfile import ZipFile
+
+    steps = _workflow("wheelhouse-release.yml")["jobs"]["build-release-assets"]["steps"]
+    script = next(
+        step["run"] for step in steps
+        if step.get("name") == "Verify wheel contains the exact Web UI artifact"
+    )
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    staged = tmp_path / "src/opensquilla/gateway/static/dist"
+    staged.mkdir(parents=True)
+    (staged / "index.html").write_text("synthetic entry", encoding="utf-8")
+    wheel = dist / "opensquilla-0.5.5-py3-none-any.whl"
+    with ZipFile(wheel, "w") as archive:
+        archive.write(staged / "index.html", "opensquilla/gateway/static/dist/index.html")
+    if verifier != "absent":
+        tool = tmp_path / "scripts/verify_webui_artifact.py"
+        tool.parent.mkdir()
+        help_text = "--dist --wheel" + (" --forbid-personal-bgm" if verifier == "legacy" else "")
+        tool.write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "if '--help' in sys.argv:\n"
+            f"    print({help_text!r})\n"
+            "    Path('help-called').touch()\n"
+            "else:\n"
+            "    Path('verify-args.json').write_text(json.dumps(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", script],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+            "GITHUB_EVENT_NAME": event,
+            "RELEASE_TAG": tag,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    if verifier == "absent":
+        assert "Verified legacy wheel Web UI" in result.stdout
+    else:
+        args = json.loads((tmp_path / "verify-args.json").read_text(encoding="utf-8"))
+        expected = ["--forbid-personal-bgm"] if expects_legacy_flag else []
+        expected += [
+            "--dist", "src/opensquilla/gateway/static/dist",
+            "--wheel", "dist/opensquilla-0.5.5-py3-none-any.whl",
+        ]
+        assert args == expected
+        assert (tmp_path / "help-called").exists() == (event == "workflow_dispatch" and bool(tag))
 
 
 @pytest.mark.parametrize("event,tag", [("push", "v0.5.5"), ("workflow_dispatch", "edge")])
@@ -3129,15 +3863,6 @@ def test_linux_desktop_recovery_e2e_scripts_preserve_x11_authority() -> None:
         )
 
 
-def test_desktop_cleanup_flow_allows_windows_helper_release_latency() -> None:
-    source = Path(
-        "desktop/electron/scripts/test-desktop-cleanup-flow.mjs"
-    ).read_text(encoding="utf-8")
-
-    assert "process.platform === 'win32' ? 90_000 : 30_000" in source
-    assert "pending synthetic targets" in source
-
-
 @pytest.mark.parametrize(("job_name", "test_step_name"), [
     ("ubuntu-full", "Test Ubuntu full shard"),
     ("windows-full", "Test Windows shard"),
@@ -3161,46 +3886,49 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         "tests/test_live_multi_provider_matrix.py",
         "tests/test_live_provider_profile_smoke.py",
     }
-    if job_name in {"ubuntu-full", "windows-full"}:
+    if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_architecture_import_contracts.py",
             "tests/test_cli/test_chat_cmd.py",
             "tests/test_live_long_task_case_driver.py",
             "tests/test_engine/turn_runner/test_stage_test_boundaries.py",
             "tests/test_engine/test_runtime_artifacts.py",
+            "tests/test_engine/test_tool_concurrency.py",
             "tests/test_engine/test_tokenjuice_tool_result_projection.py",
             "tests/test_tools/test_tool_upgrade_compatibility.py",
             "tests/test_gateway/test_goal_rpc.py",
             "tests/test_tools/test_dispatch_legacy_coverage.py",
             "tests/unit/cli/repl/test_slash_bridge.py",
-            "tests/test_gateway/test_channel_turn_ingress.py",
-            "tests/test_gateway/test_goal_registry_cleanup.py",
-            "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
-            "tests/test_gateway/test_task_runtime_wait_slots.py",
-            "tests/test_gateway/test_goal_turn_authority.py",
-            "tests/test_gateway/test_task_progress_projection.py",
-            "tests/functional/test_gateway_silent_reply_process_e2e.py",
             "tests/test_engine/test_cancelled_turn_segments.py",
             "tests/test_tools/test_shell_workdir.py",
             "tests/test_sandbox/test_shell_code_network_hints.py",
             "tests/test_tools/test_shell_runtime_preflight.py",
             "tests/test_sandbox/test_windows_shell_process_runtime.py",
         })
-        selector = '"${family}"' if job_name == "windows-full" else '"${{ matrix.shard }}"'
-        assert f'{selector} == "desktop-installer-contracts"' in preflight["run"]
-        assert f'{selector} == "gateway-sqlite"' in preflight["run"]
+        assert '"${family}" == "desktop-installer-contracts"' in preflight["run"]
         assert '"${regression_args[@]}"' in preflight["run"]
-        assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
-    if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
             "tests/test_tools/test_shell_process_isolation.py",
+            "tests/test_tools/test_shell_blocking_launch.py",
+            "tests/test_ci/test_rpc_architecture_contracts.py",
+            "tests/test_skills/test_hub_management_service.py",
+            "tests/test_gateway/test_native_attachment_import.py",
+            "tests/test_gateway/test_recovery_scheduler.py",
+            "tests/test_gateway/test_goal_user_input.py",
+            "tests/test_gateway/test_manual_compaction_contract.py",
+            "tests/test_gateway/test_sandbox_token_rpc_workers.py",
+            "tests/test_live_provider_profile_gateway_e2e.py",
+            "tests/test_ci/test_upgrade_baselines.py",
+            "tests/test_engine/test_runtime_router_fallback.py",
         })
         assert '"${family}" == "core"' in preflight["run"]
     assert set(re.findall(r"tests/[a-zA-Z0-9_/.]+\.py", preflight["run"])) == (
         expected_preflight_files
     )
     assert "-vv --tb=short" in preflight["run"]
+    if job_name in {"ubuntu-full", "windows-full"}:
+        assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
     assert f"-o faulthandler_timeout={faulthandler_timeout}" in main["run"]
     assert "no:faulthandler" not in preflight["run"]
     assert "no:faulthandler" not in main["run"]
@@ -3208,33 +3936,158 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
     assert "--showlocals" not in main["run"]
 
 
-@pytest.mark.parametrize(("family", "expected_file"), [
-    ("core", "tests/test_ci/test_windows_signatures.py"),
-    ("core", "tests/test_cli/test_chat_cmd.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_goal_registry_cleanup.py"),
-    ("gateway-sqlite", "tests/test_gateway/test_task_runtime_wait_slots.py"),
-    ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
-    ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
-    ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
+@pytest.mark.parametrize("family", [
+    "core", "gateway-sqlite", "recovery-migration", "desktop-installer-contracts",
 ])
-def test_windows_preflight_selects_regressions_for_physical_partitions(family, expected_file):
-    steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
+@pytest.mark.parametrize("scope", ["single", "family", "full", "mixed"])
+def test_windows_preflight_selects_regressions_for_physical_partitions(family, scope):
+    job = _workflow("ci.yml")["jobs"]["windows-full"]
+    steps = job["steps"]
     preflight = next(step for step in steps if step.get("name") == (
         "Preflight offline test environment"
     ))
-    selector = "regression_args=()" + preflight["run"].split("regression_args=()", 1)[1]
+    assert job["strategy"]["matrix"]["shard"] == (
+        "${{ fromJSON(needs.plan-ci.outputs.python_matrix).windows }}"
+    )
+    assert preflight["env"]["PLANNED_WINDOWS_SHARDS"] == (
+        "${{ toJSON(fromJSON(needs.plan-ci.outputs.python_matrix).windows) }}"
+    )
+    assert job["strategy"]["fail-fast"] is False
+    assert "windows-full" in _workflow("ci.yml")["jobs"]["ci-result"]["needs"]
+    selector = "set -euo pipefail\nregression_args=()" + preflight["run"].split(
+        "regression_args=()", 1,
+    )[1]
     selector = selector.split("uv run pytest", 1)[0]
+    runner = runpy.run_path(".github/scripts/windows_test_shards.py")
+    regressions = {
+        path for path in TEST_PATH_RE.findall(selector)
+        if runner["shard_for_test"](path) == family
+    }
     suites = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
+    full_matrix = suites["full_python_matrix"]["windows"]
     partitions = [
-        shard for shard in suites["full_python_matrix"]["windows"]
+        shard for shard in full_matrix
         if shard.startswith(f"{family}-")
     ]
     assert partitions
     for shard in partitions:
-        script = selector.replace("${{ matrix.shard }}", shard)
+        planned = {
+            "single": [shard],
+            "family": partitions,
+            "full": full_matrix,
+            "mixed": [shard, next(cell for cell in full_matrix if cell not in partitions)],
+        }[scope]
+        planned_json = json.dumps(planned)
+        owned = set(runner["files_for_planned_windows_shards"](
+            Path.cwd(), shard, planned_json,
+        ))
+        # Stub only process execution. Use the real assignment inventory and
+        # Windows CRLF output to exercise the workflow's filtering shell.
+        script = '''uv() {
+          [[ "$#" == 9 && "$1" == run && "$2" == python &&
+             "$3" == .github/scripts/windows_test_shards.py && "$4" == list &&
+             "$5" == "$EXPECTED_SHARD" && "$6" == --platform && "$7" == windows &&
+             "$8" == --planned-windows-shards && "$9" == "$EXPECTED_PLAN" ]] || return 96
+          printf '%s' "$OWNED_TEST_FILES"
+        }
+        ''' + selector.replace("${{ matrix.shard }}", shard)
         script += '\nprintf "%s\\n" "${regression_args[@]}"\n'
         result = subprocess.run(
             [_bash_executable(), "-c", script],
+            env={
+                **os.environ,
+                "EXPECTED_SHARD": shard,
+                "EXPECTED_PLAN": planned_json,
+                "PLANNED_WINDOWS_SHARDS": planned_json,
+                "OWNED_TEST_FILES": "\r\n".join(sorted(owned)) + "\r\n",
+            },
             check=True, capture_output=True, text=True, timeout=10,
         )
-        assert expected_file in result.stdout.splitlines(), shard
+        remaining = set(filter(None, result.stdout.splitlines()))
+        assert remaining == regressions - owned, shard
+        if scope in {"family", "full"}:
+            assert remaining == set(), shard
+        else:
+            assert remaining == {
+                path for path in regressions
+                if runner["windows_shard_for_test"](path) != shard
+            }, shard
+
+
+@pytest.mark.parametrize("partial_output", [False, True])
+def test_windows_preflight_stops_if_shard_inventory_fails(partial_output):
+    steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
+    preflight = next(step for step in steps if step.get("name") == (
+        "Preflight offline test environment"
+    ))
+    selector = "set -euo pipefail\nregression_args=()" + preflight["run"].split(
+        "regression_args=()", 1,
+    )[1]
+    selector = selector.split("uv run pytest", 1)[0]
+    script = "uv() {\n"
+    if partial_output:
+        script += "printf 'tests/test_cli/test_chat_cmd.py\\r\\n'\n"
+    script += "return 31\n}\n" + selector.replace("${{ matrix.shard }}", "core-1")
+    script += "\nprintf 'preflight-continued\\n'\n"
+    result = subprocess.run(
+        [_bash_executable(), "-c", script],
+        env={**os.environ, "PLANNED_WINDOWS_SHARDS": '["core-1"]'},
+        check=False, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 31
+    assert "preflight-continued" not in result.stdout
+
+
+_GATEWAY_REGRESSION_FILES = {
+    "tests/test_gateway/test_channel_turn_ingress.py",
+    "tests/test_gateway/test_plan_rpc.py",
+    "tests/test_gateway/test_goal_registry_cleanup.py",
+    "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+    "tests/test_gateway/test_task_runtime_wait_slots.py",
+    "tests/test_gateway/test_goal_turn_authority.py",
+    "tests/test_gateway/test_task_progress_projection.py",
+    "tests/functional/test_gateway_silent_reply_process_e2e.py",
+}
+
+
+def test_gateway_preflight_regressions_keep_one_main_windows_partition():
+    runner = runpy.run_path(".github/scripts/windows_test_shards.py")
+    partitions = [
+        runner["files_for_shard"](Path.cwd(), shard, platform="windows")
+        for shard in runner["WINDOWS_SHARD_NAMES"]
+        if shard.startswith("gateway-sqlite-")
+    ]
+    for path in _GATEWAY_REGRESSION_FILES:
+        assert sum(path in files for files in partitions) == 1, path
+
+
+def test_gateway_split_elects_exactly_one_preflight_owner_for_every_partial_plan():
+    steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
+    preflight = next(s for s in steps if s.get("name") == "Preflight offline test environment")
+    expression = preflight["if"].removeprefix("${{").removesuffix("}}").strip()
+    # Evaluate the actual workflow condition over all nonempty selections. The
+    # substitutions cover only this bounded expression, never an external file.
+    expression = expression.replace(
+        "fromJSON(needs.plan-ci.outputs.python_matrix).windows", "planned"
+    ).replace("matrix.shard", "shard")
+    expression = expression.replace("&&", " and ").replace("||", " or ").replace("!", " not ")
+    split = ["gateway-sqlite-5", "gateway-sqlite-9", "gateway-sqlite-10", "gateway-sqlite-11"]
+    for size in range(1, len(split) + 1):
+        for selection in itertools.combinations(split, size):
+            planned = [*selection, "core-1", "gateway-sqlite-6"]
+            selected = [shard for shard in planned if eval(  # noqa: S307
+                f"({expression})", {"__builtins__": {}, "fromJSON": json.loads,
+                             "contains": lambda items, item: item in items},
+                {"planned": planned, "shard": shard},
+            )]
+            assert selected == [selection[0], "core-1", "gateway-sqlite-6"]
+
+
+@pytest.mark.parametrize("job_name,platform", [
+    ("windows-full", "windows"), ("ubuntu-full", "ubuntu"),
+])
+def test_offline_runner_uses_explicit_platform_ownership(job_name, platform):
+    steps = _workflow("ci.yml")["jobs"][job_name]["steps"]
+    commands = [s["run"] for s in steps if "windows_test_shards.py run" in s.get("run", "")]
+    assert len(commands) == 1
+    assert f"--platform {platform}" in commands[0]

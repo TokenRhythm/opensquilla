@@ -340,6 +340,7 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
         base_url=str(p.get("baseUrl", "") or ""),
         proxy=str(p.get("proxy", "") or ""),
         force_refresh=_bool_param(params, "forceRefresh"),
+        cache_only=_bool_param(params, "cacheOnly"),
     )
     return cast(
         dict[str, Any],
@@ -357,6 +358,13 @@ async def _image_generation_models_discover(
             str(_require(params, "providerId"))
         ),
     )
+
+
+async def _video_generation_models_discover(
+    params: Any, ctx: RpcContext
+) -> dict[str, Any]:
+    del ctx
+    return await _discover_video_models(str(_require(params, "providerId")))
 
 
 def _profile_probe_command(params: Any) -> Any:
@@ -1104,6 +1112,7 @@ async def _discover_saved_profile_models(
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
             force_refresh=_bool_param(command.values, "forceRefresh"),
+            cache_only=_bool_param(command.values, "cacheOnly"),
             persist_catalog=True,
             catalog_config=cfg,
         )
@@ -1144,6 +1153,7 @@ async def _discover_draft_profile_models(
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
             force_refresh=_bool_param(command.values, "forceRefresh"),
+            cache_only=_bool_param(command.values, "cacheOnly"),
             persist_catalog=False,
             catalog_config=draft,
         )
@@ -1349,6 +1359,7 @@ async def _discover_primary_models(
                 not same_provider or reuse_stored_credentials
             ),
             force_refresh=force_refresh,
+            cache_only=command.cache_only,
             persist_catalog=(
                 same_provider and reuse_stored_credentials and not request_overrides
             ),
@@ -1371,6 +1382,16 @@ async def _discover_image_models(provider_id: str) -> dict[str, Any]:
 
     with _validation_error("onboarding.imageGeneration.invalid"):
         return await discover_image_generation_models(str(provider_id))
+
+
+async def _discover_video_models(provider_id: str) -> dict[str, Any]:
+    """List video-output models using provider-scoped catalog metadata."""
+    from opensquilla.onboarding.video_generation_model_discovery import (
+        discover_video_generation_models,
+    )
+
+    with _validation_error("onboarding.videoGeneration.invalid"):
+        return await discover_video_generation_models(str(provider_id))
 
 
 @_d.method("onboarding.router.catalog", scope="operator.read")
@@ -1679,6 +1700,7 @@ _PLATFORM_SETUP_IMPLEMENTATIONS = {
     "onboarding.provider.probe": _provider_probe,
     "onboarding.models.discover": _models_discover,
     "onboarding.imageGeneration.models.discover": _image_generation_models_discover,
+    "onboarding.videoGeneration.models.discover": _video_generation_models_discover,
     "onboarding.provider.credential.reveal": _provider_credential_reveal,
     "onboarding.provider.credential.clear": _provider_credential_clear,
     "onboarding.llmProfile.upsert": _llm_profile_upsert,

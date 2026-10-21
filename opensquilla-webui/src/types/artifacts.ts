@@ -27,6 +27,8 @@ export interface ArtifactPayload {
   createdAt?: string
   store?: string
   download_url?: string
+  /** Immutable revision URL retained by the document adapter for verified previews. */
+  revision_download_url?: string
   thumbnail_url?: string
   [key: string]: unknown
 }

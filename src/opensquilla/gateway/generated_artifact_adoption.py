@@ -5,14 +5,23 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from opensquilla.artifact_session import ArtifactSessionService
-from opensquilla.artifact_session.models import Actor, ActorKind, ArtifactBlobRef
+from opensquilla.artifact_session.errors import ArtifactConflictError
+from opensquilla.artifact_session.models import (
+    Actor,
+    ActorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    RevisionSource,
+)
 from opensquilla.artifacts import (
+    ArtifactError,
     ArtifactRef,
     ArtifactSource,
     ArtifactStore,
@@ -30,6 +39,11 @@ from opensquilla.tools.types import ToolContext, current_tool_context
 
 ArtifactStateEmitter = Callable[[dict[str, Any]], Awaitable[None]]
 log = logging.getLogger(__name__)
+
+_VISUALIZE_WIDGET_MAX_BYTES = 1024 * 1024
+_VISUALIZE_WIDGET_TITLE_MAX_CHARS = 128
+_VISUALIZE_WIDGET_MAX_EDITS = 32
+_VISUALIZE_WIDGET_EDIT_MAX_BYTES = 256 * 1024
 
 
 @dataclass(slots=True)
@@ -50,6 +64,79 @@ class GeneratedArtifactAdopter:
     preview_service: Any = None
     source_paths: dict[str, ArtifactSource] = field(default_factory=dict)
     validate_session: Callable[[Any], Awaitable[None]] | None = None
+    _widget_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    @staticmethod
+    def _normalize_widget_title(title: str) -> str:
+        normalized = " ".join(title.split()) if isinstance(title, str) else ""
+        if not normalized:
+            raise ValueError("show_widget title must be a nonempty short label")
+        if len(normalized) > _VISUALIZE_WIDGET_TITLE_MAX_CHARS:
+            raise ValueError("show_widget title exceeds the 128 character limit")
+        return normalized
+
+    @staticmethod
+    def _widget_name(title: str) -> tuple[str, str]:
+        """Return the stable store filename and model-facing widget id."""
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "-", title).strip("-_")
+        slug = (slug or "widget")[:64]
+        title_hash = hashlib.sha256(title.encode("utf-8")).hexdigest()[:8]
+        return f"{slug}-{title_hash}.html", f"widget:{title_hash}"
+
+    async def _find_widget_document(self, name: str):
+        documents = await self.service.list_documents(
+            session_key=self.session_key,
+            session_id=self.session_id,
+            limit=500,
+        )
+        for document in documents:
+            if document.name != name or document.kind is not ArtifactKind.HTML:
+                continue
+            try:
+                head = await self.service.get_document_head(document.document_id)
+                ref = self.store.get_ref(
+                    session_id=self.session_id,
+                    artifact_id=head.revision.artifact_id,
+                )
+            except ArtifactError:
+                continue
+            if ref.source == "show-widget":
+                return document
+        return None
+
+    @staticmethod
+    def _apply_widget_edits(widget_code: str, edits: list[dict[str, str]]) -> str:
+        if not isinstance(edits, list) or not edits:
+            raise ValueError("edit_widget edits must contain at least one edit")
+        if len(edits) > _VISUALIZE_WIDGET_MAX_EDITS:
+            raise ValueError(
+                f"edit_widget accepts at most {_VISUALIZE_WIDGET_MAX_EDITS} edits"
+            )
+        updated = widget_code
+        for index, edit in enumerate(edits, start=1):
+            if not isinstance(edit, dict):
+                raise ValueError(f"edit_widget edit {index} must be an object")
+            old_string = edit.get("old_string")
+            new_string = edit.get("new_string")
+            if not isinstance(old_string, str) or not old_string:
+                raise ValueError(f"edit_widget edit {index} old_string must be nonempty")
+            if not isinstance(new_string, str):
+                raise ValueError(f"edit_widget edit {index} new_string must be a string")
+            if len(old_string.encode("utf-8")) > _VISUALIZE_WIDGET_EDIT_MAX_BYTES:
+                raise ValueError(f"edit_widget edit {index} old_string is too large")
+            if len(new_string.encode("utf-8")) > _VISUALIZE_WIDGET_EDIT_MAX_BYTES:
+                raise ValueError(f"edit_widget edit {index} new_string is too large")
+            matches = updated.count(old_string)
+            if matches == 0:
+                raise ValueError(
+                    f"edit_widget edit {index} old_string was not found; no changes applied"
+                )
+            if matches != 1:
+                raise ValueError(
+                    f"edit_widget edit {index} old_string must match exactly once"
+                )
+            updated = updated.replace(old_string, new_string, 1)
+        return updated
 
     async def working_source_scopes(self) -> list[dict[str, str]]:
         async with self.service.repository._read_transaction("workspace.preview.scopes") as conn:
@@ -60,9 +147,234 @@ class GeneratedArtifactAdopter:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def publish_widget(
+        self,
+        context: ToolContext,
+        *,
+        title: str,
+        widget_code: str,
+        loading_messages: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a ``generative-frame`` widget as an inline Visualize receipt.
+
+        ``show_widget`` is a model-facing convenience API.  The browser still
+        consumes an immutable Artifact document so reconnects, session changes,
+        and remote clients do not depend on an in-memory tool registry or a
+        browser-side streamed tool call.
+
+        Same-title calls update one durable Document and append an immutable
+        ArtifactSession revision.  The stable filename is an internal
+        identity, while ``widgetId`` is the host-facing registry key.
+        """
+        if (
+            not isinstance(context, ToolContext)
+            or current_tool_context.get() is not context
+            or not context.is_owner
+            or context.guest_safe
+            or context.session_key != self.session_key
+            or context.session_id != self.session_id
+        ):
+            raise ValueError("show_widget context no longer matches the admitted session")
+
+        normalized_title = self._normalize_widget_title(title)
+        if not isinstance(widget_code, str) or not widget_code.strip():
+            raise ValueError("show_widget widget_code must be a nonempty HTML fragment or SVG")
+        payload = widget_code.encode("utf-8")
+        if len(payload) > _VISUALIZE_WIDGET_MAX_BYTES:
+            raise ValueError("show_widget widget_code exceeds the 1 MiB limit")
+
+        from opensquilla.gateway.visualize_html import validate_visualize_html
+
+        # This catches truncation, NULs, Markdown fences and malformed raw text
+        # before an immutable revision is created.  It deliberately does not
+        # claim that browser scripts/layout or semantic calculations succeeded.
+        await asyncio.to_thread(validate_visualize_html, payload)
+
+        name, widget_id = self._widget_name(normalized_title)
+        async with self._widget_lock:
+            ref = await asyncio.to_thread(
+                self.store.publish_bytes,
+                payload,
+                session_id=self.session_id,
+                session_key=self.session_key,
+                name=name,
+                mime="text/html",
+                source="show-widget",
+                visibility="internal",
+            )
+            existing = await self._find_widget_document(name)
+            if existing is None:
+                commit = await self.service.create_document(
+                    session_key=self.session_key,
+                    session_id=self.session_id,
+                    name=name,
+                    kind=ArtifactKind.HTML,
+                    initial_artifact=ArtifactBlobRef(
+                        artifact_id=ref.id,
+                        sha256=ref.sha256,
+                        filename=ref.name,
+                        media_type=ref.mime,
+                        byte_size=ref.size,
+                    ),
+                    actor=Actor(kind=ActorKind.SYSTEM, actor_id="visualize"),
+                    validate_session=self.validate_session,
+                )
+            else:
+                head = await self.service.get_document_head(existing.document_id)
+                commit = await self.service.commit_revision(
+                    document_id=existing.document_id,
+                    expected_head_revision_id=head.document.head_revision_id,
+                    expected_state_revision=head.document.state_revision,
+                    artifact=ArtifactBlobRef(
+                        artifact_id=ref.id,
+                        sha256=ref.sha256,
+                        filename=ref.name,
+                        media_type=ref.mime,
+                        byte_size=ref.size,
+                    ),
+                    actor=Actor(kind=ActorKind.SYSTEM, actor_id="visualize"),
+                    source=RevisionSource.AGENT,
+                )
+        document_id = commit.document.document_id
+        revision_id = commit.revision.revision_id
+        result: dict[str, Any] = {
+            "ok": True,
+            "title": normalized_title,
+            "widgetId": widget_id,
+            "action": "show",
+            "kind": (
+                "svg"
+                if widget_code.lstrip().casefold().startswith("<svg")
+                else "html"
+            ),
+            "previewStatus": "inline-ready",
+            "presentation": "inline",
+            "documentId": document_id,
+            "revisionId": revision_id,
+            "artifactId": ref.id,
+            # Keep the model-facing title as the chat label.  The content
+            # store's collision-safe filename remains available separately.
+            "name": normalized_title,
+            "artifactName": ref.name,
+            "mime": ref.mime,
+            "sha256": ref.sha256,
+            "size": ref.size,
+            "marker": f"visualize:{document_id}:{revision_id}",
+            "renderStatus": "not-observed",
+            "version": 1,
+        }
+        result["version"] = commit.document.generation
+        if loading_messages is not None:
+            result["loadingMessages"] = list(loading_messages)
+        return result
+
+    async def edit_widget(
+        self,
+        context: ToolContext,
+        *,
+        title: str,
+        edits: list[dict[str, str]],
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Apply upstream-compatible exact replacements to a persisted widget.
+
+        The latest ArtifactSession head is the source of truth.  The edit is
+        validated fully before ``commit_revision`` performs a head/state CAS,
+        so a stale model call cannot overwrite a newer widget version.
+        """
+        if (
+            not isinstance(context, ToolContext)
+            or current_tool_context.get() is not context
+            or not context.is_owner
+            or context.guest_safe
+            or context.session_key != self.session_key
+            or context.session_id != self.session_id
+        ):
+            raise ValueError("edit_widget context no longer matches the admitted session")
+        normalized_title = self._normalize_widget_title(title)
+        name, widget_id = self._widget_name(normalized_title)
+        async with self._widget_lock:
+            document = await self._find_widget_document(name)
+            if document is None:
+                raise ValueError(
+                    f'No widget titled "{normalized_title}". '
+                    "Use show_widget to create it."
+                )
+            head = await self.service.get_document_head(document.document_id)
+            version = head.document.generation
+            if expected_version is not None:
+                if type(expected_version) is not int or expected_version < 1:
+                    raise ValueError("edit_widget expected_version must be a positive integer")
+                if expected_version != version:
+                    raise ArtifactConflictError(
+                        f"widget version conflict (expected {expected_version}, current {version})"
+                    )
+            _, payload, _ = await asyncio.to_thread(
+                self.store.read_verified_material,
+                head.revision.artifact_id,
+                session_id=self.session_id,
+                max_bytes=_VISUALIZE_WIDGET_MAX_BYTES,
+            )
+            try:
+                current_code = payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("widget artifact is not valid UTF-8") from exc
+            updated_code = self._apply_widget_edits(current_code, edits)
+            updated_payload = updated_code.encode("utf-8")
+            if len(updated_payload) > _VISUALIZE_WIDGET_MAX_BYTES:
+                raise ValueError("edit_widget widget_code exceeds the 1 MiB limit")
+            from opensquilla.gateway.visualize_html import validate_visualize_html
+
+            await asyncio.to_thread(validate_visualize_html, updated_payload)
+            ref = await asyncio.to_thread(
+                self.store.publish_bytes,
+                updated_payload,
+                session_id=self.session_id,
+                session_key=self.session_key,
+                name=head.revision.filename,
+                mime=head.revision.media_type,
+                source="show-widget",
+                visibility="internal",
+            )
+            commit = await self.service.commit_revision(
+                document_id=document.document_id,
+                expected_head_revision_id=head.document.head_revision_id,
+                expected_state_revision=head.document.state_revision,
+                artifact=ArtifactBlobRef(
+                    artifact_id=ref.id,
+                    sha256=ref.sha256,
+                    filename=ref.name,
+                    media_type=ref.mime,
+                    byte_size=ref.size,
+                ),
+                actor=Actor(kind=ActorKind.SYSTEM, actor_id="visualize-edit"),
+                source=RevisionSource.AGENT,
+            )
+        return {
+            "ok": True,
+            "title": normalized_title,
+            "widgetId": widget_id,
+            "action": "edit",
+            "applied": len(edits),
+            "version": commit.document.generation,
+            "previewStatus": "inline-ready",
+            "presentation": "inline",
+            "documentId": commit.document.document_id,
+            "revisionId": commit.revision.revision_id,
+            "artifactId": ref.id,
+            "name": normalized_title,
+            "artifactName": ref.name,
+            "mime": ref.mime,
+            "sha256": ref.sha256,
+            "size": ref.size,
+            "marker": f"visualize:{commit.document.document_id}:{commit.revision.revision_id}",
+            "renderStatus": "not-observed",
+        }
+
     async def open_workspace_preview(
         self, context: ToolContext, *, path: str, bundle: str | None = None,
         bundle_root: str | None = None,
+        presentation: str = "workbench",
     ) -> dict[str, Any]:
         """Register an HTML source as an internal Document without publishing it."""
         if self.workspace is None:
@@ -108,6 +420,57 @@ class GeneratedArtifactAdopter:
         if entry.suffix.casefold() not in {".html", ".htm", ".xhtml"}:
             raise ValueError("workspace preview entrypoint must be HTML")
         source_path = entry.relative_to(root).as_posix()
+        if presentation not in {"workbench", "inline"}:
+            raise ValueError("invalid workspace preview presentation")
+        if presentation == "inline":
+            if bundle not in {None, "none"} or bundle_root is not None:
+                raise ValueError(
+                    "inline preview requires a self-contained HTML file; use bundle=none"
+                )
+            if entry.suffix.casefold() == ".xhtml":
+                raise ValueError("inline preview requires .html or .htm")
+            # Read one bounded, no-follow snapshot. Never return a live working
+            # head: an old chat must keep showing the exact bytes delivered then.
+            payload = await asyncio.to_thread(
+                _read_regular_bundle_file, entry, max_bytes=1024 * 1024
+            )
+            if len(entry.name) > 250:
+                raise ValueError(
+                    "inline preview requires a name <=250 characters"
+                )
+            from opensquilla.gateway.visualize_html import validate_visualize_html
+
+            await asyncio.to_thread(validate_visualize_html, payload)
+            ref = await asyncio.to_thread(
+                self.store.publish_bytes, payload,
+                session_id=self.session_id, session_key=self.session_key,
+                name=entry.name, mime="text/html",
+                source="workspace-preview", visibility="internal",
+            )
+            commit = await self.service.create_document(
+                session_key=self.session_key, session_id=self.session_id,
+                name=entry.name, kind=ArtifactKind.HTML,
+                initial_artifact=ArtifactBlobRef(
+                    artifact_id=ref.id, sha256=ref.sha256, filename=ref.name,
+                    media_type=ref.mime, byte_size=ref.size,
+                ),
+                actor=Actor(kind=ActorKind.SYSTEM, actor_id="visualize"),
+                validate_session=self.validate_session,
+            )
+            scope = {"workspace": str(root), "source_path": source_path,
+                     "bundle_mode": "none", "bundle_root": ""}
+            if scope not in context.workspace_preview_scopes:
+                context.workspace_preview_scopes.append(scope)
+            document_id = commit.document.document_id
+            revision_id = commit.revision.revision_id
+            return {
+                "previewStatus": "inline-ready", "presentation": "inline",
+                "documentId": document_id, "revisionId": revision_id,
+                "artifactId": ref.id, "name": ref.name, "mime": ref.mime,
+                "sha256": ref.sha256, "size": ref.size,
+                "marker": f"visualize:{document_id}:{revision_id}",
+                "renderStatus": "not-observed",
+            }
         async with self.service.repository._read_transaction("workspace.preview.lookup") as conn:
             if self.validate_session is not None:
                 await self.validate_session(conn)
@@ -297,6 +660,12 @@ class GeneratedArtifactAdopter:
         if candidate is not None and candidate.artifact_id != ref.id:
             raise ValueError("generated publication belongs to another artifact")
         if self.workspace is not None and candidate is not None:
+            candidate_root = Path(self.workspace) / "artifacts" / ".office-candidates"
+            if Path(candidate.path).is_relative_to(candidate_root):
+                # Candidates are never adopted by publication, including queue recovery
+                # where no runtime adopter object survived. Only turn completion commits.
+                return
+        if self.workspace is not None and candidate is not None:
             from opensquilla.artifact_session.working_files import prepare_working_source
 
             try:
@@ -407,6 +776,11 @@ class GeneratedArtifactAdopter:
         if len(matches) != 1:
             return False
         binding = matches[0]
+        from opensquilla.office_format import office_format
+
+        if office_format(binding.entrypoint, binding.entry_mime):
+            # This download is not a committed Office version or publication receipt.
+            return True
         saved = await save_working_version(
             self.service,
             self.store,

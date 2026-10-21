@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { effectScope } from 'vue'
 import {
   _resetChannelCatalogForTests,
   ensureChannelCatalog,
@@ -40,6 +41,17 @@ const channelSetup = {
 
 function createEditor() {
   return useChannelEditor(setupCatalog, channelAdministration, channelSetup)
+}
+
+function deferred<T = unknown>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: Error) => void
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail })
+  return { promise, resolve, reject }
+}
+
+function savedChannel(name: string) {
+  return { entry: { ...STORED_ENTRY, name }, secretFields: ['token', 'signing_secret'] }
 }
 
 const SLACK_SPEC = {
@@ -92,6 +104,165 @@ beforeEach(() => {
 })
 
 describe('useChannelEditor', () => {
+  it('keeps the initial configuration load alive when edit mode is discarded before it arrives', async () => {
+    const initial = deferred()
+    mockRpc({ 'channels.get': () => initial.promise })
+    const editor = createEditor()
+    const loading = editor.open('team-slack')
+    editor.discard()
+    initial.resolve(savedChannel('team-slack'))
+    await loading
+    expect(editor.phase.value).toBe('active')
+    expect(editor.loadedName.value).toBe('team-slack')
+    expect(editor.form.isDirty.value).toBe(false)
+    expect(editor.form.payload().name).toBe('team-slack')
+  })
+
+  it.each(['resolve', 'reject'] as const)('ignores a stale channel load that later %ss', async settle => {
+    const first = deferred()
+    mockRpc({ 'channels.get': params => params?.name === 'first' ? first.promise : savedChannel('second') })
+    const editor = createEditor()
+    const oldLoad = editor.open('first')
+    editor.reset()
+    await editor.open('second')
+    editor.updateField('slack_channel_id', 'C-SECOND')
+    if (settle === 'resolve') first.resolve(savedChannel('first'))
+    else first.reject(new Error('old load failed'))
+    await oldLoad
+    expect(editor.phase.value).toBe('active')
+    expect(editor.loadError.value).toBe('')
+    expect(editor.loadedName.value).toBe('second')
+    expect(editor.form.payload()).toMatchObject({ name: 'second', slack_channel_id: 'C-SECOND' })
+    await editor.save()
+    expect(rpcCall).toHaveBeenCalledWith('onboarding.channel.upsert', {
+      entry: expect.objectContaining({ name: 'second', slack_channel_id: 'C-SECOND' }),
+    })
+  })
+
+  it('does not reopen a reset editor when the catalog for compose arrives', async () => {
+    const catalog = deferred()
+    mockRpc({ 'onboarding.catalog': () => catalog.promise })
+    const editor = createEditor()
+    const composing = editor.startCompose('slack')
+    editor.reset()
+    catalog.resolve({ channels: [SLACK_SPEC] })
+    await composing
+    expect(editor.phase.value).toBe('idle')
+    expect(editor.entryType.value).toBe('')
+    expect(editor.form.payload()).not.toHaveProperty('name')
+  })
+
+  it('keeps a new compose draft when a previous saved channel finishes loading', async () => {
+    const first = deferred()
+    mockRpc({ 'channels.get': () => first.promise })
+    const editor = createEditor()
+    const loading = editor.open('first')
+    await editor.startCompose('slack', { existingNames: [] })
+    editor.updateField('token', 'draft-secret')
+    first.resolve(savedChannel('first'))
+    await loading
+    expect(editor.form.isEditing.value).toBe(false)
+    expect(editor.form.payload()).toMatchObject({ name: 'slack', token: 'draft-secret' })
+  })
+
+  it('drops pending configuration reads when its scope is disposed', async () => {
+    const first = deferred()
+    mockRpc({ 'channels.get': () => first.promise })
+    const scope = effectScope()
+    const editor = scope.run(createEditor)!
+    const loading = editor.open('first')
+    scope.stop()
+    first.resolve(savedChannel('first'))
+    await loading
+    expect(editor.loadedName.value).toBe('')
+    expect(editor.loadedEntry.value).toBeNull()
+  })
+
+  it.each(['resolve', 'reject'] as const)('does not restore a stale probe verdict after an edit (%s)', async settle => {
+    const pending = deferred()
+    mockRpc({ 'onboarding.channel.probe': () => pending.promise })
+    const editor = createEditor()
+    await editor.open('team-slack')
+    const probing = editor.testDraft()
+    editor.updateField('slack_channel_id', 'C-NEW')
+    if (settle === 'resolve') pending.resolve({ warnings: ['old warning'] })
+    else pending.reject(new Error('old draft failed'))
+    expect(await probing).toBe(false)
+    expect(editor.probe.value).toEqual({ phase: 'idle', rows: [] })
+  })
+
+  it('does not commit another draft when selection changes during the save probe', async () => {
+    const pending = deferred()
+    mockRpc({
+      'channels.get': params => savedChannel(String(params?.name)),
+      'onboarding.channel.probe': () => pending.promise,
+    })
+    const editor = createEditor()
+    await editor.open('first')
+    editor.updateField('slack_channel_id', 'C-FIRST')
+    const saving = editor.save()
+    editor.reset()
+    await editor.open('second')
+    editor.updateField('slack_channel_id', 'C-SECOND')
+    pending.resolve({ warnings: [] })
+    expect(await saving).toEqual({ status: 'superseded' })
+    expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.channel.upsert')).toBe(false)
+    expect(editor.form.payload()).toMatchObject({ name: 'second', slack_channel_id: 'C-SECOND' })
+    expect(editor.probe.value.phase).toBe('idle')
+  })
+
+  it('does not submit unprobed edits made while a save is probing', async () => {
+    const pending = deferred()
+    mockRpc({ 'onboarding.channel.probe': () => pending.promise })
+    const editor = createEditor()
+    await editor.open('team-slack')
+    editor.updateField('slack_channel_id', 'C-OLD')
+    const saving = editor.save()
+    editor.updateField('slack_channel_id', 'C-NEW')
+    pending.resolve({ warnings: [] })
+    expect(await saving).toEqual({ status: 'superseded' })
+    expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.channel.upsert')).toBe(false)
+    expect(editor.form.payload().slack_channel_id).toBe('C-NEW')
+  })
+
+  it('does not reseed or release the new save when an old upsert finishes after reopening the same channel', async () => {
+    const first = deferred()
+    const second = deferred()
+    let commits = 0
+    mockRpc({ 'onboarding.channel.upsert': () => ++commits === 1 ? first.promise : second.promise })
+    const editor = createEditor()
+    await editor.open('team-slack')
+    editor.updateField('slack_channel_id', 'C-OLD')
+    const oldSave = editor.saveAnyway()
+    editor.reset()
+    await editor.open('team-slack')
+    editor.updateField('slack_channel_id', 'C-NEW')
+    const newSave = editor.saveAnyway()
+    first.resolve({ changed: true })
+    expect(await oldSave).toMatchObject({ status: 'superseded', outcome: { name: 'team-slack' } })
+    expect(editor.saving.value).toBe(true)
+    expect(editor.form.payload().slack_channel_id).toBe('C-NEW')
+    expect(rpcCall.mock.calls.filter(([method]) => method === 'channels.get')).toHaveLength(2)
+    second.resolve({ changed: true })
+    expect((await newSave).status).toBe('saved')
+    expect(editor.saving.value).toBe(false)
+  })
+
+  it('guards the post-save reseed when its response arrives after selecting another channel', async () => {
+    const reseed = deferred()
+    let reads = 0
+    mockRpc({ 'channels.get': params => ++reads === 2 ? reseed.promise : savedChannel(String(params?.name)) })
+    const editor = createEditor()
+    await editor.open('first')
+    const saving = editor.saveAnyway()
+    await vi.waitFor(() => expect(reads).toBe(2))
+    await editor.open('second')
+    editor.updateField('slack_channel_id', 'C-SECOND')
+    reseed.resolve(savedChannel('first'))
+    expect(await saving).toMatchObject({ status: 'superseded', outcome: { name: 'first' } })
+    expect(editor.form.payload()).toMatchObject({ name: 'second', slack_channel_id: 'C-SECOND' })
+  })
+
   it('open() hydrates from channels.get + catalog and starts clean', async () => {
     const editor = createEditor()
     await editor.open('team-slack')

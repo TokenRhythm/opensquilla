@@ -10,18 +10,30 @@ from __future__ import annotations
 
 import asyncio
 import random
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import TaskRuntime
-from opensquilla.session.models import AgentTaskRecord
+from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def isolated_approval_queue(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    # Keep terminal cleanup in memory like the task ledger. Real approval DB
+    # worker timing is unrelated to ordering among ready scheduler waiters.
+    queue = SimpleNamespace(expire_pending_for_session_async=AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        "opensquilla.application.approval_queue.get_approval_queue", lambda: queue,
+    )
+    return queue
+
 
 def _make_envelope(agent_id: str, session_key: str) -> RouteEnvelope:
     return RouteEnvelope(
@@ -298,8 +310,8 @@ async def test_round_robin_strict_abcabc_order() -> None:
     """With max_concurrency=1, 3 sessions A/B/C enqueued first-to-last must
     execute in strict ABCABCABC... order (true RR, not count-minimum).
 
-    max_concurrency=1 ensures only one task runs at a time, making the RR
-    ordering deterministic and verifiable without timing sensitivity.
+    With in-memory terminal cleanup, each successor is ready before the next
+    slot is released. max_concurrency=1 makes the RR order observable.
     """
     random.seed(0)
     # max_concurrency=1: strictly sequential; RR order must be exact.
@@ -350,6 +362,50 @@ async def test_round_robin_strict_abcabc_order() -> None:
     assert completion_order == expected, (
         f"Expected strict ABCABC order, got: {completion_order}"
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_does_not_block_other_ready_sessions(
+    isolated_approval_queue: SimpleNamespace,
+) -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    completion_order: list[str] = []
+    agent_id = "agent-terminal-rr"
+    envs = {label: _make_envelope(agent_id, f"{agent_id}::sess-{label}") for label in "ABC"}
+
+    async def expire(session_key: str) -> int:
+        if session_key == envs["A"].session_key and not cleanup_started.is_set():
+            cleanup_started.set()
+            await release_cleanup.wait()
+        return 0
+
+    async def turn_handler(run: Any) -> None:
+        completion_order.append(run.session_key.rsplit("-", 1)[-1])
+
+    isolated_approval_queue.expire_pending_for_session_async.side_effect = expire
+    storage = _make_storage()
+    runtime = TaskRuntime(storage=storage, turn_handler=turn_handler, max_concurrency=1)
+    first = await runtime.enqueue(envs["A"], "first A")
+    handles = [first]
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5.0)
+        successor = await runtime.enqueue(envs["A"], "second A")
+        handles.append(successor)
+        peers = [await runtime.enqueue(envs[label], label) for label in "BC"]
+        handles.extend(peers)
+        await asyncio.gather(*(runtime.wait(handle.task_id, timeout=5.0) for handle in peers))
+
+        assert completion_order == ["A", "B", "C"]
+        pending = await storage.get_agent_task(successor.task_id)
+        assert pending.status is AgentTaskStatus.QUEUED
+    finally:
+        release_cleanup.set()
+        await asyncio.gather(*(runtime.wait(handle.task_id, timeout=5.0) for handle in handles))
+
+    assert completion_order == ["A", "B", "C", "A"]
+    assert runtime._global_in_flight == 0
+    assert runtime._agent_slot_waiters == {}
 
 
 # ---------------------------------------------------------------------------

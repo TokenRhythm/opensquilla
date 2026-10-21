@@ -1,0 +1,135 @@
+// @vitest-environment happy-dom
+import { describe, expect, it } from 'vitest'
+import type { ChatRenderedMessage, ChatToolCall } from '@/types/chat'
+import { parseVisualizeReceipt, splitVisualizeBody, visualizeReceipts, visualizeReceiptsFromMessage } from './receipts'
+const receipt = { previewStatus: 'inline-ready', presentation: 'inline', documentId: 'doc_123', revisionId: 'rev_123', artifactId: 'artifact_123', name: 'chart.html', mime: 'text/html', size: 100, sha256: 'a'.repeat(64), marker: 'visualize:doc_123:rev_123' }
+const call = { toolId: 'call_1', name: 'open_workspace_preview', status: 'success', isRunning: false, isError: false, result: JSON.stringify(receipt) } as ChatToolCall
+const widgetCall = (id: string, revision: string, version: number | undefined, action: 'show' | 'edit' = 'edit'): ChatToolCall => ({
+  ...call, toolId: id, name: action === 'edit' ? 'edit_widget' : 'show_widget',
+  result: JSON.stringify({ ...receipt, widgetId: 'budget', version, action, revisionId: revision, marker: `visualize:${receipt.documentId}:${revision}` }),
+})
+describe('Visualize authorized receipts and body placement', () => {
+  it('requires a successful matching tool result, never a marker by itself', () => {
+    expect(visualizeReceipts([{ ...call, isError: true }])).toEqual([])
+    expect(visualizeReceipts([{ ...call, name: 'exec' }])).toEqual([])
+    expect(visualizeReceipts([{ ...call, result: JSON.stringify({ ...receipt, marker: 'visualize:doc_other:rev_123' }) }])).toEqual([])
+    expect(splitVisualizeBody(`<p><code>${receipt.marker}</code></p>`, [])).toEqual([{ key: 'text-0', html: `<p><code>${receipt.marker}</code></p>` }])
+  })
+  it('places a single canvas between text while preserving trailing content', () => {
+    const parts = splitVisualizeBody(`<p>Before</p><p><code>${receipt.marker}</code></p><p>After</p><p><code>${receipt.marker}</code></p>`, visualizeReceipts([call]))
+    expect(parts.map(part => part.receipt ? 'canvas' : part.html)).toEqual(['<p>Before</p>', 'canvas', '<p>After</p>'])
+  })
+  it('does not interpret fenced code or partial prose markers and uses one fallback', () => {
+    const html = `<pre><code>${receipt.marker}</code></pre><p>Example <code>${receipt.marker}</code></p>`
+    const parts = splitVisualizeBody(html, visualizeReceipts([call, call]))
+    expect(parts[0]?.html).toBe(html)
+    expect(parts.filter(part => part.receipt)).toHaveLength(1)
+    expect(splitVisualizeBody(html, visualizeReceipts([call]), false).filter(part => part.receipt)).toHaveLength(0)
+  })
+  it('shows only the explicitly selected publication after a draft was republished', () => {
+    const latest = { ...receipt, documentId: 'doc_latest', revisionId: 'rev_latest', marker: 'visualize:doc_latest:rev_latest' }
+    const receipts = visualizeReceipts([call, { ...call, toolId: 'call_2', result: JSON.stringify(latest) }])
+    const parts = splitVisualizeBody(`<p>Updated</p><p><code>${latest.marker}</code></p><p>Use this version.</p>`, receipts)
+    expect(parts.filter(part => part.receipt).map(part => part.receipt?.marker)).toEqual([latest.marker])
+    expect(parts.map(part => part.receipt ? 'canvas' : part.html)).toEqual(['<p>Updated</p>', 'canvas', '<p>Use this version.</p>'])
+    expect(splitVisualizeBody(`<p><code>${receipt.marker}</code></p><p><code>${latest.marker}</code></p>`, receipts)
+      .filter(part => part.receipt)).toHaveLength(2)
+  })
+  it('does not let an unauthorized marker suppress successful receipt fallback', () => {
+    const parts = splitVisualizeBody('<p><code>visualize:doc_unknown:rev_unknown</code></p>', visualizeReceipts([call]))
+    expect(parts.filter(part => part.receipt).map(part => part.receipt?.marker)).toEqual([receipt.marker])
+  })
+
+  it('accepts a direct show_widget Artifact receipt without workspace-preview metadata', () => {
+    const direct = {
+      title: 'Capacity simulator', documentId: 'doc_widget', revisionId: 'rev_widget',
+      sha256: 'b'.repeat(64), size: 512, marker: 'visualize:doc_widget:rev_widget',
+    }
+    const directCall = { ...call, toolId: 'call_widget', name: 'show_widget', result: JSON.stringify(direct) } as ChatToolCall
+    expect(parseVisualizeReceipt(directCall)).toEqual({
+      callId: 'call_widget', documentId: 'doc_widget', revisionId: 'rev_widget',
+      artifactId: 'doc_widget', name: 'Capacity simulator', mime: 'text/html',
+      sha256: 'b'.repeat(64), size: 512, marker: direct.marker,
+    })
+    expect(visualizeReceipts([directCall])).toHaveLength(1)
+  })
+
+  it('accepts edit_widget receipts and keeps only the latest revision for one widget', () => {
+    const initial = {
+      ...receipt, widgetId: 'budget', version: 1, action: 'show', visibility: 'internal',
+      documentId: 'doc_widget', revisionId: 'rev_one', marker: 'visualize:doc_widget:rev_one',
+    }
+    const edited = {
+      ...initial, action: 'edit', version: 2, revisionId: 'rev_two', marker: 'visualize:doc_widget:rev_two',
+    }
+    const show = { ...call, name: 'show_widget', toolId: 'show_widget_call', result: JSON.stringify(initial) } as ChatToolCall
+    const edit = { ...call, name: 'edit_widget', toolId: 'edit_widget_call', result: JSON.stringify(edited) } as ChatToolCall
+    const latest = visualizeReceipts([show, edit])
+    expect(latest).toHaveLength(1)
+    expect(latest[0]).toMatchObject({ widgetId: 'budget', action: 'edit', version: 2, revisionId: 'rev_two' })
+    expect(splitVisualizeBody(`<p><code>${edited.marker}</code></p>`, latest)[0]?.receipt).toMatchObject({ revisionId: 'rev_two' })
+    expect(splitVisualizeBody(`<p><code>${initial.marker}</code></p>`, latest)[0]?.receipt).toMatchObject({ revisionId: 'rev_two' })
+    const legacyShow = { ...show, result: JSON.stringify({ ...initial, widgetId: undefined, action: undefined }) } as ChatToolCall
+    expect(visualizeReceipts([legacyShow, edit])).toHaveLength(1)
+  })
+
+  it('keeps the greatest published version even when older edits arrive later', () => {
+    const first = widgetCall('show_one', 'rev_one', 1, 'show')
+    const second = widgetCall('edit_two', 'rev_two', 2)
+    const third = widgetCall('show_three', 'rev_three', 3, 'show')
+    for (const calls of [[first, third, second], [third, second, first], [second, first, third]]) {
+      expect(visualizeReceipts(calls)).toMatchObject([{ version: 3, revisionId: 'rev_three', callId: 'show_three' }])
+    }
+  })
+
+  it('keeps the first receipt on a version tie, including duplicate projections', () => {
+    const latest = widgetCall('edit_two', 'rev_two', 2)
+    const duplicate = { ...latest }
+    const conflictingTie = widgetCall('edit_same_version', 'rev_conflict', 2)
+    expect(visualizeReceipts([latest, duplicate, conflictingTie])).toMatchObject([
+      { version: 2, revisionId: 'rev_two', callId: 'edit_two' },
+    ])
+  })
+
+  it('does not let legacy unversioned edits replace a known version in either order', () => {
+    const legacy = widgetCall('legacy_edit', 'rev_legacy', undefined)
+    const versioned = widgetCall('show_two', 'rev_two', 2, 'show')
+    for (const calls of [[legacy, versioned], [versioned, legacy]]) {
+      expect(visualizeReceipts(calls)).toMatchObject([{ version: 2, revisionId: 'rev_two' }])
+    }
+  })
+
+  it('retains legacy call order without replaying duplicated older publications', () => {
+    const first = widgetCall('legacy_show', 'rev_one', undefined, 'show')
+    const second = widgetCall('legacy_edit', 'rev_two', undefined)
+    const third = widgetCall('legacy_rewrite', 'rev_three', undefined, 'show')
+    expect(visualizeReceipts([first, second, first])).toMatchObject([{ revisionId: 'rev_two' }])
+    expect(visualizeReceipts([first, second, third, first, second])).toMatchObject([{ revisionId: 'rev_three' }])
+  })
+
+  it.each([undefined, 3])('merges timeline and flat projections without a stale revision rollback (version %s)', version => {
+    const first = widgetCall('edit_one', 'rev_one', version === undefined ? undefined : 2)
+    const latest = widgetCall('edit_latest', 'rev_latest', version)
+    const message = {
+      timelineItems: [{ type: 'tool-group', group: { calls: [first, latest] } }],
+      toolCalls: [first, { ...latest }, first],
+    } as ChatRenderedMessage
+    expect(visualizeReceiptsFromMessage(message)).toMatchObject([{ revisionId: 'rev_latest', callId: 'edit_latest' }])
+  })
+
+  it('accepts size aliases but rejects an unfinalized or non-inline widget result', () => {
+    const base = { documentId: 'doc_widget', revisionId: 'rev_widget', sha256: 'b'.repeat(64), marker: 'visualize:doc_widget:rev_widget' }
+    const directCall = (payload: Record<string, unknown>) => ({ ...call, toolId: 'call_widget', name: 'show_widget', result: JSON.stringify(payload) } as ChatToolCall)
+    expect(parseVisualizeReceipt(directCall({ ...base, byteLength: 512 }))).not.toBeNull()
+    expect(parseVisualizeReceipt(directCall({ ...base, size: 512, previewStatus: 'error' }))).toBeNull()
+    expect(parseVisualizeReceipt(directCall({ ...base, size: 512, presentation: 'expanded' }))).toBeNull()
+    expect(parseVisualizeReceipt(directCall({ ...base, size: 512, marker: 'visualize:doc_other:rev_widget' }))).toBeNull()
+  })
+
+  it('keeps the legacy tool strict and does not treat an ordinary show_widget call as a canvas', () => {
+    const legacy = { ...call, name: 'open_workspace_preview', result: JSON.stringify({ ...receipt, previewStatus: undefined, presentation: undefined }) } as ChatToolCall
+    expect(parseVisualizeReceipt(legacy)).toBeNull()
+    const unfinished = { ...call, name: 'show_widget', status: '', result: JSON.stringify({ documentId: 'doc_widget', revisionId: 'rev_widget' }) } as ChatToolCall
+    expect(parseVisualizeReceipt(unfinished)).toBeNull()
+  })
+})

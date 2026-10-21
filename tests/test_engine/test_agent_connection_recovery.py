@@ -173,13 +173,13 @@ async def test_connection_wait_respects_existing_task_deadline():
     events = await asyncio.wait_for(_run(provider, timeout=0.05), timeout=1)
 
     assert len(provider.calls) == 1
-    assert any(
+    assert not any(
         event.kind == "provider_activity" and event.phase == "retry_wait"
         for event in events
     )
     errors = [event for event in events if event.kind == "error"]
     assert len(errors) == 1
-    assert errors[0].code == "agent_runtime_timeout"
+    assert errors[0].code == "connection_failed"
 
 
 async def test_rate_retry_wait_respects_existing_task_deadline(monkeypatch):

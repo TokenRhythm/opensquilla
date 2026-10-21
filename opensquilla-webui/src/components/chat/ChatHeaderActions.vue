@@ -2,17 +2,29 @@
   <div
     ref="rootRef"
     class="chat-header"
+    :class="{ 'chat-header--finding': findState?.open }"
     :data-layout="layout"
     data-testid="chat-header-actions"
   >
     <div class="chat-header__identity">
       <h1 class="chat-header__title chat-label" :title="title">{{ title }}</h1>
-      <span class="chat-header__copy-live" aria-live="polite">{{ copyLiveText }}</span>
+      <span v-if="copyState === 'err'" class="chat-header__copy-live" aria-live="polite">{{ copyLiveText }}</span>
     </div>
 
     <span class="chat-header__spacer" aria-hidden="true"></span>
 
-    <div v-if="layout === 'wide'" class="chat-header__actions">
+    <ChatFindBar
+      v-if="findState?.open"
+      ref="findBarRef"
+      class="chat-header__find"
+      v-bind="findState"
+      @update:query="emit('update-find-query', $event)"
+      @search="emit('search-find', $event)"
+      @navigate="emit('navigate-find', $event)"
+      @close="emit('close-find')"
+    />
+
+    <div v-if="layout === 'wide' && deliverableCount > 0" class="chat-header__actions">
       <button
         v-if="deliverableCount > 0"
         ref="wideDeliverablesRef"
@@ -33,20 +45,6 @@
           data-testid="chat-deliverables-new-badge"
           aria-hidden="true"
         >New</span>
-      </button>
-      <button
-        v-if="!shareMode"
-        ref="wideShareRef"
-        type="button"
-        class="chat-header__action chat-share-btn"
-        :aria-disabled="!canShare"
-        :title="shareLabel"
-        :aria-label="shareAriaLabel"
-        data-testid="chat-session-action-share"
-        @click="invoke('share')"
-      >
-        <Icon name="share" :size="14" />
-        <span class="chat-share-btn__label">{{ t('chat.share') }}</span>
       </button>
     </div>
 
@@ -69,7 +67,7 @@
         <Icon :name="primaryActionIcon" :size="16" />
         <span
           v-if="primaryAction === 'deliverables'"
-          class="chat-header__count-badge chat-header__count-badge--corner"
+          class="chat-header__count-badge"
           aria-hidden="true"
         >{{ deliverableBadge }}</span>
         <span
@@ -115,6 +113,18 @@
         @keydown="onMenuKeydown"
       >
         <button
+          v-if="findState"
+          type="button"
+          class="chat-header__menu-item"
+          role="menuitem"
+          data-testid="chat-session-action-find"
+          @click="invoke('find', true)"
+        >
+          <Icon name="search" :size="16" />
+          <span>{{ t('chat.find.label') }}</span>
+          <kbd class="chat-header__shortcut">{{ findShortcutLabel }}</kbd>
+        </button>
+        <button
           v-if="menuActions.includes('deliverables')"
           type="button"
           class="chat-header__menu-item topbar-state topbar-state--deliverables"
@@ -153,28 +163,8 @@
           type="button"
           class="chat-header__menu-item"
           role="menuitem"
-          data-testid="chat-session-action-copy-app-link"
-          @click="invoke('copy-session-link', true)"
-        >
-          <Icon name="externalLink" :size="16" />
-          <span>{{ t('chat.copySessionAppLink') }}</span>
-        </button>
-        <button
-          type="button"
-          class="chat-header__menu-item"
-          role="menuitem"
-          data-testid="chat-session-action-copy-gateway-link"
-          @click="invoke('copy-gateway-link', true)"
-        >
-          <Icon name="externalLink" :size="16" />
-          <span>{{ t('chat.copySessionGatewayLink') }}</span>
-        </button>
-        <button
-          type="button"
-          class="chat-header__menu-item"
-          role="menuitem"
           data-testid="chat-session-action-copy"
-          @click="invoke('copy-session-key', true)"
+          @click="invoke('copy-session-link', true)"
         >
           <Icon :name="copyIcon" :size="16" />
           <span>{{ copyLabel }}</span>
@@ -188,6 +178,8 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ChatFindBar from './ChatFindBar.vue'
+import type { ChatRouteHeaderFindState } from '@/composables/chat/useChatRouteHeaderBridge'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -196,8 +188,9 @@ import {
   type SessionHeaderLayout,
 } from '@/utils/headerLayout'
 import type { IconName } from '@/utils/icons'
+import { isMacPlatform } from '@/utils/browser'
 
-type Action = 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link'
+type Action = 'deliverables' | 'share' | 'copy-session-link' | 'find'
 
 const COARSE_POINTER_QUERY = '(pointer: coarse)'
 
@@ -210,14 +203,18 @@ const props = defineProps<{
   hasNewDeliverable: boolean
   shareMode: boolean
   shareableMessageCount: number
+  findState?: ChatRouteHeaderFindState | null
 }>()
 
 const emit = defineEmits<{
   'open-deliverables': []
   'start-share': []
-  'copy-session-key': []
   'copy-session-link': []
-  'copy-gateway-link': []
+  'open-find': []
+  'update-find-query': [query: string]
+  'search-find': [query: string]
+  'navigate-find': [direction: 'previous' | 'next']
+  'close-find': []
 }>()
 
 const { t } = useI18n()
@@ -227,7 +224,8 @@ const menuTriggerRef = ref<HTMLButtonElement | null>(null)
 const menuRef = ref<HTMLDivElement | null>(null)
 const primaryActionRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
-const wideShareRef = ref<HTMLButtonElement | null>(null)
+const findBarRef = ref<{ focus: () => void } | null>(null)
+const findShortcutLabel = isMacPlatform() ? '⌘F' : 'Ctrl+F'
 const layout = ref<SessionHeaderLayout>('wide')
 const menuOpen = ref(false)
 useChatTopbarPopoverCoordination('session-actions', menuOpen)
@@ -237,7 +235,7 @@ let coarsePointerMedia: MediaQueryList | null = null
 let layoutFrame: number | null = null
 let hasMeasuredLayout = false
 
-const copyLabel = computed(() => props.copyState === 'ok' ? t('chat.copied') : t('chat.copySessionKey'))
+const copyLabel = computed(() => t('chat.copySessionLink'))
 const deliverablesLabel = computed(() => {
   const label = t('chat.deliverablesCount', { count: props.deliverableCount })
   return props.hasNewDeliverable ? `${label}, New` : label
@@ -246,34 +244,19 @@ const deliverableBadge = computed(() => props.deliverableCount > 99
   ? '99+'
   : String(props.deliverableCount))
 const canShare = computed(() => props.shareableMessageCount > 0)
-const shareLabel = computed(() => !canShare.value
-  ? t('chat.shareSendFirst')
-  : t('chat.shareSelectHint'))
-const shareAriaLabel = computed(() => !canShare.value
-  ? t('chat.shareSendFirst')
-  : t('chat.share'))
-
 const primaryAction = computed<Action | null>(() => {
   if (layout.value !== 'compact') return null
   if (props.deliverableCount > 0) return 'deliverables'
-  if (!props.shareMode && canShare.value) return 'share'
   return null
 })
 
-const primaryActionLabel = computed(() => {
-  if (primaryAction.value === 'deliverables') return deliverablesLabel.value
-  return shareAriaLabel.value
-})
-const primaryActionIcon = computed<IconName>(() => {
-  if (primaryAction.value === 'deliverables') return 'fileText'
-  return 'share'
-})
+const primaryActionLabel = deliverablesLabel
+const primaryActionIcon: IconName = 'fileText'
 
 const menuActions = computed<Action[]>(() => {
   const actions: Action[] = []
-  if (layout.value === 'wide') return actions
-  if (props.deliverableCount > 0 && primaryAction.value !== 'deliverables') actions.push('deliverables')
-  if (!props.shareMode && primaryAction.value !== 'share') actions.push('share')
+  if (layout.value === 'tight' && props.deliverableCount > 0) actions.push('deliverables')
+  if (!props.shareMode) actions.push('share')
   return actions
 })
 
@@ -283,22 +266,19 @@ function isVisible(element: HTMLElement | null): element is HTMLElement {
 
 function actionForElement(element: Element | null): Action | null {
   if (element === wideDeliverablesRef.value) return 'deliverables'
-  if (element === wideShareRef.value) return 'share'
-  if (element === menuTriggerRef.value) return 'copy-session-key'
+  if (element === menuTriggerRef.value) return 'copy-session-link'
   if (element === primaryActionRef.value) return primaryAction.value
   if (!(element instanceof HTMLElement)) return null
   const testId = element.dataset.testid
   if (testId === 'chat-session-action-deliverables') return 'deliverables'
   if (testId === 'chat-session-action-share') return 'share'
-  if (testId === 'chat-session-action-copy') return 'copy-session-key'
-  if (testId === 'chat-session-action-copy-app-link') return 'copy-session-link'
-  if (testId === 'chat-session-action-copy-gateway-link') return 'copy-gateway-link'
+  if (testId === 'chat-session-action-copy') return 'copy-session-link'
+  if (testId === 'chat-session-action-find') return 'find'
   return null
 }
 
 function focusWideFallback() {
   const fallback = wideDeliverablesRef.value
-    || wideShareRef.value
     || menuTriggerRef.value
   fallback?.focus()
 }
@@ -319,10 +299,15 @@ function syncLayout() {
   const restoreHeaderFocus = Boolean(
     activeElement instanceof Node && rootRef.value?.contains(activeElement),
   )
+  const findHadFocus = activeElement instanceof Element && Boolean(activeElement.closest('.chat-find-bar'))
   layout.value = next
   menuOpen.value = false
   if (restoreHeaderFocus) {
     void nextTick(() => {
+      if (findHadFocus && props.findState?.open) {
+        findBarRef.value?.focus()
+        return
+      }
       if (focusedAction && focusAction(focusedAction)) return
       if (next !== 'wide') {
         menuTriggerRef.value?.focus()
@@ -373,9 +358,8 @@ function invoke(action: Action, fromMenu = false) {
   if (fromMenu) closeMenu(true)
   if (action === 'deliverables') emit('open-deliverables')
   if (action === 'share') emit('start-share')
-  if (action === 'copy-session-key') emit('copy-session-key')
   if (action === 'copy-session-link') emit('copy-session-link')
-  if (action === 'copy-gateway-link') emit('copy-gateway-link')
+  if (action === 'find') emit('open-find')
 }
 
 function onMenuKeydown(event: KeyboardEvent) {
@@ -402,11 +386,13 @@ function onMenuKeydown(event: KeyboardEvent) {
 }
 
 function focusAction(action: Action): boolean {
+  if (action === 'find' && props.findState?.open && findBarRef.value) {
+    findBarRef.value.focus()
+    return true
+  }
   const direct = action === 'deliverables'
     ? wideDeliverablesRef.value
-    : action === 'share'
-      ? wideShareRef.value
-      : menuTriggerRef.value
+    : menuTriggerRef.value
   if (isVisible(direct)) {
     direct.focus()
     return true
@@ -508,6 +494,15 @@ defineExpose({ focusAction, closeMenu })
   min-width: 0;
 }
 
+.chat-header__find { flex: 0 1 320px; }
+.chat-header--finding .chat-header__identity { flex-shrink: 2; }
+.chat-header__shortcut {
+  margin-inline-start: auto;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-xs);
+}
+
 .chat-header__copy-live {
   border: 0;
   clip: rect(0 0 0 0);
@@ -535,9 +530,9 @@ defineExpose({ focusAction, closeMenu })
 
 .chat-header__action {
   align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   color: var(--text-muted);
   cursor: pointer;
   display: inline-flex;
@@ -554,7 +549,7 @@ defineExpose({ focusAction, closeMenu })
 .chat-header__action:focus-visible,
 .chat-header__action.is-open {
   background: var(--bg-hover);
-  border-color: var(--border-strong);
+  border-color: transparent;
   color: var(--text);
 }
 
@@ -564,15 +559,20 @@ defineExpose({ focusAction, closeMenu })
   opacity: 0.6;
 }
 
+.chat-header__action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .chat-header__action--icon {
-  background: var(--bg-elevated);
-  flex: 0 0 44px;
-  height: 44px;
-  min-height: 44px;
-  min-width: 44px;
+  background: transparent;
+  flex: 0 0 32px;
+  height: 32px;
+  min-height: 32px;
+  min-width: 32px;
   padding: 0;
   position: relative;
-  width: 44px;
+  width: 32px;
 }
 
 .chat-header__action--icon-small {
@@ -580,16 +580,22 @@ defineExpose({ focusAction, closeMenu })
   padding: 0.25rem;
 }
 
+.chat-header__action--icon[data-action='deliverables'] {
+  flex-basis: auto;
+  padding-inline: var(--sp-1);
+  width: auto;
+}
+
 .chat-header__action--deliverables.topbar-state {
-  background: var(--topbar-state-fill);
-  border-color: var(--topbar-state-border);
+  background: transparent;
+  border-color: transparent;
   color: var(--topbar-state-channel);
 }
 
 .chat-header__count-badge {
   align-items: center;
-  background: var(--bg-hover);
-  border: 1px solid var(--border-strong);
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-full);
   box-sizing: border-box;
   color: var(--text-muted);
@@ -638,8 +644,8 @@ defineExpose({ focusAction, closeMenu })
 
 .topbar-state--deliverables .chat-header__count-badge,
 .chat-header__count-badge.topbar-state--deliverables {
-  background: var(--topbar-state-fill);
-  border-color: var(--topbar-state-border);
+  background: transparent;
+  border-color: transparent;
   color: var(--topbar-state-channel);
 }
 
@@ -719,14 +725,23 @@ defineExpose({ focusAction, closeMenu })
   margin-top: 2px;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 768px), (pointer: coarse) {
   .chat-header__copy,
   .chat-header__action {
     min-height: 44px;
   }
+  .chat-header__action--icon {
+    flex-basis: 44px;
+    height: 44px;
+    min-width: 44px;
+    width: 44px;
+  }
 }
 
 @media (max-width: 480px) {
+  .chat-header--finding .chat-header__identity,
+  .chat-header--finding .chat-header__spacer { display: none; }
+  .chat-header__find { flex-grow: 1; }
   .chat-header__menu {
     left: var(--sp-3);
     max-width: none;

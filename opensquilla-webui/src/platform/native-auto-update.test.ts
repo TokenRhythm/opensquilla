@@ -253,4 +253,17 @@ describe('desktop update platform bridge', () => {
       installMode: 'unsupported',
     })
   })
+  it('keeps automatic preparation capability explicit and release notes separate from assets', async () => {
+    const raw: Record<string, unknown> = {
+      status: 'available', installMode: 'manual', canAutoDownload: true,
+      releaseUrl: 'https://example.invalid/installer.exe',
+      releaseNotesUrl: 'https://github.com/TokenRhythm/opensquilla/releases/tag/v2.0.0',
+    }
+    setDesktopApi({ getUpdateState: async () => raw })
+    const updates = createDesktopPlatform().updates
+    expect(await updates.getState()).toMatchObject(raw)
+    Object.assign(raw, { canAutoDownload: undefined, releaseNotesUrl: undefined })
+    expect(await updates.getState()).toMatchObject({ canAutoDownload: false, releaseNotesUrl: null })
+  })
+
 })

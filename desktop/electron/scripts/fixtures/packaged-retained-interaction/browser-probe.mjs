@@ -2,7 +2,7 @@
 // or injects an RPC frame. This function is serializable for page.evaluate().
 export function installRetainedRpcProbe() {
   if (globalThis.__retainedAuditRpc) return
-  const probe = { requests: [], events: [] }
+  const probe = { requests: [], events: [], transport: [] }
   Object.defineProperty(globalThis, '__retainedAuditRpc', { value: probe })
   const observed = new WeakSet()
   const originalSend = WebSocket.prototype.send
@@ -30,12 +30,19 @@ export function installRetainedRpcProbe() {
       this.addEventListener('message', event => {
         try {
           const frame = JSON.parse(event.data)
+          if (frame.type === 'res') {
+            probe.transport.push({ type: 'res', id: frame.id, ok: frame.ok,
+              code: typeof frame.error?.code === 'string' ? frame.error.code : undefined, at: Date.now() })
+          }
           if (frame.type === 'event') recordEvent(frame.payload, frame.event, undefined)
         } catch { /* Observation cannot change the production transport. */ }
       })
     }
     try {
       const frame = typeof data === 'string' ? JSON.parse(data) : null
+      if (frame?.type === 'req') {
+        probe.transport.push({ type: 'req', id: frame.id, method: frame.method, at: Date.now() })
+      }
       if (frame?.type === 'req' && ['chat.send', 'chat.abort'].includes(frame.method)) {
         const params = frame.params || {}
         probe.requests.push({ method: frame.method, params: {

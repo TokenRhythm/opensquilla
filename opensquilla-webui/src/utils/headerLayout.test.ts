@@ -12,7 +12,6 @@ import {
   SYSTEM_HEADER_TIGHT_ENTER_WIDTH,
   SYSTEM_HEADER_TIGHT_EXIT_WIDTH,
   SYSTEM_HEADER_WIDE_EXIT_WIDTH,
-  highestSystemSeverity,
   resolveSessionHeaderLayout,
   resolveSystemHeaderLayout,
   type SessionHeaderLayout,
@@ -194,17 +193,5 @@ describe('resolveSystemHeaderLayout', () => {
       pressureCount: Number.NaN,
     })).toBe('wide')
     expect(resolveSystemHeaderLayout({ topbarWidth: 1199, pressureCount: -10 })).toBe('wide')
-  })
-})
-
-describe('highestSystemSeverity', () => {
-  it('uses normal for no active status', () => {
-    expect(highestSystemSeverity([])).toBe('normal')
-  })
-
-  it('selects the highest severity independent of input order', () => {
-    expect(highestSystemSeverity(['info', 'danger', 'warning'])).toBe('danger')
-    expect(highestSystemSeverity(['warning', 'normal', 'info'])).toBe('warning')
-    expect(highestSystemSeverity(['normal', 'info'])).toBe('info')
   })
 })

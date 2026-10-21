@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 import secrets
-from collections.abc import Callable, Collection
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from opensquilla.attachment_refs import (
     is_attachment_ref,
     make_attachment_ref,
     read_attachment_ref_bytes,
+)
+from opensquilla.contracts.attachment_display import (
+    normalize_attachment_display_mime,
+    normalize_attachment_display_name,
 )
 from opensquilla.contracts.attachments import (
     IMAGE_ATTACHMENT_BYTES,
@@ -96,6 +101,176 @@ def render_attachment_material_marker(
         )
     detail = result.error or "workspace materialization unavailable"
     return f"[{prefix}: {result.name} ({result.mime}): {detail}]"
+
+
+def render_historical_attachment_material_marker(
+    result: AttachmentWorkspaceMaterialization,
+) -> str:
+    """Bound the materialization details included in historical provider text.
+
+    Filesystem exceptions can include absolute paths, and working-file state
+    can outlive the workspace that created it. Neither is a safe input to a
+    provider-history budget. Keep a canonical relative path when available;
+    otherwise emit a fixed unavailable reason while retaining diagnostics in
+    ``result.error`` for the caller.
+    """
+
+    safe_mime = normalize_attachment_mime(result.mime)
+    if (
+        safe_mime is None
+        or len(safe_mime) > 120
+        or re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", safe_mime) is None
+    ):
+        safe_mime = "application/octet-stream"
+    safe_result = replace(result, name=_safe_filename(result.name), mime=safe_mime)
+    unavailable = (
+        f"[historical attachment unavailable: {safe_result.name} ({safe_result.mime})]"
+    )
+    if not result.available or not isinstance(result.rel_path, str):
+        return unavailable
+    relative = PurePosixPath(result.rel_path)
+    parts = relative.parts
+    if (
+        relative.is_absolute()
+        or relative.as_posix() != result.rel_path
+        or len(parts) != 4
+        or parts[:2] != (".opensquilla", "attachments")
+        or len(parts[2]) > 180
+        or parts[2] != _safe_path_segment(parts[2], fallback="session")
+        or len(parts[3]) > 193
+        or re.fullmatch(r"[0-9a-f]{12}-.+", parts[3]) is None
+        or parts[3][13:] != _safe_filename(parts[3][13:])
+    ):
+        return unavailable
+    expected_working = (relative.parent / "working" / relative.name).as_posix()
+    working_path = result.working_path if result.working_path == expected_working else None
+    return render_attachment_material_marker(
+        replace(safe_result, working_path=working_path),
+        prefix="historical attachment available",
+    )
+
+
+def historical_attachment_capacity_marker(
+    attachment: Mapping[str, Any],
+    *,
+    session_id: str,
+    sha256_ref: str | None,
+) -> str:
+    """Return a side-effect-free upper estimate of an opaque history marker.
+
+    The provider can see an omitted marker, an unavailable marker, or a
+    materialized workspace path. Construct all three using the same renderer
+    and retain the largest token and character costs without reading or
+    writing attachment material.
+    """
+
+    raw_mime = (
+        attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
+    )
+    mime = normalize_attachment_display_mime(raw_mime)
+    label = normalize_attachment_display_name(attachment.get("name"))
+    candidates = [
+        f"[historical attachment omitted: {label} ({mime})]",
+        f"[historical attachment unavailable: {label} ({mime})]",
+        f"[historical attachment unavailable: {label} ({mime}): "
+        "attachment data is not valid base64]",
+        f"[historical attachment unavailable: {label} ({mime}): "
+        "invalid attachment reference]",
+    ]
+    has_material = bool(
+        attachment.get("data") or attachment.get("sha256_ref")
+        or attachment.get("sha256") or attachment.get("material_id")
+    )
+    if has_material:
+        scope = _safe_path_segment(session_id or "s" * 180, fallback="session")
+        sha = sha256_ref if isinstance(sha256_ref, str) and re.fullmatch(
+            r"[0-9a-f]{64}", sha256_ref
+        ) else "0" * 64
+        safe_name = _safe_filename(_attachment_name(dict(attachment)))
+        rel_path = PurePosixPath(
+            ".opensquilla", "attachments", scope, f"{sha[:12]}-{safe_name}"
+        ).as_posix()
+        # Replay selects ``type`` before ``mime``/``media_type`` and passes
+        # that value to the materializer.  A legacy row can contain both
+        # fields with different values, so use the replay-selected MIME here.
+        material_mime = raw_mime.strip() if isinstance(raw_mime, str) else mime
+        # A materialized payload is bounded by the file staging limits. The
+        # long decimal reserve also covers legacy rows without a stored size.
+        result = AttachmentWorkspaceMaterialization(
+            available=True,
+            name=safe_name,
+            mime=material_mime,
+            size=10**20 - 1,
+            rel_path=rel_path,
+        )
+        candidates.append(render_historical_attachment_material_marker(result))
+        working_path = (
+            PurePosixPath(rel_path).parent / "working" / PurePosixPath(rel_path).name
+        ).as_posix()
+        candidates.append(render_historical_attachment_material_marker(
+            replace(result, working_path=working_path),
+        ))
+
+    from opensquilla.token_estimation import estimate_tokens
+
+    target_tokens = max(estimate_tokens(candidate) for candidate in candidates)
+    # Character admission measures the serialized provider payload. A name
+    # containing quotes, backslashes, or control characters expands in JSON.
+    target_chars = max(len(json.dumps(candidate, ensure_ascii=False)) for candidate in candidates)
+    marker = max(candidates, key=lambda candidate: (estimate_tokens(candidate), len(candidate)))
+    serialized_chars = len(json.dumps(marker, ensure_ascii=False))
+    if serialized_chars < target_chars:
+        marker += "!" * (target_chars - serialized_chars)
+    # A SHA derived only at materialization time and an unknown session scope
+    # can alter tokenizer segmentation, though their ASCII lengths are fixed.
+    unknown_path_bytes = (12 if sha256_ref is None and has_material else 0) + (
+        180 if not session_id and has_material else 0
+    )
+    target_tokens += unknown_path_bytes
+    while estimate_tokens(marker) < target_tokens:
+        marker += " !"
+    return marker
+
+
+def historical_image_material_capacity_marker(
+    attachment: Mapping[str, Any],
+    *,
+    session_id: str,
+) -> str:
+    """Reserve the image workspace marker without materializing its bytes.
+
+    The replay path is generated from a sanitized session, content hash, and
+    filename. A missing session or a hash that changes during materialization
+    can change tokenization, so leave enough room for every unknown path byte.
+    The display name follows the runtime's image marker, which can be longer
+    than the sanitized path component.
+    """
+
+    label = normalize_attachment_display_name(
+        attachment.get("name"), fallback="image",
+    )
+    raw_mime = attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
+    mime = normalize_attachment_display_mime(raw_mime)
+    scope = _safe_path_segment(session_id or "s" * 180, fallback="session")
+    # Use a stable path shape regardless of PNG compression or content. The
+    # actual twelve hash characters can vary in tokenizer cost, reserved below.
+    sha = "0" * 64
+    path = PurePosixPath(
+        ".opensquilla", "attachments", scope,
+        f"{sha[:12]}-{_safe_filename(_attachment_name(dict(attachment)))}",
+    ).as_posix()
+    marker = f"[attachment available: {label} ({mime}) at {path}]"
+
+    from opensquilla.token_estimation import estimate_tokens
+
+    # A different twelve-character hash or unknown session scope can contain
+    # up to one tokenizer unit per ASCII byte. The suffix also covers their
+    # character cost, without depending on filesystem or provider state.
+    unknown_path_bytes = 12 + (180 if not session_id else 0)
+    target_tokens = estimate_tokens(marker) + unknown_path_bytes
+    while estimate_tokens(marker) < target_tokens:
+        marker += " !"
+    return marker
 
 
 class AttachmentWorkspaceMaterializer:
@@ -456,8 +631,13 @@ def _safe_filename(value: str) -> str:
         cleaned = "attachment"
     if len(cleaned) > 180:
         suffix = Path(cleaned).suffix
-        stem = cleaned[: max(1, 180 - len(suffix))]
-        cleaned = f"{stem}{suffix}"
+        if len(suffix) >= 180:
+            # A hostile extension can itself exceed the whole filename limit.
+            cleaned = cleaned[:180].rstrip(" .")
+        else:
+            stem = cleaned[: 180 - len(suffix)]
+            cleaned = f"{stem}{suffix}"
+        cleaned = cleaned or "attachment"
     return cleaned
 
 

@@ -1,6 +1,6 @@
 <template>
-  <div class="sk-stage control-stage control-stage--spacious">
-    <header class="sk-stage__header control-stage__header">
+  <div class="sk-stage control-stage control-stage--spacious control-stage--hub-actions">
+    <header class="sk-stage__header control-stage__header control-stage__header--hub-actions">
       <div class="sk-stage__title-block control-stage__title-block">
         <h1 class="sk-stage__title control-stage__title">{{ t('cronSkills.skillsView.title') }}</h1>
         <p class="sk-stage__subtitle control-stage__subtitle">{{ t('cronSkills.skillsView.subtitle') }}</p>
@@ -47,93 +47,21 @@
               <button class="btn btn--ghost sk-overview-modal__close" type="button" :aria-label="t('common.close')" @click="skillsOverviewOpen = false"><Icon name="x" :size="18" /></button>
             </div>
           </header>
-          <SkillsStats :tiles="statTiles" :active-key="statusFilter" :proposal-count="proposals.length" @select="selectStatusFromOverview" @show-proposals="showProposalsFromOverview" />
+          <SkillsStats :tiles="statTiles" :active-key="statusFilter" @select="selectStatusFromOverview" />
         </section>
       </div>
     </Transition>
 
     <div class="sk-panel" data-testid="skills-catalog">
-      <div class="sk-installed">
-        <details
-          v-if="proposalsSettings.available"
-          class="sk-group sk-group--ap-settings"
-          :open="proposalsSettingsOn"
-        >
-          <summary class="sk-group__head">
-            <span class="sk-group__caret">▾</span>
-            <span class="sk-group__label">{{ t('cronSkills.autoPropose.title') }}</span>
-            <span class="sk-group__count">{{ proposalsSettingsOn ? t('cronSkills.autoPropose.on') : t('cronSkills.autoPropose.off') }}</span>
-            <span class="sk-group__meta">{{ t('cronSkills.autoPropose.meta') }}</span>
-          </summary>
-          <div class="sk-ap-settings">
-            <label class="sk-ap-toggle">
-              <ControlSwitch
-                :checked="proposalsSettings.enabled"
-                :disabled="mutationBusy"
-                :aria-label="t('cronSkills.autoPropose.scheduledLabel')"
-                @change="(v) => toggleAutoPropose('enabled', v)"
-              />
-              <span class="sk-ap-toggle__label">{{ t('cronSkills.autoPropose.scheduledLabel') }}</span>
-              <i18n-t keypath="cronSkills.autoPropose.scheduledHint" tag="span" class="sk-ap-toggle__hint">
-                <template #cron><code>{{ proposalsSettings.cron || '0 5 * * *' }}</code></template>
-              </i18n-t>
-            </label>
-            <label class="sk-ap-toggle">
-              <ControlSwitch
-                :checked="proposalsSettings.on_dream_complete"
-                :disabled="mutationBusy"
-                :aria-label="t('cronSkills.autoPropose.dreamLabel')"
-                @change="(v) => toggleAutoPropose('on_dream_complete', v)"
-              />
-              <span class="sk-ap-toggle__label">{{ t('cronSkills.autoPropose.dreamLabel') }}</span>
-              <span class="sk-ap-toggle__hint">{{ t('cronSkills.autoPropose.dreamHint') }}</span>
-            </label>
-            <label class="sk-ap-toggle">
-              <ControlSwitch
-                :checked="proposalsSettings.auto_enable"
-                :disabled="mutationBusy"
-                :aria-label="t('cronSkills.autoPropose.autoEnableLabel')"
-                @change="(v) => toggleAutoPropose('auto_enable', v)"
-              />
-              <span class="sk-ap-toggle__label">{{ t('cronSkills.autoPropose.autoEnableLabel') }}</span>
-              <i18n-t keypath="cronSkills.autoPropose.autoEnableHint" tag="span" class="sk-ap-toggle__hint">
-                <template #risk><code>{{ proposalsSettings.auto_enable_max_risk || 'low' }}</code></template>
-              </i18n-t>
-            </label>
-            <label class="sk-ap-toggle">
-              <span class="sk-ap-toggle__label">{{ t('cronSkills.autoPropose.riskCeilingLabel') }}</span>
-              <select
-                class="sk-ap-select"
-                :value="proposalsSettings.auto_enable_max_risk || 'low'"
-                :disabled="mutationBusy"
-                @change="setAutoEnableRisk(($event.target as HTMLSelectElement).value)"
-              >
-                <option value="low">{{ t('cronSkills.autoPropose.riskLow') }}</option>
-                <option value="medium">{{ t('cronSkills.autoPropose.riskMedium') }}</option>
-                <option value="high">{{ t('cronSkills.autoPropose.riskHigh') }}</option>
-              </select>
-              <span class="sk-ap-toggle__hint">{{ t('cronSkills.autoPropose.riskCeilingHint') }}</span>
-            </label>
-          </div>
-        </details>
-
-        <PendingSkillProposals
-          ref="proposalsPanelRef"
-          :proposals="proposals"
-          :mutation-disabled="mutationBusy"
-          @show="openProposalDialog"
-          @accept="acceptProposal"
-          @reject="rejectProposal"
-        />
-        <AutoEnabledSkills :skills="autoEnabledSkills" :mutation-disabled="mutationBusy" @disable="disableAutoEnabled" />
-        <SkillGroup
-          :title="t('cronSkills.skillsView.metaSkillsTitle')"
-          :description="t('cronSkills.skillsView.metaSkillsDesc')"
-          :skills="metaSkills"
-          group-class="sk-group--meta"
-          meta
-          @open="openSkillDialog"
-        />
+      <ErrorState v-if="catalogError && !catalogHasLoaded" :message="t('cronSkills.skills.loadFailed')" :on-retry="loadData" />
+      <div v-else-if="!catalogHasLoaded" class="state" aria-busy="true">
+        <LoadingSpinner />
+      </div>
+      <div v-else class="sk-installed">
+        <p v-if="catalogError" class="sk-catalog-status" role="status">
+          <span>{{ t('cronSkills.skills.refreshFailed') }}</span>
+          <button class="btn btn--ghost" type="button" :disabled="catalogLoading" @click="loadData">{{ t('shared.errorState.retry') }}</button>
+        </p>
         <SkillGroup
           v-for="layer in visibleLayerGroups"
           :key="layer.key"
@@ -183,7 +111,6 @@
 
     <SkillDetailDialog
       :skill="selectedSkill"
-      :proposal="selectedProposal"
       :loading-content="selectedSkillLoading"
       :content-error="selectedSkillError"
       :install-feedback="installFeedback"
@@ -203,26 +130,24 @@
 </template>
 
 <script setup lang="ts">
-import { computed, inject, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import ControlSwitch from '@/components/ControlSwitch.vue'
-import AutoEnabledSkills from '@/components/skills/AutoEnabledSkills.vue'
-import PendingSkillProposals from '@/components/skills/PendingSkillProposals.vue'
+import ErrorState from '@/components/ErrorState.vue'
+import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import SkillDetailDialog from '@/components/skills/SkillDetailDialog.vue'
 import SkillGroup from '@/components/skills/SkillGroup.vue'
 import SkillsAddDrawer from '@/components/skills/SkillsAddDrawer.vue'
 import SkillsStats from '@/components/skills/SkillsStats.vue'
-import { useSkillProposals } from '@/composables/skills/useSkillProposals'
 import { useSkillDetailController } from '@/composables/skills/useSkillDetailController'
 import { isSkillTaskEligible, prepareSkillTaskPrefill } from '@/composables/skills/skillTaskPrefill'
 import { createSkillMutationGate } from '@/composables/skills/useSkillMutationGate'
 import { useSkillRegistry } from '@/composables/skills/useSkillRegistry'
-import { isMetaSkill, skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
+import { skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
 import { useToasts } from '@/composables/useToasts'
 import { useDialogA11y } from '@/composables/useDialogA11y'
-import type { Proposal, Skill } from '@/types/skills'
+import type { Skill } from '@/types/skills'
 import { SKILL_CATALOG_KEY, type SkillReloadResult } from '@/modules/skillCatalog'
 
 const { t } = useI18n()
@@ -239,38 +164,18 @@ const addSkillOpen = ref(false)
 useDialogA11y(skillsOverviewPanelRef, skillsOverviewOpen, () => { skillsOverviewOpen.value = false })
 const reloading = ref(false)
 const settingEnabled = ref(false)
-const selectedProposal = ref<Proposal | null>(null)
-const proposalsPanelRef = ref<InstanceType<typeof PendingSkillProposals> | null>(null)
 
 let loadData: () => Promise<boolean>
 const mutationGate = createSkillMutationGate()
 
-const proposalsModel = useSkillProposals(skillCatalog, async () => { await loadData() }, mutationGate)
-const {
-  proposals,
-  autoEnabledSkills,
-  proposalsSettings,
-  proposalsSettingsOn,
-  loadProposals,
-  toggleAutoPropose,
-  setAutoEnableRisk,
-  showProposal,
-  acceptProposal,
-  rejectProposal,
-  disableAutoEnabled,
-} = proposalsModel
-
-const catalog = useSkillsCatalog(skillCatalog, {
-  proposals,
-  autoEnabledSkills,
-  proposalsSettings,
-  loadProposals,
-})
+const catalog = useSkillsCatalog(skillCatalog)
 
 const {
+  loading: catalogLoading,
+  hasLoaded: catalogHasLoaded,
+  error: catalogError,
   filterText,
   statusFilter,
-  metaSkills,
   visibleLayerGroups,
   installedEmpty,
   emptyMessage,
@@ -309,15 +214,6 @@ async function manualReload() {
         summary: reloadSummary(result),
         errors: result.errors?.length || 0,
       }), { tone: 'warn' })
-    } else if (!result.changed) {
-      pushToast(t('cronSkills.skillsView.reloadNoChanges', {
-        generation: result.generation,
-      }))
-    } else {
-      pushToast(t('cronSkills.skillsView.reloadSuccess', {
-        generation: result.generation,
-        summary: reloadSummary(result),
-      }), { tone: 'ok' })
     }
   } catch (err) {
     pushToast(t('cronSkills.skillsView.reloadFailed', {
@@ -356,7 +252,7 @@ const {
   uninstallSkill,
 } = registry
 
-const skillDetail = useSkillDetailController({ catalog: skillCatalog, installDeps })
+const skillDetail = useSkillDetailController({ catalog: skillCatalog, installDeps, uninstallSkill })
 const {
   selectedSkill,
   selectedSkillLoading,
@@ -365,20 +261,21 @@ const {
   openSkill,
   closeSkill,
   installCurrentDependencies,
+  uninstallCurrentSkill,
 } = skillDetail
 
 const skillLaunchPending = ref(false)
 const canUseSelectedSkillInTask = computed(() => {
   const skill = selectedSkill.value
   if (!skill || !isSkillTaskEligible(skill)) return false
-  return isMetaSkill(skill) || Boolean(skillCatalog.supportsCandidates?.())
+  return Boolean(skillCatalog.supportsCandidates?.())
 })
 
 async function useSkillInTask(skill: Skill) {
   if (skillLaunchPending.value || mutationBusy.value || selectedSkill.value !== skill) return
   skillLaunchPending.value = true
   try {
-    const candidates = isMetaSkill(skill) ? [] : (await skillCatalog.listCandidates()).candidates
+    const candidates = (await skillCatalog.listCandidates()).candidates
     // Closing the dialog or selecting another skill retires an in-flight read.
     if (selectedSkill.value !== skill) return
     const prefill = prepareSkillTaskPrefill(skill, candidates)
@@ -413,9 +310,7 @@ async function setSkillEnabled(name: string, enabled: boolean) {
   try {
     const result = await skillCatalog.setEnabled({ name, enabled })
     if (result.persisted) {
-      pushToast(t(result.refreshed
-        ? enabled ? 'cronSkills.skillDetail.enabledSaved' : 'cronSkills.skillDetail.disabledSaved'
-        : 'cronSkills.skillDetail.refreshPending'), { tone: result.refreshed ? 'ok' : 'warn' })
+      if (!result.refreshed) pushToast(t('cronSkills.skillDetail.refreshPending'), { tone: 'warn' })
       await loadData()
       if (selectedSkill.value === original) await openSkill({ ...original, disabled: !enabled })
     }
@@ -467,30 +362,16 @@ onActivated(() => {
 onDeactivated(teardownLive)
 onUnmounted(teardownLive)
 
-function scrollToProposals() {
-  proposalsPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-}
-
 function selectStatusFromOverview(key: string) {
   skillsOverviewOpen.value = false
   selectStatusFilter(key)
 }
 
-async function showProposalsFromOverview() {
-  skillsOverviewOpen.value = false
-  await showProposalsFromStats()
-}
 function selectStatusFilter(key: string) {
   setStatusFilter(key)
 }
 
-async function showProposalsFromStats() {
-  await nextTick()
-  scrollToProposals()
-}
-
 async function openSkillDialog(skill: Skill) {
-  selectedProposal.value = null
   await openSkill(skill)
 }
 
@@ -516,7 +397,6 @@ async function openRegistryResultDetails(
   }
 
   addSkillOpen.value = false
-  selectedProposal.value = null
   if (skill) {
     await openSkill(skill)
     return
@@ -533,16 +413,8 @@ async function openRegistryResultDetails(
   })
 }
 
-async function openProposalDialog(proposalId: string) {
-  const proposal = await showProposal(proposalId)
-  if (!proposal) return
-  closeSkill()
-  selectedProposal.value = proposal
-}
-
 function closeDialog() {
   closeSkill()
-  selectedProposal.value = null
 }
 
 async function installDepsAndMaybeClose(name: string, installId: string) {
@@ -550,12 +422,21 @@ async function installDepsAndMaybeClose(name: string, installId: string) {
 }
 
 async function uninstallSkillAndClose(name: string, installId: string) {
-  const removed = await uninstallSkill(name, installId)
-  if (removed) closeDialog()
+  await uninstallCurrentSkill(name, installId)
 }
 </script>
 
 <style>
+.sk-catalog-status {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 13px;
+  gap: 8px;
+  line-height: 20px;
+  margin: 0;
+}
 /* Compact skills overview */
 .sk-overview-modal {
   align-items: center;
@@ -678,15 +559,6 @@ async function uninstallSkillAndClose(name: string, installId: string) {
   border-radius: var(--radius-lg);
   overflow: hidden;
 }
-.sk-group--meta {
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
-}
-.sk-group--proposals {
-  border-color: color-mix(in srgb, var(--warn) 30%, var(--border));
-}
-.sk-group--ap-settings {
-  border-color: color-mix(in srgb, var(--accent) 20%, var(--border));
-}
 .sk-group__head {
   display: flex;
   align-items: center;
@@ -726,112 +598,6 @@ async function uninstallSkillAndClose(name: string, installId: string) {
 /* Grid */
 .sk-grid {
   padding: var(--sp-3) var(--sp-4) var(--sp-4);
-}
-
-/* Proposals list */
-.sk-proposals-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: var(--sp-3) var(--sp-4) var(--sp-4);
-}
-.sk-proposal-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: var(--sp-3);
-  padding: var(--sp-3);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  flex-wrap: wrap;
-}
-.sk-proposal-row__head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.sk-proposal-row__id {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--text);
-  background: var(--bg-elevated);
-  padding: 2px 6px;
-  border-radius: var(--radius-sm);
-}
-.sk-proposal-row__actions {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-.sk-prop-chip {
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-}
-.sk-prop-chip--ok {
-  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
-  color: var(--ok);
-}
-.sk-prop-chip--warn {
-  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
-  color: var(--warn);
-}
-.sk-prop-chip--auto {
-  border-style: dashed;
-  color: var(--accent);
-}
-.sk-prop-hash {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-dim);
-}
-
-/* Auto-propose settings */
-.sk-ap-settings {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4) var(--sp-4);
-}
-.sk-ap-toggle {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-2);
-  flex-wrap: wrap;
-  cursor: pointer;
-}
-.sk-ap-toggle input[type="checkbox"] {
-  margin-top: 2px;
-  accent-color: var(--accent);
-}
-.sk-ap-toggle__label {
-  font-weight: 600;
-  font-size: var(--fs-sm);
-  color: var(--text);
-}
-.sk-ap-toggle__hint {
-  font-size: var(--fs-xs);
-  color: var(--text-muted);
-  width: 100%;
-  margin-left: 44px;
-}
-.sk-ap-select {
-  padding: 4px 8px;
-  font-size: var(--fs-sm);
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text);
-  outline: none;
-}
-.sk-ap-select:focus {
-  border-color: var(--accent);
 }
 
 .sk-spinner {
@@ -1237,10 +1003,6 @@ async function uninstallSkillAndClose(name: string, installId: string) {
   .sk-detail__dependency-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .sk-proposal-row {
-    flex-direction: column;
-    align-items: flex-start;
-  }
 }
 
 /* Skill catalog groups read as open sections, not cards inside cards. */
@@ -1249,9 +1011,6 @@ async function uninstallSkillAndClose(name: string, installId: string) {
   border: 0;
   border-radius: 0;
   overflow: visible;
-}
-.sk-group--skills.sk-group--meta {
-  border: 0;
 }
 .sk-group--skills > .sk-group__head {
   border-bottom: 0;
@@ -1344,18 +1103,8 @@ async function uninstallSkillAndClose(name: string, installId: string) {
 }
 
 .sk-tile,
-.sk-stat,
-.sk-proposal-row {
+.sk-stat {
   font-family: var(--font-sans);
-}
-.sk-prop-chip,
-.sk-prop-hash {
-  font-size: 11px;
-  line-height: 18px;
-}
-.sk-proposal-row__id {
-  font-size: 12px;
-  line-height: 18px;
 }
 .sk-stat__label,
 .sk-stat__hint {

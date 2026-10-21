@@ -34,4 +34,21 @@ describe('useSetupBehaviorForm', () => {
     expect(form.isDirty.value).toBe(false)
     expect(form.patches()).toEqual({})
   })
+
+  it('accepts a saved value without overwriting a newer draft', () => {
+    const form = useSetupBehaviorForm()
+    form.initFromConfig({ naming: { enabled: false } })
+    form.setAutoSessionTitles(true)
+    form.setAutoSessionTitles(false)
+
+    form.acceptSaved(true)
+
+    expect(form.autoSessionTitles.value).toBe(false)
+    expect(form.isDirty.value).toBe(true)
+    expect(form.patches()).toEqual({ 'naming.enabled': false })
+
+    form.acceptSaved(false)
+    expect(form.isDirty.value).toBe(false)
+    expect(form.patches()).toEqual({})
+  })
 })

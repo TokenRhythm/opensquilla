@@ -5,7 +5,6 @@ import type {
 } from '@/types/chat'
 import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRoute'
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
-import type { SessionSubscriptionResult } from '@/composables/chat/useChatSessionSubscription'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import {
   beginSessionHandoffDiag,
@@ -80,6 +79,8 @@ export interface UseChatSessionRuntimeOptions {
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
   retireAttachments?: () => void
+  /** Clear session-local navigation state without changing the restored draft. */
+  resetInputHistory?: () => void
   resetDraftComposer?: () => void
 }
 
@@ -158,6 +159,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   }
 
   function resetSessionViewState() {
+    options.resetInputHistory?.()
     options.messages.value = []
     options.lastHeaderRole.value = ''
     options.lastHeaderDay.value = ''
@@ -302,59 +304,6 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     return switchSession(key, { kind: 'response_handoff', ownerRequestId })
   }
 
-  async function rebindDraftSession(
-    key: string,
-    guard: DraftSessionRebindGuard,
-  ): Promise<SessionSubscriptionResult> {
-    const sourceSessionKey = options.sessionKey.value
-    if (!key || !guard(sourceSessionKey)) return false
-    const { epoch, signal: handoffSignal } = beginHandoff(key)
-    if (key === sourceSessionKey) {
-      finishHandoff(epoch, 'unchanged')
-      return false
-    }
-    const shouldCommit = () => (
-      isCurrentHandoff(epoch, key, sourceSessionKey)
-      && guard(sourceSessionKey)
-    )
-
-    try {
-      const pendingQueueSwitch = options.switchPendingQueue(
-        key,
-        shouldCommit,
-        handoffSignal,
-      )
-      if (pendingQueueSwitch) await pendingQueueSwitch
-    } catch (error) {
-      finishHandoff(epoch, 'failed')
-      throw error
-    }
-    if (!shouldCommit()) {
-      finishHandoff(epoch, 'superseded')
-      return false
-    }
-    options.cancelSessionBootstrap()
-    resetCompactState()
-    // A recovered provisional draft remains a draft: do not write it to the URL
-    // or active-session storage before the first accepted send.
-    options.sessionKey.value = key
-    resetSessionRuntimeState()
-    options.pendingSessionIntent.value = 'new_chat'
-    options.applySessionRunState({ run_status: 'idle' })
-    resetSessionViewState()
-    options.restoreWidgetState()
-    let live: Promise<SessionSubscriptionResult>
-    try {
-      live = options.startSessionBootstrap({ includeHistory: false }).live
-    } finally {
-      finishHandoff(epoch, 'committed')
-    }
-    const outcome = await live
-    return handoffEpoch === epoch && options.sessionKey.value === key
-      ? outcome
-      : false
-  }
-
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
   async function startDraftSession(agentId?: string) {
@@ -400,8 +349,5 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     startDraftSession,
     switchToSession,
     adoptResponseSession,
-    rebindDraftSession,
   }
 }
-
-export type DraftSessionRebindGuard = (sourceSessionKey: string) => boolean

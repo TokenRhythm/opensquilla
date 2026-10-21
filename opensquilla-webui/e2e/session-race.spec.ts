@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { installSidebarFixture } from './support/sidebar-fixture'
+import { expectComposerValue } from './utils'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
@@ -23,6 +25,59 @@ async function readSessionDiag(page: Page): Promise<Array<{ source?: string; to?
       OpenSquillaSessionDiag?: { read?: () => Array<{ source?: string; to?: string }> }
     }).OpenSquillaSessionDiag
     return helper?.read?.() ?? []
+  })
+}
+
+for (const targetHistoryCount of [0, 1, 5]) {
+  test(`composer history preserves saved draft after session switch (${targetHistoryCount} target messages)`, async ({ page }) => {
+    const errors: string[] = []
+    page.on('pageerror', error => errors.push(error.message))
+    const savedDraft = 'B saved draft survives history navigation'
+    const historyRequests: string[] = []
+    await page.route('**/api/**', route => route.fulfill({ json: {} }))
+    await installSidebarFixture(page, {
+      'sessions.list': {
+        sessions: [SESSION_A, SESSION_B].map((key, index) => ({
+          key, title: index === 0 ? SESSION_A_TITLE : SESSION_B_TITLE,
+          sessionKind: 'chat', surface: 'webchat', conversationKind: 'direct',
+          effectiveAgentId: 'main', updatedAt: 200 - index,
+          messageCount: index === 0 ? 5 : targetHistoryCount, status: 'ok', runStatus: 'idle',
+        })),
+        count: 2, ts: 1_800_000_000, has_more: false,
+      },
+      'chat.history': (params: Record<string, unknown>) => {
+        const key = String(params.key || params.sessionKey || '')
+        historyRequests.push(key)
+        return chatHistoryPayload(Array.from({ length: key === SESSION_A ? 5 : targetHistoryCount }, (_, index) => ({
+          role: 'user', text: `${key === SESSION_A ? 'A' : 'B'} request ${index + 1}`,
+          message_id: `${key}-user-${index}`, timestamp: 1_800_000_000 + index,
+        })))
+      },
+    })
+    await page.addInitScript(({ key, text }) => {
+      localStorage.setItem(`opensquilla.chat.draft:${key}`, text)
+    }, { key: SESSION_B, text: savedDraft })
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
+    const composer = page.locator('.chat-textarea')
+    await expect(page.locator('.chat-thread')).toContainText('A request 5')
+    await composer.press('ArrowUp')
+    await expectComposerValue(composer, 'A request 5')
+
+    await page.locator('.sidebar-history-row[data-family="chats"]')
+      .filter({ hasText: SESSION_B_TITLE }).locator('.sidebar-history-item').click()
+    await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
+    await expect.poll(() => historyRequests.includes(SESSION_B)).toBe(true)
+    await expect(page.locator('.chat-thread')).not.toContainText('A request 5')
+    if (targetHistoryCount) await expect(page.locator('.chat-thread')).toContainText('B request 1')
+    await expectComposerValue(composer, savedDraft)
+    for (const key of ['ArrowUp', 'ArrowDown']) {
+      await composer.press(key)
+      await expectComposerValue(composer, savedDraft)
+      await expect.poll(() => page.evaluate(key => (
+        localStorage.getItem(`opensquilla.chat.draft:${key}`)
+      ), SESSION_B)).toBe(savedDraft)
+    }
+    expect(errors).toEqual([])
   })
 }
 
@@ -110,7 +165,7 @@ test('late chat.send response cannot navigate away from the current session', as
   })
 
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_A))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await expect(page.locator('.chat-textarea')).toBeVisible()
 
   await page.locator('.chat-textarea').fill('hello from A')

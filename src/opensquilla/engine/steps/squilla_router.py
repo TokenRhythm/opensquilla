@@ -15,7 +15,6 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from inspect import Parameter, signature
-from pathlib import Path
 from typing import Any, Protocol, cast
 
 import structlog
@@ -576,86 +575,6 @@ class _UnavailableV4Strategy:
         )
 
 
-def _capture_flags(config: object) -> tuple[bool, bool]:
-    """Return ``(emit_train_features, emit_raw_bge)`` from self-learning config."""
-
-    sl = getattr(config, "self_learning", None)
-    if sl is None:
-        return (False, False)
-    capture = bool(getattr(sl, "enabled", False)) and bool(getattr(sl, "capture_enabled", True))
-    return (capture, bool(getattr(sl, "enable_mlp", False)))
-
-
-def _active_bundle_dir(config: object) -> str | None:
-    """Resolve a promoted self-learning bundle dir, or None to use the base.
-
-    Only consulted when self-learning is enabled, so the default install pays no
-    extra cost. Verifies the candidate's base-fingerprint pin first (memoized
-    per pointer/base pair inside ``verify_active_bundle``, so the hash cost is
-    paid once per swap, not per turn): a package upgrade that replaced the
-    shipped weights detaches the now-stale candidate instead of serving a
-    hybrid of new projections and an old head. Falls back to baseline on any
-    error.
-    """
-
-    sl = getattr(config, "self_learning", None)
-    if sl is None or not getattr(sl, "enabled", False):
-        return None
-    try:
-        from opensquilla.squilla_router.self_learning.promotion import (
-            resolve_active_bundle_dir,
-            verify_active_bundle,
-        )
-
-        verify_active_bundle(_base_bundle_dir(config))
-        resolved = resolve_active_bundle_dir()
-        return str(resolved) if resolved is not None else None
-    except Exception:  # noqa: BLE001 — never let pointer resolution break routing
-        return None
-
-
-def _base_bundle_dir(config: object) -> Path:
-    """The configured or packaged base bundle root (never the learned one)."""
-
-    configured = getattr(config, "v4_bundle_dir", None)
-    if configured:
-        return Path(configured)
-    from opensquilla.squilla_router.v4_phase3 import default_bundle_dir
-
-    return default_bundle_dir()
-
-
-def invalidate_strategy_cache() -> None:
-    """Drop the cached strategy so the next turn reloads the active bundle.
-
-    Called after a promotion/rollback swaps the active pointer in-process.
-    """
-
-    global _strategy, _strategy_key  # noqa: PLW0603
-    with _strategy_lock:
-        _strategy = None
-        _strategy_key = None
-        _history_store.clear()
-
-
-def _register_self_learning_invalidator() -> None:
-    """Hand the offline self-learning loop a way to drop our strategy cache.
-
-    Registration lives here (engine -> squilla_router is an approved import
-    edge) so the orchestrator never has to import the engine back.
-    """
-
-    try:
-        from opensquilla.squilla_router.self_learning.hooks import set_cache_invalidator
-
-        set_cache_invalidator(invalidate_strategy_cache)
-    except Exception:  # noqa: BLE001 — the seam is optional; routing must not care
-        pass
-
-
-_register_self_learning_invalidator()
-
-
 def _strategy_cache_key(config: object) -> tuple:
     strategy_name = _strategy_name(config)
     confidence = getattr(config, "confidence_threshold", 0.5)
@@ -665,8 +584,6 @@ def _strategy_cache_key(config: object) -> tuple:
         getattr(config, "v4_use_aux_head", None),
         getattr(config, "require_router_runtime", False),
         confidence,
-        _capture_flags(config),
-        _active_bundle_dir(config),
     )
 
 
@@ -720,8 +637,6 @@ def _get_strategy(config: object) -> RouterStrategy:
         if _strategy_key is not None and _strategy_key != key:
             _history_store.clear()
 
-        emit_train_features, emit_raw_bge = _capture_flags(config)
-        learned_dir = _active_bundle_dir(config)
         base_dir = getattr(config, "v4_bundle_dir", None)
 
         def _build(bundle_dir: str | None) -> RouterStrategy:
@@ -734,44 +649,24 @@ def _get_strategy(config: object) -> RouterStrategy:
                     confidence_threshold=getattr(config, "confidence_threshold", 0.5),
                     require_router_runtime=getattr(config, "require_router_runtime", False),
                     use_aux_head=getattr(config, "v4_use_aux_head", None),
-                    emit_train_features=emit_train_features,
-                    emit_raw_bge=emit_raw_bge,
                 ),
             )
             if getattr(built, "source", "") == "v4_phase3" and not getattr(
                 built, "_available", True
             ):
                 # require_router_runtime=false: the V4 adapter swallowed its
-                # own init failure. Surface it so the fallback chain (learned
-                # -> baseline -> heuristic) applies uniformly — the flag opts
+                # own init failure. Surface it so the baseline -> heuristic
+                # fallback applies uniformly — the flag opts
                 # out of loud failure, not of useful routing.
                 raise RuntimeError("V4 Phase 3 router did not become available")
             return built
 
         try:
-            strategy = _build(str(learned_dir) if learned_dir else base_dir)
-        except Exception as exc:  # noqa: BLE001
-            if learned_dir is not None:
-                # A broken learned bundle must degrade to the shipped ML
-                # baseline, not straight to heuristic tiering.
-                log.warning(
-                    "squilla_router.learned_bundle_failed",
-                    bundle_dir=str(learned_dir),
-                    error=str(exc),
-                    action="falling_back_to_baseline",
-                )
-                try:
-                    strategy = _build(base_dir)
-                except Exception as base_exc:  # noqa: BLE001
-                    log.warning(
-                        "squilla_router.strategy_unavailable", error=str(base_exc)
-                    )
-                    _warn_router_runtime_fallback_once(base_exc)
-                    strategy = _degraded_fallback_strategy(base_exc)
-            else:
-                log.warning("squilla_router.strategy_unavailable", error=str(exc))
-                _warn_router_runtime_fallback_once(exc)
-                strategy = _degraded_fallback_strategy(exc)
+            strategy = _build(base_dir)
+        except Exception as exc:  # noqa: BLE001 — preserve useful routing if ML is unavailable.
+            log.warning("squilla_router.strategy_unavailable", error=str(exc))
+            _warn_router_runtime_fallback_once(exc)
+            strategy = _degraded_fallback_strategy(exc)
         _strategy = strategy
         _strategy_key = key
         return strategy
@@ -2642,12 +2537,6 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         ctx.metadata["routing_extra"] = extra
         thinking_mode = extra.get("thinking_mode")
         prompt_policy = extra.get("prompt_policy")
-        # Move the (large) self-learning feature vectors out of routing_extra so
-        # they never reach decision logs or accumulated routing history.
-        train_features = extra.pop("_train_features", None)
-        if train_features is not None:
-            ctx.metadata["routing_train_features"] = train_features
-            ctx.metadata["routing_train_turn_index"] = routing_turn_index
 
     if tier_name is None or tier_name not in tiers:
         default = normalize_text_tier(getattr(router_cfg, "default_tier", DEFAULT_TEXT_TIER))

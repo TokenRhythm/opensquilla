@@ -18,6 +18,8 @@ import threading
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config, persist_config
 from opensquilla.onboarding.mutations import upsert_llm_provider
@@ -216,7 +218,12 @@ def test_persist_updates_symlink_target_in_place(tmp_path):
     real = tmp_path / "real-config.toml"
     real.write_text("port = 18791\n")
     link = tmp_path / "config.toml"
-    link.symlink_to(real)
+    try:
+        link.symlink_to(real)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
     cfg = load_config(link)
     cfg.port = 18795
@@ -590,6 +597,41 @@ def test_explicit_image_key_persists_when_equal_to_env_value(tmp_path, monkeypat
     monkeypatch.delenv("OPENSQUILLA_IMAGE_GENERATION_PROVIDERS__OPENAI__API_KEY")
     reloaded = load_config(target)
     assert reloaded.image_generation.providers.openai.api_key == "sk-img-synthetic"
+
+
+@pytest.mark.parametrize("primary", ["", "openai/gpt-image-2.5-flare", "openai/gpt-image-1"])
+@pytest.mark.parametrize("fallbacks", [[], ["openrouter/selected-image-model"]])
+def test_image_provider_save_preserves_selected_route_after_reload(tmp_path, primary, fallbacks):
+    from opensquilla.onboarding.mutations import upsert_image_generation_provider
+    from opensquilla.provider.image_generation_policy import DEFAULT_IMAGE_GENERATION_PRIMARY
+    from opensquilla.tools.builtin import media
+
+    target = tmp_path / "config.toml"
+    target.write_text(
+        '[llm]\nprovider = "openrouter"\napi_key = "synthetic-openrouter-key"\n'
+    )
+    result = upsert_image_generation_provider(
+        load_config(target),
+        provider_id="openai",
+        primary=primary,
+        api_key="synthetic-openai-key",
+        fallbacks=fallbacks,
+    )
+    persist_config(result.config, path=target)
+
+    expected_primary = primary or DEFAULT_IMAGE_GENERATION_PRIMARY
+    saved = tomllib.loads(target.read_text())["image_generation"]
+    assert saved["primary"] == expected_primary
+    assert saved["binding"] == "custom"
+
+    reloaded = load_config(target)
+    media.configure_image_generation(reloaded.image_generation, llm_config=reloaded.llm)
+    try:
+        assert media._resolve_image_generation_candidates(None, reloaded.image_generation) == [
+            expected_primary, *fallbacks,
+        ]
+    finally:
+        media.configure_image_generation(None)
 
 
 # ---------------------------------------------------------------------------

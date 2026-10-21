@@ -235,8 +235,8 @@ def test_ollama_done_true_rejects_invalid_native_tool_call_after_recognized_star
                 "role": "assistant",
                 "content": "partial text",
                 "tool_calls": [
-                    {"function": {"name": "lookup", "arguments": {"q": "valid"}}},
-                    {"function": {"name": tool_name, "arguments": arguments}}
+                    {"id": "call_0", "function": {"name": "lookup", "arguments": {"q": "valid"}}},
+                    {"id": "call_1", "function": {"name": tool_name, "arguments": arguments}}
                 ],
             },
             "done": False,

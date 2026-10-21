@@ -61,9 +61,9 @@ function readSupportedLocales() {
 }
 
 function readLocaleLabels() {
-  const src = readFileSync(resolve(webuiSrc, 'components', 'LanguageSwitcher.vue'), 'utf8')
+  const src = readFileSync(resolve(webuiSrc, 'components', 'settings', 'SettingsLanguageControl.vue'), 'utf8')
   const m = src.match(/LOCALE_LABELS[^{]*\{([\s\S]*?)\}/)
-  if (!m) throw new Error('could not parse LOCALE_LABELS from src/components/LanguageSwitcher.vue')
+  if (!m) throw new Error('could not parse LOCALE_LABELS from src/components/settings/SettingsLanguageControl.vue')
   const labels = {}
   for (const mm of m[1].matchAll(/(?:'([^']+)'|"([^"]+)"|([A-Za-z][\w-]*))\s*:\s*(?:'([^']+)'|"([^"]+)")/g)) {
     labels[mm[1] ?? mm[2] ?? mm[3]] = mm[4] ?? mm[5]

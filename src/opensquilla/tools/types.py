@@ -14,17 +14,16 @@ from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
-# Set only by the trusted Meta scheduler around its internal skill_view
-# preface. It is intentionally separate from model-supplied tool arguments.
-current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "current_meta_skill_owner",
-    default="",
-)
-
 # A fresh dictionary per dispatch keeps output references out of tool text and
 # isolates parallel calls. Reader workers can update the shared per-call value.
 current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "current_execution_log", default=None,
+)
+
+# Each dispatch owns this dictionary. File tools populate it after the mutation
+# succeeds; it travels as UI metadata, never as provider-visible result text.
+current_file_snapshot: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "current_file_snapshot", default=None,
 )
 
 
@@ -119,7 +118,6 @@ class ToolContext:
     scratch_file_writes: list[dict[str, Any]] = field(default_factory=list)
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = field(default_factory=set)
-    coding_mode: bool = False  # operator coding-mode toggle (affects tool defaults)
     on_memory_source_write: Callable[[str, str], None] | None = None
     on_bootstrap_source_write: Callable[[str, str], None] | None = None
     on_runtime_event: Callable[[dict[str, Any]], None] | None = None
@@ -342,6 +340,9 @@ class ToolContext:
     process_event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = field(
         default=None, repr=False
     )
+    # Actual Agent sources are independent from task execution and from each other.
+    memory_notes_dir: str | None = None
+    bootstrap_source_dir: str | None = None
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
@@ -409,7 +410,6 @@ current_tool_context: contextvars.ContextVar[ToolContext | None] = contextvars.C
 SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
     {
         "submit_plan", "update_plan", "create_goal", "get_goal", "update_goal",
-        "update_goal_progress", "plan_run_checkpoint",
         "cron",
         "gateway",
         "agents_list",
@@ -419,6 +419,8 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "session_search",
         "message",
         "publish_artifact",
+        "video_generate",
+        "video_status",
     }
 )
 
@@ -506,6 +508,10 @@ class ToolSpec:
     # the sixth positional argument now lands in ``default_access`` as a bool.
     # Both forms are normalized here so an old ``False`` cannot fail open.
     exposed_by_default: bool | None = field(default=None, repr=False)
+    # Full object schema for integrations whose root keywords cannot be
+    # represented by the legacy properties/required pair. Keep the pair above
+    # for existing in-process tools and integrations.
+    input_schema: dict[str, Any] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         raw_access = self.default_access

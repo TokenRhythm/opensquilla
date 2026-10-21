@@ -37,6 +37,10 @@ ROUTER_PROVENANCE_WHEEL_PATH = (
     f"{WHEEL_ROUTER_PREFIX}/v4.2_phase3_inference/PROVENANCE.md"
 )
 TOKENJUICE_PROVENANCE_WHEEL_PATH = "opensquilla/plugins/tokenjuice/PROVENANCE.md"
+OFFICE_PREVIEW_NOTICE_WHEEL_PATH = (
+    "opensquilla/gateway/static/dist/assets/office-preview-licenses/"
+    "Silurus-THIRD_PARTY_NOTICES.md"
+)
 ALLOWED_SKILL_REFERENCE_WHEEL_PATHS = frozenset(
     {
         "opensquilla/skills/bundled/html-coder/references/add-css-style.md",
@@ -298,6 +302,8 @@ def _is_allowed_runtime_markdown(path: str) -> bool:
     if name == ROUTER_PROVENANCE_WHEEL_PATH:
         return True
     if name == TOKENJUICE_PROVENANCE_WHEEL_PATH:
+        return True
+    if name == OFFICE_PREVIEW_NOTICE_WHEEL_PATH:
         return True
     if name in ALLOWED_SKILL_REFERENCE_WHEEL_PATHS:
         return True

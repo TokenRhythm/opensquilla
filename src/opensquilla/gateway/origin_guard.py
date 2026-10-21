@@ -72,6 +72,23 @@ def request_principal_is_owner(config: GatewayConfig, request: Request) -> bool:
     return bool(principal and principal.is_owner)
 
 
+async def request_principal_is_owner_async(config: GatewayConfig, request: Request) -> bool:
+    """Recheck current owner authority without blocking on named-token I/O.
+
+    Do not reuse the middleware's Principal: Desktop ownership must still be
+    active at this guard, rather than only when the request entered middleware.
+    """
+    from opensquilla.gateway.auth import resolve_auth_async
+
+    auth_params: dict[str, str] = {}
+    token = extract_http_token(request)
+    if token:
+        auth_params["token"] = token
+    peer_ip = request.client.host if request.client is not None else None
+    principal = await resolve_auth_async(config, auth_params, "operator", peer_ip=peer_ip)
+    return bool(principal and principal.is_owner)
+
+
 def _effective_port(scheme: str, port: int | None) -> int | None:
     if port is not None:
         return port

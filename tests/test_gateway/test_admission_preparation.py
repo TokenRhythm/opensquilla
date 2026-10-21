@@ -63,7 +63,10 @@ async def test_unavailable_guest_sandbox_rejects_before_allocating_workspace(tmp
 
 
 @pytest.mark.asyncio
-async def test_page_context_is_user_content_on_the_normal_owner_route(tmp_path, monkeypatch):
+@pytest.mark.parametrize("office", [False, True])
+async def test_page_context_is_user_content_on_the_normal_owner_route(
+    tmp_path, monkeypatch, office,
+):
     deps = _route_dependencies(tmp_path, guest=False)
     monkeypatch.setattr(
         preparation,
@@ -78,23 +81,33 @@ async def test_page_context_is_user_content_on_the_normal_owner_route(tmp_path, 
         "targetRef": "page-synthetic",
         "annotations": [{"text": "Use a blue heading"}],
     }
+    candidate = {"documentId": "doc-one", "revisionId": "rev-one", "sha256": "a" * 64}
+    if office:
+        deps["page_context_resolver"].return_value["_officeCandidate"] = candidate
     command = AdmitTurn(
         deps["key"], "update the heading", "session",
         page_context={"targetRef": "page-synthetic"},
         selected_skills=(
             {"name": "synthetic-page", "instanceId": "instance-one", "digest": "digest-one"},
         ),
+        required_services=("desktop_browser",),
     )
     prepared = await preparation.prepare_route(command, **deps)
     deps["page_context_resolver"].assert_awaited_once_with(
         command.page_context, session_key=deps["key"], session_id=deps["session_id"],
-        workspace=str(tmp_path),
+        workspace=str(tmp_path), candidate_id=prepared.turn_id,
     )
     assert "Use a blue heading" in prepared.page_context_text
+    assert "_officeCandidate" not in prepared.page_context_text
+    if office:
+        assert prepared.envelope.metadata["office_candidate"] == candidate
+    else:
+        assert "office_candidate" not in prepared.envelope.metadata
     assert "artifact_context" not in prepared.envelope.runtime_services
     assert "turn_authority_cleanup" not in prepared.envelope.runtime_services
     assert prepared.host_execute_allowed is True
     assert prepared.envelope.metadata["selected_skills"] == list(command.selected_skills)
+    assert prepared.envelope.required_services == ("desktop_browser",)
     assert prepared.envelope.tool_context(is_owner=True).selected_skills == command.selected_skills
 
 

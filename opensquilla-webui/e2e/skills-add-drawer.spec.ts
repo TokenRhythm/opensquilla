@@ -17,6 +17,7 @@ type SkillGatewayCapture = {
   inFlight: number
   installAttempts: Record<string, number>
   installIdentifiers: string[]
+  installedIdentifiers: Set<string>
   installSources: string[]
   listCalls: number
   listRefreshDelayMs: number
@@ -52,17 +53,6 @@ function lifecycle(
 function catalogPayload() {
   return {
     skills: [
-      {
-        name: 'meta-synthetic',
-        description: 'Synthetic meta Skill used only by the browser contract test.',
-        kind: 'meta',
-        layer: 'bundled',
-        status: 'ready',
-        lifecycle: {
-          ...lifecycle(),
-          install_state: 'untracked',
-        },
-      },
       {
         name: 'bundled-synthetic',
         description: 'Synthetic bundled Skill used only by the browser contract test.',
@@ -175,6 +165,7 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
     inFlight: 0,
     installAttempts: {},
     installIdentifiers: [],
+    installedIdentifiers: new Set(),
     installSources: [],
     listCalls: 0,
     listRefreshDelayMs: 0,
@@ -206,9 +197,6 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
               'skills.list',
               'skills.search',
               'skills.install',
-              'exec.proposals.list',
-              'exec.proposals.auto_enabled.list',
-              'exec.proposals.settings.get',
             ],
             events: [],
           },
@@ -235,6 +223,10 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
         const query = String(frame.params?.query || '')
         const isFailureFixture = query.includes('failure')
         const isUnknownFixture = query.includes('unknown')
+        const reference = isFailureFixture
+          ? 'synthetic-publisher/synthetic-failure@1.0.0'
+          : isUnknownFixture ? 'synthetic-publisher/synthetic-unknown@1.0.0'
+            : 'synthetic-publisher/synthetic-search-result@1.0.0'
         ws.send(response(frame.id, {
           results: [{
             name: isFailureFixture
@@ -257,7 +249,7 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
               : isUnknownFixture
                 ? 'synthetic-publisher/synthetic-unknown@1.0.0'
                 : 'synthetic-publisher/synthetic-search-result@1.0.0',
-            installed: false,
+            installed: capture.installedIdentifiers.has(reference),
           }],
         }))
         return
@@ -279,7 +271,9 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
           if (identifier.includes('synthetic-unknown')) {
             ws.send(rejectedResponse(frame.id, 'Synthetic install response was interrupted.'))
           } else {
-            ws.send(response(frame.id, installPayload(identifier, index, source, attempt)))
+            const result = installPayload(identifier, index, source, attempt)
+            if (result.success) capture.installedIdentifiers.add(identifier)
+            ws.send(response(frame.id, result))
           }
         }, delay)
         return
@@ -292,17 +286,6 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
           squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
           permissions: {},
           skills: {},
-        },
-        'exec.proposals.list': { proposals: [] },
-        'exec.proposals.auto_enabled.list': { skills: [] },
-        'exec.proposals.settings.get': {
-          settings: {
-            available: false,
-            enabled: false,
-            on_dream_complete: false,
-            auto_enable: false,
-            auto_enable_max_risk: 'low',
-          },
         },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'usage.status': { sessions: [] },
@@ -326,12 +309,12 @@ async function openSkills(page: Page) {
     localStorage.setItem('opensquilla-theme', 'light')
   })
   await page.goto(CONTROL_URL)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 15_000 })
   await expect(page.getByTestId('skills-catalog')).toBeVisible({ timeout: 15_000 })
 }
 
 test.describe('Add Skill drawer', () => {
-  test('keeps the catalog full-width until the accessible overlay is opened', async ({ page }) => {
+  test('keeps the catalog full-width behind the accessible centered dialog', async ({ page }) => {
     await installSkillGateway(page)
     await openSkills(page)
 
@@ -357,7 +340,10 @@ test.describe('Add Skill drawer', () => {
     expect(drawer).not.toBeNull()
     expect(Math.abs(after!.x - before!.x)).toBeLessThanOrEqual(1)
     expect(Math.abs(after!.width - before!.width)).toBeLessThanOrEqual(1)
-    expect(Math.abs(drawer!.width - 460)).toBeLessThanOrEqual(1)
+    await expect.poll(async () => Math.abs((await dialog.boundingBox())!.width - 980))
+      .toBeLessThanOrEqual(1)
+    const settledDialog = (await dialog.boundingBox())!
+    expect(Math.abs(settledDialog.x + settledDialog.width / 2 - page.viewportSize()!.width / 2)).toBeLessThanOrEqual(1)
 
     await page.keyboard.press('Shift+Tab')
     await expect(dialog.locator('#skills-add-github-input')).toBeFocused()
@@ -433,10 +419,15 @@ test.describe('Add Skill drawer', () => {
       .toHaveCount(1, { timeout: 5_000 })
     await expect(activity.locator('.sk-add-section-title .sk-spinner')).toBeVisible()
     await expect(activity).toContainText('Reloading')
-    await expect(searchResult.getByRole('button')).not.toHaveAttribute('aria-busy', 'true')
+    // Changing source deliberately resets registry results; install activity survives it.
+    await expect(searchResult).toBeHidden()
     await expect(dialog.locator('.sk-spinner:visible')).toHaveCount(1)
 
+    await expect(dialog.locator('.sk-spinner:visible')).toHaveCount(0)
+    await dialog.getByRole('button', { name: 'Search', exact: true }).click()
     await expect(searchResult.getByRole('button')).toContainText('View details')
+    expect(capture.installIdentifiers).toHaveLength(1)
+    await expect(searchResult.getByRole('button')).not.toHaveAttribute('aria-busy', 'true')
     await expect(activity.locator('.sk-add-activity-toggle'))
       .toHaveAttribute('aria-expanded', 'false', { timeout: 5_000 })
     await expect(activity.locator('.sk-add-queue-item')).toBeHidden()
@@ -629,7 +620,7 @@ test.describe('Add Skill drawer', () => {
     await expect(dialog.locator('.sk-add-queue')).toContainText('1 failed')
   })
 
-  test('uses a full-width drawer at the 390px breakpoint', async ({ page }) => {
+  test('uses a full-width bottom sheet at the 390px breakpoint', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 })
     await installSkillGateway(page)
     await openSkills(page)
@@ -643,6 +634,7 @@ test.describe('Add Skill drawer', () => {
     expect(box).not.toBeNull()
     expect(Math.abs(box!.x)).toBeLessThanOrEqual(1)
     expect(Math.abs(box!.width - 390)).toBeLessThanOrEqual(1)
-    expect(Math.abs(box!.height - 844)).toBeLessThanOrEqual(1)
+    expect(box!.height).toBeLessThanOrEqual(844 * 0.92 + 1)
+    expect(Math.abs(box!.y + box!.height - 844)).toBeLessThanOrEqual(1)
   })
 })

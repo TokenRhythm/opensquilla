@@ -8,15 +8,23 @@ import {
   launchPackagedCandidate,
   requiredOption,
   waitFor,
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
 } from './packaged-smoke-helpers.mjs'
 import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
-import { createSessionRecoveryEvidence } from './session-recovery-rpc-evidence.mjs'
+import { createSessionBootstrapGate, createSessionRecoveryEvidence, createSessionRecoveryFault } from './session-recovery-rpc-evidence.mjs'
 import {
   captureElectronProcessIdentity,
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
 } from './packaged-first-send-cleanup.mjs'
+
+async function composerValue(locator) {
+  return await locator.evaluate((element) => {
+    const value = element?.value
+    return typeof value === 'string' ? value : element?.textContent ?? ''
+  })
+}
 
 const LONG_SESSION_MESSAGE_COUNT = 320
 const TERMINAL_RECOVERY_TIMEOUT_MS = 35_000
@@ -44,6 +52,8 @@ let page
 let processIdentity = {}
 let runError
 let recoveryResult
+let gatewayReadinessStartedAt
+let lastGatewayConnection
 let injectHang = false
 let socketCount = 0
 let nextSocketIndex = 0
@@ -56,6 +66,8 @@ let heldHistoryRequests = 0
 let heldSubscribeRequests = 0
 let serverTickCount = 0
 const rpcEvidence = createSessionRecoveryEvidence(sessionKey)
+const recoveryFault = createSessionRecoveryFault(sessionKey)
+const coldBootstrap = createSessionBootstrapGate(sessionKey)
 let faultReleased = 0
 let provider
 
@@ -135,12 +147,24 @@ async function configureSyntheticRecoveryProvider(baseUrl) {
   const raw = await readFile(configPath, 'utf8')
   assert.equal(raw.split(/\r?\n/, 1)[0], `# Synthetic ${label} release-preservation profile`,
     'recovered-send verification requires its explicitly seeded synthetic profile')
-  const headings = [...raw.matchAll(/^\[llm\]\r?$/gm)]
+  // The release-preservation seed contains absolute profile roots.  The
+  // packaged probe is intentionally run from a disposable copy, so stale
+  // roots would make Gateway read a different profile than the one recorded
+  // by the harness and produce false recovery/viewport failures.  Rebind only
+  // this explicitly synthetic fixture before launch; a real user profile is
+  // rejected by the header assertion above and is never rewritten.
+  const profileRoot = resolve(userDataDir, 'opensquilla')
+  const rebound = raw
+    .replace(/^state_dir = .*$/m, `state_dir = ${JSON.stringify(resolve(profileRoot, 'state'))}`)
+    .replace(/^workspace_dir = .*$/m, `workspace_dir = ${JSON.stringify(resolve(profileRoot, 'workspace'))}`)
+  assert.match(rebound, new RegExp(`^state_dir = ${escapeRegExp(JSON.stringify(resolve(profileRoot, 'state')))}$`, 'm'))
+  assert.match(rebound, new RegExp(`^workspace_dir = ${escapeRegExp(JSON.stringify(resolve(profileRoot, 'workspace')))}$`, 'm'))
+  const headings = [...rebound.matchAll(/^\[llm\]\r?$/gm)]
   assert.equal(headings.length, 1, 'the synthetic profile must have one LLM section')
   const start = headings[0].index
-  const next = raw.indexOf('\n[', start + 1)
-  const end = next < 0 ? raw.length : next
-  const section = raw.slice(start, end)
+  const next = rebound.indexOf('\n[', start + 1)
+  const end = next < 0 ? rebound.length : next
+  const section = rebound.slice(start, end)
   assert.match(section, /^provider = "ollama"\r?$/m)
   assert.ok(section.includes(`model = "${recoveryModel}"`), 'the profile must use the synthetic model')
   const updated = section.replace(/^base_url = "http:\/\/127\.0\.0\.1:11434"\r?$/m,
@@ -148,7 +172,11 @@ async function configureSyntheticRecoveryProvider(baseUrl) {
   assert.notEqual(updated, section, 'the synthetic baseline endpoint must be present')
   // Existing profile config is authoritative over Desktop's credential cache.
   // Only this disposable send probe redirects its synthetic provider endpoint.
-  await writeFile(configPath, raw.slice(0, start) + updated + raw.slice(end), 'utf8')
+  await writeFile(configPath, rebound.slice(0, start) + updated + rebound.slice(end), 'utf8')
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 async function captureRecoveryFailure() {
@@ -174,7 +202,11 @@ async function captureRecoveryFailure() {
     path: resolve(directory, 'failure.png'), timeout: 2_500,
   })) : null
   const evidence = {
+    gateway: lastGatewayConnection ?? null,
+    gatewayReadinessElapsedMs: gatewayReadinessStartedAt === undefined
+      ? null : Math.round(performance.now() - gatewayReadinessStartedAt),
     label, heldHistoryRequests, heldSubscribeRequests, socketCount, nextSocketIndex,
+    coldBootstrapMethods: coldBootstrap.methods(),
     physicalCloseCount, serverTickCount, faultReleased,
     ui, rpc: rpcEvidence.snapshot(),
     screenshot: screenshot?.diagnosticError ? screenshot : { captured: Boolean(screenshot) },
@@ -221,74 +253,79 @@ try {
     const server = client.connectToServer()
 
     client.onClose(() => {
+      coldBootstrap.close(socketIndex)
+      recoveryFault.close(socketIndex)
       physicalCloseCount += 1
       if (!injectHang) healthyCloseCount += 1
     })
 
     client.onMessage((message) => {
+      let frame
       try {
-        const frame = JSON.parse(String(message))
-        const held = injectHang && (
-          (frame.method === 'chat.history' && frame.params?.sessionKey === sessionKey)
-          || (frame.method === 'sessions.messages.subscribe' && frame.params?.key === sessionKey)
-        )
-        rpcEvidence.request(socketIndex, frame, held)
-        if (
-          frame?.type === 'req'
-          && frame.method === 'sessions.messages.subscribe'
-          && !injectHang
-          && [sessionKey, switchSessionKey].includes(frame.params?.key)
-        ) {
-          healthyNavigationSocketIds.add(socketIndex)
-          healthySubscribeKeys.push(frame.params.key)
-        }
-        if (frame?.type === 'req' && injectHang) {
-          if (
-            frame.method === 'chat.history'
-            && frame.params?.sessionKey === sessionKey
-          ) {
-            countTargetSocket()
-            heldHistoryRequests += 1
-            return
-          }
-          if (
-            frame.method === 'sessions.messages.subscribe'
-            && frame.params?.key === sessionKey
-          ) {
-            countTargetSocket()
-            heldSubscribeRequests += 1
-            return
-          }
-        }
+        frame = JSON.parse(String(message))
       } catch {
         // Non-JSON protocol frames must remain byte-transparent.
       }
-      try {
-        server.send(message)
-      } catch {
-        // Setup navigation or application cleanup can close the peer between
-        // the message callback and this forwarding attempt.
+      const forward = () => {
+        if (frame) {
+          const faultDomain = injectHang ? recoveryFault.holdRequest(socketIndex, frame) : null
+          rpcEvidence.request(socketIndex, frame, faultDomain !== null)
+          if (
+            frame?.type === 'req'
+            && frame.method === 'sessions.messages.subscribe'
+            && !injectHang
+            && [sessionKey, switchSessionKey].includes(frame.params?.key)
+          ) {
+            healthyNavigationSocketIds.add(socketIndex)
+            healthySubscribeKeys.push(frame.params.key)
+          }
+          if (faultDomain !== null) {
+            countTargetSocket()
+            if (faultDomain === 'history') heldHistoryRequests += 1
+            else heldSubscribeRequests += 1
+            return
+          }
+        }
+        try {
+          server.send(message)
+        } catch {
+          // Setup navigation or application cleanup can close the peer between
+          // the message callback and this forwarding attempt.
+        }
       }
+      if (!coldBootstrap.holdRequest(socketIndex, frame, forward)) forward()
     })
 
     server.onMessage((message) => {
+      const forward = () => {
+        try {
+          client.send(message)
+        } catch {
+          // The client can close while the real Gateway emits a final tick.
+        }
+      }
+      let frame
       try {
-        const frame = JSON.parse(String(message))
-        rpcEvidence.response(socketIndex, frame)
+        frame = JSON.parse(String(message))
+      } catch {
+        // Non-JSON protocol frames must remain byte-transparent.
+      }
+      if (frame) {
+        const held = recoveryFault.holdResponse(socketIndex, frame, forward)
+        rpcEvidence.response(socketIndex, frame, held)
+        if (held) {
+          countTargetSocket()
+          heldHistoryRequests += 1
+          return
+        }
         if (typeof frame?.protocol === 'number') {
           socketPolicies.set(socketIndex, frame.policy)
         }
         if (frame?.type === 'event' && frame.event === 'tick') {
           serverTickCount += 1
         }
-      } catch {
-        // Non-JSON protocol frames must remain byte-transparent.
       }
-      try {
-        client.send(message)
-      } catch {
-        // The client can close while the real Gateway emits a final tick.
-      }
+      forward()
     })
   })
 
@@ -297,12 +334,25 @@ try {
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
     'candidate Desktop renderer',
   )
+  gatewayReadinessStartedAt = performance.now()
   await waitFor(
-    async () => (await page.evaluate(
-      () => window.opensquillaDesktop?.getGatewayConnection?.(),
-    ))?.status === 'ready',
+    async () => {
+      const connection = await page.evaluate(
+        () => window.opensquillaDesktop?.getGatewayConnection?.(),
+      )
+      // Never put the connection's authToken in logs or diagnostic artifacts.
+      lastGatewayConnection = connection
+        ? { status: connection.status, error: connection.error ?? null } : null
+      return ['ready', 'error', 'stopped'].includes(connection?.status)
+    },
     'candidate Desktop Gateway readiness',
+    DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   )
+  assert.equal(lastGatewayConnection?.status, 'ready',
+    `Candidate Gateway failed: ${JSON.stringify(lastGatewayConnection)}`)
+  console.error(JSON.stringify({ event: 'packaged_gateway_ready',
+    elapsedMs: Math.round(performance.now() - gatewayReadinessStartedAt),
+    budgetMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS }))
   // The preceding release-upgrade launch can persist this exact chat URL. In
   // that case page.goto() below may not create a new socket, so explicitly
   // reload after installing the context-wide route.
@@ -312,6 +362,7 @@ try {
   sessionUrl.pathname = '/chat'
   sessionUrl.search = new URLSearchParams({ session: sessionKey }).toString()
   sessionUrl.hash = ''
+  coldBootstrap.begin()
   await page.goto(sessionUrl.toString(), { waitUntil: 'domcontentloaded' })
 
   const thread = page.locator('.chat-thread')
@@ -319,6 +370,20 @@ try {
   const sendButton = page.locator('.chat-send-btn.btn--primary')
   const recoveredMessage = page.getByText(expectedLastMessage, { exact: true }).first()
   const sessionRow = key => page.locator(`[data-session-key="${key}"]`)
+
+  // A fresh document has no in-memory presentation cache. Keep this original
+  // cold-entry safety contract separate from the warm return tested below.
+  await waitFor(() => (
+    coldBootstrap.methods().includes('sessions.messages.subscribe')
+    && coldBootstrap.methods().includes('sessions.messages.snapshot.read')
+  ), 'cold session history and live bootstrap requests', SESSION_RECOVERY_TIMEOUT_MS)
+  await composer.waitFor({ state: 'visible', timeout: SESSION_RECOVERY_TIMEOUT_MS })
+  assert.equal(await page.getByText(expectedLastMessage, { exact: true }).count(), 0,
+    'cold history must remain unavailable while its bootstrap requests are held')
+  assert.equal(await composer.isEditable(), true, 'cold recovery must keep the composer editable')
+  assert.equal(await sendButton.isDisabled(), true, 'cold bootstrap must not grant send authority')
+  assert.equal(rpcEvidence.sendCount(), 0, 'cold bootstrap must not submit a user message')
+  coldBootstrap.release()
 
   await waitFor(
     async () => await recoveredMessage.isVisible() && !await sendButton.isDisabled(),
@@ -433,7 +498,7 @@ try {
   )
   assert.equal(await composer.isEditable(), true, 'composer must stay editable during recovery')
   await composer.fill(preservedDraft)
-  assert.equal(await composer.inputValue(), preservedDraft)
+  assert.equal(await composerValue(composer), preservedDraft)
   const recoveryUrl = page.url()
   const retainedComposer = await composer.elementHandle()
   assert.ok(retainedComposer, 'the existing composer must be mounted before recovery')
@@ -441,9 +506,14 @@ try {
     'the editable draft owns focus before recovery')
   assert.equal(
     await page.getByText(expectedLastMessage, { exact: true }).count(),
-    0,
-    'retained history must remain unavailable while its RPC is held',
+    1,
+    'a warm return must keep the retained history visible exactly once while its RPC is held',
   )
+  assert.equal(await recoveredMessage.isVisible(), true)
+  assert.equal(await recoveredMessage.evaluate(node => Boolean(node.closest('[inert]'))), true,
+    'cached history must remain read-only until its authoritative readers recover')
+  assert.equal(await sendButton.isDisabled(), true, 'cached presentation must not grant send authority')
+  assert.equal(rpcEvidence.sendCount(), 0, 'warm recovery must not submit or resend a user message')
 
   const historyFailure = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="history-error"]',
@@ -469,13 +539,14 @@ try {
   assert.ok(heldHistoryRequests > 0, 'history hang was not exercised')
   assert.ok(heldSubscribeRequests > 0, 'live subscription hang was not exercised')
   assert.equal(await composer.isEditable(), true)
-  assert.equal(await composer.inputValue(), preservedDraft)
+  assert.equal(await composerValue(composer), preservedDraft)
   assert.equal(await sendButton.isDisabled(), true, 'live degraded state must fail closed')
   assert.equal(await page.locator('[data-testid="chat-session-recovery-status"]').count(), 1,
     'concurrent domain failures must share one non-blocking recovery notice')
 
   injectHang = false
   faultReleased = rpcEvidence.mark('fault-released')
+  recoveryFault.release()
   // No click, reload, route change or focus movement may be needed to recover.
   await waitFor(
     () => recoveredMessage.isVisible(),
@@ -496,7 +567,7 @@ try {
     SESSION_RECOVERY_TIMEOUT_MS,
   )
 
-  assert.equal(await composer.inputValue(), preservedDraft)
+  assert.equal(await composerValue(composer), preservedDraft)
   assert.equal(await recoveredMessage.isVisible(), true)
   assert.equal(page.url(), recoveryUrl, 'automatic recovery must not navigate the page')
   assert.equal(await composer.evaluate((node, original) => node === original, retainedComposer), true,
@@ -547,7 +618,7 @@ try {
     }, 'the recovered session to consume a new live streamed reply', SESSION_RECOVERY_TIMEOUT_MS)
     assert.equal((await reply.innerText()).trim(), recoveredReply,
       'the streamed answer must contain the provider text exactly once')
-    assert.equal(await composer.inputValue(), '', 'only the explicit send may consume the draft')
+    assert.equal(await composerValue(composer), '', 'only the explicit send may consume the draft')
     provider.finish()
     await waitFor(async () => {
       if (await sendButton.isDisabled() || await reply.count() !== 1) return false
@@ -578,6 +649,8 @@ try {
     sessionKey,
     switchSessionKey,
     expectedLastMessage,
+    coldBootstrapVerified: true,
+    warmPresentationVerified: true,
     healthyNavigationSocketCount: healthyNavigationSample.socketCount,
     healthyNavigationNewSocketCount: healthyNavigationSample.newSocketCount,
     healthyNavigationCloseCount: healthyNavigationSample.closeCount,

@@ -12,7 +12,7 @@ import hashlib
 import hmac
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -38,6 +38,7 @@ from opensquilla.telemetry.contracts.common import (
     StrictTelemetryModel,
 )
 from opensquilla.telemetry.ids import new_batch_id
+from opensquilla.telemetry.state_io import run_state_io
 
 _DEFAULT_MAX_EVENTS = 10_000
 _DEFAULT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
@@ -118,7 +119,7 @@ CREATE TABLE IF NOT EXISTS telemetry_contract_recoveries (
 """
 
 _RECOVERABLE_GROWTH_EVENTS = frozenset({
-    "product_active", "client_launch", "metaskill_usage", "coding_mode_usage",
+    "product_active", "client_launch",
     "first_turn_started", "first_turn_result",
     "onboarding_result", "first_app_ready",
 })
@@ -250,14 +251,18 @@ class TelemetryOutbox:
     ) -> Self:
         normalized_scope = TelemetryScope(scope)
         resolved_limits = _resolve_limits(normalized_scope, limits or OutboxLimits())
-        directory = Path(state_dir) / "telemetry"
-        if directory.is_symlink():
-            raise ValueError("telemetry state directory cannot be a symlink")
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _restrict_permissions(directory, 0o700)
-        database_path = directory / _SCOPE_DATABASE_NAMES[normalized_scope]
-        if database_path.is_symlink():
-            raise ValueError("telemetry outbox database cannot be a symlink")
+        def prepare_path() -> Path:
+            directory = Path(state_dir) / "telemetry"
+            if directory.is_symlink():
+                raise ValueError("telemetry state directory cannot be a symlink")
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _restrict_permissions(directory, 0o700)
+            database_path = directory / _SCOPE_DATABASE_NAMES[normalized_scope]
+            if database_path.is_symlink():
+                raise ValueError("telemetry outbox database cannot be a symlink")
+            return database_path
+
+        database_path = await run_state_io(prepare_path)
 
         connection = await aiosqlite.connect(
             str(database_path),
@@ -272,7 +277,7 @@ class TelemetryOutbox:
             await connection.execute(f"PRAGMA busy_timeout={resolved_limits.busy_timeout_ms}")
             await connection.executescript(_SCHEMA)
             await connection.execute("PRAGMA user_version=1")
-            _restrict_permissions(database_path, 0o600)
+            await run_state_io(lambda: _restrict_permissions(database_path, 0o600))
         except BaseException:
             await connection.close()
             raise
@@ -336,6 +341,58 @@ class TelemetryOutbox:
                 (event_id,),
             )
             return EnqueueResult.ENQUEUED if retained is not None else EnqueueResult.EVICTED
+
+    async def enqueue_many(
+        self,
+        events: Sequence[tuple[StrictTelemetryModel, OutboxPriority | int | None]],
+    ) -> tuple[EnqueueResult, ...]:
+        """Commit a group with one retention pass and one durable transaction.
+
+        A conflicting event rolls back the entire group so callers can isolate
+        the rejected observation without partially committing the group.
+        """
+
+        self._ensure_open()
+        prepared = []
+        for event, priority in events:
+            validated, payload = self._prepare_event(event)
+            prepared.append((
+                validated,
+                payload,
+                OutboxPriority(priority) if priority is not None else _priority_for(validated),
+            ))
+        if not prepared:
+            return ()
+
+        now_ms = self._clock()
+        results: list[EnqueueResult] = []
+        async with self._transaction():
+            await self._purge_expired_locked(now_ms)
+            for event, payload, priority in prepared:
+                existing = await self._fetchone(
+                    "SELECT payload_sha256 FROM telemetry_outbox WHERE event_id = ?",
+                    (str(event.event_id),),
+                )
+                if existing is not None:
+                    if bytes(existing["payload_sha256"]) != hashlib.sha256(payload).digest():
+                        raise OutboxEventConflictError("event_id already has different content")
+                    results.append(EnqueueResult.DUPLICATE)
+                    continue
+                await self._insert_event_locked(
+                    event, payload, priority=priority,
+                    created_at_ms=now_ms, expires_at_ms=now_ms + self.limits.ttl_ms,
+                )
+                results.append(EnqueueResult.ENQUEUED)
+            await self._evict_over_capacity_locked(now_ms)
+            for index, (event, _payload, _priority) in enumerate(prepared):
+                if results[index] is not EnqueueResult.ENQUEUED:
+                    continue
+                retained = await self._fetchone(
+                    "SELECT 1 FROM telemetry_outbox WHERE event_id = ?", (str(event.event_id),),
+                )
+                if retained is None:
+                    results[index] = EnqueueResult.EVICTED
+        return tuple(results)
 
     def _prepare_event(self, event: StrictTelemetryModel) -> tuple[EventBase, bytes]:
         if not isinstance(event, StrictTelemetryModel):

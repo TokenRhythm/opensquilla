@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -77,6 +79,79 @@ def _item(event_id: str = "event-1") -> UsageEventItem:
     )
 
 
+@pytest.mark.asyncio
+async def test_cancelling_queued_usage_reservation_does_not_reach_caller_boundary(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    queued = asyncio.Event()
+    caller_reached = []
+    await storage._operation_lock.acquire()
+
+    async def reserve_then_continue():
+        queued.set()
+        await storage.start_usage_event(_start())
+        caller_reached.append("reserved")
+
+    pending = asyncio.create_task(reserve_then_continue())
+    try:
+        await asyncio.wait_for(queued.wait(), timeout=2)
+        pending.cancel()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not caller_reached
+        async with storage.conn.execute("SELECT count(*) FROM usage_events") as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        storage._operation_lock.release()
+        await reserve_then_continue()
+        assert caller_reached == ["reserved"]
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(pending, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_usage_reservations_are_committed_before_returning(tmp_path):
+    path = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(path))
+    # This checks durable queue completion; twelve serial writes can exceed the
+    # interactive busy budget on a loaded worker even while each write progresses.
+    storage._busy_budget_seconds = 30.0
+    queued = [asyncio.Event() for _ in range(12)]
+    returned = []
+    await storage._operation_lock.acquire()
+
+    async def reserve_then_check(index):
+        queued[index].set()
+        event = _start(f"event-{index}", execution_id=f"execution-{index}")
+        await storage.start_usage_event(event)
+        # This verifies storage's return contract, not a real provider dispatch.
+        reader = sqlite3.connect(path)
+        try:
+            row = reader.execute(
+                "SELECT status FROM usage_events WHERE event_id = ?", (event.event_id,),
+            ).fetchone()
+            assert row == ("started",)
+        finally:
+            reader.close()
+        returned.append(event.event_id)
+
+    pending = [asyncio.create_task(reserve_then_check(i)) for i in range(len(queued))]
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in queued)), timeout=2)
+        assert not returned
+        storage._operation_lock.release()
+        await asyncio.wait_for(asyncio.gather(*pending), timeout=30)
+        assert len(set(returned)) == len(queued)
+        assert not storage.conn.in_transaction
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await storage.close()
+
+
 def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
     assert usd_to_nanos(0.0092) == 9_200_000
     assert usd_to_nanos(Decimal("0.0000000005")) == 1
@@ -90,7 +165,7 @@ def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
 
 
 def test_session_schema_version_includes_artifact_mutations_and_routing_state() -> None:
-    assert SCHEMA_VERSION == 25
+    assert SCHEMA_VERSION == 26
 
 
 async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -> None:
@@ -188,7 +263,166 @@ async def test_initialize_cutover_is_set_based_and_repairs_legacy_components(
             for statement in traced
             if "INSERT INTO usage_legacy_baselines" in statement
         ]
-        assert len(baseline_inserts) == 1
+        # SQLite repeats a statement in its trace callback while executing
+        # each accounting-revision row trigger. It is still one set-based SQL.
+        assert len(set(baseline_inserts)) == 1
+        assert "FROM ranked" in baseline_inserts[0]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("missing_current_checkpoint", [False, True])
+async def test_initialize_recovers_imported_cutover_without_resnapshotting_usage(
+    tmp_path: Path, missing_current_checkpoint: bool,
+) -> None:
+    """Old recovery copies kept ledger rows but discarded their global state."""
+
+    from opensquilla.gateway.usage_query import query_usage_ledger
+
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    key = "agent:main:webchat:recovered-ledger"
+    try:
+        await storage.upsert_session(
+            SessionNode(
+                session_key=key, session_id="session-1",
+                input_tokens=12, output_tokens=4, total_tokens=16,
+                total_cost_usd=0.001, estimated_cost_component_usd=0.001,
+                cost_source="opensquilla_estimate",
+            )
+        )
+        await storage.initialize_usage_ledger(100)
+        # Initial cutover and the first live event can share a millisecond.
+        await storage.start_usage_event(_start(started_at_ms=100))
+        await storage.finalize_usage_event("event-1", _completion(), items=(_item(),))
+        await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=key, expected_epoch=0,
+        )
+        assert await storage.advance_reset_epoch(key) == 1
+        # A second current generation missing its checkpoint must use ancestry,
+        # not compatibility totals that already contain the finalized event.
+        if missing_current_checkpoint:
+            await storage.conn.execute(
+                "UPDATE sessions SET epoch = 2 WHERE session_key = ?", (key,),
+            )
+            await storage.conn.commit()
+        baselines_before = await storage.list_usage_legacy_baselines()
+        restored_at = max(row.captured_at_ms for row in baselines_before) + 1_000
+        events_before = await storage.query_usage_events(None, None)
+        query = {"range": {"preset": "all"}, "timezone": "UTC"}
+        totals_before = (await query_usage_ledger(storage, query, now_ms=1_000))["totals"]
+        assert totals_before["totalTokens"] == 136
+        assert totals_before["costNanos"] == 10_200_000
+
+        await storage.conn.execute("DELETE FROM usage_ledger_state")
+        await storage.conn.commit()
+        state = await storage.initialize_usage_ledger(restored_at)
+        assert state.ledger_started_at_ms == 100
+        baselines_after = await storage.list_usage_legacy_baselines()
+        assert [row for row in baselines_after if row.session_epoch < 2] == baselines_before
+        if missing_current_checkpoint:
+            assert baselines_after[2].session_epoch == 2
+            assert baselines_after[2].total_tokens == 136
+        assert await storage.query_usage_events(None, None) == events_before
+        assert (await query_usage_ledger(storage, query, now_ms=3_000))["totals"] == totals_before
+        reconciled = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=key, expected_epoch=2 if missing_current_checkpoint else 1,
+        )
+        assert reconciled is not None
+        assert reconciled.total_tokens == 136
+        assert reconciled.total_cost_usd == pytest.approx(0.0102)
+        await storage.close()
+        storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+        assert await storage.initialize_usage_ledger(restored_at + 1_000) == state
+        assert await storage.list_usage_legacy_baselines() == baselines_after
+    finally:
+        await storage.close()
+
+
+async def test_imported_cutover_repair_is_atomic(tmp_path: Path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(SessionNode(session_key="agent:main:one", session_id="one"))
+        await storage.initialize_usage_ledger(100)
+        baselines_before = await storage.list_usage_legacy_baselines()
+        await storage.conn.executescript(
+            """
+            DELETE FROM usage_ledger_state;
+            UPDATE sessions SET epoch = 1;
+            CREATE TRIGGER fail_recovered_baseline BEFORE INSERT ON usage_legacy_baselines
+            WHEN NEW.session_epoch = 1
+            BEGIN SELECT RAISE(ABORT, 'injected repair failure'); END;
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="injected repair failure"):
+            await storage.initialize_usage_ledger(200)
+        assert await storage.get_usage_ledger_state() is None
+        assert await storage.list_usage_legacy_baselines() == baselines_before
+        assert not storage.conn.in_transaction
+        await storage.conn.execute("DROP TRIGGER fail_recovered_baseline")
+        await storage.conn.commit()
+        assert (await storage.initialize_usage_ledger(300)).ledger_started_at_ms == 100
+        assert len(await storage.list_usage_legacy_baselines()) == 2
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("checkpoint_ms", [None, 105, 110])
+async def test_imported_cutover_with_only_post_cutover_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint_ms: int | None,
+) -> None:
+    from opensquilla.gateway.usage_query import query_usage_ledger
+
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    key = "agent:main:late-session"
+    has_later_checkpoint = checkpoint_ms is not None
+    try:
+        await storage.initialize_usage_ledger(100)
+        # Historical generation creation did not always write a checkpoint.
+        await storage.conn.execute(
+            """INSERT INTO sessions (session_key, session_id, created_at, updated_at)
+               VALUES (?, 'session-1', 105, 105)""", (key,),
+        )
+        await storage.conn.commit()
+        await storage.start_usage_event(_start(started_at_ms=110))
+        await storage.finalize_usage_event(
+            "event-1", _completion(completed_at_ms=110), items=(_item(),),
+        )
+        await storage.conn.execute(
+            """UPDATE sessions SET input_tokens=100, output_tokens=20, total_tokens=120,
+               total_cost_usd=0.0092, estimated_cost_component_usd=0.0092,
+               cost_source='opensquilla_estimate' WHERE session_key=?""", (key,),
+        )
+        await storage.conn.commit()
+        if has_later_checkpoint:
+            # The checkpoint can share a millisecond with live usage, or have
+            # an earlier wall-clock timestamp after a system clock adjustment.
+            monkeypatch.setattr("opensquilla.session.storage._now_ms", lambda: checkpoint_ms)
+            assert await storage.advance_reset_epoch(key) == 1
+        prior = await storage.list_usage_legacy_baselines()
+        assert len(prior) == int(has_later_checkpoint)
+        restored_at = max([row.captured_at_ms for row in prior] + [200]) + 1_000
+        await storage.conn.execute("DELETE FROM usage_ledger_state")
+        await storage.conn.commit()
+
+        state = await storage.initialize_usage_ledger(restored_at)
+        assert state.ledger_started_at_ms == (checkpoint_ms - 1 if has_later_checkpoint else 110)
+        after = await storage.list_usage_legacy_baselines()
+        if has_later_checkpoint:
+            assert after == prior
+        else:
+            assert after[0].total_tokens == 0
+        totals = (await query_usage_ledger(
+            storage, {"range": {"preset": "all"}, "timezone": "UTC"}, now_ms=restored_at,
+        ))["totals"]
+        assert totals["totalTokens"] == 120
+        assert totals["costNanos"] == 9_200_000
+        reconciled = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=key, expected_epoch=int(has_later_checkpoint),
+        )
+        assert reconciled is not None
+        assert reconciled.total_tokens == 120
+        assert await storage.initialize_usage_ledger(restored_at + 1_000) == state
+        assert await storage.list_usage_legacy_baselines() == after
     finally:
         await storage.close()
 
@@ -473,7 +707,7 @@ async def test_unknown_never_downgrades_finalized_and_survives_session_delete(
         await storage.close()
 
 
-async def test_session_boundaries_clean_meta_state_but_preserve_billing_audit(
+async def test_session_boundaries_preserve_billing_audit(
     tmp_path: Path,
 ) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
@@ -501,56 +735,14 @@ async def test_session_boundaries_clean_meta_state_but_preserve_billing_audit(
             receipts=(receipt,),
         )
 
-        async def stage(client_request_id: str) -> None:
-            launch_text = f"/meta meta-paper-write -- {client_request_id}"
-            await storage.stage_meta_launch_draft(
-                session_key=session.session_key,
-                client_request_id=client_request_id,
-                meta_skill_name="meta-paper-write",
-                launch_text=launch_text,
-            )
-            await storage.promote_meta_launch_draft(
-                session_key=session.session_key,
-                client_request_id=client_request_id,
-                meta_skill_name="meta-paper-write",
-                launch_text=launch_text,
-            )
-
         async def assert_billing_audit_survives() -> None:
             assert await storage.query_usage_events(None, None) == [finalized]
             assert await storage.query_usage_event_items(["event-1"]) == [item]
             assert await storage.query_usage_item_billing_receipts(["event-1"]) == [receipt]
 
-        await stage("before-reset")
         assert await storage.advance_reset_epoch(session.session_key) == 1
-        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
-        assert await storage.get_meta_control_intent(
-            session_key=session.session_key,
-            control_kind="manual",
-            correlation_id="request:before-reset",
-        ) is None
         await assert_billing_audit_survives()
-
-        await stage("before-delete")
         await storage.delete_session(session.session_key)
-        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
-        assert await storage.get_meta_control_intent(
-            session_key=session.session_key,
-            control_kind="manual",
-            correlation_id="request:before-delete",
-        ) is None
-        async with storage.conn.execute(
-            """
-            SELECT client_request_id
-            FROM meta_launch_discard_tombstones
-            WHERE session_key = ?
-            """,
-            (session.session_key,),
-        ) as cur:
-            assert {str(row[0]) for row in await cur.fetchall()} == {
-                "before-reset",
-                "before-delete",
-            }
         await assert_billing_audit_survives()
     finally:
         await storage.close()

@@ -308,15 +308,17 @@ async def test_request_user_input_emits_canonical_interactive_protocol() -> None
     )
 
 
-def test_plan_control_schema_exposes_runtime_limits_and_server_owned_next_step() -> None:
+def test_plan_control_schema_exposes_runtime_limits_and_current_progress_tool() -> None:
     from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
 
     request = get_default_registry().get("request_user_input")
     submit = get_default_registry().get("submit_plan")
-    checkpoint = get_default_registry().get("plan_run_checkpoint")
+    progress = get_default_registry().get("update_plan")
     assert request is not None
     assert submit is not None
-    assert checkpoint is not None
+    assert progress is not None
+    assert get_default_registry().get("plan_run_checkpoint") is None
+    assert get_default_registry().get("update_goal_progress") is None
 
     questions = request.spec.parameters["questions"]
     assert questions["minItems"] == 1
@@ -328,9 +330,13 @@ def test_plan_control_schema_exposes_runtime_limits_and_server_owned_next_step()
     assert steps["minItems"] == 1
     assert steps["maxItems"] == 64
     assert steps["items"]["properties"]["step_id"]["maxLength"] == 128
-    assert "next_step_id" not in checkpoint.spec.parameters
-    assert checkpoint.spec.parameters["step_id"]["maxLength"] == 128
-    assert checkpoint.spec.parameters["reason"]["maxLength"] == 2_000
+    progress_steps = progress.spec.parameters["steps"]
+    assert progress_steps["maxItems"] == 20
+    assert progress_steps["items"]["properties"]["step"]["maxLength"] == 200
+    assert progress_steps["items"]["properties"]["status"]["enum"] == [
+        "pending", "in_progress", "completed",
+    ]
+    assert progress.spec.parameters["explanation"]["maxLength"] == 1_000
 
 
 @pytest.mark.asyncio
@@ -408,44 +414,37 @@ async def test_request_user_input_failure_does_not_end_plan_turn() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("run_status", "terminates_turn"),
-    [
-        ("running", False),
-        ("blocked", False),
-        ("completed", False),
-    ],
-)
-async def test_checkpoint_progress_never_terminates_turn(
-    run_status: str,
-    terminates_turn: bool,
-) -> None:
+@pytest.mark.parametrize("step_status", ["pending", "in_progress", "completed"])
+async def test_progress_never_terminates_turn(step_status: str) -> None:
+    from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
+
+    registered = get_default_registry().get("update_plan")
+    assert registered is not None
     registry = ToolRegistry()
+    registry.register(registered.spec, registered.handler)
+    progress_steps = [{"step": "Verify the implementation", "status": step_status}]
 
-    async def checkpoint() -> str:
-        return json.dumps(
-            {
-                "status": "checkpoint_recorded",
-                "plan_run": {"status": run_status},
-            }
-        )
+    async def update_progress(steps, explanation):
+        assert steps == progress_steps
+        assert explanation is None
+        return {"steps": steps, "revision": 1}
 
-    registry.register(
-        ToolSpec(
-            name="plan_run_checkpoint",
-            description="checkpoint",
-            parameters={},
-        ),
-        checkpoint,
+    ctx = ToolContext(
+        update_progress=update_progress,
+        allowed_tools={"update_plan"},
+        surfaced_tools={"update_plan"},
     )
-
-    result = await build_tool_handler(registry, ToolContext())(
+    result = await build_tool_handler(registry, ctx)(
         ToolCall(
-            tool_use_id=f"checkpoint-{run_status}",
-            tool_name="plan_run_checkpoint",
-            arguments={},
+            tool_use_id=f"progress-{step_status}",
+            tool_name="update_plan",
+            arguments={"steps": progress_steps},
         )
     )
 
     assert result.is_error is False
-    assert result.terminates_turn is terminates_turn
+    assert result.terminates_turn is False
+    assert json.loads(result.content) == {
+        "status": "accepted",
+        "progress": {"steps": progress_steps, "revision": 1},
+    }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any, NoReturn, cast
 
@@ -166,6 +167,23 @@ class GatewaySessionLifecycleAdapter:
             if normalized_kind == "webchat"
             else SessionCreationKind.DEFAULT
         )
+        session_key = _optional_non_empty_aliased_string(values, "session_key")
+        if session_key is not None:
+            if not self._context.principal.is_owner:
+                raise RpcHandlerError("OWNER_REQUIRED", "Draft materialization requires an owner.")
+            # This extension only materializes a WebUI draft. It cannot select
+            # channel, guest, CLI, main or another agent's session namespace.
+            prefix = f"agent:{agent_id}:webchat:"
+            suffix = session_key.removeprefix(prefix)
+            if (
+                kind is not SessionCreationKind.WEBCHAT
+                or not session_key.startswith(prefix)
+                or suffix == "default"
+                or re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", suffix) is None
+            ):
+                raise ValueError("params.session_key must identify a webchat draft for agentId")
+            if message is not None:
+                raise ValueError("params.session_key cannot be combined with an initial message")
         raw_workspace_id = values.get("workspaceId", values.get("workspace_id"))
         workspace_id: str | None = None
         if raw_workspace_id is not None:
@@ -196,6 +214,7 @@ class GatewaySessionLifecycleAdapter:
             workspace_id=workspace_id,
             provider=OptionalSessionBinding(provider_present, provider),
             auth_profile=OptionalSessionBinding(auth_profile_present, auth_profile),
+            session_key=session_key,
         )
         try:
             result = await self._application.create(command)
@@ -217,6 +236,9 @@ class GatewaySessionLifecycleAdapter:
                 ),
                 SessionAvailabilityRequirement.CREATE_WITH_WORKSPACE: (
                     "sessions.create(workspaceId=...) requires a session manager"
+                ),
+                SessionAvailabilityRequirement.CREATE_WITH_KEY: (
+                    "sessions.create(session_key=...) requires a session manager"
                 ),
             }
             raise RpcUnavailableError(messages[exc.requirement]) from exc

@@ -1,5 +1,5 @@
 import { computed, getCurrentScope, onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue'
-import type { ModelCatalog, ModelDescriptor, ProviderListError } from '@/modules/providerConfiguration'
+import type { ModelCatalog, ModelCatalogResult, ModelDescriptor, ProviderListError } from '@/modules/providerConfiguration'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 
 export interface NewTaskModelSelection {
@@ -29,6 +29,12 @@ export interface UseNewTaskModelSelectionOptions {
   routingMode: Readonly<Ref<ModelRoutingMode>>
   busy: Readonly<Ref<boolean>>
   connectionEpoch?: Readonly<Ref<number>>
+  /**
+   * Keep provider catalog discovery out of the initial Chat surface load.
+   * Callers still start it through the explicit refresh action (the model
+   * picker emits that action when opened).
+   */
+  autoRefresh?: boolean
   storage?: SelectionStorage | null
 }
 
@@ -85,6 +91,7 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
   let controller: AbortController | null = null
   let inFlight: Promise<void> | null = null
   let selectionOperation = 0
+  let refreshRequested = false
 
   function persist(next: SavedSelection | null) {
     saved.value = next
@@ -165,7 +172,8 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
     error.value = null
   }
 
-  function refresh(): Promise<void> {
+  function refresh(cacheFirst = false): Promise<void> {
+    refreshRequested = true
     if (!catalogAvailable.value) return Promise.resolve()
     if (inFlight) return inFlight
     const currentGeneration = generation
@@ -175,10 +183,31 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
     error.value = null
     const request = (async () => {
       try {
-        const result = await options.catalog.list({ scope: 'configured', signal: requestController.signal })
+        const load = (cacheOnly = false) => options.catalog.list({
+          scope: 'configured', signal: requestController.signal,
+          ...(cacheOnly ? { cacheOnly: true } : {}),
+        })
+        const publish = (result: ModelCatalogResult) => {
+          // Preserve rows only for providers with transient discovery errors.
+          // An authenticated rejection or successful empty response replaces them.
+          const transient = new Set(result.errors.filter(item => [
+            'transport_transient', 'provider_overloaded', 'rate_limited', 'probe_timeout', 'network',
+          ].includes(item.kind)).map(item => item.provider))
+          const keys = new Set(result.models.map(item => `${item.provider}\u0000${item.id}`))
+          models.value = [...result.models, ...models.value.filter(item => (
+            transient.has(item.provider) && !keys.has(`${item.provider}\u0000${item.id}`)
+          ))]
+          providerErrors.value = result.errors
+        }
+        if (cacheFirst) {
+          const snapshot = await load(true)
+          if (generation !== currentGeneration || !catalogAvailable.value) return
+          publish(snapshot)
+          if (!snapshot.catalog || (snapshot.catalog.cacheHit && !snapshot.catalog.stale)) return
+        }
+        const result = await load()
         if (generation !== currentGeneration || !catalogAvailable.value) return
-        models.value = result.models
-        providerErrors.value = result.errors
+        publish(result)
       } catch (cause) {
         if (generation !== currentGeneration || requestController.signal.aborted) return
         error.value = cause instanceof Error ? cause.message : String(cause)
@@ -203,7 +232,7 @@ export function useNewTaskModelSelection(options: UseNewTaskModelSelectionOption
   }, { immediate: true })
   watch([catalogAvailable, () => options.connectionEpoch?.value], () => {
     invalidateCatalog()
-    if (catalogAvailable.value) void refresh()
+    if (catalogAvailable.value && (options.autoRefresh !== false || refreshRequested)) void refresh(true)
   }, { immediate: true })
   if (getCurrentScope()) onScopeDispose(() => {
     selectionOperation += 1

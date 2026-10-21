@@ -40,7 +40,6 @@
           <button
             type="button"
             class="btn btn--icon btn--ghost tool-sheet__copy"
-            :class="{ 'is-copied': copied }"
             :title="copyLabel"
             :aria-label="copyLabel"
             @click="copyContent"
@@ -200,9 +199,10 @@ const LANGUAGE_LABEL: Record<string, string> = {
 const rawMode = ref(false)
 const wrapLines = ref(false)
 const copied = ref(false)
+let copyGeneration = 0
+let copiedResetId: ReturnType<typeof setTimeout> | null = null
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const rootRef = ref<HTMLElement | null>(null)
-let copiedResetId: ReturnType<typeof setTimeout> | null = null
 const inspection = inject(SESSION_INSPECTION_KEY, null)
 const logMode = ref(false)
 const logPage = ref<ExecutionLogPage | null>(null)
@@ -235,7 +235,6 @@ function resetExecutionLog() {
   logError.value = false
   logPending.value = false
   logOffsetInput.value = 0
-  copied.value = false
 }
 
 async function loadExecutionLog(offset: number) {
@@ -252,7 +251,6 @@ async function loadExecutionLog(offset: number) {
       props.sessionKey, props.context.executionLogHandle, offset, { signal: request.signal },
     )
     if (logRequest !== request || request.signal.aborted) return
-    copied.value = false
     logPage.value = page
     logOffsetInput.value = page.offset
   } catch (error) {
@@ -361,9 +359,7 @@ const showLineNumbers = computed(() =>
 const lineNumberText = computed(() =>
   Array.from({ length: contentLines.value.length }, (_, index) => String(index + 1)).join('\n'),
 )
-const copyLabel = computed(() => copied.value
-  ? t('chat.copied')
-  : t(logMode.value ? 'chat.toolModal.copyPage' : 'chat.copy'))
+const copyLabel = computed(() => t(logMode.value ? 'chat.toolModal.copyPage' : 'chat.copy'))
 
 const highlightedContent = computed(() => {
   const content = viewContent.value
@@ -377,9 +373,18 @@ const highlightedContent = computed(() => {
   }
 })
 
+function resetCopyFeedback() {
+  copyGeneration += 1
+  copied.value = false
+  if (copiedResetId) clearTimeout(copiedResetId)
+  copiedResetId = null
+}
+
 async function copyContent() {
+  const generation = ++copyGeneration
   try {
     await copyTextWithFallback(viewContent.value)
+    if (generation !== copyGeneration || !props.open) return
     copied.value = true
     if (copiedResetId) clearTimeout(copiedResetId)
     copiedResetId = setTimeout(() => {
@@ -387,7 +392,8 @@ async function copyContent() {
       copiedResetId = null
     }, 1600)
   } catch {
-    copied.value = false
+    if (generation !== copyGeneration || !props.open) return
+    resetCopyFeedback()
     pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
   }
 }
@@ -444,23 +450,19 @@ const treeHtml = computed(() => {
 })
 
 // Each new viewing session starts in the compact tree/raw default, with
-// original line widths restored. Copy feedback must not leak to another file.
+// original line widths restored.
 watch(() => props.open, open => {
   if (!open) return
   rawMode.value = false
   wrapLines.value = false
-  copied.value = false
-  if (copiedResetId) {
-    clearTimeout(copiedResetId)
-    copiedResetId = null
-  }
 })
 
 watch(() => [props.open, props.sessionKey, props.context?.executionLogHandle, props.context?.section], resetExecutionLog)
+watch(() => [props.open, props.sessionKey, props.context?.executionLogHandle, props.context?.section, logMode.value, viewContent.value], resetCopyFeedback, { flush: 'sync' })
 
 onBeforeUnmount(() => {
+  resetCopyFeedback()
   resetExecutionLog()
-  if (copiedResetId) clearTimeout(copiedResetId)
 })
 </script>
 
@@ -578,10 +580,6 @@ onBeforeUnmount(() => {
 
 .tool-sheet__mode {
   font-size: var(--fs-xs);
-}
-
-.tool-sheet__copy.is-copied {
-  color: var(--ok);
 }
 
 .tool-sheet__body {

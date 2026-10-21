@@ -87,6 +87,69 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+it('keeps a fixed HTML lease on A with normal preview capabilities until explicit Continue editing', async () => {
+  const published = { ...artifact, id: 'published-A', documentId: 'doc-current', sha256: 'a'.repeat(64) }
+  const item = createArtifactPreviewWorkbenchItem({ artifact: published, nativeHtml: false,
+    sessionKey: 'side-child', resourceIdentity: 'deliverable:published-A' })
+  const headArtifact = vi.fn(() => ({ ...published, id: 'current-B', sha256: 'b'.repeat(64) }))
+  const load = vi.fn(async () => undefined)
+  const snapshot = vi.fn(() => ({ workspace: null }))
+  const editCurrentResource = vi.fn(async () => undefined)
+  const createLease = vi.fn<ArtifactPreviewAccess['createLease']>().mockResolvedValue({
+    version: 1, lease_id: 'fixed-A', effective_mode: 'full', entrypoint: 'index.html',
+    launch_url: 'http://preview.localhost/index.html', preview_origin: 'http://preview.localhost',
+    expires_at: '2099-01-01T00:00:00Z', idle_timeout_seconds: 3600,
+    source: { kind: 'bundle', collection_status: 'complete', file_count: 2, total_bytes: 128, warning_codes: [] },
+  })
+  const definition = createArtifactWorkbenchDefinitions({
+    artifactDocuments: { load, snapshot: snapshot as never, headArtifact }, editCurrentResource,
+    artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
+    baseOrigin: 'http://localhost', currentSessionId: () => 'parent', previewLeasesEnabled: true,
+    confirmRemoteResources: async () => true, pushToast: vi.fn(), t: key => key,
+    platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+  })[0]!
+  const renderState: Record<string, unknown> = {}
+  const runtime = await definition.createRuntime!(item, { getRenderState: () => renderState,
+    updateRenderState: patch => Object.assign(renderState, patch), isItemOpen: () => true,
+    setExpanded: vi.fn(), reportError: vi.fn() })
+  try {
+    expect(createLease).toHaveBeenCalledWith(expect.objectContaining({ id: 'published-A', sha256: 'a'.repeat(64) }),
+      'full', 'web', expect.objectContaining({ sessionKey: 'side-child' }))
+    await runtime.handleComponentEvent?.({ type: 'artifact-head-changed', payload: { revisionId: 'B' } }, item)
+    expect(createLease).toHaveBeenCalledOnce()
+    expect(load).not.toHaveBeenCalled()
+    expect(snapshot).not.toHaveBeenCalled()
+    expect(headArtifact).not.toHaveBeenCalled()
+    const state = { active: true, hostAvailable: true, nativeSurface: false, runtimeState: renderState }
+    expect(definition.getProps!(item, state)).toMatchObject({ documentFeatures: false, artifact: { id: 'published-A' } })
+    expect(definition.getToolbarItems!(item, state).map(action => action.id)).toContain('edit-current')
+    expect(editCurrentResource).not.toHaveBeenCalled()
+    await runtime.performAction?.('edit-current', item)
+    expect(editCurrentResource).toHaveBeenCalledWith(expect.objectContaining({ type: 'deliverable', artifactId: 'published-A' }),
+      item, expect.any(Function))
+  } finally { await runtime.dispose?.('closed') }
+})
+
+it('shows only the unified annotation action for fixed HTML even when Web cannot annotate', () => {
+  const item = createArtifactPreviewWorkbenchItem({
+    artifact, nativeHtml: false, sessionKey: 'session-a', resourceIdentity: 'deliverable:artifact-1',
+  })
+  const definition = createArtifactWorkbenchDefinitions({
+    prepareAnnotation: vi.fn(async () => undefined),
+    editCurrentResource: vi.fn(async () => undefined),
+    baseOrigin: 'http://localhost', currentSessionId: () => 'session-a',
+    confirmRemoteResources: async () => true, pushToast: vi.fn(), t: key => key,
+    platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+  })[0]!
+  const items = definition.getToolbarItems!(item, {
+    active: true, hostAvailable: true, nativeSurface: false, runtimeState: {},
+  })
+  expect(items.some(action => action.id === 'edit-current')).toBe(false)
+  expect(items.find(action => action.id === 'prepare-annotation')).toMatchObject({
+    disabled: true, tooltip: 'workbench.artifactAnnotation.desktopEditingOnly',
+  })
+})
+
 function nativeResource() {
   return {
     artifact,
@@ -117,6 +180,7 @@ async function createNativeRuntimeHarness(
     artifact,
     nativeHtml: true,
     sessionKey: 'session-a',
+    resourceIdentity: 'document:document-1',
   })
   const definition = createArtifactWorkbenchDefinitions({
     baseOrigin: 'http://localhost',
@@ -146,6 +210,7 @@ async function createAnnotationDraftHarness(
   atomicCloseRearm = false,
   workingDocumentId?: string,
   navigatedPage?: string,
+  overlayEditorV2 = false,
 ) {
   let currentHead = { ...artifact }
   const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
@@ -182,6 +247,9 @@ async function createAnnotationDraftHarness(
   const showOverlay = vi.fn(async (
     _request: Parameters<NonNullable<NativeWorkbenchApi['showArtifactAnnotationOverlay']>>[0],
   ): Promise<NativeWorkbenchSurfaceResult> => showOverlayResult)
+  const updateOverlay = vi.fn(async (
+    _request: Parameters<NonNullable<NativeWorkbenchApi['updateArtifactAnnotationOverlay']>>[0],
+  ): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
   const setSurfaceRect = vi.fn(async () => ({ ok: true as const }))
   const setAnnotationMode = vi.fn(async (
     _request: Parameters<NonNullable<NativeWorkbenchApi['setArtifactAnnotationMode']>>[0],
@@ -215,7 +283,6 @@ async function createAnnotationDraftHarness(
     getCapabilities: vi.fn(async () => ({
       protocolVersions: [3] as Array<3>,
       modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-      maxSurfaces: 8,
     })),
     getArtifactAnnotationCapabilities: vi.fn(async () => ({
       version: 3 as const,
@@ -223,10 +290,12 @@ async function createAnnotationDraftHarness(
       picker: true,
       trustedOverlay: true,
       overlayCopyVersion: 1 as const,
+      ...(overlayEditorV2 ? { overlayEditorVersion: 2 as const } : {}),
       ...(atomicCloseRearm ? { atomicCloseRearm: true as const } : {}),
     })),
     setArtifactAnnotationMode: setAnnotationMode,
     showArtifactAnnotationOverlay: showOverlay,
+    ...(overlayEditorV2 ? { updateArtifactAnnotationOverlay: updateOverlay } : {}),
     closeArtifactAnnotationOverlay: closeOverlay,
     captureWorkbenchScreenshot: vi.fn(async () => ({
       targetRef: 'target-focused', mimeType: 'image/png' as const,
@@ -259,6 +328,7 @@ async function createAnnotationDraftHarness(
     artifact,
     nativeHtml: true,
     sessionKey: 'session-a',
+    resourceIdentity: 'document:document-1',
   })
   const definition = createArtifactWorkbenchDefinitions({
     artifactContent: { ...testArtifactContent, uploadAttachment },
@@ -353,6 +423,7 @@ async function createAnnotationDraftHarness(
     },
     beginOverlayEdit,
     closeOverlay,
+    updateOverlay,
     completeOverlayEdit,
     createSurface,
     createAnnotation,
@@ -405,7 +476,7 @@ describe('artifact Workbench provider', () => {
       const renderState: Record<string, unknown> = {}
       const nativeApi: NativeWorkbenchApi = {
         getCapabilities: vi.fn<NonNullable<NativeWorkbenchApi['getCapabilities']>>(
-          async () => ({ protocolVersions: [3], modes: ['offline'], maxSurfaces: 8 }),
+          async () => ({ protocolVersions: [3], modes: ['offline'] }),
         ),
         createArtifactPreviewLease: vi.fn(), renewArtifactPreviewLease: vi.fn(), revokeArtifactPreviewLease: vi.fn(),
         createSurface: vi.fn(async () => ({ ok: true })),
@@ -424,7 +495,8 @@ describe('artifact Workbench provider', () => {
         source: { kind: 'bundle', collection_status: 'complete', file_count: 3, total_bytes: 128, warning_codes: [] },
       }))
       const item = createArtifactPreviewWorkbenchItem({
-        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1, ...options,
+        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1,
+        resourceIdentity: 'document:document-1', ...options,
       })
       const definition = createArtifactWorkbenchDefinitions({
         artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
@@ -540,6 +612,7 @@ describe('artifact Workbench provider', () => {
       await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
         artifact: { ...artifact, previewPagePath: 'editorial.html' },
         nativeHtml: true, sessionKey: 'session-a',
+        resourceIdentity: 'document:document-1',
       }))
       const expected = kind === 'known-lease'
         ? 'This client or Gateway does not support opening this subpage directly. Update and try again.'
@@ -571,7 +644,7 @@ describe('artifact Workbench provider', () => {
     const harness = await createAnnotationDraftHarness()
     if (compatibility === 'old-protocol') {
       vi.mocked(harness.nativeApi.getCapabilities!).mockResolvedValue({
-        protocolVersions: [1], modes: ['offline'], maxSurfaces: 8,
+        protocolVersions: [1], modes: ['offline'],
       })
     } else {
       harness.nativeApi.createArtifactPreviewLease = undefined
@@ -579,6 +652,7 @@ describe('artifact Workbench provider', () => {
     await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
       artifact: { ...artifact, previewPagePath: 'editorial.html' },
       nativeHtml: true, sessionKey: 'session-a',
+      resourceIdentity: 'document:document-1',
     }))
     await vi.waitFor(() => expect(harness.renderState.previewLeaseError)
       .toBe('This client or Gateway does not support opening this subpage directly. Update and try again.'))
@@ -604,6 +678,7 @@ describe('artifact Workbench provider', () => {
       const next = createArtifactPreviewWorkbenchItem({
         artifact: { ...artifact, ...(previewPagePath ? { previewPagePath } : {}) },
         nativeHtml: true, sessionKey: 'session-a',
+        resourceIdentity: 'document:document-1',
       })
       expect(next.id).toBe(harness.item.id)
       await harness.runtime.update?.(next)
@@ -1120,6 +1195,77 @@ describe('artifact Workbench provider', () => {
     },
   )
 
+  it('unlocks the native V2 editor after a failed record and retries the same draft', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    expect(harness.showOverlay).toHaveBeenCalledWith(expect.objectContaining({
+      overlayEditorVersion: 2, editorState: expect.objectContaining({ action: 'record' }),
+    }))
+    harness.updateAnnotation.mockRejectedValueOnce(new Error('Storage unavailable'))
+    const record = { version: 3 as const, surfaceId: harness.item.id, type: 'annotation-record-current' as const,
+      detail: { annotationId: harness.annotationId, body: 'Keep this until recording succeeds.' } }
+    await harness.runtime.handleNativeSurfaceEvent?.(record, harness.item)
+    expect(harness.closeOverlay).not.toHaveBeenCalled()
+    expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.updateFailed' }),
+    }))
+    await harness.runtime.handleNativeSurfaceEvent?.(record, harness.item)
+    expect(harness.updateAnnotation).toHaveBeenLastCalledWith(harness.annotationId, record.detail.body)
+    expect(harness.closeOverlay).toHaveBeenCalledOnce()
+    expect(harness.completeOverlayEdit).toHaveBeenCalledOnce()
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('keeps native V2 input locked between successful persistence and close acknowledgement', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    let acknowledgeClose!: (result: NativeWorkbenchSurfaceResult) => void
+    harness.closeOverlay.mockReturnValueOnce(new Promise(resolve => { acknowledgeClose = resolve }))
+    const recording = harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-record-current',
+      detail: { annotationId: harness.annotationId, body: 'Wait for close before more input.' },
+    }, harness.item)
+    await vi.waitFor(() => expect(harness.closeOverlay).toHaveBeenCalledOnce())
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId, editorState: expect.objectContaining({ busy: true }),
+    }))
+    acknowledgeClose({ ok: true })
+    await recording
+    expect(harness.completeOverlayEdit).toHaveBeenCalledOnce()
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('unlocks the native V2 editor after a failed close without completing the draft', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    harness.closeOverlay.mockResolvedValueOnce({ ok: false, code: 'ANNOTATION_UNAVAILABLE', retryable: true })
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-record-current',
+      detail: { annotationId: harness.annotationId, body: 'Retry closing this editor.' },
+    }, harness.item)
+    expect(harness.completeOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.closeFailed' }),
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('unlocks the native V2 editor after a failed cancel and retains ownership for retry', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true, undefined, undefined, true)
+    harness.discardAnnotation.mockRejectedValueOnce(new Error('Storage unavailable'))
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-cancel',
+      detail: { annotationId: harness.annotationId, body: 'Keep this if cancellation fails.', reason: 'user-cancelled' },
+    }, harness.item)
+    expect(harness.closeOverlay).not.toHaveBeenCalled()
+    expect(harness.releaseOverlayEdit).not.toHaveBeenCalled()
+    expect(harness.updateOverlay).toHaveBeenLastCalledWith(expect.objectContaining({
+      annotationId: harness.annotationId,
+      editorState: expect.objectContaining({ busy: false, action: 'record', error: 'workbench.artifactAnnotation.discardFailed' }),
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
+
   it('keeps the trusted editor and draft ownership when atomic rearm fails', async () => {
     const harness = await createAnnotationDraftHarness({ ok: true }, true)
     harness.closeOverlay
@@ -1368,6 +1514,7 @@ describe('artifact Workbench provider', () => {
       nativeHtml: false,
       previewLeaseEligible: false,
       sessionKey: 'session-a',
+      resourceIdentity: 'document:document-1',
     })
     const renderState: Record<string, unknown> = {}
     const pushToast = vi.fn()
@@ -1452,7 +1599,7 @@ describe('artifact Workbench provider', () => {
     })
 
     expect(createLease).not.toHaveBeenCalled()
-    expect(load).toHaveBeenCalledOnce()
+    expect(load).not.toHaveBeenCalled()
   })
 
   it('keeps a bound attachment preview on its immutable wire identity', async () => {
@@ -1727,7 +1874,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [2] as Array<2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: createLease,
       renewArtifactPreviewLease: vi.fn(async () => ({
@@ -1753,6 +1899,7 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const pushToast = vi.fn()
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -1975,7 +2122,7 @@ describe('artifact Workbench provider', () => {
     ]))
   })
 
-  it('keeps temporary mode selection separate from the saved default', async () => {
+  it.each(['complete', 'partial'] as const)('keeps a %s preview quiet while changing its temporary mode and saved default', async collectionStatus => {
     const requestedModes: string[] = []
     let leaseSequence = 0
     const createLease = vi.fn(async (request: { mode: 'full' | 'offline' }) => {
@@ -1996,10 +2143,10 @@ describe('artifact Workbench provider', () => {
           idle_timeout_seconds: 28_800,
           source: {
             kind: 'bundle' as const,
-            collection_status: 'complete' as const,
+            collection_status: collectionStatus,
             file_count: 2,
             total_bytes: 42,
-            warning_codes: [],
+            warning_codes: collectionStatus === 'partial' ? ['missing_dependency'] : [],
           },
         },
       }
@@ -2009,7 +2156,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2, 3] as Array<1 | 2 | 3>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: createLease,
       renewArtifactPreviewLease: vi.fn(async () => ({
@@ -2064,6 +2210,16 @@ describe('artifact Workbench provider', () => {
       reportError: vi.fn(),
     })
 
+    const toolbar = () => definition.getToolbarItems?.(item, {
+      active: true,
+      hostAvailable: true,
+      nativeSurface: true,
+      runtimeState: renderState,
+    }) || []
+    expect(renderState.previewCollectionStatus).toBe(collectionStatus)
+    expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+    expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+
     await runtime.performAction?.('set-preview-mode-full', item)
     await runtime.performAction?.('set-preview-mode-full', item)
 
@@ -2072,6 +2228,8 @@ describe('artifact Workbench provider', () => {
     expect(createSurface).toHaveBeenLastCalledWith(expect.objectContaining({ version: 3 }))
     expect(renderState.previewDefaultMode).toBe('offline')
     expect(savePreviewPreferences).not.toHaveBeenCalled()
+    expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+    expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
 
     await runtime.performAction?.('set-default-preview-mode', item)
     await runtime.performAction?.('set-default-preview-mode', item)
@@ -2081,7 +2239,7 @@ describe('artifact Workbench provider', () => {
       mode: 'full',
       noticeShown: false,
     })
-    expect(pushToast).toHaveBeenCalledOnce()
+    expect(pushToast).not.toHaveBeenCalled()
     expect(renderState.previewDefaultMode).toBe('full')
     await runtime.dispose?.('closed')
   })
@@ -2178,13 +2336,15 @@ describe('artifact Workbench provider', () => {
     }
     expect(definition.getToolbarItems?.(item, presentation)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: 'missing-resources', kind: 'status' }),
         expect.objectContaining({
           id: 'toggle-remote-resources',
           kind: 'action',
           pressed: true,
         }),
       ]),
+    )
+    expect(definition.getToolbarItems?.(item, presentation)).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'missing-resources' })]),
     )
 
     const createsBeforeFailure = createSurface.mock.calls.length
@@ -2319,6 +2479,100 @@ describe('artifact Workbench provider', () => {
     expect(confirmRemoteResources).toHaveBeenCalledOnce()
     expect(createSurface).toHaveBeenCalledOnce()
     expect(harness.renderState.remoteResourcesEnabled).toBe(false)
+  })
+
+  it('keeps a native missing-resource event quiet through ready and refresh', async () => {
+    const nativeApi: NativeWorkbenchApi = {
+      createSurface: vi.fn(async () => ({ ok: true })),
+      setSurfaceRect: vi.fn(async () => ({ ok: true })),
+      activateSurface: vi.fn(async () => ({ ok: true })),
+      destroySurface: vi.fn(async () => ({ ok: true })),
+      onSurfaceEvent: vi.fn(() => () => undefined),
+    }
+    const harness = await createNativeRuntimeHarness(nativeApi)
+    const reload = vi.fn(async () => undefined)
+    await harness.runtime.setComponentHandle?.({ reload })
+    const toolbar = () => harness.definition.getToolbarItems?.(harness.item, {
+      active: true,
+      hostAvailable: true,
+      nativeSurface: true,
+      runtimeState: harness.renderState,
+    }) || []
+    try {
+      await harness.runtime.handleComponentEvent?.({
+        type: 'native-html-ready', payload: nativeResource(),
+      }, harness.item)
+      for (const type of ['missing-resource', 'ready'] as const) {
+        await harness.runtime.handleNativeSurfaceEvent?.({
+          version: 1, surfaceId: harness.item.id, type,
+        }, harness.item)
+        expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+        expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+      }
+      expect(harness.renderState.missingResources).toBe(true)
+      expect(harness.renderState.nativeSurfaceState).toBe('ready')
+      expect(harness.pushToast).not.toHaveBeenCalled()
+
+      await harness.runtime.performAction?.('refresh', harness.item)
+      expect(reload).toHaveBeenCalledOnce()
+      await harness.runtime.handleComponentEvent?.({
+        type: 'native-html-ready', payload: nativeResource(),
+      }, harness.item)
+      await harness.runtime.handleNativeSurfaceEvent?.({
+        version: 1, surfaceId: harness.item.id, type: 'missing-resource',
+      }, harness.item)
+      expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+      expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+    } finally {
+      await harness.runtime.dispose?.('closed')
+    }
+  })
+
+  it('does not turn a legacy web resource warning into a generic warning and keeps failed-page retry', async () => {
+    const renderState: Record<string, unknown> = {}
+    const reload = vi.fn(async () => undefined)
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact, nativeHtml: false, sessionKey: 'session-a',
+    })
+    const definition = createArtifactWorkbenchDefinitions({
+      baseOrigin: 'http://localhost',
+      confirmRemoteResources: vi.fn(async () => true),
+      currentSessionId: () => 'session-a',
+      platform: { id: 'web', capabilities: {}, files: {} } as unknown as Platform,
+      pushToast: vi.fn(),
+      t: key => key,
+    }).find(candidate => candidate.kind === 'artifact-preview')!
+    const runtime = await definition.createRuntime!(item, {
+      getRenderState: () => renderState,
+      updateRenderState: patch => Object.assign(renderState, patch),
+      isItemOpen: () => true,
+      setExpanded: vi.fn(),
+      reportError: vi.fn(),
+    })
+    await runtime.setComponentHandle?.({ reload })
+    const toolbar = () => definition.getToolbarItems?.(item, {
+      active: true, hostAvailable: true, nativeSurface: false, runtimeState: renderState,
+    }) || []
+    try {
+      await runtime.handleComponentEvent?.({
+        type: 'preview-state-change', payload: 'missing-resource',
+      }, item)
+      expect(renderState.missingResources).toBe(false)
+      expect(toolbar().map(item => item.id)).not.toContain('missing-resources')
+      expect(toolbar().map(item => item.id)).not.toContain('preview-warnings')
+      expect(toolbar()).toContainEqual(expect.objectContaining({ id: 'refresh', disabled: false }))
+
+      await runtime.handleComponentEvent?.({
+        type: 'preview-state-change', payload: 'error',
+      }, item)
+      expect(renderState.previewState).toBe('error')
+      expect(renderState.previewReadiness).toBe('error')
+      expect(toolbar()).toContainEqual(expect.objectContaining({ id: 'refresh', disabled: false }))
+      await runtime.performAction?.('refresh', item)
+      expect(reload).toHaveBeenCalledOnce()
+    } finally {
+      await runtime.dispose?.('closed')
+    }
   })
 
   it('surfaces an offline network block as ready with warnings', async () => {
@@ -2499,7 +2753,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2] as Array<1 | 2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: createLease,
       renewArtifactPreviewLease: vi.fn(async () => ({
@@ -2589,6 +2842,112 @@ describe('artifact Workbench provider', () => {
     await runtime.dispose?.('closed')
   })
 
+  it.each([429, 503])('keeps the live page and annotations through a transient renewal %s', async status => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, status, code: 'RATE_LIMITED', message: 'Try later' })
+    const initialState = { ...h.renderState }
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(renew).toHaveBeenCalledOnce()
+      expect(h.renderState).toEqual(initialState)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+      expect(h.pushToast).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(h.createSurface).toHaveBeenCalledOnce()
+      expect(h.closeOverlay).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(renew).toHaveBeenCalledTimes(3)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it('cancels a queued renewal retry when the preview closes', async () => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, status: 429, code: 'RATE_LIMITED', message: 'Try later' })
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+    await h.runtime.dispose?.('closed')
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+    expect(renew).toHaveBeenCalledOnce()
+    expect(h.destroySurface).toHaveBeenCalledOnce()
+  })
+
+  it.each([true, false])('does not overlap slow renewals or resume them after close (success=%s)', async success => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    let finish!: (value: Awaited<ReturnType<typeof renew>>) => void
+    const pending = new Promise<Awaited<ReturnType<typeof renew>>>(resolve => { finish = resolve })
+    renew.mockReturnValueOnce(pending)
+    await vi.advanceTimersByTimeAsync(45 * 60 * 1000)
+    expect(renew).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
+    finish(success ? {
+      ok: true, status: 200,
+      payload: { version: 1, lease_id: 'apl-annotation-focused', expires_at: '2099-01-01T00:00:00Z' },
+    } : { ok: false, status: 503, code: 'PREVIEW_BROKER_UNAVAILABLE', message: 'Unavailable' })
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+    expect(renew).toHaveBeenCalledOnce()
+    expect(h.destroySurface).toHaveBeenCalledOnce()
+    expect(h.pushToast).not.toHaveBeenCalled()
+  })
+
+  it('cancels the old retry when a preview lease is replaced', async () => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, status: 429, code: 'RATE_LIMITED', message: 'Try later' })
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      await h.runtime.performAction?.('refresh', h.item)
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(renew).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(h.createSurface).toHaveBeenCalledTimes(2)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it.each([
+    { status: 401, code: 'UNAUTHORIZED' },
+    { status: 403, code: 'FORBIDDEN' },
+    { status: 502, code: 'INVALID_RESPONSE' },
+    { status: 0, code: 'DESKTOP_PREVIEW_BROKER_UNAVAILABLE' },
+  ])('does not silently retry a terminal renewal $code', async failure => {
+    vi.useFakeTimers()
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValueOnce({ ok: false, ...failure, message: 'Unavailable' })
+    try {
+      await vi.advanceTimersByTimeAsync(16 * 60 * 1000)
+      expect(renew).toHaveBeenCalledOnce()
+      expect(h.destroySurface).toHaveBeenCalledOnce()
+      expect(h.renderState.previewBlocked).toBe(true)
+      expect(h.pushToast).toHaveBeenCalledOnce()
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it('bounds transient retries by the last confirmed lease expiry', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(Date.parse('2099-01-01T00:00:00Z') - 15 * 60 * 1000 - 500))
+    const h = await createAnnotationDraftHarness()
+    const renew = vi.mocked(h.nativeApi.renewArtifactPreviewLease!)
+    renew.mockResolvedValue({ ok: false, status: 503, code: 'PREVIEW_BROKER_UNAVAILABLE', message: 'Unavailable' })
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(h.destroySurface).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(renew).toHaveBeenCalledTimes(2)
+      expect(h.destroySurface).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+      expect(renew).toHaveBeenCalledTimes(2)
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
   it('settles a revoked-lease replacement failure without an unhandled renewal rejection', async () => {
     vi.useFakeTimers()
     const privateDiagnostic = 'revoked lease at /private/operator/profile'
@@ -2616,7 +2975,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [2] as Array<2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createArtifactPreviewLease: vi.fn(async () => ({
         ok: true as const,
@@ -2690,12 +3048,11 @@ describe('artifact Workbench provider', () => {
     }
   })
 
-  it('uses the explicit v1 compatibility path when a v2-era Desktop lacks the lease broker', async () => {
+  it.each([false, true])('only allows the v1 single-file fallback outside explicit history (history=%s)', async (historical) => {
     const nativeApi: NativeWorkbenchApi = {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [1, 2] as Array<1 | 2>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       createSurface: vi.fn(async () => ({ ok: true })),
       setSurfaceRect: vi.fn(async () => ({ ok: true })),
@@ -2706,6 +3063,7 @@ describe('artifact Workbench provider', () => {
     const renderState: Record<string, unknown> = {}
     const previewItem = createArtifactPreviewWorkbenchItem({
       artifact: { ...artifact, id: 'art-fixture' },
+      historical,
       nativeHtml: true,
       sessionKey: 'session-a',
     })
@@ -2731,11 +3089,17 @@ describe('artifact Workbench provider', () => {
       reportError: vi.fn(),
     })
 
-    expect(renderState).toMatchObject({
-      compatibilityFallback: true,
-      previewBlocked: false,
-      previewMode: 'offline',
-    })
+    if (historical) {
+      expect(renderState.previewBlocked).toBe(true)
+      expect(renderState.compatibilityFallback).not.toBe(true)
+      expect(nativeApi.createSurface).not.toHaveBeenCalled()
+    } else {
+      expect(renderState).toMatchObject({
+        compatibilityFallback: true,
+        previewBlocked: false,
+        previewMode: 'offline',
+      })
+    }
   })
 
   it('clears a Web preview origin before revoking its lease on normal close', async () => {
@@ -2806,7 +3170,7 @@ describe('artifact Workbench provider', () => {
         keepalive: true,
         method: 'DELETE',
         sessionKey: 'session-a',
-        timeoutMs: 0,
+        timeoutMs: 15_000,
       })
       expect(clearPreviewOrigin.mock.invocationCallOrder[0]).toBeLessThan(
         requestBlob.mock.invocationCallOrder[0]!,
@@ -2854,7 +3218,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [4] as Array<4>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       getArtifactAnnotationCapabilities: vi.fn(async () => ({
         version: 4 as const,
@@ -2915,6 +3278,7 @@ describe('artifact Workbench provider', () => {
     const reportError = vi.fn()
     const pushToast = vi.fn()
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -3033,7 +3397,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [3] as Array<3>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       getArtifactAnnotationCapabilities,
       setArtifactAnnotationMode,
@@ -3085,6 +3448,7 @@ describe('artifact Workbench provider', () => {
     }
     const renderState: Record<string, unknown> = {}
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -3270,7 +3634,7 @@ describe('artifact Workbench provider', () => {
       annotationId: string
       sessionKey: string
       documentId: string
-      selection: { targetRef: string; resourceId?: string; locatorHint?: string }
+      selection: { targetRef?: string; resourceId?: string; locatorHint?: string }
     }) => {
       if (rejectNextCreate) {
         const error = rejectNextCreate
@@ -3436,7 +3800,6 @@ describe('artifact Workbench provider', () => {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [3] as Array<3>,
         modes: ['full', 'offline'] as Array<'full' | 'offline'>,
-        maxSurfaces: 8,
       })),
       getArtifactAnnotationCapabilities: vi.fn(async () => ({
         version: 3 as const,
@@ -3472,6 +3835,7 @@ describe('artifact Workbench provider', () => {
     }
     const renderState: Record<string, unknown> = {}
     const item = createArtifactPreviewWorkbenchItem({
+      resourceIdentity: 'document:document-1',
       artifact,
       nativeHtml: true,
       sessionKey: 'session-a',
@@ -4226,7 +4590,7 @@ async function createWorkingHeadRuntime(workingDocumentId?: string) {
   const revokeLease = vi.fn(async () => ({ ok: true as const, status: 204, payload: undefined }))
   const nativeApi: NativeWorkbenchApi = {
     getCapabilities: vi.fn(async () => ({ protocolVersions: [4] as Array<4>,
-      modes: ['full', 'offline'] as Array<'full' | 'offline'>, maxSurfaces: 8 })),
+      modes: ['full', 'offline'] as Array<'full' | 'offline'> })),
     createArtifactPreviewLease: createLease,
     renewArtifactPreviewLease: vi.fn(async () => ({ ok: true as const, status: 200,
       payload: { version: 1 as const, lease_id: `apl-working-${sequence}`, expires_at: '2099-01-01T00:00:00Z' } })),

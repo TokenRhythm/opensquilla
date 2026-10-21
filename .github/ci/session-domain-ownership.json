@@ -10,13 +10,15 @@
         "src/opensquilla/gateway/adapters/conversation_ancillary_contract.py",
         "src/opensquilla/gateway/adapters/session_lifecycle.py",
         "src/opensquilla/gateway/adapters/session_lifecycle_contract.py",
+        "src/opensquilla/gateway/sidechat_leases.py",
+        "src/opensquilla/gateway/sidechat_policy.py",
+        "src/opensquilla/session/sidechat.py",
         "src/opensquilla/gateway/usage_query.py"
       ],
       "owned_symbols": {
         "src/opensquilla/gateway/rpc_chat.py": [
           "_GatewayClarificationSubmissionPort",
           "_canonical_webchat_session_key",
-          "_clarify_fields_to_text",
           "_handle_chat_clarify_submit_contract",
           "_submit_clarification"
         ],
@@ -24,7 +26,6 @@
           "_GatewayCommandCatalogPort",
           "_command_catalog",
           "_handle_commands_list_for_surface_contract",
-          "_meta_skill_argument_choices",
           "_serialize"
         ],
         "src/opensquilla/gateway/rpc_prompt_cache_keepalive.py": [
@@ -35,11 +36,6 @@
           "_status_contract",
           "_stored_session_key"
         ],
-        "src/opensquilla/gateway/rpc_router.py": [
-          "_GatewayRouteFeedbackPort",
-          "_handle_router_feedback_submit_contract",
-          "_submit_route_feedback"
-        ],
         "src/opensquilla/gateway/rpc_sessions.py": [
           "_GatewaySessionLifecyclePorts",
           "_SessionLifecycleDeletionPort",
@@ -49,6 +45,7 @@
           "_buffer_session_event",
           "_channel_types_from_config",
           "_cleanup_pending_input_scopes",
+          "_cleanup_sidechat_pending_material",
           "_create_session_key",
           "_delete_session_with_lifecycle",
           "_effective_agent_id_for_session",
@@ -63,8 +60,12 @@
           "_handle_sessions_fork",
           "_handle_sessions_fork_through_turn",
           "_handle_sessions_rename",
+          "_handle_sessions_sidechat_create",
+          "_handle_sessions_sidechat_close",
           "_initial_user_message_owner_kwargs",
           "_list_transcript_titles",
+          "_read_transcript_title_inputs",
+          "_require_key",
           "_model_value",
           "_next_fork_display_name",
           "_pending_input_attachment_scopes",
@@ -73,6 +74,7 @@
           "_session_fork_title_family",
           "_session_lifecycle_adapter",
           "_session_sidebar_title",
+          "_sidechat_owned_session_keys",
           "_validate_rpc_session_deployment"
         ],
         "src/opensquilla/gateway/rpc_usage.py": [
@@ -170,7 +172,9 @@
           "_handle_sessions_send_contract",
           "_handle_sessions_steer_v2_contract",
           "_is_remote_web_guest",
+          "_install_auto_title",
           "_list_transcript_titles",
+          "_read_transcript_title_inputs",
           "_model_value",
           "_next_fork_display_name",
           "_normalize_terminal_event_payload",
@@ -246,6 +250,11 @@
     }
   },
   "cross_domain_boundaries": [
+    {
+      "path": "src/opensquilla/gateway/rpc_sessions.py",
+      "symbol": "_cleanup_unreferenced_pending_promotions",
+      "owner": "PendingInputQueue"
+    },
     {
       "path": "src/opensquilla/gateway/rpc_sessions.py",
       "symbol": "build_turn_admission_application",

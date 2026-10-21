@@ -2,7 +2,7 @@ import { test, expect, type Page } from '@playwright/test'
 import { relativeLuminance } from './utils'
 
 // End-to-end coverage for the pluggable theme engine (P0): the value-theme axis
-// (light / dark / system) driven through the real appearance menu, persistence,
+// (light / dark / system) driven through the real Settings picker, persistence,
 // registry-driven validation of the persisted choice, and the layered token
 // contract (L1 per-theme values, the new ink/fill pairs, and L0 foundation
 // tokens that stay invariant across themes). Runs against whatever build serves
@@ -11,18 +11,13 @@ import { relativeLuminance } from './utils'
 const CONTROL = '/control/'
 const THEME_KEY = 'opensquilla-theme'
 
-// Topbar menu labels as rendered by themePickerOptions({ scope: 'basic' }): the
-// built-in modes use the translated chrome.themeMode.* keys (English in CI). The
-// topbar now lists only these three plus a "More themes…" action; custom themes
-// (shown by their manifest name) live in Settings → Appearance. Selecting by
-// label stays correct as the registry grows.
-const MENU_LABEL = { light: 'Light', dark: 'Dark', system: 'System' } as const
+// Theme preferences are managed by the complete Settings > Interface picker.
+const THEME_MODES = ['light', 'dark', 'system'] as const
 
 async function bootShell(page: Page) {
-  // The topbar (and its appearance control) render for every route and do not
-  // depend on the RPC backend, so the shell is reachable without live data.
+  // The shell renders on every route, including without a configured provider.
   await page.goto(CONTROL + 'chat')
-  await page.waitForSelector('.conn-pill', { timeout: 20000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 20000 })
   // initTheme() applies data-theme on mount; wait until it has.
   await expect
     .poll(() => page.evaluate(() => document.documentElement.getAttribute('data-theme')))
@@ -56,39 +51,26 @@ function rootToken(page: Page, name: string) {
   )
 }
 
-async function pickTheme(page: Page, mode: keyof typeof MENU_LABEL) {
-  // Target the appearance button by its accessible name — `.theme-menu-wrap` is
-  // not unique (the language switcher reuses the wrapper class).
-  await page.getByRole('button', { name: 'Theme' }).click()
-  await page.waitForSelector('.theme-menu', { timeout: 5000 })
-  await page
-    .locator('.theme-menu .theme-menu__item')
-    .filter({ hasText: MENU_LABEL[mode] })
-    .first()
-    .click()
-  // menu closes after a pick
-  await expect(page.locator('.theme-menu')).toHaveCount(0)
+async function pickTheme(page: Page, mode: typeof THEME_MODES[number]) {
+  await page.goto(CONTROL + 'settings/interface')
+  await page.locator(`.appearance-theme__opt:has(input[name="appearance-theme"][value="${mode}"])`).click()
+  await expect(page.locator(`input[name="appearance-theme"][value="${mode}"]`)).toBeChecked()
 }
 
-// The topbar menu now lists only the basic modes + a "More themes…" action; the
-// full custom-theme list lives in Settings → Appearance. A custom theme is
-// therefore selected in Settings and persisted like any other choice — so, as
-// with the P2 skin coverage below, custom/world themes are exercised here by
-// seeding the persisted id and booting, which drives the very same apply +
-// lazy-world path the Settings radio does, without depending on the settings
-// dialog rendering in the backend-free shell.
+// Persisted theme ids exercise the same theme application and lazy world-load
+// path as the Settings radio group, without needing a live provider catalog.
 async function bootWithTheme(page: Page, themeId: string) {
   await page.addInitScript(
     (v) => localStorage.setItem('opensquilla-theme', v),
     themeId,
   )
   await page.goto(CONTROL + 'chat')
-  await page.waitForSelector('.conn-pill', { timeout: 20000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 20000 })
   await expect.poll(() => dataTheme(page)).toBe(themeId)
 }
 
 test.describe('Theme engine (P0)', () => {
-  test('appearance menu applies each value theme and persists across reload', async ({ page }) => {
+  test('Settings picker applies each value theme and persists across reload', async ({ page }) => {
     await bootShell(page)
 
     await pickTheme(page, 'light')
@@ -165,23 +147,19 @@ test.describe('Theme engine (P0)', () => {
 
     expect(darkRadius).toBe(lightRadius)
     expect(darkFs).toBe(lightFs)
-    expect(darkRadius).toBe('8px') // the ladder's control tier, unchanged by P0
+    expect(darkRadius).toBe('10px') // Current shared foundation control tier.
   })
 
-  test('the topbar menu lists only the basic modes plus "More themes…"', async ({ page }) => {
+  test('Settings exposes all registered themes while the topbar stays quiet', async ({ page }) => {
     await bootShell(page)
-    await page.getByRole('button', { name: 'Theme' }).click()
-    await page.waitForSelector('.theme-menu', { timeout: 5000 })
-    const items = page.locator('.theme-menu .theme-menu__item')
-    // Light / Dark / System + the "More themes…" action = 4 rows, no custom themes.
-    await expect(items).toHaveCount(4)
-    await expect(items.filter({ hasText: 'Arctic' })).toHaveCount(0)
-    await expect(items.filter({ hasText: 'Synthwave' })).toHaveCount(0)
-    await expect(items.filter({ hasText: 'More themes' })).toHaveCount(1)
-
-    // "More themes…" deep-links to Settings → Appearance (the full theme list).
-    await items.filter({ hasText: 'More themes' }).click()
-    await expect(page).toHaveURL(/\/settings\/appearance$/)
+    await expect(page.locator('.topbar .theme-menu-wrap')).toHaveCount(0)
+    await page.goto(CONTROL + 'settings/interface')
+    const values = await page.locator('input[name="appearance-theme"]').evaluateAll(elements =>
+      elements.map(element => (element as HTMLInputElement).value))
+    expect(values.sort()).toEqual(['light', 'dark', 'system', 'arctic', 'crt-green', 'ember', 'miami', 'synthwave', 'terminal', 'vapor'].sort())
+    await page.locator('.appearance-theme__opt:has(input[value="arctic"])').click()
+    await expect.poll(() => dataTheme(page)).toBe('arctic')
+    await expect(page.locator('input[name="appearance-theme"][value="arctic"]')).toBeChecked()
   })
 
   test('a custom value theme (Arctic) applies when selected and is visually distinct', async ({ page }) => {
@@ -214,7 +192,7 @@ test.describe('Theme engine (P0)', () => {
     // a light/dark ground, whereas this loads straight into the renamed theme.)
     await page.addInitScript((k) => localStorage.setItem(k, 'nord'), THEME_KEY)
     await page.goto(CONTROL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 20000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 20000 })
     await expect.poll(() => dataTheme(page)).toBe('arctic')
     // the canonical id is written back on first load
     await expect
@@ -222,10 +200,6 @@ test.describe('Theme engine (P0)', () => {
       .toBe('arctic')
   })
 })
-
-function contentBackground(page: Page) {
-  return page.evaluate(() => getComputedStyle(document.getElementById('content')!).backgroundColor)
-}
 
 test.describe('Global world theme (Terminal)', () => {
   test('selecting Terminal applies its palette globally and lazy-loads the world layer', async ({ page }) => {
@@ -253,35 +227,5 @@ test.describe('Global world theme (Terminal)', () => {
         page.evaluate(() => getComputedStyle(document.documentElement, '::before').backgroundImage),
       )
       .toMatch(/gradient/i)
-  })
-})
-
-test.describe('Expressive skin (P2 — Out of Register)', () => {
-  test('applies to a skinned route, scoped to the content area only', async ({ page }) => {
-    await page.addInitScript((k) => localStorage.setItem(k, 'dark'), THEME_KEY) // force a dark shell
-    await page.goto(CONTROL + 'changelog')
-    await page.waitForSelector('.conn-pill', { timeout: 20000 })
-
-    // the content area opts into the skin via meta.skin
-    await expect(page.locator('#content')).toHaveAttribute('data-skin', 'out-of-register')
-
-    // the lazy skin CSS turns the content newsprint (light)…
-    await expect.poll(async () => relativeLuminance(await contentBackground(page))).toBeGreaterThan(0.6)
-    // …while the shell stays on the dark ground — proof the skin is scoped, not global
-    expect(relativeLuminance(await bodyBackground(page))).toBeLessThan(0.3)
-  })
-
-  test('does NOT apply to operational routes', async ({ page }) => {
-    await page.goto(CONTROL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 20000 })
-    await expect(page.locator('#content')).not.toHaveAttribute('data-skin')
-  })
-
-  test('lazily loads its serif face on the skinned route', async ({ page }) => {
-    await page.goto(CONTROL + 'changelog')
-    await page.waitForSelector('.conn-pill', { timeout: 20000 })
-    await expect
-      .poll(() => page.evaluate(() => document.fonts.check('900 40px Fraunces')))
-      .toBe(true)
   })
 })

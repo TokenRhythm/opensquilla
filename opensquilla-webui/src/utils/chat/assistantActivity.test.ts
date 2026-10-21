@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type {
   ChatRenderedMessage,
@@ -157,6 +157,206 @@ describe('projectAssistantActivity', () => {
       item.type === 'tool-group' ? item.group.calls : [],
     )
     expect(tools.map(item => item.toolId)).toEqual(['ok', 'failed'])
+  })
+
+  it('uses explicit answer presentation after a failed settled tool', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting the repository.\n\nThe final answer.',
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'The final answer.',
+            rawText: 'The final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('explicit-presentation')
+    expect(projection.answerPart?.rawText).toBe('The final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'narration',
+      'failed-tool',
+    ])
+  })
+
+  it('keeps answer text containing process-like phrases when marked as answer', () => {
+    const answer = 'Now let me examine the flow and explain the result.'
+    const projection = projectAssistantActivity(
+      message({
+        text: `Inspecting the repository.\n\n${answer}`,
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool-with-natural-language-answer'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: answer,
+            rawText: answer,
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('explicit-presentation')
+    expect(projection.answerPart?.rawText).toBe(answer)
+  })
+
+  it('keeps explicit intermediate-only failure out of the answer body', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting the repository.',
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool'),
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('explicit-no-answer')
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'narration',
+      'failed-tool',
+    ])
+  })
+
+  it('fails open when explicit presentation meets a pending tool', () => {
+    const canonical = 'Inspecting the repository.\n\nThe final answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('pending', { status: '', isRunning: true }),
+          ], 'pending-tool'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'The final answer.',
+            rawText: 'The final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'settled' },
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('fails open when an earlier answer marker makes the terminal span ambiguous', () => {
+    const canonical = 'Earlier answer.\n\nWork after it.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'earlier-answer',
+            html: 'Earlier answer.',
+            rawText: 'Earlier answer.',
+            presentation: 'answer',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool'),
+          {
+            type: 'text',
+            key: 'work',
+            html: 'Work after it.',
+            rawText: 'Work after it.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
   })
 
   it('keeps tool-bounded candidate text as activity without repeating the final answer', () => {
@@ -1242,10 +1442,12 @@ describe('projectAssistantActivityTimeline', () => {
     const rateLimited = statusStep({
       at: 10_000,
       label: { code: 'chat.activity.provider.rateLimited', params: { seconds: 8 } },
+      isCurrent: true, providerRecovery: { phase: 'retry_wait', reason: 'rate_limited', startedAt: 10_000, retryAfterMs: 8_000 },
     })
     const retryWait = statusStep({
       at: 10_000,
       label: { code: 'chat.activity.provider.retryWait', params: { seconds: 12 } },
+      isCurrent: true, providerRecovery: { phase: 'retry_wait', reason: 'transport_transient', startedAt: 10_000, retryAfterMs: 12_000 },
     })
     const reasoning = statusStep({
       at: 10_000,
@@ -1254,7 +1456,7 @@ describe('projectAssistantActivityTimeline', () => {
 
     expect(providerActivityRemainingSeconds(rateLimited, 10_999)).toBe(8)
     expect(providerActivityRemainingSeconds(rateLimited, 13_000)).toBe(5)
-    expect(providerActivityRemainingSeconds(rateLimited, 30_000)).toBe(0)
+    expect(providerActivityRemainingSeconds(rateLimited, 30_000)).toBeNull()
     expect(providerActivityRemainingSeconds(retryWait, 15_000)).toBe(7)
     expect(providerActivityRemainingSeconds(reasoning, 15_000)).toBeNull()
   })
@@ -1495,6 +1697,60 @@ describe('isSemanticActivityStatusStep', () => {
 })
 
 describe('splitLiveAssistantTimeline', () => {
+  it('keeps narration before a later real draft without changing its answer marker or inventing a tool', () => {
+    const text: ChatStreamTimelineItem = {
+      type: 'text', key: 'pre-tool-text', rawText: 'I will prepare that code.',
+      html: '<p>I will prepare that code.</p>', presentation: 'answer', activityOrder: 4,
+    }
+    const timeline = [text]
+    const before = structuredClone(timeline)
+    const preparing = splitLiveAssistantTimeline(timeline, { toolInputPreviewOrder: 5 })
+    expect(preparing).toEqual({ activityItems: timeline, answerItem: null })
+    expect(preparing.activityItems[0]).toBe(text)
+    expect(timeline).toEqual(before)
+    expect(preparing.activityItems.some(item => item.type === 'tool-group')).toBe(false)
+    // A discarded or superseded draft supplies no order and cannot hold back
+    // the real text or fabricate a completed/executing tool in the transcript.
+    const discarded = splitLiveAssistantTimeline(timeline)
+    expect(discarded.activityItems).toEqual([])
+    expect(discarded.answerItem).toEqual(text)
+  })
+
+  it('renders only the relocated raw answer as an immutable display copy', () => {
+    const text: ChatStreamTimelineItem = {
+      type: 'text', key: 'unrendered-answer', rawText: 'I will prepare that code.',
+      html: '', presentation: 'answer', activityOrder: 4,
+    }
+    const renderActivityMarkdown = vi.fn(() => '<p>I will prepare that code.</p>')
+    const preparing = splitLiveAssistantTimeline([text], { toolInputPreviewOrder: 5, renderActivityMarkdown })
+    expect(preparing.answerItem).toBeNull()
+    expect(preparing.activityItems).toEqual([{ ...text, html: '<p>I will prepare that code.</p>' }])
+    expect(preparing.activityItems[0]).not.toBe(text)
+    expect(text.html).toBe('')
+    expect(text.presentation).toBe('answer')
+    expect(renderActivityMarkdown).toHaveBeenCalledExactlyOnceWith(text.rawText)
+    renderActivityMarkdown.mockClear()
+    expect(splitLiveAssistantTimeline([text], { renderActivityMarkdown }).answerItem).toEqual(text)
+    expect(renderActivityMarkdown).not.toHaveBeenCalled()
+    splitLiveAssistantTimeline([{ ...text, html: '<p>Already rendered</p>' }], { toolInputPreviewOrder: 5, renderActivityMarkdown })
+    expect(renderActivityMarkdown).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, 0, -1, 3, 4, 4.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    'leaves a newer answer outside when draft order %s is absent, older, or invalid', toolInputPreviewOrder => {
+      const text: ChatStreamTimelineItem = {
+        type: 'text', key: 'answer', rawText: 'Newer answer', html: 'Newer answer',
+        presentation: 'answer', activityOrder: 4,
+      }
+      expect(splitLiveAssistantTimeline([text], { toolInputPreviewOrder })).toEqual({ activityItems: [], answerItem: text })
+    },
+  )
+
+  it('does not infer order for legacy unsequenced text from a live draft', () => {
+    const text: ChatStreamTimelineItem = { type: 'text', key: 'legacy', rawText: 'Answer', html: 'Answer' }
+    expect(splitLiveAssistantTimeline([text], { toolInputPreviewOrder: 5 })).toEqual({ activityItems: [], answerItem: text })
+  })
+
   it('keeps only the trailing text outside as the current answer candidate', () => {
     const timeline: ChatStreamTimelineItem[] = [
       toolGroup([call('inspect', { name: 'read_file' })]),

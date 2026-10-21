@@ -191,11 +191,13 @@ for (const scenario of [
   }) => {
     const gateway = await installGateway(page, scenario.reason)
     await page.goto(CONTROL_URL + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
     await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
     await expect(page.locator('.msg-user')).toHaveCount(2)
-    await expect.poll(() => gateway.methods.filter(method => method === 'sessions.routing.get').length)
-      .toBeGreaterThan(0)
+    // The authoritative subscription already supplies the session routing.
+    // A separate fallback read is unnecessary and must not gate this scenario.
+    expect(gateway.methods).toContain('sessions.messages.subscribe')
+    expect(gateway.methods).not.toContain('sessions.routing.get')
 
     const routingButton = page.getByRole('button', {
       name: "Models & routing",
@@ -224,7 +226,7 @@ for (const scenario of [
     }
     expect(gateway.chatSends).toHaveLength(0)
     await routingButton.click()
-    await page.getByRole('menuitemradio', { name: 'Intelligent model routing', exact: true }).click()
+    await page.getByRole('menuitemradio', { name: 'Intelligent model routing Token-efficient', exact: true }).click()
 
     await expect.poll(() => gateway.routingSets).toEqual([{
       sessionKey: SESSION_KEY,

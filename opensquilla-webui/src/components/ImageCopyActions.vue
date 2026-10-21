@@ -68,12 +68,15 @@ async function perform(mode: 'image' | 'svg-source') {
   // Calling copy before awaiting preserves the click's clipboard activation.
   const ok = await copy(mode)
   if (attempt !== generation) return
-  result.value = ok ? 'ok' : 'error'
-  feedback.value = t(ok
-    ? mode === 'image' ? 'imageClipboard.copiedImage' : 'imageClipboard.copiedSource'
-    : 'imageClipboard.failed')
   clearTimeout(feedbackTimer)
-  feedbackTimer = setTimeout(() => { feedback.value = ''; result.value = 'idle' }, 1200)
+  if (ok && mode === 'image') {
+    result.value = 'ok'
+    feedbackTimer = setTimeout(() => { result.value = 'idle' }, 1200)
+  } else if (!ok) {
+    result.value = 'error'
+    feedback.value = t('imageClipboard.failed')
+    feedbackTimer = setTimeout(() => { feedback.value = ''; result.value = 'idle' }, 1200)
+  }
 }
 
 function reset() {
@@ -94,7 +97,8 @@ onBeforeUnmount(reset)
       :aria-label="t('imageClipboard.copyImage')" :title="t('imageClipboard.imageDescription')"
       :aria-busy="busy" :disabled="busy" @click.stop="perform('image')">
       <span v-if="busy" class="spinner" aria-hidden="true" />
-      <Icon v-else name="copy" :size="16" />
+      <Icon v-else :name="result === 'ok' ? 'check' : 'copy'" :size="16"
+        :class="{ 'image-copy-actions__success': result === 'ok' }" />
       <span v-if="labelled">{{ t('imageClipboard.copyImage') }}</span>
     </button>
     <button v-if="svg && sourceMenu" ref="moreButton" type="button" class="btn btn--icon btn--ghost"
@@ -120,6 +124,15 @@ onBeforeUnmount(reset)
 <style scoped>
 .image-copy-actions { display: inline-flex; align-items: center; gap: var(--sp-1); flex-shrink: 0; }
 .image-copy-actions__copy { flex-shrink: 0; }
+.image-copy-actions__success { color: var(--ok); animation: image-copy-success var(--dur-base) var(--ease-out); }
+@keyframes image-copy-success {
+  0% { opacity: 0; transform: scale(.7); }
+  65% { opacity: 1; transform: scale(1.09); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .image-copy-actions__success { animation: none; }
+}
 .image-copy-menu-backdrop { position: fixed; inset: 0; z-index: 10000; }
 .image-copy-menu { position: fixed; width: max-content; min-width: 180px; padding: var(--sp-1); max-width: calc(100vw - 16px); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-surface); color: var(--text); box-shadow: var(--shadow-lg); }
 .image-copy-menu button { border: 0; border-radius: var(--radius-sm); padding: var(--sp-2) var(--sp-3); background: transparent; color: inherit; font: inherit; font-size: var(--fs-sm); cursor: pointer; text-align: start; }

@@ -4,8 +4,9 @@ export function allowedComposerRunModes(
   allowed: SandboxRunMode[],
   setupStatus: SandboxSetupStatusPayload | null,
   setupResolved: boolean,
+  capabilityAvailable = false,
 ): SandboxRunMode[] {
-  return setupResolved && setupStatus?.state === 'ready'
+  return setupResolved && (capabilityAvailable || setupStatus?.state === 'ready')
     ? allowed
     : allowed.filter(mode => mode !== 'safe')
 }
@@ -27,15 +28,15 @@ export function composerRunModeSelectionAction(
   setupStatus: SandboxSetupStatusPayload | null,
   canSetup: boolean,
   setupResolved = true,
+  capabilityAvailable = false,
 ): ComposerRunModeSelectionAction {
   if (mode === 'full') return 'persist'
   if (!setupResolved || setupStatus === null) return 'ignore'
-  const isWindows = setupStatus.platform.toLowerCase().startsWith('win')
-  // Windows startup is passive and may report a stale marker as ready. Route
-  // an explicit Safe selection through setup so the offline identity is
-  // revalidated/repaired; portable ready states remain a cheap persistence.
-  if (setupStatus.state === 'ready' && !(isWindows && canSetup)) return 'persist'
-  return ['not_setup', 'failed', 'ready'].includes(setupStatus.state) && canSetup
+  // A ready readiness result is authoritative for mode selection. Setup is
+  // reserved for first-time configuration and an explicit retryable failure;
+  // selecting Safe again must not reopen administrator setup on Windows.
+  if (capabilityAvailable || setupStatus.state === 'ready') return 'persist'
+  return ['not_setup', 'failed'].includes(setupStatus.state) && canSetup
     ? 'setup'
     : 'ignore'
 }

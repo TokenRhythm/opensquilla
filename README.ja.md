@@ -42,7 +42,7 @@ OpenSquilla は、Token を効率的に使うマイクロカーネル AI Agent �
 
 すべての入口——Web UI、CLI、チャットチャネル——が同じループ上で動くため、ツールのディスパッチ、リトライ、判断ログの挙動はどこでも同一です。プラグイン可能なプロバイダ層は TokenRhythm、OpenRouter、OpenAI、Anthropic、Ollama、DeepSeek、Gemini、Qwen/DashScope をはじめとする 20 以上の LLM プロバイダと、あなたのコードや設定スキーマを変えることなくやり取りします。
 
-OpenSquilla 0.5.5 が現在の安定版リリースです。
+OpenSquilla 0.5.6 が現在の安定版リリースです。
 
 タスク指向の製品ドキュメントについては、[OpenSquilla 製品ガイド](README.product.md)または[ドキュメント索引](docs/README.md)から始めてください。
 
@@ -56,7 +56,7 @@ OpenSquilla は Windows、macOS、Linux で動作します。ご自身のユー�
 
 リリース版のインストールコマンドは、公開された GitHub リリースのアセットを使います。Python wheel のインストールでは、バージョン付きの wheel ファイル名を使います。インストーラーが wheel ファイル名に埋め込まれたバージョンを検証するためです。
 
-0.5.5 をデスクトップで使う場合は、GitHub リリースからパッケージ版デスクトップインストーラーを使うことをおすすめします。macOS では `OpenSquilla-0.5.5-mac-arm64.dmg`、Windows では `OpenSquilla-0.5.5-win-x64.exe` です。
+0.5.6 をデスクトップで使う場合は、GitHub リリースからパッケージ版デスクトップインストーラーを使うことをおすすめします。macOS では `OpenSquilla-0.5.6-mac-arm64.dmg`、Windows では `OpenSquilla-0.5.6-win-x64.exe` です。
 
 | 方法 | 対象 | 使うべき場面 |
 | --- | --- | --- |
@@ -89,10 +89,10 @@ macOS のターミナルインストールでは、SquillaRouter の LightGBM �
 
 ### デスクトップインストーラー
 
-0.5.5 のデスクトップインストーラーは、Vue 製コントロールコンソールとゲートウェイランタイムを Electron シェルにまとめています。
+0.5.6 のデスクトップインストーラーは、Vue 製コントロールコンソールとゲートウェイランタイムを Electron シェルにまとめています。
 
-- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/OpenSquilla-0.5.5-mac-arm64.dmg>
-- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/OpenSquilla-0.5.5-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/OpenSquilla-0.5.6-mac-arm64.dmg>
+- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/OpenSquilla-0.5.6-win-x64.exe>
 
 中国本土からより高速にダウンロードするには、OSS の直接ダウンロード用エイリアスを使用してください。
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -129,7 +129,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. OpenSquilla をインストールする**——どのプラットフォームでも同じコマンドです。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/opensquilla-0.5.6-py3-none-any.whl"
 ```
 
 これはリリース URL から OpenSquilla wheel をインストールし、続いて `uv` が、選択した extra が宣言する依存関係をダウンロードします。デフォルトの `recommended` extra には、ONNX Runtime、LightGBM、NumPy、tokenizers といった SquillaRouter のランタイム依存関係が含まれるため、これらの wheel がすでにキャッシュされていない限り、初回インストールにはネットワークアクセスが必要です。`uv` は macOS の `libomp` や Windows の Visual C++ Redistributable のようなシステムネイティブのランタイムはインストールしません。ルーターランタイムがネイティブライブラリの読み込みエラーを報告した場合は、[トラブルシューティング](#troubleshooting)を参照してください。
@@ -145,7 +145,7 @@ opensquilla gateway run
 > 新規の `uv` インストール直後に `opensquilla` が見つからない場合は、新しいターミナルを開くか、ステップ 1 の PATH 設定の行を再実行してください。
 
 完全にバージョンを固定したインストールには、バージョン付きの wheel URL を使ってください:
-`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl`。
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.6/opensquilla-0.5.6-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -504,22 +504,122 @@ docker build -t opensquilla:local .
 | **耐久性のあるセッション、サブエージェント、スケジューリング** | SQLite を基盤としたセッション、トランスクリプト、再生のストレージに、Agent ごとのワークスペースを備えます。Agent は深さの制限されたサブエージェントを生成でき、ツリー内蔵の cron パーサーを持つ `SchedulerEngine` が `opensquilla cron` 経由で定期ジョブを実行します。 |
 | **オペレーター制御** | ヒューマンインザループの承認により、機微なツール呼び出しを判断のために一時停止できます。ターンごと・セッションごとの Token とコストの集計（`opensquilla cost`）と診断は、CLI と Web UI から利用できます。 |
 
-MetaSkill ドキュメント: [`docs/features/meta-skills.md`](docs/features/meta-skills.md)、
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md)、
-[`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md)。
 
 ---
 
 ## ベンチマーク結果
 
-PinchBench 1.2.1 の 25 タスクにわたる平均結果:
+結果は[テクニカルレポート](https://aixiv.science/abs/aixiv.260822.000001)によるものです。
+スコアは各ベンチマークの採点器によるもので、コストは全フレームワークで同一の
+プロバイダー価格表を用いています。OpenSquilla の行は、ルーティングを無効にして
+フルハーネスを実行する強制単一モデル（ハーネス自体の貢献を切り出すもの）か、
+マルチティアルーティングのモデルプールのいずれかです。
 
-| Agent | ベースモデル | 平均スコア | 総入力 token | 総出力 token | 総コスト |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| OpenSquilla | モデルルーター（Opus4.7、GLM5.1、DS4 Flash） | 0.9251 | 1,721,328 | 61,475 | $0.688 |
-| OpenClaw | Claude Opus 4.7 | 0.9255 | 3,066,243 | 50,890 | $6.233 |
+### PinchBench
 
-スコアは 25 タスクの平均で、token 数とコストは実行全体の合計です。
+ファイル操作、データ処理、Web 検索、創作出力、ツール使用、記憶の想起にわたる 25 タスク。
+スコアはタスク間の平均、コストは実行全体の合計です。
+
+| フレームワーク | モデル（プール） | スコア | コスト |
+| --- | --- | ---: | ---: |
+| OpenClaw | Opus-4.7 | 92.55 | $6.23 |
+| OpenClaw | GLM-5.1 | 88.33 | $1.60 |
+| OpenClaw | OpenRouter Auto | 88.10 | $3.01 |
+| Hermes Agent | Opus-4.7 | 92.65 | $6.66 |
+| OpenSquilla | Opus-4.7 | 93.85 | $4.84 |
+| OpenSquilla | {DeepSeek-V4 Flash, DeepSeek-V4 Flash, GLM-5.1, Opus-4.7} | 92.51 | $0.69 |
+| OpenSquilla | {MiniMax M2.5 (free), DeepSeek-V4 Flash, DeepSeek-V4 Flash, GLM-5.1} | 90.48 | $0.13 |
+
+強制単一モデルの OpenSquilla が最高スコアを取り、OpenClaw の Opus-4.7 直接実行より
+1.3 ポイント高く、コストは 22% 低くなります。Opus-4.7 をバックストップとする
+ルーティングプールは、ベースライン 92.55 のスコアの 99.96% を $0.69 で維持します。
+OpenRouter Auto の行は別プロトコルで測ったクエリレベルのルーティングベースラインであり、
+他の行とは直接比較できません。
+
+### ClawMark
+
+臨床支援やコンテンツ運用から法務、HR、保険、不動産まで 13 領域にわたる 100 の業務タスク。
+コストはタスクあたりの平均請求コストです。
+
+| フレームワーク | モデル（プール） | スコア | タスクあたりコスト |
+| --- | --- | ---: | ---: |
+| OpenClaw | GLM-5.1 | 71.2 | $0.62 |
+| OpenSquilla | GLM-5.1 | 77.0 | $0.87 |
+| OpenSquilla | {MiniMax M2.5 (free), DeepSeek-V4 Pro, GLM-5.1, GLM-5.1} | 70.6 | $0.39 |
+
+ハーネスだけで同じモデルに 5.8 ポイントを上乗せしますが、その分コストは高くなります。
+品質の動作点が価格でベースラインを上回る唯一のベンチマークです。ルーティングプールは
+その利得を 37% 安いタスクと引き換えにし、GLM-5.1 直接実行の近くに着地します。
+
+### ClawSWEBench
+
+8 言語・43 リポジトリからなる 350 の多言語 SWE-bench 形式の修復タスク。タスクセット、
+コンテナ、プロンプト、最大ターン数、タイムアウトはすべて固定です。コストはタスクあたりの
+平均請求コストです。
+
+| フレームワーク | モデル（プール） | 解決率 | タスクあたりコスト |
+| --- | --- | ---: | ---: |
+| OpenClaw | Opus-4.7 | 77.1% | $3.09 |
+| OpenClaw | GLM-5.2 | 74.3% | $0.87 |
+| OpenClaw | GLM-5.1 | 73.4% | $0.79 |
+| OpenClaw | Qwen3.7-Max | 73.1% | $1.25 |
+| OpenSquilla | GLM-5.2 | 79.4% | $0.95 |
+| OpenSquilla | GLM-5.1 | 74.9% | $0.87 |
+| OpenSquilla | {DeepSeek-V4 Flash, GLM-5.1, GLM-5.2} | 74.0% | $0.44 |
+
+強制単一モデルの GLM-5.2 が最も多く解決し、OpenClaw の GLM-5.2 直接実行より 5.1
+ポイント高く、OpenClaw 最強の単一モデルを約 31% のコストで上回ります。ルーティングプールは
+OpenClaw の GLM-5.2 直接実行と半分のコストで並び、350 タスクのうち 207 タスク（59%）を
+安価な DeepSeek-V4 Flash 層に委譲し、139 タスクを最上位層へ引き上げます。
+
+### DRACO
+
+事実正確性、網羅性、客観性、提示品質、引用品質の 5 次元で採点される
+100 の分野横断的な深い調査タスク。コストはタスクあたりの平均請求コスト、
+トークンは入力と出力の合計（千単位）です。
+
+| フレームワーク | モデル（プール） | スコア | タスクあたりコスト | トークン (K) |
+| --- | --- | ---: | ---: | ---: |
+| OpenClaw | Opus-4.8 | 52.13 | $1.1420 | 54.2 |
+| OpenSquilla | Opus-4.8 | 52.36 | $0.6559 | 103.5 |
+| OpenSquilla | {DeepSeek-V4 Pro, GLM-5.2, Opus-4.8} | 52.33 | $0.3729 | 108.6 |
+
+ハーネスだけで OpenClaw の直接実行をわずかに上回り、コストはほぼ半減します。ルーティングを
+有効にするとそのスコアの 99.94% を、OpenClaw 直接実行より 67% 低いコストで維持します。
+ルーティング実行のほうがトークンは多いので、削減はプロンプトの短縮ではなく
+呼び出しの価格構成から来ています。
+
+### マルチモデルアンサンブルルーティング
+
+高精度モードは複数の proposer モデルに下書きさせ、aggregator がそれらを融合します。
+以下の各行はすべて同じ OpenSquilla ハーネス、同じ DRACO 上で実行されるため、
+実行基盤は固定で、変わるのはモデル配分だけです。
+
+| 検索 | 手法 | スコア | タスクあたりコスト | トークン (K) |
+| --- | --- | ---: | ---: | ---: |
+| DuckDuckGo | Fable 5 | 59.80 | $1.2122 | 93.7 |
+| DuckDuckGo | Opus-4.8 | 52.36 | $0.6559 | 103.5 |
+| DuckDuckGo | DeepSeek-V4 Pro | 50.32 | $0.1320 | 83.4 |
+| DuckDuckGo | GPT-5.5 | 50.22 | $0.4505 | 81.9 |
+| DuckDuckGo | Qwen3.7-Max | 49.34 | $0.0432 | 99.5 |
+| DuckDuckGo | GLM-5.2 | 48.28 | $0.1214 | 116.8 |
+| DuckDuckGo | Kimi K2.7 Code | 45.48 | $0.0676 | 86.3 |
+| DuckDuckGo | Gemini-3 Flash | 40.79 | $0.0117 | 9.5 |
+| DuckDuckGo | マルチモデルアンサンブルルーティング（ours） | 60.82 | $0.3766 | 579.7 |
+| Brave | Fable 5 | 62.06 | $1.3241 | 106.7 |
+| Brave | Opus-4.8 | 59.11 | $1.6177 | 257.7 |
+| Brave | GPT-5.5 | 53.28 | $0.8407 | 189.4 |
+| Brave | マルチモデルアンサンブルルーティング（ours） | 64.09 | $0.1218 | 500.1 |
+
+アンサンブルはどちらの検索プロバイダーでも最強の単一モデルを上回ります。DuckDuckGo では
+1.02 ポイント高くコストはその 31%、Brave では 2.03 ポイント高くコストは 90.8% 低くなります。
+Fable 5 は DuckDuckGo で 100 タスク中 94、Brave で 93 を完了し、完了したタスクで採点されて
+います。他の行はすべて 100 タスクを完了しました。router が実行時に proposer 集合を組み立て、
+aggregator だけを固定した場合でも、手作業で選んだ構成に 0.51 ポイント差まで迫り、
+コストは 15.8% 低くなります。
+
+この品質はトークンとウォールクロック時間で支払われ、proposer の並列実行、早期停止、
+proposer ごとの予算で制御できます。
 
 ---
 

@@ -28,6 +28,27 @@ async function search(input: HTMLInputElement, value: string) {
   await nextTick()
 }
 describe('SettingsSearch', () => {
+  it.each(['isComposing', 'keyCode'])('does not navigate or dismiss while IME owns the keyboard (%s)', async mode => {
+    const { input, host, select } = mountSearch('zh-Hans')
+    await search(input, zh.settings.appearance.themeLabel)
+    const parentKeydown = vi.fn()
+    host.addEventListener('keydown', parentKeydown)
+    for (const key of ['Enter', 'ArrowDown', 'ArrowUp', 'Escape']) {
+      const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, isComposing: mode === 'isComposing' })
+      if (mode === 'keyCode') Object.defineProperty(event, 'keyCode', { value: 229 })
+      input.dispatchEvent(event)
+      await nextTick()
+      expect(event.defaultPrevented).toBe(false)
+      expect(document.activeElement).toBe(input)
+      expect(input.value).toBe(zh.settings.appearance.themeLabel)
+      expect(host.querySelector('.settings-search__results')).not.toBeNull()
+    }
+    expect(select).not.toHaveBeenCalled()
+    expect(parentKeydown).not.toHaveBeenCalled()
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+    expect(select).toHaveBeenCalledExactlyOnceWith('interface', 'settings.appearance.themeLabel')
+  })
+
   it('finds a translated setting and supports keyboard selection without changing values', async () => {
     const { input, host, select } = mountSearch()
     await search(input, 'sidebar width')
@@ -68,6 +89,7 @@ describe('SettingsSearch', () => {
 
   it.each([
     ['setup.memory.title', 'capabilities', en.setup.memory.title],
+    ['setup.video.title', 'capabilities', en.setup.video.title],
     ['settings.memoryOverview.autoCaptureLabel', 'advanced', en.settings.memoryOverview.autoCaptureLabel],
   ])('indexes %s under its current settings page', async (labelKey, section, label) => {
     const { input, host, select } = mountSearch()
@@ -83,7 +105,34 @@ describe('SettingsSearch', () => {
     expect(host.querySelectorAll('.settings-search__result')).toHaveLength(isDesktop ? 1 : 0)
     await search(input, en.setup.connection.tokenLabel)
     expect(host.querySelectorAll('.settings-search__result')).toHaveLength(isDesktop ? 0 : 1)
+    await search(input, en.setup.connection.wsUrlLabel)
+    expect(host.querySelectorAll('.settings-search__result')).toHaveLength(isDesktop ? 0 : 1)
   })
+
+  it.each([
+    { locale: 'en', isDesktop: false },
+    { locale: 'en', isDesktop: true },
+    { locale: 'zh-Hans', isDesktop: false },
+    { locale: 'zh-Hans', isDesktop: true },
+  ])('finds support and diagnostics on $locale with desktop=$isDesktop', async ({ locale, isDesktop }) => {
+    const { input, host, select } = mountSearch(locale, isDesktop)
+    const copy = locale === 'en' ? en : zh
+    const queries = locale === 'en'
+      ? [['support', 'monitorSupport.title'], ['diagnostics', 'monitorSupport.title'], ['download support bundle', 'monitorSupport.downloadBundle']]
+      : [['支持', 'monitorSupport.title'], ['诊断', 'monitorSupport.title'], ['下载支持包', 'settings.search.supportBundle']]
+    queries.push([copy.monitorSupport.downloadBundle, 'monitorSupport.downloadBundle'])
+    for (const [query, key] of queries) {
+      await search(input, query!)
+      const result = Array.from(host.querySelectorAll<HTMLButtonElement>('.settings-search__result'))
+        .find(button => button.querySelector('strong')?.textContent === copy.settings.rail.gateway)!
+      expect(result).toBeTruthy()
+      result.focus()
+      result.click()
+      expect(select).toHaveBeenLastCalledWith('gateway', key)
+      await nextTick()
+    }
+  })
+
   it('clears a search with Escape before the parent dialog handles Escape', async () => {
     const { input, host } = mountSearch()
     await search(input, 'not-a-setting')
@@ -98,5 +147,35 @@ describe('SettingsSearch', () => {
     expect(input.value).toBe('')
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     expect(parentKeydown).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { locale: 'en', isDesktop: false, query: 'logs' },
+    { locale: 'en', isDesktop: true, query: 'logs' },
+    { locale: 'zh-Hans', isDesktop: false, query: '日志' },
+    { locale: 'zh-Hans', isDesktop: true, query: '日志' },
+  ])('finds the on-demand log entry on $locale with desktop=$isDesktop', async ({ locale, isDesktop, query }) => {
+    const { input, host, select } = mountSearch(locale, isDesktop)
+    await search(input, query)
+    const result = host.querySelector<HTMLButtonElement>('.settings-search__result')!
+    expect(result).toBeTruthy()
+    result.click()
+    expect(select).toHaveBeenCalledExactlyOnceWith('gateway', 'gatewayLogs.viewLogs')
+  })
+
+  it.each([
+    ['setup.runtime.openLocalLogLocation', 'openLocalLogLocation'],
+    ['setup.runtime.localGatewayTitle', 'localGatewayTitle'],
+    ['updates.desktop.settingsTitle', 'updates'],
+  ])('only offers the desktop destination %s on desktop', async (key, label) => {
+    const copy = label === 'updates' ? en.updates.desktop.settingsTitle
+      : en.setup.runtime[label as 'openLocalLogLocation' | 'localGatewayTitle']
+    const web = mountSearch()
+    await search(web.input, copy)
+    expect(web.host.querySelectorAll('.settings-search__result')).toHaveLength(0)
+    const desktop = mountSearch('en', true)
+    await search(desktop.input, copy)
+    desktop.host.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    expect(desktop.select).toHaveBeenCalledExactlyOnceWith('gateway', key)
   })
 })

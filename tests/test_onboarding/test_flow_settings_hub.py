@@ -570,7 +570,12 @@ def test_start_fresh_backs_up_symlink_target_without_replacing_link(tmp_path):
     real = tmp_path / "real-config.toml"
     link = tmp_path / "config.toml"
     real.write_text("port = 18791\n")
-    link.symlink_to(real)
+    try:
+        link.symlink_to(real)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
     flow._backup_and_reset_config(link)
 

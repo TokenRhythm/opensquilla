@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import structlog
 
-from .source_paths import is_memory_source_path
+from .io_worker import await_settled, run_memory_io
+from .source_paths import (
+    is_legacy_memory_capture,
+    is_legacy_memory_capture_file,
+    is_memory_source_path,
+    resolve_memory_source_path,
+)
 from .store import LongTermMemoryStore
 from .types import MemorySource
 
@@ -69,6 +76,7 @@ class MemorySyncManager:
         ttl_days: int = 0,
         ttl_sweep_interval_minutes: float = 0.0,
         session_indexer: Any | None = None,
+        maintenance_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._workspace_dir = Path(workspace_dir).expanduser().resolve()
@@ -79,12 +87,14 @@ class MemorySyncManager:
         self._ttl_days = ttl_days
         self._ttl_sweep_interval_minutes = ttl_sweep_interval_minutes
         self._session_indexer = session_indexer
+        self._maintenance_allowed = maintenance_allowed or (lambda: True)
         self._session_search_synced = False
 
         self._dirty = False
         self._warmed_sessions: set[str] = set()
         self._delta = SessionDeltaTracker()
         self._mtimes: dict[str, float] = {}
+        self._index_paths_reconciled = False
         self._pending_changes: set[str] = set()
         self._pending_deletes: set[str] = set()
         self._last_change_time: float = 0.0
@@ -93,6 +103,14 @@ class MemorySyncManager:
         self._timer_task: asyncio.Task[None] | None = None
         self._ttl_sweep_task: asyncio.Task[None] | None = None
         self._running = False
+        # State and async store calls remain on the loop. Serialize snapshots
+        # and their application now that filesystem work can yield to callers.
+        self._operation_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._stop_operation: asyncio.Task[None] | None = None
+        self._stopped = False
+        self._generation = 0
+        self._change_revision = 0
 
     # --- Public API ---
 
@@ -110,53 +128,105 @@ class MemorySyncManager:
         disk file is seen as "new". index_file() skips unchanged files
         via hash check, so normal restarts add no overhead.
         """
-        if self._running:
-            return
-        self._running = True
-        # 1. TTL sweep FIRST — drop expired files before we waste cycles
-        #    embedding content we are about to throw away.
-        if self._ttl_enabled():
-            await self._do_ttl_sweep(initial=True)
-        # 2. THEN initial sync — surviving files get indexed.
-        await self._do_file_sync()
-        await self._do_session_sync(reason="initial")
-        # 3. Now start background loops.
-        self._poll_task = asyncio.create_task(self._poll_loop())
-        if self._interval_minutes > 0:
-            self._timer_task = asyncio.create_task(self._timer_loop())
-        if self._ttl_enabled():
-            self._ttl_sweep_task = asyncio.create_task(self._ttl_sweep_loop())
-        logger.info("sync_manager.started")
+        requested_generation = self._generation
+        stop_operation = self._stop_operation
+        if stop_operation is not None:
+            await await_settled(stop_operation)
+        async with self._lifecycle_lock:
+            # A start already queued when stop was requested must not reopen
+            # its fenced generation ahead of the stop task queued behind it.
+            if requested_generation != self._generation:
+                return
+            if self._stop_operation is not None and not self._stop_operation.done():
+                return
+            if self._running:
+                return
+            self._stop_operation = None
+            generation = self._generation
+            try:
+                async with self._operation_lock:
+                    if generation != self._generation:
+                        return
+                    self._stopped = False
+                    self._generation += 1
+                    generation = self._generation
+                    self._running = True
+                    self._warmed_sessions.clear()
+                    if self._ttl_enabled():
+                        await self._do_ttl_sweep(initial=True)
+                    if not self._accepts_generation(generation):
+                        return
+                    await self._do_file_sync()
+                    if self._accepts_generation(generation):
+                        await self._do_session_sync(reason="initial")
+            except BaseException:
+                if generation == self._generation:
+                    self._running = False
+                    self._stopped = True
+                    self._generation += 1
+                raise
+            if not self._accepts_generation(generation):
+                return
+            self._poll_task = asyncio.create_task(self._poll_loop())
+            if self._interval_minutes > 0:
+                self._timer_task = asyncio.create_task(self._timer_loop())
+            if self._ttl_enabled():
+                self._ttl_sweep_task = asyncio.create_task(self._ttl_sweep_loop())
+            logger.info("sync_manager.started")
 
     async def stop(self) -> None:
-        """Stop all background tasks."""
-        self._running = False
-        for task in (self._poll_task, self._timer_task, self._ttl_sweep_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        self._poll_task = None
-        self._timer_task = None
-        self._ttl_sweep_task = None
-        logger.info("sync_manager.stopped")
+        """Fence new work and drain background, manual, and worker operations."""
+        if self._stop_operation is None or self._stop_operation.done():
+            self._stopped = True
+            self._generation += 1
+            self._running = False
+            self._stop_operation = asyncio.create_task(self._stop_owned_operations())
+        await await_settled(self._stop_operation)
+
+    async def _stop_owned_operations(self) -> None:
+        async with self._lifecycle_lock:
+            tasks = [
+                task for task in (self._poll_task, self._timer_task, self._ttl_sweep_task)
+                if task is not None
+            ]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # A manually requested sync is not a background task. Its lock is
+            # held until any submitted file I/O and async store work settles.
+            async with self._operation_lock:
+                pass
+            self._poll_task = None
+            self._timer_task = None
+            self._ttl_sweep_task = None
+            logger.info("sync_manager.stopped")
+
+    def _accepts_generation(self, generation: int) -> bool:
+        # Manual sync before start remains supported; stop is the cutoff.
+        return not self._stopped and generation == self._generation
 
     async def sync(self, reason: str, *, force: bool = False) -> None:
-        """Unified sync entry point.
+        generation = self._generation
+        async with self._operation_lock:
+            if not self._accepts_generation(generation):
+                return
+            await self._sync_owned(reason, force=force)
 
-        Re-enqueues ``store.remove_file`` failures into
-        ``_pending_deletes`` so a transient SQLite lock does not lose
-        the path forever. Without this the first watcher tick would clear
-        the queue regardless of outcome and orphan SQLite chunks for any
-        path whose retry also failed.
+    async def _sync_owned(self, reason: str, *, force: bool = False) -> None:
+        """Unified sync while this manager owns the snapshot and store lane.
+
+        Failed deletions and unfinished reads stay queued for another attempt.
         """
+        generation = self._generation
+        revision = self._change_revision
         is_search_reason = reason == "search" or reason.startswith("search:")
         session_delta_pending = self._delta.has_pending()
         if (
             is_search_reason
             and not self._dirty
+            and self._index_paths_reconciled
             and not force
             and not session_delta_pending
             and (self._session_indexer is None or self._session_search_synced)
@@ -180,7 +250,11 @@ class MemorySyncManager:
         else:
             failed_deletes = await self._do_file_sync(force=force)
 
+        if not self._accepts_generation(generation):
+            return
         session_sync_failed = await self._do_session_sync(reason=reason, force=force)
+        if not self._accepts_generation(generation):
+            return
 
         if failed_deletes:
             self._pending_deletes.update(failed_deletes)
@@ -191,25 +265,24 @@ class MemorySyncManager:
                 paths=sorted(failed_deletes),
             )
         else:
-            # Don't clobber _dirty=True set by a concurrent _do_ttl_sweep
-            # (separate background task). If anything is still queued,
-            # leave _dirty truthy so the next search-time sync retries
-            # without waiting for poll.
+            # Message/compaction notifications can arrive while worker or
+            # index I/O yields. Preserve them alongside unfinished file work.
             self._dirty = bool(
                 self._pending_changes or self._pending_deletes or session_sync_failed
+                or revision != self._change_revision or not self._index_paths_reconciled
             )
 
-        if reason == "session-delta" or (
+        if revision == self._change_revision and (reason == "session-delta" or (
             is_search_reason
             and session_delta_pending
             and self._session_indexer is not None
             and not session_sync_failed
-        ):
+        )):
             self._delta.reset()
 
     async def warm_session(self, session_key: str) -> None:
         """Trigger 1: sync on first session access."""
-        if session_key in self._warmed_sessions:
+        if self._stopped or session_key in self._warmed_sessions:
             return
         self._warmed_sessions.add(session_key)
         await self.sync(reason="session-start")
@@ -217,11 +290,13 @@ class MemorySyncManager:
     def mark_dirty(self) -> None:
         """Trigger 6: flag that a sync is needed (e.g. after compaction)."""
         self._dirty = True
+        self._change_revision += 1
 
     def notify_message(self, byte_count: int) -> None:
         """Trigger 5: accumulate session delta."""
         self._delta.record(byte_count=byte_count)
         self._session_search_synced = False
+        self._change_revision += 1
 
     # --- Internal ---
 
@@ -237,11 +312,24 @@ class MemorySyncManager:
                     rel_to_memory = path.relative_to(self._memory_dir)
                     if any(part.startswith(".") for part in rel_to_memory.parts[:-1]):
                         continue
-                    rel = path.relative_to(self._workspace_dir).as_posix()
+                    rel = (Path("memory") / rel_to_memory).as_posix()
                     if not is_memory_source_path(rel):
+                        continue
+                    try:
+                        if is_legacy_memory_capture_file(path, relative_path=rel):
+                            continue
+                    except OSError:
+                        # An unreadable candidate must not retain generated raw
+                        # content in the curated index. A later scan can retry.
                         continue
                     result[rel] = path.stat().st_mtime
         return result
+
+    @staticmethod
+    def _read_file(path: Path) -> str | None:
+        if not path.is_file():
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
 
     async def _do_file_sync(
         self,
@@ -254,15 +342,20 @@ class MemorySyncManager:
 
         Returns the set of delete paths whose ``store.remove_file`` raised
         (anything other than success). Caller is expected to re-enqueue
-        them so a transient SQLite lock does not orphan chunks. Index
-        failures stay log-only because the file is still on disk and the
-        next watcher tick will rediscover it via mtime.
+        them so a transient SQLite lock does not orphan chunks.
+        Failed and cancelled reads are requeued: their mtime snapshot may
+        already have been applied when the worker yields.
         """
+        generation = self._generation
+        if not self._accepts_generation(generation):
+            return set()
         if changes is None or deletes is None:
-            current = self._scan_files()
+            current = await run_memory_io(self._scan_files)
+            if not self._accepts_generation(generation):
+                return set()
 
-            changes = set()
-            deletes = set()
+            changes = set(self._pending_changes)
+            deletes = set(self._pending_deletes)
 
             for path, mtime in current.items():
                 old_mtime = self._mtimes.get(path)
@@ -272,32 +365,83 @@ class MemorySyncManager:
             for path in set(self._mtimes) - set(current):
                 deletes.add(path)
 
+            # _mtimes starts empty after restart. Reconcile the durable index
+            # too, including raw captures deliberately left in their old place.
+            if not self._index_paths_reconciled or force:
+                list_paths = getattr(self._store, "list_paths", None)
+                if callable(list_paths):
+                    try:
+                        indexed = await list_paths(source=MemorySource.memory)
+                        if not self._accepts_generation(generation):
+                            return set()
+                        deletes.update(
+                            path for path in indexed
+                            if is_memory_source_path(path) and path not in current
+                        )
+                        self._index_paths_reconciled = True
+                    except Exception:
+                        self._index_paths_reconciled = False
+                        logger.warning("sync_manager.index_reconcile_failed")
+                else:
+                    self._index_paths_reconciled = True
+
             self._mtimes = current
+            self._pending_changes.difference_update(changes)
+            self._pending_deletes.difference_update(deletes)
 
         failed_deletes: set[str] = set()
-        for rel_path in deletes:
-            try:
-                await self._store.remove_file(rel_path)
-                logger.info("sync_manager.removed", path=rel_path)
-            except Exception:
-                failed_deletes.add(rel_path)
-                logger.warning("sync_manager.remove_failed", path=rel_path)
+        remaining_changes = set(changes)
+        remaining_deletes = set(deletes)
+        try:
+            for rel_path in deletes:
+                if not self._accepts_generation(generation):
+                    return failed_deletes
+                try:
+                    await self._store.remove_file(rel_path)
+                    logger.info("sync_manager.removed", path=rel_path)
+                except Exception:
+                    failed_deletes.add(rel_path)
+                    logger.warning("sync_manager.remove_failed", path=rel_path)
+                remaining_deletes.discard(rel_path)
 
-        for rel_path in changes:
-            abs_path = self._workspace_dir / rel_path
-            if not abs_path.is_file():
-                continue
-            try:
-                content = abs_path.read_text(encoding="utf-8", errors="replace")
-                n = await self._store.index_file(
-                    path=rel_path,
-                    content=content,
-                    source=MemorySource.memory,
-                )
-                if n > 0:
-                    logger.info("sync_manager.indexed", path=rel_path, chunks=n)
-            except Exception:
-                logger.warning("sync_manager.index_failed", path=rel_path)
+            for rel_path in changes:
+                if not self._accepts_generation(generation):
+                    return failed_deletes
+                try:
+                    content = await run_memory_io(
+                        self._read_file, resolve_memory_source_path(
+                            self._workspace_dir, self._memory_dir, rel_path,
+                        ),
+                    )
+                    if not self._accepts_generation(generation):
+                        return failed_deletes
+                    if content is not None:
+                        if is_legacy_memory_capture(rel_path, content):
+                            # The source may have changed since the scan. Remove
+                            # only derived rows, never move or rewrite the file.
+                            await self._store.remove_file(rel_path)
+                            self._mtimes.pop(rel_path, None)
+                            remaining_changes.discard(rel_path)
+                            continue
+                        n = await self._store.index_file(
+                            path=rel_path,
+                            content=content,
+                            source=MemorySource.memory,
+                        )
+                        if n > 0:
+                            logger.info("sync_manager.indexed", path=rel_path, chunks=n)
+                    remaining_changes.discard(rel_path)
+                except Exception:
+                    logger.warning("sync_manager.index_failed", path=rel_path)
+        finally:
+            # Stop fences snapshot application, but unfinished claimed work
+            # must survive a restart. Stop drains this lock before start can
+            # create a new generation; only retry responsibility is restored.
+            if generation == self._generation or self._stopped:
+                self._pending_changes.update(remaining_changes)
+                self._pending_deletes.update(remaining_deletes | failed_deletes)
+                if remaining_changes or remaining_deletes or failed_deletes:
+                    self._dirty = True
 
         return failed_deletes
 
@@ -317,9 +461,15 @@ class MemorySyncManager:
         } or reason.startswith("search:")
         if not should_sync:
             return False
+        generation = self._generation
+        revision = self._change_revision
+        if not self._accepts_generation(generation):
+            return False
         try:
             result = await self._session_indexer.sync(force=force)
-            self._session_search_synced = True
+            if not self._accepts_generation(generation):
+                return False
+            self._session_search_synced = revision == self._change_revision
             logger.info(
                 "sync_manager.sessions_synced",
                 reason=reason,
@@ -341,24 +491,31 @@ class MemorySyncManager:
                 if not self._running:
                     break
 
-                current = self._scan_files()
-                now = asyncio.get_event_loop().time()
+                async with self._operation_lock:
+                    generation = self._generation
+                    if not self._running:
+                        break
+                    current = await run_memory_io(self._scan_files)
+                    if not self._accepts_generation(generation):
+                        break
+                    now = asyncio.get_running_loop().time()
 
-                for path, mtime in current.items():
-                    old = self._mtimes.get(path)
-                    if old is None or mtime > old:
-                        self._pending_changes.add(path)
+                    for path, mtime in current.items():
+                        old = self._mtimes.get(path)
+                        if old is None or mtime > old:
+                            self._pending_changes.add(path)
+                            self._last_change_time = now
+
+                    for path in set(self._mtimes) - set(current):
+                        self._pending_deletes.add(path)
                         self._last_change_time = now
 
-                for path in set(self._mtimes) - set(current):
-                    self._pending_deletes.add(path)
-                    self._last_change_time = now
+                    self._mtimes = current
+                    needs_sync = bool(self._pending_changes or self._pending_deletes) and (
+                        now - self._last_change_time >= self._debounce_seconds
+                    )
 
-                self._mtimes = current
-
-                if (self._pending_changes or self._pending_deletes) and (
-                    now - self._last_change_time >= self._debounce_seconds
-                ):
+                if needs_sync:
                     # sync(reason="watch") atomically snapshots, clears,
                     # and re-enqueues failed store removals. Do NOT clear
                     # _pending_* here — that would wipe the re-enqueued
@@ -400,14 +557,29 @@ class MemorySyncManager:
         """
         from opensquilla.memory.retention import prune_expired_memory_files
 
+        if not self._maintenance_allowed():
+            return
+        generation = self._generation
+        operation = asyncio.create_task(prune_expired_memory_files(
+            memory_dir=self._memory_dir,
+            store=self._store,
+            ttl_days=self._ttl_days,
+            workspace_dir=self._workspace_dir,
+            debounce_seconds=self._debounce_seconds + 0.5,
+            maintenance_allowed=self._maintenance_allowed,
+        ))
         try:
-            result = await prune_expired_memory_files(
-                memory_dir=self._memory_dir,
-                store=self._store,
-                ttl_days=self._ttl_days,
-                workspace_dir=self._workspace_dir,
-                debounce_seconds=self._debounce_seconds + 0.5,
-            )
+            result = await await_settled(operation)
+        except asyncio.CancelledError:
+            # A settled sweep can have unlinked a file but failed to remove
+            # its index. Preserve that receipt even when its owner is stopped
+            # or cancelled; startup cannot rediscover a file already deleted.
+            if not operation.cancelled() and operation.exception() is None:
+                failed = operation.result().failed_store_removals
+                if failed:
+                    self._pending_deletes.update(failed)
+                    self._dirty = True
+            raise
         except Exception:
             logger.exception("sync_manager.ttl_sweep_failed", initial=initial)
             return
@@ -421,6 +593,8 @@ class MemorySyncManager:
                 paths=list(result.failed_store_removals),
             )
 
+        if not self._accepts_generation(generation):
+            return
         if result.files_pruned > 0 or result.error:
             logger.info(
                 "sync_manager.ttl_sweep",
@@ -442,7 +616,9 @@ class MemorySyncManager:
             try:
                 await asyncio.sleep(interval)
                 if self._running and self._ttl_enabled():
-                    await self._do_ttl_sweep(initial=False)
+                    async with self._operation_lock:
+                        if self._running:
+                            await self._do_ttl_sweep(initial=False)
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -59,11 +59,15 @@ publish_artifact(
 ```
 
 - `bundle="auto"` (the default) follows statically identifiable local
-  references from HTML, CSS, and JavaScript. Missing or rejected references are
-  reported as a partial bundle.
+  references from HTML, CSS, and JavaScript. Publication rejects missing or
+  unsafe statically identifiable local dependencies.
 - `bundle="directory"` snapshots the complete dedicated project directory and
   fails atomically if it contains a rejected path or sensitive file.
 - `bundle="none"` preserves the legacy single-file behavior.
+
+Remote URLs and dynamic references are preserved; they are not converted into
+an offline dependency bundle. A newly published single-file HTML must not
+depend on identifiable local files missing from its stored content.
 
 Historical single-file HTML remains readable without migration. If it refers
 to local CSS, scripts, or other files that were never stored, the preview is
@@ -109,6 +113,12 @@ right-hand panel:
   Revisions, and audited changes;
 - a deliverable is an immutable published snapshot;
 - a preview is temporary host state that displays those resources.
+
+A historical deliverable card opens and downloads its published version. If
+version A was published and the working files later changed to B, the old card
+still shows A. Choose **Continue editing** to open the current working version
+B. External-open actions also keep the selected historical version and open
+its materialized copy on the execution host.
 
 Opening supported HTML for editing imports a copy into a Document. Repeated
 or response-lost imports resolve the same durable receipt, and editing the
@@ -193,9 +203,36 @@ Generate a clean product mockup image for this landing page.
 Image provider support depends on configured provider credentials, optional
 dependencies, and runtime policy.
 
+## Video Generation
+
+After [configuring video generation](configuration.md#video-generation), ask
+for a short clip in chat. The Agent may call `video_generate` with a text
+prompt and optional duration, aspect ratio, resolution, or workspace filename.
+The selected TokenRhythm or OpenRouter video model produces an MP4 in the
+workspace, which the tool registers as an artifact for Web UI or supported
+channel delivery. This release supports text-to-video only.
+
+Generation may take several minutes. If the tool returns `pending` and a
+`job_id`, the Agent can call `video_status` with that ID to continue checking
+and deliver the finished MP4. `video_status` checks the existing job without
+submitting another generation request. If submission has an unknown outcome
+and no job ID was returned, do not automatically retry: a second request
+could create and charge for another video. If the MP4 was saved but artifact
+registration fails, the result reports `generated_delivery_failed` and keeps
+the workspace path.
+Once a provider returns a valid job ID, the Gateway retains its job record
+even if the turn is stopped or times out. Recovery still requires that ID;
+stopping before a tool result does not return it to the Agent automatically.
+For non-owner callers, resuming a job requires the same Gateway process to
+retain its job record and the same provider credential; a restart or credential
+rotation can prevent recovery. A retained job keeps its original provider and
+model even when the configured route changes. Its status tool remains available
+to the same session if video generation is later disabled. Video tools are
+unavailable to subagents in this release.
+
 ## Text to Speech and Media Helpers
 
-The media tool family includes image, PDF, and TTS helpers. Availability can
+The media tool family includes image, video, PDF, and TTS helpers. Availability can
 depend on provider config, optional dependencies, and runtime policy.
 
 Use media helpers when the requested output is naturally a file or asset rather
@@ -206,6 +243,17 @@ than a plain text answer.
 Channels differ in file-size limits, threading behavior, and upload APIs. If a
 channel cannot deliver an artifact directly, use the Web UI artifact card or
 session export as the recovery surface.
+
+Self-contained HTML can be sent as a single file. HTML with saved local
+materials is sent as a ZIP containing the fixed published entry and resources.
+The export uses that saved version rather than reading newer working files.
+Missing or unsafe local materials prevent a complete export, and platform size
+limits apply to the file being uploaded.
+
+Publication prepares a deliverable; it does not prove that a channel received
+it. Native delivery is confirmed by the existing outbox receipt. An uncertain
+send remains uncertain instead of being treated as success or automatically
+uploaded again.
 
 For channel setup, see [`channels.md`](channels.md).
 

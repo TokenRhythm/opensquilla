@@ -1,8 +1,4 @@
-"""Operator skill-disable toggle: a disabled skill is gated out of the agent.
-
-Backs the control-UI "Code-task plugin" toggle, which writes the skill name
-to ``skills.disabled`` via config.patch.safe.
-"""
+"""Explicitly disabled ordinary skills remain unavailable."""
 
 from __future__ import annotations
 
@@ -26,47 +22,38 @@ def _skill(name: str) -> SkillSpec:
 
 class TestEligibilityContextFromConfig:
     def test_empty_effective_disabled_reuses_default_ctx(self):
-        # The shared default ctx is reused only when nothing is gated: no
-        # disabled skills AND coding mode ON (so code-task is not gated).
-        cfg = SkillsConfig(coding_mode=True)
+        # An empty disabled list reuses the normal default context.
+        cfg = SkillsConfig()
         ctx = skill_catalog_projection._eligibility_ctx(cfg)
         assert ctx is skill_catalog_projection._elig_ctx
 
-    def test_default_config_gates_codetask(self):
-        # Default config (coding mode OFF) gates code-task, so it is NOT the
-        # shared singleton.
-        cfg = SkillsConfig()
-        ctx = skill_catalog_projection._eligibility_ctx(cfg)
-        assert ctx is not skill_catalog_projection._elig_ctx
-        assert "code-task" in ctx.disabled_set
-
     def test_disabled_list_builds_gating_ctx(self):
-        cfg = SkillsConfig(disabled=["code-task"])
+        cfg = SkillsConfig(disabled=["sample-skill"])
         ctx = skill_catalog_projection._eligibility_ctx(cfg)
-        assert "code-task" in ctx.disabled_set
+        assert "sample-skill" in ctx.disabled_set
 
 
 class TestDeterministicGate:
     def test_disabled_skill_is_gated_out(self):
-        ctx = EligibilityContext.auto(disabled_set={"code-task"})
+        ctx = EligibilityContext.auto(disabled_set={"sample-skill"})
         gated = skill_catalog_projection._deterministic_gate(
-            [_skill("code-task"), _skill("git-diff")], available_tools=set(), elig_ctx=ctx
+            [_skill("sample-skill"), _skill("git-diff")], available_tools=set(), elig_ctx=ctx
         )
         names = {s.name for s in gated}
-        assert "code-task" not in names
+        assert "sample-skill" not in names
         assert "git-diff" in names
 
     def test_enabled_when_not_disabled(self):
         ctx = EligibilityContext.auto(disabled_set=set())
         gated = skill_catalog_projection._deterministic_gate(
-            [_skill("code-task")], available_tools=set(), elig_ctx=ctx
+            [_skill("sample-skill")], available_tools=set(), elig_ctx=ctx
         )
-        assert {s.name for s in gated} == {"code-task"}
+        assert {s.name for s in gated} == {"sample-skill"}
 
 
 def test_disabled_skill_fails_eligibility():
-    spec = _skill("code-task")
-    ctx = EligibilityContext.auto(disabled_set={"code-task"})
+    spec = _skill("sample-skill")
+    ctx = EligibilityContext.auto(disabled_set={"sample-skill"})
     assert check_eligibility(spec, ctx) is False
 
 

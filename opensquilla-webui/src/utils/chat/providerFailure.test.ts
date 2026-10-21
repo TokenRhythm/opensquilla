@@ -25,8 +25,8 @@ describe('provider terminal metadata', () => {
     const outcome = normalizeTurnOutcome({ turn_id: 't', code: '429', message: fallback })
     expect(outcome?.errorId).toBeUndefined()
     expect(outcome?.failureKind).toBeUndefined()
-    expect(localizedChatErrorMessage('429', fallback)).toBe('The task did not finish. Please try again later.')
-    expect(localizedChatErrorMessage('429', fallback, false, 'future_kind')).toBe('The task did not finish. Please try again later.')
+    expect(localizedChatErrorMessage('429', fallback)).toBe('This request did not finish.')
+    expect(localizedChatErrorMessage('429', fallback, false, 'future_kind')).toBe('This request did not finish.')
   })
 
   it('fails closed when references or turn identities conflict', () => {

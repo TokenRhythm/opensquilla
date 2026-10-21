@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from opensquilla.channels.delivery_store import ChannelDeliveryStore, install_outbox
+from opensquilla.channels.delivery_store import install_outbox
 from opensquilla.channels.discord import DiscordChannel, DiscordChannelConfig
 from opensquilla.channels.types import (
     ChannelArtifactDeliveryRequest,
@@ -49,7 +49,7 @@ def _multipart(request: httpx.Request) -> tuple[dict[str, Any], bytes]:
 
 @pytest.mark.parametrize("failure", ["timeout", "server_error"])
 async def test_discord_unknown_file_send_is_not_replayed(
-    tmp_path: Path, failure: str
+    channel_store, tmp_path: Path, failure: str
 ) -> None:
     requests: list[httpx.Request] = []
 
@@ -62,7 +62,7 @@ async def test_discord_unknown_file_send_is_not_replayed(
         return httpx.Response(200, json={"id": "duplicate-message"})
 
     path = tmp_path / "outbox.sqlite"
-    store = ChannelDeliveryStore(path)
+    store = await channel_store(path)
     channel = DiscordChannel(DiscordChannelConfig(token="synthetic-token"))
     channel._client = httpx.AsyncClient(
         base_url="https://discord.com/api/v10", transport=httpx.MockTransport(handler)
@@ -75,9 +75,9 @@ async def test_discord_unknown_file_send_is_not_replayed(
         with pytest.raises(httpx.HTTPError):
             await channel.deliver_artifact(artifact)
         assert len(requests) == 1
-        assert store.diagnostics("discord-test")["outbox"]["unknown"]["count"] == 1
-        store.close()
-        store = ChannelDeliveryStore(path)
+        assert (await store.diagnostics("discord-test"))["outbox"]["unknown"]["count"] == 1
+        (await store.close())
+        store = await channel_store(path)
         channel._delivery_store = store
         replay = await channel.deliver_artifact(artifact)
         assert not replay.is_delivered()
@@ -86,10 +86,12 @@ async def test_discord_unknown_file_send_is_not_replayed(
         assert len(requests) == 1
     finally:
         await channel.stop()
-        store.close()
+        (await store.close())
 
 
-async def test_discord_rejected_send_reuses_nonce_and_success_is_deduped(tmp_path: Path) -> None:
+async def test_discord_rejected_send_reuses_nonce_and_success_is_deduped(
+    channel_store, tmp_path: Path
+) -> None:
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -98,7 +100,7 @@ async def test_discord_rejected_send_reuses_nonce_and_success_is_deduped(tmp_pat
             return httpx.Response(429, json={"retry_after": 1})
         return httpx.Response(200, json={"id": "result-1"})
 
-    store = ChannelDeliveryStore(tmp_path / "outbox.sqlite")
+    store = await channel_store(tmp_path / "outbox.sqlite")
     channel = DiscordChannel(DiscordChannelConfig(token="synthetic-token"))
     channel._client = httpx.AsyncClient(
         base_url="https://discord.com/api/v10", transport=httpx.MockTransport(handler)
@@ -122,10 +124,10 @@ async def test_discord_rejected_send_reuses_nonce_and_success_is_deduped(tmp_pat
         assert payload["message_reference"] == {"message_id": "message-1"}
         assert payload["allowed_mentions"] == {"replied_user": False}
         assert all(req.url.path == "/api/v10/channels/thread-1/messages" for req in requests)
-        assert store.diagnostics("discord-test")["outbox"]["sent"]["count"] == 1
+        assert (await store.diagnostics("discord-test"))["outbox"]["sent"]["count"] == 1
     finally:
         await channel.stop()
-        store.close()
+        (await store.close())
 
 
 async def test_discord_legacy_file_signature_sends_one_multipart_request(tmp_path: Path) -> None:

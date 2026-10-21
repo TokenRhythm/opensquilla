@@ -198,17 +198,25 @@ class GatewayPendingInputQueueAdapter:
             (("workspaceId", "workspace_id"), "workspaceId"),
             (("collaborationMode", "collaboration_mode"), "collaborationMode"),
             (("initialRoutingMode", "initial_routing_mode"), "initialRoutingMode"),
-            (("displayText", "display_text"), "displayText"),
         ):
             value = self._value_string(raw, *aliases)
             if value is not None:
                 params[name] = value
+        # 纯附件的空 displayText 是明确的用户正文，不能按可选 ID 规则丢掉。
+        for alias in ("displayText", "display_text"):
+            if alias in raw:
+                value = raw[alias]
+                if value is not None and not isinstance(value, str):
+                    raise ValueError("params.displayText must be a string")
+                if value is not None:
+                    params["displayText"] = value
+                break
         for field in ("initialModel", "initial_model", "initialProvider", "initial_provider"):
             if field in raw:
                 params[field] = raw[field]
         for field in (
-            "pageContext", "workspaceFiles", "selectedSkills", "promptAnnotationIds",
-            "prompt_annotation_ids", "documentContext", "document_context",
+            "pageContext", "workspaceFiles", "selectedSkills", "localPathReferences", "turnCommand",
+            "promptAnnotationIds", "prompt_annotation_ids", "documentContext", "document_context",
         ):
             if field in raw:
                 params[field] = raw[field]
@@ -350,6 +358,10 @@ class GatewayPendingInputQueueAdapter:
                 "conflict": (
                     "PENDING_INPUT_CONFLICT",
                     "A pending input id was reused for different content",
+                ),
+                "session-unavailable": (
+                    "PENDING_SESSION_UNAVAILABLE",
+                    "This conversation no longer accepts queued messages",
                 ),
             }
             code, message = codes[exc.reason]

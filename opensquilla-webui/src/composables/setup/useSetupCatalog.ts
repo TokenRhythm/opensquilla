@@ -5,6 +5,8 @@ import { useSetupCapabilitiesForm } from '@/composables/setup/useSetupCapabiliti
 import { useSetupBehaviorForm } from '@/composables/setup/useSetupBehaviorForm'
 import {
   hasEffectiveProvider,
+  catalogNeedsRefresh,
+  updateDiscoveredCatalog,
   normalizeCatalogSyncStatus,
   normalizeDiscoveredModels,
   normalizeProbeTimings,
@@ -45,7 +47,7 @@ import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composab
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
-import { useToasts } from '@/composables/useToasts'
+import { useToasts, type ToastTone } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { chooseRouterConflictAction, submitPrimaryProviderTransition } from '@/composables/setup/primaryProviderTransition'
 import { savedRouterActivationSafe } from '@/composables/setup/savedRouterSafety'
@@ -57,6 +59,7 @@ import { copyTextWithFallback } from '@/utils/browser'
 import { TEXT_TIERS, normalizeRouterTier, routerTierLabelKey } from '@/utils/chat/routerTiers'
 import {
   APP_SETTINGS_KEY,
+  AppSettingsError,
   type AppSettings,
   type SettingsValue,
 } from '@/modules/appSettings'
@@ -493,6 +496,12 @@ const saveAllPending = ref(false)
 const providerSavePending = ref(false)
 const primaryMutationPending = ref(false)
 const modelStrategyRoutingBusy = ref(false)
+// Immediate mode writes reuse the forms, but their optimistic changes are not
+// manual drafts. Keep the existing draft indicators stable until they settle.
+const routingModeDraftIndicators = ref<{
+  sectionDirty: boolean
+  formDirty: boolean
+} | null>(null)
 const routerResetPending = ref(false)
 // The reactive flag drives UI feedback; this synchronous guard closes the
 // same-microtask double-click window before the first save RPC can yield.
@@ -535,6 +544,8 @@ const routerForm = useSetupRouterForm()
 const ensembleForm = useSetupEnsembleForm()
 const capabilitiesForm = useSetupCapabilitiesForm()
 const promotedForm = useSettingsPromotedForm()
+const thinkingDraftScope = ref<'provider' | 'modelStrategy'>('provider')
+let providerThinkingDraftSnapshot: string | null = null
 
 const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 // Discovery may populate the runtime catalog after the first capacity read.
@@ -542,8 +553,10 @@ const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 watch(() => providerForm.connection.value.models, () => {
   if (providerForm.connection.value.modelSource === 'live') modelCapacity.invalidate()
 })
-watch(tierModelCatalogs, catalogs => {
-  if (Object.values(catalogs).some(catalog => catalog.source === 'live')) modelCapacity.invalidate()
+watch(tierModelCatalogs, (catalogs, previous) => {
+  if (Object.entries(catalogs).some(([provider, catalog]) => (
+    catalog.source === 'live' && catalog.models !== previous[provider]?.models
+  ))) modelCapacity.invalidate()
 })
 const tierModelDiscoveries = new Map<string, Promise<void>>()
 let tierModelDiscoveryEpoch = 0
@@ -707,40 +720,35 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
   if (existing) return existing
 
   const epoch = tierModelDiscoveryEpoch
+  const publish = (next: DiscoveredModelCatalog) => {
+    tierModelCatalogs.value = { ...tierModelCatalogs.value, [provider]: next }
+  }
+  const current = () => tierModelCatalogs.value[provider] || { models: [], source: 'none' as const }
+  publish({ ...current(), discovering: true, discoverError: '', discoverFailureKind: '' })
   const request = (async () => {
     try {
       // Deliberately provider-only. Never forward the selected provider's
       // unsaved apiKey/baseUrl/proxy into another provider's request.
-      let res
-      if (provider === normalizeProviderId(config.value.llm?.provider)) {
-        // The current provider lives in [llm], not llm_profiles. This branch
-        // matters when Model Service is currently editing a different saved
-        // profile: the fixed-model picker must still discover the active
-        // provider through its primary deployment.
-        res = await setupWorkflow.provider.discoverPrimaryModels({ providerId: provider })
-      } else {
-        // The Adapter owns the legacy provider-discovery fallback so this
-        // consumer never branches on RPC method availability.
-        res = await setupWorkflow.profile.discoverProfileModels({ providerId: provider })
+      const load = (cacheOnly = false) => {
+        const params = { providerId: provider, ...(cacheOnly ? { cacheOnly: true } : {}) }
+        return provider === normalizeProviderId(config.value.llm?.provider)
+          ? setupWorkflow.provider.discoverPrimaryModels(params)
+          : setupWorkflow.profile.discoverProfileModels(params)
       }
+      const snapshot = await load(true)
       if (epoch !== tierModelDiscoveryEpoch) return
-      const source = res?.ok && res.source === 'live' ? 'live' : 'none'
-      tierModelCatalogs.value = {
-        ...tierModelCatalogs.value,
-        [provider]: source === 'live'
-          ? {
-              models: normalizeDiscoveredModels(res.models),
-              source,
-              catalog: normalizeCatalogSyncStatus(res.catalog),
-            }
-          : { models: [], source: 'none' },
+      if (normalizeCatalogSyncStatus(snapshot.catalog)?.cacheHit !== false) {
+        publish(updateDiscoveredCatalog(current(), snapshot))
       }
-    } catch {
+      if (!catalogNeedsRefresh(snapshot)) return
+      const res = await load()
       if (epoch !== tierModelDiscoveryEpoch) return
-      tierModelCatalogs.value = {
-        ...tierModelCatalogs.value,
-        [provider]: { models: [], source: 'none' },
-      }
+      publish(updateDiscoveredCatalog(current(), res))
+    } catch (error) {
+      if (epoch !== tierModelDiscoveryEpoch) return
+      publish({ ...current(), discoverError: error instanceof Error ? error.message : String(error) })
+    } finally {
+      if (epoch === tierModelDiscoveryEpoch) publish({ ...current(), discovering: false })
     }
   })()
   const tracked = request.finally(() => {
@@ -851,6 +859,7 @@ async function loadData(options: {
   forceResetRouter?: boolean
   resetProviderConnection?: boolean
   throwOnError?: boolean
+  rebaseSections?: ReadonlySet<string>
 } = {}) {
   try {
     const [cat, st, cfg, effective] = await Promise.all([
@@ -870,6 +879,7 @@ async function loadData(options: {
           behavior: behaviorForm.isDirty.value,
           privacy: privacyDirty.value,
           memoryCapture: promotedForm.captureDirty.value,
+          thinking: thinkingDraftScope.value === 'modelStrategy' && promotedForm.thinkingDirty.value && !options.forceResetModelStrategy,
           router: !options.forceResetModelStrategy && !options.forceResetRouter && routerForm.isDirty.value,
           ensemble: !options.forceResetModelStrategy && ensembleForm.isDirty.value,
           fixedModel: !options.forceResetModelStrategy && (
@@ -882,6 +892,15 @@ async function loadData(options: {
           audio: promotedForm.audioDirty.value,
         }
       : null
+    if (preserve && options.rebaseSections) {
+      for (const name of options.rebaseSections) {
+        if (name === 'modelStrategy') {
+          preserve.thinking = preserve.router = preserve.ensemble = preserve.fixedModel = false
+        } else if (name in preserve) {
+          preserve[name as keyof typeof preserve] = false
+        }
+      }
+    }
     catalog.value = (cat || {}) as OnboardingCatalog
     status.value = (st || {}) as OnboardingStatus
     config.value = (cfg || {}) as ConfigData
@@ -910,10 +929,10 @@ async function loadData(options: {
         )
         providerImageGenerationOptIn.value = true
         providerSelectionKind.value = 'primary'
-        if (providerForm.selectedProvider.value) void providerForm.discoverModels()
-        promotedForm.initProviderFromConfig(config.value)
+        // Provider discovery starts when its section is opened or refreshed.
+        promotedForm.initProviderFromConfig(config.value, preserve?.thinking)
       }
-      if (!preserve?.fixedModel) {
+      if (!preserve?.fixedModel && !(options.preserveProviderDraft && providerOwnsFixedModelDraft.value)) {
         modelStrategyForm.initFixedModel(config.value.llm?.model || '')
         providerOwnsFixedModelDraft.value = false
         providerFixedModelDraftSnapshot.value = null
@@ -1864,7 +1883,7 @@ const routingSummary = computed(() => ({
   hasForeignTierProviders: Object.entries(config.value.squilla_router?.tiers || {}).some(([name, tier]) => (
     name !== 'image' && Boolean(tier.provider) && normalizeProviderId(tier.provider) !== normalizeProviderId(currentProvider.value)
   )),
-  hasUnsavedChanges: modelStrategyForm.isDirty.value,
+  hasUnsavedChanges: routingModeDraftIndicators.value?.formDirty ?? modelStrategyForm.isDirty.value,
   resetPending: routerResetPending.value,
   resetDisabledReason: !hasSavedProvider.value ? t('setup.router.chooseProviderFirst')
     : !resetRecommendedSupported.value ? t('setup.modelStrategy.resetUpgradeHint')
@@ -1912,6 +1931,7 @@ const providerFormPanel = providerForm.createPanel({
   providerEnvKey,
   providerEnvCommand,
   llmTimeoutSeconds: promotedForm.llmTimeoutSeconds,
+  llmThinking: promotedForm.llmThinking,
   contextWindowTokens: promotedForm.contextWindowTokens,
   contextWindowGlobal,
   effectiveMaxTokens,
@@ -2043,6 +2063,7 @@ const routerPanel = routerForm.createPanel({
     const provider = normalizeProviderId(providerForm.selectedProvider.value)
     if (provider) {
       catalogs[provider] = {
+        ...providerForm.connection.value,
         models: providerForm.connection.value.models,
         source: providerForm.connection.value.modelSource,
       }
@@ -2082,6 +2103,7 @@ const fixedModelCatalog = computed<DiscoveredModelCatalog>(() => {
   if (!provider) return emptyFixedModelCatalog
   if (provider === normalizeProviderId(providerForm.selectedProvider.value)) {
     return {
+      ...providerForm.connection.value,
       models: providerForm.connection.value.models,
       source: providerForm.connection.value.modelSource,
     }
@@ -2098,6 +2120,7 @@ const modelStrategyPanel = modelStrategyForm.createPanel({
   ensemblePanel,
   routerTemplateState: routerForm.tierTemplateState,
   fixedModelCatalog,
+  llmThinking: computed(() => promotedForm.llmThinking.value),
 })
 
 
@@ -2198,40 +2221,6 @@ const actionItems = computed<SettingsActionItem[]>(() => {
   if (!items.length) push(t('setup.action.reviewPending'), 'provider')
   return items
 })
-
-const configCliArg = computed(() => {
-  const path = status.value.configPath
-  return path ? ` --config ${shellArg(path)}` : ''
-})
-
-const envRecoveryCommands = computed(() => {
-  const cmds = Array.isArray(status.value.envRecoveryCommands) ? status.value.envRecoveryCommands : []
-  return cmds
-    .filter(entry => entry && entry.command)
-    .map(entry => ({ label: entry.label || t('setup.command.setEnvKey'), command: entry.command || '' }))
-})
-
-const fixCommands = computed(() => {
-  if (!envRecoveryCommands.value.length) return []
-  return [
-    ...envRecoveryCommands.value,
-    { label: t('setup.command.restartAfterEnv'), command: `opensquilla gateway restart${configCliArg.value}` },
-  ]
-})
-
-const handoffCommands = computed(() => [
-  { label: t('setup.command.cliOnboarding'), command: `opensquilla onboard --if-needed${configCliArg.value}` },
-  { label: t('setup.command.checkStatus'), command: `opensquilla onboard status${configCliArg.value}` },
-])
-
-const recipeCommands = computed(() => [
-  { label: t('setup.command.providerOptions'), command: `opensquilla onboard catalog providers${configCliArg.value}` },
-  { label: t('setup.command.routerTiers'), command: `opensquilla onboard catalog router${configCliArg.value}` },
-  { label: t('setup.command.searchOptions'), command: `opensquilla onboard catalog search${configCliArg.value}` },
-  { label: t('setup.command.channelOptions'), command: `opensquilla onboard catalog channels${configCliArg.value}` },
-  { label: t('setup.command.imageOptions'), command: `opensquilla onboard catalog image${configCliArg.value}` },
-  { label: t('setup.command.memoryOptions'), command: `opensquilla onboard catalog memory${configCliArg.value}` },
-])
 
 const configSummary = computed(() => {
   const rows: Array<{ label: string; value: string }> = [
@@ -2367,6 +2356,7 @@ const providerDirty = computed(() => (
   ||
   providerForm.isDirty.value
   || (providerOwnsFixedModelDraft.value && modelStrategyForm.fixedModelDirty.value)
+  || (editingPrimaryProvider.value && thinkingDraftScope.value === 'provider' && promotedForm.thinkingDirty.value)
   || (editingPrimaryProvider.value && promotedForm.timeoutDirty.value)
   || (editingPrimaryProvider.value && promotedForm.contextWindowDirty.value)
 ))
@@ -2375,6 +2365,7 @@ const securityPrivacyDirty = computed(() => privacyDirty.value)
 const memorySettingsDirty = computed(() => promotedForm.captureDirty.value)
 const modelStrategyDirty = computed(() => (
   modelCapacity.dirty('modelStrategy')
+  || (thinkingDraftScope.value === 'modelStrategy' && promotedForm.thinkingDirty.value)
   ||
   routerForm.isDirty.value
   || ensembleForm.isDirty.value
@@ -2395,7 +2386,7 @@ function sectionDirty(sectionId: string): boolean {
   if (sectionId === 'general') return behaviorDirty.value
   if (sectionId === 'securityPrivacy') return securityPrivacyDirty.value
   if (sectionId === 'advanced') return memorySettingsDirty.value
-  if (sectionId === 'modelStrategy') return modelStrategyDirty.value
+  if (sectionId === 'modelStrategy') return routingModeDraftIndicators.value?.sectionDirty ?? modelStrategyDirty.value
   if (sectionId === 'capabilities') return capabilitiesDirty.value
   return false
 }
@@ -2422,6 +2413,7 @@ async function saveDirtySections() {
       image: capabilitiesForm.imageDirty.value,
       audio: promotedForm.audioDirty.value,
     }
+    const behaviorPatches = behaviorForm.patches()
     if (!Object.values(work).some(Boolean)) return
 
     // A configured primary provider and Model Routing share llm.model. Validate
@@ -2440,19 +2432,71 @@ async function saveDirtySections() {
 
     const selectedProviderId = normalizeProviderId(providerForm.selectedProvider.value)
     const restoreProfileSelection = providerSelectionKind.value !== 'primary'
-    if (work.privacy && !(await savePrivacy(disableNetworkObservability.value, { reload: false }))) return
-    if (work.memoryCapture && !(await saveMemoryAutoCapture({ reload: false }))) return
-    if (work.behavior && !(await saveBehavior({ reload: false }))) return
-    if (work.modelStrategy && !(await saveModelStrategy({
+    const completed = new Set<string>()
+    const completedLabels: string[] = []
+    const feedback: Array<{ message: string; tone?: ToastTone; restartRequired?: boolean }> = []
+    const reconcileAfterRefresh: Array<() => void> = []
+    let cancelledSavedLabels: string[] | null = null
+    const saveOptions: SaveOptions = {
       reload: false,
-      allowUnsavedProvider: false,
-    }))) return
-    if (work.search && !(await saveSearch({ reload: false }))) return
-    if (work.memory && !(await saveMemory({ reload: false }))) return
-    if (work.image && !(await saveImage({ reload: false }))) return
-    if (work.audio && !(await saveAudio({ reload: false }))) return
+      feedback: result => feedback.push(result),
+      afterRefresh: reconcile => reconcileAfterRefresh.push(reconcile),
+      onCancelled: savedLabels => { cancelledSavedLabels = savedLabels },
+    }
+    const actions: Array<[string, string, boolean, () => Promise<boolean>]> = [
+      ['privacy', 'settings.rail.securityPrivacy', work.privacy, () => savePrivacy(disableNetworkObservability.value, saveOptions)],
+      ['memoryCapture', 'setup.memory.autoCaptureLabel', work.memoryCapture, () => saveMemoryAutoCapture(saveOptions)],
+      ['behavior', 'setup.behavior.title', work.behavior, () => saveBehavior(saveOptions, behaviorPatches)],
+      ['modelStrategy', 'setup.modelStrategy.title', work.modelStrategy, () => saveModelStrategy({ ...saveOptions, allowUnsavedProvider: false })],
+      ['search', 'setup.search.title', work.search, () => saveSearch(saveOptions)],
+      ['memory', 'setup.memory.title', work.memory, () => saveMemory(saveOptions)],
+      ['image', 'setup.image.title', work.image, () => saveImage(saveOptions)],
+      ['audio', 'setup.audio.title', work.audio, () => saveAudio(saveOptions)],
+    ]
+    for (const [name, label, changed, save] of actions) {
+      if (!changed) continue
+      const before = feedback.length
+      if (!await save()) {
+        const failure = feedback.slice(before).reverse().find(item => item.tone === 'danger' || item.tone === 'warn')
+        const detail = failure?.message || t('setup.toast.settingsSaveStopped')
+        if ([...completed].some(name => name !== 'behavior') || reconcileAfterRefresh.length) {
+          // Rebase only acknowledged sections. Keep the failed section's
+          // drafts and never replay any write to recover a read failure.
+          try {
+            await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, rebaseSections: new Set([...completed].filter(name => name !== 'behavior')), throwOnError: true })
+            for (const reconcile of reconcileAfterRefresh) reconcile()
+          } catch { /* The last known values and drafts remain available. */ }
+        }
+        const restartRequired = feedback.some(item => item.restartRequired)
+        if (cancelledSavedLabels !== null) {
+          const savedLabels = [...completedLabels, ...cancelledSavedLabels]
+          if (savedLabels.length) {
+            pushToast(saveResultWithRestart(t('setup.toast.settingsSaveCancelledPartial', {
+              saved: savedLabels.join(', '),
+            }), restartRequired), { tone: 'info' })
+          }
+          return
+        }
+        if (completed.size) {
+          pushToast(saveResultWithRestart(t('setup.toast.settingsPartialSaved', { saved: completedLabels.join(', '), detail }), restartRequired), { tone: 'warn' })
+        } else pushToast(saveResultWithRestart(detail, restartRequired), { tone: failure?.tone || 'danger' })
+        return
+      }
+      completed.add(name)
+      completedLabels.push(t(label))
+    }
 
-    await loadData()
+    // A behavior-only save is fully confirmed by its mutation response.
+    if (completed.size === 1 && completed.has('behavior')) {
+      if (feedback.some(item => item.restartRequired)) pushToast(t('setup.toast.settingsSavedRestart'))
+      return
+    }
+    try {
+      await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, rebaseSections: new Set([...completed].filter(name => name !== 'behavior')), throwOnError: true })
+    } catch {
+      pushToast(saveResultWithRestart(t('setup.modelStrategy.savedRefreshFailed'), feedback.some(item => item.restartRequired)), { tone: 'warn' })
+      return
+    }
     if (
       restoreProfileSelection
       && selectedProviderId
@@ -2461,6 +2505,7 @@ async function saveDirtySections() {
     ) {
       applyConfiguredProviderSelection(selectedProviderId)
     }
+    if (feedback.some(item => item.restartRequired)) pushToast(t('setup.toast.settingsSavedRestart'))
   } finally {
     saveAllPending.value = false
     saveAllRequestPending = false
@@ -2470,9 +2515,27 @@ async function saveDirtySections() {
 async function discardChanges() {
   if (saveAllRequestPending || modelStrategyRoutingBusy.value) return
   if (providerInteractionLocked()) return
-  restoreProviderCapacityDrafts = null
-  for (const draft of [...modelCapacity.drafts.values()]) modelCapacity.discard(draft.scope)
-  await loadData()
+  try {
+    // The global dirty bar excludes the provider editor, whose verification
+    // and Save changes action own that draft. Discard exactly the same scope.
+    await loadData({ preserveProviderDraft: true, throwOnError: true })
+    modelCapacity.discard('modelStrategy')
+    if (thinkingDraftScope.value === 'modelStrategy') {
+      promotedForm.acceptLlmThinking(config.value.llm?.thinking)
+    }
+    // Cancelling the retained provider editor must not resurrect a routing
+    // draft that the user just discarded through the global dirty bar.
+    restoreProviderCapacityDrafts = null
+    providerThinkingDraftSnapshot = null
+    if (providerFixedModelDraftSnapshot.value !== null) {
+      providerFixedModelDraftSnapshot.value = {
+        provider: currentProvider.value,
+        model: currentModel.value,
+      }
+    }
+  } catch (err) {
+    pushToast(t('setup.toast.loadFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2514,7 +2577,19 @@ function selectProvider(value: string) {
   providerForm.selectProvider(value)
 }
 
+function resetProviderThinkingDraft() {
+  if (thinkingDraftScope.value !== 'provider') return
+  if (providerThinkingDraftSnapshot === null) {
+    promotedForm.resetLlmThinking()
+    return
+  }
+  promotedForm.setLlmThinking(providerThinkingDraftSnapshot)
+  thinkingDraftScope.value = 'modelStrategy'
+  providerThinkingDraftSnapshot = null
+}
+
 function applyConfiguredProviderSelection(value: string) {
+  resetProviderThinkingDraft()
   const provider = normalizeProviderId(value)
   if (!provider) return
   if (provider === normalizeProviderId(currentProvider.value)) {
@@ -2577,9 +2652,11 @@ async function requestAddProvider(value: string) {
 
 function cancelProviderEdit() {
   if (providerInteractionLocked()) return
+  resetProviderThinkingDraft()
   if (restoreProviderCapacityDrafts) restoreProviderCapacityDrafts()
   else modelCapacity.discard(`provider:${normalizeProviderId(providerForm.selectedProvider.value)}`)
   restoreProviderCapacityDrafts = null
+  providerThinkingDraftSnapshot = null
   if (providerOwnsFixedModelDraft.value && providerFixedModelDraftSnapshot.value != null) {
     modelStrategyForm.setFixedProvider(providerFixedModelDraftSnapshot.value.provider)
     modelStrategyForm.setFixedModel(providerFixedModelDraftSnapshot.value.model)
@@ -2626,18 +2703,17 @@ function isRpcMethodUnavailableError(err: unknown): boolean {
 }
 
 function primaryMutationResultUncertain(error: unknown): boolean {
-  return !(error instanceof SetupWorkflowError || error instanceof ProviderConfigurationError) || error.code === 'unavailable'
+  return !(error instanceof SetupWorkflowError || error instanceof ProviderConfigurationError || error instanceof AppSettingsError) || error.code === 'unavailable'
 }
 
-async function reportPrimaryMutationFailure(error: unknown) {
+async function reportPrimaryMutationFailure(error: unknown, options: SaveOptions = {}) {
   const uncertain = primaryMutationResultUncertain(error)
   if (uncertain || (error instanceof SetupWorkflowError && error.reason === 'already-active')) {
     // Refresh observed state without replaying a mutation or discarding an unacknowledged key edit.
     const selected = normalizeProviderId(providerForm.selectedProvider.value)
     const profileDraft = !editingPrimaryProvider.value
     const draftModel = String(providerForm.providerFieldValues.value.model ?? '').trim()
-    try {
-      await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, throwOnError: true })
+    const reconcile = () => {
       if (profileDraft && selected === normalizeProviderId(currentProvider.value) && hasConfiguredPrimaryProvider.value) {
         // A lost response can leave this draft's target as the observed primary.
         // Rebase only its identity so a later explicit Save cannot create a shadow
@@ -2652,11 +2728,19 @@ async function reportPrimaryMutationFailure(error: unknown) {
           modelStrategyForm.setFixedModel(draftModel)
         }
       }
-    } catch (refreshError) {
-      pushToast(saveFailedMessage(refreshError), { tone: 'danger' })
+    }
+    if (options.afterRefresh) options.afterRefresh(reconcile)
+    else {
+      try {
+        await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, throwOnError: true })
+        reconcile()
+      } catch {
+        // This read belongs to the failed save. Keep its draft and emit one
+        // operation-level outcome below, rather than a second refresh error.
+      }
     }
   }
-  pushToast(uncertain ? t('setup.provider.primarySaveUncertain') : providerRpcErrorMessage(error), { tone: 'danger' })
+  saveToast(options, uncertain ? t('setup.provider.primarySaveUncertain') : providerRpcErrorMessage(error), { tone: 'danger' })
 }
 
 function representativeProviderModel(providerId: string): string {
@@ -2792,11 +2876,12 @@ function primarySwitchReplacesRouter(providerId: string, previousProvider: strin
     && (provider === 'openrouter' || provider === 'tokenrhythm')
 }
 
-function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: string, replacedRouter = false) {
+function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: string, replacedRouter = false, savedMessage = '') {
   const synchronized = action === 'use_recommended' || previousBinding === 'follow_primary' || replacedRouter
-  const message = t(action === 'disable' ? 'setup.provider.routerOutcomeDisabled'
+  const routerMessage = t(action === 'disable' ? 'setup.provider.routerOutcomeDisabled'
     : synchronized ? 'setup.provider.routerOutcomeSynchronized'
       : 'setup.provider.routerOutcomePreserved')
+  const message = savedMessage ? `${savedMessage} ${routerMessage}` : routerMessage
   // The synchronized outcome is emitted by both the direct activation and the
   // save-and-activate paths. Keep that completion feedback to one visible card
   // when a user moves between the two controls quickly.
@@ -2853,7 +2938,7 @@ async function activateProvider(value: string) {
       })
       pushPrimaryRouterOutcome(transition.routerAction, previousBinding, replacesRouter)
     } catch (err) {
-      if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'danger' })
+      if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' })
       else await reportPrimaryMutationFailure(err)
     }
   } finally {
@@ -2889,6 +2974,7 @@ function setProviderImageGenerationOptIn(enabled: boolean) {
 
 function onProviderChange() {
   if (providerInteractionLocked()) return
+  resetProviderThinkingDraft()
   const provider = normalizeProviderId(providerForm.selectedProvider.value)
   if (configuredProviderIds.value.has(provider)) {
     applyConfiguredProviderSelection(provider)
@@ -3032,10 +3118,6 @@ async function removeProviderCredential() {
         provider: providerLabel,
         envKey: response.entry.credentialEnv || credential.envKey,
       }), { tone: 'warn' })
-    } else {
-      pushToast(t('setup.toast.providerCredentialRemoved', {
-        provider: providerLabel,
-      }))
     }
     // Refresh saved credential status without reinitializing any form. Removing
     // one secret must not silently discard drafts in Provider, Routing, or any
@@ -3181,11 +3263,6 @@ async function removeProviderProfile(providerId: string) {
       pushToast(t('setup.toast.providerProfileRemovedImageNeedsCredential', {
         provider: providerLabel,
       }), { tone: 'warn' })
-    } else {
-      pushToast(t(
-        'setup.toast.providerProfileRemoved',
-        { provider: providerLabel },
-      ))
     }
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })
@@ -3204,6 +3281,29 @@ async function removeProviderProfile(providerId: string) {
 function updateLlmTimeout(value: number) {
   if (providerInteractionLocked()) return
   promotedForm.setLlmTimeoutSeconds(value)
+}
+
+function updateLlmThinking(value: string) {
+  if (providerInteractionLocked() || !editingPrimaryProvider.value) return
+  // The provider dialog temporarily owns the shared value. Keep the routing
+  // draft so cancelling this dialog restores both its value and ownership.
+  if (thinkingDraftScope.value === 'modelStrategy') {
+    providerThinkingDraftSnapshot = promotedForm.llmThinking.value
+  }
+  thinkingDraftScope.value = 'provider'
+  promotedForm.setLlmThinking(value)
+}
+
+function updateModelStrategyThinking(value: string) {
+  if (providerInteractionLocked() || modelStrategyRoutingBusy.value) return
+  providerThinkingDraftSnapshot = null
+  thinkingDraftScope.value = 'modelStrategy'
+  promotedForm.setLlmThinking(value)
+}
+
+function updateEnsembleThinking(candidate: { provider: string; model: string; role?: string }, value: string) {
+  if (providerInteractionLocked() || modelStrategyRoutingBusy.value) return
+  ensembleForm.setCandidateThinking(candidate, value)
 }
 
 function updateContextWindow(value: string) {
@@ -3295,6 +3395,10 @@ async function setModelStrategy(strategy: ModelStrategy) {
     ensembleForm.restoreRoutingModeState(ensembleRoutingState)
     routerForm.restoreRoutingModeState(routerRoutingState)
   }
+  routingModeDraftIndicators.value = {
+    sectionDirty: modelStrategyDirty.value,
+    formDirty: modelStrategyForm.isDirty.value,
+  }
   modelStrategyRoutingBusy.value = true
   let acknowledged = false
   try {
@@ -3342,13 +3446,14 @@ async function setModelStrategy(strategy: ModelStrategy) {
       : { preserveFormDrafts: true, throwOnError: true })
   } catch (err) {
     if (!acknowledged) restoreMode()
-    if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'danger' })
+    if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' })
     else if (primaryMutationResultUncertain(err)) {
       // Observe, never replay, a request whose result is unknown.
       try { await loadData({ preserveFormDrafts: true, throwOnError: true }) } catch { /* Keep drafts and stale snapshot. */ }
       pushToast(t('setup.modelStrategy.resultUncertain'), { tone: 'danger' })
     } else pushToast(saveFailedMessage(err), { tone: 'danger' })
   } finally {
+    routingModeDraftIndicators.value = null
     modelStrategyRoutingBusy.value = false
   }
 }
@@ -3368,10 +3473,9 @@ async function resetRecommendedRouter(): Promise<boolean> {
     await providerConfiguration.resetRecommended!({ providerId, activateRouter: false })
     acknowledged = true
     await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, forceResetRouter: true, throwOnError: true })
-    pushToast(t('setup.modelStrategy.resetSaved', { provider: providerCatalogLabel(providerId) }))
     return true
   } catch (error) {
-    if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'danger' })
+    if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' })
     else if (primaryMutationResultUncertain(error)) {
       try { await loadData({ preserveFormDrafts: true, throwOnError: true }) } catch { /* Preserve drafts. */ }
       pushToast(t('setup.modelStrategy.resultUncertain'), { tone: 'danger' })
@@ -3729,9 +3833,7 @@ async function resetCapability(name: CapabilityId) {
     } else {
       promotedForm.initAudioFromConfig(config.value)
     }
-    pushToast(response?.restartRequired
-      ? t('setup.toast.capabilityResetRestart', { capability: title })
-      : t('setup.toast.capabilityReset', { capability: title }))
+    if (response?.restartRequired) pushToast(t('setup.toast.capabilityResetRestart', { capability: title }))
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })
   } finally {
@@ -3870,6 +3972,47 @@ interface SaveOptions {
   reload?: boolean
   includeProviderModelDraft?: boolean
   activate?: boolean
+  feedback?: (result: { message: string; tone?: ToastTone; restartRequired?: boolean }) => void
+  afterRefresh?: (reconcile: () => void) => void
+  onCancelled?: (savedLabels: string[]) => void
+}
+
+function saveResultWithRestart(message: string, restartRequired: boolean): string {
+  return restartRequired ? t('setup.toast.saveResultRestart', { message }) : message
+}
+
+// A settings-wide Save collects these local outcomes and emits one final
+// notification. Independent operations (copy, probes, removals) are unaffected.
+function saveToast(options: SaveOptions, message: string, presentation?: { tone?: ToastTone }, restartRequired = false) {
+  if (options.feedback) options.feedback({ message, tone: presentation?.tone, restartRequired })
+  else if (message && presentation) pushToast(saveResultWithRestart(message, restartRequired), presentation)
+  else if (message) pushToast(message)
+}
+
+async function finishSave(options: SaveOptions, section: string, message: string, restartRequired = false): Promise<boolean> {
+  if (options.reload !== false) {
+    try {
+      await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, rebaseSections: new Set([section]), throwOnError: true })
+    } catch {
+      saveToast(options, t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' }, restartRequired)
+      return false
+    }
+  }
+  saveToast(options, message, undefined, restartRequired)
+  return true
+}
+
+async function reportSaveFailure(error: unknown, options: SaveOptions): Promise<false> {
+  if (primaryMutationResultUncertain(error)) {
+    // Read only: do not replay the mutation, clear credentials, or ask the
+    // operator to reconcile a transport failure against saved credentials.
+    if (options.afterRefresh) options.afterRefresh(() => {})
+    else {
+      try { await loadData({ preserveFormDrafts: true, throwOnError: true }) } catch { /* Keep drafts. */ }
+    }
+    saveToast(options, t('setup.modelStrategy.resultUncertain'), { tone: 'danger' })
+  } else saveToast(options, saveFailedMessage(error), { tone: 'danger' })
+  return false
 }
 
 function saveProviderAndActivate(): Promise<boolean> {
@@ -3887,21 +4030,53 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     pushToast(t('setup.capacity.invalid'), { tone: 'danger' })
     return false
   }
-  const capacityOnly = modelCapacity.dirty(capacityScope)
+  const thinkingPatch = editingPrimaryProvider.value && thinkingDraftScope.value === 'provider' ? promotedForm.thinkingPatch() : null
+  // Runtime tuning must not reconfigure the primary or reset its routing policy.
+  const settingsOnly = (modelCapacity.dirty(capacityScope) || thinkingPatch !== null)
     && !providerForm.isDirty.value
     && !(providerOwnsFixedModelDraft.value && modelStrategyForm.fixedModelDirty.value)
     && !promotedForm.timeoutDirty.value && !promotedForm.contextWindowDirty.value
     && !options.activate
-  if (capacityOnly) {
+  if (settingsOnly) {
     providerSavePending.value = true
     primaryMutationPending.value = true
+    let thinkingAcknowledged = false
+    let writesCompleted = false
+    let restartRequired = false
     try {
-      await modelCapacity.save(capacityScope, deepPatchConfig)
+      restartRequired = thinkingPatch ? await patchConfig(thinkingPatch) : false
+      if (thinkingPatch) {
+        thinkingAcknowledged = true
+        promotedForm.acceptLlmThinking(thinkingPatch['llm.thinking'])
+        providerThinkingDraftSnapshot = null
+      }
+      await modelCapacity.save(capacityScope, async patch => {
+        const restart = await deepPatchConfig(patch)
+        restartRequired ||= restart
+        return restart
+      })
+      writesCompleted = true
       restoreProviderCapacityDrafts = null
-      pushToast(t('setup.capacity.saved'))
+      providerThinkingDraftSnapshot = null
+      if (thinkingPatch && options.reload !== false) {
+        await loadData({ preserveDirtySectionDrafts: true, throwOnError: true })
+      }
+      if (restartRequired) pushToast(thinkingPatch
+        ? t('setup.toast.providerSavedRestart')
+        : saveResultWithRestart(t('setup.capacity.saved'), true))
       return true
-    } catch {
-      pushToast(t('setup.capacity.saveFailed'), { tone: 'danger' })
+    } catch (err) {
+      if (writesCompleted) saveToast(options, t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' }, restartRequired)
+      else if (thinkingAcknowledged) {
+        const message = t(primaryMutationResultUncertain(err) ? 'setup.toast.modelStrategyPartialSaveUncertain' : 'setup.capacity.providerPartialSaved')
+        saveToast(options, primaryMutationResultUncertain(err) ? message : `${message} ${saveFailedMessage(err)}`, { tone: 'warn' }, restartRequired)
+      } else {
+        const uncertain = primaryMutationResultUncertain(err)
+        // Preserve the editable capacity metadata after an unacknowledged
+        // standalone write, just as the Model Routing editor does.
+        if (uncertain && options.afterRefresh) options.afterRefresh(() => {})
+        saveToast(options, uncertain ? t('setup.modelStrategy.resultUncertain') : saveFailedMessage(err), { tone: 'danger' })
+      }
       return false
     } finally {
       providerSavePending.value = false
@@ -3925,6 +4100,8 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     && !profileSaveSupported.value
   )
   let primaryAcknowledged = false
+  let restartRequired = false
+  let unacknowledgedProviderPatches: Record<string, unknown> | null = null
   let refreshStarted = false
   let resolvedRouterAction: 'use_recommended' | 'disable' | undefined
   let replacedRouter = false
@@ -3975,7 +4152,10 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   providerSavePending.value = true
   primaryMutationPending.value = true
   // Snapshot all provider-owned patches before a conflict dialog can yield.
-  const providerPatches = promotedForm.providerPatches()
+  const providerPatches: Record<string, unknown> = {
+    ...promotedForm.providerPatches(),
+    ...(thinkingDraftScope.value === 'provider' ? promotedForm.thinkingPatch() ?? {} : {}),
+  }
   const contextModel = currentFormModelValue()
   const contextPatch = contextModel
     ? promotedForm.contextWindowPatch(providerForm.selectedProvider.value, contextModel) : null
@@ -4006,15 +4186,22 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
           ...imageGenerationIntentPayload(selectedProviderId),
         }, command => setupWorkflow.profile.upsertAndActivateProfile(command), providerCatalogLabel)
         if (!transition) return false
+        restartRequired ||= transition.result?.restartRequired === true
         resolvedRouterAction = transition.routerAction
         replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
         acceptPrimaryRouterAction(resolvedRouterAction)
       } else {
-        await setupWorkflow.profile.upsertProfile(payload)
+        const result = await setupWorkflow.profile.upsertProfile(payload)
+        restartRequired ||= result?.restartRequired === true
       }
       primaryAcknowledged = true
-      await modelCapacity.save(capacityScope, deepPatchConfig)
+      await modelCapacity.save(capacityScope, async patch => {
+        const restart = await deepPatchConfig(patch)
+        restartRequired ||= restart
+        return restart
+      })
       restoreProviderCapacityDrafts = null
+      providerThinkingDraftSnapshot = null
       if (options.reload !== false) {
         // Saving a routing-only profile refreshes its persisted status without
         // discarding drafts in any other Settings section. Provider-owned
@@ -4026,11 +4213,12 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
         applyConfiguredProviderSelection(selectedProviderId)
       }
       if (activateProfile) {
-        pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter)
-      } else {
-        pushToast(t('setup.toast.providerProfileSaved', {
+        pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter,
+          restartRequired ? t('setup.toast.providerSavedRestart') : '')
+      } else if (restartRequired) {
+        pushToast(saveResultWithRestart(t('setup.toast.providerProfileSaved', {
           provider: providerCatalogLabel(selectedProviderId),
-        }))
+        }), restartRequired))
       }
       return true
     }
@@ -4041,18 +4229,34 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     const payload = providerConfigurePayload(options.includeProviderModelDraft === true)
     const transition = await submitPrimaryProviderTransition(payload, command => setupWorkflow.provider.configurePrimary(command), providerCatalogLabel)
     if (!transition) return false
+    restartRequired ||= transition.result?.restartRequired === true
     primaryAcknowledged = true
     resolvedRouterAction = transition.routerAction
     replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
     acceptPrimaryRouterAction(resolvedRouterAction)
+    unacknowledgedProviderPatches = providerPatches
     const restart = await patchConfig(providerPatches)
+    restartRequired ||= restart
+    unacknowledgedProviderPatches = null
+    if ('llm.thinking' in providerPatches) {
+      promotedForm.acceptLlmThinking(providerPatches['llm.thinking'])
+      providerThinkingDraftSnapshot = null
+    }
     // The per-model context-window override rides the deep-merge patch form. Key
     // it on the CURRENT canonical model draft rather than payload.model (which
     // deliberately preserves the saved primary model until Model Routing is
     // saved), and skip the patch entirely when no model is selected.
-    if (contextPatch) await deepPatchConfig(contextPatch)
-    await modelCapacity.save(capacityScope, deepPatchConfig)
+    if (contextPatch) {
+      const restart = await deepPatchConfig(contextPatch)
+      restartRequired ||= restart
+    }
+    await modelCapacity.save(capacityScope, async patch => {
+      const restart = await deepPatchConfig(patch)
+      restartRequired ||= restart
+      return restart
+    })
     restoreProviderCapacityDrafts = null
+    providerThinkingDraftSnapshot = null
     if (options.reload !== false) {
       // Replacing the primary deployment on a legacy Gateway changes the
       // identity that Router and the fixed fallback are based on. Rebuild that
@@ -4063,10 +4267,8 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       pushToast(t('setup.toast.envNotVisibleGateway', { envKey: providerEnvKey.value }), { tone: 'danger' })
       return true
     }
-    pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter)
-    if (!resolvedRouterAction) {
-      pushToast(restart ? t('setup.toast.providerSavedRestart') : t('setup.toast.providerSaved'))
-    }
+    pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter,
+      restartRequired ? t('setup.toast.providerSavedRestart') : '')
     return true
   } catch (err) {
     if (primaryAcknowledged) {
@@ -4074,12 +4276,28 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
         try {
           const selected = normalizeProviderId(providerForm.selectedProvider.value)
           await reloadProviderData(true)
+          // Rebase on the saved values, then restore any unacknowledged edits.
+          // A failed response may follow a committed write; matching read-back
+          // values stay clean and must not restore an older routing draft.
+          if (unacknowledgedProviderPatches) {
+            if ('llm_request_timeout_seconds' in unacknowledgedProviderPatches) {
+              promotedForm.setLlmTimeoutSeconds(Number(unacknowledgedProviderPatches.llm_request_timeout_seconds))
+            }
+            if ('llm.thinking' in unacknowledgedProviderPatches) {
+              promotedForm.setLlmThinking(String(unacknowledgedProviderPatches['llm.thinking'] ?? ''))
+              if (!promotedForm.thinkingDirty.value) providerThinkingDraftSnapshot = null
+            }
+          }
           if (selected !== normalizeProviderId(currentProvider.value)) applyConfiguredProviderSelection(selected)
         } catch { /* Keep drafts when the read-back itself is unavailable. */ }
-        pushToast(t('setup.capacity.providerPartialSaved'), { tone: 'danger' })
+        const message = t(primaryMutationResultUncertain(err) ? 'setup.toast.modelStrategyPartialSaveUncertain' : 'setup.capacity.providerPartialSaved')
+        pushToast(saveResultWithRestart(primaryMutationResultUncertain(err) ? message : `${message} ${providerRpcErrorMessage(err)}`, restartRequired), { tone: 'warn' })
         return false
       }
-      pushToast(t(refreshStarted ? 'setup.modelStrategy.savedRefreshFailed' : 'setup.provider.primarySavedAdditionalFailed'), { tone: 'danger' })
+      const message = t(refreshStarted ? 'setup.modelStrategy.savedRefreshFailed'
+        : primaryMutationResultUncertain(err) ? 'setup.toast.modelStrategyPartialSaveUncertain' : 'setup.provider.primarySavedAdditionalFailed')
+      pushToast(saveResultWithRestart(!refreshStarted && !primaryMutationResultUncertain(err)
+        ? `${message} ${providerRpcErrorMessage(err)}` : message, restartRequired), { tone: 'warn' })
     } else await reportPrimaryMutationFailure(err)
     return false
   } finally {
@@ -4088,21 +4306,29 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   }
 }
 
-async function saveBehavior(options: SaveOptions = {}): Promise<boolean> {
+async function saveBehavior(options: SaveOptions = {}, patches = behaviorForm.patches()): Promise<boolean> {
+  const submitted = patches['naming.enabled']
+  if (typeof submitted !== 'boolean') return true
   try {
-    const restart = await safePatchConfig(behaviorForm.patches())
-    pushToast(restart ? t('setup.toast.behaviorSavedRestart') : t('setup.toast.behaviorSaved'))
-    if (options.reload !== false) await loadData()
+    const restart = await safePatchConfig({ 'naming.enabled': submitted })
+    config.value = {
+      ...config.value,
+      naming: { ...config.value.naming, enabled: submitted },
+    }
+    behaviorForm.acceptSaved(submitted)
+    // The mutation response confirms this preference. Avoid unrelated setup
+    // reads and retain a newer draft while still sharing the batch feedback.
+    saveToast(options, restart ? t('setup.toast.behaviorSavedRestart') : '', undefined, restart)
     return true
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
+    saveToast(options, primaryMutationResultUncertain(err) ? t('setup.modelStrategy.resultUncertain') : saveFailedMessage(err), { tone: 'danger' })
     return false
   }
 }
 
 async function savePrivacy(
   value = disableNetworkObservability.value,
-  options: { reload?: boolean } = {},
+  options: SaveOptions = {},
 ): Promise<boolean> {
   try {
     const nextPrivacy = { ...(config.value.privacy || {}) }
@@ -4121,14 +4347,10 @@ async function savePrivacy(
         privacy: nextPrivacy,
       }
       disableNetworkObservability.value = value
-    } else {
-      await loadData()
     }
-    pushToast(restart ? t('setup.toast.privacySavedRestart') : t('setup.toast.privacySaved'))
-    return true
+    return await finishSave(options, 'privacy', restart ? t('setup.toast.privacySavedRestart') : '', restart)
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
-    return false
+    return await reportSaveFailure(err, options)
   }
 }
 
@@ -4144,14 +4366,10 @@ async function saveMemoryAutoCapture(options: SaveOptions = {}): Promise<boolean
         },
       }
       promotedForm.initMemoryCaptureFromConfig(config.value)
-    } else {
-      await loadData()
     }
-    pushToast(restart ? t('setup.toast.captureSavedRestart') : t('setup.toast.captureSaved'))
-    return true
+    return await finishSave(options, 'memoryCapture', restart ? t('setup.toast.captureSavedRestart') : '', restart)
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
-    return false
+    return await reportSaveFailure(err, options)
   }
 }
 
@@ -4162,15 +4380,19 @@ async function saveRouter() {
   }
   if (providerInteractionLocked()) return
   primaryMutationPending.value = true
+  let routingAcknowledged = false
   try {
     if (routerForm.routingDirty.value) {
       await setupWorkflow.capability.configureRouter(routerForm.payload())
+      routingAcknowledged = true
     }
     const restart = await safePatchConfig(routerForm.visualModePatches())
-    pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
-    await loadData()
+    await finishSave({}, 'router', restart ? t('setup.toast.routerSavedRestart') : '', restart)
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
+    if (routingAcknowledged) {
+      const message = t('setup.toast.modelStrategyPartialSaved')
+      pushToast(primaryMutationResultUncertain(err) ? message : `${message} ${saveFailedMessage(err)}`, { tone: 'warn' })
+    } else await reportSaveFailure(err, {})
   } finally {
     primaryMutationPending.value = false
   }
@@ -4187,10 +4409,9 @@ async function saveEnsemble() {
     if (Object.keys(params).length) {
       await setupWorkflow.capability.configureEnsemble(params)
     }
-    pushToast(t('setup.toast.ensembleSaved'))
-    await loadData()
+    await finishSave({}, 'ensemble', '')
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
+    await reportSaveFailure(err, {})
   } finally {
     primaryMutationPending.value = false
   }
@@ -4202,6 +4423,7 @@ async function saveModelStrategy(options: SaveOptions & {
   if (providerInteractionLocked() || modelStrategyRoutingBusy.value) return false
   const routerRoutingPayload = routerForm.routingDirty.value ? JSON.parse(JSON.stringify(routerForm.payload())) : null
   const routerVisualPatches = routerForm.visualModePatches()
+  const thinkingPatch = thinkingDraftScope.value === 'modelStrategy' ? promotedForm.thinkingPatch() : null
   const fixedModelPatches = modelStrategyForm.fixedModelPatches()
   const fixedProviderChanged = modelStrategyForm.fixedProviderDirty.value
   const fixedProviderId = normalizeProviderId(modelStrategyForm.fixedProvider.value)
@@ -4212,27 +4434,27 @@ async function saveModelStrategy(options: SaveOptions & {
   const hasEnsembleWork = Object.keys(ensemblePayload).length > 0
   const hasCapacityWork = modelCapacity.dirty('modelStrategy')
   if (!modelCapacity.valid('modelStrategy')) {
-    pushToast(t('setup.capacity.invalid'), { tone: 'danger' })
+    saveToast(options, t('setup.capacity.invalid'), { tone: 'danger' })
     return false
   }
-  if (!hasRouterWork && !hasFixedModelWork && !hasEnsembleWork && !hasCapacityWork) return true
+  if (!hasRouterWork && !hasFixedModelWork && !hasEnsembleWork && !hasCapacityWork && !thinkingPatch) return true
   if (hasFixedModelWork && !fixedModel) {
-    pushToast(t('setup.toast.chooseFixedModel'), { tone: 'danger' })
+    saveToast(options, t('setup.toast.chooseFixedModel'), { tone: 'danger' })
     return false
   }
   if (!hasSavedProvider.value && routerRoutingPayload && !options.allowUnsavedProvider) {
-    pushToast(t('setup.toast.chooseProviderRouter'), { tone: 'danger' })
+    saveToast(options, t('setup.toast.chooseProviderRouter'), { tone: 'danger' })
     return false
   }
   if (fixedProviderChanged && (!fixedProviderId || !configuredProviderIds.value.has(fixedProviderId))) {
-    pushToast(t('setup.toast.chooseProvider'), { tone: 'danger' })
+    saveToast(options, t('setup.toast.chooseProvider'), { tone: 'danger' })
     return false
   }
   if (hasEnsembleWork && ensembleForm.enabled.value && !ensembleLineupReady()) {
     // Keep this client-side guard aligned with the Gateway's runtime
     // requirement. It prevents a predictable rejected write and leaves the
     // lineup draft intact for the user to complete.
-    pushToast(ensembleLineupHint(), { tone: 'danger' })
+    saveToast(options, ensembleLineupHint(), { tone: 'danger' })
     return false
   }
 
@@ -4241,8 +4463,12 @@ async function saveModelStrategy(options: SaveOptions & {
   let visualSaved = false
   let ensembleSaved = false
   let fixedSaved = false
+  let thinkingSaved = false
   let primaryActivationAttempted = false
-  const refreshPartialSave = async (unknownPrimaryResult = false) => {
+  let refreshStarted = false
+  let restartRequired = false
+  const refreshPartialSave = async (failure?: unknown, cancelled = false) => {
+    const unknownResult = failure !== undefined && primaryMutationResultUncertain(failure)
     const savedSections: string[] = []
     const pendingSections: string[] = []
     for (const [changed, acknowledged, label] of [
@@ -4251,72 +4477,79 @@ async function saveModelStrategy(options: SaveOptions & {
       [hasEnsembleWork, ensembleSaved, 'setup.modelStrategy.cards.ensemble.title'],
       [hasFixedModelWork, fixedSaved, 'setup.modelStrategy.cards.single.title'],
       [hasCapacityWork, !modelCapacity.dirty('modelStrategy'), 'setup.capacity.title'],
+      [Boolean(thinkingPatch), thinkingSaved, 'setup.thinking.globalLabel'],
     ] as const) {
       if (changed) (acknowledged ? savedSections : pendingSections).push(t(label))
     }
-    const message = t(unknownPrimaryResult
+    let message = t(cancelled ? 'setup.toast.settingsSaveCancelledPartial' : unknownResult
       ? 'setup.toast.modelStrategyPartialSaveUncertain'
       : hasCapacityWork && modelCapacity.dirty('modelStrategy')
         ? 'setup.capacity.partialSaved' : 'setup.toast.modelStrategyPartialSaved', {
       saved: savedSections.join(', '), pending: pendingSections.join(', '),
     })
-    try {
-      await loadData({ preserveFormDrafts: true, throwOnError: true })
-    } catch (refreshError) {
-      // Do not rebase acknowledged sections onto stale config if the refresh fails.
-      pushToast(saveFailedMessage(refreshError), { tone: 'danger' })
-      pushToast(message, { tone: 'danger' })
-      return
+    if (failure !== undefined && !primaryMutationResultUncertain(failure)) {
+      message += ` ${providerRpcErrorMessage(failure)}`
     }
-    if (fixedSaved) {
-      modelStrategyForm.initFixedModel(config.value.llm?.model || '', config.value.llm?.provider || '')
-      providerOwnsFixedModelDraft.value = false
-      providerFixedModelDraftSnapshot.value = null
-    }
-    if (ensembleSaved) {
-      const detail = (status.value.sectionDetails || {}).ensemble || {}
-      ensembleForm.initFromConfig({
-        ...(config.value.llm_ensemble || {}),
-        configured_all_failed_policy: detail.configuredAllFailedPolicy,
-        effective_all_failed_policy: detail.effectiveAllFailedPolicy,
-        policy_deprecated: detail.policyDeprecated,
-      })
-    }
-    if (routerSaved) {
-      const detail = (status.value.sectionDetails || {}).router || {}
-      const binding = String(detail.routerBinding || config.value.squilla_router?.preset_binding || '')
-      routerForm.initFromConfig(
-        config.value.squilla_router || {}, currentRouterProfile.value?.tiers || {}, currentProvider.value,
-        binding === 'follow_primary' || binding === 'custom' ? binding : 'legacy',
-        detail.routerProviderRoles || detail.router_provider_roles,
-        ensembleForm.selectionMode.value, ensembleForm.enabled.value, c3TierEnsembleStatus(detail),
-      )
-      if (!visualSaved && 'squilla_router.visual_mode' in routerVisualPatches) {
-        routerForm.setRouterVisualMode(String(routerVisualPatches['squilla_router.visual_mode']))
+    const reconcile = () => {
+      if (fixedSaved) {
+        modelStrategyForm.initFixedModel(config.value.llm?.model || '', config.value.llm?.provider || '')
+        providerOwnsFixedModelDraft.value = false
+        providerFixedModelDraftSnapshot.value = null
       }
-    } else if (visualSaved) {
-      routerForm.acceptSavedVisualMode(config.value.squilla_router?.visual_mode)
+      if (ensembleSaved) {
+        const detail = (status.value.sectionDetails || {}).ensemble || {}
+        ensembleForm.initFromConfig({
+          ...(config.value.llm_ensemble || {}),
+          configured_all_failed_policy: detail.configuredAllFailedPolicy,
+          effective_all_failed_policy: detail.effectiveAllFailedPolicy,
+          policy_deprecated: detail.policyDeprecated,
+        })
+      }
+      if (routerSaved) {
+        const detail = (status.value.sectionDetails || {}).router || {}
+        const binding = String(detail.routerBinding || config.value.squilla_router?.preset_binding || '')
+        routerForm.initFromConfig(
+          config.value.squilla_router || {}, currentRouterProfile.value?.tiers || {}, currentProvider.value,
+          binding === 'follow_primary' || binding === 'custom' ? binding : 'legacy',
+          detail.routerProviderRoles || detail.router_provider_roles,
+          ensembleForm.selectionMode.value, ensembleForm.enabled.value, c3TierEnsembleStatus(detail),
+        )
+        if (!visualSaved && 'squilla_router.visual_mode' in routerVisualPatches) {
+          routerForm.setRouterVisualMode(String(routerVisualPatches['squilla_router.visual_mode']))
+        }
+      } else if (visualSaved) {
+        routerForm.acceptSavedVisualMode(config.value.squilla_router?.visual_mode)
+      }
     }
-    pushToast(message, { tone: 'danger' })
+    if (options.afterRefresh) options.afterRefresh(reconcile)
+    else {
+      try {
+        await loadData({ preserveFormDrafts: true, throwOnError: true })
+        reconcile()
+      } catch { /* Keep drafts and avoid rebasing from stale data. */ }
+    }
+    if (cancelled) options.onCancelled?.(savedSections)
+    saveToast(options, message, { tone: cancelled ? 'info' : 'warn' }, restartRequired)
   }
   primaryMutationPending.value = true
   try {
     if (hasRouterWork) {
       if (routerRoutingPayload) {
-        await setupWorkflow.capability.configureRouter(routerRoutingPayload)
+        const result = await setupWorkflow.capability.configureRouter(routerRoutingPayload)
+        restartRequired ||= result?.restartRequired === true
         routerSaved = true
         savedAny = true
       }
       const restart = await safePatchConfig(routerVisualPatches)
       visualSaved = Object.keys(routerVisualPatches).length > 0
-      pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
+      restartRequired ||= restart
       savedAny = true
     }
 
     if (hasEnsembleWork) {
-      await setupWorkflow.capability.configureEnsemble(ensemblePayload)
+      const result = await setupWorkflow.capability.configureEnsemble(ensemblePayload)
+      restartRequired ||= result?.restartRequired === true
       ensembleSaved = true
-      pushToast(t('setup.toast.ensembleSaved'))
       savedAny = true
     }
 
@@ -4329,37 +4562,53 @@ async function saveModelStrategy(options: SaveOptions & {
           providerId, model: fixedModel, imageGenerationIntent: 'preserve',
         }, command => setupWorkflow.profile.activateProfile(command), providerCatalogLabel)
         if (!transition) {
-          if (savedAny) await refreshPartialSave()
+          if (savedAny) await refreshPartialSave(undefined, true)
+          else options.onCancelled?.([])
           return false
         }
         restart = transition.result?.restartRequired === true
-        if (!hasRouterWork) {
-          pushToast(t('setup.toast.providerActivated', {
-            provider: providerCatalogLabel(providerId),
-          }))
-        }
       } else {
         restart = await patchConfig(fixedModelPatches)
       }
-      if (!hasRouterWork && !fixedProviderChanged) {
-        pushToast(restart ? t('setup.toast.routerSavedRestart') : t('setup.toast.routerSaved'))
-      }
+      restartRequired ||= restart
       savedAny = true
     }
 
     fixedSaved = hasFixedModelWork
 
-    if (hasCapacityWork) {
-      await modelCapacity.save('modelStrategy', deepPatchConfig)
+    if (thinkingPatch) {
+      const restart = await patchConfig(thinkingPatch)
+      restartRequired ||= restart
+      thinkingSaved = true
       savedAny = true
-      pushToast(t('setup.capacity.saved'))
+      promotedForm.acceptLlmThinking(thinkingPatch['llm.thinking'])
     }
-    if (savedAny && options.reload !== false) await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, forceResetModelStrategy: true, throwOnError: true })
+
+    if (hasCapacityWork) {
+      await modelCapacity.save('modelStrategy', async patch => {
+        const restart = await deepPatchConfig(patch)
+        restartRequired ||= restart
+        return restart
+      })
+      savedAny = true
+    }
+    if (savedAny && options.reload !== false) {
+      refreshStarted = true
+      await loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true, forceResetModelStrategy: true, throwOnError: true })
+    }
+    if (savedAny) saveToast(options, restartRequired ? t('setup.toast.modelSettingsSavedRestart') : '', undefined, restartRequired)
     return savedAny
   } catch (err) {
-    if (savedAny) await refreshPartialSave(primaryActivationAttempted && primaryMutationResultUncertain(err))
-    if (primaryActivationAttempted) await reportPrimaryMutationFailure(err)
-    else pushToast(saveFailedMessage(err), { tone: 'danger' })
+    if (refreshStarted) saveToast(options, t('setup.modelStrategy.savedRefreshFailed'), { tone: 'warn' }, restartRequired)
+    else if (savedAny) await refreshPartialSave(err)
+    else if (primaryActivationAttempted) await reportPrimaryMutationFailure(err, options)
+    else {
+      const uncertain = primaryMutationResultUncertain(err)
+      // This branch had no standalone read-back. Keep the capacity editor's
+      // metadata and draft intact; a batch owns its single reconciliation read.
+      if (uncertain && options.afterRefresh) options.afterRefresh(() => {})
+      saveToast(options, uncertain ? t('setup.modelStrategy.resultUncertain') : saveFailedMessage(err), { tone: 'danger' })
+    }
     return false
   } finally {
     primaryMutationPending.value = false
@@ -4368,25 +4617,23 @@ async function saveModelStrategy(options: SaveOptions & {
 
 async function saveSearch(options: SaveOptions = {}): Promise<boolean> {
   if (searchDraftMissingKey.value) {
-    pushToast(t('setup.capabilities.searchKeyRequired'), { tone: 'danger' })
+    saveToast(options, t('setup.capabilities.searchKeyRequired'), { tone: 'danger' })
     return false
   }
   const params = capabilitiesForm.searchPayload()
   try {
     await setupWorkflow.capability.configureSearch(params)
-    pushToast(t('setup.toast.searchSaved'))
-    if (options.reload !== false) await loadData()
-    return true
+    return await finishSave(options, 'search', '')
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
-    return false
+    return await reportSaveFailure(err, options)
   }
 }
 
 async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
   const embeddingDirty = capabilitiesForm.memoryDirty.value
   try {
-    let envToastShown = false
+    let message = embeddingDirty ? t('setup.toast.memorySavedRestart') : ''
+    let restartRequired = embeddingDirty
     if (embeddingDirty) {
       const params = capabilitiesForm.memoryPayload()
       const res = await setupWorkflow.capability.configureMemoryEmbedding(params) as {
@@ -4394,16 +4641,12 @@ async function saveMemory(options: SaveOptions = {}): Promise<boolean> {
         restartRequired?: boolean
       }
       const remote = res?.entry?.remote || {}
-      envToastShown = _toastEnvReferenceSave(t('setup.toast.memorySurface'), remote.api_key_env, '', remote.api_key ?? '', res?.restartRequired)
+      message = envReferenceSaveMessage(t('setup.toast.memorySurface'), remote.api_key_env, '', remote.api_key ?? '', res?.restartRequired) || message
+      restartRequired ||= res?.restartRequired === true
     }
-    if (!envToastShown) {
-      pushToast(embeddingDirty ? t('setup.toast.memorySavedRestart') : t('setup.toast.memorySaved'))
-    }
-    if (options.reload !== false) await loadData()
-    return true
+    return await finishSave(options, 'memory', message, restartRequired)
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
-    return false
+    return await reportSaveFailure(err, options)
   }
 }
 
@@ -4415,20 +4658,16 @@ async function saveImage(options: SaveOptions = {}): Promise<boolean> {
       restartRequired?: boolean
     }
     const entry = res?.entry || {}
-    if (!_toastEnvReferenceSave(t('setup.image.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)) {
-      pushToast(t('setup.toast.imageSaved'))
-    }
-    if (options.reload !== false) await loadData()
-    return true
+    const message = envReferenceSaveMessage(t('setup.image.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)
+    const restartRequired = res?.restartRequired === true
+    return await finishSave(options, 'image', message || (restartRequired ? saveResultWithRestart(t('setup.toast.imageSaved'), true) : ''), restartRequired)
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
-    return false
+    return await reportSaveFailure(err, options)
   }
 }
 
 async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
   if (!promotedForm.audioDirty.value) {
-    pushToast(t('setup.toast.noAudioChanges'))
     return true
   }
   try {
@@ -4437,32 +4676,26 @@ async function saveAudio(options: SaveOptions = {}): Promise<boolean> {
       restartRequired?: boolean
     }
     const entry = res?.entry || {}
-    if (!_toastEnvReferenceSave(t('setup.audio.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)) {
-      pushToast(res?.restartRequired ? t('setup.toast.audioSavedRestart') : t('setup.toast.audioSaved'))
-    }
-    if (options.reload !== false) await loadData()
-    return true
+    const message = envReferenceSaveMessage(t('setup.audio.title'), entry.api_key_env, entry.api_key_source, entry.api_key, res?.restartRequired)
+    return await finishSave(options, 'audio', message || (res?.restartRequired ? t('setup.toast.audioSavedRestart') : ''), res?.restartRequired === true)
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
-    return false
+    return await reportSaveFailure(err, options)
   }
 }
 
-function _toastEnvReferenceSave(
+function envReferenceSaveMessage(
   surface: string,
   envKey: string | undefined,
   keySource = '',
   hasInlineKey = '',
   restartRequired = false,
-): boolean {
+): string {
   const key = String(envKey || '').trim()
-  if (!key || hasInlineKey) return false
+  if (!key || hasInlineKey) return ''
   if (keySource === 'missing_env' || restartRequired) {
-    pushToast(t('setup.toast.envSavedRestart', { surface, envKey: key }))
-    return true
+    return t('setup.toast.envSavedRestart', { surface, envKey: key })
   }
-  pushToast(t('setup.toast.envSavedReference', { surface, envKey: key }))
-  return true
+  return t('setup.toast.envSavedReference', { surface, envKey: key })
 }
 
 // ---------------------------------------------------------------------------
@@ -4473,28 +4706,21 @@ function tierLabel(tier: string): string {
   return t(routerTierLabelKey(tier))
 }
 
-function shellArg(value: string): string {
-  const text = String(value || '')
-  if (/^[A-Za-z0-9_@%+=:,./~-]+$/.test(text)) return text
-  return `'${text.replace(/'/g, `'\''`)}'`
-}
-
-async function copyText(text: string, successMessage: string) {
+async function copyText(text: string) {
   if (!text) return
   try {
     await copyTextWithFallback(text)
-    pushToast(successMessage)
   } catch (err) {
     pushToast(t('setup.toast.copyFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
   }
 }
 
 async function copyCommand(command: string) {
-  await copyText(command, t('setup.toast.copiedCommand'))
+  await copyText(command)
 }
 
 async function copyConfigPath() {
-  await copyText(configPath.value, t('setup.toast.copiedPath'))
+  await copyText(configPath.value)
 }
 
   return {
@@ -4519,9 +4745,6 @@ async function copyConfigPath() {
     providerEnvKey,
     hasSetupAction,
     actionItems,
-    fixCommands,
-    handoffCommands,
-    recipeCommands,
     configSummary,
     configPath,
     selectInitialSection,
@@ -4570,6 +4793,9 @@ async function copyConfigPath() {
     setEnsembleProposerMaxRetries,
     updateProviderField,
     updateLlmTimeout,
+    updateLlmThinking,
+    updateModelStrategyThinking,
+    updateEnsembleThinking,
     updateContextWindow,
     probeProviderConnection,
     cancelProviderProbe: providerForm.cancelProbe,

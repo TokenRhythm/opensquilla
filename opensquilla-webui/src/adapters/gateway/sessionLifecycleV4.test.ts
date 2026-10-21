@@ -19,6 +19,8 @@ import {
 import {
   SESSIONS_FORK_THROUGH_TURN_METHOD,
 } from '@/contracts/generated/v4/sessionsForkThroughTurn'
+import { SESSIONS_SIDECHAT_CREATE_METHOD } from '@/contracts/generated/v4/sessionsSidechatCreate'
+import { SESSIONS_SIDECHAT_CLOSE_METHOD } from '@/contracts/generated/v4/sessionsSidechatClose'
 
 type LifecycleTransport = Parameters<typeof createV4SessionLifecycle>[0]
 
@@ -32,6 +34,47 @@ function makeTransport(responses: Record<string, unknown>) {
 }
 
 describe('v4 SessionLifecycle Adapter', () => {
+  it('creates a contextual side conversation with an idempotent owner and no frontend history payload', async () => {
+    const child = { key: 'child', parentKey: 'parent', sessionId: 'id', inherited: {
+      model: 'm', provider: 'p', reasoningLevel: 'high', modelRoutingMode: 'direct', modelRoutingRevision: 3, runMode: 'safe',
+    } }
+    const { transport, request } = makeTransport({ [SESSIONS_SIDECHAT_CREATE_METHOD]: child })
+    const result = await createV4SessionLifecycle(transport).createSidechat!({ parentKey: 'parent', clientRequestId: 'owner' })
+    expect(result).toEqual(child)
+    expect(request).toHaveBeenCalledExactlyOnceWith(SESSIONS_SIDECHAT_CREATE_METHOD, { parentKey: 'parent', clientRequestId: 'owner' }, undefined)
+  })
+
+  it('requires authoritative parent and closed-child acknowledgement', async () => {
+    const { transport } = makeTransport({
+      [SESSIONS_SIDECHAT_CREATE_METHOD]: { key: 'child', parentKey: 'other-parent', sessionId: 'id', inherited: {
+        model: null, provider: null, reasoningLevel: null, modelRoutingMode: null, modelRoutingRevision: 0, runMode: null,
+      } },
+      [SESSIONS_SIDECHAT_CLOSE_METHOD]: { key: 'another-child', closed: true },
+    })
+    const lifecycle = createV4SessionLifecycle(transport)
+    await expect(lifecycle.createSidechat!({ parentKey: 'parent', clientRequestId: 'owner' })).rejects.toThrow('confirm its parent')
+    await expect(lifecycle.closeSidechat!({ key: 'child' })).rejects.toThrow('not acknowledged')
+  })
+
+  it('closes only the requested side conversation and advertises both lifecycle methods', async () => {
+    const { transport, request } = makeTransport({ [SESSIONS_SIDECHAT_CLOSE_METHOD]: { key: 'child', closed: true } })
+    await expect(createV4SessionLifecycle(transport).closeSidechat!({ key: 'child' })).resolves.toEqual({ key: 'child', closed: true })
+    expect(request).toHaveBeenCalledExactlyOnceWith(SESSIONS_SIDECHAT_CLOSE_METHOD, { key: 'child' }, undefined)
+    expect(createV4SessionLifecycle({ ...transport, supports: method => method !== SESSIONS_SIDECHAT_CLOSE_METHOD }).supportsSidechat!()).toBe(false)
+  })
+
+  it('materializes a draft at its existing key without a seeded message', async () => {
+    const { request, transport } = makeTransport({
+      [SESSIONS_CREATE_METHOD]: { key: 'agent:main:webchat:draft', sessionId: 'durable-id' },
+    })
+    await createV4SessionLifecycle(transport).create({
+      sessionKey: 'agent:main:webchat:draft', agentId: 'main', kind: 'webchat', workspaceId: 'project-a',
+    })
+    expect(request).toHaveBeenCalledExactlyOnceWith(SESSIONS_CREATE_METHOD, {
+      session_key: 'agent:main:webchat:draft', agentId: 'main', kind: 'webchat', workspaceId: 'project-a',
+    }, undefined)
+  })
+
   it('maps the domain create input to the legacy wire names', async () => {
     const { request, transport } = makeTransport({
       [SESSIONS_CREATE_METHOD]: {

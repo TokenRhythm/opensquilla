@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine import Agent, AgentConfig
-from opensquilla.engine.agent import _provider_retry_delay_seconds
+from opensquilla.engine import Agent, AgentConfig, ToolResult
+from opensquilla.engine.agent import _provider_retry_delay_seconds, _ToolArgumentProgress
 from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.runtime import (
     _SELECTOR_REASONING_TRUNCATED_NOTICE,
@@ -17,15 +17,18 @@ from opensquilla.engine.runtime import (
     _SelectorPreTextBuffer,
 )
 from opensquilla.engine.types import ErrorEvent as EngineErrorEvent
-from opensquilla.engine.types import ProviderActivityEvent, ThinkingEvent
+from opensquilla.engine.types import ProviderActivityEvent, RunHeartbeatEvent, ThinkingEvent
 from opensquilla.provider import (
     ChatConfig,
     DoneEvent,
     ErrorEvent,
     Message,
     ProviderFailureKind,
+    ProviderHeartbeatEvent,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
+    ToolInputSchema,
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
@@ -67,6 +70,259 @@ class _CapturingTurnLog:
         self.records.append({"kind": kind, "payload": payload})
 
 
+class _ObservedSequenceProvider(_SequenceProvider):
+    def __init__(self, streams: list[list[Any]]) -> None:
+        super().__init__(streams)
+        self.observed: list[Any] = []
+
+    async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+        for event in events:
+            self.observed.append(event)
+            yield event
+
+
+def _tool_progress_agent(provider: Any, executions: list[str]) -> Agent:
+    async def handler(call: Any) -> ToolResult:
+        executions.append(call.tool_use_id)
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="ok",
+        )
+
+    return Agent(
+        provider=provider,
+        config=AgentConfig(max_provider_retries=0),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo a value.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=handler,
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_tool_argument_fragment_reports_progress_before_tool_commit() -> None:
+    provider = _ObservedSequenceProvider([
+        [
+            ToolUseStartEvent(tool_use_id="first", tool_name="echo"),
+            ToolUseDeltaEvent(tool_use_id="first", json_fragment=""),
+            ToolUseDeltaEvent(tool_use_id="first", json_fragment="{"),
+            ToolUseStartEvent(tool_use_id="second", tool_name="echo"),
+            ToolUseDeltaEvent(tool_use_id="second", json_fragment="{}"),
+            ToolUseDeltaEvent(tool_use_id="first", json_fragment="}"),
+            ToolUseEndEvent(tool_use_id="first", tool_name="echo", arguments={}),
+            ToolUseEndEvent(tool_use_id="second", tool_name="echo", arguments={}),
+            DoneEvent(stop_reason="tool_calls"),
+        ],
+        [TextDeltaEvent(text="done"), DoneEvent(stop_reason="stop")],
+    ])
+    executions: list[str] = []
+    events: list[Any] = []
+
+    async for event in _tool_progress_agent(provider, executions).run_turn("hello"):
+        events.append(event)
+        if isinstance(event, RunHeartbeatEvent) and event.phase == "llm_tool_arguments":
+            assert isinstance(provider.observed[-1], ToolUseDeltaEvent)
+            assert provider.observed[-1].json_fragment == "{"
+            assert not any(isinstance(raw, DoneEvent) for raw in provider.observed)
+            assert executions == []
+            assert not any(str(getattr(item, "kind", "")).startswith("tool_use") for item in events)
+            assert event.message == "Receiving tool arguments"
+            assert "first" not in repr(event) and "second" not in repr(event)
+
+    heartbeats = [event for event in events if isinstance(event, RunHeartbeatEvent)]
+    # Empty frames and parallel starts do not repeat the initial signal.
+    assert len(heartbeats) == 1
+    assert sorted(executions) == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_tool_argument_progress_preserves_periodic_character_boundary() -> None:
+    prefix = '{"value":"'
+    provider = _ObservedSequenceProvider([
+        [
+            ToolUseStartEvent(tool_use_id="large", tool_name="echo"),
+            ToolUseDeltaEvent(tool_use_id="large", json_fragment=prefix),
+            ToolUseDeltaEvent(tool_use_id="large", json_fragment="x" * (4095 - len(prefix))),
+            ToolUseDeltaEvent(tool_use_id="large", json_fragment="x"),
+            ToolUseDeltaEvent(tool_use_id="large", json_fragment='"}'),
+            ToolUseEndEvent(tool_use_id="large", tool_name="echo", arguments={"value": "x"}),
+            DoneEvent(stop_reason="tool_calls"),
+        ],
+        [TextDeltaEvent(text="done"), DoneEvent(stop_reason="stop")],
+    ])
+    executions: list[str] = []
+    heartbeat_chars: list[int] = []
+
+    async for event in _tool_progress_agent(provider, executions).run_turn("hello"):
+        if isinstance(event, RunHeartbeatEvent) and event.phase == "llm_tool_arguments":
+            heartbeat_chars.append(sum(
+                len(raw.json_fragment)
+                for raw in provider.observed
+                if isinstance(raw, ToolUseDeltaEvent)
+            ))
+
+    assert heartbeat_chars == [len(prefix), 4096]
+    assert executions == ["large"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_prefix", [True, False])
+async def test_tool_argument_progress_never_commits_invalid_or_failed_attempt(
+    invalid_prefix: bool,
+) -> None:
+    provider = _ObservedSequenceProvider([[
+        ToolUseStartEvent(tool_use_id="pending", tool_name="echo"),
+        ToolUseDeltaEvent(
+            tool_use_id="unknown" if invalid_prefix else "pending",
+            json_fragment='{"private":"uncommitted"',
+        ),
+        ErrorEvent(message="request rejected", code="400"),
+    ]])
+    executions: list[str] = []
+
+    events = [event async for event in _tool_progress_agent(provider, executions).run_turn("hello")]
+
+    assert executions == []
+    assert not any(str(getattr(event, "kind", "")).startswith("tool_use") for event in events)
+    assert "uncommitted" not in repr(events)
+    heartbeats = [event for event in events if isinstance(event, RunHeartbeatEvent)]
+    assert len(heartbeats) == (0 if invalid_prefix else 1)
+    assert any(isinstance(event, EngineErrorEvent) for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_leg", [False, True])
+async def test_selector_reports_pending_argument_progress_before_commit(
+    fallback_leg: bool,
+) -> None:
+    streamed = _ObservedSequenceProvider([[
+        ToolUseStartEvent(tool_use_id="private-tool-id", tool_name="echo"),
+        ToolUseDeltaEvent(tool_use_id="private-tool-id", json_fragment='{"secret":'),
+        ToolUseDeltaEvent(tool_use_id="private-tool-id", json_fragment="true}"),
+        ToolUseEndEvent(
+            tool_use_id="private-tool-id", tool_name="echo", arguments={"secret": True},
+        ),
+        DoneEvent(stop_reason="tool_calls"),
+    ]])
+    primary = _SequenceProvider([[ErrorEvent(code="503")]]) if fallback_leg else streamed
+
+    class _Selector:
+        current_config = SimpleNamespace(provider="openrouter", model="primary/model")
+
+        def next_fallback_after_failure(self, exc: Exception) -> Any:
+            del exc
+            self.current_config = SimpleNamespace(provider="openrouter", model="fallback/model")
+            return streamed if fallback_leg else None
+
+    visible: list[Any] = []
+    progress_count = 0
+    async for event in _SelectorFallbackProvider(primary, _Selector()).chat(
+        [Message(role="user", content="hello")]
+    ):
+        visible.append(event)
+        if isinstance(event, ProviderHeartbeatEvent) and event.phase == "llm_tool_arguments":
+            progress_count += 1
+            assert streamed.observed[-1].json_fragment == '{"secret":'
+            assert not any(isinstance(raw, DoneEvent) for raw in streamed.observed)
+            assert event.upstream_activity is True
+            assert "secret" not in repr(event) and "private-tool-id" not in repr(event)
+            assert not any(
+                isinstance(raw, (ToolUseStartEvent, ToolUseDeltaEvent)) for raw in visible
+            )
+
+    assert progress_count == 1
+    assert any(isinstance(event, ToolUseEndEvent) for event in visible)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector_wrapped", [False, True])
+async def test_slow_small_tool_deltas_refresh_progress_for_more_than_twenty_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+    selector_wrapped: bool,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(
+        "opensquilla.engine.agent._ToolArgumentProgress",
+        lambda: _ToolArgumentProgress(clock=lambda: clock[0]),
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime._ToolArgumentProgress",
+        lambda: _ToolArgumentProgress(clock=lambda: clock[0]),
+    )
+
+    class _SlowSmallProvider(_ObservedSequenceProvider):
+        async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+            for event in events:
+                if isinstance(event, ToolUseDeltaEvent):
+                    clock[0] += 1.0
+                self.observed.append(event)
+                yield event
+
+    provider = _SlowSmallProvider([
+        [
+            ToolUseStartEvent(tool_use_id="slow", tool_name="echo"),
+            ToolUseDeltaEvent(tool_use_id="slow", json_fragment='{"value":"'),
+            *[ToolUseDeltaEvent(tool_use_id="slow", json_fragment="x") for _ in range(24)],
+            ToolUseDeltaEvent(tool_use_id="slow", json_fragment='"}'),
+            ToolUseEndEvent(tool_use_id="slow", tool_name="echo", arguments={"value": "x" * 24}),
+            DoneEvent(stop_reason="tool_calls"),
+        ],
+        [TextDeltaEvent(text="done"), DoneEvent(stop_reason="stop")],
+    ])
+
+    class _Selector:
+        current_config = SimpleNamespace(provider="openrouter", model="primary/model")
+
+    agent_provider = (
+        _SelectorFallbackProvider(provider, _Selector()) if selector_wrapped else provider
+    )
+    executions: list[str] = []
+    pulse_times: list[float] = []
+    async for event in _tool_progress_agent(agent_provider, executions).run_turn("hello"):
+        if (
+            isinstance(event, RunHeartbeatEvent)
+            and event.phase == "llm_tool_arguments"
+            and not any(isinstance(raw, DoneEvent) for raw in provider.observed)
+        ):
+            pulse_times.append(clock[0])
+            assert executions == []
+
+    assert pulse_times == list(range(1, 26, 2))
+    assert executions == ["slow"]
+
+
+def test_tool_argument_progress_ignores_empty_fragments_and_resets_for_retry() -> None:
+    clock = [0.0]
+    progress = _ToolArgumentProgress(clock=lambda: clock[0])
+    assert progress.record("first", "{")
+    clock[0] = 25.0
+    assert not progress.record("first", "")  # Time alone never manufactures progress.
+    assert progress.record("first", "x")
+    progress.clear()
+    assert progress.record("second-attempt", "{")
+
+
+def test_selector_progress_does_not_escape_invalid_frames_or_failed_buffer() -> None:
+    buffer = _SelectorPreTextBuffer()
+    assert buffer.append(ToolUseDeltaEvent(tool_use_id="missing", json_fragment="private")) is None
+    assert buffer.protocol_error
+    assert buffer.drain(successful_leg=False) == []
+    buffer.append(ToolUseStartEvent(tool_use_id="next", tool_name="echo"))
+    pulse = buffer.append(ToolUseDeltaEvent(tool_use_id="next", json_fragment="{"))
+    assert isinstance(pulse, ProviderHeartbeatEvent)
+    assert buffer.drain(successful_leg=False) == []
+    buffer.append(ToolUseStartEvent(tool_use_id="retry", tool_name="echo"))
+    assert isinstance(
+        buffer.append(ToolUseDeltaEvent(tool_use_id="retry", json_fragment="{")),
+        ProviderHeartbeatEvent,
+    )
+
+
 @pytest.fixture
 async def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     loop = asyncio.get_running_loop()
@@ -80,6 +336,12 @@ async def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         await original_sleep(0)
 
     monkeypatch.setattr(loop, "time", lambda: now[0])
+    from opensquilla.provider import retry_after
+
+    monkeypatch.setattr(
+        retry_after, "_provider_retry_after_cooldowns",
+        retry_after.ProviderRetryAfterCooldowns(clock=loop.time),
+    )
     monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     return sleeps
 
@@ -455,12 +717,16 @@ async def test_selector_streams_each_fallback_reasoning_delta_before_text() -> N
             )
             return fallback
 
-    events = [
-        event
-        async for event in _SelectorFallbackProvider(primary, _Selector()).chat(
-            [Message(role="user", content="hi")]
-        )
-    ]
+    stream = _SelectorFallbackProvider(primary, _Selector()).chat(
+        [Message(role="user", content="hi")]
+    )
+    first = await anext(stream)
+    assert isinstance(first, ProviderDomainActivityEvent)
+    assert (first.phase, first.from_model, first.model) == (
+        "fallback", "primary/model", "fallback/model",
+    )
+    assert fallback.calls == 0  # Selection is observed before the target request begins.
+    events = [first, *[event async for event in stream]]
 
     visible = [
         event

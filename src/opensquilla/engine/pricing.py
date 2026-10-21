@@ -126,6 +126,11 @@ class ResolvedModelPrice:
     entry: PriceEntry
     source: str
 
+    @property
+    def has_accounting_price(self) -> bool:
+        """Heuristic defaults are not evidence of a quoted price, including zero."""
+        return self.source not in {"default", "custom_free"}
+
 
 @dataclass(frozen=True)
 class CostEstimate:
@@ -741,3 +746,51 @@ def resolve_model_price(model_id: str, provider: str = "") -> ResolvedModelPrice
 def lookup_price(model_id: str, provider: str = "") -> PriceEntry:
     """Look up pricing through the layered resolver (see resolve_model_price)."""
     return resolve_model_price(model_id, provider).entry
+
+
+def token_price_snapshot(
+    resolved: ResolvedModelPrice, *, provider: str, model: str, cache_blind: bool = False,
+):
+    """Freeze the rates actually selected for one legacy token estimate.
+
+    The content identity remains reproducible even when an external catalog has
+    no upstream revision. New media estimators use explicit UsagePriceRules.
+    """
+    import hashlib
+
+    from opensquilla.usage_metering import UsagePriceRule, UsagePriceSnapshot, canonical_json
+
+    price = resolved.entry
+    rates = {
+        "input": price.input_per_m,
+        "output": price.output_per_m,
+        "cache_read": price.cache_read_per_m,
+        "cache_write": price.cache_write_per_m,
+        "cache_blind": cache_blind,
+    }
+    children = () if cache_blind else ("cache_read_tokens", "cache_write_tokens")
+    rules = [
+        UsagePriceRule(
+            "input_tokens", "token", str(price.input_per_m), "1000000", subtract_metrics=children
+        ),
+        UsagePriceRule("output_tokens", "token", str(price.output_per_m), "1000000"),
+    ]
+    if not cache_blind:
+        rules.extend(
+            (
+                UsagePriceRule(
+                    "cache_read_tokens", "token", str(price.cache_read_per_m or 0), "1000000"
+                ),
+                UsagePriceRule(
+                    "cache_write_tokens", "token", str(price.cache_write_per_m or 0), "1000000"
+                ),
+            )
+        )
+    return UsagePriceSnapshot(
+        source=resolved.source,
+        source_revision="rates-sha256:"
+        + hashlib.sha256(canonical_json(rates).encode()).hexdigest(),
+        rules=tuple(rules),
+        provider=provider,
+        model=model,
+    )

@@ -47,6 +47,7 @@ from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.run_mode import full_host_access_for_context
 from opensquilla.tools.types import current_tool_context
+from tests.helpers.sqlite_process_probe import run_sqlite_probe
 
 OWNER = Principal(
     role="operator",
@@ -1825,6 +1826,7 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from opensquilla.artifact_session import ArtifactSessionService
     from opensquilla.sandbox.escalation import (
         current_tool_run_context,
         reset_resolved_run_context_overlays,
@@ -1964,6 +1966,10 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
     object.__setattr__(envelope, "sandbox_run_context_fresh", True)
 
     try:
+        # build_services initializes ArtifactSession before accepting turns.
+        # Match that readiness step before the unchanged stream/wait deadlines.
+        artifact_service = await ArtifactSessionService.from_session_storage(storage)
+        await artifact_service.close()
         first = await runtime.enqueue(envelope, "first")
         await asyncio.wait_for(first_started.wait(), timeout=2.0)
         assert (await runtime.status(first.task_id)).status == "running"
@@ -2345,67 +2351,105 @@ async def test_reset_revalidates_missing_project_after_durable_acceptance(
         assert calls == []
 
 
-@pytest.mark.asyncio
-async def test_fork_revalidates_file_replacement_after_durable_acceptance(
-    tmp_path: Path,
+_PROJECT_REVALIDATION_PROBE = (
+    Path(__file__).with_name("fixtures") / "project_workspace_revalidation_probe.py"
+)
+
+
+def test_fork_revalidates_file_replacement_after_durable_acceptance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with open_stack(tmp_path / "sessions.db") as stack:
-        project_path = tmp_path / "project"
-        project = await add_project(stack, project_path)
-        assert project is not None
-        parent = await stack.manager.create(
-            "agent:main:webchat:fork-post-accept-file",
-            workspace_id=project.workspace_id,
-            origin={
-                RUN_CONTEXT_ORIGIN_KEY: {
-                    "run_mode": "standard",
-                    "workspace": project.path,
-                }
-            },
-        )
-        fork_before = await stack.manager.append_message(
-            parent.session_key,
-            "user",
-            "fork here",
-        )
-        calls: list[dict[str, Any]] = []
+    # Real durable rejection is a correctness contract, not a two-second SLO.
+    # Keep the shared await_direct_task and all other scenarios unchanged.
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    result = run_sqlite_probe(tmp_path, _PROJECT_REVALIDATION_PROBE, ("none",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "probe_stdout_utf8=\u2713" in result.output
+    assert "probe_stderr_utf8=\u2713" in result.output
+    assert "phase=cleanup-complete" in result.output
+    assert "project_workspace_revalidation_contract=passed" in result.output
 
-        class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
-                calls.append(kwargs)
-                yield DoneEvent()
 
-        original_accept_turn = stack.storage.accept_turn
-        replaced = False
+def test_project_workspace_revalidation_probe_preserves_slow_real_commit(tmp_path: Path) -> None:
+    result = run_sqlite_probe(tmp_path, _PROJECT_REVALIDATION_PROBE, ("slow-error-commit",))
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "error_commit_delay=2.1" in result.output
+    assert "phase=cleanup-complete" in result.output
+    assert "project_workspace_revalidation_contract=passed" in result.output
 
-        async def replace_after_accept(*args: Any, **kwargs: Any) -> Any:
-            nonlocal replaced
-            acceptance = await original_accept_turn(*args, **kwargs)
-            if not replaced:
-                replaced = True
-                project_path.rmdir()
-                project_path.write_text("not a directory", encoding="utf-8")
-            return acceptance
 
-        stack.storage.accept_turn = replace_after_accept  # type: ignore[method-assign]
-        stack.context.task_runtime = None
-        stack.context.turn_runner = Runner()
-        response = await get_dispatcher().dispatch(
-            "fork-post-accept-file",
-            "sessions.send",
-            {
-                "key": parent.session_key,
-                "message": "forked",
-                "forkBeforeMessageId": fork_before.message_id,
-            },
-            stack.context,
-        )
-        assert response.ok is True
-        child_key = response.payload["sessionKey"]
-        await await_direct_task(child_key)
+@pytest.mark.parametrize(("fault", "failure"), [
+    ("bypass-revalidation", "replaced project reached the runner"),
+    ("duplicate-error-append", "workspace rejection was not persisted exactly once"),
+])
+def test_project_workspace_revalidation_probe_rejects_broken_behavior(
+    tmp_path: Path, fault: str, failure: str,
+) -> None:
+    result = run_sqlite_probe(tmp_path, _PROJECT_REVALIDATION_PROBE, (fault,))
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert f"fault={fault}" in result.output.splitlines(), result.output
+    assert "phase=cleanup-complete" in result.output
+    assert result.output.rstrip().splitlines()[-1] == f"AssertionError: {failure}", result.output
+    assert "project_workspace_revalidation_contract=passed" not in result.output
 
-        assert replaced is True
-        assert calls == []
+
+@pytest.mark.parametrize("fault", ["hang-persist", "hang-cleanup"])
+def test_project_workspace_revalidation_probe_bounds_noncompletion(
+    tmp_path: Path, fault: str,
+) -> None:
+    ready = f"PROJECT_REVALIDATION_{fault.upper().replace('-', '_')}_ENTERED"
+    result = run_sqlite_probe(
+        tmp_path, _PROJECT_REVALIDATION_PROBE, (fault,),
+        ready_signal=ready, execution_seconds=3,
+    )
+    assert result.timed_out == "execution/cleanup", result.output
+    assert result.returncode != 0, result.output
+    assert f"fault={fault}" in result.output.splitlines(), result.output
+    assert ready in result.output.splitlines(), result.output
+    assert f"phase={fault}-blocked" in result.output.splitlines(), result.output
+    if fault == "hang-cleanup":
+        assert "phase=workspace-revalidation-verified" in result.output.splitlines(), result.output
+        assert "phase=direct-task-cleanup-complete" in result.output.splitlines(), result.output
+    else:
+        assert "phase=admission-verified" in result.output.splitlines(), result.output
+    assert "phase=cleanup-complete" not in result.output
+    assert "project_workspace_revalidation_contract=passed" not in result.output
+
+
+@pytest.mark.parametrize(("fault", "failure", "verified"), [
+    (
+        "hang-cleanup-with-prior-error",
+        "prior failure must not become an expected cleanup hang",
+        "workspace-revalidation-verified",
+    ),
+    (
+        "hang-persist-with-prior-error",
+        "prior failure must not become an expected persistence hang",
+        "admission-verified",
+    ),
+])
+def test_project_workspace_revalidation_probe_preserves_prior_failure(
+    tmp_path: Path, fault: str, failure: str, verified: str,
+) -> None:
+    ready = f"PROJECT_REVALIDATION_{fault.upper().replace('-', '_')}_ENTERED"
+    result = run_sqlite_probe(
+        tmp_path, _PROJECT_REVALIDATION_PROBE, (fault,),
+        ready_signal=ready, execution_seconds=3,
+    )
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert f"fault={fault}" in result.output.splitlines(), result.output
+    assert f"phase={verified}" in result.output.splitlines(), result.output
+    if fault == "hang-persist-with-prior-error":
+        assert "phase=error-persistence" in result.output.splitlines(), result.output
+    assert "phase=cleanup-complete" in result.output.splitlines(), result.output
+    assert result.output.rstrip().splitlines()[-1] == f"RuntimeError: {failure}", result.output
+    assert ready not in result.output
+    assert f"phase={fault}-blocked" not in result.output
+    assert "project_workspace_revalidation_contract=passed" not in result.output
 
 
 @pytest.mark.asyncio
@@ -2820,6 +2864,8 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
             assert outcomes["outside_after_standard"] is False
             assert [operation.kind for operation in native_operations] == ["write_text"]
 
+            # The ordinary Full turn uses the configured default workspace.
+            (tmp_path / "default-workspace").mkdir()
             full_completed = asyncio.Event()
 
             class FullRunner:

@@ -1,4 +1,5 @@
 import { normalizePageContext } from '@/types/pageContext'
+import { artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 
@@ -127,6 +128,79 @@ export function createRpcWorkbenchResourceProvider(
     }
   }
 
+  async function openResource(sessionKey: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<import('@/types/workbenchResources').WorkbenchResourceOpenResponse | null> {
+    if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.open)) return null
+    let response: Record<string, unknown>
+    try {
+      response = await call<Record<string, unknown>>(WORKBENCH_RESOURCE_RPC_METHODS.open, { sessionKey, ...params }, signal)
+    } catch (error) {
+      if (isMethodNotFound(error)) return null
+      throw error
+    }
+    const resolved = normalizeWorkbenchResource(response.resource)
+    const resolution = record(response.resolution)
+    const resolutionStatus = resolution ? stringAt(resolution, 'status') : ''
+    const disposition = stringAt(response, 'disposition')
+      || (resolutionStatus === 'readonly' ? 'readonly' : 'document')
+    if (!resolved) throw new Error('The workbench open response is invalid.')
+    if (disposition === 'readonly') {
+      const reasonCode = stringAt(response, 'reasonCode', 'reason_code')
+        || resolved.capabilities.editReasonCode
+        || resolved.capabilities.reasonCode
+        || 'format_edit_not_supported'
+      return {
+        disposition,
+        resolution: { status: 'readonly' },
+        resource: {
+          ...resolved,
+          capabilities: {
+            ...resolved.capabilities,
+            manualEdit: false,
+            edit: resolved.capabilities.agentEdit,
+            editReasonCode: reasonCode,
+            reasonCode,
+          },
+        },
+        reasonCode,
+        materialized: false,
+      }
+    }
+    if (disposition !== 'document') {
+      throw new Error('The workbench open disposition is invalid.')
+    }
+    const document = normalizeArtifactDocument(response.document, undefined, sessionKey)
+    const revision = normalizeArtifactRevision(response.revision)
+    const binding = response.binding === undefined
+      ? null
+      : normalizeBinding(response.binding)
+    if (
+      !document
+      || !revision
+      || revision.documentId !== document.documentId
+      || revision.revisionId !== document.headRevisionId
+      || resolved.resource.type !== 'document'
+      || workbenchResourceRefId(resolved.resource) !== document.documentId
+      || (response.binding !== undefined && !binding)
+    ) {
+      throw new Error('The current workbench document response is invalid.')
+    }
+    return {
+      disposition,
+      resolution: {
+        status: resolutionStatus === 'materialized' ? 'materialized' : 'current',
+      },
+      resource: resolved,
+      document,
+      revision,
+      ...(binding ? { binding } : {}),
+      ...(normalizePageContext(response.pageContext) ? { pageContext: normalizePageContext(response.pageContext)! } : {}),
+      ...(typeof response.workingFile === 'string' ? { workingFile: response.workingFile } : {}),
+      materialized: boolAt(response, 'materialized'),
+      ...(typeof response.baselineUpdated === 'boolean' ? { baselineUpdated: response.baselineUpdated } : {}),
+      ...(stringAt(response, 'previousRevisionId') ? { previousRevisionId: stringAt(response, 'previousRevisionId') } : {}),
+    }
+  }
+
   return {
     available: () => supports(WORKBENCH_RESOURCE_RPC_METHODS.list),
     canImportDocuments: () => supports(WORKBENCH_RESOURCE_RPC_METHODS.importDocument),
@@ -166,6 +240,12 @@ export function createRpcWorkbenchResourceProvider(
         )
         const hasMore = boolAt(response, 'hasMore', 'has_more')
         const nextCursor = stringAt(response, 'nextCursor', 'next_cursor')
+        // Bounded secondary consumers (such as Markdown images) must not walk
+        // an entire old session. Normal Workbench callers keep full pagination.
+        if (options.singlePage) return {
+          resources: [...resources.values()], totalCount,
+          hasMore, nextCursor: nextCursor || null,
+        }
         if (!hasMore) break
         if (!nextCursor || visitedCursors.has(nextCursor)) {
           throw new Error('Workbench resource pagination did not advance.')
@@ -185,87 +265,16 @@ export function createRpcWorkbenchResourceProvider(
       return normalizeWorkbenchResource(response.resource)
     },
     async open(sessionKey, resource, request, signal) {
-      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.open)) return null
-      let response: Record<string, unknown>
-      try {
-        response = await call<Record<string, unknown>>(
-          WORKBENCH_RESOURCE_RPC_METHODS.open,
-          {
-            sessionKey,
-            resourceRef: serializeRef(resource),
-            intent: request.intent,
-            ...(request.expectedSha256
-              ? { expectedSha256: request.expectedSha256 }
-              : {}),
-            idempotencyKey: request.idempotencyKey,
-          },
-          signal,
-        )
-      } catch (error) {
-        // Mixed-version Gateways keep the existing preview/import fallback.
-        if (isMethodNotFound(error)) return null
-        throw error
-      }
-      const resolved = normalizeWorkbenchResource(response.resource)
-      const resolution = record(response.resolution)
-      const resolutionStatus = resolution ? stringAt(resolution, 'status') : ''
-      const disposition = stringAt(response, 'disposition')
-        || (resolutionStatus === 'readonly' ? 'readonly' : 'document')
-      if (!resolved) throw new Error('The workbench open response is invalid.')
-      if (disposition === 'readonly') {
-        const reasonCode = stringAt(response, 'reasonCode', 'reason_code')
-          || resolved.capabilities.editReasonCode
-          || resolved.capabilities.reasonCode
-          || 'format_edit_not_supported'
-        return {
-          disposition,
-          resolution: { status: 'readonly' },
-          resource: {
-            ...resolved,
-            capabilities: {
-              ...resolved.capabilities,
-              manualEdit: false,
-              edit: resolved.capabilities.agentEdit,
-              editReasonCode: reasonCode,
-              reasonCode,
-            },
-          },
-          reasonCode,
-          materialized: false,
-        }
-      }
-      if (disposition !== 'document') {
-        throw new Error('The workbench open disposition is invalid.')
-      }
-      const document = normalizeArtifactDocument(response.document, undefined, sessionKey)
-      const revision = normalizeArtifactRevision(response.revision)
-      const binding = response.binding === undefined
-        ? null
-        : normalizeBinding(response.binding)
-      if (
-        !document
-        || !revision
-        || revision.documentId !== document.documentId
-        || revision.revisionId !== document.headRevisionId
-        || resolved.resource.type !== 'document'
-        || workbenchResourceRefId(resolved.resource) !== document.documentId
-        || (response.binding !== undefined && !binding)
-      ) {
-        throw new Error('The current workbench document response is invalid.')
-      }
-      return {
-        disposition,
-        resolution: {
-          status: resolutionStatus === 'materialized' ? 'materialized' : 'current',
-        },
-        resource: resolved,
-        document,
-        revision,
-        ...(binding ? { binding } : {}),
-        ...(normalizePageContext(response.pageContext) ? { pageContext: normalizePageContext(response.pageContext)! } : {}),
-        ...(typeof response.workingFile === 'string' ? { workingFile: response.workingFile } : {}),
-        materialized: boolAt(response, 'materialized'),
-      }
+      return openResource(sessionKey, { resourceRef: serializeRef(resource), ...request }, signal)
+    },
+    async prepareAnnotation(sessionKey, request, signal) {
+      if (Boolean(request.resourceRef) === Boolean(request.workspaceFile)) throw new Error('Choose one annotation resource.')
+      return openResource(sessionKey, {
+        intent: 'annotate',
+        ...(request.resourceRef ? { resourceRef: serializeRef(request.resourceRef) } : { workspaceFile: { ...request.workspaceFile } }),
+        ...(request.resourceRef && request.expectedSha256 ? { expectedSha256: request.expectedSha256 } : {}),
+        ...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
+      }, signal)
     },
     async createPreview(sessionKey, resource, signal) {
       if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.createPreview)) {
@@ -311,6 +320,14 @@ export function createRpcWorkbenchResourceProvider(
       const resolved = normalizeWorkbenchResource(response.resource)
       const preview = record(response.preview)
       const previewResource = normalizeRef(preview?.resource)
+      const format = resolved ? artifactWorkbenchPreviewKind({ name: resolved.name, mime: resolved.mime }) : 'unsupported'
+      const localAdapter = record(preview?.adapter)
+      const localRenderer = stringAt(preview || {}, 'mode') === 'local-renderer'
+        && stringAt(preview || {}, 'sandboxProfile', 'sandbox_profile') === 'none'
+        && isOfficePreviewFormat(format) && localAdapter?.id === 'silurus-office'
+        && localAdapter.version === '0.88.0' && localAdapter.format === format
+      const isolatedRenderer = stringAt(preview || {}, 'mode') === 'isolated'
+        && stringAt(preview || {}, 'sandboxProfile', 'sandbox_profile') === 'opaque-offline'
       if (
         !resolved
         || !resolved.capabilities.preview
@@ -319,8 +336,7 @@ export function createRpcWorkbenchResourceProvider(
         || previewResource.type !== resolved.resource.type
         || workbenchResourceRefId(previewResource)
           !== workbenchResourceRefId(resolved.resource)
-        || stringAt(preview, 'mode') !== 'isolated'
-        || stringAt(preview, 'sandboxProfile', 'sandbox_profile') !== 'opaque-offline'
+        || !(localRenderer || isolatedRenderer)
         || valueAt(preview, 'network') !== false
       ) {
         throw new Error('The workbench preview descriptor is invalid.')
@@ -329,10 +345,10 @@ export function createRpcWorkbenchResourceProvider(
         resource: resolved,
         preview: {
           protocolVersion: numberAt(preview, 'protocolVersion', 'protocol_version') ?? 1,
-          mode: 'isolated',
+          mode: localRenderer ? 'local-renderer' : 'isolated',
           resource: previewResource,
           launchUrl: stringAt(preview, 'launchUrl', 'launch_url') || undefined,
-          sandboxProfile: 'opaque-offline',
+          sandboxProfile: localRenderer ? 'none' : 'opaque-offline',
           network: false,
           adapter: record(preview.adapter),
         },

@@ -2,6 +2,10 @@
 
 from typing import Final
 
+UNPRODUCTIVE_COMPACTION_REASONS: Final[frozenset[str]] = frozenset(
+    {"no_compression_benefit", "no_progress"},
+)
+
 STALE_COMPACTION_REASONS: Final[frozenset[str]] = frozenset(
     {
         "stale_preimage",

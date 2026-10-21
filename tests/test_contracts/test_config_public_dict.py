@@ -66,7 +66,6 @@ PUBLIC_TOP_LEVEL_KEYS = frozenset(
         "agents",
         "agents_defaults",
         "subagents",
-        "meta_skill",
         "control_ui",
         "privacy",
     }

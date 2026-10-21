@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shlex
@@ -87,6 +88,91 @@ def _process_test_python() -> str:
     return sys.executable
 
 
+def _real_exec_diagnostic(session: shell._BgSession) -> dict[str, object]:
+    collector = session.collector_task
+    stack = []
+    awaited = collector.get_coro() if collector is not None else None
+    for _ in range(12):
+        frame = getattr(awaited, "cr_frame", None)
+        if frame is not None:
+            stack.append(f"{frame.f_code.co_name}:{frame.f_lineno}")
+        awaited = getattr(awaited, "cr_await", None)
+        if awaited is None:
+            break
+    owner = session.process_tree
+    return {
+        "execution_id": session.session_id,
+        "pid": session.process.pid,
+        "process_returncode": session.process.returncode,
+        "session_returncode": session.returncode,
+        "done": session.done,
+        "timed_out": session.timed_out,
+        "killed": session.killed,
+        "io_mode": session.io_mode_used,
+        "collector_done": collector.done() if collector is not None else None,
+        "collector_cancelled": collector.cancelled() if collector is not None else None,
+        "collector_await_stack": stack,
+        "capture": session.output_capture.describe(),
+        # Query the already-owned Job only; is_active() can close an empty Job.
+        "windows_job_active_processes": (
+            owner.windows_job.active_process_count()
+            if owner is not None and owner.windows_job is not None else None
+        ),
+    }
+
+
+@contextlib.asynccontextmanager
+async def _owned_real_exec(session_key: str, task_id: str):
+    """Keep failure evidence and reap only sessions started by this test scope."""
+    existing = set(shell._bg_sessions)
+    token = current_tool_context.set(_ctx(session_key, task_id=task_id))
+    observed: dict[str, object] = {}
+    failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
+    try:
+        yield observed
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            sessions = [
+                session for execution_id, session in tuple(shell._bg_sessions.items())
+                if execution_id not in existing
+                and session.session_key == session_key and session.task_id == task_id
+            ]
+            if failure is not None:
+                failure.add_note(f"real exec observations: {json.dumps(observed)}")
+                for session in sessions:
+                    try:
+                        failure.add_note(json.dumps(_real_exec_diagnostic(session)))
+                    except Exception as exc:
+                        failure.add_note(f"real exec diagnostic failed: {exc!r}")
+            for session in sessions:
+                try:
+                    await shell._stop_bg_session(session)
+                except BaseException as exc:
+                    cleanup_failure = cleanup_failure or exc
+                    (failure or cleanup_failure).add_note(f"owned session stop failed: {exc!r}")
+                try:
+                    # _stop_bg_session suppresses its collector timeout. Explicitly
+                    # drain and verify instead of letting registry reset hide it.
+                    if session.collector_task is not None:
+                        await asyncio.wait_for(
+                            asyncio.shield(session.collector_task),
+                            timeout=shell._BACKGROUND_KILL_TIMEOUT,
+                        )
+                    assert session.done, "owned session did not finalize"
+                    assert session.process_tree is None or not session.process_tree.is_active()
+                except BaseException as exc:
+                    cleanup_failure = cleanup_failure or exc
+                    (failure or cleanup_failure).add_note(f"owned session drain failed: {exc!r}")
+        finally:
+            current_tool_context.reset(token)
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
+
+
 @pytest.fixture(autouse=True)
 def _reset_bg_sessions():
     previous = dict(shell._bg_sessions)
@@ -134,41 +220,6 @@ def test_background_process_result_surfaces_local_http_server_url() -> None:
     assert "include the local URL" in result
 
 
-def test_bg_session_payload_surfaces_codetask_status_with_spaced_path(tmp_path) -> None:
-    run_dir = tmp_path / "Application Support" / "code-task" / "run-1"
-    run_dir.mkdir(parents=True)
-    status_path = run_dir / "status.json"
-    status_path.write_text(
-        json.dumps(
-            {
-                "run_id": "run-1",
-                "phase": "agent_running",
-                "updated": "2026-06-29T00:00:00Z",
-                "log_paths": {"stdout": str(run_dir / "agent_stdout.log")},
-            }
-        ),
-        encoding="utf-8",
-    )
-    session = _session(
-        "code",
-        "agent:main:one",
-        command="opensquilla-gateway code-task solve --task-file /tmp/x --yes",
-    )
-    session.output_lines.append(
-        "[code-task] run started: run_id=run-1 "
-        f"artifact_dir={run_dir} status={status_path} "
-        "(work happens in the run dir)\n"
-    )
-
-    payload = shell._bg_session_payload(session)
-
-    code_task = payload["code_task"]
-    assert isinstance(code_task, dict)
-    assert code_task["run_id"] == "run-1"
-    assert code_task["artifact_dir"] == str(run_dir)
-    assert code_task["status_path"] == str(status_path)
-    assert code_task["phase"] == "agent_running"
-    assert code_task["log_paths"] == {"stdout": str(run_dir / "agent_stdout.log")}
 
 
 def test_verified_channel_admin_can_manage_background_sessions_across_sessions() -> None:
@@ -451,44 +502,53 @@ async def test_task_cancel_is_exact_across_siblings_sessions_and_repeats() -> No
         ("agent:main:shared", "task-sibling"),
         ("agent:main:other", "task-target"),
     )
-    for session_key, task_id in identities:
-        token = current_tool_context.set(_ctx(session_key, task_id=task_id))
-        try:
+    # Tree cancellation can complete before the collector and Proactor pipes.
+    # Keep every started scope owned until it has drained, including when a
+    # later spawn fails, so registry reset cannot strand a previous test's loop.
+    async with contextlib.AsyncExitStack() as owned:
+        for session_key, task_id in identities:
+            observed = await owned.enter_async_context(_owned_real_exec(session_key, task_id))
             result = await shell._start_host_background_process(
                 _python_shell_command("import time; time.sleep(30)"),
                 cwd=None,
                 effective_timeout=30.0,
                 runtime=None,
             )
-        finally:
-            current_tool_context.reset(token)
-        session_id = result.splitlines()[0].split("=", 1)[1]
-        sessions.append(shell._bg_sessions[session_id])
+            observed["started"] = result
+            session_id = result.splitlines()[0].split("=", 1)[1]
+            sessions.append(shell._bg_sessions[session_id])
 
-    try:
-        assert await shell.cancel_background_processes_for_task(
-            "agent:main:shared",
-            "task-target",
-        ) == 1
-        assert await shell.cancel_background_processes_for_task(
-            "agent:main:shared",
-            "task-target",
-        ) == 0
-        assert sessions[0].process_tree is not None
-        assert sessions[0].process_tree.is_active() is False
-        assert sessions[1].process_tree is not None
-        assert sessions[1].process_tree.is_active() is True
-        assert sessions[2].process_tree is not None
-        assert sessions[2].process_tree.is_active() is True
-    finally:
-        await shell.cancel_background_processes_for_task(
-            "agent:main:shared",
-            "task-sibling",
-        )
-        await shell.cancel_background_processes_for_task(
-            "agent:main:other",
-            "task-target",
-        )
+        failure: BaseException | None = None
+        try:
+            assert await shell.cancel_background_processes_for_task(
+                "agent:main:shared",
+                "task-target",
+            ) == 1
+            assert await shell.cancel_background_processes_for_task(
+                "agent:main:shared",
+                "task-target",
+            ) == 0
+            assert sessions[0].process_tree is not None
+            assert sessions[0].process_tree.is_active() is False
+            assert sessions[1].process_tree is not None
+            assert sessions[1].process_tree.is_active() is True
+            assert sessions[2].process_tree is not None
+            assert sessions[2].process_tree.is_active() is True
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            cleanup_failure: BaseException | None = None
+            for session_key, task_id in identities[1:]:
+                try:
+                    await shell.cancel_background_processes_for_task(session_key, task_id)
+                except BaseException as exc:
+                    cleanup_failure = cleanup_failure or exc
+                    (failure or cleanup_failure).add_note(
+                        f"task cancellation cleanup failed for {session_key}/{task_id}: {exc!r}"
+                    )
+            if failure is None and cleanup_failure is not None:
+                raise cleanup_failure
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
@@ -554,39 +614,47 @@ async def test_exec_command_writes_optional_stdin() -> None:
 async def test_exec_command_yield_returns_handle_and_process_waits_for_same_run() -> None:
     """The unified start path must spawn once and expose its result to process."""
 
-    token = current_tool_context.set(
-        _ctx("agent:main:unified-exec", task_id="task-unified-exec")
-    )
-    try:
-        command = _python_shell_command(
-            "import time; print('started', flush=True); time.sleep(0.2); print('done')"
+    async with _owned_real_exec("agent:main:unified-exec", "task-unified-exec") as observed:
+        # This owns the managed handle/wait contract. Use the Windows shell
+        # directly so its five-second budget does not also measure another
+        # interpreter's redirector and site initialization. Native Python argv
+        # and stdin contracts have separate coverage in test_shell_native_argv.
+        command = (
+            "Write-Output 'started'; Start-Sleep -Milliseconds 200; Write-Output 'done'"
+            if os.name == "nt"
+            else _python_shell_command(
+                "import time; print('started', flush=True); time.sleep(0.2); print('done')"
+            )
         )
         started = await shell.exec_command(command, timeout=5.0, yield_time_ms=0)
         payload = json.loads(started)
+        observed["started"] = payload
         execution_id = payload["execution_id"]
         assert payload["session"]["status"] == "running"
 
         waited = json.loads(
             await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
         )
+        observed["waited"] = waited
         assert waited["execution_id"] == execution_id
         assert waited["exited"] is True
         assert waited["session"]["status"] == "done"
         assert waited["session"]["returncode"] == 0
         assert "started" in waited["output"]
         assert "done" in waited["output"]
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.asyncio
 async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
-    token = current_tool_context.set(
-        _ctx("agent:main:unified-pipe", task_id="task-unified-pipe")
-    )
-    try:
-        command = _python_shell_command(
-            "import sys; print('READY', flush=True); print('INPUT:' + sys.stdin.read())"
+    async with _owned_real_exec("agent:main:unified-pipe", "task-unified-pipe") as observed:
+        # Exercise the actual shell pipe through submit/EOF without adding a
+        # second runtime's startup to this generic process API contract.
+        command = (
+            "Write-Output 'READY'; Write-Output ('INPUT:' + ($input -join ''))"
+            if os.name == "nt"
+            else _python_shell_command(
+                "import sys; print('READY', flush=True); print('INPUT:' + sys.stdin.read())"
+            )
         )
         started = json.loads(
             await shell.exec_command(
@@ -595,6 +663,7 @@ async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
                 io_mode="pipe",
             )
         )
+        observed["started"] = started
         execution_id = started["execution_id"]
         written = json.loads(
             await shell.process(
@@ -609,10 +678,9 @@ async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
         waited = json.loads(
             await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
         )
+        observed["waited"] = waited
         assert waited["session"]["returncode"] == 0
         assert "INPUT:payload" in waited["output"]
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.platform_pty
@@ -709,24 +777,34 @@ async def test_unified_exec_emits_process_completion_event() -> None:
 
 @pytest.mark.asyncio
 async def test_process_wait_any_and_all_cover_multiple_unified_executions() -> None:
-    token = current_tool_context.set(
-        _ctx("agent:main:wait-modes", task_id="task-wait-modes")
-    )
-    try:
+    async with _owned_real_exec("agent:main:wait-modes", "task-wait-modes") as observed:
+        # Multiple-session waiting is independent of native Python startup.
+        first_command = (
+            "Start-Sleep -Milliseconds 100; Write-Output 'first'"
+            if os.name == "nt"
+            else _python_shell_command("import time; time.sleep(0.1); print('first')")
+        )
+        second_command = (
+            "Start-Sleep -Milliseconds 800; Write-Output 'second'"
+            if os.name == "nt"
+            else _python_shell_command("import time; time.sleep(0.8); print('second')")
+        )
         first = json.loads(
             await shell.exec_command(
-                _python_shell_command("import time; time.sleep(0.1); print('first')"),
+                first_command,
                 yield_time_ms=0,
                 timeout=5.0,
             )
         )
+        observed["first_started"] = first
         second = json.loads(
             await shell.exec_command(
-                _python_shell_command("import time; time.sleep(0.8); print('second')"),
+                second_command,
                 yield_time_ms=0,
                 timeout=5.0,
             )
         )
+        observed["second_started"] = second
         execution_ids = [first["execution_id"], second["execution_id"]]
         any_result = json.loads(
             await shell.process(
@@ -736,6 +814,7 @@ async def test_process_wait_any_and_all_cover_multiple_unified_executions() -> N
                 timeout=5.0,
             )
         )
+        observed["waited_any"] = any_result
         assert any_result["wait_mode"] == "any"
         assert any_result["exited"] is True
         assert any_result["completed_execution_ids"]
@@ -748,12 +827,11 @@ async def test_process_wait_any_and_all_cover_multiple_unified_executions() -> N
                 timeout=5.0,
             )
         )
+        observed["waited_all"] = all_result
         assert all_result["wait_mode"] == "all"
         assert all_result["exited"] is True
         assert set(all_result["completed_execution_ids"]) == set(execution_ids)
         assert all(item["status"] == "done" for item in all_result["sessions"])
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.asyncio
@@ -1098,18 +1176,6 @@ def test_process_tool_declares_wait_timeout_metadata() -> None:
     assert spec.execution_timeout_argument == "timeout"
 
 
-def test_process_wait_uses_coding_mode_default_timeout() -> None:
-    ctx = ToolContext(coding_mode=True)
-
-    assert ctx.coding_mode is True
-    token = current_tool_context.set(ctx)
-    try:
-        assert (
-            shell._resolve_process_wait_timeout(None)
-            == shell._CODING_PROCESS_WAIT_TIMEOUT
-        )
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="uses POSIX sleep/true")

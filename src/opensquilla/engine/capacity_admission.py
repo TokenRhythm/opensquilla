@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.context_budget import hard_input_tokens
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
-from opensquilla.provider.request_proof import effective_proof_token_budget
+from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.request_proof import effective_proof_token_budget, fit_generation_tokens
 
 NON_MATERIAL_INPUT_HEADROOM_TOKENS = 8_192
 MAX_THINKING_BUDGET_TOKENS = 50_000
@@ -126,20 +127,43 @@ def assess_model_request_capacity(
         return unknown
     if window_source not in {"catalog", "config", "override"}:
         return unknown
-    budget = ContextBudgetGovernor.from_values(
-        context_window_tokens=window,
-        max_output_tokens=max_output,
-        thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
-        context_overflow_threshold=0.85,
-        provider_request_proof_max_chars=provider_request_proof_max_chars,
-    ).snapshot()
-    safe_input_tokens, _headroom = effective_proof_token_budget(budget.usable_tokens)
+    # Catalog output is a ceiling, not an input reservation. OpenAI-compatible
+    # caps already include reasoning; router thinking levels are not additional
+    # output. Only native Anthropic may raise the wire cap for an explicit budget.
+    thinking = max(0, int(thinking_budget_tokens))
+    requested_generation = max_output
+    minimum_generation = 1
+    try:
+        backend: str = get_provider_spec(provider_id).backend
+    except ValueError:
+        backend = ""
+    if backend == "anthropic" and thinking:
+        from opensquilla.provider.anthropic import _uses_adaptive_thinking
+
+        if not _uses_adaptive_thinking(model_id):
+            if thinking >= max_output:
+                requested_generation = thinking + 4_096
+    # Other adapters have not adopted dynamic caps; their actual fixed reserve
+    # remains binding here rather than assuming a reduction they will not send.
+    generation = (
+        fit_generation_tokens(
+            window,
+            requested_generation,
+            required_input_tokens,
+            minimum_generation_tokens=minimum_generation,
+        )
+        if backend == "openai_compat"
+        else requested_generation
+    )
+    safe_input_tokens, _headroom = effective_proof_token_budget(
+        hard_input_tokens(window, generation or minimum_generation),
+    )
     # This prefilter receives token estimates, not the serialized request.
     # Its character cap is enforced separately by the final adapter proof;
     # converting that cap to tokens would conflate two independent limits.
     return ModelRequestCapacityAssessment(
         (
-            "fits" if required_input_tokens <= safe_input_tokens
+            "fits" if generation > 0 and required_input_tokens <= safe_input_tokens
             else "known_capacity_request_too_large"
         ),
         required_input_tokens,

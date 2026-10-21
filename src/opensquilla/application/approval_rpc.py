@@ -122,13 +122,108 @@ async def approval_wait_decision_rpc_payload(
 ) -> dict[str, Any]:
     """Wait for an approval decision and return its status payload."""
 
-    status = queue.status(approval_id)
+    status = await queue.status_async(approval_id)
     if not status["resolved"]:
-        await queue.wait(
+        await queue.wait_async(
             approval_id,
             timeout=float(timeout_seconds) if timeout_seconds is not None else None,
         )
-    return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
+    return await approval_status_rpc_payload_async(queue, approval_id, queue.get_settings().mode)
+
+
+async def approval_status_rpc_payload_async(
+    queue: ApprovalQueue,
+    approval_id: str,
+    mode: str,
+) -> dict[str, Any]:
+    status = await queue.status_async(approval_id)
+    resolved_mode = status["params"].get("approvalMode", mode)
+    return {
+        "id": status["id"],
+        "mode": resolved_mode,
+        "approved": status["approved"],
+        "resolved": status["resolved"],
+        "resolution": status.get("resolution", ""),
+        "deadline": status.get("deadline"),
+        "consumed": status["consumed"],
+        "pending": not status["resolved"],
+    }
+
+
+async def approval_lookup_status_rpc_payload_async(
+    queue: ApprovalQueue,
+    approval_id: str,
+    *,
+    namespace: str,
+) -> dict[str, Any]:
+    try:
+        entry = await queue.get_async(approval_id)
+    except KeyError:
+        return {
+            "found": False,
+            "id": approval_id,
+            "namespace": namespace,
+            "pending": False,
+            "resolutionInProgress": False,
+            "resolved": False,
+        }
+    if entry.namespace != namespace:
+        raise ValueError(f"Approval does not belong to {namespace} namespace: {approval_id}")
+    resolution_in_progress = entry.claim_token is not None
+    resolved = bool(entry.resolved and not resolution_in_progress)
+    return {
+        "found": True,
+        "id": entry.approval_id,
+        "namespace": entry.namespace,
+        "pending": bool(not entry.resolved and not resolution_in_progress),
+        "resolutionInProgress": resolution_in_progress,
+        "resolved": resolved,
+        "approved": bool(entry.approved) if resolved else False,
+        "resolution": str(entry.resolution or "") if resolved else "",
+        "consumed": bool(entry.consumed) if resolved else False,
+        "deadline": entry.deadline,
+    }
+
+
+async def approval_request_rpc_payload_async(
+    queue: ApprovalQueue,
+    *,
+    namespace: str,
+    params: dict[str, Any],
+    node_id: str | None = None,
+) -> dict[str, Any]:
+    settings = queue.get_settings(node_id=node_id)
+    request_params = dict(params)
+    request_params["approvalMode"] = settings.mode
+    approval_id = await queue.request_async(namespace=namespace, params=request_params)
+    if settings.mode == "auto-approve":
+        await queue.resolve_async(approval_id, True)
+    elif settings.mode == "auto-deny":
+        await queue.resolve_async(approval_id, False)
+    return await approval_status_rpc_payload_async(queue, approval_id, settings.mode)
+
+
+async def approval_extend_rpc_payload_async(
+    queue: ApprovalQueue,
+    approval_id: str,
+    seconds: float,
+) -> dict[str, Any]:
+    deadline = await queue.extend_async(approval_id, seconds)
+    payload = await approval_status_rpc_payload_async(queue, approval_id, queue.get_settings().mode)
+    payload["deadline"] = deadline
+    return payload
+
+
+async def approval_resolve_rpc_payload_async(
+    queue: ApprovalQueue,
+    approval_id: str,
+    approved: bool,
+    *,
+    elevated_mode: str | None = None,
+) -> dict[str, Any]:
+    del elevated_mode
+    await queue.resolve_async(approval_id, approved, elevated_mode=None)
+    return await approval_status_rpc_payload_async(queue, approval_id, queue.get_settings().mode)
 
 
 def approval_snapshot_rpc_payload(queue: ApprovalQueue) -> dict[str, Any]:
@@ -172,11 +267,16 @@ def approval_resolve_rpc_payload(
 
 __all__ = [
     "approval_extend_rpc_payload",
+    "approval_extend_rpc_payload_async",
     "approval_lookup_status_rpc_payload",
+    "approval_lookup_status_rpc_payload_async",
     "approval_request_rpc_payload",
+    "approval_request_rpc_payload_async",
     "approval_resolve_rpc_payload",
+    "approval_resolve_rpc_payload_async",
     "approval_settings_rpc_payload",
     "approval_snapshot_rpc_payload",
     "approval_status_rpc_payload",
+    "approval_status_rpc_payload_async",
     "approval_wait_decision_rpc_payload",
 ]

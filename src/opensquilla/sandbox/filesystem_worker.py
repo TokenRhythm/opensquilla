@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path, PurePath
 from typing import Any
 
+from opensquilla.file_snapshot import build_file_edit_snapshot
 from opensquilla.sandbox.directory_listing import format_directory_entry
 from opensquilla.sandbox.path_aliases import resolve_workspace_alias
 from opensquilla.sandbox.permissions import (
@@ -661,10 +662,12 @@ def _edit_text(payload: dict[str, Any]) -> dict[str, object]:
     count = original.count(old_text)
     if count > 1:
         raise ValueError(f"old_text matches {count} locations in {path}; be more specific")
-    _write_utf8_safely(path, original.replace(old_text, new_text, 1), create=False)
+    updated = original.replace(old_text, new_text, 1)
+    _write_utf8_safely(path, updated, create=False)
     return {
         "message": f"Edited {path}: replaced {len(old_text)} chars with {len(new_text)} chars",
         "created": False,
+        "file_snapshot": build_file_edit_snapshot(str(path), original, updated),
     }
 
 
@@ -755,6 +758,7 @@ def _edit_source(payload: dict[str, Any]) -> dict[str, object]:
     from opensquilla.tools.source_edit_contract import (
         SourceEditContractError,
         apply_line_edits,
+        build_diff_summary,
     )
 
     path = _authorized_source_target(payload)
@@ -786,7 +790,14 @@ def _edit_source(payload: dict[str, Any]) -> dict[str, object]:
                 "status": "contract_error",
             }
         updated_bytes = updated.encode("utf-8")
-        if updated_bytes != original_bytes:
+        # Keep the private receipt bounded even for a tiny edit to a huge file.
+        # The parent needs the summary and change bit, not both complete bodies.
+        # Prepare display work before committing the mutation.
+        changed = updated_bytes != original_bytes
+        diff_summary = build_diff_summary(
+            original, updated, path=str(payload.get("displayPath") or path),
+        )
+        if changed:
             handle.seek(0)
             handle.write(updated_bytes)
             handle.truncate()
@@ -795,8 +806,8 @@ def _edit_source(payload: dict[str, Any]) -> dict[str, object]:
             "message": f"Edited source file {path}",
             "created": False,
             "status": "applied",
-            "original": original,
-            "updated": updated,
+            "changed": changed,
+            "diffSummary": diff_summary,
             "beforeRevision": before_revision,
             "afterRevision": _source_revision(updated_bytes),
             "beforeFingerprint": _source_fingerprint(original_bytes),

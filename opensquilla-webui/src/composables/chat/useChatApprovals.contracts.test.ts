@@ -97,9 +97,7 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
     stream: {
-      isStreaming: ref(false),
       appendInterruptFrame,
-      ensureInterruptBubble: vi.fn(),
     },
     interruptState,
   }))!
@@ -506,7 +504,6 @@ describe('clarify tool-result recovery', () => {
         sessionKey: 'agent:main:web',
         fields: { scope: 'focused' },
         requestId: 'input-request-1',
-        run_id: 'plan-run-1',
       })
       expect(runtime.approvals.pendingClarify.value).toBeNull()
       expect(runtime.approvals.clarifySubmitted.value).toBe(false)
@@ -780,7 +777,7 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
-  it('retains the legacy cross-turn clarify receipt after a successful send acknowledgement', async () => {
+  it('ignores retired clarification payloads without a request identity', async () => {
     installSnapshot()
     const runtime = await harness()
     try {
@@ -796,13 +793,9 @@ describe('clarify tool-result recovery', () => {
 
       await runtime.approvals.submitClarify({ scope: 'focused' })
 
-      expect(runtime.rpcCall).toHaveBeenLastCalledWith('chat.clarify_submit', {
-        sessionKey: 'agent:main:web',
-        fields: { scope: 'focused' },
-        run_id: 'plan-run-1',
-      })
-      expect(runtime.approvals.pendingClarify.value?.requestId).toBeUndefined()
-      expect(runtime.approvals.clarifySubmitted.value).toBe(true)
+      expect(runtime.rpcCall).not.toHaveBeenCalled()
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
       expect(runtime.approvals.clarifyBusy.value).toBe(false)
     } finally {
       runtime.unsubscribe()

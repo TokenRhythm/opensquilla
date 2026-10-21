@@ -1,14 +1,17 @@
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { ChatPageContext } from '@/types/pageContext'
+import type { ProjectInitTurnCommand } from '@/types/turnCommand'
 import type { InjectionKey } from 'vue'
 import type { Attachment, WorkspaceFileReference } from '@/types/chat'
 
 /** Domain-facing representation of a durable pending-input row. */
 export interface PendingInputServerItem {
+  readonly turnCommand?: ProjectInitTurnCommand
   readonly pendingInputId: string
   readonly clientRequestId: string
   readonly clientMessageId: string
   readonly message?: string
+  readonly localPathReferences?: readonly string[]
   readonly displayText?: string
   readonly attachments?: readonly PendingInputServerAttachment[]
   readonly workspaceFiles?: readonly WorkspaceFileReference[]
@@ -25,14 +28,17 @@ export interface PendingInputServerAttachment {
   readonly name: string
   readonly mime: string
   readonly size?: number
+  readonly origin?: 'paste'
 }
 
 export interface PendingInputEnqueueRequest {
+  turnCommand?: ProjectInitTurnCommand
   key: string
   pendingInputId: string
   clientRequestId?: string
   clientMessageId?: string
   message: string
+  localPathReferences?: readonly string[]
   attachments: readonly unknown[]
   workspaceFiles?: readonly WorkspaceFileReference[]
   selectedSkills?: readonly SelectedSkillRef[]

@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 from opensquilla.application.artifact_workbench import ArtifactCatalogQuery, ArtifactIdentity
+from opensquilla.artifact_session import ArtifactConflictError, ArtifactSessionService
 from opensquilla.artifacts import (
     ArtifactNotFoundError,
     ArtifactStore,
@@ -19,6 +20,10 @@ from opensquilla.gateway.adapters.artifact_workbench import (
 from opensquilla.gateway.adapters.artifact_workbench_contract import (
     register_artifact_workbench_contract,
 )
+from opensquilla.gateway.artifact_product_errors import (
+    ArtifactProductErrorCode,
+    logged_artifact_product_error,
+)
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import ERROR_NOT_FOUND
 from opensquilla.gateway.rpc import (
@@ -29,6 +34,7 @@ from opensquilla.gateway.rpc import (
 )
 from opensquilla.gateway.session_services import (
     SessionServiceUnavailableError,
+    get_session_storage,
     session_id_for_key,
 )
 from opensquilla.paths import media_root_from_config
@@ -109,7 +115,31 @@ class _ArtifactCatalogRuntimePort:
             ) from None
         except OSError as exc:
             raise RpcUnavailableError("Artifact storage is temporarily unavailable.") from exc
-        return {"artifact": artifact_payload(ref)}
+        payload = artifact_payload(ref)
+        if ref.source == "workspace-preview":
+            # Historical chat cards retain the internal revision artifact, not
+            # its document identity. Resolve its existing owner across revisions;
+            # never adopt it or make internal material a public deliverable.
+            storage = get_session_storage(self._ctx.session_manager)
+            if storage is None:
+                raise RpcUnavailableError("Artifact storage is temporarily unavailable.")
+            service = await ArtifactSessionService.from_session_storage(storage)
+            try:
+                document = await service.get_document_for_artifact(
+                    session_key=session_key,
+                    session_id=session_id,
+                    artifact_id=ref.id,
+                )
+            except ArtifactConflictError as exc:
+                raise logged_artifact_product_error(
+                    ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                    exc,
+                    operation="artifacts.get.document",
+                    reason_code="ambiguous_document_mapping",
+                ) from exc
+            if document is not None:
+                payload["documentId"] = document.document_id
+        return {"artifact": payload}
 
 
 _handle_artifacts_list = GatewayArtifactWorkbenchAdapter.bind(

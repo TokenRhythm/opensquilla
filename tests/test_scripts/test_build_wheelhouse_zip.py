@@ -336,10 +336,36 @@ def test_release_wheel_allows_only_canonical_distribution_license_notices() -> N
     assert module.forbidden_release_wheel_entries([notice, *forbidden]) == forbidden
 
 
-def test_release_wheel_notice_still_undergoes_sensitive_text_scanning(tmp_path: Path) -> None:
+def test_release_wheel_allows_only_canonical_office_preview_notice() -> None:
+    module = load_script()
+    notice = (
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/"
+        "Silurus-THIRD_PARTY_NOTICES.md"
+    )
+    forbidden = [
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/private-notes.md",
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/LICENSE.md",
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/nested/"
+        "Silurus-THIRD_PARTY_NOTICES.md",
+        "opensquilla/gateway/static/dist/assets/Silurus-THIRD_PARTY_NOTICES.md",
+        "docs/" + notice,
+    ]
+    assert module.forbidden_release_wheel_entries([notice, *forbidden]) == forbidden
+
+
+@pytest.mark.parametrize(
+    "notice",
+    [
+        "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md",
+        "opensquilla/gateway/static/dist/assets/office-preview-licenses/"
+        "Silurus-THIRD_PARTY_NOTICES.md",
+    ],
+)
+def test_release_wheel_notice_still_undergoes_sensitive_text_scanning(
+    tmp_path: Path, notice: str
+) -> None:
     module = load_script()
     wheel = tmp_path / "notice-probe.whl"
-    notice = "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md"
     marker = module.FORBIDDEN_RELEASE_TEXT_MARKERS[0]
     with ZipFile(wheel, "w") as archive:
         archive.writestr(notice, marker)
@@ -359,7 +385,6 @@ def test_pyproject_release_wheel_config_excludes_forbidden_skill_resources() -> 
     assert "src/opensquilla/skills/bundled/**/skill-card.md" in excludes
     assert "src/opensquilla/skills/bundled/**/references/*.md" in excludes
     assert "src/opensquilla/skills/exp/**" in excludes
-    assert "src/opensquilla/skills/meta/META_SKILL_AUTHORING.md" in excludes
     assert module.forbidden_release_wheel_entries(tuple(force_includes.values())) == []
 
 
@@ -999,7 +1024,7 @@ def test_release_workflow_publishes_wheel_and_electron_assets_without_portable()
     assert "OpenSquilla-{desktop_version}-mac-arm64.dmg" in workflow
     assert "OpenSquilla-{desktop_version}-win-x64.exe" in workflow
     assert "opensquilla-latest-py3-none-any.whl" not in workflow
-    assert "gh release upload \"${TAG}\" dist/* --clobber" in workflow
+    assert 'gh release upload "${TAG}" dist/public/* --clobber' in workflow
     assert "dist/*.zip dist/*.zip.sha256 dist/SHA256SUMS" not in workflow
     assert "Git LFS pointer leaked into wheel" in workflow
     assert "Verify GitHub Release assets" in workflow

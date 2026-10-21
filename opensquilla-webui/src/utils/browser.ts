@@ -9,16 +9,26 @@ export async function copyTextWithFallback(text: string): Promise<void> {
     }
   }
 
+  const previousFocus = document.activeElement
   const textarea = document.createElement('textarea')
   textarea.value = text
   textarea.setAttribute('readonly', '')
   textarea.style.position = 'fixed'
   textarea.style.left = '-9999px'
   document.body.appendChild(textarea)
-  textarea.select()
-  const ok = document.execCommand('copy')
-  textarea.remove()
-  if (!ok) throw new Error('Copy failed')
+  try {
+    textarea.select()
+    const ok = document.execCommand('copy')
+    if (!ok) throw new Error('Copy failed')
+  } finally {
+    // Chromium focuses the selected textarea. Removing it alone leaves focus
+    // on body, breaking keyboard navigation after a menu action.
+    const restoreFocus = document.activeElement === textarea
+    textarea.remove()
+    if (restoreFocus && previousFocus instanceof HTMLElement && previousFocus.isConnected) {
+      previousFocus.focus({ preventScroll: true })
+    }
+  }
 }
 
 // Extract the filename from a Content-Disposition header value. Prefers the

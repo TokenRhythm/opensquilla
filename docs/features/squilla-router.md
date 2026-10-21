@@ -19,6 +19,28 @@ SquillaRouter is useful when you want:
 
 It is not required. OpenSquilla can also run in direct single-model mode.
 
+## Base Model and Memory
+
+Routing loads the packaged base model, or the explicit `squilla_router.v4_bundle_dir`
+path. Router self-learning and its feedback submission API have been removed. On upgrade,
+the obsolete `squilla_router.self_learning` settings are discarded automatically;
+credentials, model tiers, explicit model paths, and Dream settings are preserved.
+A failed automatic config backup or rewrite does not prevent loading the migrated
+settings in memory. Explicit save failures still report an error.
+
+Historical learned-model pointers, samples, and training directories are left in
+place and are no longer read. Model choices may therefore differ from a previously
+personalized model. Routing diagnostics, manual model selection, calibration, and
+immediate complaint escalation remain available.
+
+Chat thumbs up/down rate the answer independently of routing. Selections are kept
+only for the current page and reset on reload; they are not submitted or used for
+training. Clicking the selected thumb again clears it.
+
+Memory Dream runs independently. Saving its enabled state or schedule reconciles
+its scheduled jobs; if that cannot take effect live, settings report that a restart
+is required. Dream's preview and memory-writing behavior are unchanged.
+
 ## Enable Routing
 
 Recommended first-run setup:

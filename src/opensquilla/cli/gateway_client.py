@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import json
 import math
+import sys
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -13,6 +14,8 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla import __version__
+from opensquilla.compaction_timing import DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
 from opensquilla.contracts.adapters.sessions_list_contract import call_sessions_list
 from opensquilla.contracts.adapters.sessions_resolve_contract import call_sessions_resolve
 from opensquilla.contracts.gateway_transport import (
@@ -478,6 +481,12 @@ class GatewayClient:
         }
         if self.structured_user_input:
             params["caps"].append(STRUCTURED_USER_INPUT_CAPABILITY)
+            params["client"] = {
+                "id": "opensquilla-cli",
+                "version": __version__,
+                "platform": sys.platform,
+                "mode": "tui",
+            }
         if token:
             params["auth"] = {"token": token}
         await self._ws.send(
@@ -744,14 +753,14 @@ class GatewayClient:
             return None
         if method == "sessions.contextCompact" and (params or {}).get("wait", True):
             # Synchronous compaction runs until the Gateway's absolute deadline
-            # (120 seconds by default). Let its terminal result arrive before
+            # (the shared compaction default). Let its terminal result arrive before
             # applying a client timeout, including an ordinary response margin.
-            server_budget = 120.0
+            server_budget = DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
             try:
                 configured = await self.get_config("compaction.total_timeout_seconds")
             except GatewayRPCError:
                 # Older/restricted Gateways may not expose the configuration;
-                # preserve their default compaction budget in that case.
+                # allow the current bounded server budget in that case.
                 configured = None
         elif method == "cron.run":
             # This RPC waits for the job's completion, not just its admission.

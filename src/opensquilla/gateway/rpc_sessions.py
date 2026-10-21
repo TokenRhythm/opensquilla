@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import inspect
 import json
 import re
@@ -14,6 +15,7 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -221,6 +223,7 @@ from opensquilla.gateway.session_view import (
     build_session_view_item,
     derive_transcript_title,
     has_refused_chat_title,
+    session_title_from_metadata,
 )
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
@@ -280,6 +283,7 @@ from opensquilla.session.storage import (
     SessionListCursor,
     SessionRoutingConflictError,
     SessionStorage,
+    StorageBusyError,
     TurnAcceptanceResult,
     bounded_interactive_storage_reads,
 )
@@ -310,6 +314,165 @@ def _pending_input_lock_for(pending_input_id: str) -> asyncio.Lock:
 
 
 log = structlog.get_logger(__name__)
+
+
+# Connection-owned v2 read lifecycle state.  Durable history remains in
+# sessions.db; this map only fences an in-flight recovery attempt to the
+# WebSocket that opened it.  A later lane implementation can replace this
+# adapter with durable recovery receipts without changing the wire contract.
+_V2_READ_LEASES: dict[tuple[str, str], dict[str, Any]] = {}
+_V2_READ_OPEN_BY_CONNECTION: dict[tuple[str, str], str] = {}
+_V2_READ_CONNECTION_OWNERS: dict[str, object] = {}
+
+
+def _clear_v2_read_connection(conn_id: str, owner: object) -> None:
+    """Retire only the leases owned by this physical connection."""
+    if _V2_READ_CONNECTION_OWNERS.get(conn_id) is not owner:
+        return
+    _V2_READ_CONNECTION_OWNERS.pop(conn_id, None)
+    for identity, state in tuple(_V2_READ_LEASES.items()):
+        if identity[0] == conn_id:
+            state["status"] = "retired"
+            _V2_READ_LEASES.pop(identity, None)
+    for identity in tuple(_V2_READ_OPEN_BY_CONNECTION):
+        if identity[0] == conn_id:
+            _V2_READ_OPEN_BY_CONNECTION.pop(identity, None)
+
+
+def _own_v2_read_connection(ctx: RpcContext) -> None:
+    from opensquilla.gateway.websocket import get_registry
+
+    connection = get_registry().get(ctx.conn_id)
+    if (
+        connection is None or connection.principal != ctx.principal
+        or connection._closing
+    ):
+        raise RpcHandlerError("READ_STALE", "Read connection is no longer current", accepted=False)
+    previous = _V2_READ_CONNECTION_OWNERS.get(ctx.conn_id)
+    if previous is connection:
+        return
+    if previous is not None:
+        _clear_v2_read_connection(ctx.conn_id, previous)
+    _V2_READ_CONNECTION_OWNERS[ctx.conn_id] = connection
+    # Keep this owner until disconnect, even when explicit close empties its
+    # leases. Reopening a view on the same socket must not register twice.
+    conn_id = ctx.conn_id
+    connection.add_transport_cleanup(lambda: _clear_v2_read_connection(conn_id, connection))
+
+
+def _v2_read_progress(state: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": state["status"],
+        "base_seq": int(state["base_seq"]),
+        "target_seq": int(state["target_seq"]),
+        "next_seq": int(state["next_seq"]),
+        "consumed_through_seq": int(state["consumed_through_seq"]),
+        "handoff_seq": state.get("handoff_seq"),
+        "proof_id": state.get("proof_id"),
+    }
+
+
+def _v2_state_manifest(
+    *, key: str, session_id: str, session_epoch: int, generation: str, stream_seq: int,
+) -> dict[str, Any]:
+    # The manifest is metadata-only. Snapshot bytes still use the bounded
+    # sessions.messages.snapshot.read path until v2 lane data frames exist.
+    material = json.dumps(
+        {
+            "key": key,
+            "session_id": session_id,
+            "session_epoch": session_epoch,
+            "generation": generation,
+            "stream_seq": stream_seq,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(material).hexdigest()
+    return {
+        "length": len(material),
+        "sha256": digest,
+        "schema_version": 1,
+        "chunks": [{
+            "index": 0,
+            "offset": 0,
+            "byte_length": len(material),
+            "sha256": digest,
+        }],
+    }
+
+
+def _v2_replay_snapshot(
+    *, key: str, stream_generation: str, base_seq: int,
+) -> tuple[Any, dict[str, Any], tuple[tuple[int, ...], ...]]:
+    """Capture a bounded, contiguous replay proof for one v2 lease.
+
+    The client never gets to declare the replay complete by merely sending an
+    ACK.  We re-read the authoritative stream registry, require the original
+    generation and every sequence in ``base_seq + 1 .. current_seq``, then
+    hash the event metadata/payload that was covered by that proof.  Payloads
+    are not retained in the lease; only sequence batches (at most eight) and
+    the digest are kept, so a large catch-up cannot pin Gateway memory.
+    """
+    streams = get_session_streams()
+    try:
+        replay = streams.replay(key, base_seq, stream_generation)
+    except TypeError:
+        # Small unit-test doubles from the pre-v2 route used a two-argument
+        # replay method. Production SessionStreamRegistry always accepts the
+        # generation fence; retaining this fallback keeps those tests useful.
+        replay = streams.replay(key, base_seq)
+    generation = str(getattr(replay, "stream_generation", ""))
+    current_seq = int(getattr(replay, "current_stream_seq", base_seq))
+    if generation != stream_generation:
+        raise RpcHandlerError(
+            "REBASE_REQUIRED", "The session event stream was replaced; reload state",
+            retryable=True, accepted=False,
+        )
+    has_events_field = hasattr(replay, "events")
+    events = tuple(getattr(replay, "events", ()) or ())
+    expected = list(range(base_seq + 1, current_seq + 1))
+    actual = [int(getattr(event, "stream_seq", -1)) for event in events]
+    if (
+        not bool(getattr(replay, "replay_complete", not has_events_field))
+        or actual != expected
+    ):
+        raise RpcHandlerError(
+            "REBASE_REQUIRED", "The event replay is no longer contiguous; reload state",
+            retryable=True, accepted=False,
+        )
+    digest = hashlib.sha256()
+    for event in events:
+        material = json.dumps(
+            {
+                "stream_seq": int(event.stream_seq),
+                "event_name": str(event.event_name),
+                "payload": event.payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        digest.update(len(material).to_bytes(8, "big"))
+        digest.update(material)
+    proof = {
+        "stream_generation": stream_generation,
+        "base_seq": base_seq,
+        "target_seq": current_seq,
+        "event_count": len(events),
+        "events_sha256": digest.hexdigest(),
+        "batch_size": 8,
+    }
+    proof_id = hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    proof["proof_id"] = proof_id
+    batches = tuple(
+        tuple(expected[index : index + 8])
+        for index in range(0, len(expected), 8)
+    )
+    return replay, proof, batches
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
 
@@ -325,7 +488,9 @@ def _emit_steer_metric(disposition: str, **labels: Any) -> None:
 
 
 if TYPE_CHECKING:
-    pass
+    from opensquilla.gateway.routing import RouteEnvelope
+    from opensquilla.gateway.task_runtime import TaskReservation
+    from opensquilla.provider.selector import ProviderConfig
 
 _SESSION_SUBSCRIBE_REPLAY_BUDGET_SECONDS = 2.0
 _ARTIFACT_STATE_EVENT_FIELDS = (
@@ -1829,8 +1994,14 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     # classifies these codes (engine/outcome.py); this is the missing link that
     # carries it to clients.
     from opensquilla.engine.outcome import outcome_from_error
+    from opensquilla.provider.failures import safe_http_status
 
+    http_status = safe_http_status(payload.get("http_status", prior_outcome.get("http_status")))
+    payload.pop("http_status", None)
+    if http_status is not None:
+        payload["http_status"] = http_status
     outcome = outcome_from_error(
+        http_status=http_status,
         code=str(code) if code else None,
         message=safe_error_message,
         error_class=str(code) if code else None,
@@ -2213,12 +2384,33 @@ async def _list_task_rows_by_session(
     return {key: await _list_task_rows(ctx, storage, key) for key in keys}
 
 
+async def _read_transcript_title_inputs[T](operation: str, read: Awaitable[T]) -> T:
+    """Keep read failures distinct from authoritative empty title inputs."""
+    started = time.monotonic()
+    try:
+        return await read
+    except TimeoutError as exc:
+        # Native storage already supplies StorageBusyError with its original
+        # budget diagnostics. Older adapters can still expose a raw deadline.
+        raise StorageBusyError(
+            operation,
+            waited_ms=max(0, int((time.monotonic() - started) * 1000)),
+            retry_after_ms=250,
+            stage="deadline",
+            resource="session_transcript_titles",
+        ) from exc
+
+
 async def _list_transcript_titles(
     storage: Any,
     sessions: Sequence[Any],
     *,
     channel_types: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    sessions = [
+        session for session in sessions
+        if not session_title_from_metadata(session, channel_types=channel_types)
+    ]
     affected = [
         session
         for session in sessions
@@ -2230,14 +2422,12 @@ async def _list_transcript_titles(
         if getattr(session, "session_id", None)
     }
     if affected:
-        try:
-            titles.update(
-                await read_refused_title_fallbacks(storage, affected, channel_types=channel_types)
+        titles.update(
+            await _read_transcript_title_inputs(
+                "list_canonical_user_transcript_content_batch",
+                read_refused_title_fallbacks(storage, affected, channel_types=channel_types),
             )
-        except Exception:
-            # Keep list/search enrichment best-effort. A failed historical read
-            # selects the existing default, never an unrelated active-tail topic.
-            log.warning("sessions.refused_title_recovery_failed", exc_info=True)
+        )
     session_ids = [str(getattr(session, "session_id", "") or "") for session in sessions]
     session_ids = [
         session_id for session_id in session_ids if session_id and session_id not in titles
@@ -2248,29 +2438,34 @@ async def _list_transcript_titles(
     title_inputs: dict[str, list[str]] = {session_id: [] for session_id in session_ids}
     storage_batch = getattr(storage, "list_user_transcript_content_batch", None)
     if callable(storage_batch):
-        try:
-            grouped = await storage_batch(session_ids, limit_per_session=3)
-            title_inputs.update(
-                {
-                    str(session_id): [str(value) for value in values if value]
-                    for session_id, values in grouped.items()
-                }
-            )
-        except Exception:
-            log.warning("sessions.transcript_title_batch_failed", exc_info=True)
-
-    if not any(title_inputs.values()):
+        grouped = await _read_transcript_title_inputs(
+            "list_user_transcript_content_batch",
+            storage_batch(session_ids, limit_per_session=3),
+        )
+        title_inputs.update(
+            {
+                str(session_id): [str(value) for value in values if value]
+                for session_id, values in grouped.items()
+            }
+        )
+    else:
+        # Only absent batch capability permits this compatibility path. Neither
+        # an empty successful batch nor a failed read should cause N+1 queries.
         storage_get_transcript = getattr(storage, "get_transcript", None)
         if callable(storage_get_transcript):
             for session_id in session_ids:
                 try:
-                    entries = await storage_get_transcript(session_id, limit=8)
-                except Exception:
-                    log.warning(
-                        "sessions.transcript_title_read_failed",
-                        session_id=session_id,
+                    entries = await _read_transcript_title_inputs(
+                        "get_transcript",
+                        storage_get_transcript(session_id, limit=8, content_mode="bounded"),
                     )
-                    continue
+                except TypeError as exc:
+                    # Keep older adapters that do not accept content_mode.
+                    if "content_mode" not in str(exc):
+                        raise
+                    entries = await _read_transcript_title_inputs(
+                        "get_transcript", storage_get_transcript(session_id, limit=8),
+                    )
                 title_inputs[session_id] = [
                     str(getattr(entry, "content", "") or "")
                     for entry in entries
@@ -2636,6 +2831,43 @@ _handle_sessions_list_contract = register_sessions_list_contract(
 )
 
 
+async def _handle_sessions_messages_search(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.adapters._generated_contract_bindings import (
+        validate_generated_contract_params,
+    )
+    from opensquilla.history_cursor import HistoryCursorInvalidatedError
+    from opensquilla.session.message_search import search_session_messages
+
+    values = validate_generated_contract_params('sessions.messages.search', params, strict=True)
+    key = _require_key(values)
+    identity = await _snapshot_session_identity(ctx, key)
+    session_id, epoch = identity
+    if session_id is None or epoch is None:
+        raise RpcHandlerError('NOT_FOUND', 'Session not found', accepted=False)
+    if (values.get('session_id', session_id) != session_id
+            or values.get('session_epoch', epoch) != epoch):
+        raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
+    storage = get_session_storage(getattr(ctx, 'session_manager', None))
+    if storage is None:
+        raise RpcUnavailableError('Session storage unavailable')
+    try:
+        result = await search_session_messages(
+            storage, key=key, session_id=session_id, session_epoch=epoch,
+            query=values['query'], cursor=values.get('cursor'), limit=values.get('limit', 50),
+        )
+    except HistoryCursorInvalidatedError as exc:
+        raise RpcHandlerError('HISTORY_STALE', str(exc), accepted=False) from exc
+    if await _snapshot_session_identity(ctx, key) != identity:
+        raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
+    return result
+
+
+_handle_sessions_messages_search_contract = register_connection_recovery_contract(
+    _d, 'sessions.messages.search', _handle_sessions_messages_search,
+    internal_error=RpcHandlerError, guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
     """Search sessions by title and by transcript content.
 
@@ -2821,12 +3053,47 @@ class _GatewaySessionLifecyclePorts(
     async def create(self, session: NewSession) -> SessionIdentity:
         if self._manager is None:
             raise RpcUnavailableError("sessions.create requires a session manager")
+        if session.reuse_existing:
+            lock = get_session_lock(self._context.turn_runner, session.session_key)
+            if lock is None or self._storage is None:
+                raise RpcUnavailableError("Draft materialization requires session runtime storage")
+            # Coordinate preparation and retries with the session runtime.
+            # Admission may commit outside this lock, so the manager also uses
+            # insert-only persistence and we validate any raced durable winner.
+            async with lock:
+                existing = await self._storage.get_session(session.session_key)
+                if existing is not None:
+                    self._validate_existing_draft(session, existing)
+                    return SessionIdentity(
+                        session_key=str(existing.session_key),
+                        session_id=str(existing.session_id),
+                        epoch=int(getattr(existing, "epoch", 0) or 0),
+                    )
+                return await self._create_new(session)
+        return await self._create_new(session)
+
+    @staticmethod
+    def _validate_existing_draft(requested: NewSession, existing: Any) -> None:
+        workspace_id = requested.workspace.workspace_id if requested.workspace else None
+        if (
+            getattr(existing, "agent_id", None) != requested.agent_id
+            or getattr(existing, "workspace_id", None) != workspace_id
+            or getattr(existing, "guest_owner_id", None) is not None
+        ):
+            raise RpcHandlerError(
+                "INVALID_PARAMS",
+                "The draft session already exists with a different binding.",
+            )
+
+    async def _create_new(self, session: NewSession) -> SessionIdentity:
         create_kwargs: dict[str, Any] = {
             "session_key": session.session_key,
             "agent_id": session.agent_id,
             "display_name": session.display_name,
             "model": session.model,
         }
+        if session.reuse_existing:
+            create_kwargs["reuse_existing"] = True
         if session.provider.present:
             create_kwargs["provider_override"] = session.provider.value
         if session.auth_profile.present:
@@ -2846,6 +3113,8 @@ class _GatewaySessionLifecyclePorts(
                 ).to_origin_payload()
             }
         created = await self._manager.create(**create_kwargs)
+        if session.reuse_existing:
+            self._validate_existing_draft(session, created)
         return SessionIdentity(
             session_key=str(created.session_key),
             session_id=str(created.session_id),
@@ -3009,6 +3278,134 @@ _handle_sessions_fork_through_turn_contract = register_session_lifecycle_contrac
 )
 
 
+async def _handle_sessions_sidechat_create(params: dict | None, ctx: RpcContext) -> dict:
+    """Create one independently controlled side conversation from authoritative history."""
+    if not ctx.principal.is_owner:
+        raise RpcHandlerError("OWNER_REQUIRED", "Side conversations require an owner.")
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    parent_key = params.get("parentKey")
+    request_id = params.get("clientRequestId")
+    if not isinstance(parent_key, str) or not parent_key.strip():
+        raise ValueError("params.parentKey is required")
+    if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
+        raise ValueError("params.clientRequestId must contain 1 to 128 characters")
+    parent_key = canonicalize_session_key(parent_key)
+    manager = ctx.session_manager
+    if manager is None:
+        raise RpcUnavailableError("Side conversations require a session manager")
+    lock = get_session_lock(ctx.turn_runner, parent_key)
+    if lock is None:
+        raise RpcUnavailableError("Side conversations require session lifecycle locking")
+    async with lock:
+        child = await manager.create_sidechat(parent_key, request_id)
+        from opensquilla.gateway.sidechat_leases import renew_sidechat_lease
+
+        await renew_sidechat_lease(
+            get_session_storage(manager), child.session_key,
+            lambda: _handle_sessions_sidechat_close({"key": child.session_key}, ctx),
+        )
+    run_context = (child.origin or {}).get(RUN_CONTEXT_ORIGIN_KEY) or {}
+    return {
+        "key": child.session_key, "parentKey": parent_key, "sessionId": child.session_id,
+        "inherited": {
+            "model": child.model_override or child.model,
+            "provider": child.provider_override or child.model_provider,
+            "reasoningLevel": child.reasoning_level or child.thinking_level,
+            "modelRoutingMode": child.model_routing_mode,
+            "modelRoutingRevision": child.model_routing_revision,
+            "runMode": run_context.get("run_mode"),
+        },
+    }
+
+
+async def _sidechat_owned_session_keys(storage: Any, key: str) -> tuple[str, ...]:
+    """Read the whole owned subtree without treating a failed read as empty."""
+    keys = [key]
+    seen = {key}
+    for parent in keys:
+        offset = 0
+        while True:
+            children = await storage.list_sessions(spawned_by=parent, limit=100, offset=offset)
+            for child in children:
+                if child.session_key not in seen:
+                    seen.add(child.session_key)
+                    keys.append(child.session_key)
+            if len(children) < 100:
+                break
+            offset += 100
+    return tuple(keys)
+
+
+async def _handle_sessions_sidechat_close(params: dict | None, ctx: RpcContext) -> dict:
+    if not ctx.principal.is_owner:
+        raise RpcHandlerError("OWNER_REQUIRED", "Side conversations require an owner.")
+    from opensquilla.session.sidechat import set_state, sidechat_metadata
+
+    key = _require_key(params)
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise RpcUnavailableError("Side conversations require session storage")
+    child = await set_state(storage, key, "closing")
+    if (sidechat_metadata(child) or {}).get("state") != "closed":
+        # Reuse the complete cancellation application: runtime, descendant work,
+        # process trees, pending approvals, and terminal publication all drain.
+        cancellation = await _session_turn_admission_adapter(ctx).cancel(
+            {"key": key}, surface="session"
+        )
+        if isinstance(cancellation, dict) and cancellation.get("reason") == "task_cancel_unknown":
+            raise RpcUnavailableError("Side conversation cancellation is still draining")
+        owned = await _sidechat_owned_session_keys(storage, key)
+        runtime = ctx.task_runtime
+        try:
+            async with asyncio.timeout(_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS):
+                async with contextlib.AsyncExitStack() as fences:
+                    quiesce = getattr(runtime, "quiesce_sessions", None)
+                    if callable(quiesce):
+                        # Drain native drivers and their completion tails, then
+                        # hold admission/execution gates through the final fence.
+                        await fences.enter_async_context(quiesce(
+                            owned, cancel_source="sidechat_close", cancel_reason="sidechat_closed",
+                        ))
+                    for owned_key in owned:
+                        for status in ("running", "queued"):
+                            if await storage.list_agent_tasks(
+                                session_key=owned_key, status=status, limit=1,
+                            ):
+                                raise RpcUnavailableError(
+                                    "Side conversation cancellation is still draining"
+                                )
+                        has_work = getattr(runtime, "has_session_work", None)
+                        if callable(has_work) and await has_work(owned_key):
+                            raise RpcUnavailableError(
+                                "Side conversation cancellation is still draining"
+                            )
+                    if set(await _sidechat_owned_session_keys(storage, key)) != set(owned):
+                        raise RpcUnavailableError(
+                            "Side conversation descendants are still draining"
+                        )
+                    if not await _cleanup_sidechat_pending_material(ctx, storage, child):
+                        raise RpcUnavailableError("Side conversation material cleanup is pending")
+                    await set_state(storage, key, "closed")
+        except TimeoutError as exc:
+            raise RpcUnavailableError("Side conversation cancellation is still draining") from exc
+    elif not await _cleanup_sidechat_pending_material(ctx, storage, child):
+        # Older builds may already have marked a child closed before cleanup.
+        # Explicit close stays an idempotent way to retry those durable owners.
+        raise RpcUnavailableError("Side conversation material cleanup is pending")
+    return {"key": key, "closed": True}
+
+
+_handle_sessions_sidechat_create_contract = register_session_lifecycle_contract(
+    _d, "sessions.sidechat.create", _handle_sessions_sidechat_create,
+    internal_error=RpcHandlerError, guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_sidechat_close_contract = register_session_lifecycle_contract(
+    _d, "sessions.sidechat.close", _handle_sessions_sidechat_close,
+    internal_error=RpcHandlerError, guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+
 async def _should_auto_title(
     ctx: RpcContext,
     storage: Any,
@@ -3045,6 +3442,8 @@ def _schedule_auto_title(
     enabled: bool,
     session_id: str | None = None,
     root_turn_id: str | None = None,
+    selected_provider_config: ProviderConfig | None = None,
+    expected_session_epoch: int | None = None,
 ) -> None:
     if not enabled:
         return
@@ -3068,9 +3467,52 @@ def _schedule_auto_title(
             key,
             first_message,
             provider_request_correlation=provider_request_correlation,
+            selected_provider_config=selected_provider_config,
+            expected_session_id=session_id,
+            expected_session_epoch=expected_session_epoch,
         ),
         name=f"session-title:{key}",
     )
+
+
+def _install_auto_title(
+    ctx: RpcContext,
+    route: RouteEnvelope,
+    key: str,
+    first_message: str,
+    *,
+    enabled: bool,
+    session_id: str,
+    session_epoch: int,
+    root_turn_id: str,
+    reservation: TaskReservation | None = None,
+) -> None:
+    """Install a process-local, one-shot handoff after durable acceptance."""
+    if not enabled:
+        return
+    consumed = False
+
+    def on_initial_provider_ready(provider_config: ProviderConfig) -> None:
+        nonlocal consumed
+        if consumed:
+            return
+        # Claim before copying or scheduling: retries/fallbacks cannot name twice.
+        consumed = True
+        _schedule_auto_title(
+            ctx,
+            key,
+            first_message,
+            enabled=True,
+            session_id=session_id,
+            root_turn_id=root_turn_id,
+            selected_provider_config=deepcopy(provider_config),
+            expected_session_epoch=session_epoch,
+        )
+
+    # TaskRuntime reserves its own envelope. Attach to that accepted instance,
+    # never to serialized metadata or a pre-reservation copy.
+    envelope = reservation.runtime_task.envelope if reservation is not None else route
+    envelope.runtime_services["on_initial_provider_ready"] = on_initial_provider_ready
 
 
 def _turn_source_scope(source_hint: dict[str, Any], ctx: RpcContext) -> str:
@@ -3268,8 +3710,9 @@ def _cleanup_pending_input_scopes(
     ctx: RpcContext,
     pending_input_id: str,
     session_ids: set[str],
-) -> None:
+) -> bool:
     media_root = media_root_from_config(ctx.config)
+    succeeded = True
     for session_id in session_ids:
         try:
             cleanup_pending_chat_input_material(
@@ -3278,6 +3721,7 @@ def _cleanup_pending_input_scopes(
                 pending_input_id=pending_input_id,
             )
         except OSError:
+            succeeded = False
             # The durable row lifecycle is authoritative. A filesystem cleanup
             # failure is retried by session deletion and must not turn a
             # committed cancel/dispatch into a misleading RPC failure.
@@ -3286,6 +3730,7 @@ def _cleanup_pending_input_scopes(
                 pending_input_id=pending_input_id,
                 session_id=session_id,
             )
+    return succeeded
 
 
 def _material_ids_in_transcript_content(content: Any) -> set[str]:
@@ -3316,7 +3761,7 @@ async def _cleanup_unreferenced_pending_promotions(
     session_key: str,
     pending_input_id: str,
     source_session_ids: set[str],
-) -> None:
+) -> bool:
     """Delete failed-dispatch canonical copies only when no durable owner remains."""
 
     media_root = media_root_from_config(ctx.config)
@@ -3329,12 +3774,12 @@ async def _cleanup_unreferenced_pending_promotions(
         ).items():
             promotions.setdefault(target_session_id, set()).update(material_ids)
     if not promotions:
-        return
+        return True
 
     current_session = await storage.get_session(session_key)
     current_session_id = getattr(current_session, "session_id", None)
     if not isinstance(current_session_id, str) or not current_session_id:
-        return
+        return False
 
     # Another staged input with the same content is a live reference even if
     # its canonical promotion has not yet been accepted.
@@ -3350,8 +3795,9 @@ async def _cleanup_unreferenced_pending_promotions(
                 if isinstance(material_id, str) and len(material_id) == 64:
                     other_pending_ids.add(material_id.lower())
     except Exception:  # noqa: BLE001 - cleanup must fail closed.
-        return
+        return False
 
+    succeeded = True
     for target_session_id, material_ids in promotions.items():
         if target_session_id != current_session_id:
             # A reset archive or child session can still reference a retired
@@ -3361,6 +3807,7 @@ async def _cleanup_unreferenced_pending_promotions(
         try:
             transcript = await storage.get_canonical_transcript(target_session_id)
         except Exception:  # noqa: BLE001 - never delete without a reference proof.
+            succeeded = False
             continue
         transcript_ids: set[str] = set()
         for entry in transcript:
@@ -3372,12 +3819,41 @@ async def _cleanup_unreferenced_pending_promotions(
             try:
                 path.unlink(missing_ok=True)
             except OSError:
+                succeeded = False
                 log.warning(
                     "pending_inputs.promotion_cleanup_failed",
                     pending_input_id=pending_input_id,
                     session_id=target_session_id,
                     material_id=material_id,
                 )
+    return succeeded
+
+
+async def _cleanup_sidechat_pending_material(
+    ctx: RpcContext, storage: SessionStorage, child: Any,
+) -> bool:
+    """Retry committed cancellation cleanup without touching parent materials."""
+    from opensquilla.session.sidechat import finish_pending_material_cleanup, sidechat_metadata
+
+    completed: set[str] = set()
+    pending = (sidechat_metadata(child) or {}).get("pendingMaterialCleanup", [])
+    for item in pending:
+        pending_id = item["pendingInputId"]
+        scopes = set(item["sessionIds"])
+        try:
+            if not await _cleanup_unreferenced_pending_promotions(
+                ctx=ctx, storage=storage, session_key=item["sessionKey"],
+                pending_input_id=pending_id, source_session_ids=scopes,
+            ):
+                continue
+            if _cleanup_pending_input_scopes(
+                ctx=ctx, pending_input_id=pending_id, session_ids=scopes,
+            ):
+                completed.add(pending_id)
+        except Exception:  # noqa: BLE001 - retain durable retry ownership on failed I/O.
+            log.warning("sidechat.pending_material_cleanup_failed", pending_input_id=pending_id)
+    await finish_pending_material_cleanup(storage, child.session_key, completed)
+    return len(completed) == len(pending)
 
 
 async def _prepare_session_event_payload(
@@ -3497,10 +3973,19 @@ class _GatewayCancellationPorts(CancellationPrimitives):
             key,
         )
 
-    def reject_approvals(self, key: str) -> int:
+    async def reject_approvals(self, key: str) -> int:
         from opensquilla.gateway.approval_queue import get_approval_queue
 
-        return get_approval_queue().resolve_pending_for_session(key, approved=False)
+        queue = get_approval_queue()
+        resolve_async = getattr(queue, "resolve_pending_for_session_async", None)
+        if callable(resolve_async):
+            return cast(int, await resolve_async(key, approved=False))
+        # Keep lightweight test/adaptor queues compatible while never running
+        # their legacy synchronous SQLite call on the Gateway loop.
+        resolve_sync = getattr(queue, "resolve_pending_for_session", None)
+        if callable(resolve_sync):
+            return await asyncio.to_thread(resolve_sync, key, approved=False)
+        return 0
 
     async def drain(self, key: str, task_ids: tuple[str, ...], deadline: float) -> None:
         await _drain_cancelled_task_runtime(
@@ -3539,9 +4024,11 @@ class _GatewayCancellationPorts(CancellationPrimitives):
                 "sessions.changed",
                 build_sessions_changed_payload(
                     key,
-                    "task_terminal",
-                    run_status="cancelled",
-                    last_task={"status": "cancelled", "terminal_reason": "user_abort"},
+                    # The tree scan has finished, but another task may already
+                    # own this session. Task lifecycle events carry the exact
+                    # terminal identities; this operation-level notification
+                    # only invalidates the client's task/group projection.
+                    "cancellation_completed",
                 ),
             )
 
@@ -3757,6 +4244,10 @@ async def _delete_session_with_lifecycle(
 ) -> None:
     """Quiesce every writer and fail closed before deleting one session."""
 
+    from opensquilla.session.sidechat import sidechat_metadata
+
+    # Side panels are owned by the parent lifecycle even when normal subagent
+    # cascading is disabled. Close children before removing the owning row.
     session_keys = [canonical_key]
     async with contextlib.AsyncExitStack() as fences:
         # Child completion can schedule a parent wake while the runtime task is
@@ -3773,6 +4264,12 @@ async def _delete_session_with_lifecycle(
         lock = get_session_lock(ctx.turn_runner, canonical_key)
         if lock is not None:
             await fences.enter_async_context(lock)
+
+        children_reader = getattr(storage, "list_sidechat_children", None)
+        if callable(children_reader):
+            for child in await children_reader(canonical_key):
+                if sidechat_metadata(child) is not None:
+                    await _handle_sessions_sidechat_close({"key": child.session_key}, ctx)
 
         await drain_pending_flushes_for_sessions(session_keys)
 
@@ -3799,7 +4296,7 @@ async def _delete_session_with_lifecycle(
         # closed before their session record is removed.
         from opensquilla.gateway.approval_queue import get_approval_queue
 
-        get_approval_queue().expire_pending_for_session(canonical_key)
+        await get_approval_queue().expire_pending_for_session_async(canonical_key)
         await storage.delete_session(canonical_key)
         hold_store = getattr(ctx.turn_runner, "router_control_hold_store", None)
         forget_routing = getattr(hold_store, "forget_session", None)
@@ -4233,6 +4730,7 @@ async def _hydrate_sessions_messages_metadata(
 
 async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
     from opensquilla.gateway.recovery_scheduler import CURRENT_RECOVERY_OPERATION
+    from opensquilla.gateway.websocket import get_registry
 
     key = _require_key(params)
     operation = CURRENT_RECOVERY_OPERATION.get()
@@ -4261,6 +4759,22 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
             registered_new = ctx.conn_id not in subscription_mgr.get_message_subscribers(key)
             subscription_mgr.subscribe_messages(ctx.conn_id, key)
             token = subscription_mgr.get_message_subscription_token(ctx.conn_id, key)
+        connection = get_registry().get(ctx.conn_id)
+        if connection is not None:
+            # Establish the replacement fence even when the new subscription
+            # is idle and has not emitted a physical frame yet.
+            if not connection._register_flow_subscription_epoch(key):
+                if registered_new:
+                    subscription_mgr.unsubscribe_messages(
+                        ctx.conn_id, key, expected_token=token,
+                    )
+                raise RpcHandlerError(
+                    "SESSION_FLOW_LANE_LIMIT",
+                    "Too many unretired session flow lanes; "
+                    "confirm retire before opening another lane",
+                    retryable=True,
+                    accepted=False,
+                )
 
     try:
         result = await _build_sessions_messages_subscription_payload(
@@ -4305,6 +4819,617 @@ async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContex
         key,
         application.read_snapshot(key, client_caps=client_caps),
     )
+
+
+def _v2_cursor_encode(
+    *, key: str, session_id: str, session_epoch: int, direction: str, cursor: str | None,
+) -> str | None:
+    if cursor is None:
+        return None
+    raw = json.dumps(
+        {
+            "v": 1,
+            "key": key,
+            "session_id": session_id,
+            "session_epoch": session_epoch,
+            "direction": direction,
+            "cursor": cursor,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _v2_cursor_decode(
+    value: object,
+    *, key: str, session_id: str, session_epoch: int, direction: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise RpcHandlerError("INVALID_REQUEST", "params.cursor must be an opaque cursor")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (ValueError, TypeError, UnicodeError) as exc:
+        raise RpcHandlerError(
+            "HISTORY_STALE", "The history cursor is invalid; reload history"
+        ) from exc
+    if not isinstance(decoded, dict) or decoded.get("v") != 1:
+        raise RpcHandlerError("HISTORY_STALE", "The history cursor is invalid; reload history")
+    cursor = decoded.get("cursor")
+    if (
+        decoded.get("key") != key
+        or decoded.get("session_id") != session_id
+        or decoded.get("session_epoch") != session_epoch
+        or decoded.get("direction") != direction
+        or not isinstance(cursor, str)
+    ):
+        raise RpcHandlerError(
+            "REBASE_REQUIRED", "The history cursor belongs to an older session view"
+        )
+    return cursor
+
+
+def _v2_history_item(
+    message: Mapping[str, Any], *, session_id: str, session_epoch: int, order: int,
+) -> dict[str, Any]:
+    message_id = str(message.get("message_id") or message.get("id") or f"item-{order}")
+    ref = message.get("contentRef")
+    source_revision = message.get("contentRevision") or (
+        ref.get("revision") if isinstance(ref, Mapping) else None
+    )
+    if not isinstance(source_revision, str) or not source_revision:
+        # Compatibility for projectors without indexed storage metadata. This
+        # fences preview merges only; it never authorizes a ContentReader read.
+        source_revision = "preview-v1:" + hashlib.sha256(
+            str(message.get("text") or "").encode("utf-8")
+        ).hexdigest()
+    pending = bool(message.get("contentMetadataPending"))
+    unavailable = bool(message.get("contentUnavailableReason")) and not pending
+    complete = message.get("contentPreviewComplete")
+    if not isinstance(complete, bool):
+        complete = not (ref or pending or unavailable)
+    item: dict[str, Any] = {
+        "message_id": message_id,
+        "item_id": str(message.get("transcript_id") or message_id),
+        "order": str(message.get("timestamp") or order),
+        "role": str(message.get("role") or "unknown"),
+        "preview": str(message.get("text") or ""),
+        "preview_complete": complete,
+        "message": dict(message),
+        "source_revision": source_revision,
+        "content_availability": "preparing"
+        if pending
+        else "unavailable"
+        if unavailable
+        else "ready",
+        "contents": [],
+    }
+    if isinstance(ref, Mapping):
+        if pending:
+            # An unknown length can identify a semantic read but cannot
+            # advertise a ready byte-range handle.
+            return item
+        ref_session = str(ref.get("sessionId") or session_id)
+        ref_message = str(ref.get("messageId") or message_id)
+        revision = ref.get("revision")
+        # The HTTP reader compares this exact storage revision. A synthetic
+        # message-id revision can never authorize a read of the backing row.
+        # Missing metadata leaves the preview available without advertising
+        # a ready handle that cannot safely be consumed.
+        if not isinstance(revision, str) or not revision or len(revision) > 256:
+            item["content_availability"] = "preparing" if pending else "unavailable"
+            return item
+        byte_length = ref.get("byteLength")
+        if isinstance(byte_length, bool) or not isinstance(byte_length, int) or byte_length < 0:
+            byte_length = len(item["preview"].encode("utf-8"))
+        digest = ref.get("sha256")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            digest = None
+        item["contents"] = [
+            {
+                "availability": "ready",
+                "ref": {
+                    "content_id": f"legacy:{ref_session}:{ref_message}",
+                    "session_id": ref_session,
+                    "session_epoch": session_epoch,
+                    "revision": revision,
+                    **({"view": ref["view"]} if ref.get("view") in {"raw", "display"} else {}),
+                    **(
+                        {"source": ref["source"]}
+                        if ref.get("source") in {"active", "compacted"}
+                        else {}
+                    ),
+                    "representation": "text-utf8",
+                    "byte_length": byte_length,
+                    "sha256": digest,
+                    "status": "sealed",
+                    "durable": True,
+                    "expires_at": None,
+                },
+            }
+        ]
+    elif not complete and not pending:
+        item["content_availability"] = "unavailable"
+    return item
+
+
+async def _handle_sessions_read_open_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    key = _require_key(params)
+    identity = await _snapshot_session_identity(ctx, key)
+    session_id, session_epoch = identity
+    if not isinstance(session_id, str) or session_epoch is None:
+        raise RpcHandlerError("NOT_FOUND", "Session not found", accepted=False)
+    values = params or {}
+    if values.get("session_id") is not None and values.get("session_id") != session_id:
+        raise RpcHandlerError("REBASE_REQUIRED", "Session identity changed", accepted=False)
+    if values.get("session_epoch") is not None and int(values["session_epoch"]) != int(
+        session_epoch
+    ):
+        raise RpcHandlerError("REBASE_REQUIRED", "Session epoch changed", accepted=False)
+    # Identity reads above may yield across disconnect. Bind to the current
+    # socket immediately before retaining state, with no intervening await.
+    _own_v2_read_connection(ctx)
+    lease_key = (ctx.conn_id, key)
+    existing_id = _V2_READ_OPEN_BY_CONNECTION.get(lease_key)
+    if existing_id is not None and (ctx.conn_id, existing_id) in _V2_READ_LEASES:
+        return cast(dict[str, Any], _V2_READ_LEASES[(ctx.conn_id, existing_id)]["open_result"])
+    replay = get_session_streams().replay(key, None)
+    stream_generation = str(getattr(replay, "stream_generation", "unknown"))
+    stream_seq = max(0, int(getattr(replay, "current_stream_seq", 0)))
+    lease_id = uuid.uuid4().hex
+    recovery_id = uuid.uuid4().hex
+    state: dict[str, Any] = {
+        "lease_id": lease_id,
+        "recovery_id": recovery_id,
+        "key": key,
+        "session_id": session_id,
+        "session_epoch": int(session_epoch),
+        "connection_epoch": str(values.get("connection_epoch") or f"conn:{ctx.conn_id}"),
+        "subscription_epoch": str(values.get("subscription_epoch") or "0"),
+        "state_revision": stream_seq,
+        "base_seq": stream_seq,
+        "target_seq": stream_seq,
+        "next_seq": stream_seq + 1,
+        "consumed_through_seq": stream_seq,
+        "status": "staged",
+        "stream_generation": stream_generation,
+        "manifest": _v2_state_manifest(
+            key=key, session_id=session_id, session_epoch=int(session_epoch),
+            generation=stream_generation, stream_seq=stream_seq,
+        ),
+    }
+    result = {
+        "lease_id": lease_id,
+        "recovery_id": recovery_id,
+        "session_id": session_id,
+        "session_epoch": int(session_epoch),
+        "connection_epoch": state["connection_epoch"],
+        "subscription_epoch": state["subscription_epoch"],
+        "state_revision": stream_seq,
+        "base_stream_generation": stream_generation,
+        "base_stream_seq": stream_seq,
+        "state_manifest": state["manifest"],
+    }
+    state["open_result"] = result
+    _V2_READ_LEASES[(ctx.conn_id, lease_id)] = state
+    _V2_READ_OPEN_BY_CONNECTION[lease_key] = lease_id
+    return result
+
+
+def _v2_read_lease(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params required: key, lease_id")
+    key = _require_key(params)
+    lease_id = params.get("lease_id")
+    if not isinstance(lease_id, str) or not lease_id:
+        raise ValueError("params.lease_id is required")
+    state = _V2_READ_LEASES.get((ctx.conn_id, lease_id))
+    if state is None or state["key"] != key:
+        raise RpcHandlerError("READ_STALE", "Read lease is no longer current", accepted=False)
+    recovery_id = params.get("recovery_id")
+    if recovery_id is not None and recovery_id != state["recovery_id"]:
+        raise RpcHandlerError(
+            "READ_STALE", "Read recovery attempt is no longer current", accepted=False,
+        )
+    return state
+
+
+async def _handle_sessions_read_state_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    state = _v2_read_lease(params, ctx)
+    identity = await _snapshot_session_identity(ctx, state["key"])
+    install_lock = state.get("install_lock")
+    if identity != (state["session_id"], state["session_epoch"]):
+        state["status"] = "rebase_required"
+    elif (
+        state["status"] not in {"installed", "retired", "rebase_required"}
+        and (install_lock is None or not install_lock.locked())
+    ):
+        # Refresh the target without declaring a client ACK authoritative. The
+        # next install call still performs a second read for the final CAS.
+        # An in-flight install owns its proof through the durable write; a
+        # state poll must not overwrite that proof with a newer live tail.
+        try:
+            _replay, proof, batches = _v2_replay_snapshot(
+                key=state["key"], stream_generation=state["stream_generation"],
+                base_seq=state["base_seq"],
+            )
+        except RpcHandlerError:
+            state["status"] = "rebase_required"
+        else:
+            state["target_seq"] = max(state["target_seq"], int(proof["target_seq"]))
+            state["replay_proof"] = proof
+            state["replay_batches"] = batches
+            if (
+                state["status"] == "base_applied"
+                and state["consumed_through_seq"] < state["target_seq"]
+            ):
+                state["status"] = "catching_up"
+    return {
+        "lease_id": state["lease_id"],
+        "recovery_id": state["recovery_id"],
+        "session_id": state["session_id"],
+        "session_epoch": state["session_epoch"],
+        "state_revision": state["state_revision"],
+        "status": state["status"],
+        "progress": _v2_read_progress(state),
+    }
+
+
+async def _handle_sessions_read_install_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    state = _v2_read_lease(params, ctx)
+    # A receipt is sealed only after its durable write. Concurrent confirms
+    # must not race that write or let a later failure undo an installed proof.
+    lock = state.setdefault("install_lock", asyncio.Lock())
+    async with lock:
+        state = _v2_read_lease(params, ctx)
+        return await _install_v2_read_lease(state, params or {}, ctx)
+
+
+async def _install_v2_read_lease(
+    state: dict[str, Any], values: dict[str, Any], ctx: RpcContext,
+) -> dict[str, Any]:
+    identity = await _snapshot_session_identity(ctx, state["key"])
+    if identity != (state["session_id"], state["session_epoch"]):
+        state["status"] = "rebase_required"
+        raise RpcHandlerError(
+            "REBASE_REQUIRED", "The session identity changed during recovery",
+            retryable=True, accepted=False,
+        )
+    installed = state["status"] == "installed"
+    if installed:
+        # Installation seals one recovery receipt. Confirming it again must
+        # not require the bounded replay cache to retain its original base
+        # throughout a long-running live subscription. Keep identity and
+        # generation fences, but never extend the sealed proof via an ACK.
+        replay = get_session_streams().replay(state["key"], None)
+        if str(getattr(replay, "stream_generation", "")) != state["stream_generation"]:
+            state["status"] = "rebase_required"
+            raise RpcHandlerError(
+                "REBASE_REQUIRED", "The session event stream was replaced; reload state",
+                retryable=True, accepted=False,
+            )
+    else:
+        # Uninstalled recoveries still require a fresh contiguous server proof;
+        # a client ACK cannot turn an expired replay base into installed state.
+        _replay, proof, batches = _v2_replay_snapshot(
+            key=state["key"], stream_generation=state["stream_generation"],
+            base_seq=state["base_seq"],
+        )
+        state["replay_proof"] = proof
+        state["replay_batches"] = batches
+        state["target_seq"] = int(proof["target_seq"])
+    consumed = values.get("consumed_through_seq")
+    acknowledged = values.get("ack_through_seq")
+    target_seq = int(state["target_seq"])
+    if consumed is not None:
+        if (
+            isinstance(consumed, bool)
+            or not isinstance(consumed, int)
+            or int(consumed) > target_seq
+        ):
+            raise RpcHandlerError(
+                "INVALID_REQUEST", "consumed_through_seq exceeds the server replay target",
+                accepted=False,
+            )
+        state["consumed_through_seq"] = max(state["consumed_through_seq"], int(consumed))
+    if acknowledged is not None:
+        if (
+            isinstance(acknowledged, bool)
+            or not isinstance(acknowledged, int)
+            or int(acknowledged) > target_seq
+        ):
+            raise RpcHandlerError(
+                "INVALID_REQUEST", "ack_through_seq exceeds the server replay target",
+                accepted=False,
+            )
+        state["consumed_through_seq"] = max(state["consumed_through_seq"], int(acknowledged))
+    if installed:
+        return {
+            "lease_id": state["lease_id"],
+            "recovery_id": state["recovery_id"],
+            "status": state["status"],
+            "progress": _v2_read_progress(state),
+        }
+    if values.get("base_applied") is True:
+        state["handoff_seq"] = state["base_seq"]
+        state["status"] = "base_applied"
+    elif state["status"] == "staged":
+        state["status"] = "base_applied"
+    state["next_seq"] = max(state["next_seq"], state["consumed_through_seq"] + 1)
+    if state["status"] in {"base_applied", "catching_up"} and (
+        state["consumed_through_seq"] >= target_seq
+    ):
+        # Final CAS: identity and stream generation/target must still match
+        # the proof captured above. If a new event landed, leave the lease in
+        # catching_up and make the caller ACK the newly observed tail.
+        final_identity = await _snapshot_session_identity(ctx, state["key"])
+        if final_identity != (state["session_id"], state["session_epoch"]):
+            state["status"] = "rebase_required"
+            raise RpcHandlerError(
+                "REBASE_REQUIRED", "The session identity changed before install",
+                retryable=True, accepted=False,
+            )
+        try:
+            _final_replay, final_proof, final_batches = _v2_replay_snapshot(
+                key=state["key"], stream_generation=state["stream_generation"],
+                base_seq=state["base_seq"],
+            )
+        except RpcHandlerError:
+            state["status"] = "rebase_required"
+        else:
+            if int(final_proof["target_seq"]) != target_seq:
+                state["target_seq"] = int(final_proof["target_seq"])
+                state["replay_proof"] = final_proof
+                state["replay_batches"] = final_batches
+                state["status"] = "catching_up"
+            else:
+                state["replay_proof"] = final_proof
+                state["proof_id"] = final_proof["proof_id"]
+                storage = get_session_storage(getattr(ctx, "session_manager", None))
+                persist = getattr(storage, "upsert_session_read_recovery_receipt", None)
+                if callable(persist):
+                    try:
+                        await persist({
+                            "recovery_id": state["recovery_id"],
+                            "session_key": state["key"],
+                            "session_id": state["session_id"],
+                            "session_epoch": state["session_epoch"],
+                            "connection_epoch": state["connection_epoch"],
+                            "subscription_epoch": state["subscription_epoch"],
+                            "stream_generation": state["stream_generation"],
+                            "base_seq": state["base_seq"],
+                            "target_seq": state["target_seq"],
+                            "consumed_through_seq": state["consumed_through_seq"],
+                            "status": "installed",
+                            "proof_id": state["proof_id"],
+                            "proof": final_proof,
+                        })
+                        state["receipt_durable"] = True
+                    except Exception as exc:  # noqa: BLE001 - explicit durability failure
+                        state["status"] = "catching_up"
+                        raise RpcHandlerError(
+                            "READ_UNAVAILABLE",
+                            "Recovery proof could not be persisted; retry install",
+                            retryable=True, accepted=False,
+                        ) from exc
+                    # Persistence may yield across reset, disconnect or a
+                    # replacement stream. Never publish a sealed receipt into
+                    # that replacement view, even when the old write succeeded.
+                    installed_identity = await _snapshot_session_identity(ctx, state["key"])
+                    _v2_read_lease(values, ctx)
+                    installed_stream = get_session_streams().replay(state["key"], None)
+                    if (
+                        state["status"] == "rebase_required"
+                        or installed_identity != (state["session_id"], state["session_epoch"])
+                        or str(getattr(installed_stream, "stream_generation", ""))
+                        != state["stream_generation"]
+                    ):
+                        state["status"] = "rebase_required"
+                        raise RpcHandlerError(
+                            "REBASE_REQUIRED", "Session changed while recovery proof was persisted",
+                            retryable=True, accepted=False,
+                        )
+                state["status"] = "installed"
+    return {
+        "lease_id": state["lease_id"],
+        "recovery_id": state["recovery_id"],
+        "status": state["status"],
+        "progress": _v2_read_progress(state),
+    }
+
+
+async def _handle_sessions_read_close_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    state = _v2_read_lease(params, ctx)
+    state["status"] = "retired"
+    _V2_READ_LEASES.pop((ctx.conn_id, state["lease_id"]), None)
+    if _V2_READ_OPEN_BY_CONNECTION.get((ctx.conn_id, state["key"])) == state["lease_id"]:
+        _V2_READ_OPEN_BY_CONNECTION.pop((ctx.conn_id, state["key"]), None)
+    return {"lease_id": state["lease_id"], "closed": True, "status": "retired"}
+
+
+async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params required: key, direction")
+    key = _require_key(params)
+    direction = params.get("direction")
+    if direction not in {"before", "after"}:
+        raise ValueError("params.direction must be before or after")
+    session_id, session_epoch = await _snapshot_session_identity(ctx, key)
+    if not isinstance(session_id, str) or session_epoch is None:
+        raise RpcHandlerError("NOT_FOUND", "Session not found", accepted=False)
+    if params.get("session_id") is not None and params["session_id"] != session_id:
+        raise RpcHandlerError("REBASE_REQUIRED", "Session identity changed", accepted=False)
+    if params.get("session_epoch") is not None and int(params["session_epoch"]) != int(
+        session_epoch
+    ):
+        raise RpcHandlerError("REBASE_REQUIRED", "Session epoch changed", accepted=False)
+    legacy_cursor = _v2_cursor_decode(
+        params.get("cursor"), key=key, session_id=session_id,
+        session_epoch=int(session_epoch), direction=direction,
+    )
+    anchor_message_id = params.get('anchor_message_id')
+    anchor_has_successor = False
+    if anchor_message_id is not None:
+        if (not isinstance(anchor_message_id, str) or not anchor_message_id
+                or params.get('cursor') is not None):
+            raise ValueError(
+                'anchor_message_id must be nonempty and cannot be combined with cursor'
+            )
+        storage = get_session_storage(getattr(ctx, 'session_manager', None))
+        if storage is None:
+            raise RpcUnavailableError('Session storage unavailable')
+        anchors = await storage.read_message_search_rows(
+            session_id, message_id=anchor_message_id, descending=True, limit=1,
+        )
+        if not anchors:
+            raise RpcHandlerError(
+                'HISTORY_STALE', 'Search message no longer exists', accepted=False,
+            )
+        anchor = anchors[0]
+        successors = await storage.read_message_search_rows(
+            session_id, after=(anchor['created_at'], anchor['entry_id']),
+            limit=1, visible_only=False,
+        )
+        # Existing before-pages are exclusive. The real next row is a valid
+        # membership-checked cursor, making this page end at the hit without
+        # inventing an anchor or loading all intervening history.
+        direction = 'before'
+        anchor_has_successor = bool(successors)
+        legacy_cursor = (
+            f"{successors[0]['created_at']}|{successors[0]['entry_id']}" if successors else None
+        )
+    limit = min(256, max(1, int(params.get("target_items") or 64)))
+    legacy_params: dict[str, Any] = {
+        "sessionKey": key,
+        "limit": limit,
+        "includeCanonical": True,
+        "includeSummaries": True,
+    }
+    if legacy_cursor is not None:
+        legacy_params["before" if direction == "before" else "after"] = legacy_cursor
+    legacy = await read_chat_history_v4(legacy_params, ctx)
+    raw_messages = legacy.get("messages") if isinstance(legacy, Mapping) else []
+    if not isinstance(raw_messages, list):
+        raw_messages = []
+    items = [
+        _v2_history_item(
+            message, session_id=session_id, session_epoch=int(session_epoch), order=index
+        )
+        for index, message in enumerate(raw_messages)
+        if isinstance(message, Mapping)
+    ]
+    target_bytes = min(1_048_576, max(1, int(params.get("target_bytes") or 1_048_576)))
+    result: dict[str, Any] = {
+        "session_id": session_id,
+        "session_epoch": int(session_epoch),
+        "projection_revision": int(session_epoch),
+        "items": [],
+        "before_cursor": None,
+        "after_cursor": None,
+        "has_more_before": False,
+        "has_more_after": False,
+        "complete_for_requested_window": False,
+        # Storage/archive coverage is independent of this transport page's
+        # byte budget. Preserve the canonical reader's fallback proof.
+        "canonical_available": bool(legacy.get("canonical_available", False)),
+        "canonical_complete": bool(legacy.get("canonical_complete", False)),
+        "history_scope": legacy.get("history_scope", "latest_window"),
+        "compaction_summaries": legacy.get("compaction_summaries", []),
+        "turn_outcomes": legacy.get("turn_outcomes", []),
+    }
+
+    def boundary(item: Mapping[str, Any], edge: str) -> str:
+        message = item["message"]
+        cursor = message.get("historyCursorBefore" if edge == "before" else "historyCursorAfter")
+        if isinstance(cursor, str):
+            return cursor
+        timestamp, transcript_id = message.get("timestamp"), message.get("transcript_id")
+        if timestamp is None or transcript_id is None:
+            raise RpcHandlerError(
+                "RESPONSE_TOO_LARGE", "History item has no resumable boundary", accepted=False
+            )
+        return f"{int(timestamp)}|{int(transcript_id)}"
+
+    if anchor_message_id is not None and items:
+        # Include both navigation cursors in the budget before choosing the
+        # anchored suffix. Appending this metadata afterwards could reject a
+        # page that should have fitted after dropping one older context item.
+        result['after_cursor'] = _v2_cursor_encode(
+            key=key, session_id=session_id, session_epoch=int(session_epoch),
+            direction='after', cursor=boundary(items[-1], 'after'),
+        )
+        result['has_more_after'] = anchor_has_successor
+
+    # Walk from the requested edge: newest suffix for before, oldest prefix
+    # for after. Serialize each item once, including its semantic metadata.
+    bounded: list[dict[str, Any]] = []
+    item_bytes = 0
+    for item in reversed(items) if direction == "before" else items:
+        encoded_size = len(
+            json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        candidate_count = len(bounded) + 1
+        truncated = candidate_count < len(items)
+        legacy_edge = boundary(item, direction) if truncated else legacy.get(
+            "oldest_cursor" if direction == "before" else "newest_cursor"
+        )
+        result[f"{direction}_cursor"] = _v2_cursor_encode(
+            key=key, session_id=session_id, session_epoch=int(session_epoch),
+            direction=direction, cursor=legacy_edge,
+        )
+        result[f"has_more_{direction}"] = bool(legacy.get("has_more")) or truncated
+        result["complete_for_requested_window"] = not truncated
+        # result.items remains [] while calculating the fixed page metadata.
+        overhead = len(
+            json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        if overhead + item_bytes + encoded_size + candidate_count - 1 > target_bytes:
+            break
+        bounded.append(item)
+        item_bytes += encoded_size
+    if not bounded and items:
+        raise RpcHandlerError(
+            "RESPONSE_TOO_LARGE",
+            "A history item exceeds the requested page byte budget",
+            details={
+                "target_bytes": target_bytes,
+                "message_id": items[-1 if direction == "before" else 0]["message_id"],
+            },
+            accepted=False,
+        )
+    if direction == "before":
+        bounded.reverse()
+    truncated_by_bytes = len(bounded) < len(items)
+    legacy_edge = legacy.get("oldest_cursor" if direction == "before" else "newest_cursor")
+    if truncated_by_bytes:
+        legacy_edge = boundary(bounded[0 if direction == "before" else -1], direction)
+    result["items"] = bounded
+    result[f"{direction}_cursor"] = _v2_cursor_encode(
+        key=key, session_id=session_id, session_epoch=int(session_epoch),
+        direction=direction, cursor=legacy_edge,
+    )
+    result[f"has_more_{direction}"] = bool(legacy.get("has_more")) or truncated_by_bytes
+    result["complete_for_requested_window"] = not truncated_by_bytes
+    if anchor_message_id is not None:
+        if not any(item['message_id'] == anchor_message_id for item in bounded):
+            raise RpcHandlerError(
+                'HISTORY_STALE', 'Search message changed during navigation', accepted=False,
+            )
+        if await _snapshot_session_identity(ctx, key) != (session_id, session_epoch):
+            raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
+    if (
+        len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        > target_bytes
+    ):
+        raise RpcHandlerError(
+            "RESPONSE_TOO_LARGE",
+            "History metadata exceeds the requested page byte budget",
+            accepted=False,
+        )
+    return result
 
 
 async def _snapshot_session_identity(ctx: RpcContext, key: str) -> tuple[str | None, int | None]:
@@ -4415,11 +5540,15 @@ async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcC
         ) from exc
 
 
-async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcContext) -> None:
+async def _handle_sessions_messages_unsubscribe(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any] | None:
     key = _require_key(params)
     subscription_mgr = getattr(ctx, "subscription_manager", None)
     if subscription_mgr is not None:
-        subscription_mgr.unsubscribe_messages(ctx.conn_id, key)
+        retire = subscription_mgr.unsubscribe_messages(ctx.conn_id, key)
+        return {"lane_retire": retire} if retire is not None else None
     return None
 
 
@@ -4484,6 +5613,45 @@ _handle_sessions_messages_unsubscribe_contract = register_sessions_messages_unsu
 _handle_sessions_preview_contract = register_sessions_preview_contract(
     _d,
     _handle_sessions_preview,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+
+# Additive v2 read lifecycle. These handlers intentionally use the generated
+# descriptors directly so request/result validation is identical to the other
+# modern Gateway contracts while legacy sessions.messages.* remains unchanged.
+_handle_sessions_read_open_v2_contract = register_connection_recovery_contract(
+    _d,
+    "sessions.read.open.v2",
+    _handle_sessions_read_open_v2,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_read_state_v2_contract = register_connection_recovery_contract(
+    _d,
+    "sessions.read.state.v2",
+    _handle_sessions_read_state_v2,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_read_install_v2_contract = register_connection_recovery_contract(
+    _d,
+    "sessions.read.install.v2",
+    _handle_sessions_read_install_v2,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_read_close_v2_contract = register_connection_recovery_contract(
+    _d,
+    "sessions.read.close.v2",
+    _handle_sessions_read_close_v2,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_history_page_v2_contract = register_connection_recovery_contract(
+    _d,
+    "sessions.history.page.v2",
+    _handle_sessions_history_page_v2,
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )
@@ -5769,6 +6937,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
             tui_connection=is_registered_tui_connection(ctx.conn_id),
         )
         self._native_sessions = ctx.session_manager
+        self.startup_services = ctx.startup_services
         self.sessions = (
             GatewayAdmissionSessions(ctx.session_manager)
             if ctx.session_manager is not None
@@ -5803,7 +6972,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
         self._fork_session = partial(_fork_with_numbered_title, ctx)
         self._fork_title_allocation = partial(_fork_title_allocation_context, ctx)
         self._next_fork_title = partial(_next_fork_display_name, ctx)
-        self.schedule_auto_title = partial(_schedule_auto_title, ctx)
+        self.install_auto_title = partial(_install_auto_title, ctx)
         self.steer_metric = _emit_steer_metric
         self.positive_int = _coerce_positive_int
         self.workspace_error = partial(map_project_workspace_error, owner=self.is_owner)
@@ -5910,6 +7079,106 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
 
     def is_remote_guest(self, source: IncomingTurnSource) -> bool:
         return _is_remote_web_guest(self._principal, source_hint_from_turn(source))
+
+    async def resolve_activation_authority(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+    ) -> dict[str, Any]:
+        """Capture the server-computed authority for a queued turn.
+
+        This is deliberately resolved at the durable ingress boundary rather
+        than from client metadata.  Named-token reads stay off the Gateway
+        event loop and carry the revision/fingerprint that the storage claim
+        rechecks immediately before provider dispatch.
+        """
+        from opensquilla.gateway.scopes import normalize_operator_scopes
+        from opensquilla.gateway.token_store import (
+            AuthorizationDecision,
+            TokenStore,
+            permission_fingerprint,
+            run_auth_database_operation,
+        )
+
+        principal = self._principal
+        auth_state = str(getattr(principal, "auth_state", "invalid") or "invalid")
+        if auth_state == "invalid":
+            raise RpcHandlerError(
+                "UNAUTHORIZED",
+                "The current authorization is no longer valid.",
+                accepted=False,
+            )
+
+        role = str(getattr(principal, "role", "") or "")
+        scopes = frozenset(getattr(principal, "scopes", frozenset()))
+        capabilities = frozenset(getattr(principal, "capabilities", frozenset()))
+        public_id = str(getattr(principal, "token_public_id", "") or "")
+        authority_kind = "named_token" if public_id not in {"", "desktop", "legacy"} else (
+            "guest" if auth_state == "guest" else "local"
+        )
+        revision = 1
+        fingerprint = permission_fingerprint((role,), scopes, capabilities)
+        if authority_kind == "named_token":
+            state_dir = str(getattr(self._runtime_config, "state_dir", "") or "")
+            if not state_dir:
+                raise RpcHandlerError(
+                    "AUTHORITY_UNAVAILABLE",
+                    "Current authorization storage is unavailable; retry this turn.",
+                    retryable=True,
+                    accepted=False,
+                )
+            try:
+                decision: AuthorizationDecision = await run_auth_database_operation(
+                    lambda: TokenStore(Path(state_dir) / "sessions.db", initialize=False)
+                    .get_active_authorization_decision(public_id),
+                )
+            except Exception as exc:  # noqa: BLE001 - explicit unavailable state
+                raise RpcHandlerError(
+                    "AUTHORITY_UNAVAILABLE",
+                    "Current authorization storage is unavailable; retry this turn.",
+                    retryable=True,
+                    accepted=False,
+                ) from exc
+            if decision.status == "unavailable":
+                raise RpcHandlerError(
+                    "AUTHORITY_UNAVAILABLE",
+                    "Current authorization could not be read; retry this turn.",
+                    retryable=True,
+                    accepted=False,
+                )
+            if decision.status != "allow":
+                raise RpcHandlerError(
+                    "UNAUTHORIZED",
+                    "The current authorization is no longer valid.",
+                    accepted=False,
+                )
+            if (
+                role not in decision.roles
+                or not scopes <= normalize_operator_scopes(decision.scopes)
+                or not capabilities <= decision.capabilities
+                or decision.authorization_revision is None
+                or not decision.permission_fingerprint
+            ):
+                raise RpcHandlerError(
+                    "UNAUTHORIZED",
+                    "The current authorization does not grant this operation.",
+                    accepted=False,
+                )
+            revision = int(decision.authorization_revision)
+            fingerprint = str(decision.permission_fingerprint)
+
+        return {
+            "session_id": session_id,
+            "session_epoch": session_epoch,
+            "authorization_revision": revision,
+            "permission_fingerprint": fingerprint,
+            "authority_kind": authority_kind,
+            # Public token identifiers are not secrets.  The storage claim
+            # uses this coordinate to re-read the same token row in its writer
+            # transaction and detect revoke/revision races.
+            "token_public_id": public_id if authority_kind == "named_token" else None,
+        }
 
 
     async def prepare_route(

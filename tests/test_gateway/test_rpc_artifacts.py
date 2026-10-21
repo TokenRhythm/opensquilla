@@ -11,12 +11,20 @@ import pytest
 from PIL import Image
 
 import opensquilla.gateway.rpc_artifacts as rpc_artifacts
+from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
+    ArtifactSessionService,
+)
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.contracts.generated.v4.artifacts_list import ArtifactsListResult
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.guest_rpc_policy import guest_owned_session_key
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher, validate_classification
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 
@@ -487,3 +495,172 @@ async def test_guest_can_read_only_its_session_artifacts(artifact_rpc_env) -> No
     assert rejected_list.error.code == "UNAUTHORIZED"
     assert rejected_get.error is not None
     assert rejected_get.error.code == "UNAUTHORIZED"
+
+
+def _revision_blob(ref) -> ArtifactBlobRef:
+    return ArtifactBlobRef(
+        artifact_id=ref.id,
+        sha256=ref.sha256,
+        filename=ref.name,
+        media_type=ref.mime,
+        byte_size=ref.size,
+    )
+
+
+async def _workspace_preview(artifact_rpc_env, *, source="workspace-preview"):
+    manager, store, ctx = artifact_rpc_env
+    key = "agent:main:webchat:workspace-preview"
+    session = await manager.create(key)
+    ref = store.publish_bytes(
+        b"<html><body>Original preview</body></html>",
+        session_id=session.session_id,
+        session_key=key,
+        name="index.html",
+        mime="text/html",
+        source=source,
+        visibility="listed" if source == "publish_artifact" else "internal",
+    )
+    storage = get_session_storage(manager)
+    assert storage is not None
+    service = await ArtifactSessionService.from_session_storage(storage)
+    return key, session, ref, service, ctx
+
+
+async def _create_preview_document(service, key, session_id, ref):
+    return await service.create_document(
+        session_key=key,
+        session_id=session_id,
+        name=ref.name,
+        kind=ArtifactKind.HTML,
+        initial_artifact=_revision_blob(ref),
+        actor=Actor(ActorKind.SYSTEM, "workspace-preview"),
+    )
+
+
+async def _get_preview_artifact(ctx, key, artifact_id, **extra):
+    return await get_dispatcher().dispatch(
+        "get-workspace-preview",
+        "artifacts.get",
+        {"sessionKey": key, "artifactId": artifact_id, **extra},
+        ctx,
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_preview_get_resolves_existing_document_across_head_changes(
+    artifact_rpc_env,
+) -> None:
+    key, session, ref, service, ctx = await _workspace_preview(artifact_rpc_env)
+    original = await _create_preview_document(service, key, session.session_id, ref)
+    ctx = RpcContext(
+        conn_id="read-only-preview",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({READ_SCOPE}),
+            is_owner=False,
+            authenticated=True,
+        ),
+        session_manager=ctx.session_manager,
+        config=ctx.config,
+    )
+    first = await _get_preview_artifact(ctx, key, ref.id)
+    assert first.error is None, first.error
+    assert first.payload["artifact"]["documentId"] == original.document.document_id
+
+    _, store, _ = artifact_rpc_env
+    newer = store.publish_bytes(
+        b"<html><body>New head</body></html>",
+        session_id=session.session_id,
+        session_key=key,
+        name="index.html",
+        mime="text/html",
+        source="workspace-preview",
+        visibility="internal",
+    )
+    current = await service.commit_revision(
+        document_id=original.document.document_id,
+        expected_head_revision_id=original.revision.revision_id,
+        expected_state_revision=original.document.state_revision,
+        artifact=_revision_blob(newer),
+        actor=Actor(ActorKind.SYSTEM, "workspace-preview"),
+    )
+    before_audit = await service.latest_audit_event(original.document.document_id)
+    before_revisions = await service.list_revisions(original.document.document_id)
+    old_card = await _get_preview_artifact(ctx, key, ref.id)
+    new_card = await _get_preview_artifact(ctx, key, newer.id)
+    assert old_card.error is None, old_card.error
+    assert new_card.error is None, new_card.error
+    assert old_card.payload["artifact"]["documentId"] == original.document.document_id
+    assert new_card.payload["artifact"]["documentId"] == original.document.document_id
+    # Keep immutable card metadata separate from the mutable document head.
+    assert old_card.payload["artifact"]["sha256"] == ref.sha256
+    assert new_card.payload["artifact"]["sha256"] == newer.sha256
+    assert await service.get_document_head(original.document.document_id) == current
+    assert await service.list_revisions(original.document.document_id) == before_revisions
+    assert await service.latest_audit_event(original.document.document_id) == before_audit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrong_scope", ["session-key", "session-incarnation"])
+async def test_workspace_preview_mapping_requires_both_current_session_identifiers(
+    artifact_rpc_env, wrong_scope,
+) -> None:
+    key, session, ref, service, ctx = await _workspace_preview(artifact_rpc_env)
+    foreign = await _create_preview_document(
+        service,
+        key if wrong_scope == "session-incarnation" else key + "-other",
+        session.session_id if wrong_scope == "session-key" else "prior-incarnation",
+        ref,
+    )
+    response = await _get_preview_artifact(ctx, key, ref.id)
+    assert response.error is None, response.error
+    assert "documentId" not in response.payload["artifact"]
+    # A stale or foreign relation must not suppress the correct unique mapping.
+    current = await _create_preview_document(service, key, session.session_id, ref)
+    response = await _get_preview_artifact(ctx, key, ref.id)
+    assert response.error is None, response.error
+    assert response.payload["artifact"]["documentId"] == current.document.document_id
+    assert response.payload["artifact"]["documentId"] != foreign.document.document_id
+
+
+@pytest.mark.asyncio
+async def test_workspace_preview_ambiguous_mapping_fails_without_selecting_or_mutating(
+    artifact_rpc_env,
+) -> None:
+    key, session, ref, service, ctx = await _workspace_preview(artifact_rpc_env)
+    first = await _create_preview_document(service, key, session.session_id, ref)
+    second = await _create_preview_document(service, key, session.session_id, ref)
+    before = await service.list_documents(session_key=key, session_id=session.session_id)
+    response = await _get_preview_artifact(ctx, key, ref.id)
+    assert response.error is not None
+    assert response.error.code == "DOCUMENT_UNAVAILABLE"
+    assert response.error.retryable is False
+    assert response.error.details["reasonCode"] == "ambiguous_document_mapping"
+    assert first.document.document_id not in response.error.message
+    assert second.document.document_id not in response.error.message
+    assert response.payload is None
+    assert await service.list_documents(session_key=key, session_id=session.session_id) == before
+
+
+@pytest.mark.asyncio
+async def test_workspace_preview_orphan_lookup_never_adopts_a_document(artifact_rpc_env) -> None:
+    key, session, ref, service, ctx = await _workspace_preview(artifact_rpc_env)
+    response = await _get_preview_artifact(ctx, key, ref.id)
+    assert response.error is None, response.error
+    assert "documentId" not in response.payload["artifact"]
+    assert await service.list_documents(session_key=key, session_id=session.session_id) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["publish_artifact", "office-revision"])
+async def test_artifact_document_enrichment_uses_server_provenance_only(
+    artifact_rpc_env, source,
+) -> None:
+    key, session, ref, service, ctx = await _workspace_preview(artifact_rpc_env, source=source)
+    await _create_preview_document(service, key, session.session_id, ref)
+    response = await _get_preview_artifact(
+        ctx, key, ref.id, source="workspace-preview", documentId="doc-client-guess",
+    )
+    assert response.error is None, response.error
+    assert response.payload["artifact"]["source"] == source
+    assert "documentId" not in response.payload["artifact"]

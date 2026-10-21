@@ -24,6 +24,7 @@ import {
   FIRST_SEND_REPORT_VERSION,
   MAIN_CONSOLE_JOURNAL,
   evaluateFirstSendEvidence,
+  firstSendRendererSnapshot,
   installMainConsoleObservation,
   markMainConsoleCleanup,
   observeRendererPages,
@@ -31,6 +32,13 @@ import {
   readEvidenceLog,
 } from './packaged-first-send-evidence.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
+
+async function composerValue(locator) {
+  return await locator.evaluate((element) => {
+    const value = element?.value
+    return typeof value === 'string' ? value : element?.textContent ?? ''
+  })
+}
 
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
@@ -182,13 +190,14 @@ assertSecretScrubbingBoundary()
 const executablePath = resolve(requiredOption('--executable'))
 const userDataDir = resolve(requiredOption('--user-data-dir'))
 const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
+const tracePath = process.env.OPENSQUILLA_FIRST_SEND_TRACE_PATH
 let app
 let provider
 let runError
 let rendererPage
 let electronProcessIdentity
 let failureRendererSnapshot
-let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [] }
+let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [], sessionStreamWarnings: [] }
 let targetPageId = null
 let targetWebContentsId = null
 let mainObservationInstalled = false
@@ -215,19 +224,7 @@ function reportPhase(phase, details = {}) {
 
 async function captureRendererFailure(page) {
   if (!page) return null
-  return captureFirstSendDiagnostic(() => page.evaluate(() => ({
-    pathname: location.pathname,
-    sessionMaterialized: new URL(location.href).searchParams.has('session'),
-    connected: Boolean(document.querySelector('.conn-pill.connected')),
-    sendButtonDisabled: document.querySelector('.chat-send-btn.btn--primary')?.disabled ?? null,
-    assistantMessages: document.querySelectorAll('.msg-ai').length,
-    assistantAnswers: document.querySelectorAll('.msg-ai-text').length,
-    errorBoundaries: document.querySelectorAll('.error-boundary').length,
-    // Only error-card text from this fresh synthetic profile is retained;
-    // exclude message bodies, inputs, session identifiers and URL queries.
-    sessionErrors: [...document.querySelectorAll('.msg-error-card__text')]
-      .slice(0, 5).map(element => (element.textContent || '').slice(0, 500)),
-  })))
+  return captureFirstSendDiagnostic(() => page.evaluate(firstSendRendererSnapshot))
 }
 
 async function browserRpcSnapshot(page) {
@@ -376,10 +373,13 @@ try {
       GITHUB_ACTIONS: '0',
       OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS: '131072',
       OPENSQUILLA_TESTING: '0',
+      // This gate counts main-turn requests to detect duplicate chat sends.
+      OPENSQUILLA_NAMING_ENABLED: 'false',
       NO_PROXY: '127.0.0.1,localhost,::1',
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
+  if (tracePath) await app.context().tracing.start({ screenshots: true, snapshots: true })
   // Observe every available page before waiting for a URL, Gateway readiness,
   // or process diagnostics. The desktop log covers earlier trusted-frame
   // console events; none of those pre-observation errors can be waived.
@@ -411,12 +411,24 @@ try {
   // visible can interrupt that promise and strand startup before inspection.
   // Prove the initial document and Gateway are settled before installing the
   // page-level WebSocket probe.
-  reportPhase('gateway-connection-start')
-  await page.locator('.conn-pill.connected').waitFor({
-    state: 'visible',
-    timeout: INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
-  })
-  reportPhase('gateway-connected')
+  reportPhase('gateway-readiness-start')
+  await waitFor(
+    () => page.evaluate(async () => {
+      const desktop = window.opensquillaDesktop
+      if (!desktop) return false
+      const [gateway, connection] = await Promise.all([
+        desktop.getGatewayStatus(),
+        desktop.getGatewayConnection(),
+      ])
+      return gateway.owned === true && gateway.status === 'ready' && connection.status === 'ready'
+    }),
+    'owned packaged Gateway and connection descriptor readiness',
+    INITIAL_GATEWAY_CONNECTION_TIMEOUT_MS,
+  )
+  await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
+  // IPC readiness does not prove a WebSocket handshake. The send-enabled,
+  // actual chat.send and provider/answer assertions below prove that path.
+  reportPhase('gateway-ready')
   // Observe the renderer's own WebSocket without proxying it. Playwright's
   // routeWebSocket transparent proxy changes the ASGI accept sequence in a
   // packaged Electron app. Register the probe for later full-document route
@@ -445,12 +457,6 @@ try {
 
     const composer = page.locator('.chat-textarea')
     const header = page.locator('#app-route-header [data-testid="chat-header-actions"]')
-    await page.locator('.conn-pill.connected').waitFor({
-      state: 'visible',
-      // Initial cold start completed before probe installation. Keep the strict
-      // interaction budget used by the rest of this gate.
-      timeout: SEND_TIMEOUT_MS,
-    })
     await composer.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
     // The packaged app can expose its initial draft URL before Vue has mounted
     // the permanent route header. Establish the landing-route baseline before
@@ -465,6 +471,7 @@ try {
 
     const firstMessage = `Synthetic first send ${String(iteration).padStart(2, '0')}`
     await composer.fill(firstMessage)
+    assert.equal(await composerValue(composer), firstMessage, 'first message must reach the composer before clicking send')
     const sendButton = page.locator('.chat-send-btn.btn--primary')
     await waitFor(async () => await sendButton.count() === 1 && !await sendButton.isDisabled(), 'enabled first send')
     const landingHeaderIdentity = await establishStableHeaderIdentity(header, iteration)
@@ -502,6 +509,7 @@ try {
 
     const followupMessage = `Synthetic follow-up ${String(iteration).padStart(2, '0')}`
     await composer.fill(followupMessage)
+    assert.equal(await composerValue(composer), followupMessage, 'follow-up must reach the composer before clicking send')
     await page.locator('.chat-send-btn.btn--primary').click()
     await waitFor(
       () => observedChatSendCount(page, followupMessage).then(count => count === 1),
@@ -557,8 +565,13 @@ try {
     event: 'packaged_first_send_failure_diagnostics',
     processes: electronProcessSnapshot(electronProcessIdentity),
     renderer: failureRendererSnapshot,
+    sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
   }))
 } finally {
+  if (tracePath && app) {
+    const trace = await captureFirstSendDiagnostic(() => app.context().tracing.stop(runError ? { path: tracePath } : {}))
+    if (trace?.diagnosticError) console.error(`First-send trace capture failed: ${trace.diagnosticError}`)
+  }
   reportPhase('cleanup-start', { failed: Boolean(runError) })
   if (app && mainObservationInstalled) {
     const marked = await captureFirstSendDiagnostic(() => markMainConsoleCleanup(app))
@@ -593,6 +606,7 @@ const renderer = {
   consoleErrors: rendererObservation.consoleErrorDetails.length,
   pageErrorDetails: rendererObservation.pageErrorDetails,
   consoleErrorDetails: rendererObservation.consoleErrorDetails,
+  sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
 }
 const journal = await readEvidenceLog(resolve(userDataDir, MAIN_CONSOLE_JOURNAL))
 const observation = {

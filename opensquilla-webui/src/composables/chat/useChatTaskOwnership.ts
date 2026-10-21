@@ -10,6 +10,8 @@ const TERMINAL_STATUSES = new Set([
   'interrupted',
 ])
 
+const SETTLED_RUN_STATUSES = new Set(['idle', 'failed', 'timeout', 'cancelled', 'interrupted'])
+
 function normalizedStatus(value: unknown): string {
   return String(value || '').trim().toLowerCase()
 }
@@ -77,10 +79,12 @@ export interface ChatTaskOwnershipApi {
   hasAuthoritativeWork: ComputedRef<boolean>
   stopTargetTaskId: ComputedRef<string>
   beginHydration: () => void
+  captureSnapshotRevision: () => number
   applySnapshot: (
     source: ChatRunStatusSource | null | undefined,
     hydrationComplete: boolean,
-  ) => void
+    expectedRevision?: number,
+  ) => boolean
   noteAccepted: (taskId: string, status?: string) => {
     claimRender: boolean
     renderTaskId: string
@@ -115,6 +119,11 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
   const stopRequestedTaskId = ref('')
   const hydrationResolved = ref(initiallyResolved)
   const settledTaskIds = new Set<string>()
+  let snapshotRevision = 0
+
+  function captureSnapshotRevision() {
+    return snapshotRevision
+  }
 
   function rememberSettled(taskId: string) {
     settledTaskIds.add(taskId)
@@ -142,6 +151,7 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
   }
 
   function reset(resolved = false) {
+    snapshotRevision++
     runningTaskId.value = ''
     queuedTaskIds.value = new Set()
     stopRequestedTaskId.value = ''
@@ -157,6 +167,7 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
         renderTaskId: runningTaskId.value || firstQueuedTaskId.value,
       }
     }
+    if (!queuedTaskIds.value.has(taskId)) snapshotRevision++
     replaceQueued(next => next.add(taskId))
     return {
       foreground: runningTaskId.value === '' && firstQueuedTaskId.value === taskId,
@@ -167,6 +178,7 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
   function noteRunning(task: ChatRunTask | string): boolean {
     const taskId = typeof task === 'string' ? task.trim() : chatTaskId(task)
     if (!taskId || settledTaskIds.has(taskId)) return false
+    if (runningTaskId.value !== taskId || queuedTaskIds.value.has(taskId)) snapshotRevision++
     runningTaskId.value = taskId
     replaceQueued(next => next.delete(taskId))
     hydrationResolved.value = true
@@ -184,6 +196,9 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
       normalizedTaskId && stopRequestedTaskId.value === normalizedTaskId,
     )
     if (normalizedTaskId) {
+      if (wasRunning || wasQueued || wasStopTarget) {
+        snapshotRevision++
+      }
       rememberSettled(normalizedTaskId)
       if (wasRunning) runningTaskId.value = ''
       replaceQueued(next => next.delete(normalizedTaskId))
@@ -218,12 +233,18 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
   function applySnapshot(
     source: ChatRunStatusSource | null | undefined,
     hydrationComplete: boolean,
+    expectedRevision?: number,
   ) {
+    // The reader captures this before awaiting metadata. A newer task or Stop
+    // intent must not be overwritten by an older result on the same lease.
+    if (expectedRevision !== undefined && expectedRevision !== snapshotRevision) return false
     if (!hydrationComplete) {
       hydrationResolved.value = false
-      return
+      return false
     }
     const envelope = source || {}
+    const runStatus = normalizedStatus(envelope.run_status ?? envelope.runStatus)
+    if (!runStatus) return false
     const activeTask = envelope.active_task || envelope.activeTask || null
     const tasks = taskList(source)
     for (const task of tasks) {
@@ -274,7 +295,23 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
       )
     ) {
       noteTerminal(stopRequestedTaskId.value)
+    } else if (
+      stopRequestedTaskId.value
+      && SETTLED_RUN_STATUSES.has(runStatus)
+      && activeTask === null
+      && (envelope.active_task === null || envelope.activeTask === null)
+      && (envelope.last_task !== undefined || envelope.lastTask !== undefined)
+      && !nextRunningTaskId
+      && nextQueuedTaskIds.length === 0
+    ) {
+      // A complete, current read with no live work can outlive the terminal
+      // row for the stopped task. A failed/cancelled last task still makes
+      // the session terminal rather than idle. Release only the control
+      // latch; pending-input queue policy is not changed here.
+      noteTerminal(stopRequestedTaskId.value)
     }
+    snapshotRevision++
+    return true
   }
 
   function isQueued(taskId: string): boolean {
@@ -291,18 +328,25 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
 
   function beginStop(): string {
     const target = stopTargetTaskId.value
-    if (target) stopRequestedTaskId.value = target
+    if (target) {
+      if (stopRequestedTaskId.value !== target) snapshotRevision++
+      stopRequestedTaskId.value = target
+    }
     return target
   }
 
   function requestStop(taskId: string): string {
     const target = String(taskId || '').trim()
-    if (target) stopRequestedTaskId.value = target
+    if (target) {
+      if (stopRequestedTaskId.value !== target) snapshotRevision++
+      stopRequestedTaskId.value = target
+    }
     return target
   }
 
   function clearStop(taskId = '') {
     if (!taskId || stopRequestedTaskId.value === taskId) {
+      if (stopRequestedTaskId.value) snapshotRevision++
       stopRequestedTaskId.value = ''
     }
   }
@@ -315,6 +359,7 @@ export function useChatTaskOwnership(initiallyResolved = true): ChatTaskOwnershi
     hasAuthoritativeWork,
     stopTargetTaskId,
     beginHydration,
+    captureSnapshotRevision,
     applySnapshot,
     noteAccepted,
     noteQueued,

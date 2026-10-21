@@ -30,6 +30,7 @@ import structlog
 
 from opensquilla.engine.hooks import ToolHook, ToolHookCall, ToolHookResult
 from opensquilla.execution_status import normalize_execution_status
+from opensquilla.file_snapshot import retain_file_snapshot
 from opensquilla.result_budget import (
     DEFAULT_TOOL_RESULT_BUDGET_POLICY,
     DEFAULT_TOOL_RUN_BUDGET_POLICY,
@@ -52,6 +53,7 @@ from opensquilla.sandbox.operation_runtime import (
     record_tool_operation_success,
     run_tool_handler_with_operation_guard,
 )
+from opensquilla.search.turn_state import current_search_turn_state
 from opensquilla.search_tool_outcome import parse_web_tool_outcome
 from opensquilla.tool_boundary import (
     AgentToolHandler,
@@ -76,6 +78,7 @@ from opensquilla.tools.types import (
     ProjectedToolArgumentsError,
     ToolContext,
     current_execution_log,
+    current_file_snapshot,
     current_tool_context,
 )
 
@@ -334,16 +337,32 @@ def _build_terminal_retrieval_replay_result(
     tool_call: ToolCall,
     exc: TerminalRetrievalReplayError,
 ) -> ToolResult:
+    if exc.error_kind == "blocked":
+        user_message = (
+            "The failed search provider was blocked this turn. Do not retry that "
+            "provider with another query, mode, recency, or domain filter. Use an "
+            "available search provider, fetch a known page directly, or continue "
+            "with available evidence."
+        )
+    elif exc.error_kind == "auth":
+        user_message = (
+            "The failed search provider needs valid credentials. Changing the "
+            "query, mode, recency, or domain filters will not resolve this failure. "
+            "Use an available search provider, fetch a known page directly, or "
+            "continue with available evidence."
+        )
+    else:
+        user_message = (
+            "An equivalent search already ended in a non-retryable failure this turn. "
+            "Change the query, mode, recency, or domain filters before searching "
+            "again, or continue with available evidence."
+        )
     payload = {
         "status": "error",
         "tool": tool_call.tool_name,
         "reason": "terminal_search_failure_replay",
         "error_kind": exc.error_kind,
-        "user_message": (
-            "An equivalent search already ended in a non-retryable failure this turn. "
-            "Change the query, mode, recency, or domain filters before searching "
-            "again, or continue with available evidence."
-        ),
+        "user_message": user_message,
         "retry_allowed": False,
     }
     status = {
@@ -1429,8 +1448,11 @@ def build_tool_handler(
         reservation = reservation_or_control
 
         token = current_tool_context.set(effective_ctx)
+        search_state_token = current_search_turn_state.set(run_budget_tracker.search_turn_state)
         execution_log: dict[str, str] = {}
         log_token = current_execution_log.set(execution_log)
+        file_snapshot: dict[str, Any] = {}
+        snapshot_token = current_file_snapshot.set(file_snapshot)
         tool_started_at = time.monotonic()
         raw_result: Any = None
         exception: BaseException | None = None
@@ -1515,15 +1537,29 @@ def build_tool_handler(
                         registered,
                     )
                     final_result.execution_log_handle = execution_log.get("handle")
+                    if (
+                        file_snapshot
+                        and exception is None
+                        and not final_result.is_error
+                        and (
+                            final_result.execution_status is None
+                            or final_result.execution_status.get("reason") != "approval_pending"
+                        )
+                    ):
+                        final_result.file_snapshot = await retain_file_snapshot(
+                            file_snapshot, context=effective_ctx,
+                        )
                     return final_result
             finally:
+                current_file_snapshot.reset(snapshot_token)
                 current_execution_log.reset(log_token)
+                current_search_turn_state.reset(search_state_token)
                 current_tool_context.reset(token)
 
     # Agent-side lossy projection is only safe when the callable can actually
     # dispatch the provider-visible recovery tool.  Keep this capability on
-    # the handler itself so embedded Agents and wrapped Meta children do not
-    # mistake an arbitrary non-null callback for a retrieval implementation.
+    # the handler itself so embedded Agents do not mistake an arbitrary non-null
+    # callback for a retrieval implementation.
     setattr(
         _handler,
         "_opensquilla_available_tools",

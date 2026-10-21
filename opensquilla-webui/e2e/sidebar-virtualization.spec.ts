@@ -34,14 +34,16 @@ async function openSidebar(page: Page, count: number, current = 3) {
     },
   })
   await page.goto(`/control/chat?session=${encodeURIComponent(current === 3 ? SIDEBAR_ACTIVE_SESSION_KEY : key(current))}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   const list = page.locator(listSelector)
   await expect(list).toHaveAttribute('data-sidebar-loaded-count', String(Math.min(count, 200)))
   return { list, pages, renames }
 }
 
 for (const count of [200, 1000, 3000]) {
-  test(`${count} paginated tasks keep a bounded DOM and responsive rename`, async ({ page }, info) => {
+  test(`${count} paginated tasks keep a bounded DOM and responsive rename`, {
+    tag: count === 3000 ? '@capacity' : [],
+  }, async ({ page }, info) => {
     const errors: string[] = []
     page.on('pageerror', error => errors.push(error.message))
     await page.addInitScript(() => {
@@ -208,26 +210,33 @@ test('reveals an initially offscreen selected task and remains usable after a dr
   const { list } = await openSidebar(page, 200, 175)
   const selected = page.locator(`[data-session-key="${key(175)}"] .sidebar-history-item`)
   await expect(selected).toBeInViewport()
-  const anchor = await list.evaluate(element => {
+  const readAnchor = () => list.evaluate(element => {
     const top = element.getBoundingClientRect().top
     const row = [...element.querySelectorAll<HTMLElement>('[data-session-key]')]
       .find(row => row.getBoundingClientRect().bottom > top)!
     return { key: row.dataset.sessionKey!, offset: row.getBoundingClientRect().top - top }
   })
-  await page.setViewportSize({ width: 390, height: 844 })
-  await page.getByTestId('sidebar-toggle-collapsed').click()
-  // The shorter drawer need not keep the old bottom row visible, but must
-  // preserve the reader's top row instead of snapping to the selected task.
-  await expect.poll(() => list.evaluate((element, anchor) => {
+  const expectAnchor = (anchor: { key: string; offset: number }) => expect.poll(() => list.evaluate((element, anchor) => {
     const row = [...element.querySelectorAll<HTMLElement>('[data-session-key]')]
       .find(row => row.dataset.sessionKey === anchor.key)
     return row ? Math.abs(row.getBoundingClientRect().top - element.getBoundingClientRect().top - anchor.offset) : Infinity
   }, anchor)).toBeLessThanOrEqual(2)
+  const anchor = await readAnchor()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.getByTestId('sidebar-toggle-collapsed').click()
+  // The shorter drawer need not keep the old bottom row visible, but must
+  // preserve the reader's top row instead of snapping to the selected task.
+  await expectAnchor(anchor)
   await list.hover()
+  const drawerScroll = await list.evaluate(element => element.scrollTop)
   await page.mouse.wheel(0, -600)
+  await expect.poll(() => list.evaluate(element => element.scrollTop)).toBeLessThan(drawerScroll)
   await expect.poll(() => page.locator(rowsSelector).count()).toBeLessThan(45)
+  const drawerAnchor = await readAnchor()
   await page.keyboard.press('Escape')
   await expect(page.getByTestId('sidebar-toggle-collapsed')).toBeFocused()
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await expectAnchor(drawerAnchor)
 })
 
 test('mixed project trees, pinned tasks and family folds retain correct geometry', async ({ page }) => {

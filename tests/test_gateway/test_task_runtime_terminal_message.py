@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,6 +28,21 @@ from opensquilla.silent_reply import (
     SILENT_REPLY_NOT_ALLOWED_MESSAGE,
 )
 from opensquilla.tools.types import CallerKind, ToolContext
+
+
+@pytest.fixture(autouse=True)
+def isolated_approval_queue(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    from opensquilla.application import approval_queue
+
+    # Terminal settlement expires session approvals. Keep that real async path,
+    # without timing default database initialization or sharing another test's
+    # singleton and event-loop state in these message-contract tests.
+    queue = approval_queue.ApprovalQueue(db_path=":memory:")
+    monkeypatch.setattr(approval_queue, "_queue", queue)
+    try:
+        yield
+    finally:
+        queue.close()
 
 
 def _make_envelope(
@@ -887,12 +902,13 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_kind", [None, "empty_response"])
+@pytest.mark.parametrize("budget", ["configured", "available"])
 async def test_task_runtime_stream_reasoning_budget_error_emits_actionable_terminal_message(
-    failure_kind: str | None,
+    failure_kind: str | None, budget: str,
 ) -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     engine_message = (
-        "The provider used the configured output budget for reasoning without returning a "
+        f"The provider used the {budget} output budget for reasoning without returning a "
         "visible answer. Increase llm.max_tokens or choose another model or provider."
     )
 
@@ -1329,3 +1345,33 @@ async def test_task_runtime_preserves_accepted_inputs_on_provider_budget_error(
     assert "automatic context compaction" in payload["terminal_message"]
     assert "send less text" not in payload["terminal_message"]
     assert "failed before" not in payload["terminal_message"]
+
+
+@pytest.mark.parametrize("http_status", [429, 503, None, "429", True, 200, 700])
+async def test_http_status_survives_stream_and_durable_task_without_inference(http_status):
+    emitted = []
+
+    async def emitter(_session, name, payload):
+        emitted.append((name, payload))
+
+    async def stream():
+        yield ErrorEvent(message="PRIVATE_PROVIDER_BODY", code="429",
+                         failure_kind="rate_limited", http_status=http_status)
+
+    async def handler(run):
+        await _emit_task_runtime_stream_events(
+            stream(), run.envelope.session_key, emitter, task_id=run.task_id,
+            idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+    expected = http_status if type(http_status) is int and 400 <= http_status <= 599 else None
+    assert record.details["turn_outcome"].get("http_status") == expected
+    for name in ("session.event.error", "task.failed"):
+        payload = next(payload for event, payload in emitted if event == name)
+        assert payload.get("http_status") == expected
+        assert payload["turn_outcome"].get("http_status") == expected
+        assert "PRIVATE_PROVIDER_BODY" not in repr(payload)
+    assert "PRIVATE_PROVIDER_BODY" not in repr(record.details)

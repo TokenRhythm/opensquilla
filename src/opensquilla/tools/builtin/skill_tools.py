@@ -38,7 +38,6 @@ from opensquilla.tools.registry import tool
 from opensquilla.tools.types import (
     PlanAccess,
     ToolError,
-    current_meta_skill_owner,
     current_tool_context,
 )
 
@@ -71,12 +70,21 @@ def _skill_available(name: str) -> bool:
     """Whether ``name`` may be surfaced/invoked under the live operator config.
 
     Delegates to the shared eligibility gate (single source of truth) so the
-    skill_list / skill_view paths honor exactly the same coding-mode / disabled
-    rules as the pre-turn filter and the meta-skill executors.
+    skill_list / skill_view paths honor the same disabled-skill rules as
+    the pre-turn catalog.
     """
     from opensquilla.skills.eligibility import is_skill_available_live
 
     return is_skill_available_live(name)
+
+
+def _missing_required_tools(skill: Any) -> tuple[str, ...]:
+    """Check requirements against this turn's complete post-policy tool catalog."""
+    ctx = current_tool_context.get()
+    authorized = getattr(ctx, "authorized_tool_names", None)
+    if authorized is None:
+        return ()
+    return tuple(name for name in skill.requires_tools if name not in authorized)
 
 
 def _active_catalog() -> Any | None:
@@ -300,8 +308,7 @@ def _find_install_spec(skill_name: str, install_id: str) -> SkillInstallSpec:
 
     skill = cast(SkillSpec | None, _active_skill(skill_name))
     if skill is None or not _skill_available(skill_name):
-        # Coding-mode-gated skills are reported as not-found so deps cannot be
-        # previewed or installed via install_skill_deps while OFF (codex review).
+        # Dependency installation follows the same availability rules as the catalog.
         raise ToolError(
             f"Skill not found: {skill_name} in this turn's catalog snapshot. "
             "New installations become visible next turn; use the install receipt for status."
@@ -385,7 +392,7 @@ def create_skill_tools(
     """Register skill tools (list, view, create, edit, delete) with the global registry.
 
     ``skills_cfg_getter`` returns the live skills config so operator gating
-    (coding mode / disabled) is honored at call time, not boot time. The
+    is honored at call time, not boot time. The
     Gateway composition root supplies ``management_service`` so agent installs
     share its configured journal and managed-root transaction lock.
     """
@@ -415,8 +422,6 @@ def create_skill_tools(
             return "No skill loader available."
         skills = project_public_catalog(
             _active_skills(),
-            coding_mode=_skill_available("code-task"),
-            include_stable_meta=False,
         )
         if not skills:
             return (
@@ -426,7 +431,7 @@ def create_skill_tools(
 
         from opensquilla.skills.eligibility import EligibilityContext, diagnose_eligibility
 
-        # Hide operator-gated skills (coding mode off / disabled) so the list
+        # Hide operator-disabled skills so the list
         # does not reveal a skill the agent cannot use.
         skills = [s for s in skills if _skill_available(s.name)]
         if not skills:
@@ -443,6 +448,12 @@ def create_skill_tools(
         for s in skills:
             report = diagnose_eligibility(s, ctx)
             lines.append(f"  - {s.name}: {s.description}")
+            missing_tools = _missing_required_tools(s)
+            if missing_tools:
+                lines.append(
+                    "      [unavailable] Required tools unavailable in this turn: "
+                    + ", ".join(missing_tools)
+                )
             if not report.eligible:
                 missing = []
                 for b in report.missing_bins:
@@ -494,7 +505,7 @@ def create_skill_tools(
                     error="Skill catalog is unavailable.",
                 )
             return "No skill loader available."
-        # Gate operator-disabled / coding-mode skills here too: removing them
+        # Gate operator-disabled skills here too: removing them
         # from <available_skills> is not enough if skill_view can fetch any
         # skill by name. Same message as not-found so it leaks no bypass hint.
         if not _skill_available(name):
@@ -504,8 +515,6 @@ def create_skill_tools(
             skill = _active_skill(name)
         if skill is not None and not can_view_skill(
             skill,
-            coding_mode=_skill_available("code-task"),
-            owner_meta_skill=current_meta_skill_owner.get(),
             explicitly_selected=(
                 getattr(skill, "instance_id", "") in getattr(tool_ctx, "verified_skill_ids", set())
             ),
@@ -531,12 +540,24 @@ def create_skill_tools(
                 "becomes visible next turn; absence here does not mean installation failed."
             )
 
-        if body_requested:
-            source = (
-                "user" if getattr(skill, "instance_id", "")
-                in getattr(tool_ctx, "verified_skill_ids", set())
-                else "auto"
+        source = (
+            "user" if getattr(skill, "instance_id", "")
+            in getattr(tool_ctx, "verified_skill_ids", set())
+            else "auto"
+        )
+        missing_tools = _missing_required_tools(skill)
+        if missing_tools:
+            error = "Required tools unavailable in this turn: " + ", ".join(missing_tools)
+            if body_requested:
+                await emit_skill_load(
+                    tool_ctx, skill, source=source, status="failed", error=error,
+                )
+            return (
+                f"Skill unavailable: {name}. {error}. "
+                "Use skill_list to inspect available skills."
             )
+
+        if body_requested:
             await emit_skill_load(tool_ctx, skill, source=source, status="loading")
             body = _expanded_skill_body(skill)
             await emit_skill_load(

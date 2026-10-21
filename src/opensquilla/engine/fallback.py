@@ -8,11 +8,14 @@ MODEL_NOT_FOUND / UNSUPPORTED_FEATURE / INSUFFICIENT_CREDITS into UNKNOWN.
 
 from __future__ import annotations
 
-import asyncio
-import random
+# Re-export for existing callers and instrumentation.
+import asyncio as asyncio
+import random as random
 from dataclasses import dataclass, field
 
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.recovery import backoff_sleep as backoff_sleep
+from opensquilla.provider.recovery import sleep_before_retry as sleep_before_retry
 
 _RETRYABLE_FAILURE_KINDS = frozenset(
     {
@@ -21,18 +24,6 @@ _RETRYABLE_FAILURE_KINDS = frozenset(
         ProviderFailureKind.CONTEXT_OVERFLOW,
     }
 )
-
-
-async def sleep_before_retry(delay_s: float) -> None:
-    """Honor the requested delay even when an event-loop timer wakes early."""
-    loop = asyncio.get_running_loop()
-    retry_at = loop.time() + delay_s
-    remaining = delay_s
-    while True:
-        await asyncio.sleep(remaining)
-        remaining = retry_at - loop.time()
-        if remaining <= 0:
-            return
 
 
 @dataclass
@@ -84,32 +75,3 @@ class FallbackPolicy:
             if self.fallback_models:
                 return self.fallback_models[0]
         return None
-
-
-def backoff_sleep(
-    attempt: int,
-    base_ms: int = 1000,
-    max_ms: int = 30_000,
-    _fake: bool = False,
-) -> float:
-    """Calculate exponential backoff delay with jitter.
-
-    Args:
-        attempt: 0-indexed retry attempt number.
-        base_ms: Base delay in milliseconds.
-        max_ms: Maximum delay cap in milliseconds.
-        _fake: If True, return the delay without actually sleeping (for testing).
-
-    Returns:
-        Calculated delay in seconds.
-    """
-    import structlog
-
-    jitter = random.randint(0, base_ms // 2)  # noqa: S311
-    delay_ms = min(base_ms * (2**attempt) + jitter, max_ms)
-    delay_s = delay_ms / 1000.0
-
-    if not _fake:
-        structlog.get_logger().info("backoff_sleep", delay_s=round(delay_s, 2), attempt=attempt)
-
-    return float(delay_s)

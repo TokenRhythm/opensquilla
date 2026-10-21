@@ -1,0 +1,24 @@
+[
+  {
+    "name": "generative-frame",
+    "version": "0.0.5",
+    "license": "MIT",
+    "repository": {
+      "type": "git",
+      "url": "git+https://github.com/assistant-ui/assistant-ui.git",
+      "directory": "packages/generative-frame"
+    },
+    "notice": "generative-frame-MIT.txt"
+  },
+  {
+    "name": "safe-content-frame",
+    "version": "0.0.34",
+    "license": "MIT",
+    "repository": {
+      "type": "git",
+      "url": "git+https://github.com/assistant-ui/assistant-ui.git",
+      "directory": "packages/safe-content-frame"
+    },
+    "notice": "safe-content-frame-MIT.txt"
+  }
+]

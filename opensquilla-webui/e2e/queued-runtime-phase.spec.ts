@@ -1,5 +1,9 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload, sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload, sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-queued-runtime-phase'
@@ -16,6 +20,7 @@ function wsEvent(event: string, payload: unknown) {
 async function mockQueuedRouterLifecycle(page: Page) {
   let sendFrame: ((frame: string) => void) | null = null
   let streamSeq = 2
+  let sends = 0
 
   const emit = (event: string, payload: Record<string, unknown> = {}) => {
     if (!sendFrame) throw new Error('queued lifecycle websocket is not connected')
@@ -32,11 +37,13 @@ async function mockQueuedRouterLifecycle(page: Page) {
     window.localStorage.setItem('opensquilla-locale', 'en')
     window.localStorage.setItem('opensquilla.routerVisualEffects', '1')
   })
+  await page.route('**/api/**', route => route.fulfill({ json: {} }))
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
   await page.routeWebSocket(/\/ws$/, ws => {
     sendFrame = frame => ws.send(frame)
     ws.send(wsEvent('connect.challenge', {}))
@@ -54,6 +61,7 @@ async function mockQueuedRouterLifecycle(page: Page) {
         return
       }
       if (method === 'chat.send') {
+        sends += 1
         ws.send(wsResponse(frame.id as string | number | undefined, {
           accepted: true,
           session: SESSION_KEY,
@@ -75,7 +83,7 @@ async function mockQueuedRouterLifecycle(page: Page) {
 
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': { messages: [], has_more: false },
+        'chat.history': chatHistoryPayload(),
         'commands.list_for_surface': { commands: [] },
         'config.get': {
           squilla_router: {
@@ -92,13 +100,13 @@ async function mockQueuedRouterLifecycle(page: Page) {
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
+        'models.routing.get': { mode: 'router' },
+        'sessions.routing.get': { key: SESSION_KEY, mode: 'router', revision: 0 },
+        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-        },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY),
         'usage.status': { sessions: [] },
       }
       ws.send(wsResponse(
@@ -109,6 +117,7 @@ async function mockQueuedRouterLifecycle(page: Page) {
   })
 
   return {
+    get sends() { return sends },
     markRunning() {
       emit('task.running')
     },
@@ -131,29 +140,39 @@ test('durable queued stays queued until running and an authoritative router deci
 }) => {
   const lifecycle = await mockQueuedRouterLifecycle(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
-
-  await page.locator('.chat-textarea').fill('Wait for a real runtime slot.')
-  await page.locator('.chat-send-btn[aria-label="Send"]').click()
+  const textarea = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  await expect(textarea).toBeVisible()
+  await textarea.fill('Wait for a real runtime slot.')
+  await expect(send).toBeEnabled({ timeout: 10_000 })
+  await send.click()
+  await expect.poll(() => lifecycle.sends).toBe(1)
 
   const activity = page.locator('.assistant-activity--live')
+  const header = activity.locator('.assistant-activity__live-elapsed')
+  const stop = page.getByRole('button', { name: 'Stop current response', exact: true })
   await expect(activity).toBeVisible({ timeout: 10_000 })
-  await expect(activity.locator('.assistant-activity__live-label')).toHaveText('Queued')
+  await expect(header).toHaveText('Queued')
+  await expect(header).not.toContainText('0s')
+  await expect(stop).toBeEnabled()
   await expect(activity).not.toContainText('Waiting for model')
+  await expect(activity.locator('.assistant-activity__stale-note')).toHaveCount(0)
   await expect(page.locator('.router-fx')).toHaveCount(0)
 
   lifecycle.markRunning()
-  await expect(activity.locator('.assistant-activity__live-label')).toHaveText('Running')
+  await expect(header).toHaveText(/^Time spent /)
+  await expect(activity.locator('.assistant-activity__sr-only')).toHaveText('Working')
+  await expect(stop).toBeEnabled()
   await expect(page.locator('.router-fx')).toHaveCount(0)
 
   lifecycle.markProviderActive()
-  await expect(activity.locator('.assistant-activity__live-label')).toHaveText(
-    'Working',
-  )
+  await expect(header).toHaveText(/^Time spent /)
+  await expect(activity.locator('.assistant-activity__sr-only')).toHaveText('Working')
   await expect(activity).not.toContainText('Waiting for model')
   await expect(page.locator('.router-fx')).toHaveCount(0)
 
   lifecycle.decideRoute()
   await expect(page.locator('.router-fx')).toHaveCount(1)
   await expect(page.locator('.router-fx')).toContainText('router-selected')
+  expect(lifecycle.sends).toBe(1)
 })

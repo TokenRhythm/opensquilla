@@ -3,7 +3,7 @@
     class="router-fx"
     :data-source="message.routerSource"
     :data-observe="message.routerObserve ? 'true' : undefined"
-    :data-static="message.routerStatic ? 'true' : undefined"
+    :data-static="isStaticPresentation ? 'true' : undefined"
     :data-settled="routerDataSettled"
     :data-panel="message.routerPanel || 'real-candidates'"
     :data-phase="showsRouterStage ? motionPhase : undefined"
@@ -171,6 +171,9 @@ const selectorVisible = ref(false)
 const selectorStyle = ref<Record<string, string>>({})
 const gridElement = ref<HTMLElement | null>(null)
 const gridCells = computed(() => props.message.gridCells || [])
+// Cached/live-snapshot routes have already happened, but their model calls can
+// still be running. Freeze their motion without turning them into history.
+const isStaticPresentation = computed(() => props.message.routerStatic === true || props.message.routerReplayed === true)
 const visualGridCells = computed(() => gridCells.value.map(cell => ({
   ...cell,
   visualName: cell.executionKind === 'ensemble'
@@ -202,9 +205,12 @@ const executionDiffersFromRoute = computed(() => Boolean(
 ))
 const executionCellIndex = computed(() => {
   if (!executionDiffersFromRoute.value) return -1
-  return gridCells.value.findIndex(cell => (
+  const matches = gridCells.value.flatMap((cell, index) => (
     cell.kind === 'real' && String(cell.model || '').trim() === executionModel.value
+      ? [index] : []
   ))
+  // Model-only execution evidence cannot identify one of several deployments.
+  return matches.length === 1 ? matches[0]! : -1
 })
 const winnerIndex = computed(() => (
   executionDiffersFromRoute.value ? executionCellIndex.value : routeWinnerIndex.value
@@ -336,7 +342,7 @@ function shouldAnimate(): boolean {
   return showsRouterStage.value
     && winnerIndex.value >= 0
     && realCandidateIndices.value.length > 1
-    && props.message.routerStatic !== true
+    && !isStaticPresentation.value
     && props.message.routerObserve !== true
     && props.message.routerSettled !== true
     && prefersReducedMotion.value !== true
@@ -418,7 +424,7 @@ function initializeMotion() {
     return
   }
   const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
-    && props.message.routerStatic !== true
+    && !isStaticPresentation.value
     && props.message.routerObserve !== true
   settleStatic(shouldAnnounce)
 }
@@ -433,7 +439,11 @@ watch([winnerIndex, executionModel], ([next, nextExecutionModel], [previous, pre
     || (next === previous && nextExecutionModel === previousExecutionModel)
   ) return
   if (executionDiffersFromRoute.value || nextExecutionModel !== previousExecutionModel) {
-    settleStatic(props.message.routerStatic !== true && props.message.routerObserve !== true)
+    // Replay freezes selection motion, but a later physical model change is
+    // new information even when it arrives through another live snapshot.
+    const executionChanged = Boolean(nextExecutionModel) && nextExecutionModel !== previousExecutionModel
+    settleStatic(props.message.routerStatic !== true && props.message.routerObserve !== true
+      && (!isStaticPresentation.value || executionChanged))
     return
   }
   if (next < 0) return
@@ -446,14 +456,21 @@ watch([winnerIndex, executionModel], ([next, nextExecutionModel], [previous, pre
 
 watch(
   () => [
-    props.message.routerStatic === true,
+    isStaticPresentation.value,
     props.message.routerObserve === true,
     props.message.routerSettled === true,
     prefersReducedMotion.value,
-  ],
-  ([routerStatic, routerObserve, routerSettled, reduceMotion]) => {
-    if (!mounted || (!routerStatic && !routerObserve && !routerSettled && !reduceMotion)) return
-    const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value) && !routerStatic && !routerObserve
+    executionModel.value,
+  ] as const,
+  ([staticPresentation, routerObserve, routerSettled, reduceMotion, nextExecutionModel], [, , previousSettled, , previousExecutionModel]) => {
+    if (!mounted || (!staticPresentation && !routerObserve && !routerSettled && !reduceMotion)) return
+    const executionChanged = Boolean(nextExecutionModel) && nextExecutionModel !== previousExecutionModel
+    // A restored active call can finish later without changing its model.
+    // Announce that live transition, while an already settled replay mounts silently.
+    const newlySettled = routerSettled && !previousSettled
+    const shouldAnnounce = (winnerIndex.value >= 0 || executionDiffersFromRoute.value)
+      && props.message.routerStatic !== true && !routerObserve
+      && (!staticPresentation || executionChanged || newlySettled)
     settleStatic(shouldAnnounce)
   },
 )
@@ -708,6 +725,16 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
     color-mix(in srgb, var(--router-accent) 3%, var(--router-surface));
 }
 
+.router-fx-ensemble[aria-busy="false"] {
+  background: var(--router-surface);
+}
+
+.router-fx-ensemble[aria-busy="false"]:hover:not(:disabled),
+.router-fx-ensemble[aria-busy="false"][aria-expanded="true"] {
+  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--router-text) 3%, var(--router-surface));
+}
+
 .router-fx-ensemble:disabled {
   cursor: default;
 }
@@ -730,7 +757,7 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
 
 .router-fx-ensemble__dot.done {
   background: var(--ok);
-  box-shadow: 0 0 10px color-mix(in srgb, var(--ok) 58%, transparent);
+  box-shadow: none;
   animation: none;
 }
 
@@ -743,6 +770,11 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
   font-size: 12.5px;
   font-weight: 650;
   white-space: nowrap;
+}
+
+.router-fx-ensemble[aria-busy="false"] .router-fx-ensemble__label {
+  color: var(--text-muted);
+  font-weight: 400;
 }
 
 .router-fx-ensemble__meta {

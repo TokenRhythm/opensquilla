@@ -15,9 +15,9 @@ const requests = createPendingRequestStore(
   },
 )
 
-export function goalSetIdentity(sessionKey: string, epoch: number, objective: string): string {
+export function goalSetIdentity(sessionKey: string, epoch: number, objective: string, localPathReferences: readonly string[] = []): string {
   // Preserve persisted ordinary requests across upgrades; legacy custom settings stay distinct.
-  return JSON.stringify([sessionKey, epoch, objective, null, 'foreground'])
+  return JSON.stringify([sessionKey, epoch, objective, null, 'foreground', ...(localPathReferences.length ? [localPathReferences] : [])])
 }
 
 export function recoverGoalSet(identity: string): PendingGoalSet {

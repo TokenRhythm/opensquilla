@@ -17,8 +17,13 @@ class AssetBudget:
 
 ASSET_BUDGETS: dict[str, tuple[AssetBudget, ...]] = {
     "macos": (
-        AssetBudget("OpenSquilla-*-mac-arm64.dmg", 360_291_400),
-        AssetBudget("OpenSquilla-*-mac-arm64.zip", 364_706_552),
+        # #1224 established the v0.5.3 reduction targets. #1913 added four
+        # mandatory offline Chinese OTF faces (40,594,640 source bytes).
+        # This is a one-time fixed allowance for those assets, not a measured
+        # DMG compression delta or a budget derived from the candidate size.
+        # The package gate still forbids bundled developer Runtime Packs.
+        AssetBudget("OpenSquilla-*-mac-arm64.dmg", 400_886_040),
+        AssetBudget("OpenSquilla-*-mac-arm64.zip", 405_301_192),
     ),
     "windows": (
         AssetBudget("OpenSquilla-*-win-x64.exe", 423_062_346),

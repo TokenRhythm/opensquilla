@@ -189,8 +189,7 @@
       ],
       "properties": {
         "resource": {
-          "type": "object",
-          "additionalProperties": true
+          "$ref": "#/$defs/WorkbenchResourceProjection"
         }
       }
     },
@@ -270,6 +269,21 @@
           "$ref": "#/$defs/Err"
         }
       ]
+    },
+    "WorkbenchResourceProjection": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "sourcePath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "Authorized workspace-relative path to the existing working source; presentation metadata, never a resource identity or host absolute path."
+        }
+      }
     }
   }
 }

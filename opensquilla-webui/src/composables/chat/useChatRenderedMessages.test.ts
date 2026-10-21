@@ -7,6 +7,7 @@ import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
 import type { TimeTranslator } from '@/utils/messageTime'
 import { workspacePreviewOpenAction, workspacePreviewsFromMessage } from '@/utils/chat/workspacePreviews'
+import { projectActivityToolDetail } from '@/utils/chat/activityToolDetails'
 
 function renderedMessagesForRouterVisualMode(
   visualMode: 'real_candidates' | 'legacy_grid',
@@ -58,6 +59,46 @@ function renderedMessagesFor(
 }
 
 describe('useChatRenderedMessages scheduled provenance', () => {
+  it('keeps semantic content identity while answer text segments are not tool calls', () => {
+    const contentRef = {
+      version: 1 as const, sessionKey: 'agent:main:webchat:test', sessionId: 'sid', messageId: 'mid',
+      view: 'display' as const, byteLength: 32 * 1024, revision: 'r1',
+    }
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'bounded answer', ts: 1, contentRef,
+      tool_calls: [{ type: 'text', presentation: 'answer', text: 'bounded answer' }],
+    }])
+    const row = api.renderedMessages.value[0]
+    expect(row?.contentRef).toEqual(contentRef)
+    expect(row?.toolCalls).toEqual([])
+    expect(row?.contentSlice).toBeUndefined()
+  })
+
+  it('preserves live authoritative chronology after finalization without a history snapshot', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'Inspecting.Done.', ts: 1,
+      tool_calls: [{ tool_use_id: 'read-1', name: 'read_file', groupId: 'read-group',
+        input: 'sample.txt', result: 'contents', activityOrder: 30 }],
+      timeline: [
+        { type: 'text', raw: 'Inspecting.', presentation: 'intermediate', activityOrder: 20 },
+        { type: 'tool-group', groupId: 'read-group', activityOrder: 30 },
+        { type: 'text', raw: 'Done.', presentation: 'answer', activityOrder: 50 },
+      ],
+      reasoningBlocks: [{ id: 'thought-1', index: 0, text: 'Check the file.', contentKind: 'reasoning',
+        startedAt: 900, endedAt: 1000, status: 'completed', activityOrder: 10 },
+      { id: 'thought-2', index: 1, text: 'Summarize.', contentKind: 'reasoning',
+        startedAt: 200, endedAt: 300, status: 'completed', activityOrder: 40 }],
+    }])
+    const message = api.renderedMessages.value[0]!
+    expect(message.timelineItems?.map(item => item.activityOrder)).toEqual([20, 30, 50])
+    expect(message.toolCalls?.[0]?.activityOrder).toBe(30)
+    expect(message.timelineItems?.[1]?.type === 'tool-group'
+      && message.timelineItems[1].group.calls[0]?.activityOrder).toBe(30)
+    expect(message.timelineItems?.filter(item => item.type === 'text').map(item => item.presentation))
+      .toEqual(['intermediate', 'answer'])
+    expect(message.reasoningBlocks?.map(block => block.activityOrder)).toEqual([10, 40])
+  })
+
   it('keeps persisted sources and labels live cron completions before history arrives', () => {
     const api = renderedMessagesFor([
       { role: 'user', text: 'Run the inventory check.', ts: 1, provenanceKind: 'cron' },
@@ -69,6 +110,96 @@ describe('useChatRenderedMessages scheduled provenance', () => {
 
     expect(api.renderedMessages.value.map(message => message.provenanceKind))
       .toEqual(['cron', 'cron', undefined, undefined, 'cron'])
+  })
+})
+
+describe('historical tool result completeness', () => {
+  it.each(['persisted segments', 'activity snapshot', 'explicit timeline'].flatMap(mode =>
+    [false, true].map(referenced => ({ mode, referenced }))))(
+    'restores the file snapshot through $mode after input projection (reference=$referenced)', ({ mode, referenced }) => {
+      const snapshot = { kind: 'write' as const, path: 'index.html', content: '<p>complete</p>'.repeat(2000),
+        ...(referenced ? { sha256_ref: 'a'.repeat(64), bytes: 2_000_000 } : {}) }
+      const source: ChatMessage = {
+        role: 'assistant', text: '', ts: 1, restoredFromHistory: true,
+        tool_calls: [
+          { type: 'tool_use', tool_use_id: 'write-1', name: 'write_file', groupId: 'write-group',
+            input: { path: snapshot.path, content: '[historical_tool_argument_omitted]\nhead: partial' } },
+          { type: 'tool_result', tool_use_id: 'write-1', name: 'write_file', result: 'Written 28000 bytes',
+            file_snapshot: snapshot },
+        ],
+      }
+      if (mode === 'explicit timeline') source.timeline = [{ type: 'tool-group', groupId: 'write-group' }]
+      if (mode === 'activity snapshot') source.activitySnapshot = {
+        version: 2, taskId: 'history-turn', turnId: 'history-turn', complete: true, reasoningUtf16Length: 0,
+        entries: [{ type: 'segment', id: 'tool:write-1', order: 30,
+          segment_type: 'tool', tool_use_id: 'write-1', name: 'write_file' }],
+      }
+      const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+      expect(message.toolCalls?.[0]?.fileSnapshot).toEqual(snapshot)
+      const timeline = message.timelineItems?.[0]
+      expect(timeline?.type).toBe('tool-group')
+      if (timeline?.type !== 'tool-group') throw new Error('Expected a file tool row')
+      const item = timeline.group.calls[0]!
+      expect(item.fileSnapshot).toEqual(snapshot)
+      expect(projectActivityToolDetail(item, 'file.write').codeView?.content).toBe(referenced ? '' : snapshot.content)
+    },
+  )
+
+  it.each(['persisted segments', 'activity snapshot', 'explicit timeline'] as const)(
+    'preserves retained-result metadata through %s',
+    mode => {
+      // Metadata shape from the installed z9x0q5gp README read. The file text is
+      // synthetic; only the actual retained/original lengths matter here.
+      const toolId = 'historical-read'
+      const result = 'x'.repeat(2000)
+      const source: ChatMessage = {
+        role: 'assistant', text: '', ts: 1, restoredFromHistory: true,
+        tool_calls: [
+          { type: 'tool_use', tool_use_id: toolId, name: 'read_file',
+            groupId: 'read-group', input: { path: 'README.md' } },
+          { type: 'tool_result', tool_use_id: toolId, name: 'read_file', result,
+            result_truncated: true, result_original_chars: 4186 },
+        ],
+      }
+      if (mode === 'explicit timeline') {
+        source.timeline = [{ type: 'tool-group', groupId: 'read-group' }]
+      }
+      if (mode === 'activity snapshot') {
+        source.activitySnapshot = {
+          version: 2, taskId: 'history-turn', turnId: 'history-turn', complete: true,
+          reasoningUtf16Length: 0,
+          entries: [{ type: 'segment', id: `tool:${toolId}`, order: 30,
+            segment_type: 'tool', tool_use_id: toolId, name: 'read_file' }],
+        }
+      }
+      const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+      const expected = { toolId, result, resultTruncated: true, resultOriginalChars: 4186 }
+      expect(message.toolCalls?.[0]).toMatchObject(expected)
+      const timeline = message.timelineItems?.[0]
+      expect(timeline?.type).toBe('tool-group')
+      if (timeline?.type === 'tool-group') {
+        expect(timeline.group.calls[0]).toMatchObject(expected)
+        if (mode === 'activity snapshot') expect(timeline.activityOrder).toBe(30)
+      }
+      expect(source.tool_calls?.[1]?.result_truncated).toBe(true)
+      expect(source.tool_calls?.[1]?.result_original_chars).toBe(4186)
+    },
+  )
+
+  it('keeps explicit completeness false and ignores invalid original lengths', () => {
+    const message = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 1,
+      tool_calls: [{ type: 'tool_result', tool_use_id: 'complete-read', name: 'read_file',
+        result: 'retained output', resultTruncated: false, resultOriginalChars: -1 }],
+    }]).renderedMessages.value[0]!
+    expect(message.toolCalls?.[0]?.resultTruncated).toBe(false)
+    expect(message.toolCalls?.[0]?.resultOriginalChars).toBeUndefined()
+    const timeline = message.timelineItems?.[0]
+    expect(timeline?.type).toBe('tool-group')
+    if (timeline?.type === 'tool-group') {
+      expect(timeline.group.calls[0]?.resultTruncated).toBe(false)
+      expect(timeline.group.calls[0]?.resultOriginalChars).toBeUndefined()
+    }
   })
 })
 
@@ -369,6 +500,17 @@ describe('useChatRenderedMessages internal control turns', () => {
 
     expect(api.renderedMessages.value).toHaveLength(1)
     expect(api.renderedMessages.value[0]?.hasAttachments).toBe(true)
+  })
+
+  it.each(['preparing', 'unavailable'] as const)('keeps empty user %s content visible for existing local feedback', availability => {
+    const api = renderedMessagesFor([{
+      role: 'user', text: '', ts: 1, messageId: 'pending-user', attachments: [],
+      contentAvailability: availability, previewComplete: false,
+    }])
+    expect(api.renderedMessages.value).toHaveLength(1)
+    expect(api.renderedMessages.value[0]).toMatchObject({
+      displayRole: 'user', contentAvailability: availability, previewComplete: false,
+    })
   })
 
   it('keeps subagent completion control rows out while retaining the parent creation route', () => {
@@ -2941,7 +3083,7 @@ describe('useChatRenderedMessages per-turn usage', () => {
 })
 
 describe('useChatRenderedMessages clarify history recovery', () => {
-  it('restores a clarify interrupt from persisted meta-step tool input', () => {
+  it('keeps retired workflow history as ordinary transcript without an actionable form', () => {
     const api = renderedMessagesFor([
       {
         role: 'assistant',
@@ -2995,14 +3137,8 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       interruptKind: 'clarify'
     } => part.type === 'interrupt' && part.interruptKind === 'clarify')
 
-    expect(clarify).toBeTruthy()
-    expect(clarify?.key).toBe('m-clarify:interrupt:run-1|project_clarify')
-    expect(clarify?.clarify?.intro).toBe('A few details.')
-    expect(clarify?.clarify?.fields.map(field => field.name)).toEqual([
-      'topic',
-      'age_band',
-    ])
-    expect(clarify?.clarify?.fields[1].choices).toEqual(['PRE_K', 'EARLY_GRADE'])
+    expect(clarify).toBeUndefined()
+    expect(message.text).toContain('Please reply with these fields.')
   })
 
   it('restores request_user_input from persisted tool_result JSON without arguments', () => {
@@ -3020,6 +3156,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
             result: JSON.stringify({
               kind: 'user_input',
               paused: true,
+              request_id: 'request-history-2',
               run_id: 'plan-run-2',
               step: 'choose_target',
               clarify_schema: {
@@ -3043,7 +3180,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       interruptKind: 'clarify'
     } => part.type === 'interrupt' && part.interruptKind === 'clarify')
 
-    expect(clarify?.key).toBe('m-request-user-input:interrupt:plan-run-2|choose_target')
+    expect(clarify?.key).toBe('m-request-user-input:interrupt:request-history-2')
     expect(clarify?.clarify).toEqual({
       intro: 'Choose where to implement.',
       fields: [{
@@ -3054,6 +3191,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
         defaultValue: '',
         choices: ['current', 'new'],
       }],
+      requestId: 'request-history-2',
       runId: 'plan-run-2',
       step: 'choose_target',
     })
@@ -3118,6 +3256,93 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
   })
 
+  it('keeps a resolved question in activity order after history restoration', () => {
+    const pending = {
+      status: 'input_required',
+      kind: 'user_input',
+      paused: true,
+      request_id: 'request-ordered',
+      run_id: 'run-ordered',
+      step: 'choose_target',
+      clarify_schema: {
+        fields: [{ name: 'target', type: 'enum', choices: ['current', 'new'] }],
+      },
+    }
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'done',
+      ts: 0,
+      messageId: 'm-ordered-question',
+      turnOutcome: { turnId: 'run-ordered', taskId: 'run-ordered', status: 'succeeded' },
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'request-ordered-tool',
+          name: 'request_user_input',
+          input: { questions: [{ id: 'target', question: 'Where?', options: [{ label: 'Current' }, { label: 'New' }] }] },
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'request-ordered-tool',
+          name: 'request_user_input',
+          user_input_request: pending,
+          result: JSON.stringify({
+            status: 'answered',
+            kind: 'user_input',
+            paused: false,
+            request_id: 'request-ordered',
+            answers: { target: 'current' },
+          }),
+        },
+        {
+          type: 'tool_use',
+          tool_use_id: 'inspect-ordered-tool',
+          name: 'skill_view',
+          input: {},
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'inspect-ordered-tool',
+          name: 'skill_view',
+          result: 'ok',
+        },
+        { type: 'text', text: 'done' },
+      ],
+      activitySnapshot: {
+        version: 2,
+        taskId: 'run-ordered',
+        turnId: 'run-ordered',
+        complete: true,
+        reasoningUtf16Length: 0,
+        entries: [
+          {
+            type: 'segment', id: 'tool:request-ordered-tool', order: 10,
+            segment_type: 'tool', tool_use_id: 'request-ordered-tool', name: 'request_user_input',
+          },
+          {
+            type: 'interrupt', id: 'clarify:request-ordered', order: 11,
+            interrupt_type: 'clarify', reference_id: 'request-ordered',
+            started_at: 10, ended_at: 11,
+          },
+          {
+            type: 'segment', id: 'tool:inspect-ordered-tool', order: 12,
+            segment_type: 'tool', tool_use_id: 'inspect-ordered-tool', name: 'skill_view',
+          },
+          {
+            type: 'segment', id: 'text:0', order: 13,
+            segment_type: 'text', text_index: 0, text_utf16_length: 4,
+          },
+        ],
+      },
+    }])
+
+    const rendered = api.renderedMessages.value[0]
+    expect(rendered.timelineItems?.map(item => item.type)).toEqual([
+      'tool-group', 'interrupt', 'tool-group', 'text',
+    ])
+    expect(rendered.timelineItems?.map(item => item.activityOrder)).toEqual([10, 11, 12, 13])
+  })
+
   it.each(['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted'])(
     'expires only unresolved structured input owned by the %s historical turn',
     (status) => {
@@ -3156,7 +3381,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
             part.type === 'interrupt' && part.interruptKind === 'clarify',
         ) ?? []
         expect(clarifies.map(part => part.resolution)).toEqual([
-          'expired', 'replied', null, null,
+          'expired', 'replied', null,
         ])
       }
     },
@@ -3287,7 +3512,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
 
   it('applies clarify submit state to recovered historical interrupt cards', () => {
     const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
-      ['run-1|project_clarify', {
+      ['request-history-1', {
         resolution: 'replied',
         busy: true,
         error: '',
@@ -3302,10 +3527,11 @@ describe('useChatRenderedMessages clarify history recovery', () => {
         tool_calls: [
           {
             type: 'tool_use',
-            tool_use_id: 'meta_step_project_clarify',
-            name: 'meta-step:project_clarify',
+            tool_use_id: 'request-input-history-1',
+            name: 'request_user_input',
             input: {
               kind: 'user_input',
+              request_id: 'request-history-1',
               paused: true,
               step: 'project_clarify',
               run_id: 'run-1',

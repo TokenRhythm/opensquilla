@@ -8,6 +8,9 @@ export interface CommandCatalogItem {
   readonly description?: string
   readonly desc?: string
   readonly aliases?: unknown
+  readonly category?: string
+  readonly busy_policy?: string
+  readonly presentation?: string
   readonly execution?: Readonly<{ action?: string }>
   readonly [key: string]: unknown
 }

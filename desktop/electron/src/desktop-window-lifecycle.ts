@@ -2,6 +2,8 @@ export const DESKTOP_EXIT_PHASES = [
   'running',
   'deferred',
   'draining',
+  'terminating',
+  'failed',
   'committed',
 ] as const
 
@@ -195,6 +197,8 @@ export function mainWindowCloseAction(
   if (context.exitPhase !== 'running') return 'hide'
   if (context.behavior === 'quit') return 'quit'
   if (context.behavior === 'ask') return 'ask'
+  // Background closure only hides the window. Gateway activity must never
+  // turn this preference into a task-interruption or application-quit request.
   return 'hide'
 }
 

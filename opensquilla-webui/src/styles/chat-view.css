@@ -6,17 +6,13 @@
   overflow: hidden;
   background: var(--bg-surface);
   color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
-  /* The one conversation column. Every turn-content box — user bubbles,
-     assistant messages, the live work card, the composer — aligns to this
-     same column so streaming and settled content share a left edge. Widens
-     a step on very large viewports so the thread is not a sliver. */
-  --chat-col: min(calc(100% - 48px), clamp(980px, 62vw, 1280px));
-  /* The input column: the composer panel and everything anchored to it
-     (slash menu, queue chips) is deliberately narrower than the thread. */
-  --composer-col: 820px;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  /* Prose, activity and input share one readable column. Wide code stays
+     inside its own scrollable detail instead of stretching the transcript. */
+  --composer-col: 800px;
+  --chat-col: min(calc(100% - 48px), var(--composer-col));
 }
 
 .chat--new-landing {
@@ -25,28 +21,6 @@
   /* Bottom > top: nudges the centred group slightly above true-centre
      (optical centre), which reads as more intentional than dead-centre. */
   padding: 2rem 0 6rem;
-}
-
-/* Once setup is requested it becomes the primary task. Reclaim the landing
-   greeting's space so the dependency details remain comfortably readable on
-   short and mobile viewports while the composer stays available below. */
-.chat--new-landing.chat--meta-setup {
-  justify-content: flex-start;
-  gap: 0;
-  padding: var(--sp-3) 0;
-}
-
-.chat--new-landing.chat--meta-setup .chat-body {
-  display: none;
-}
-
-.chat--new-landing.chat--meta-setup > .meta-setup-card {
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.chat--new-landing.chat--meta-setup .chat-composer-dock {
-  width: 100%;
 }
 
 .chat-share-banner {
@@ -228,6 +202,13 @@
   scrollbar-gutter: stable;
 }
 
+@media (min-width: 769px) {
+  .chat-thread {
+    /* Keep the reading column centred on the composer despite the scrollbar. */
+    scrollbar-gutter: stable both-edges;
+  }
+}
+
 /* Floating composer (existing conversation, toggle on): reserve the dock's
    measured height in the body itself. This shortens the scroll viewport so no
    visible transcript text can enter the glass panel, including while the
@@ -375,6 +356,41 @@
   font-size: 0.875rem;
 }
 
+.chat-thread--temporary-empty .chat-thread__header {
+  flex: 1;
+}
+
+.chat-temporary-empty {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 2rem 1.5rem;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.chat-temporary-empty h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.chat-temporary-empty p {
+  max-width: 24rem;
+  margin: 0;
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.chat-temporary-empty .chat-temporary-empty__keep {
+  color: var(--text-dim);
+  font-size: 0.8125rem;
+}
+
 /* Messages */
 
 /* Pre-reveal router phase. It is visible only before the live activity owns
@@ -382,24 +398,6 @@
    as a second primary progress panel. */
 .router-fx-reserve {
   opacity: 0.55;
-}
-
-/* AI message */
-.msg-ai {
-  display: flex;
-  gap: 0.625rem;
-  width: var(--chat-col);
-  margin: 0 auto;
-  padding: 0.5rem 0;
-  align-items: flex-start;
-  max-width: calc(100% - 48px);
-}
-
-.msg-ai-main {
-  flex: 1;
-  min-width: 0;
-  max-width: none;
-  padding-top: 0.0625rem;
 }
 
 /* The thinking indicator reuses the run-state dot. */
@@ -417,13 +415,6 @@
    (which read as a loading skeleton and added a second, desynced rhythm). */
 .activity-shimmer {
   color: var(--text-muted);
-}
-
-/* Gateway-confirmed answer text streams in its final visual position. */
-.live-answer {
-  margin-top: 0;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--hairline);
 }
 
 /* ── Jump-to-latest pill (floats above the composer when scrolled up) ─── */
@@ -464,30 +455,10 @@
   transform: translateY(6px);
 }
 
-/* ── Streaming caret: blinking tail bar while output is still generating ─ */
-.stream-caret {
-  display: inline-block;
-  width: 0.5rem;
-  height: 1.05em;
-  margin-left: 1px;
-  vertical-align: text-bottom;
-  background: var(--accent);
-  border-radius: 1px; /* radius-allow: 1px stream caret geometry */
-  animation: stream-caret-blink 1s steps(2, start) infinite;
-}
-@keyframes stream-caret-blink {
-  0%, 50% { opacity: 1; }
-  50.01%, 100% { opacity: 0; }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .plan-run-dock-enter-active,
   .plan-run-dock-leave-active {
     transition: none;
-  }
-
-  .stream-caret {
-    animation: none;
   }
 
   .jump-latest-enter-active,
@@ -592,7 +563,7 @@
   bottom: calc(100% + var(--sp-2));
   left: 50%;
   z-index: 35;
-  width: min(calc(100% - 48px), var(--composer-col, 820px));
+  width: min(calc(100% - 48px), var(--composer-col, 800px));
   min-width: 0;
   pointer-events: none;
   transform: translateX(-50%);
@@ -643,7 +614,7 @@
 .goal-run-dock {
   position: relative;
   width: 100%;
-  max-width: var(--composer-col, 860px);
+  max-width: var(--composer-col, 800px);
   margin: 0 auto 8px;
 }
 
@@ -681,7 +652,7 @@
 }
 
 .chat--new-landing .chat-composer {
-  width: min(calc(100% - 48px), 820px);
+  width: min(calc(100% - 48px), var(--composer-col, 800px));
   margin: 0 auto;
   padding: 0;
   background: transparent;
@@ -856,49 +827,8 @@
   font-family: var(--font-mono);
 }
 
-/* Highlight token mapping — values from the --syntax-* family in base.css */
-:deep(.hljs-comment), :deep(.hljs-quote) {
-  color: var(--syntax-comment);
-  font-style: italic;
-}
-
-:deep(.hljs-meta), :deep(.hljs-doctag) {
-  color: var(--syntax-comment);
-}
-
-:deep(.hljs-keyword), :deep(.hljs-selector-tag), :deep(.hljs-built_in), :deep(.hljs-template-tag) {
-  color: var(--syntax-keyword);
-}
-
-:deep(.hljs-string), :deep(.hljs-regexp), :deep(.hljs-addition) {
-  color: var(--syntax-string);
-}
-
-:deep(.hljs-number), :deep(.hljs-literal), :deep(.hljs-symbol), :deep(.hljs-bullet) {
-  color: var(--syntax-literal);
-}
-
-:deep(.hljs-title), :deep(.hljs-section), :deep(.hljs-name) {
-  color: var(--syntax-title);
-}
-
-:deep(.hljs-attr), :deep(.hljs-attribute), :deep(.hljs-variable), :deep(.hljs-template-variable),
-:deep(.hljs-type), :deep(.hljs-property), :deep(.hljs-selector-id), :deep(.hljs-selector-class),
-:deep(.hljs-selector-attr), :deep(.hljs-selector-pseudo) {
-  color: var(--syntax-attr);
-}
-
-:deep(.hljs-deletion) {
-  color: var(--danger);
-}
-
-:deep(.hljs-emphasis) {
-  font-style: italic;
-}
-
-:deep(.hljs-strong) {
-  font-weight: 600;
-}
+/* Highlight token colors moved to styles/chat-markdown.css — one palette for
+   chat, streaming, session inspect, and the artifact preview. */
 
 :deep(code) {
   background: var(--bg-hover);
@@ -1078,13 +1008,6 @@
     gap: 0.875rem;
   }
 
-  /* The app topbar floats above new-chat content. Setup mode intentionally
-     replaced the landing padding with a compact desktop inset, so restore a
-     phone-safe top inset here and keep the card title/status fully visible. */
-  .chat--new-landing.chat--meta-setup {
-    padding: calc(3.25rem + env(safe-area-inset-top, 0px)) 0.75rem 0.75rem;
-  }
-
   .chat-landing-brand,
   .chat--new-landing .chat-composer {
     width: 100%;
@@ -1107,7 +1030,16 @@
   }
 
   .chat-thread {
-    padding: 0.75rem 0.75rem 1.5rem;
+    padding: 0.75rem 0 1.5rem;
+  }
+
+  .chat :deep(.msg-ai:not(.msg-ai--share-mode)) {
+    /* The shell includes the reserved scrollbar gutter. Measuring this column
+       against that shell avoids subtracting the gutter and mobile padding a
+       second time; its 12px edges now match the composer panel below. */
+    width: min(calc(100cqw - 24px), var(--composer-col));
+    max-width: none;
+    margin-inline: 12px 0;
   }
 
 }

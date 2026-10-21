@@ -1,0 +1,6 @@
+{
+  "name": "opensquilla-pr1793-quit-acceptance",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs"
+}

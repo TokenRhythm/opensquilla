@@ -58,7 +58,10 @@ body::before {
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-hover); }
 
-input:not([type="radio"]):not([type="checkbox"]), textarea, select {
+/* Element defaults stay below component rules. A compound field owns its
+   focus boundary on the wrapper and resets its inner input without having to
+   compete with a growing list of global :not() exceptions. */
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select) {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -69,9 +72,10 @@ input:not([type="radio"]):not([type="checkbox"]), textarea, select {
   outline: none;
   transition: border-color var(--transition), box-shadow var(--transition);
 }
-input:not([type="radio"]):not([type="checkbox"]):focus, textarea:focus, select:focus {
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+:where(input:not([type="radio"]):not([type="checkbox"]), textarea, select):focus {
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+  box-shadow: none;
 }
 input[type="radio"], input[type="checkbox"] {
   accent-color: var(--accent);
@@ -179,35 +183,6 @@ pre {
   min-width: auto;
 }
 
-/* ── Connection pill ─────────────────────────────────────────────────── */
-.conn-pill {
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 999px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.conn-pill.connected {
-  background: color-mix(in srgb, var(--ok) 16%, var(--bg-surface));
-  color: var(--ok);
-  border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--border));
-}
-.conn-pill.connecting {
-  background: color-mix(in srgb, var(--warn) 16%, var(--bg-surface));
-  color: var(--warn);
-  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
-  animation: live-pulse var(--dur-pulse) var(--ease-standard) infinite;
-}
-.conn-pill.disconnected {
-  background: color-mix(in srgb, var(--danger) 12%, var(--bg-surface));
-  color: var(--danger);
-  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--border));
-}
-
 /* ── Chat topbar semantic state contract ───────────────────────────────────
    Domain classes say WHAT a control represents; data-state says HOW urgent it
    is. Components consume these variables while value themes may add a restrained
@@ -227,8 +202,7 @@ pre {
 
 /* A healthy connection remains recognizable as healthy without becoming an
    attention surface. World themes intentionally do not add a glow to normal. */
-.topbar .topbar-state--connection[data-state="normal"],
-.topbar .topbar-state--system[data-state="normal"] {
+.topbar .topbar-state--connection[data-state="normal"] {
   --topbar-state-channel: var(--ok);
   --topbar-state-fill: color-mix(in srgb, var(--ok) 10%, var(--bg-surface));
   --topbar-state-border: color-mix(in srgb, var(--ok) 28%, var(--border));
@@ -252,9 +226,8 @@ pre {
   --topbar-state-border: color-mix(in srgb, var(--danger) 34%, var(--border));
 }
 
-/* The one ambient "alive/working" pulse — opacity only (compositor-cheap, no
-   paint), reused by the connection pill, the sidebar running dot, the work-card
-   dots and the meta-skill chip so the whole running view breathes together. */
+/* The shared "alive/working" pulse — opacity only (compositor-cheap, no
+   paint), reused by sidebar running dots and work-card activity. */
 @keyframes live-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.45; }
@@ -477,6 +450,7 @@ pre {
   border: none;
   border-radius: var(--radius-md);
   color: var(--sidebar-text-strong);
+  font-family: inherit;
   font-size: var(--fs-sm);
   font-weight: 500;
   cursor: pointer;
@@ -1016,10 +990,12 @@ pre {
 .sidebar-history-title,
 .sidebar-session-preview__title {
   font-family: var(--font-sans);
-  font-size: 0.828125rem;
-  font-weight: 500;
-  line-height: 1.35;
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  line-height: 20px;
 }
+
+.sidebar-history-item.is-current .sidebar-history-title { font-weight: 500; }
 
 .sidebar-history-title {
   flex: 1;
@@ -1722,24 +1698,10 @@ pre {
   height: 44px;
 }
 
-.main--sidebar-drawer .topbar .conn-pill {
-  min-height: 44px;
-}
-
-/* The compact dock leaves 509–699px for the main pane. Collapse language to
-   its icon; the Chat action group responds to the space left after app chrome. */
+/* The compact dock leaves 509–699px for the main pane. Keep the action
+   group compact within the space left after app chrome. */
 .main--sidebar-compact .topbar-right {
   gap: var(--sp-1);
-}
-
-.main--sidebar-compact .topbar-right .lang-menu-trigger {
-  justify-content: center;
-  width: 28px;
-  padding-inline: 0;
-}
-
-.main--sidebar-compact .topbar-right .lang-menu-current {
-  display: none;
 }
 
 /* Drawer affordances retain the mobile touch contract even when a coarse-only
@@ -1827,11 +1789,7 @@ pre {
   margin-left: auto;
 }
 
-/* Theme picker menu (topbar) */
-.theme-menu-wrap {
-  position: relative;
-}
-
+/* Shared menu surface used by provider selection. */
 .theme-menu {
   position: absolute;
   right: 0;
@@ -1865,28 +1823,10 @@ pre {
   background: var(--bg-hover);
   color: var(--text);
 }
-/* Branded focus ring for the theme/language popover items (reused by both). */
+/* Shared focus ring for provider menu items. */
 .theme-menu__item:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
-}
-
-.theme-menu__item[aria-checked='true'] {
-  color: var(--text);
-}
-
-.theme-menu__check {
-  margin-left: auto;
-  color: var(--accent);
-}
-
-/* "More themes…" — a navigation action to Settings → Appearance, set off from
-   the basic light/dark/system rows by a hairline divider. */
-.theme-menu__item--more {
-  margin-top: var(--sp-1);
-  padding-top: 9px;
-  border-top: 1px solid var(--hairline);
-  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
 }
 
 .sidebar-toggle.btn {
@@ -1925,12 +1865,6 @@ pre {
   border-radius: 0;
   box-shadow: none;
   overflow: hidden;
-}
-
-.main .content--chat .chat {
-  border: 0;
-  border-radius: 0;
-  box-shadow: none;
 }
 
 .approval-inline {
@@ -1995,23 +1929,6 @@ pre {
 
   .topbar--chat .topbar-right {
     gap: var(--sp-1);
-  }
-
-  .topbar--chat .topbar-right .lang-menu-current,
-  .topbar--chat .topbar-right > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
-    display: none;
-  }
-
-  .topbar--chat .topbar-right .lang-menu-trigger {
-    justify-content: center;
-    padding-inline: 0;
-    width: 44px;
-  }
-
-  .topbar--chat .topbar-right--attention > .conn-pill,
-  .topbar--chat .topbar-right--attention .lang-menu-wrap,
-  .topbar--chat .topbar-right--attention > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
-    display: none;
   }
 
   .sidebar-dock-toggle {
@@ -2188,14 +2105,6 @@ pre {
 
   .sidebar-foot .sidebar-fn-item {
     min-height: 32px;
-  }
-}
-
-@media (max-width: 400px) {
-  /* Language and theme remain available from the mobile More → Settings path;
-     reclaim their header space so the conversation menu keeps a 44px target. */
-  .topbar--chat .topbar-right .lang-menu-wrap {
-    display: none;
   }
 }
 

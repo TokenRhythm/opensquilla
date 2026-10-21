@@ -8,42 +8,16 @@ def _main_source() -> str:
     return (ROOT / "desktop/electron/src/main.ts").read_text(encoding="utf-8")
 
 
-def _coordinator_source() -> str:
-    return (ROOT / "desktop/electron/src/onboarding-flow-coordinator.ts").read_text(
-        encoding="utf-8"
-    )
-
-
 def _section(source: str, start: str, end: str) -> str:
     start_index = source.index(start)
     return source[start_index : source.index(end, start_index)]
 
 
-def test_onboarding_uses_one_flow_scoped_source_of_truth() -> None:
+def test_onboarding_window_uses_coordinator_lifecycle() -> None:
     source = _main_source()
-    coordinator = _coordinator_source()
-    flow_type = _section(source, "interface OnboardingFlow", "interface DesktopSettingsPayload")
     run = _section(source, "async function runOnboarding", "async function pathExists")
 
-    assert "extends CoordinatedOnboardingFlow" in flow_type
-    for field in (
-        "window: BrowserWindow | null",
-        "resolve: ((credential: DesktopConnection | null) => void) | null",
-        "reject: ((error: Error) => void) | null",
-    ):
-        assert field in flow_type
-    for field in (
-        "state: OnboardingFlowState",
-        "savePayload: Payload | null",
-        "savePromise: Promise<Result> | null",
-    ):
-        assert field in coordinator
-
-    assert "private activeFlow: Flow | null = null" in coordinator
     assert "const onboardingFlows = new OnboardingFlowCoordinator" in source
-    assert "activeOnboardingFlow" not in source
-    assert "let resolveOnboarding" not in source
-    assert "let rejectOnboarding" not in source
     assert run.index("await onboardingFlows.waitForAbandonedSave()") < run.index(
         "await loadPendingMigrationProviderSetup()"
     )
@@ -54,27 +28,13 @@ def test_onboarding_uses_one_flow_scoped_source_of_truth() -> None:
     assert "if (flow.window === window) flow.window = null" in run
 
 
-def test_onboarding_save_is_per_flow_single_flight_with_exact_payload_joining() -> None:
+def test_onboarding_save_ipc_checks_trust_and_maps_coordinator_results() -> None:
     source = _main_source()
-    coordinator = _coordinator_source()
-    request = coordinator[coordinator.index("  requestSave(") :]
     handler = _section(
         source,
         "ipcMain.handle('desktop:onboarding:save'",
         "ipcMain.handle('desktop:onboarding:cancel'",
     )
-
-    assert "isDeepStrictEqual(flow.savePayload, payload)" in request
-    assert "{ kind: 'joined', promise: flow.savePromise }" in request
-    assert "{ kind: 'conflict' }" in request
-    assert "const operation = Promise.resolve().then(perform)" in request
-    assert request.index("flow.savePayload = payload") < request.index(
-        "const operation = Promise.resolve().then(perform)"
-    )
-    assert request.index("const operation = Promise.resolve().then(perform)") < (
-        request.index("flow.savePromise = savePromise")
-    )
-    assert "if (flow.savePromise !== savePromise) return" in request
 
     trust = "if (!flow || !trustedOnboardingIpc(event, flow))"
     request_save = "const request = onboardingFlows.requestSave("
@@ -130,7 +90,7 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     assert "throw error" in save
 
 
-def test_onboarding_does_not_wait_for_configuration_before_starting_gateway() -> None:
+def test_fresh_onboarding_runs_before_gateway_without_changing_existing_prompt_path() -> None:
     source = _main_source()
     startup = _section(
         source,
@@ -140,7 +100,10 @@ def test_onboarding_does_not_wait_for_configuration_before_starting_gateway() ->
     run = _section(source, "async function runOnboarding", "async function pathExists")
 
     assert "await prepareDesktopStartupConnection()" in startup
-    assert "await runOnboarding()" not in startup
+    assert "const shouldRunFreshOnboarding" in startup
+    assert "await runOnboarding()" in startup
+    assert "await onboardingFlows.waitForAbandonedSave()" in startup
+    assert startup.index("await runOnboarding()") < startup.index("sendBootStatus('gateway-start')")
     assert "void runOnboarding()" in source
     assert "Promise<DesktopConnection | null>" in run
     assert "modal: true" not in run

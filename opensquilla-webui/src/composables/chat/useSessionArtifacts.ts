@@ -7,7 +7,7 @@ import type { ArtifactPayload } from '@/types/artifacts'
 const MAX_ARTIFACT_PAGE_LIMIT = 200
 
 export interface UseSessionArtifactsOptions {
-  catalog: ArtifactCatalog
+  catalog: Pick<ArtifactCatalog, 'listSession'>
   sessionKey: Ref<string>
   messages: Ref<ChatMessage[]>
   streamArtifacts: Ref<ArtifactPayload[]>

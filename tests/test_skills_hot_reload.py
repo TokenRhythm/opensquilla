@@ -52,20 +52,13 @@ def _inject_transient_tree_hash_race(
 
 def test_loader_normalizes_crlf_before_parsing_yaml_block_scalars(tmp_path: Path) -> None:
     root = tmp_path / "skills"
-    skill_file = root / "crlf-meta" / "SKILL.md"
+    skill_file = root / "crlf-skill" / "SKILL.md"
     skill_file.parent.mkdir(parents=True)
     source = """---
-name: crlf-meta
-description: CRLF fixture
-kind: meta
-composition:
-  steps:
-    - id: deliver
-      kind: llm_chat
-      with:
-        task: |
-          first line
-          second line
+name: crlf-skill
+description: |
+  first line
+  second line
 ---
 body
 """
@@ -73,12 +66,10 @@ body
 
     loader = _loader(root, tmp_path)
     loader.load_all()
-    spec = loader.get_by_name("crlf-meta")
+    spec = loader.get_by_name("crlf-skill")
 
     assert spec is not None
-    assert spec.composition_raw is not None
-    step = spec.composition_raw["steps"][0]
-    assert step["with"]["task"] == "first line\nsecond line"
+    assert spec.description == "first line\nsecond line"
 
 
 def test_external_add_modify_delete_publish_on_next_probe(tmp_path: Path) -> None:
@@ -837,7 +828,7 @@ def test_publish_writes_snapshot_without_reentering_loader(
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
 
 
-def test_snapshot_v12_is_invalid_and_v16_round_trips_atomically(tmp_path: Path) -> None:
+def test_snapshot_v12_is_invalid_and_v17_round_trips_atomically(tmp_path: Path) -> None:
     root = tmp_path / "skills"
     _write_skill(root, "alpha")
     snapshot_path = tmp_path / "snapshot.json"
@@ -848,7 +839,7 @@ def test_snapshot_v12_is_invalid_and_v16_round_trips_atomically(tmp_path: Path) 
     loader.load_all()
     loader.save_snapshot()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 16
+    assert data["version"] == 17
     assert all("mtime_ns" in entry for entry in data["manifest"].values())
     assert all("tree_state" in entry for entry in data["manifest"].values())
     assert data["skills"][0]["tree_digest"]

@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import i18n from '@/i18n'
 import SetupTierTable from './SetupTierTable.vue'
+import { MODEL_CAPACITY_KEY, useModelCapacityForm } from '@/composables/setup/useModelCapacityForm'
+import type { ModelCapacityTarget, ProviderConfiguration } from '@/modules/providerConfiguration'
 import type {
   DiscoveredModel,
   DiscoveredModelsByProvider,
@@ -63,6 +65,14 @@ async function mountTable(props: Record<string, unknown> = {}, listeners: Record
     ...listeners,
   })
   app.use(i18n)
+  app.provide(MODEL_CAPACITY_KEY, useModelCapacityForm({
+    capacitySupported: true,
+    resolveCapacity: async (items: ModelCapacityTarget[]) => ({ models: items.map(item => ({
+      ...item, localRuntime: false,
+      contextWindow: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+      maxOutputTokens: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+    })) }),
+  } as unknown as ProviderConfiguration))
   app.mount(el)
   await nextTick()
   return { app, el }
@@ -97,6 +107,16 @@ async function mountTableWithAsyncCatalog() {
   return { app, el, modelsByProvider }
 }
 
+const flushDialog = async () => { await Promise.resolve(); await Promise.resolve(); await nextTick() }
+async function editThinking(el: HTMLElement, tier: string, value: string) {
+  const select = el.querySelector<HTMLSelectElement>(`select[aria-label="${tier} thinking level"]`)!
+  const initialValue = select.value
+  select.value = value
+  select.dispatchEvent(new Event('change', { bubbles: true }))
+  await nextTick()
+  return initialValue
+}
+
 beforeEach(() => {
   i18n.global.locale.value = 'en'
   document.body.innerHTML = ''
@@ -116,6 +136,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(table?.classList.contains('setup-tier-table--without-provider')).toBe(true)
     expect(el.querySelector('.setup-tier-table__row.is-head')?.textContent)
       .not.toContain('Request entry')
+    expect(el.querySelector('.setup-tier-table__row.is-head')?.children.length).toBe(4)
     expect(el.querySelector('[aria-label="c0 request entry"]')).toBeNull()
     expect(el.querySelector('[aria-label="c1 request entry"]')).toBeNull()
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 model"]')?.disabled).toBe(false)
@@ -147,6 +168,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(head?.textContent).toContain('Request entry')
     expect(head?.textContent).toContain('Model')
     expect(head?.textContent).toContain('Thinking')
+    expect(head?.children.length).toBe(5)
     expect(head?.textContent).not.toContain('Image')
 
     const requestEntry = el.querySelector('[aria-label="c0 request entry"]')
@@ -159,6 +181,60 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')?.value).toBe('high')
     expect(el.querySelector('[aria-label$="supports image"]')).toBeNull()
 
+    app.unmount()
+  })
+
+  it('edits thinking inline without duplicating the control in model settings', async () => {
+    const onUpdateTierField = vi.fn()
+    const rows = ref(ROWS.map(row => ({ ...row })))
+    const { app, el } = await mountTable({ rows: rows.value }, {
+      onUpdateTierField: (name: string, key: string, value: string) => {
+        onUpdateTierField(name, key, value)
+        if (key === 'thinkingLevel') rows.value.find(row => row.name === name)!.thinkingLevel = value
+      },
+    })
+    expect(await editThinking(el, 'c0', 'low')).toBe('high')
+    expect(onUpdateTierField).toHaveBeenLastCalledWith('c0', 'thinkingLevel', 'low')
+    expect(await editThinking(el, 'c0', '')).toBe('low')
+    expect(onUpdateTierField).toHaveBeenLastCalledWith('c0', 'thinkingLevel', '')
+    const select = el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')!
+    expect(select.value).toBe('')
+    expect(Array.from(select.options).map(option => option.value))
+      .toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+
+    el.querySelector<HTMLButtonElement>('.model-capacity-trigger')!.click()
+    await flushDialog()
+    const dialog = document.querySelector('.model-capacity-dialog')!
+    expect(dialog).toBeTruthy()
+    expect(dialog.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
+    expect(dialog.textContent).toContain('Context window')
+    expect(dialog.textContent).toContain('Maximum output length')
+    expect(dialog.querySelectorAll('select').length).toBe(0)
+    app.unmount()
+  })
+
+  it('preserves single-model thinking while shared fusion manages the active C3 setting', async () => {
+    const rows = ref([{ ...ROWS[0], name: 'c3', ensembleEnabled: false }])
+    const onEditEnsemble = vi.fn()
+    const onUpdateTierField = vi.fn()
+    const { app, el } = await mountTable({ rows: rows.value }, {
+      onEditEnsemble,
+      onUpdateTierField,
+    })
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')?.value).toBe('high')
+    rows.value[0]!.ensembleEnabled = true
+    await nextTick()
+    expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')?.textContent)
+      .toBe('Determined by fusion plan')
+    expect(el.querySelector('.model-capacity-trigger')).toBeNull()
+    el.querySelector<HTMLButtonElement>('[data-testid="tier-edit-shared-ensemble"]')!.click()
+    expect(onEditEnsemble).toHaveBeenCalledOnce()
+    rows.value[0]!.ensembleEnabled = false
+    await nextTick()
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')?.value).toBe('high')
+    expect(el.querySelector('[data-testid="tier-edit-shared-ensemble"]')).toBeNull()
+    expect(onUpdateTierField).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -236,8 +312,8 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(details.dataset.open).toBe('false')
     expect(el.textContent).not.toContain('glm-5.2')
     expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
-    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
-      ?.textContent).toContain('Determined by fusion plan')
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')?.textContent)
+      .toBe('Determined by fusion plan')
     const liveStatus = el.querySelector<HTMLElement>('[role="status"][aria-live="polite"]')
     expect(liveStatus?.getAttribute('aria-atomic')).toBe('true')
     expect(liveStatus?.textContent)
@@ -487,11 +563,9 @@ describe('SetupTierTable — editable routing rows', () => {
     }, { onUpdateTierField, onMigrateLegacyEnsemble })
 
     const provider = el.querySelector<HTMLSelectElement>('select[aria-label="c3 request entry"]')!
-    const thinking = el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')!
     expect(provider.value).toBe('tokenrhythm')
     expect(provider.disabled).toBe(false)
-    expect(thinking.value).toBe('high')
-    expect(thinking.disabled).toBe(false)
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')?.value).toBe('high')
     expect(el.textContent).toContain('previously saved tier-following fusion plan')
     expect(el.textContent).not.toContain('Determined by Multi-model fusion')
     expect(el.textContent).not.toContain('Determined by fusion plan')
@@ -500,8 +574,7 @@ describe('SetupTierTable — editable routing rows', () => {
     migrate.click()
     expect(onMigrateLegacyEnsemble).toHaveBeenCalledOnce()
 
-    thinking.value = 'xhigh'
-    thinking.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(await editThinking(el, 'c3', 'xhigh')).toBe('high')
     expect(onUpdateTierField).toHaveBeenCalledWith('c3', 'thinkingLevel', 'xhigh')
     app.unmount()
   })
@@ -529,8 +602,8 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 request entry"]')?.value)
       .toBe('openai')
     expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
-    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
-      ?.textContent).toContain('Determined by fusion plan')
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')?.textContent)
+      .toBe('Determined by fusion plan')
     app.unmount()
   })
 
@@ -630,8 +703,8 @@ describe('SetupTierTable — editable routing rows', () => {
     const provider = el.querySelector<HTMLSelectElement>('[aria-label="c3 request entry"]')
     expect(provider?.value).toBe('openai')
     expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
-    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
-      ?.textContent).toContain('Determined by fusion plan')
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')?.textContent)
+      .toBe('Determined by fusion plan')
     app.unmount()
   })
 
@@ -678,8 +751,8 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(el.querySelector<HTMLSelectElement>('[aria-label="c3 request entry"]')?.value)
       .toBe('openai')
     expect(el.querySelector('select[aria-label="c3 thinking level"]')).toBeNull()
-    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
-      ?.textContent).toContain('Determined by fusion plan')
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')?.textContent)
+      .toBe('Determined by fusion plan')
     app.unmount()
   })
 
@@ -698,8 +771,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
       .toContain('previously saved tier-following fusion plan')
     expect(el.querySelector('[data-testid="tier-ensemble-migrate-legacy"]')).toBeTruthy()
-    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')?.value)
-      .toBe(ROWS[1].thinkingLevel)
+    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 thinking level"]')?.disabled).toBe(false)
     app.unmount()
   })
 
@@ -764,6 +836,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(provider.closest('[role="row"]')?.getAttribute('aria-disabled')).toBeNull()
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 model"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')?.disabled).toBe(true)
+    expect(el.querySelector<HTMLButtonElement>('.model-capacity-trigger')?.disabled).toBe(true)
     expect(el.querySelector('[aria-label="c0 supports image"]')).toBeNull()
     provider.value = 'openrouter'
     provider.dispatchEvent(new Event('change', { bubbles: true }))
@@ -794,6 +867,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 request entry"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 model"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')?.disabled).toBe(true)
+    expect(el.querySelector<HTMLButtonElement>('.model-capacity-trigger')?.disabled).toBe(true)
     expect(el.querySelector('[aria-label="c0 supports image"]')).toBeNull()
 
     app.unmount()
@@ -921,7 +995,7 @@ describe('SetupTierTable — combobox swap condition', () => {
 })
 
 describe('SetupTierTable — readonly preview mode', () => {
-  it('renders model and thinking as text with no editable inputs', async () => {
+  it('previews model and thinking values without editable inputs', async () => {
     const rows = ROWS.map(row => ({ ...row, provider: 'openrouter' }))
     const { app, el } = await mountTable({
       readonly: true,
@@ -935,10 +1009,10 @@ describe('SetupTierTable — readonly preview mode', () => {
     const model = el.querySelector('[aria-label="c0 model"]')
     expect(model?.tagName).toBe('SPAN')
     expect(model?.textContent).toBe('deepseek/deepseek-v4-flash')
-    expect(el.querySelector('[aria-label="c0 thinking level"]')?.tagName).toBe('SPAN')
+    expect(el.querySelector('[aria-label="c0 thinking level"]')?.textContent).toBe('high')
+    expect(el.querySelector('[aria-label="c1 thinking level"]')?.textContent).toBe('Default (unset)')
     expect(el.querySelectorAll('select').length).toBe(0)
     expect(el.querySelector('input[role="combobox"]')).toBeNull()
-    // The image switch stays visible (disabled) so the preview shows state.
     expect(el.querySelector('[aria-label="c0 supports image"]')).toBeNull()
 
     app.unmount()
@@ -970,8 +1044,8 @@ describe('SetupTierTable — readonly preview mode', () => {
     )
     expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
       .toContain('uses the Fixed and fallback model')
-    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')
-      ?.textContent).toContain('Determined by fusion plan')
+    expect(el.querySelector('[aria-label="c3 thinking is determined by the Multi-model fusion plan"]')?.textContent)
+      .toBe('Determined by fusion plan')
     expect(el.textContent).not.toContain('glm-5.2')
     expect(el.textContent).not.toContain('static_tokenrhythm_b5')
     expect(el.querySelector('select[aria-label="c3 execution mode"]')).toBeNull()

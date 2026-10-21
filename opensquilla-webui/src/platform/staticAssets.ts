@@ -1,17 +1,21 @@
-/** Read a same-origin UI asset without treating it as a Gateway API call. */
-export async function readStaticJson<T>(path: string): Promise<T | null> {
-  let resolved: URL
-  try {
-    resolved = new URL(path, globalThis.location?.href)
-  } catch {
-    return null
+/** Read a build-generated static resource without Gateway credentials.
+ * Callers must select URLs from a bundled manifest, never document/user input.
+ * This is the static-asset transport boundary, separate from domain HTTP APIs.
+ */
+export async function readBundledStaticAsset(source: string, signal: AbortSignal): Promise<Uint8Array> {
+  signal.throwIfAborted()
+  const url = new URL(source, location.href)
+  const inline = url.protocol === 'data:'
+  if (!inline) {
+    const own = new URL(location.href)
+    if (url.protocol !== own.protocol || url.host !== own.host
+      || !/(?:^|\/)(?:assets|node_modules|@fs)\//.test(url.pathname)
+      || /(?:^|\/)api(?:\/|$)/.test(url.pathname)
+      || url.username || url.password) throw new Error('Not a bundled static resource')
   }
-  if (
-    !globalThis.location?.origin
-    || resolved.origin !== globalThis.location.origin
-    || /^\/api(?:\/|$)/.test(resolved.pathname)
-  ) return null
-  const response = await fetch(path, { cache: 'no-cache' })
-  if (!response.ok) return null
-  return await response.json() as T
+  const response = await fetch(url.href, { signal, credentials: 'omit', redirect: 'error' })
+  if (!response.ok) throw new Error('Static resource unavailable')
+  const data = new Uint8Array(await response.arrayBuffer())
+  signal.throwIfAborted()
+  return data
 }

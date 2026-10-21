@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-Hans" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>连接静默恢复验收 · OpenSquilla</title>
+  <style>
+    html body #app { display:block; height:auto; min-height:100vh; overflow:visible; }
+    .connection-fixture { max-width:1000px; margin:auto; padding:24px; }
+    .fixture-controls { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0; }
+    .fixture-controls button { font:inherit; padding:8px 12px; color:var(--text); background:var(--bg-elevated); border:1px solid var(--border); border-radius:8px; }
+    .fixture-window { background:var(--bg-surface); border:1px solid var(--border); border-radius:12px; }
+    .connection-fixture .topbar { position:relative; display:flex; align-items:center; justify-content:space-between; gap:16px; height:56px; padding:12px 20px; }
+    .fixture-chat { padding:28px; min-height:210px; }
+    .fixture-composer { padding:16px; }
+    .fixture-composer .chat-composer { position:relative; inset:auto; width:100%; padding:0; }
+    .connection-fixture output { display:block; color:var(--text-muted); margin-top:12px; font-size:13px; overflow-wrap:anywhere; }
+    .connection-fixture p { line-height:1.7; }
+  </style>
+</head>
+<body><div id="app"></div><script type="module" src="./connection-recovery.ts"></script></body>
+</html>

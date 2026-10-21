@@ -37,7 +37,9 @@ def build_isolated_core_wheel(repo_root: Path, temp_root: Path) -> Path:
         if source_path == (repo_root / "src/opensquilla/gateway/static").resolve():
             generated.add("dist")
         if source_path == (repo_root / "opensquilla-webui").resolve():
-            generated.add("dist")
+            # Only public-assets is a build input. Old checkouts can retain
+            # private music or broken links under the retired public tree.
+            generated.update({"dist", "public"})
         return generated
 
     for directory in ("src", "migrations", "opensquilla-webui", "scripts"):

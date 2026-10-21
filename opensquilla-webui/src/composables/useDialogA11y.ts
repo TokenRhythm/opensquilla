@@ -113,8 +113,8 @@ interface DialogA11yOptions {
 /**
  * Modal-dialog accessibility for an open/close-driven overlay: traps Tab focus
  * inside `rootRef`, closes on Escape, moves focus into the dialog on open, and
- * restores focus to the invoking element on close. Mirrors the pattern already
- * used by SettingsDialog and SessionInspectDrawer.
+ * restores focus to the invoking element on close. Mirrors the pattern used by
+ * the app's modal dialogs.
  */
 export function useDialogA11y(
   rootRef: Ref<HTMLElement | null>,
@@ -125,6 +125,8 @@ export function useDialogA11y(
   const dialogToken = Symbol('dialog-a11y')
   const occludesNativeSurface = options.occludesNativeSurface !== false
   let invokerEl: HTMLElement | null = null
+  let focusGeneration = 0
+  let disposed = false
 
   function onKeydown(event: KeyboardEvent) {
     if (event.defaultPrevented) return
@@ -157,25 +159,41 @@ export function useDialogA11y(
   useDocumentEvent('keydown', onKeydown)
 
   watch(isOpen, (open, wasOpen) => {
+    const generation = ++focusGeneration
     if (open && !wasOpen) {
       invokerEl = document.activeElement instanceof HTMLElement ? document.activeElement : null
       registerOpenDialog(dialogToken)
       if (occludesNativeSurface) registerNativeSurfaceOcclusion(dialogToken)
+      const stackVersion = openDialogVersion.value
       void nextTick(() => {
+        if (disposed || generation !== focusGeneration || !isOpen.value
+          || stackVersion !== openDialogVersion.value
+          || openDialogStack[openDialogStack.length - 1] !== dialogToken) return
         const target = options.initialFocus?.value
           ?? rootRef.value?.querySelector<HTMLElement>(FOCUSABLE)
           ?? null
-        target?.focus()
+        if (target?.isConnected && !target.closest('[inert]')) target.focus({ preventScroll: true })
       })
     } else if (!open && wasOpen) {
       const wasTopmost = unregisterOpenDialog(dialogToken)
       unregisterNativeSurfaceOcclusion(dialogToken)
-      if (wasTopmost && invokerEl && document.contains(invokerEl)) invokerEl.focus()
+      const invoker = invokerEl
       invokerEl = null
+      const stackVersion = openDialogVersion.value
+      // Occlusion drives reactive inert/aria-hidden on the Workbench. Restore
+      // focus only after that DOM patch, while this close still owns the result.
+      if (wasTopmost && invoker) void nextTick(() => {
+        if (disposed || generation !== focusGeneration || isOpen.value
+          || stackVersion !== openDialogVersion.value
+          || !invoker.isConnected || invoker.closest('[inert]')) return
+        invoker.focus({ preventScroll: true })
+      })
     }
   }, { immediate: true })
 
   onUnmounted(() => {
+    disposed = true
+    focusGeneration += 1
     unregisterOpenDialog(dialogToken)
     unregisterNativeSurfaceOcclusion(dialogToken)
     invokerEl = null

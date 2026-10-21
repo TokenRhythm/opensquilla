@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -46,6 +47,12 @@ from opensquilla.tools import get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext
 
 _MODEL = "deepseek/deepseek-v4-pro"
+
+
+class _CharacterBudgetEncoding:
+    def encode(self, text: str, *, disallowed_special: tuple[Any, ...]) -> range:
+        del disallowed_special
+        return range((len(text) + 7) // 8)
 
 
 class _CountingProvider:
@@ -242,7 +249,7 @@ async def test_normal_turn_reads_transcript_once_before_provider(
 
 
 @pytest.mark.asyncio
-async def test_runtime_prefix_preflight_inherits_current_generation_budget(
+async def test_runtime_preflight_inherits_current_generation_budget(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -305,7 +312,7 @@ async def test_runtime_prefix_preflight_inherits_current_generation_budget(
         assert summaries[0][2].max_tokens == ordinary[0][2].max_tokens == 8192
         assert summaries[0][1] is None
         assert summaries[0][2].system.startswith("You are a conversation compactor.")
-        assert "within 1024 tokens" in summaries[0][2].system
+        assert "1024" not in summaries[0][2].system
         assert len(await manager.get_summaries(key)) == 1
         assert (await manager.get_session(key)).compaction_count == 1
     finally:
@@ -313,12 +320,98 @@ async def test_runtime_prefix_preflight_inherits_current_generation_budget(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["body_cap", "timeout", "circuit"])
+@pytest.mark.parametrize("failure", ["consumer_capacity", "timeout", "circuit"])
 @pytest.mark.parametrize("hard_overflow", [False, True])
 async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path, failure: str, hard_overflow: bool,
 ) -> None:
+    await _exercise_preflight_recovery(monkeypatch, tmp_path, failure, hard_overflow)
+
+
+@pytest.mark.asyncio
+async def test_effective_second_summary_call_commits_and_continues(monkeypatch, tmp_path):
+    await _exercise_preflight_recovery(
+        monkeypatch, tmp_path, "consumer_capacity", False, recover_on_second=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hard_overflow", [False, True])
+async def test_failed_preflight_continues_through_cooldown_and_sqlite_reopen(
+    monkeypatch, tmp_path, hard_overflow,
+):
+    await _exercise_preflight_recovery(
+        monkeypatch, tmp_path, "consumer_capacity", hard_overflow, follow_up=True,
+    )
+
+
+async def _exercise_preflight_recovery(
+    monkeypatch, tmp_path, failure, hard_overflow, *, recover_on_second=False, follow_up=False,
+):
+    from opensquilla import token_estimation
+    from opensquilla.session import compaction as compaction_module
+
+    # Exercise paid-call recovery and the real 100k character limit. An optional
+    # tokenizer's conservative fallback would exhaust the protected tail's token
+    # budget before any provider call, testing a different failure boundary.
+    encoding = _CharacterBudgetEncoding()
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+    loop = asyncio.get_running_loop()
+    compaction_clock = SimpleNamespace(now=loop.time())
+    active_timeouts: list[asyncio.Timeout] = []
+    summary_cancelled = False
+    operations = []
+    active_operations = []
+    calls = []
+    original_compact = compaction_module.compact_context_new
+    original_call = compaction_module.call_compaction_provider
+
+    async def observe_compaction(request):
+        operations.append(request)
+        active_operations.append(request)
+        try:
+            return await original_compact(request)
+        finally:
+            active_operations.pop()
+
+    async def observe_summary_call(*args, **kwargs):
+        assert len(active_operations) == 1
+        calls.append(len(kwargs.get("source_entries") or []))
+        return await original_call(*args, **kwargs)
+
+    monkeypatch.setattr(compaction_module, "compact_context_new", observe_compaction)
+    monkeypatch.setattr(compaction_module, "call_compaction_provider", observe_summary_call)
+    if failure == "timeout":
+        from opensquilla.provider import retry_after
+
+        monkeypatch.setattr(loop, "time", lambda: compaction_clock.now)
+
+        monkeypatch.setattr(
+            retry_after, "_provider_retry_after_cooldowns",
+            retry_after.ProviderRetryAfterCooldowns(clock=lambda: compaction_clock.now),
+        )
+        # Expire the shared deadline after the paid call starts. Preparation
+        # speed must not turn this into a different, zero-provider-call case.
+        monkeypatch.setattr(
+            "opensquilla.session.compaction.time.monotonic",
+            lambda: compaction_clock.now,
+        )
+
+        @asynccontextmanager
+        async def controlled_timeout(delay: float) -> AsyncIterator[asyncio.Timeout]:
+            assert delay == pytest.approx(1.0)
+            async with asyncio.timeout(None) as timeout:
+                active_timeouts.append(timeout)
+                try:
+                    yield timeout
+                finally:
+                    active_timeouts.pop()
+
+        monkeypatch.setattr(
+            "opensquilla.session.compaction.asyncio",
+            SimpleNamespace(**(vars(asyncio) | {"timeout": controlled_timeout})),
+        )
 
     class Provider(_CountingProvider):
         def __init__(self):
@@ -337,8 +430,14 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
 
         def chat(self, messages, tools=None, config=None):
             if config.candidate_output_mode == "inert_artifact":
+                assert len(active_operations) == 1
+                operation = active_operations[0].config
+                assert config.turn_deadline_at_monotonic == operation.deadline_at_monotonic
                 self.summary_calls += 1
                 return self.summary()
+            # Ordinary Agent execution cannot restart the failed preflight's
+            # paid summary operation or dispatch before it has unwound.
+            assert not active_operations
             projection = self.project_final_request(messages, tools, config)
             if not projection.fits:
                 return self.rejected(projection.proof)
@@ -351,12 +450,27 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
             )
 
         async def summary(self):
+            nonlocal summary_cancelled
             if failure == "timeout":
-                await asyncio.sleep(5)
-            yield ProviderText(text="synthetic oversized summary " * 2_000)
+                compaction_clock.now += 2.0
+                active_timeouts[-1].reschedule(asyncio.get_running_loop().time())
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    summary_cancelled = True
+                    raise
+                raise AssertionError("expired summary stream must be cancelled")
+            # Exceed the complete consumer request's 100k character cap.
+            # A local body cap no longer owns candidate admission.
+            yield ProviderText(text=(
+                "Earlier synthetic work completed; continue the current task."
+                if recover_on_second and self.summary_calls >= 2
+                else "synthetic oversized summary " * 3_350
+            ))
             yield ProviderDone(stop_reason="stop", output_tokens=5_000)
 
-    storage = SessionStorage(":memory:")
+    storage_path = tmp_path / "preflight-recovery.sqlite3"
+    storage = SessionStorage(str(storage_path))
     await storage.connect()
     manager = SessionManager(
         storage, inject_time_prefix=False, checkpoint_workspace_dir=str(tmp_path),
@@ -391,12 +505,46 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
             runner._record_compaction_failure(key)
     try:
         events = await _run(runner, key)
-        assert provider.summary_calls == (0 if failure == "circuit" else 1)
-        assert provider.main_calls == (0 if hard_overflow else 1)
-        assert any(isinstance(event, ErrorEvent) for event in events) is hard_overflow
-        if hard_overflow:
-            errors = [event for event in events if isinstance(event, ErrorEvent)]
-            assert errors[-1].code == "provider_request_too_large"
+        # Oversized-checkpoint input projection makes a useful second call
+        # possible. Assert exactly which calls belong to the ONE preflight
+        # operation, rather than accidentally relying on input rejection.
+        expected_calls = (
+            0 if failure == "circuit" else 2 if recover_on_second else
+            4 if failure == "consumer_capacity" and not hard_overflow else 1
+        )
+        assert provider.summary_calls == expected_calls
+        assert len(operations) == (0 if failure == "circuit" else 1)
+        if failure == "consumer_capacity":
+            assert calls == (
+                [4, 0] if recover_on_second else [6] if hard_overflow else [4, 0, 2, 0]
+            )
+        assert summary_cancelled is (failure == "timeout")
+        assert provider.main_calls == 1
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        if recover_on_second:
+            assert key not in runner._compaction_failures
+            assert key not in runner._turn_compaction_failed_sessions
+            summaries = await manager.get_summaries(key)
+            assert len(summaries) == 1
+            assert (await manager.get_session(key)).compaction_count == 1
+            assert (await manager.get_canonical_transcript(key))[:len(original)] == original
+            active = await manager.get_transcript(key)
+            assert active[:4] == original[4:]
+            await storage.close()
+            storage = SessionStorage(str(storage_path))
+            await storage.connect()
+            manager = SessionManager(
+                storage, inject_time_prefix=False, checkpoint_workspace_dir=str(tmp_path),
+            )
+            assert await manager.get_summaries(key) == summaries
+            runner = TurnRunner(
+                provider_selector=_Selector(provider), session_manager=manager, config=config,
+            )
+            events = await _run(runner, key)
+            assert not any(isinstance(event, ErrorEvent) for event in events)
+            assert provider.main_calls == 2
+            assert (await manager.get_session(key)).compaction_count == 1
+            return
         assert runner._compaction_failures[key].count == (3 if failure == "circuit" else 1)
         assert key not in runner._turn_compaction_failed_sessions
         current = await manager.get_transcript(key)
@@ -408,6 +556,55 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
             (node.session_id,),
         ) as cursor:
             assert (await cursor.fetchone())[0] == 0
+        if follow_up:
+            # Same session: persistent summary failures never block ordinary
+            # requests, leave no false checkpoint, and enter the existing
+            # cooldown. Each attempt is a new operation, not an Agent retry.
+            for turn in range(2, 5):
+                before_calls, before_operations = provider.summary_calls, len(operations)
+                before_logical = len(calls)
+                events = await _run(runner, key)
+                assert not any(isinstance(event, ErrorEvent) for event in events)
+                assert provider.main_calls == turn
+                expected_sequence = (
+                    [] if turn == 4 else
+                    [6] if hard_overflow and turn == 2 else
+                    [8, 0] if hard_overflow else
+                    [4, 0, 2, 0] if turn == 2 else [4, 0, 4, 0]
+                )
+                # Once newer completed replies become the protected tail,
+                # the old huge round becomes compactable and a useful shorten
+                # is allowed again. The optimization is not a sticky failure.
+                assert calls[before_logical:] == expected_sequence
+                assert provider.summary_calls - before_calls == len(expected_sequence)
+                assert len(operations) - before_operations == int(turn < 4)
+                assert runner._compaction_failures[key].count == min(turn, 3)
+                assert key not in runner._turn_compaction_failed_sessions
+                assert await manager.get_summaries(key) == []
+                assert (await manager.get_session(key)).compaction_count == 0
+                assert (await manager.get_transcript(key))[:len(original)] == original
+            canonical = await manager.get_canonical_transcript(key)
+            await storage.close()
+            storage = SessionStorage(str(storage_path))
+            await storage.connect()
+            manager = SessionManager(
+                storage, inject_time_prefix=False, checkpoint_workspace_dir=str(tmp_path),
+            )
+            assert await manager.get_canonical_transcript(key) == canonical
+            runner = TurnRunner(
+                provider_selector=_Selector(provider), session_manager=manager, config=config,
+            )
+            # Cooldown is intentionally in memory: a new runtime may attempt
+            # again, but must still release the turn and continue normally.
+            before_operations = len(operations)
+            events = await _run(runner, key)
+            assert not any(isinstance(event, ErrorEvent) for event in events)
+            assert provider.main_calls == 5
+            assert len(operations) == before_operations + 1
+            assert key not in runner._turn_compaction_failed_sessions
+            assert await manager.get_summaries(key) == []
+            assert (await manager.get_session(key)).compaction_count == 0
+            assert (await manager.get_canonical_transcript(key))[:len(canonical)] == canonical
     finally:
         await storage.close()
 
@@ -444,7 +641,7 @@ async def test_inline_source_rejects_equal_length_temporary_window_after_append(
 
     async def append_after_local_window(key, *args, transcript_snapshot=None, **kwargs):
         frozen = list(await transcript_snapshot.get_entries())
-        assert await runner._record_emergency_ephemeral_compaction(
+        prepared_window = await runner._prepare_request_window(
             key, frozen, 1000, compaction_id="synthetic-alignment",
             phase="preflight", reason="summary_failed",
             expected_session_id=kwargs.get("expected_session_id"),
@@ -455,6 +652,8 @@ async def test_inline_source_rejects_equal_length_temporary_window_after_append(
                 key, "user" if index % 2 == 0 else "assistant",
                 f"new-{index}", token_count=10,
             )
+        assert prepared_window is not None
+        return prepared_window
 
     monkeypatch.setattr(runner._stream_consumer_stage, "run", observe_stream)
     if request_local_history:

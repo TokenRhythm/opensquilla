@@ -7,6 +7,7 @@ import { usePlatform } from '@/platform'
 import {
   AudioTranscriptionError,
   type AudioTranscription,
+  type AudioTranscriptionOwner,
 } from '@/modules/audioTranscription'
 
 // Abort a hung transcription request so voiceBusy cannot pin the mic button
@@ -35,7 +36,7 @@ function recordingFailureKey(err: unknown): string {
   return 'chat.toast.voiceRecordFailed'
 }
 
-export function useVoiceInput(transcription: AudioTranscription) {
+export function useVoiceInput(transcription: AudioTranscription, recordingOwner?: () => AudioTranscriptionOwner | Promise<AudioTranscriptionOwner>) {
   const { pushToast } = useToasts()
   const platform = usePlatform()
   const voiceBusy = ref(false)
@@ -69,6 +70,8 @@ export function useVoiceInput(transcription: AudioTranscription) {
     const generation = ++recordingGeneration
     voiceBusy.value = true
     try {
+      const owner = await recordingOwner?.()
+      if (cleanedUp || generation !== recordingGeneration) return
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       if (cleanedUp || generation !== recordingGeneration) {
         stream.getTracks().forEach(track => track.stop())
@@ -85,7 +88,7 @@ export function useVoiceInput(transcription: AudioTranscription) {
       mediaRecorder.onstop = () => {
         if (generation !== recordingGeneration || recorder !== mediaRecorder) return
         const mime = mediaRecorder.mimeType || 'audio/webm'
-        void transcribeChunks(mime, onText, generation)
+        void transcribeChunks(mime, onText, generation, owner)
       }
       mediaRecorder.start()
       voiceRecording.value = true
@@ -132,6 +135,7 @@ export function useVoiceInput(transcription: AudioTranscription) {
     mime: string,
     onText: (text: string) => void,
     generation: number,
+    owner?: AudioTranscriptionOwner,
   ) {
     if (generation !== recordingGeneration || cleanedUp) return
     const payload = new Blob(chunks, { type: mime })
@@ -160,6 +164,7 @@ export function useVoiceInput(transcription: AudioTranscription) {
         recording: payload,
         mimeType: mime,
         signal: controller.signal,
+        ...owner,
       })
       if (generation !== recordingGeneration || cleanedUp) return
       if (text) onText(text)
@@ -254,6 +259,7 @@ export function useVoiceInput(transcription: AudioTranscription) {
     voiceBusy,
     voiceRecording,
     toggleVoiceInput,
+    cancel: cancelRecording,
     cleanup,
   }
 }

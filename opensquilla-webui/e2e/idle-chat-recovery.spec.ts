@@ -6,6 +6,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:e2e-idle-recovery'
 const DRAFT = 'Synthetic follow-up preserved while the client is idle.'
@@ -95,7 +96,9 @@ for (const halfOpen of [false, true]) {
     // Product probe/retry deadlines remain unchanged.
     for (let elapsed = 0; elapsed < 65_000; elapsed += 1_000) {
       await page.clock.runFor(1_000)
-      if (halfOpen && connectionCount > 1 && await send.isEnabled()) break
+      // Opening the replacement socket precedes Hello and message subscription.
+      // Keep advancing the existing budget until the recovered stream is ready.
+      if (halfOpen && connectionCount > 1 && subscriptions.includes(connectionCount) && await send.isEnabled()) break
       if (!halfOpen && elapsed >= 6_000) break
     }
 
@@ -107,12 +110,12 @@ for (const halfOpen of [false, true]) {
       (window as unknown as { __idleRecoveryComposer: Element }).__idleRecoveryComposer
         === document.querySelector('.chat-textarea')
     ))).toBe(true)
-    await expect(input).toHaveValue(DRAFT)
+    await expectComposerValue(input, DRAFT)
     await expect(send).toBeEnabled()
     await input.press('Enter')
     await expect.poll(() => sends.length).toBe(1)
     expect(sends[0]).toMatchObject({ sessionKey: SESSION, message: DRAFT })
-    await expect(input).toHaveValue('')
+    await expectComposerValue(input, '')
     await page.clock.runFor(2_000)
     expect(sends).toHaveLength(1)
   })

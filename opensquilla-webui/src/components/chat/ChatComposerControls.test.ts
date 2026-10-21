@@ -49,7 +49,9 @@ describe('ChatComposer control hierarchy', () => {
     expect(viewSource).toContain('@confirm="void confirmComposerSandboxSetup()"')
     expect(viewSource).toContain('@background="runComposerSandboxSetupInBackground"')
     expect(viewSource).toContain('useSandboxSetupStore')
-    expect(viewSource).toContain('sandboxSetupStore.startSafeSetup()')
+    expect(viewSource).toContain(
+      'sandboxSetupStore.startSafeSetup({ repairIdentity: sandboxIdentityRepairRequired.value })',
+    )
     expect(viewSource).not.toContain('completeComposerSafeSetup')
     expect(viewSource).toContain('composerRunModeSelectionAction')
   })
@@ -81,18 +83,6 @@ describe('ChatComposer control hierarchy', () => {
     expect(composerSource).not.toContain('setVisualEffectsEnabled')
   })
 
-  it('keeps Coding mode command-first while exposing its active global state', () => {
-    expect(composerSource).toContain('v-if="codingModeEnabled"')
-    expect(composerSource).toContain('chat-coding-mode-chip')
-    expect(composerSource).toContain("emit('setCodingModeEnabled', false)")
-    expect(slashSource).toContain("action === 'coding.mode'")
-    expect(slashSource).toContain('const enabled = !options.codingModeEnabled.value')
-    expect(viewSource).toContain('codingModeEnabled,')
-    expect(viewSource).toContain('codingModeSettingsBusy,')
-    expect(viewSource).toContain('setCodingModeEnabled,')
-    expect(viewSource).toContain('@set-coding-mode-enabled="setComposerCodingModeEnabled"')
-  })
-
   it('completes Slash candidates without executing them from the suggestion menu', () => {
     expect(viewSource).toContain('@choose="completeSlashCmd"')
     expect(viewSource).not.toContain('@click="selectSlashCmd(cmd)"')
@@ -109,46 +99,6 @@ describe('ChatComposer model routing contract', () => {
     expect(composerSource).not.toContain('llmEnsembleEnabled: boolean')
   })
 
-  it('threads the independent model-routing control through ChatComposer and ChatView', () => {
-    expect(composerSource).toContain('ChatComposerModelRouting')
-    expect(composerSource).toContain('<Icon v-if="sessionRoutingMode === \'squilla_router\'" name="router"')
-    expect(composerSource).toContain('chat-model-routing-btn--${sessionRoutingMode}')
-    expect(composerSource).toContain("'is-open': modelRoutingOpen")
-    expect(composerSource).toContain(':model-routing-mode="sessionRoutingMode"')
-    expect(composerSource).toContain(':busy="sessionRoutingBusy || sessionRoutingControlBlocked"')
-    expect(composerSource).toContain('@set-session-routing-mode="emit(\'setSessionRoutingMode\', $event)"')
-    expect(composerSource).toContain('sessionRoutingMode: ModelRoutingMode')
-    expect(composerSource).toContain('setSessionRoutingMode: [mode: ModelRoutingMode]')
-
-    expect(viewSource).toContain(':session-routing-mode="modelRoutingMode"')
-    expect(viewSource).toContain(':session-routing-busy="modelRoutingMutationBusy"')
-    expect(viewSource).toContain(':session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy"')
-    expect(viewSource).toContain(':session-routing-available="sessionRoutingAvailable"')
-    expect(viewSource).toContain('gatewayAccess.isAuthenticated')
-    expect(viewSource).toContain('sessionRouting.available()')
-    expect(composerSource).toContain('v-if="modelRoutingVisible"')
-    expect(viewSource).toContain('@set-session-routing-mode="setComposerSessionRoutingMode"')
-    expect(viewSource).toContain('async function setComposerSessionRoutingMode(mode: ModelRoutingMode)')
-    expect(viewSource).toContain('if (goalBusy.value) return')
-    expect(viewSource).toContain('await newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode)')
-    expect(viewSource).toContain('useChatSessionRouting')
-    expect(viewSource).toContain('isDraft: isDraftSurface')
-    expect(viewSource).toContain("return pendingSessionIntent.value === 'new_chat'")
-    expect(viewSource).toContain('if (!isProvisionalDraftSession()) return')
-
-    const setterStart = viewSource.indexOf(
-      'async function setComposerSessionRoutingMode(mode: ModelRoutingMode)',
-    )
-    const setterEnd = viewSource.indexOf(
-      '\nasync function setComposerCodingModeEnabled',
-      setterStart,
-    )
-    const setterSource = viewSource.slice(setterStart, setterEnd)
-    expect(setterStart).toBeGreaterThanOrEqual(0)
-    expect(setterEnd).toBeGreaterThan(setterStart)
-    expect(setterSource).not.toContain('scheduleHistorySync()')
-  })
-
   it('blocks ordinary sends while this chat route is changing', () => {
     const start = viewSource.indexOf('async function onComposerSend()')
     const end = viewSource.indexOf('\nsendCurrentInput = onComposerSend', start)
@@ -156,7 +106,7 @@ describe('ChatComposer model routing contract', () => {
     const routingBusyGate = sendSource.indexOf(
       'if (modelRoutingMutationBusy.value || planModeBusy.value) return',
     )
-    const ordinarySend = sendSource.indexOf('onSend()')
+    const ordinarySend = sendSource.indexOf('onSend(')
 
     expect(start).toBeGreaterThanOrEqual(0)
     expect(end).toBeGreaterThan(start)
@@ -165,14 +115,19 @@ describe('ChatComposer model routing contract', () => {
     expect(viewSource).toContain('sendBlockedReason: effectiveSendBlockedReason,')
     expect(viewSource).toContain('&& !deliveryBlockedReason.value')
     expect(viewSource).toContain('sessionRoutingSendBlockedReason.value || liveSendBlockedReason.value')
-    expect(viewSource).toContain(
-      'deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value',
-    )
+    const baseBlockedStart = viewSource.indexOf('const baseSendBlockedReason = ')
+    const baseBlockedEnd = viewSource.indexOf('const queuedSendBlockedReason = ', baseBlockedStart)
+    expect(baseBlockedStart).toBeGreaterThanOrEqual(0)
+    expect(baseBlockedEnd).toBeGreaterThan(baseBlockedStart)
+    expect(viewSource.slice(baseBlockedStart, baseBlockedEnd)).toContain('|| deliveryBlockedReason.value')
+    expect(viewSource).toContain('baseSendBlockedReason.value || promptAnnotationSendBlockedReason.value')
     expect(viewSource).not.toContain('\n  || sessionRoutingSendBlockedReason.value\n')
     expect(composerSource).toContain('|| sessionRoutingBusy || inputDisabled')
     expect(composerSource).toContain(":aria-busy=\"sendPending || sessionRoutingBusy ? 'true' : 'false'\"")
     expect(composerSource).toContain(".chat-send-btn[aria-busy='true']:disabled")
-    expect(composerSource).toContain("'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled")
+    expect(composerSource).toContain(
+      "'is-ready': hasSendContent && !sendBlockedMessage && !sendDisabled && !inputDisabled",
+    )
     expect(en.chat.composer.routingUpdateBlocked)
       .toBe('Model routing is being updated. Wait before sending.')
   })
@@ -188,3 +143,50 @@ describe('ChatComposer model routing contract', () => {
     expect(modelRoutingSource).not.toContain(':disabled:hover')
   })
 })
+
+it('threads the independent model-routing control through ChatComposer and ChatView', () => {
+    expect(composerSource).toContain('ChatComposerModelRouting')
+    expect(composerSource).toContain('<Icon v-if="sessionRoutingMode === \'squilla_router\'" name="router"')
+    expect(composerSource).toContain('chat-model-routing-btn--${sessionRoutingMode}')
+    expect(composerSource).toContain("'is-open': modelRoutingOpen")
+    expect(composerSource).toContain(':model-routing-mode="sessionRoutingMode"')
+    expect(composerSource).toContain(':busy="sessionRoutingBusy || sessionRoutingControlBlocked"')
+    expect(composerSource).toContain('@set-session-routing-mode="emit(\'setSessionRoutingMode\', $event)"')
+    expect(composerSource).toContain('sessionRoutingMode: ModelRoutingMode')
+    expect(composerSource).toContain('setSessionRoutingMode: [mode: ModelRoutingMode]')
+
+    const composerOpening = viewSource.match(/<ChatComposer\b[^>]*>/)?.[0] || ''
+    // The warm preview owns display values only. Keep current authorization
+    // and mutation state, and block changes until authoritative recovery.
+    expect(composerOpening).toContain(':session-routing-mode="sessionViewCache.presentation.value?.modelRoutingMode ?? modelRoutingMode"')
+    expect(composerOpening).toContain(':session-model-name="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.sessionModelName : sessionModelName"')
+    expect(composerOpening).toContain(':model-selection="sessionViewCache.showingPreview.value ? sessionViewCache.presentation.value?.modelSelection : composerModelSelection"')
+    expect(composerOpening).toContain(':model-selection-available="sessionViewCache.presentation.value?.modelSelectionAvailable ?? composerModelSelectionAvailable"')
+    expect(composerOpening).toContain(':session-routing-busy="modelRoutingMutationBusy"')
+    expect(composerOpening).toContain(':session-routing-control-blocked="preparingHostSession || goalBusy || modelRoutingSettingsBusy || sessionViewCache.showingPreview.value"')
+    expect(composerOpening).toContain(':model-selection-disabled-reason="sessionViewCache.showingPreview.value ? \'busy\' : composerModelDisabledReason"')
+    expect(composerOpening).toContain(':session-routing-available="sessionRoutingAvailable"')
+    expect(viewSource).toContain('gatewayAccess.isAuthenticated')
+    expect(viewSource).toContain('sessionRouting.available()')
+    expect(composerSource).toContain('v-if="modelRoutingVisible"')
+    expect(viewSource).toContain('@set-session-routing-mode="setComposerSessionRoutingMode"')
+    expect(viewSource).toContain('async function setComposerSessionRoutingMode(mode: ModelRoutingMode)')
+    expect(viewSource).toContain('if (preparingHostSession.value || goalBusy.value) return')
+    expect(viewSource).toContain('await newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode)')
+    expect(viewSource).toContain('useChatSessionRouting')
+    expect(viewSource).toContain('isDraft: isDraftSurface')
+    expect(viewSource).toContain("return pendingSessionIntent.value === 'new_chat'")
+    expect(viewSource).toContain('if (!isProvisionalDraftSession()) return')
+
+    const setterStart = viewSource.indexOf(
+      'async function setComposerSessionRoutingMode(mode: ModelRoutingMode)',
+    )
+    const setterEnd = viewSource.indexOf(
+      '\nasync function setComposerModel',
+      setterStart,
+    )
+    const setterSource = viewSource.slice(setterStart, setterEnd)
+    expect(setterStart).toBeGreaterThanOrEqual(0)
+    expect(setterEnd).toBeGreaterThan(setterStart)
+    expect(setterSource).not.toContain('scheduleHistorySync()')
+  })

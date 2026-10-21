@@ -1,5 +1,7 @@
 import json
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -121,6 +123,39 @@ def test_build_checkpoint_events_serializes_provider_content_blocks_as_json() ->
     assert len(events) == 1
     assert json.loads(events[0].content) == [{"type": "text", "text": "visible block"}]
     assert events[0].content_type == "json"
+
+
+def test_checkpoint_excludes_ui_file_snapshot_without_mutating_tool_data(tmp_path) -> None:
+    actual_data = {"file_snapshot": "REAL_TOOL_DATA"}
+    segments = [
+        {"type": "tool_use", "name": "write_file", "input": actual_data},
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "result": actual_data,
+            "file_snapshot": {
+                "kind": "write", "path": "page.html", "content": "UI_ONLY_BODY" * 10_000,
+            },
+        },
+    ]
+    before = deepcopy(segments)
+    entry = SimpleNamespace(role="assistant", content="Wrote the page", tool_calls=segments)
+
+    events = build_checkpoint_events(
+        session_key="agent:main:webchat:abc",
+        session_id="session-1",
+        entries=[entry],
+        source="turn_runner",
+        turn_id="turn-1",
+    )
+    result = append_checkpoint_events(tmp_path, events)
+    saved = (tmp_path / result.relative_path).read_text(encoding="utf-8")
+
+    assert "UI_ONLY_BODY" not in saved
+    assert json.loads(events[1].content)["input"] == actual_data
+    assert json.loads(events[2].content)["result"] == actual_data
+    assert "file_snapshot" not in json.loads(events[2].content)
+    assert segments == before
 
 
 async def test_append_checkpoint_events_writes_jsonl_once(tmp_path):

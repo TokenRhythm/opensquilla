@@ -396,3 +396,238 @@ async def test_case_only_hardlinks_remain_distinct_sources_on_case_sensitive_fil
     assert result.failure_summaries == []
     assert result.artifacts == []
     assert len(ctx.published_artifacts) == 1
+
+
+async def test_channel_backstop_captures_dependencies_without_expanding_candidates(
+    artifact_context: ToolContext,
+) -> None:
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    workspace = Path(ctx.workspace_dir)
+    (workspace / "edited.html").write_text("old", encoding="utf-8")
+    (workspace / "untracked.html").write_text("untracked", encoding="utf-8")
+    with _active_context(ctx):
+        await write_file("site/index.html", '<link rel="stylesheet" href="style.css">')
+        await write_file("site/style.css", '@import "theme.css"; body{background:url(logo.svg)}')
+        await write_file("site/theme.css", "body{color:blue}")
+        await write_file("site/logo.svg", '<svg xmlns="http://www.w3.org/2000/svg"/>')
+        await write_file("site/unrelated.json", '{"private":true}')
+        await write_file("edited.html", "edited")
+        await write_file("unmentioned.html", "unmentioned")
+        await write_file("memory/private.html", "private")
+    ctx.workspace_file_writes.append(dict(ctx.workspace_file_writes[0]))
+
+    result = auto_publish_omitted_workspace_artifacts(
+        ctx,
+        final_text=(
+            "Created site/index.html; edited.html, untracked.html and memory/private.html exist"
+        ),
+    )
+
+    assert result.failure_summaries == []
+    assert len(result.artifacts) == 1
+    assert result.artifacts[0]["name"] == "index.html"
+    store = ArtifactStore(ctx.artifact_media_root)
+    artifact_id = result.artifacts[0]["id"]
+    bundle = store.read_verified_bundle(artifact_id, session_id=ctx.artifact_session_id)
+    assert {item.path for item in bundle.files} == {
+        "index.html", "style.css", "theme.css", "logo.svg",
+    }
+    sources = [
+        source for source in ctx.artifact_source_paths.values()
+        if source.artifact_id == artifact_id
+    ]
+    assert len(sources) == 1
+    assert sources[0].path == str((workspace / "site/index.html").resolve())
+    assert sources[0].bundle_mode == "auto"
+    (workspace / "site/theme.css").write_text("body{color:red}", encoding="utf-8")
+    saved = store.read_verified_bundle(artifact_id, session_id=ctx.artifact_session_id)
+    saved_theme = next(item.data for item in saved.files if item.path == "theme.css")
+    assert saved_theme == b"body{color:blue}"
+
+
+@pytest.mark.parametrize("explicit_first", [False, True], ids=["automatic", "explicit"])
+async def test_channel_changed_sidecar_creates_new_bundle_with_same_entry_bytes(
+    artifact_context: ToolContext, explicit_first: bool,
+) -> None:
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    entry = '<link rel="stylesheet" href="style.css"><h1>Report</h1>'
+    with _active_context(ctx):
+        await write_file("index.html", entry)
+        await write_file("style.css", "body{color:blue}")
+        if explicit_first:
+            await publish_artifact("index.html", name="Friendly report.html")
+    if not explicit_first:
+        first = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created index.html")
+        assert len(first.artifacts) == 1
+    old_artifact = ctx.published_artifacts[0]
+    unchanged = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created index.html")
+    assert unchanged.artifacts == []
+    with _active_context(ctx):
+        await write_file("style.css", "body{color:green}")
+
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Updated index.html")
+
+    assert result.failure_summaries == []
+    assert len(result.artifacts) == 1
+    new_artifact = result.artifacts[0]
+    assert new_artifact["id"] != old_artifact["id"]
+    assert new_artifact["sha256"] == old_artifact["sha256"]
+    store = ArtifactStore(ctx.artifact_media_root)
+    manifests = [
+        store.describe_preview_bundle(item["id"], session_id=ctx.artifact_session_id)
+        for item in (old_artifact, new_artifact)
+    ]
+    assert all(item is not None for item in manifests)
+    assert manifests[0].bundle_digest != manifests[1].bundle_digest
+    for artifact, expected in (
+        (old_artifact, b"body{color:blue}"), (new_artifact, b"body{color:green}"),
+    ):
+        bundle = store.read_verified_bundle(artifact["id"], session_id=ctx.artifact_session_id)
+        assert next(item.data for item in bundle.files if item.path == "style.css") == expected
+    repeated = auto_publish_omitted_workspace_artifacts(ctx, final_text="Updated index.html")
+    assert repeated.artifacts == []
+    assert len(ctx.published_artifacts) == 2
+
+
+@pytest.mark.parametrize("reference", ["missing.css", "../outside.css", ".env"])
+async def test_explicit_and_automatic_html_reject_unavailable_dependencies(
+    artifact_context: ToolContext, reference: str,
+) -> None:
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    workspace = Path(ctx.workspace_dir)
+    (workspace.parent / "outside.css").write_text("outside", encoding="utf-8")
+    (workspace / ".env").write_text("secret", encoding="utf-8")
+    with _active_context(ctx):
+        await write_file("index.html", f'<link rel="stylesheet" href="{reference}">')
+        for mode in ("auto", "none"):
+            with pytest.raises(ToolError, match="dependenc"):
+                await publish_artifact("index.html", bundle=mode)
+
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created index.html")
+
+    assert result.artifacts == []
+    assert len(result.failure_summaries) == 1
+    assert "dependenc" in result.failure_summaries[0]
+    assert result.resolved_target_keys == []
+    assert ctx.published_artifacts == []
+    assert ctx.artifact_source_paths == {}
+    assert not (Path(ctx.artifact_media_root) / "artifacts").exists()
+
+
+async def test_single_file_mode_requires_self_contained_html(
+    artifact_context: ToolContext,
+) -> None:
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    with _active_context(ctx):
+        await write_file("style.css", "body{color:blue}")
+        await write_file("index.html", '<link rel="stylesheet" href="style.css">')
+        with pytest.raises(ToolError, match="missing a local dependency"):
+            await publish_artifact("index.html", bundle="none")
+
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created index.html")
+
+    assert result.failure_summaries == []
+    assert len(result.artifacts) == 1
+    bundle = ArtifactStore(ctx.artifact_media_root).read_verified_bundle(
+        result.artifacts[0]["id"], session_id=ctx.artifact_session_id,
+    )
+    assert {item.path for item in bundle.files} == {"index.html", "style.css"}
+
+
+async def test_self_contained_single_file_publication_satisfies_channel_backstop(
+    artifact_context: ToolContext,
+) -> None:
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    content = '<style>body{color:blue}</style><h1>Self-contained</h1>'
+    with _active_context(ctx):
+        await write_file("index.html", content)
+        explicit = json.loads(await publish_artifact("index.html", bundle="none"))
+
+    assert "delivery receipt" in explicit["note"]
+    store = ArtifactStore(ctx.artifact_media_root)
+    artifact_id = explicit["artifact"]["id"]
+    assert store.describe_preview_bundle(artifact_id, session_id=ctx.artifact_session_id) is None
+    saved = store.read_verified_bundle(artifact_id, session_id=ctx.artifact_session_id)
+    assert saved.files[0].data == content.encode()
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created index.html")
+    assert result.artifacts == []
+    assert result.failure_summaries == []
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.parametrize("budget", ["per-file", "disk"])
+async def test_html_bundle_retains_explicit_and_automatic_publication_budgets(
+    artifact_context: ToolContext, budget: str,
+) -> None:
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    with _active_context(ctx):
+        await write_file("index.html", '<link rel="stylesheet" href="style.css">')
+        await write_file("style.css", "body{color:blue}")
+        if budget == "per-file":
+            ctx.artifact_max_bytes = 1
+        else:
+            ctx.artifact_disk_budget_bytes = 1
+        with pytest.raises(ToolError, match=f"{budget} budget"):
+            await publish_artifact("index.html")
+
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created index.html")
+
+    assert result.artifacts == []
+    assert len(result.failure_summaries) == 1
+    assert f"{budget} budget" in result.failure_summaries[0]
+    assert ctx.published_artifacts == []
+    assert ctx.artifact_source_paths == {}
+
+
+async def test_channel_backstop_does_not_publish_an_outside_tracked_path(
+    artifact_context: ToolContext,
+) -> None:
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    outside = Path(ctx.workspace_dir).parent / "outside.html"
+    outside.write_text("<h1>Outside</h1>", encoding="utf-8")
+    ctx.workspace_file_writes.append({
+        "path": str(outside), "relative_path": "../outside.html",
+        "name": "outside.html", "created": True,
+    })
+    with _active_context(ctx), pytest.raises(ToolError, match="outside workspace"):
+        await publish_artifact(str(outside))
+
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created outside.html")
+
+    assert result.artifacts == []
+    assert result.failure_summaries == []
+    assert ctx.published_artifacts == []
+
+
+async def test_html_single_file_publishes_the_exact_bytes_that_passed_validation(
+    artifact_context: ToolContext, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.tools.builtin.artifacts as artifacts_tool
+
+    ctx = artifact_context
+    ctx.caller_kind = CallerKind.CHANNEL
+    original = b"<h1>Validated</h1>"
+    target = Path(ctx.workspace_dir) / "index.html"
+    validate = artifacts_tool.validate_html_archive
+
+    def validate_then_change(bundle) -> None:
+        validate(bundle)
+        target.write_bytes(b'<img src="missing.png">')
+
+    monkeypatch.setattr(artifacts_tool, "validate_html_archive", validate_then_change)
+    with _active_context(ctx):
+        await write_file("index.html", original.decode())
+        explicit = json.loads(await publish_artifact("index.html", bundle="none"))
+
+    _, material = ArtifactStore(ctx.artifact_media_root).resolve_for_download(
+        explicit["artifact"]["id"], session_id=ctx.artifact_session_id,
+    )
+    assert material.read_bytes() == original
+    assert target.read_bytes() == b'<img src="missing.png">'

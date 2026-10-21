@@ -1,20 +1,16 @@
-import { computed, toValue, type ComputedRef, type MaybeRefOrGetter, type Ref } from 'vue'
+import { computed, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { nativeBillingDisplay } from '@/composables/usage/nativeBilling'
 import type { UsageSession, UsageTotals } from '@/types/usage'
-
-const t = i18n.global.t
 
 export function useUsageTotals(options: {
   visibleSessions: ComputedRef<UsageSession[]>
   serverTotals?: ComputedRef<UsageTotals | null>
   currency: Ref<string>
-  cnyRate: MaybeRefOrGetter<number>
   fmtCost: (
     usd: number | null | undefined,
     opts?: { decimals?: number; source?: UsageTotals },
   ) => string
-  sourceCompositionHint: (rows: UsageSession[]) => string
 }) {
   const usageTotals = computed((): UsageTotals => {
     if (options.serverTotals?.value) return options.serverTotals.value
@@ -78,56 +74,19 @@ export function useUsageTotals(options: {
     },
   ))
 
-  const costHintText = computed(() => {
-    const visibleRows = options.visibleSessions.value
-    const sourceHint = options.sourceCompositionHint(visibleRows)
-    const hints: string[] = []
-    const totalCostUsd = usageTotals.value.cost
-    const native = nativeDisplay.value
-    if (native.useCanonicalUsd) {
-      if (options.currency.value === 'CNY') {
-        hints.push(`≈ $${Number(totalCostUsd).toFixed(4)} USD`)
-      } else {
-        hints.push(`≈ ¥${(Number(totalCostUsd) * toValue(options.cnyRate)).toFixed(4)} CNY`)
-      }
-      if (native.subtotalText) {
-        hints.push(t('usageLogs.nativeBillingSubtotals', { amounts: native.subtotalText }))
-      }
-      if (native.pendingReceiptCount > 0) {
-        hints.push(t('usageLogs.coverage.pendingBilling', {
-          count: native.pendingReceiptCount,
-        }))
-      }
-    } else if (options.currency.value === 'CNY') {
-      hints.push(`${native.exactCny == null ? '≈' : '='} ${('$' + Number(totalCostUsd).toFixed(4))} USD`)
-    } else if (options.currency.value === 'USD') {
-      hints.push(native.exactCny == null
-        ? `≈ ¥${(Number(totalCostUsd) * toValue(options.cnyRate)).toFixed(4)} CNY`
-        : `= ¥${native.exactCny.toFixed(4)} CNY`)
-    }
-    return [...hints, sourceHint].filter(Boolean).join(' · ')
-  })
-
-  const costHintTitle = computed(() => {
-    if (nativeDisplay.value.exactCny != null) return t('usageLogs.nativeCostHintTitle')
-    if (nativeDisplay.value.useCanonicalUsd && options.currency.value === 'USD') {
-      return t('usageLogs.nativeMixedCostHintTitle')
-    }
-    return t('usageLogs.costHintTitle', { rate: toValue(options.cnyRate) })
-  })
-
   const sessionCountDisplay = computed(() => {
-    const n = usageTotals.value.sessions
+    const n = usageTotals.value.taskCount ?? usageTotals.value.sessions
     return n != null ? String(n) : '-'
   })
 
   const avgCostDisplay = computed(() => {
     const t = usageTotals.value
-    const avg = t.sessions > 0 ? t.cost / t.sessions : null
+    const count = t.taskCount ?? t.sessions
+    const avg = count > 0 ? t.cost / count : null
     if (avg == null) return '-'
     const native = nativeDisplay.value
     if (options.currency.value === 'CNY' && native.exactCny != null) {
-      return `¥${(native.exactCny / t.sessions).toFixed(4)}`
+      return `¥${(native.exactCny / count).toFixed(4)}`
     }
     return options.fmtCost(avg, {
       decimals: 4,
@@ -140,8 +99,6 @@ export function useUsageTotals(options: {
     totalTokensDisplay,
     tokensBreakdownParts,
     totalCostDisplay,
-    costHintText,
-    costHintTitle,
     sessionCountDisplay,
     avgCostDisplay,
   }

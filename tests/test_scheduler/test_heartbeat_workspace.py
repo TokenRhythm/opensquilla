@@ -1,5 +1,6 @@
 """Heartbeat execution follows the session root, not its Agent instruction root."""
 
+import os
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -127,7 +128,12 @@ async def test_heartbeat_revalidates_binding_before_every_run(
         else:
             root.rename(tmp_path / "preserved-source")
             if change == "symlink":
-                root.symlink_to(tmp_path / "preserved-source", target_is_directory=True)
+                try:
+                    root.symlink_to(tmp_path / "preserved-source", target_is_directory=True)
+                except OSError as exc:
+                    if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                        pytest.skip("Windows symbolic-link privilege is unavailable")
+                    raise
         with pytest.raises(ProjectWorkspaceStateError):
             await loop.run_once_now(reason="second", agent_id="main", session_key=KEY)
         assert runner.contents == ["current-task"]

@@ -9,41 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
 NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
 ORIGINALS = {
-    "AwesomeWebpageMetaSkill",
-    "awesome-webpage-image-download",
-    "awesome-webpage-research",
-    "code-task",
-    "deep-research",
-    "docx",
-    "github",
-    "history-explorer",
-    "meta-kid-project-planner",
-    "meta-paper-write",
-    "meta-short-drama",
-    "meta-skill-creator",
-    "multi-search-engine",
-    "openrouter-video-generator",
-    "paper-artifact-runtime",
-    "paper-citation-integrity-gate",
-    "paper-delivery-summary",
-    "paper-latex-sanitizer",
-    "paper-length-gate",
-    "paper-quality-gate",
-    "paper-refbib-stub",
-    "paper-section-author",
-    "paper-source-readiness-gate",
-    "pdf-toolkit",
-    "pptx",
-    "skill-creator",
-    "short-drama-delivery-audit",
-    "short-drama-review-normalizer",
-    "sub-agent",
-    "srt-from-script",
-    "subtitle-burner",
-    "text-file-read",
-    "title-card-image",
-    "video-still-animator",
-    "xlsx",
+    "browser-use", "deep-research", "docx", "github", "pdf-toolkit", "pptx",
+    "skill-creator", "sub-agent", "xlsx",
 }
 
 
@@ -63,6 +30,7 @@ def test_all_bundled_skills_have_complete_provenance(tmp_path: Path) -> None:
             "openclaw-derived",
             "clawhub-mit",
             "clawhub-mit0",
+            "opensquilla-adapted-generative-frame",
         }, skill.name
         assert provenance.maintained_by == "OpenSquilla", skill.name
         if provenance.origin == "bundled-derived":
@@ -77,6 +45,11 @@ def test_all_bundled_skills_have_complete_provenance(tmp_path: Path) -> None:
         elif provenance.origin == "clawhub-mit":
             assert provenance.upstream_url.startswith("https://clawhub.ai/"), skill.name
             assert provenance.license == "MIT", skill.name
+        elif provenance.origin == "opensquilla-adapted-generative-frame":
+            assert provenance.upstream_url == (
+                "https://github.com/assistant-ui/assistant-ui/tree/main/packages/generative-frame"
+            ), skill.name
+            assert provenance.license == "Apache-2.0 AND MIT", skill.name
         else:
             assert skill.name in ORIGINALS
             assert provenance.license == "Apache-2.0", skill.name
@@ -93,11 +66,16 @@ def test_third_party_notices_match_bundled_provenance(tmp_path: Path) -> None:
     )
     clawhub_mit = sorted(name for name, origin in skills.items() if origin == "clawhub-mit")
     clawhub_derived = sorted(name for name, origin in skills.items() if origin == "clawhub-mit0")
+    adapted = sorted(
+        name for name, origin in skills.items() if origin == "opensquilla-adapted-generative-frame"
+    )
 
     assert "## OpenClaw-derived bundled skill descriptors" in text
     assert "## OpenSquilla-original bundled skills" in text
     if clawhub_derived:
         assert "## ClawHub-derived bundled skill descriptors" in text
+    if adapted:
+        assert "## OpenSquilla-adapted bundled skills" in text
     if clawhub_mit:
         assert "## ClawHub MIT bundled skill descriptors" in text
     for name in derived:
@@ -110,6 +88,8 @@ def test_third_party_notices_match_bundled_provenance(tmp_path: Path) -> None:
         assert f"- `{name}`" in text
     for name in clawhub_derived:
         assert f"- `{name}`" in text
+    for name in adapted:
+        assert f"- `{name}`" in text
 
     listed = {
         line.strip()[3:-1]
@@ -121,19 +101,6 @@ def test_third_party_notices_match_bundled_provenance(tmp_path: Path) -> None:
     if "filesystem" in clawhub_mit:
         assert "Copyright (c) 2026 Clawdbot Community" in text
         assert "clawdbot-filesystem" in text
-
-
-def test_filesystem_skill_records_mit_notice_provenance(tmp_path: Path) -> None:
-    text = NOTICES.read_text(encoding="utf-8")
-    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
-    filesystem = loader.get_by_name("filesystem")
-
-    assert filesystem is not None
-    assert filesystem.provenance.origin == "clawhub-mit"
-    assert filesystem.provenance.license == "MIT"
-    assert "## ClawHub MIT bundled skill descriptors" in text
-    assert "- `filesystem`" in text
-    assert "Copyright (c) 2026 Clawdbot Community" in text
 
 
 def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:
@@ -150,13 +117,11 @@ def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:
         "highlight.js",
         "marked",
         "Copyright (c) 2004, John Gruber",
-        "DOMPurify",
-        "IBM Plex Sans",
-        "IBM Plex Mono",
-        "Space Grotesk",
-        "Fraunces",
-        "Newsreader",
-        "SIL OPEN FONT LICENSE Version 1.1",
+            "DOMPurify",
+            "IBM Plex Sans",
+            "IBM Plex Mono",
+            "Space Grotesk",
+            "SIL OPEN FONT LICENSE Version 1.1",
         "## npm and Python dependency packaging strategy",
     ]:
         assert expected in text
@@ -185,20 +150,6 @@ def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:
         ROOT / "opensquilla-webui" / "src" / "composables" / "chat" / "useChatTextRendering.ts",
         ROOT / "opensquilla-webui" / "src" / "assets" / "fonts" / "ibm-plex-sans-400.woff2",
         ROOT / "opensquilla-webui" / "src" / "assets" / "fonts" / "space-grotesk-400.woff2",
-        ROOT
-        / "opensquilla-webui"
-        / "src"
-        / "themes"
-        / "out-of-register"
-        / "fonts"
-        / "fraunces-400.woff2",
-        ROOT
-        / "opensquilla-webui"
-        / "src"
-        / "themes"
-        / "out-of-register"
-        / "fonts"
-        / "newsreader-400.woff2",
     ]:
         assert path.is_file(), path
 

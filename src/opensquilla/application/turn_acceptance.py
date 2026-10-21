@@ -13,19 +13,19 @@ import time
 import uuid
 from dataclasses import replace
 from functools import partial
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import structlog
 
 from opensquilla.application.admission_errors import (
     AdmissionError,
     AdmissionQueueFullError,
+    AdmissionResourceBusyError,
     AdmissionShuttingDownError,
     AdmissionUnavailableError,
 )
 from opensquilla.application.admission_failures import (
     AdmissionIngressConflictError,
-    AdmissionMetaControlConflictError,
     AdmissionPendingInputConflictError,
     AdmissionPlanConflictError,
     AdmissionPlanSessionBusyError,
@@ -37,7 +37,6 @@ from opensquilla.application.admission_views import (
     AdmissionAcceptance,
     AdmissionArchive,
     AdmissionCommit,
-    AdmissionMetaControl,
     AdmissionPlanRevision,
     AdmissionPlanRun,
     AdmissionPreparation,
@@ -45,7 +44,6 @@ from opensquilla.application.admission_views import (
     AdmissionSessionChanges,
     AdmissionSessionIntent,
     AdmissionTaskRecord,
-    MetaAdmissionControl,
     PreparedAdmissionIntent,
     SessionIdentity,
 )
@@ -68,6 +66,12 @@ log = structlog.get_logger(__name__)
 _SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
 
 
+class _TranscriptMetadata(TypedDict, total=False):
+    workspace_files: list[dict[str, Any]]
+    selected_skills: list[dict[str, str]]
+    local_path_references: list[str]
+
+
 class DurableTurnAdmission:
     """Own explicit ingress intent and one durable acceptance implementation."""
 
@@ -86,6 +90,7 @@ class DurableTurnAdmission:
             if command.receipt_replay_only:
                 return await _replay_retired_request(command, ports)
             try:
+                _ensure_required_services(command, ports)
                 if command.initial_model is not None or command.initial_provider is not None:
                     if command.intent != "new_chat" or not command.intent_was_provided:
                         raise ValueError("initialModel requires explicit new_chat intent")
@@ -161,6 +166,59 @@ class DurableTurnAdmission:
                 if command.surface == "webchat":
                     ports.clear_compaction_marker(command.session_key)
                 raise
+
+
+def _ensure_required_services(command: AdmitTurn, ports: AdmissionPrimitives) -> None:
+    """Reject dependent turns before durable acceptance while owners warm up."""
+    required = tuple(getattr(command, "required_services", ()) or ())
+    if not required:
+        return
+    services = getattr(ports, "startup_services", None)
+    if not isinstance(services, dict):
+        # A producer that declared a dependency must fail closed when the
+        # Gateway did not provide the readiness snapshot. Accepting here would
+        # recreate the original silent-tool-loss path in embedded callers.
+        raise AdmissionError(
+            "DEPENDENCY_UNAVAILABLE",
+            "Required external service readiness is unavailable.",
+            details={"services": list(required), "reason": "readiness_unknown"},
+            retryable=True,
+            retry_after_ms=1000,
+            accepted=False,
+        )
+    waiting: list[str] = []
+    unavailable: list[str] = []
+    for name in required:
+        descriptor = services.get(name)
+        if not isinstance(descriptor, dict):
+            unavailable.append(name)
+            continue
+        status = str(descriptor.get("status") or "").strip().lower()
+        if status in {"starting", "stopping"}:
+            waiting.append(name)
+        # ``disabled`` is valid only for an unrequested optional service. A
+        # producer that explicitly requires it must not be accepted while the
+        # service is disabled.
+        elif status != "ready":
+            unavailable.append(name)
+    if waiting:
+        raise AdmissionError(
+            "DEPENDENCY_STARTING",
+            "Required external service is still starting; retry this turn.",
+            details={"services": waiting, "retryable": True},
+            retryable=True,
+            retry_after_ms=500,
+            accepted=False,
+        )
+    if unavailable:
+        raise AdmissionError(
+            "DEPENDENCY_UNAVAILABLE",
+            "A required external service is unavailable.",
+            details={"services": unavailable},
+            retryable=True,
+            retry_after_ms=1000,
+            accepted=False,
+        )
 
 
 async def _replay_retired_request(
@@ -808,6 +866,7 @@ async def _accept_turn_in_scope(
     message_text = ingested_attachments.text
     raw_attachments = ingested_attachments.attachments
     inferred_normalized_input = None
+    pasted_normalized_input = None
     if normalized_input.metadata.get("guard_action") == "none":
         inferred_normalized_input = ports.infer_normalized_input(
             message_text,
@@ -816,6 +875,13 @@ async def _accept_turn_in_scope(
         if inferred_normalized_input is not None:
             message_text = inferred_normalized_input.message_text
             semantic_message_text = inferred_normalized_input.semantic_message
+        else:
+            infer_pasted = getattr(ports, "infer_pasted_text_input", None)
+            if command.source.is_web and callable(infer_pasted):
+                pasted_normalized_input = infer_pasted(message_text, raw_attachments)
+                if pasted_normalized_input is not None:
+                    message_text = pasted_normalized_input.message_text
+                    semantic_message_text = pasted_normalized_input.semantic_message
 
     normalization_metadata = (
         normalized_input.metadata
@@ -824,6 +890,11 @@ async def _accept_turn_in_scope(
             inferred_normalized_input.metadata
             if inferred_normalized_input is not None
             and inferred_normalized_input.metadata.get("guard_action") != "none"
+            else None
+        ) or (
+            pasted_normalized_input.metadata
+            if pasted_normalized_input is not None
+            and pasted_normalized_input.metadata.get("guard_action") != "none"
             else None
         )
     )
@@ -847,88 +918,25 @@ async def _accept_turn_in_scope(
     display_text = command.display_text if command.source.caller_kind == "web" else None
     if display_text is not None and not isinstance(display_text, str):
         display_text = None
-    if display_text is None and command.source.caller_kind == "web":
-        from opensquilla.meta_preflight_protocol import (
-            display_text_from_preflight_confirmation,
-        )
-
-        display_text = display_text_from_preflight_confirmation(message_text)
-    provider_message_text = message_text
-    if command.source.caller_kind == "web":
-        from opensquilla.meta_preflight_protocol import (
-            strip_preflight_confirmation_protocol_text,
-        )
-
-        stripped_message = strip_preflight_confirmation_protocol_text(message_text)
-        if stripped_message is not None:
-            provider_message_text = stripped_message.strip()
-
-    durable_meta_control: AdmissionMetaControl | None = None
-    durable_meta_control_payload: dict[str, Any] | None = None
-    parsed_control: MetaAdmissionControl | None = None
-    get_meta_control = (
-        storage.get_meta_control_intent if storage.capabilities.meta_controls else None
+    if command.local_path_references:
+        # Retain the original canonical input, including paths, even when a
+        # client displayText or generated page context changes presentation.
+        display_text = command.message
+    # 显式空 displayText 表示用户没有输入正文，附件的 provider 补充提示不能起名。
+    # 保留缺失字段的兼容路径，也不按提示词字面量过滤用户真实输入的同名文字。
+    title_message_text = (
+        display_text if display_text is not None else semantic_message_text or message_text
     )
-    if callable(get_meta_control):
-        parsed_control = ports.parse_meta_control(
-            provider_message_text,
-            semantic_message_text,
-            client_request_id=ingress_identity.client_request_id,
-        )
-        if parsed_control is not None:
-            candidate = await get_meta_control(
-                session_key=key,
-                control_kind=parsed_control.kind,
-                correlation_id=parsed_control.correlation_id,
-            )
-            if (
-                candidate is not None
-                and candidate.status == "staged"
-                and (
-                    candidate.control_kind != "manual"
-                    or candidate.meta_skill_name == parsed_control.name
-                )
-            ):
-                durable_meta_control = candidate
-                durable_meta_control_payload = {
-                    "version": 1,
-                    "intent_id": candidate.intent_id,
-                    "kind": candidate.control_kind,
-                    "name": candidate.meta_skill_name,
-                    "correlation_id": candidate.correlation_id,
-                }
-                if candidate.control_kind == "replay":
-                    durable_meta_control_payload.update(
-                        {
-                            "run_id": candidate.replay_run_id,
-                            "mode": candidate.replay_mode,
-                        }
-                    )
-        explicit_request_id = command.explicit_request_id
-        if parsed_control is not None and durable_meta_control is None and explicit_request_id:
-            legacy_match = False
-            if parsed_control.kind == "manual":
-                pending_name = ports.peek_meta_launch(
-                    key,
-                    client_request_id=ingress_identity.client_request_id,
-                )
-                legacy_match = pending_name == parsed_control.name
-            if not legacy_match:
-                raise AdmissionError(
-                    "META_CONTROL_NOT_STAGED",
-                    "This MetaSkill control is missing, expired, or already belongs to "
-                    "another accepted turn. Start it again from the MetaSkill action.",
-                    retryable=False,
-                    accepted=False,
-                )
+    generate_title = generate_title and bool(title_message_text.strip())
+    provider_message_text = message_text
 
-    def _promote_pending_meta_launch() -> str | None:
-        return ports.promote_meta_launch(
-            key,
-            client_request_id=ingress_identity.client_request_id,
-            message=provider_message_text,
-            semantic_message=semantic_message_text,
-        )
+    transcript_metadata: _TranscriptMetadata = {}
+    if workspace_files:
+        transcript_metadata["workspace_files"] = workspace_files
+    if command.selected_skills:
+        transcript_metadata["selected_skills"] = list(command.selected_skills)
+    if command.local_path_references:
+        transcript_metadata["local_path_references"] = list(command.local_path_references)
 
     prepared_route = await ports.prepare_route(
         command,
@@ -997,8 +1005,6 @@ async def _accept_turn_in_scope(
         and plan_revision_id is None
         and plan_context_revision_id is None
         and plan_run is None
-        and durable_meta_control is None
-        and parsed_control is None
         and run_kind not in goal_claim_excluded_kinds
     ):
         claim_current_goal = True
@@ -1025,11 +1031,6 @@ async def _accept_turn_in_scope(
             "task_id": turn_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
-            **(
-                {"meta_control": durable_meta_control_payload}
-                if durable_meta_control_payload is not None
-                else {}
-            ),
             **(
                 {
                     "plan_run_id": plan_run.run_id,
@@ -1059,6 +1060,32 @@ async def _accept_turn_in_scope(
             ),
         },
     )
+
+    # The Gateway primitive resolves authority from the authenticated
+    # principal and stamps the resulting immutable snapshot onto the route.
+    # Client-supplied metadata is never trusted for this field.  Embedded
+    # callers that do not expose the resolver retain the legacy path until
+    # they adopt the same boundary.
+    resolve_activation_authority = getattr(
+        ports, "resolve_activation_authority", None
+    )
+    if callable(resolve_activation_authority):
+        authority = await resolve_activation_authority(
+            session_id=session_id,
+            session_epoch=int(getattr(route_envelope, "session_epoch", 0) or 0),
+        )
+        if not isinstance(authority, dict):
+            raise AdmissionUnavailableError(
+                "Activation authority could not be resolved"
+            )
+        route_envelope = ports.refine_route(
+            route_envelope,
+            metadata={
+                **route_envelope.metadata,
+                "activation_authority": authority,
+            },
+        )
+
     ingress_turn_context: dict[str, Any] = {
         "turn_id": turn_id,
         "client_request_id": ingress_identity.client_request_id,
@@ -1067,11 +1094,6 @@ async def _accept_turn_in_scope(
         "intent": "send",
         "disposition": "queued" if ports.runtime is not None else "applied",
         "revision": 1,
-        **(
-            {"meta_control": durable_meta_control_payload}
-            if durable_meta_control_payload is not None
-            else {}
-        ),
         "sandbox_mode_resolution": {
             "desiredMode": mode_resolution.desired_mode.value,
             "effectiveMode": mode_resolution.effective_mode.value,
@@ -1124,11 +1146,6 @@ async def _accept_turn_in_scope(
         "followup" if command.selected_skills
         else "interrupt" if requested_mode == "steer" else requested_mode
     )
-    if durable_meta_control is not None:
-        # A control must begin a fresh pipeline turn and must not interrupt
-        # another accepted control. Collect could lose the pipeline marker;
-        # steer/interrupt could make recovered controls cancel one another.
-        runtime_mode = "followup"
     if atomic_intent_plan is not None and atomic_intent_plan.action == "reset":
         # A reset rotates the session identity. Any old-key task must be stopped
         # only after that rotation commits so it cannot append into the new epoch.
@@ -1149,7 +1166,25 @@ async def _accept_turn_in_scope(
         and callable(storage.accept_turn if storage.capabilities.atomic_acceptance else None)
     )
     persisted_entry = None
-    expected_epoch = 0
+    expected_epoch = int(getattr(session, "epoch", 0) or 0)
+
+    def _install_auto_title(reservation: AdmissionReservation | None = None) -> None:
+        if not generate_title:
+            return
+        try:
+            ports.install_auto_title(
+                route_envelope,
+                key,
+                title_message_text,
+                enabled=True,
+                session_id=session_id,
+                session_epoch=expected_epoch,
+                root_turn_id=turn_id,
+                reservation=reservation,
+            )
+        except Exception:  # noqa: BLE001 - naming must not block an accepted turn.
+            log.exception("sessions.send.post_accept_title_failed", session_key=key)
+
     if plan_run is not None and not atomic_runtime_acceptance:
         raise AdmissionUnavailableError(
             "Plan implementation requires atomic TaskRuntime acceptance"
@@ -1163,13 +1198,6 @@ async def _accept_turn_in_scope(
             "Initial session controls require atomic TaskRuntime acceptance"
         )
 
-    if durable_meta_control is not None and not atomic_runtime_acceptance:
-        raise AdmissionError(
-            "META_CONTROL_DURABILITY_UNAVAILABLE",
-            "This MetaSkill control requires durable task ingress; retry after Gateway recovery",
-            retryable=True,
-            accepted=False,
-        )
 
 
     if pending_input_id is not None and not prepared_acceptance:
@@ -1186,7 +1214,9 @@ async def _accept_turn_in_scope(
             raw_attachments or workspace_files or display_text is not None
             or page_context is not None or command.selected_skills
         ):
-            if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
+            if (raw_attachments or command.local_path_references) and hasattr(
+                ports.sessions, "stamp_user_text"
+            ):
                 stamped = session_manager.stamp_user_text(message_text)
                 if isinstance(stamped, str):
                     message_text = stamped
@@ -1199,9 +1229,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
-                **({"workspace_files": workspace_files} if workspace_files else {}),
-                **({"selected_skills": list(command.selected_skills)}
-                   if command.selected_skills else {}),
+                **transcript_metadata,
             )
 
         assert callable(prepare_message)
@@ -1247,14 +1275,12 @@ async def _accept_turn_in_scope(
         assert persisted_entry is not None
         atomic_task_runtime = task_runtime
 
-        meta_launch_promotion: str | None = None
 
         async def _accept_task_record(
             task_record: AdmissionTaskRecord,
             *,
             merge_into_task: bool = False,
         ) -> AdmissionAcceptance:
-            nonlocal meta_launch_promotion
             reset_archive_writer = None
             if atomic_intent_plan.action == "reset":
                 write_session_archive = (
@@ -1324,9 +1350,7 @@ async def _accept_turn_in_scope(
                     # now stop a queued implementation before it begins.
                     plan_run=accepted_plan_run,
                     merge_into_task=merge_into_task,
-                    meta_control_intent_id=(
-                        durable_meta_control.intent_id if durable_meta_control is not None else None
-                    ),
+
                     workspace_guard=workspace_guard,
                     expected_collaboration_revision=expected_collaboration_revision,
                     expected_active_plan_revision_id=expected_active_plan_revision_id,
@@ -1339,13 +1363,6 @@ async def _accept_turn_in_scope(
                     pending_input_revision=pending_input_revision,
                 )
             )
-            if not acceptance.replayed and not merge_into_task:
-                # This synchronous in-memory transition sits strictly after
-                # the durable commit and before reserve activation, so the
-                # turn can never execute while its exact marker is still
-                # expirable staging state. A prompt merged into an older
-                # collect task is not a distinct matching launch turn.
-                meta_launch_promotion = _promote_pending_meta_launch()
             return acceptance
 
         async def _commit_and_activate() -> AdmissionAcceptance:
@@ -1399,7 +1416,10 @@ async def _accept_turn_in_scope(
                     _handle, collected_acceptance = collected
                     return collected_acceptance
 
+            title_reservation: AdmissionReservation | None = None
+
             async def _freeze(reservation: AdmissionReservation) -> None:
+                nonlocal title_reservation
                 await ports.freeze_acceptance(
                     atomic_task_runtime,
                     reservation,
@@ -1409,6 +1429,7 @@ async def _accept_turn_in_scope(
                         else None
                     ),
                 )
+                title_reservation = reservation
 
             def _before_activate(_acceptance: AdmissionAcceptance) -> None:
                 if (
@@ -1416,12 +1437,7 @@ async def _accept_turn_in_scope(
                     and session_manager.capabilities.cache_epoch
                 ):
                     session_manager.set_cached_epoch(key, expected_epoch)
-
-            def _on_unactivated() -> None:
-                if meta_launch_promotion == "promoted":
-                    ports.cancel_accepted_meta_launch(
-                        key, client_request_id=ingress_identity.client_request_id
-                    )
+                _install_auto_title(title_reservation)
 
             outcome = await commit_reserved_turn(
                 runtime=atomic_task_runtime,
@@ -1442,7 +1458,6 @@ async def _accept_turn_in_scope(
                 freeze=_freeze,
                 commit=_accept_task_record,
                 before_activate=_before_activate,
-                on_unactivated=_on_unactivated,
                 compensate_goal=getattr(
                     getattr(atomic_task_runtime, "goal_service", None),
                     "compensate_activation_failure", None,
@@ -1485,6 +1500,16 @@ async def _accept_turn_in_scope(
                 retryable=True,
                 accepted=False,
             ) from exc
+        except AdmissionResourceBusyError as exc:
+            _cleanup_rejected_guest_profile()
+            raise AdmissionError(
+                "RESOURCE_BUSY",
+                "The Gateway is at its resident task capacity. Retry shortly.",
+                details={"session_key": exc.session_key, "max_resident": exc.max_resident},
+                retryable=True,
+                retry_after_ms=250,
+                accepted=False,
+            ) from exc
         except AdmissionStorageBusyError as exc:
             _cleanup_rejected_guest_profile()
             raise AdmissionError(
@@ -1512,14 +1537,6 @@ async def _accept_turn_in_scope(
             _cleanup_rejected_guest_profile()
             raise AdmissionError(
                 "IDEMPOTENCY_CONFLICT",
-                str(exc),
-                retryable=False,
-                accepted=False,
-            ) from exc
-        except AdmissionMetaControlConflictError as exc:
-            _consumed_file_uuids = []
-            raise AdmissionError(
-                "META_CONTROL_CONFLICT",
                 str(exc),
                 retryable=False,
                 accepted=False,
@@ -1737,21 +1754,6 @@ async def _accept_turn_in_scope(
                     await upload_store.evict(file_uuid)
                 except Exception:  # noqa: BLE001 - eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", file_uuid[:8])
-        if not acceptance.replayed and generate_title:
-            try:
-                ports.schedule_auto_title(
-                    key,
-                    semantic_message_text or message_text,
-                    enabled=generate_title,
-                    session_id=session_id,
-                    root_turn_id=acceptance.receipt.task_id,
-                )
-            except Exception:  # noqa: BLE001 - turn is already accepted.
-                log.exception(
-                    "sessions.send.post_accept_title_failed",
-                    session_key=key,
-                    task_id=acceptance.receipt.task_id,
-                )
         response = await ports.accepted_response(
             acceptance,
             client_request_id=ingress_identity.client_request_id,
@@ -1837,6 +1839,7 @@ async def _accept_turn_in_scope(
                 )
                 if callable(set_cached_epoch):
                     set_cached_epoch(key, expected_epoch)
+            _install_auto_title()
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
@@ -1977,18 +1980,6 @@ async def _accept_turn_in_scope(
                             "uploads.evict_failed_post_turn uuid=%s",
                             file_uuid[:8],
                         )
-            if generate_title:
-                try:
-                    ports.schedule_auto_title(
-                        key,
-                        semantic_message_text or message_text,
-                        enabled=generate_title,
-                    )
-                except Exception:  # noqa: BLE001 - turn is already accepted.
-                    log.exception(
-                        "sessions.send.post_accept_title_failed",
-                        session_key=key,
-                    )
         return await ports.accepted_response(
             acceptance,
             client_request_id=ingress_identity.client_request_id,
@@ -2016,7 +2007,9 @@ async def _accept_turn_in_scope(
             or page_context is not None or command.selected_skills
         ):
             # Stamp up-front so both the stored envelope and the LLM path agree.
-            if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
+            if (raw_attachments or command.local_path_references) and hasattr(
+                ports.sessions, "stamp_user_text"
+            ):
                 _stamped = session_manager.stamp_user_text(message_text)
                 if isinstance(_stamped, str):
                     message_text = _stamped
@@ -2030,9 +2023,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
-                **({"workspace_files": workspace_files} if workspace_files else {}),
-                **({"selected_skills": list(command.selected_skills)}
-                   if command.selected_skills else {}),
+                **transcript_metadata,
             )
             legacy_persisted_entry = await session_manager.append_message(
                 key,
@@ -2059,17 +2050,13 @@ async def _accept_turn_in_scope(
             async with _persist_lock:
                 await _persist_user_message()
 
-    # Compatibility managers without atomic acceptance still persist the user
-    # row before runtime enqueue. Promote now, while no task has been admitted,
-    # and restage if a clean queue rejection rolls the row back below.
-    legacy_meta_launch_promotion = _promote_pending_meta_launch()
-
     task_runtime = task_runtime_candidate
     if task_runtime is None:
         direct_registry = ports.direct_registry
         async with direct_registry.admission(key):
             await _persist_user_message_with_lock()
             user_message_id = getattr(legacy_persisted_entry, "message_id", None)
+            _install_auto_title()
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
@@ -2102,12 +2089,6 @@ async def _accept_turn_in_scope(
                     await _store.evict(_u)
                 except Exception:  # noqa: BLE001 — eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        if generate_title:
-            ports.schedule_auto_title(
-                key,
-                semantic_message_text or message_text,
-                enabled=generate_title,
-            )
         return {
             "status": "accepted",
             "key": key,
@@ -2157,6 +2138,7 @@ async def _accept_turn_in_scope(
             else "interrupt" if requested_mode == "steer" else requested_mode
         )
         try:
+            _install_auto_title()
             handle = await ports.start_turn(
                 task_runtime,
                 route_envelope,
@@ -2181,13 +2163,8 @@ async def _accept_turn_in_scope(
 
             if not isinstance(
                 exc,
-                (AdmissionQueueFullError, AdmissionShuttingDownError),
+                (AdmissionQueueFullError, AdmissionResourceBusyError, AdmissionShuttingDownError),
             ):
-                if legacy_meta_launch_promotion == "promoted":
-                    ports.restage_meta_launch(
-                        key,
-                        client_request_id=ingress_identity.client_request_id,
-                    )
                 raise
 
             # Roll back the just-appended user turn so a retry doesn't leave
@@ -2196,15 +2173,14 @@ async def _accept_turn_in_scope(
             # hand the orphan message_id to the client as an idempotency
             # token — clients must dedup before retrying.
             shutting_down = isinstance(exc, AdmissionShuttingDownError)
-            rollback_reason = "runtime_shutting_down" if shutting_down else "queue_full"
+            resource_busy = isinstance(exc, AdmissionResourceBusyError)
+            rollback_reason = (
+                "runtime_shutting_down" if shutting_down
+                else "resource_busy" if resource_busy else "queue_full"
+            )
             orphan_id, rollback_ok = await _rollback_persisted_user_message(rollback_reason)
 
             if rollback_ok:
-                if legacy_meta_launch_promotion == "promoted":
-                    ports.restage_meta_launch(
-                        key,
-                        client_request_id=ingress_identity.client_request_id,
-                    )
                 if shutting_down:
                     raise AdmissionError(
                         "UNAVAILABLE",
@@ -2214,6 +2190,19 @@ async def _accept_turn_in_scope(
                             "rollback_message_id": orphan_id,
                         },
                         retryable=True,
+                        accepted=False,
+                    ) from exc
+                if isinstance(exc, AdmissionResourceBusyError):
+                    raise AdmissionError(
+                        "RESOURCE_BUSY",
+                        "The Gateway is at its resident task capacity. Retry shortly.",
+                        details={
+                            "session_key": exc.session_key,
+                            "max_resident": exc.max_resident,
+                            "rollback_message_id": orphan_id,
+                        },
+                        retryable=True,
+                        retry_after_ms=250,
                         accepted=False,
                     ) from exc
                 assert isinstance(exc, AdmissionQueueFullError)
@@ -2228,11 +2217,6 @@ async def _accept_turn_in_scope(
                     retryable=True,
                     accepted=False,
                 ) from exc
-            if legacy_meta_launch_promotion == "promoted":
-                ports.cancel_accepted_meta_launch(
-                    key,
-                    client_request_id=ingress_identity.client_request_id,
-                )
             if shutting_down:
                 raise AdmissionError(
                     "UNAVAILABLE",
@@ -2242,6 +2226,20 @@ async def _accept_turn_in_scope(
                     ),
                     details={
                         "session_key": exc.session_key,
+                        "orphan_message_id": orphan_id,
+                        "remediation": "client must dedup by message_id before retry",
+                    },
+                    retryable=False,
+                    accepted=True,
+                ) from exc
+            if isinstance(exc, AdmissionResourceBusyError):
+                raise AdmissionError(
+                    "RESOURCE_BUSY_DIRTY",
+                    "Resident task capacity is full and the accepted transcript entry "
+                    "could not be rolled back.",
+                    details={
+                        "session_key": exc.session_key,
+                        "max_resident": exc.max_resident,
                         "orphan_message_id": orphan_id,
                         "remediation": "client must dedup by message_id before retry",
                     },
@@ -2267,11 +2265,6 @@ async def _accept_turn_in_scope(
                 accepted=True,
             ) from exc
         if handle.task_id != turn_id:
-            if legacy_meta_launch_promotion == "promoted":
-                ports.restage_meta_launch(
-                    key,
-                    client_request_id=ingress_identity.client_request_id,
-                )
             # ``collect`` coalesces this durable prompt into an already queued
             # runtime turn. TaskRuntime has rebound the stored row; project and
             # return that same canonical identity instead of the unused
@@ -2301,14 +2294,6 @@ async def _accept_turn_in_scope(
                     await _store.evict(_u)
                 except Exception:  # noqa: BLE001 — eviction is best-effort
                     log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
-        if generate_title:
-            ports.schedule_auto_title(
-                key,
-                semantic_message_text or message_text,
-                enabled=generate_title,
-                session_id=session_id,
-                root_turn_id=turn_id,
-            )
         await ports.publish_disposition(
             key,
             {

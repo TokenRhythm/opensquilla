@@ -1,27 +1,30 @@
 <template>
   <section class="usage-chart">
     <div class="usage-chart__head">
-      <div class="control-segmented" role="tablist" :aria-label="t('usageLogs.chart.metric')">
+      <div class="control-segmented" role="group" :aria-label="t('usageLogs.chart.metric')">
         <button
+          type="button"
           class="control-segmented__btn"
           :class="{ 'is-active': chartMode === 'tokens' }"
-          role="tab"
+          :aria-pressed="chartMode === 'tokens'"
           @click="emit('update:chartMode', 'tokens')"
         >{{ t('usageLogs.chart.tokens') }}</button>
         <button
+          type="button"
           class="control-segmented__btn"
           :class="{ 'is-active': chartMode === 'cost' }"
-          role="tab"
+          :aria-pressed="chartMode === 'cost'"
           @click="emit('update:chartMode', 'cost')"
         >{{ t('usageLogs.chart.cost') }}</button>
       </div>
-      <div class="control-segmented" role="tablist" :aria-label="t('usageLogs.chart.dateRange')">
+      <div class="control-segmented" role="group" :aria-label="t('usageLogs.chart.dateRange')">
         <button
           v-for="r in ['all', '7', '14', '30']"
           :key="r"
+          type="button"
           class="control-segmented__btn"
           :class="{ 'is-active': range === r }"
-          role="tab"
+          :aria-pressed="range === r"
           @click="emit('setRange', r)"
         >{{ r === 'all' ? t('usageLogs.chart.rangeAll') : t('usageLogs.chart.rangeDays', { days: r }) }}</button>
       </div>
@@ -59,7 +62,7 @@
           <span
             v-if="row.outputPct > 0"
             class="usage-bar-row__fill usage-bar-row__fill--output"
-            :style="`width:${row.outputPct.toFixed(1)}%`"
+            :style="`left:${row.inputPct.toFixed(1)}%;width:${row.outputPct.toFixed(1)}%`"
           />
         </span>
         <span class="usage-bar-row__value usage-mono">{{ row.valueLabel }}</span>

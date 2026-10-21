@@ -332,7 +332,7 @@ def _entry_type(value: os.stat_result) -> str:
 
 def _manifest(path: Path) -> tuple[_ManifestEntry, ...]:
     try:
-        root_stat = path.lstat()
+        root_stat = native_io_path(path).lstat()
     except (FileNotFoundError, NotADirectoryError):
         return ()
     except OSError as exc:
@@ -363,22 +363,26 @@ def _manifest(path: Path) -> tuple[_ManifestEntry, ...]:
         if entry_type != "directory":
             return
         try:
-            entries = sorted(os.scandir(candidate), key=lambda item: item.name)
+            # Quarantine can push a previously short directory past MAX_PATH.
+            # Keep native spellings at the I/O boundary, not in logical paths.
+            with os.scandir(native_io_path(candidate)) as directory:
+                entries = sorted(directory, key=lambda item: item.name)
         except OSError as exc:
             raise CleanupBlockedError(
                 f"cleanup directory cannot be enumerated: {candidate}",
                 stable_code="cleanup_path_unreadable",
             ) from exc
         for entry in entries:
+            child = candidate / entry.name
             try:
                 child_stat = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise CleanupBlockedError(
-                    f"cleanup entry cannot be inspected: {entry.path}",
+                    f"cleanup entry cannot be inspected: {child}",
                     stable_code="cleanup_path_unreadable",
                 ) from exc
             child_relative = entry.name if relative == "." else f"{relative}/{entry.name}"
-            visit(Path(entry.path), child_relative, child_stat)
+            visit(child, child_relative, child_stat)
 
     visit(path, ".", root_stat)
     return tuple(result)

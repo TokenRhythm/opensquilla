@@ -24,11 +24,11 @@ from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
     ElevationAction,
-    gate_elevated_action,
+    gate_elevated_action_async,
 )
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
-    consume_backend_denial_retry,
+    consume_backend_denial_retry_async,
     escalate_backend_denial,
     escalate_unavailable_backend_in_managed_mode,
     gate_action,
@@ -59,6 +59,7 @@ from opensquilla.sandbox.types import (
 )
 from opensquilla.subprocess_encoding import apply_utf8_child_env
 from opensquilla.tools.output_capture import BoundedOutputCapture
+from opensquilla.tools.path_policy import resolve_bound_workspace
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active, trusted_sandbox_active
 from opensquilla.tools.types import ToolError, current_tool_context
@@ -1360,12 +1361,9 @@ async def execute_code(
     sandbox_enabled = bool(
         runtime is not None and runtime.effective.sandbox_enabled and not host_execution
     )
-    workspace = (
-        Path(ctx.workspace_dir).expanduser().resolve() if ctx and ctx.workspace_dir else None
-    )
+    workspace = resolve_bound_workspace(ctx.workspace_dir if ctx is not None else None)
     cleanup_dir: str | None = None
     if workspace is not None:
-        workspace.mkdir(parents=True, exist_ok=True)
         workdir_path = workspace
     elif runtime is not None and runtime.effective.sandbox_enabled:
         workdir_path = runtime.workspace.expanduser().resolve()
@@ -1394,7 +1392,7 @@ async def execute_code(
             justification=justification,
             prefix_rule=prefix_rule,
         )
-        gate = gate_elevated_action(
+        gate = await gate_elevated_action_async(
             action,
             approval_id=approval_id,
             session_key=ctx.session_key if ctx is not None else None,
@@ -1480,7 +1478,7 @@ async def execute_code(
             sandbox_enabled = False
             elevated_code_execution = True
         else:
-            retry_gate = consume_backend_denial_retry(
+            retry_gate = await consume_backend_denial_retry_async(
                 approval_id,
                 request,
                 _policy,

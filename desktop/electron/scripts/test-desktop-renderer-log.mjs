@@ -2,8 +2,11 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { EventEmitter } from 'node:events'
+import { runInNewContext } from 'node:vm'
 
 import { appendDesktopLogRecord } from '../dist/desktop-log-file.js'
+import { createMainWindowConsoleListener } from './renderer-log-test-helpers.mjs'
 import {
   buildRendererConsoleLogEntry,
   buildRendererGoneLogEntry,
@@ -13,6 +16,38 @@ import {
   shouldForwardConsoleLevel,
 } from '../dist/desktop-renderer-log.js'
 
+const consoleRecords = []
+const mainFrame = {}
+let windowDestroyed = false
+let contentsDestroyed = false
+const contents = {
+  isDestroyed: () => contentsDestroyed,
+  get mainFrame() {
+    assert.equal(contentsDestroyed, false, 'Destroyed WebContents must not be read.')
+    return mainFrame
+  },
+}
+const consoleWindow = {
+  isDestroyed: () => windowDestroyed,
+  get webContents() {
+    assert.equal(windowDestroyed, false, 'Destroyed BrowserWindow must not be read.')
+    return contents
+  },
+}
+const consoleListener = createMainWindowConsoleListener(consoleWindow, consoleRecords)
+const consoleMessage = {
+  frame: mainFrame, level: 'error', message: 'synthetic renderer error',
+  sourceId: 'https://example.test/main.js', lineNumber: 1,
+}
+consoleListener(consoleMessage)
+assert.equal(consoleRecords.length, 1)
+consoleListener({ ...consoleMessage, frame: {} })
+assert.equal(consoleRecords.length, 1, 'Child frames must not write lifecycle logs.')
+contentsDestroyed = true
+assert.doesNotThrow(() => consoleListener(consoleMessage))
+windowDestroyed = true
+assert.doesNotThrow(() => consoleListener(consoleMessage))
+assert.equal(consoleRecords.length, 1, 'Late events must not write after teardown.')
 // A late console event must not touch an already destroyed native window.
 // The signed Windows package failed here after app.exit: Electron's default
 // uncaught-exception handler opened a synchronous error dialog and blocked exit.
@@ -136,6 +171,42 @@ for (const level of ['warning', 'info', 'debug']) {
   )
 }
 
+const recoveryMessage = {
+  level: 'warning',
+  message: '[opensquilla-recovery] ' + JSON.stringify({
+    phase: 'failed', reason: 'live_subscription_failed',
+    session_key_sha256: '8ed3f6ad685b959e', connection_generation: 7,
+    delivery_epoch: 'epoch-1', stream_seq: 91, suppressed_count: 12,
+    error_code: 'SNAPSHOT_STALE', error_kind: 'busy', retryable: true,
+    // The disk boundary must whitelist fields even if the renderer is buggy.
+    message: 'private output', payload: 'private payload', session_key: 'raw-private-session',
+  }),
+  sourceId: 'opensquilla-app://desktop/chat', lineNumber: 10,
+}
+assert.deepEqual(buildRendererConsoleLogEntry(recoveryMessage), {
+  event: 'session_recovery',
+  detail: {
+    phase: 'failed', reason: 'live_subscription_failed',
+    session_key_sha256: '8ed3f6ad685b959e', delivery_epoch: 'epoch-1',
+    connection_generation: 7, stream_seq: 91, suppressed_count: 12,
+    retryable: true, error_code: 'SNAPSHOT_STALE', error_kind: 'busy',
+  },
+})
+for (const message of [
+  '[opensquilla-recovery] not-json',
+  '[opensquilla-recovery] null',
+  '[opensquilla-recovery] []',
+  '[opensquilla-recovery] {"phase":"failed","reason":"private output"}',
+  '[opensquilla-recovery] ' + 'x'.repeat(3000),
+]) assert.equal(buildRendererConsoleLogEntry({ ...recoveryMessage, message }), null)
+assert.equal(buildRendererConsoleLogEntry({ ...recoveryMessage, level: 'info' }), null)
+const recoveryRecords = []
+const recoveryListener = createMainWindowConsoleListener(liveWindow, recoveryRecords)
+recoveryListener({ ...recoveryMessage, frame: trustedMainFrame })
+recoveryListener({ ...recoveryMessage, frame: {} })
+assert.equal(recoveryRecords.length, 1, 'Only the trusted main frame may persist recovery breadcrumbs.')
+assert.equal(recoveryRecords[0].event, 'session_recovery')
+
 const invalidLine = buildRendererConsoleLogEntry({
   level: 'error', message: 'boom', sourceId: 'data:text/javascript,secret', lineNumber: NaN,
 })
@@ -202,4 +273,81 @@ try {
   rmSync(tempDir, { recursive: true, force: true })
 }
 
-console.log('desktop renderer logging contract: all assertions passed.')
+// Exercise the main-process recovery owner without launching Electron.
+const mainSource = readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8')
+const recoveryStart = mainSource.indexOf('let rendererRecoveryGeneration = 0')
+const recoveryEnd = mainSource.indexOf("window.webContents.on('unresponsive'", recoveryStart)
+assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart)
+const recoverySource = mainSource.slice(recoveryStart, recoveryEnd)
+
+function recoveryHarness() {
+  const webContents = new EventEmitter()
+  let reloads = 0
+  webContents.reload = () => { reloads += 1 }
+  webContents.getOSProcessId = () => 123
+  const timers = new Map()
+  const logs = []
+  let nextTimer = 0
+  const window = { webContents, isDestroyed: () => false }
+  const context = {
+    window, isQuitting: false, appExitPhase: 'running', rendererUnresponsiveAt: null,
+    flushRendererConsoleSuppression() {}, releaseRendererOwnedArtifactPreviews() {},
+    recordRendererCrash() {}, buildRendererGoneLogEntry,
+    desktopLog: (event, detail) => logs.push({ event, detail }),
+    setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id },
+    clearTimeout(id) { timers.delete(id) },
+  }
+  runInNewContext(recoverySource, context)
+  return {
+    context, webContents, timers, logs,
+    get reloads() { return reloads },
+    crash() { webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 }) },
+  }
+}
+
+{
+  const h = recoveryHarness()
+  h.crash()
+  const staleReady = h.webContents.listeners('did-finish-load')[0]
+  h.crash()
+  assert.equal(h.reloads, 2, 'a second crash during recovery must reload the new generation')
+  assert.equal(h.timers.size, 1, 'the superseded recovery timer must be cleared')
+  staleReady()
+  assert.equal(h.logs.filter(log => log.event === 'renderer_recovery_ready').length, 0)
+  h.webContents.emit('did-finish-load')
+  assert.deepEqual(h.logs.filter(log => log.event === 'renderer_recovery_ready').map(log => log.detail.generation), [2])
+  assert.equal(h.timers.size, 0)
+}
+
+{
+  const h = recoveryHarness()
+  for (let index = 0; index < 4; index += 1) h.crash()
+  assert.equal(h.reloads, 3, 'repeated crashes must retain the existing three-attempt budget')
+  assert.equal(h.timers.size, 0)
+  assert.equal(h.webContents.listenerCount('did-finish-load'), 0)
+  assert.equal(h.logs.at(-1).event, 'renderer_recovery_exhausted')
+}
+
+{
+  const h = recoveryHarness()
+  h.crash()
+  h.webContents.emit('did-finish-load')
+  for (let index = 0; index < 3; index += 1) h.crash()
+  assert.equal(h.reloads, 4, 'successful recovery must reset the failure budget')
+}
+
+for (const retire of [
+  h => { h.context.isQuitting = true },
+  h => { h.context.appExitPhase = 'deferred' },
+  h => { h.context.window.isDestroyed = () => true },
+]) {
+  const h = recoveryHarness()
+  h.crash()
+  retire(h)
+  h.crash()
+  assert.equal(h.reloads, 1, 'a superseding crash during teardown must not reload')
+  assert.equal(h.timers.size, 0)
+  assert.equal(h.webContents.listenerCount('did-finish-load'), 0)
+}
+
+console.log('desktop renderer logging and recovery contract: all assertions passed.')

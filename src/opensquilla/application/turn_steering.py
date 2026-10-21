@@ -117,12 +117,14 @@ class SteeringContext:
     client_request_id: str | None = None
     disposition: Literal["steering", "rejected"] = "steering"
     revision: int = 1
+    local_path_references: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedSteeringInput:
     entry: SteeringTranscript
     expected_epoch: int
+    message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,10 +304,15 @@ class TurnSteering:
 
         # Replay precedes mutable workspace checks and transcript preparation.
         guard = await ports.workspace_guard(session)
-        context = SteeringContext(target, message_id, surface, client_request_id=request_id)
+        context = SteeringContext(
+            target, message_id, surface, client_request_id=request_id,
+            local_path_references=command.local_path_references,
+        )
         prepared = await ports.prepare(key, normalized.message, context, session)
         content = prepared.entry.content
-        message = content if isinstance(content, str) else normalized.message
+        message = prepared.message if prepared.message is not None else (
+            content if isinstance(content, str) else normalized.message
+        )
 
         async def persist(active_turn_id: str) -> SteeringAcceptance:
             if active_turn_id != target:

@@ -1,11 +1,16 @@
 import { test, expect, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import { pdfFixture } from './support/office-fixtures'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+
+// Native PDF preview requires full Chromium rather than the headless shell.
+// Browser-scoped fixtures must be configured at file scope.
+test.use({ channel: 'chromium' })
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eartifactcard'
@@ -26,8 +31,22 @@ const WEBM_TINY = Buffer.from(
 // rewriting chat.history in flight.
 async function seedHistory(
   page: Page,
-  options: { artifacts?: Array<Record<string, unknown>>; includeHtml?: boolean } = {},
+  options: { artifacts?: Array<Record<string, unknown>>; includeHtml?: boolean; workspacePreviewHtml?: boolean } = {},
 ) {
+  const requests: Array<{ method: string; params?: Record<string, unknown> }> = []
+  const documentId = 'doc_artifact_card_html'
+  const revisionId = 'rev-artifact-card-current'
+  const currentArtifactId = 'art-card-html-current'
+  const document = { documentId, headRevisionId: revisionId, name: 'interactive.html',
+    sessionKey: SESSION_KEY, kind: 'html', latestDownloadUrl: `/api/v1/artifact-documents/${documentId}`,
+    capabilities: { download: true, preview: true, revisions: true, source: false } }
+  const revision = { revisionId, documentId, artifactId: currentArtifactId, filename: 'interactive.html',
+    mediaType: 'text/html', byteSize: 4096, artifactSha256: 'b'.repeat(64),
+    downloadUrl: `/api/v1/artifact-documents/${documentId}?revisionId=${revisionId}` }
+  const resource = { resource: { type: 'document', documentId }, name: 'interactive.html', mime: 'text/html',
+    sha256: 'b'.repeat(64), size: 4096, downloadUrl: document.latestDownloadUrl,
+    capabilities: { preview: true, download: true, edit: false },
+    relations: { documentId, headRevisionId: revisionId, headArtifactId: currentArtifactId } }
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -45,10 +64,16 @@ async function seedHistory(
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       const params = frame.params as Record<string, unknown> | undefined
+      requests.push({ method, params })
       if (method === 'connect') {
         const auth = params?.auth as Record<string, unknown> | undefined
         // Match the local owner handshake: only a supplied token is verified.
         ws.send(helloOkResponse({
+          ...(options.workspacePreviewHtml ? { features: { methods: [
+            'sessions.messages.subscribe', 'sessions.messages.snapshot', 'sessions.messages.hydrate',
+            'artifacts.get', 'workbench.resources.list', 'workbench.resources.get', 'workbench.resources.open',
+            'artifacts.documents.get', 'artifacts.revisions.list', 'artifacts.changes.list',
+          ] } } : {}),
           auth: {
             principal: {
               isOwner: true,
@@ -81,6 +106,9 @@ async function seedHistory(
             name: 'interactive.html',
             mime: 'text/html',
             size: 4096,
+            ...(options.workspacePreviewHtml ? {
+              kind: 'artifact_ref', session_id: 'artifact-card-session-id', source: 'workspace-preview',
+            } : {}),
             download_url: '/api/v1/artifacts/art-card-html',
           })
         }
@@ -106,6 +134,30 @@ async function seedHistory(
         }))
         return
       }
+      if (options.workspacePreviewHtml) {
+        let payload: unknown
+        if (method === 'artifacts.get') {
+          expect(params?.sessionKey).toBe(SESSION_KEY)
+          expect(params?.artifactId).toBe('art-card-html')
+          payload = { artifact: { id: 'art-card-html', name: 'interactive.html', mime: 'text/html',
+            source: 'workspace-preview', documentId } }
+        } else if (method === 'workbench.resources.list') {
+          payload = { resources: [resource], totalCount: 1, pageSize: 200, returnedCount: 1,
+            hasMore: false, nextCursor: null }
+        } else if (method === 'workbench.resources.get' || method === 'workbench.resources.open') {
+          expect(params?.sessionKey).toBe(SESSION_KEY)
+          expect(params?.resourceRef).toMatchObject({ type: 'document', documentId })
+          payload = method === 'workbench.resources.get' ? { resource }
+            : { disposition: 'document', resolution: { status: 'current' }, resource,
+                document, revision, materialized: false }
+        } else if (method === 'artifacts.documents.get') payload = { document }
+        else if (method === 'artifacts.revisions.list') payload = { revisions: [revision] }
+        else if (method === 'artifacts.changes.list') payload = { changeSets: [] }
+        if (payload) {
+          ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload }))
+          return
+        }
+      }
       const key = String(params?.key || params?.sessionKey || SESSION_KEY)
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
@@ -130,6 +182,7 @@ async function seedHistory(
       }))
     })
   })
+  return { requests }
 }
 
 async function openSeeded(page: Page) {
@@ -139,14 +192,14 @@ async function openSeeded(page: Page) {
       return route.fulfill({
         status: 200,
         contentType: 'application/pdf',
-        body: '%PDF-1.4\n%%EOF',
+        body: pdfFixture(),
       })
     }
     return route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 })
   })
   await seedHistory(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
   await page.waitForSelector('.chat-header', { timeout: 10000 })
 }
 
@@ -232,31 +285,40 @@ test.describe('Artifact deliverable cards', () => {
     expect(requested.some(url => url.includes('art-card-img') && url.includes('variant=thumb'))).toBe(true)
   })
 
-  test('previewable file card opens the Workbench without downloading', async ({ page }) => {
-    await openSeeded(page)
+  test.describe('native PDF preview', () => {
+    test('previewable file card opens the Workbench without downloading', async ({ page }) => {
+      await openSeeded(page)
+      expect(await page.evaluate(() => navigator.pdfViewerEnabled)).toBe(true)
 
-    const pdfCard = page.locator('.msg-artifact-chip', { hasText: 'report-q2.pdf' })
-    await expect(pdfCard).toBeVisible()
-    // Clean meta uses the type pill and size, no doubled category.
-    await expect(pdfCard.locator('.msg-artifact-kind')).toHaveText('PDF')
-    await expect(pdfCard.locator('.msg-artifact-size')).toHaveText('184 KB')
+      const pdfCard = page.locator('.msg-artifact-chip', { hasText: 'report-q2.pdf' })
+      await expect(pdfCard).toBeVisible()
+      // Clean meta uses the type pill and size, no doubled category.
+      await expect(pdfCard.locator('.msg-artifact-kind')).toHaveText('PDF')
+      await expect(pdfCard.locator('.msg-artifact-size')).toHaveText('184 KB')
 
-    // Open and Download are separate, separately labelled controls.
-    const openBtn = pdfCard.getByRole('button', { name: 'Open report-q2.pdf' })
-    const downloadBtn = pdfCard.getByRole('button', { name: 'Download report-q2.pdf' })
-    await expect(openBtn).toBeVisible()
-    await expect(downloadBtn).toBeVisible()
+      // Open and Download are separate, separately labelled controls.
+      const openBtn = pdfCard.getByRole('button', { name: 'Open report-q2.pdf' })
+      const downloadBtn = pdfCard.getByRole('button', { name: 'Download report-q2.pdf' })
+      await expect(openBtn).toBeVisible()
+      await expect(downloadBtn).toBeVisible()
 
-    let popupCount = 0
-    page.on('popup', () => { popupCount += 1 })
-    await openBtn.click()
-    const workbench = page.getByTestId('workbench-host')
-    await expect(workbench).toBeVisible()
-    await expect(workbench).toHaveAttribute('role', 'complementary')
-    await expect(workbench.locator('.workbench-host__single-title')).toContainText('report-q2.pdf')
-    await expect(workbench.locator('.workbench-host__single-title')).toContainText('PDF')
-    await expect(workbench.locator('.artifact-preview__frame--pdf')).toBeVisible()
-    expect(popupCount).toBe(0)
+      let popupCount = 0
+      let downloadCount = 0
+      page.on('popup', () => { popupCount += 1 })
+      page.on('download', () => { downloadCount += 1 })
+      await openBtn.click()
+      const workbench = page.getByTestId('workbench-host')
+      await expect(workbench).toBeVisible()
+      await expect(workbench).toHaveAttribute('role', 'complementary')
+      await expect(workbench.getByRole('tab', { name: 'report-q2.pdf', exact: true })).toBeVisible()
+      await expect(workbench.getByRole('tab', { name: 'report-q2.pdf', exact: true })).toHaveAttribute('aria-selected', 'true')
+      await expect(workbench.locator('.artifact-preview__frame--pdf')).toBeVisible()
+      await expect(workbench.locator('.artifact-preview__frame--pdf'))
+        .toHaveAttribute('src', /^blob:.*#zoom=page-width&view=FitH$/)
+      await expect(workbench.getByRole('alert')).toHaveCount(0)
+      expect(popupCount).toBe(0)
+      expect(downloadCount).toBe(0)
+    })
   })
 
   test('CSV file card exposes Office Open and a separate Download control', async ({ page }) => {
@@ -272,24 +334,45 @@ test.describe('Artifact deliverable cards', () => {
 
   test('download-only file card has a Download control and no Open', async ({ page }) => {
     await seedHistory(page, {
-      artifacts: [{ id: 'art-card-json', name: 'pricing.json', mime: 'application/json', size: 12288 }],
+      artifacts: [{ id: 'art-card-binary', name: 'opaque.bin', mime: 'application/octet-stream', size: 12288 }],
     })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
 
-    const dataCard = page.locator('.msg-artifact-chip', { hasText: 'pricing.json' })
+    const dataCard = page.locator('.msg-artifact-chip', { hasText: 'opaque.bin' })
     await expect(dataCard).toBeVisible()
-    await expect(dataCard.locator('.msg-artifact-kind')).toHaveText('JSON')
-    await expect(dataCard.getByRole('button', { name: 'Open pricing.json' })).toHaveCount(0)
-    await expect(dataCard.getByRole('button', { name: 'Download pricing.json' })).toBeVisible()
+    await expect(dataCard.locator('.msg-artifact-kind')).toHaveText('BIN')
+    await expect(dataCard.getByRole('button', { name: 'Open opaque.bin' })).toHaveCount(0)
+    await expect(dataCard.getByRole('button', { name: 'Download opaque.bin' })).toBeVisible()
   })
 
-  test('html file card opens the offline Workbench preview and downloads separately', async ({ page }) => {
+  test('JSON opens as source text and retains its separate Download control', async ({ page }) => {
+    const source = '{"currency":"USD","price":42}'
+    await page.route('**/api/v1/artifacts/art-card-json', route => route.fulfill({
+      status: 200, contentType: 'application/json', body: source,
+    }))
+    await seedHistory(page, {
+      artifacts: [{ id: 'art-card-json', name: 'pricing.json', mime: 'application/json', size: source.length }],
+    })
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    const card = page.locator('.msg-artifact-chip', { hasText: 'pricing.json' })
+    await expect(card.locator('.msg-artifact-kind')).toHaveText('JSON')
+    await expect(card.getByRole('button', { name: 'Download pricing.json' })).toBeVisible()
+    const downloads: unknown[] = []
+    page.on('download', download => downloads.push(download))
+    await card.getByRole('button', { name: 'Open pricing.json' }).click()
+    await expect(page.getByTestId('workbench-host').locator('.artifact-preview__text')).toHaveText(source)
+    expect(downloads).toHaveLength(0)
+  })
+
+  for (const workspacePreview of [false, true]) {
+  test(`${workspacePreview ? 'internal workspace-preview' : 'html file'} card opens the Workbench and downloads separately`, async ({ page }) => {
     const previewPath = '/api/v1/artifact-preview/art-card-html-token/interactive.html'
     const html = '<html><body>Offline HTML preview</body></html>'
     let leaseCount = 0
     let previewCount = 0
     let nativeOpenCount = 0
     let htmlContentRequestCount = 0
+    let documentContentRequestCount = 0
     let browserDownloadCount = 0
     page.on('download', () => { browserDownloadCount += 1 })
     await page.addInitScript(() => {
@@ -303,10 +386,14 @@ test.describe('Artifact deliverable cards', () => {
     })
     await page.route('**/api/v1/artifact-preview-leases/art-card-html-lease', route =>
       route.fulfill({ status: 204 }))
+    await page.route('**/api/v1/artifact-documents/doc_artifact_card_html*', route => {
+      documentContentRequestCount += 1
+      return route.fulfill({ status: 200, contentType: 'text/html', body: html })
+    })
     await page.route('**/api/v1/artifacts/**', async route => {
       const request = route.request()
       const url = new URL(request.url())
-      if (url.pathname === '/api/v1/artifacts/art-card-html/preview-leases') {
+      if (url.pathname === `/api/v1/artifacts/${workspacePreview ? 'art-card-html-current' : 'art-card-html'}/preview-leases`) {
         leaseCount += 1
         expect(request.method()).toBe('POST')
         expect(request.headers()['x-opensquilla-session-key']).toBe(SESSION_KEY)
@@ -352,17 +439,18 @@ test.describe('Artifact deliverable cards', () => {
       }
       await route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1x1 })
     })
-    await seedHistory(page, { includeHtml: true })
+    const gateway = await seedHistory(page, { includeHtml: true, workspacePreviewHtml: workspacePreview })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
     await page.waitForSelector('.chat-header', { timeout: 10000 })
 
     const htmlCard = page.locator('.msg-artifact-chip', { hasText: 'interactive.html' })
     await expect(htmlCard).toBeVisible()
+    await expect(htmlCard.locator('.msg-artifact-kind')).toHaveText('HTML')
     await htmlCard.getByRole('button', { name: 'Open interactive.html' }).click()
     const workbench = page.getByTestId('workbench-host')
     await expect(workbench).toBeVisible()
-    await expect(workbench.locator('.workbench-host__single-title')).toContainText('interactive.html')
-    await expect(workbench.locator('.workbench-host__single-title')).toContainText('HTML')
+    await expect(workbench.getByRole('tab', { name: 'interactive.html', exact: true })).toBeVisible()
+    await expect(workbench.getByRole('tab', { name: 'interactive.html', exact: true })).toHaveAttribute('aria-selected', 'true')
     const preview = workbench.locator('.artifact-preview__frame--html')
     await expect(preview).toBeVisible()
     await expect(preview).toHaveAttribute('sandbox', 'allow-scripts')
@@ -380,9 +468,26 @@ test.describe('Artifact deliverable cards', () => {
     expect(nativeOpenCount).toBe(0)
     expect(leaseCount).toBe(1)
     expect(previewCount).toBe(1)
-    expect(htmlContentRequestCount).toBe(2)
+    if (workspacePreview) {
+      expect(htmlContentRequestCount).toBe(1) // Only explicit download reads the old artifact.
+      expect(documentContentRequestCount).toBeGreaterThan(0)
+      expect(gateway.requests).toEqual(expect.arrayContaining([
+        { method: 'artifacts.get', params: { sessionKey: SESSION_KEY, artifactId: 'art-card-html' } },
+        expect.objectContaining({ method: 'workbench.resources.open' }),
+      ]))
+    } else expect(htmlContentRequestCount).toBe(2)
+    expect(browserDownloadCount).toBe(1)
+
+    await expect(page.getByTestId('topbar-workbench-toggle')).toHaveAccessibleName('Collapse workbench')
+    await page.getByTestId('topbar-workbench-toggle').click()
+    await expect(workbench).not.toBeVisible()
+    await htmlCard.locator('.msg-artifact-body').click()
+    await expect(workbench).toBeVisible()
+    await expect(preview.contentFrame().getByText('Offline HTML preview')).toBeVisible()
+    expect(nativeOpenCount).toBe(0)
     expect(browserDownloadCount).toBe(1)
   })
+  }
 
   test('audio performs zero initial requests and fetches authenticated bytes only after Play', async ({ page }) => {
     const requests: Array<{

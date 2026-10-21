@@ -3,13 +3,18 @@ import { describe, expect, it } from 'vitest'
 
 import {
   collectClipboardFiles,
+  collectClipboardText,
   hasSendableModelInputImageAttachment,
   isImageDisplayAttachment,
+  isLongPlainTextPaste,
   isModelInputImageMime,
   isSendableModelInputImageAttachment,
+  LONG_PASTE_CHARS,
   normalizeDisplayAttachment,
   normalizeDisplayAttachments,
+  pastedTextAttachmentName,
   serializeDisplayAttachment,
+  serializeChatFiles,
   shouldCaptureFilePaste,
 } from './attachments'
 import type { Attachment } from '@/types/chat'
@@ -74,6 +79,16 @@ describe('model-input image detection', () => {
 })
 
 describe('attachment display normalization', () => {
+  it('keeps a bounded missing reason without dropping an independently usable read source', () => {
+    const attachment = normalizeDisplayAttachment({ name: 'synthetic.png', mime: 'image/png',
+      missing_reason: `  ${'unavailable'.repeat(40)}  `, download_url: '/api/v1/attachments/synthetic' })
+    expect(attachment.missingReason).toBe('unavailable'.repeat(40).slice(0, 256))
+    expect(attachment.download_url).toBe('/api/v1/attachments/synthetic')
+    expect(normalizeDisplayAttachment({ missing_reason: { unexpected: true } }).missingReason).toBeUndefined()
+    expect(normalizeDisplayAttachment({ missing_reason: '  ' }).missingReason).toBeUndefined()
+    expect(normalizeDisplayAttachment(attachment).missingReason).toBe(attachment.missingReason)
+  })
+
   it('preserves the workspace target from history without inventing attachment storage identity', () => {
     const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
       name: 'notes.md', mime: 'text/markdown', size: 14 }
@@ -297,6 +312,18 @@ describe('attachment send display serialization', () => {
     expect(JSON.stringify(display)).not.toContain('u-secret')
   })
 
+  it('serializes pasted-text provenance while keeping the instruction separate', () => {
+    const pasted: Attachment & { kind: 'inline'; data: string } = {
+      kind: 'inline',
+      local_id: 10,
+      name: 'pasted-text.txt',
+      mime: 'text/plain',
+      data: 'aGVsbG8=',
+      origin: 'paste',
+    }
+    expect(serializeChatFiles([pasted]).attachments[0]).toMatchObject({ origin: 'paste' })
+  })
+
   it('keeps SVG attachment markup download-only', () => {
     const attachment = normalizeDisplayAttachment({
       type: 'image/svg+xml; charset=utf-8',
@@ -327,6 +354,19 @@ describe('collectClipboardFiles', () => {
 
   it('returns nothing without clipboard data', () => {
     expect(collectClipboardFiles(null)).toEqual([])
+  })
+
+  it('extracts text/plain and promotes only long pastes', () => {
+    const text = 'a'.repeat(LONG_PASTE_CHARS)
+    const data = {
+      items: [],
+      files: [],
+      getData: (type: string) => type === 'text/plain' ? text : '<b>ignored</b>',
+    } as unknown as DataTransfer
+    expect(collectClipboardText(data)).toBe(text)
+    expect(isLongPlainTextPaste(text)).toBe(true)
+    expect(isLongPlainTextPaste('short')).toBe(false)
+    expect(pastedTextAttachmentName('  # Repair notes / draft\nsecond line')).toBe('# Repair notes _ draft.txt')
   })
 
   it('lets plain-text pastes fall through unchanged', () => {
@@ -371,6 +411,26 @@ describe('shouldCaptureFilePaste', () => {
   it('captures pastes aimed at the composer textarea', () => {
     const textarea = document.createElement('textarea')
     expect(shouldCaptureFilePaste(textarea, { ...base, composerTextareaFocused: true })).toBe(true)
+  })
+
+  it('captures only the focused, explicitly supplied inline editor and its children', () => {
+    const composerEditor = document.createElement('div')
+    composerEditor.contentEditable = 'true'
+    const reference = document.createElement('span')
+    reference.contentEditable = 'false'
+    composerEditor.append(reference)
+    const options = { ...base, composerEditor, composerTextareaFocused: true }
+    expect(shouldCaptureFilePaste(composerEditor, options)).toBe(true)
+    expect(shouldCaptureFilePaste(reference, options)).toBe(true)
+    expect(shouldCaptureFilePaste(reference, { ...options, composerTextareaFocused: false })).toBe(false)
+    expect(shouldCaptureFilePaste(reference, { ...options, dialogLayerOpen: true })).toBe(false)
+
+    const otherEditor = document.createElement('div')
+    otherEditor.setAttribute('contenteditable', 'true')
+    const otherChild = document.createElement('span')
+    otherEditor.append(otherChild)
+    expect(shouldCaptureFilePaste(otherEditor, options)).toBe(false)
+    expect(shouldCaptureFilePaste(otherChild, options)).toBe(false)
   })
 
   it('leaves pastes aimed at other editable surfaces alone', () => {

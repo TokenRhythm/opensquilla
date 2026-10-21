@@ -18,6 +18,8 @@ import {
 } from '@/workbench/workbenchResourceItems'
 import { normalizeWorkbenchResource } from '@/workbench/workbenchResourceProvider'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
+import OfficePreviewPanel from './OfficePreviewPanel.vue'
+import * as officePreviewAdapter from '@/workbench/officePreviewAdapter'
 
 const officeArtifact: ArtifactPayload = {
   id: 'artifact-office',
@@ -94,15 +96,24 @@ describe('ArtifactDocumentPanel', () => {
       state.value.workspace!.document.headRevisionId = revisionId
       return state.value.workspace!
     }) }
+    const onWorkbenchEvent = vi.fn()
     const mounted = mountPanel({
       artifact: htmlArtifact, documentSnapshot: state.value, documentActions: actions,
       sessionKey: 'session-a', initialSection: 'versions', nativeHtml: true, suspended: true,
+      onWorkbenchEvent,
     })
     await nextTick()
     const panel = mounted.element.querySelector('[data-document-section="versions"]')!
     const rows = [...panel.querySelectorAll('li')]
     expect(rows).toHaveLength(2)
     expect(rows[0]?.textContent).toContain('Current')
+    expect(mounted.element.querySelector('.artifact-document__current-version')?.textContent).toContain('Current v2')
+    rows[1]!.querySelector<HTMLButtonElement>('[data-artifact-action="view-revision"]')!.click()
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({
+      type: 'artifact-view-revision',
+      payload: expect.objectContaining({ revisionId: 'revision-1', id: initial.artifactId }),
+    })
+    expect(actions.restoreRevision).not.toHaveBeenCalled()
     const currentRestore = rows[0]!.querySelector<HTMLButtonElement>('[data-artifact-action="restore-revision"]')!
     expect(currentRestore).not.toBeNull()
     expect(currentRestore.disabled).toBe(false)
@@ -118,7 +129,7 @@ describe('ArtifactDocumentPanel', () => {
     expect(rows[1]?.textContent).toContain('Current')
     expect(rows[1]!.querySelector('[data-artifact-action="restore-revision"]')).not.toBeNull()
     expect([...mounted.element.querySelectorAll('[role="tab"]')]
-      .find(tab => tab.textContent?.includes('Versions'))?.textContent?.replace(/\s/g, '')).toBe('Versions2')
+      .find(tab => tab.textContent?.includes('Version history'))?.textContent?.replace(/\s/g, '')).toBe('Versionhistory(2)')
     mounted.unmount()
   })
 
@@ -528,6 +539,102 @@ describe('ArtifactDocumentPanel', () => {
     mounted.unmount()
   })
 
+  it('describes an ordinary Office selection without claiming the preview is hidden', async () => {
+    const mounted = mountPanel({
+      artifact: officeArtifact,
+      documentSnapshot: snapshot(),
+      annotationFallback: { annotationId: 'office-selection', body: '', reason: 'office-selection' },
+    })
+    await nextTick()
+    const dialog = mounted.element.querySelector('[role="dialog"]')
+    expect(dialog?.getAttribute('aria-modal')).toBe('false')
+    expect(dialog?.querySelector('textarea')?.getAttribute('placeholder')).toBe(en.workbench.annotationUnified.placeholder)
+    expect(dialog?.textContent).not.toContain(en.workbench.office.previewHint)
+    expect(dialog?.textContent).not.toContain('temporarily hidden')
+    expect(dialog?.textContent).not.toContain('Continue annotation')
+    mounted.unmount()
+  })
+
+  it.each(['escape', 'cancel button', 'focus moved elsewhere'] as const)(
+    'restores the Office mode keyboard scope after %s without stealing intentional focus',
+    async closeMethod => {
+      let viewerOptions: officePreviewAdapter.OfficePreviewOptions | undefined
+      const setSelectionMode = vi.fn()
+      vi.spyOn(officePreviewAdapter, 'createOfficePreviewSession').mockImplementation(async options => {
+        viewerOptions = options
+        options.onLocation(0, 1)
+        return {
+          destroy: vi.fn(), previous: vi.fn(async () => {}), next: vi.fn(async () => {}),
+          goTo: vi.fn(async () => {}), getPageSize: vi.fn(() => null), getNotes: vi.fn(() => null),
+          renderThumbnail: vi.fn(), fitPage: vi.fn(),
+          fitWidth: vi.fn(), zoomIn: vi.fn(), zoomOut: vi.fn(), resize: vi.fn(),
+          setSelectionMode, clearSelection: vi.fn(),
+        }
+      })
+      const fallback = ref<{ annotationId: string; body: string; reason: string } | null>(null)
+      const data = new ArrayBuffer(1)
+      const element = document.createElement('div')
+      document.body.append(element)
+      const app = createApp({ render: () => h('div', [
+        h(OfficePreviewPanel, {
+          data, format: 'pptx', annotationEnabled: true,
+          onSelectionRequest: () => { fallback.value = { annotationId: 'office-focus', body: 'Draft body', reason: 'office-selection' } },
+        }),
+        h(ArtifactDocumentPanel, {
+          artifact: { ...officeArtifact, name: 'focus.bin', mime: 'application/octet-stream' }, documentFeatures: false,
+          annotationFallback: fallback.value,
+          onWorkbenchEvent: (event: { type: string }) => {
+            if (event.type === 'artifact-annotation-fallback-cancel') fallback.value = null
+          },
+        }),
+        h('button', { class: 'intentional-focus-target' }, 'Elsewhere'),
+      ]) })
+      app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
+      app.use(createPinia())
+      provideArtifactWorkbench(app)
+      app.mount(element)
+      try {
+        await nextTick(); await nextTick()
+        const toggle = element.querySelector<HTMLButtonElement>('.office-preview__request')!
+        const preview = element.querySelector<HTMLElement>('.office-preview')!
+        toggle.click(); await nextTick()
+        expect(document.activeElement).toBe(preview)
+        viewerOptions!.onSelectionCommit!({ format: 'pptx', kind: 'element', slideIndex: 0, shapeId: '1', text: 'Title', truncated: false })
+        await nextTick(); await nextTick()
+        const dialog = element.querySelector<HTMLElement>('[role="dialog"]')!
+        const input = dialog.querySelector<HTMLTextAreaElement>('textarea')!
+        expect(document.activeElement).toBe(input)
+        const elsewhere = element.querySelector<HTMLButtonElement>('.intentional-focus-target')!
+        if (closeMethod === 'escape') {
+          const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+          input.dispatchEvent(escape)
+          expect(escape.defaultPrevented).toBe(true)
+        } else {
+          if (closeMethod === 'focus moved elsewhere') elsewhere.focus()
+          else dialog.querySelector<HTMLButtonElement>('.annotation-comment__actions button:last-child')!.focus()
+          dialog.querySelector<HTMLButtonElement>('.annotation-comment__actions button:last-child')!.click()
+        }
+        await nextTick(); await nextTick()
+        expect(element.querySelector('[role="dialog"]')).toBeNull()
+        expect(toggle.getAttribute('aria-pressed')).toBe('true')
+        if (closeMethod === 'focus moved elsewhere') {
+          expect(document.activeElement).toBe(elsewhere)
+        } else {
+          expect(document.activeElement).toBe(preview)
+          const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+          document.activeElement!.dispatchEvent(escape)
+          await nextTick()
+          expect(escape.defaultPrevented).toBe(true)
+          expect(toggle.getAttribute('aria-pressed')).toBe('false')
+          expect(setSelectionMode).toHaveBeenLastCalledWith(false)
+        }
+      } finally {
+        app.unmount()
+        element.remove()
+      }
+    },
+  )
+
   it('keeps annotation input available in the trusted Vue fallback', async () => {
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
@@ -547,10 +654,10 @@ describe('ArtifactDocumentPanel', () => {
 
     const dialog = mounted.element.querySelector('[role="dialog"]')
     const input = dialog?.querySelector<HTMLTextAreaElement>('textarea')
-    expect(dialog?.textContent).toContain('Continue annotation')
+    expect(dialog?.getAttribute('aria-modal')).toBe('false')
     expect(dialog?.querySelector('img')).toBeNull()
     expect(input?.value).toBe('Initial draft')
-    expect(dialog?.textContent).toContain('Shift + Enter for a new line')
+    expect(dialog?.textContent).toContain(en.workbench.annotationUnified.recordHint)
     if (input) {
       input.value = 'Updated draft'
       input.dispatchEvent(new Event('input', { bubbles: true }))
@@ -583,15 +690,15 @@ describe('ArtifactDocumentPanel', () => {
       type: 'artifact-annotation-fallback-submit',
       payload: { annotationId: 'annotation-1', body: 'Updated draft' },
     })
-    dialog?.querySelector<HTMLButtonElement>('button[type="button"]')?.click()
+    dialog?.querySelector<HTMLButtonElement>('.annotation-comment__actions button:last-child')?.click()
     expect(onWorkbenchEvent).toHaveBeenCalledWith({
       type: 'artifact-annotation-fallback-cancel',
-      payload: { annotationId: 'annotation-1', reason: 'user-cancelled' },
+      payload: { annotationId: 'annotation-1', body: 'Updated draft', reason: 'user-cancelled' },
     })
     mounted.unmount()
   })
 
-  it('uses the compact macOS newline chord in the annotation fallback hint', async () => {
+  it('keeps the blank comment card compact until the user types', async () => {
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)',
     )
@@ -606,9 +713,8 @@ describe('ArtifactDocumentPanel', () => {
     })
     await nextTick()
 
-    expect(mounted.element.querySelector(
-      '.artifact-document__annotation-shortcut-hint',
-    )?.textContent).toContain('⇧ Return for a new line')
+    expect(mounted.element.querySelector('.annotation-comment__actions')).toBeNull()
+    expect(mounted.element.querySelector('textarea')?.getAttribute('placeholder')).toBe(en.workbench.annotationUnified.placeholder)
     mounted.unmount()
   })
 
@@ -689,7 +795,7 @@ describe('ArtifactDocumentPanel', () => {
     const tabs = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
     expect(tabs.map(tab => tab.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
       'Preview',
-      'Versions1',
+      'Version history (1)',
       'Changes1',
     ])
 
@@ -789,7 +895,7 @@ describe('ArtifactDocumentPanel', () => {
     await nextTick()
 
     const tabs = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
-    tabs.find(tab => tab.textContent?.includes('Versions'))?.click()
+    tabs.find(tab => tab.textContent?.includes('Version history'))?.click()
     await nextTick()
     const versionPanel = mounted.element.querySelector('[data-document-section="versions"]')!
     const oldVersion = [...versionPanel.querySelectorAll('li')]
@@ -876,7 +982,7 @@ describe('ArtifactDocumentPanel', () => {
     })
     await nextTick()
     const tabs = [...mounted.element.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
-    tabs.find(tab => tab.textContent?.includes('Versions'))?.click()
+    tabs.find(tab => tab.textContent?.includes('Version history'))?.click()
     await nextTick()
     mounted.element.querySelector<HTMLButtonElement>(
       '[data-artifact-action="restore-revision"]',

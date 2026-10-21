@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ControlSelect from '@/components/ControlSelect.vue'
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useToasts } from '@/composables/useToasts'
@@ -97,7 +98,7 @@ onMounted(() => { void load() })
         role="alert"
         data-testid="desktop-close-behavior-mismatch"
       >{{ t('setup.runtime.closeBehaviorFallbackQuit') }}</span>
-      <select
+      <ControlSelect
         id="desktop-close-behavior-select"
         class="control-input desktop-preferences__select"
         data-testid="desktop-close-behavior-select"
@@ -115,7 +116,7 @@ onMounted(() => { void load() })
         <option value="ask" :disabled="!preferences.canRunInBackground">
           {{ t('setup.runtime.closeBehaviorAsk') }}
         </option>
-      </select>
+      </ControlSelect>
     </div>
     <div v-else class="control-row__control">
       <span class="desktop-preferences__error" role="alert" data-testid="desktop-close-behavior-error">

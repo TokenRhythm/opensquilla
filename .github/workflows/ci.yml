@@ -184,8 +184,10 @@ jobs:
     outputs:
       required_suites: ${{ steps.plan.outputs.required_suites }}
       desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
+      windows_profiles_split: ${{ steps.plan.outputs.windows_profiles_split }}
       python_matrix: ${{ steps.plan.outputs.python_matrix }}
       platform_matrix: ${{ steps.plan.outputs.platform_matrix }}
+      windows_nsis_profile: ${{ steps.plan.outputs.windows_nsis_profile }}
       python_targets: ${{ steps.plan.outputs.python_targets }}
       full_fallback: ${{ steps.plan.outputs.full_fallback }}
       reason_codes: ${{ steps.plan.outputs.reason_codes }}
@@ -276,6 +278,7 @@ jobs:
                   "desktop_matrix",
                   "python_matrix",
                   "platform_matrix",
+                  "windows_nsis_profile",
                   "python_targets",
                   "full_fallback",
                   "reason_codes",
@@ -290,6 +293,11 @@ jobs:
                   elif isinstance(value, (dict, list)):
                       value = json.dumps(value, sort_keys=True, separators=(",", ":"))
                   handle.write(f"{key}={value}\n")
+              windows_profiles_split = any(
+                  cell == {"os": "windows-latest", "shard": "profiles"}
+                  for cell in plan["desktop_matrix"]
+              )
+              handle.write(f"windows_profiles_split={str(windows_profiles_split).lower()}\n")
           PY
 
       - name: Report test timing coverage
@@ -301,6 +309,7 @@ jobs:
           DESKTOP_MATRIX: ${{ steps.plan.outputs.desktop_matrix }}
           PYTHON_MATRIX: ${{ steps.plan.outputs.python_matrix }}
           PLATFORM_MATRIX: ${{ steps.plan.outputs.platform_matrix }}
+          WINDOWS_NSIS_PROFILE: ${{ steps.plan.outputs.windows_nsis_profile }}
           FULL_FALLBACK: ${{ steps.plan.outputs.full_fallback }}
           REASON_CODES: ${{ steps.plan.outputs.reason_codes }}
         shell: bash
@@ -324,6 +333,7 @@ jobs:
           print(f"- Python matrix: `{json.dumps(python_matrix, separators=(',', ':'))}`")
           print(f"- Desktop matrix: `{json.dumps(desktop_matrix, separators=(',', ':'))}`")
           print(f"- Suite cells: `{len(platform_matrix)}`")
+          print(f"- Windows NSIS profile: `{os.environ['WINDOWS_NSIS_PROFILE']}`")
           PY
 
       - name: Summarize merge-group fallback decision
@@ -394,9 +404,9 @@ jobs:
         working-directory: opensquilla-webui
         shell: bash
         run: |
-          # Vite copies public/ verbatim. Prove the canonical normalization
+          # Vite copies public-assets/ verbatim. Prove the canonical normalization
           # strips harmless Finder metadata before the manifest is written.
-          printf 'CI-only Finder metadata\n' > public/.DS_Store
+          printf 'CI-only Finder metadata\n' > public-assets/.DS_Store
           npm run build:artifact
           if [[ -e dist/.DS_Store || -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
             echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
@@ -422,14 +432,129 @@ jobs:
           overwrite: true
 
   frontend-check:
-    name: Frontend tests and package validation
+    name: Frontend type and architecture checks
+    needs: [plan-ci]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Run frontend type checks
+        working-directory: opensquilla-webui
+        run: npm run typecheck
+
+  frontend-unit-tests:
+    name: Frontend unit tests (${{ matrix.shard }}/4)
+    needs: [plan-ci]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Prepare pinned offline Office preview assets
+        working-directory: opensquilla-webui
+        run: npm run prepare:office-assets
+
+      - name: Run frontend unit tests
+        working-directory: opensquilla-webui
+        run: npm run test:unit -- --shard=${{ matrix.shard }}/4
+
+  gateway-contract-linux:
+    name: Gateway Contract determinism (Linux)
+    needs: [plan-ci]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python for Contract generation
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv for Contract generation
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: python scripts/contracts/prepare_codegen_toolchains.py
+
+      - name: Verify deterministic Contract generation
+        shell: bash
+        run: |
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check-determinism --jobs 4
+
+      - name: Run real Gateway Contract toolchain integration
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/src"
+        run: >-
+          uv run --no-sync pytest -q
+          --confcutdir=tests/contracts
+          tests/contracts
+
+      - name: Write Linux Gateway Contract hash manifest
+        run: >-
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
+          --hash-manifest "${RUNNER_TEMP}/gateway-contract-hashes.json"
+
+      - name: Upload Linux Gateway Contract hash manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes.json
+          if-no-files-found: error
+          retention-days: 31
+          overwrite: true
+
+  wheel-webui-roundtrip:
+    name: Frontend sdist-to-wheel round trip
     needs: [plan-ci, frontend-artifact]
-    if: >-
-      ${{ !cancelled()
-          && needs.plan-ci.result == 'success'
-          && needs.frontend-artifact.result == 'success'
-          && (contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation')
-              || contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip')) }}
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -449,87 +574,21 @@ jobs:
           cache: npm
           cache-dependency-path: opensquilla-webui/package-lock.json
 
-      - name: Install frontend dependencies
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        working-directory: opensquilla-webui
-        run: npm ci
-
       - name: Stage verified frontend artifact for Python consumers
         working-directory: opensquilla-webui
         run: node scripts/stage-dist.mjs
 
-      - name: Set up Python for Contract generation
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv for Contract generation
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Install pinned Contract generators
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        run: python scripts/contracts/prepare_codegen_toolchains.py
-
-      - name: Verify deterministic Contract generation
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        shell: bash
-        run: |
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check-determinism --jobs 4
-
-      - name: Run real Gateway Contract toolchain integration
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        env:
-          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
-          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/src"
-        run: >-
-          uv run --no-sync pytest -q
-          --confcutdir=tests/contracts
-          tests/contracts
-
-      - name: Write Linux Gateway Contract hash manifest
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        run: >-
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
-          --hash-manifest "${RUNNER_TEMP}/gateway-contract-hashes.json"
-
-      - name: Upload Linux Gateway Contract hash manifest
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: gateway-contract-hashes-linux
-          path: ${{ runner.temp }}/gateway-contract-hashes.json
-          if-no-files-found: error
-          retention-days: 31
-          overwrite: true
-
-      - name: Run frontend type checks
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        working-directory: opensquilla-webui
-        run: npm run typecheck
-
-      - name: Run frontend unit tests
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
-        working-directory: opensquilla-webui
-        run: npm run test:unit
-
       - name: Set up Python
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Set up uv
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Verify sdist-to-wheel frontend artifact round trip
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'wheel-webui-roundtrip') }}
         shell: bash
         run: |
           package_dir="${RUNNER_TEMP}/webui-package"
@@ -559,7 +618,6 @@ jobs:
             exit 1
           fi
           python scripts/verify_webui_artifact.py \
-            --forbid-personal-bgm \
             --dist src/opensquilla/gateway/static/dist \
             --wheel "${wheels[0]}"
 
@@ -667,22 +725,6 @@ jobs:
           uv run --no-sync pytest -q --confcutdir=tests/contracts tests/contracts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify every Windows Contract role in a separate output tree
-        shell: pwsh
-        env:
-          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
-        run: |
-          npm --prefix opensquilla-webui run test:contract-tooling
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $verificationRoot = Join-Path $env:RUNNER_TEMP ("gateway-verification-" + [guid]::NewGuid())
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write-determinism --jobs 4 --profile verification --output-root $verificationRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root $verificationRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $verificationManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $verificationManifest --profile verification --output-root $verificationRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: Write Windows Gateway Contract hash manifest
         shell: pwsh
         run: |
@@ -699,6 +741,62 @@ jobs:
           retention-days: 31
           overwrite: true
 
+  gateway-contract-verification-windows:
+    name: Complete Gateway Contract verification (Windows)
+    needs: [plan-ci]
+    if: >-
+      ${{ !cancelled()
+          && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: windows-latest
+    # Real-toolchain generation scales with the complete Contract inventory.
+    # Start the complete Windows checks independently of Linux producers; the
+    # required comparison job joins both platforms after their manifests exist.
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: python scripts/contracts/prepare_codegen_toolchains.py
+
+      - name: Verify every Windows Contract role in a separate output tree
+        shell: pwsh
+        env:
+          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
+        run: |
+          npm --prefix opensquilla-webui run test:contract-tooling
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationRoot = Join-Path $env:RUNNER_TEMP ("gateway-verification-" + [guid]::NewGuid())
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write-determinism --jobs 4 --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $verificationManifest --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Upload Windows verification hash manifest
         uses: actions/upload-artifact@v4
         with:
@@ -710,13 +808,14 @@ jobs:
 
   gateway-contract-compare:
     name: Gateway Contract cross-platform hashes
-    needs: [plan-ci, frontend-check, gateway-contract-verification-linux, gateway-contract-windows]
+    needs: [plan-ci, gateway-contract-linux, gateway-contract-verification-linux, gateway-contract-windows, gateway-contract-verification-windows]
     if: >-
       ${{ !cancelled()
           && needs.plan-ci.result == 'success'
-          && needs.frontend-check.result == 'success'
+          && needs.gateway-contract-linux.result == 'success'
           && needs.gateway-contract-verification-linux.result == 'success'
           && needs.gateway-contract-windows.result == 'success'
+          && needs.gateway-contract-verification-windows.result == 'success'
           && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -764,9 +863,174 @@ jobs:
             "${RUNNER_TEMP}/gateway-contract-verification-hashes-windows/gateway-contract-verification-hashes-windows.json"
 
   webui-chat-recovery:
-    name: WebUI chat recovery
+    name: WebUI chat recovery (${{ matrix.suite }})
     needs: [plan-ci, frontend-artifact]
     if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-chat-recovery') }}
+    # Use a runner that permits the real unprivileged Bubblewrap sandbox without
+    # changing host security policy. Migrate before Ubuntu 22.04 retires in April 2027.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [general-1, general-2, general-3, general-4, clipboard, virtualization]
+    env:
+      OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+      OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download verified frontend artifact
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: opensquilla-webui-dist
+          path: opensquilla-webui/dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: 'npm'
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install Gateway dependencies
+        run: uv sync --frozen
+
+      - name: Validate renderer capacity inventory
+        id: capacity-inventory
+        # Pure WebUI plans do not select Python shards. Run the existing
+        # admission contract here before a new tag can escape both phases.
+        run: >-
+          uv run --no-sync pytest
+          tests/test_ci/test_webui_browser_suites.py
+          -q
+
+      - name: Install and verify Linux guest sandbox
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          bwrap --version
+          # Exercise the real unprivileged namespace boundary. Keep host
+          # AppArmor and sysctl restrictions intact; a denial must fail here.
+          bwrap --unshare-user --unshare-net --ro-bind / / --proc /proc /bin/true
+          uv run python - <<'PY'
+          import json
+          from dataclasses import asdict
+          from opensquilla.sandbox.backend.linux_readiness import probe_bwrap
+
+          probe = probe_bwrap()
+          print(json.dumps(asdict(probe), sort_keys=True))
+          if not probe.available or not probe.supports_perms:
+              raise SystemExit("Linux guest sandbox preflight failed: " + probe.message)
+          PY
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Prepare pinned offline Office preview assets
+        # Isolated real-Gateway fixtures start Vite directly and use source assets.
+        working-directory: opensquilla-webui
+        run: |
+          npm run prepare:office-assets
+          npm run prepare:office-assets -- --offline
+
+      - name: Stage verified frontend artifact for Gateway
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
+
+      - name: Resolve Playwright browser revision
+        id: playwright-browser
+        shell: bash
+        run: |
+          revision="$(node -e "const b=require('./opensquilla-webui/node_modules/playwright-core/browsers.json').browsers.find((item)=>item.name==='chromium'); if(!b)process.exit(2); process.stdout.write(b.revision)")"
+          printf 'revision=%s\n' "${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore Playwright browser
+        id: playwright-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
+
+      - name: Install Chromium
+        working-directory: opensquilla-webui
+        run: npx playwright install --with-deps chromium
+
+      - name: Seed Playwright browser cache from nightly main
+        if: ${{ github.event_name == 'schedule' && steps.playwright-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
+
+      - name: Run production-dist chat and Goal recovery browser contracts
+        if: ${{ startsWith(matrix.suite, 'general-') }}
+        working-directory: opensquilla-webui
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ../.github/scripts/webui_browser_suites.py "${{ matrix.suite }}" > "${RUNNER_TEMP}/browser-specs.txt"
+          mapfile -t specs < "${RUNNER_TEMP}/browser-specs.txt"
+          npm run test:e2e -- "${specs[@]}" --project=chromium --workers=2
+
+      - name: Run production-dist message clipboard contracts serially
+        if: ${{ matrix.suite == 'clipboard' }}
+        working-directory: opensquilla-webui
+        # Native copy/paste shares the OS clipboard. Keep this dedicated config
+        # separate from the parallel browser suite and preserve first-failure evidence.
+        run: >-
+          npm run test:e2e:message-copy --
+          --workers=1
+          --retries=0
+          --trace=retain-on-failure
+          --output=test-results/message-copy
+
+
+      - name: Run production-dist long-list virtualization contracts
+        if: ${{ matrix.suite == 'virtualization' }}
+        working-directory: opensquilla-webui
+        shell: bash
+        # This runner owns the absolute performance gates without other suites.
+        run: |
+          set -euo pipefail
+          python ../.github/scripts/webui_browser_suites.py virtualization > "${RUNNER_TEMP}/browser-specs.txt"
+          mapfile -t specs < "${RUNNER_TEMP}/browser-specs.txt"
+          npm run test:e2e -- "${specs[@]}" --project=chromium --workers=1 --retries=0 --grep-invert=@capacity --output=test-results/virtualization
+
+      - name: Upload chat recovery evidence
+        id: chat-traces
+        continue-on-error: true
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-chat-recovery-${{ matrix.suite }}-attempt-${{ github.run_attempt }}
+          path: opensquilla-webui/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Warn if chat-traces upload failed
+        if: ${{ !cancelled() && steps.chat-traces.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  webui-capacity:
+    name: WebUI renderer capacity
+    needs: [plan-ci, frontend-artifact]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'webui-capacity') }}
     # Use a runner that permits the real unprivileged Bubblewrap sandbox without
     # changing host security policy. Migrate before Ubuntu 22.04 retires in April 2027.
     runs-on: ubuntu-22.04
@@ -805,6 +1069,15 @@ jobs:
       - name: Install Gateway dependencies
         run: uv sync --frozen
 
+      - name: Validate renderer capacity inventory
+        id: capacity-inventory
+        # Pure WebUI plans do not select Python shards. Run the existing
+        # admission contract here before a new tag can escape both phases.
+        run: >-
+          uv run --no-sync pytest
+          tests/test_ci/test_webui_browser_suites.py
+          -q
+
       - name: Install and verify Linux guest sandbox
         shell: bash
         run: |
@@ -828,6 +1101,13 @@ jobs:
       - name: Install frontend dependencies
         working-directory: opensquilla-webui
         run: npm ci
+
+      - name: Prepare pinned offline Office preview assets
+        # Isolated real-Gateway fixtures start Vite directly and use source assets.
+        working-directory: opensquilla-webui
+        run: |
+          npm run prepare:office-assets
+          npm run prepare:office-assets -- --offline
 
       - name: Stage verified frontend artifact for Gateway
         working-directory: opensquilla-webui
@@ -858,62 +1138,34 @@ jobs:
           path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
           key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright-browser.outputs.revision }}
 
-      - name: Run production-dist chat and Goal recovery browser contracts
+      - name: Run production-dist renderer capacity contracts
+        id: webui-capacity
         working-directory: opensquilla-webui
+        # A dedicated runner isolates absolute thresholds; the aggregate gate
+        # requires this whole job whenever the capacity suite is planned.
         run: >-
           npm run test:e2e --
-          assistant-activity.spec.ts
-          auth-connection-recovery.spec.ts
-          chat-send-lifecycle.spec.ts
-          chat-send-lifecycle.real.spec.ts
-          cross-window-sync.real.spec.ts
-          composer-paste.spec.ts
-          history-hydration.spec.ts
-          idle-chat-recovery.spec.ts
-          modern-session-recovery.spec.ts
-          provider-error-experience.spec.ts
-          router-physical-model.spec.ts
-          user-message-newlines.spec.ts
-          session-created-card.spec.ts
-          session-switch-transport.spec.ts
-          new-task-ensemble-race.spec.ts
-          ensemble-new-task-legacy-turn.spec.ts
-          goal-mode.spec.ts
-          plan-questionnaire-lifecycle.spec.ts
-          plan-presentation.spec.ts
-          task-progress.spec.ts
-          queue-steer.spec.ts
-          share.spec.ts
-          --project=chromium
-          --workers=2
-
-      # Keep absolute performance gates isolated from other renderer processes.
-      - name: Run production-dist long-list virtualization contracts
-        working-directory: opensquilla-webui
-        run: >-
-          npm run test:e2e --
-          chat-virtualization.spec.ts
-          conversation-minimap.spec.ts
-          floating-composer.spec.ts
-          virtualized-logs.spec.ts
           long-task-resilience.spec.ts
-          native-gateway.spec.ts
-          sidebar-drag.spec.ts
-          sidebar-hover-geometry.spec.ts
           sidebar-virtualization.spec.ts
           --project=chromium
           --workers=1
           --retries=0
-          --output=test-results/virtualization
+          --grep=@capacity
+          --output=test-results/capacity
 
-      - name: Upload chat recovery traces
+      - name: Upload chat recovery evidence
         id: chat-traces
         continue-on-error: true
-        if: ${{ failure() }}
+        if: ${{ failure() || steps.webui-capacity.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: webui-chat-recovery-attempt-${{ github.run_attempt }}
-          path: opensquilla-webui/test-results/
+          name: webui-capacity-attempt-${{ github.run_attempt }}
+          # Successful capacity runs retain only the small metric reports.
+          # Failures still preserve the complete first-failure trace tree.
+          path: |
+            opensquilla-webui/test-results/capacity/**/long-task-performance.json
+            opensquilla-webui/test-results/capacity/**/sidebar-performance.json
+            ${{ job.status == 'failure' && 'opensquilla-webui/test-results/' || '' }}
           if-no-files-found: ignore
           retention-days: 14
 
@@ -1013,8 +1265,11 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          npm run test:local-build
           node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
+          node --test scripts/test-electron-download-proxy.mjs
+          node --test scripts/test-electron-download-tls.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
@@ -1034,14 +1289,24 @@ jobs:
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
           node scripts/test-desktop-profile-consolidation.mjs
+          node scripts/test-desktop-startup-preflight.mjs
+          node scripts/test-desktop-startup-toml.mjs
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
           node scripts/test-desktop-window-lifecycle.mjs
+          node scripts/test-desktop-quit.mjs
+          node scripts/test-desktop-close-confirmation.mjs
+          node scripts/test-browser-quit-confirmation.mjs
+          node scripts/test-desktop-quit-failure.mjs
+          node scripts/test-desktop-quit-dialog.mjs
+          node scripts/test-desktop-process-cleanup.mjs
+          node scripts/test-desktop-process-cleanup-lifecycle.mjs
           node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
           node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          node scripts/test-working-preview-refresh.mjs
           node scripts/test-resource-file-actions.mjs
           node --test scripts/fixtures/workspace-inline-preview/provider.test.mjs
           npm run test:live-html-harness
@@ -1051,6 +1316,7 @@ jobs:
           node scripts/test-router-tier-normalization.mjs
           node scripts/test-desktop-router-config.mjs
           node scripts/test-onboarding-routing.mjs
+          node --test scripts/test-e2e-posix-process-group.mjs
           node scripts/test-ci-case-telemetry.mjs
           node scripts/test-telemetry-consent.mjs
           node scripts/test-telemetry-early-spool.mjs
@@ -1143,10 +1409,11 @@ jobs:
           TARGETED_PYTEST_TARGETS: ${{ needs.plan-ci.outputs.python_targets }}
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           pytest_targets=(
             tests/unit
+            tests/test_ci/test_plan_ci.py::test_stress_inventory_cannot_disappear_between_default_and_dedicated_lanes
           )
           if [[ -n "${TARGETED_PYTEST_TARGETS}" ]]; then
             IFS=',' read -r -a affected_targets <<< "${TARGETED_PYTEST_TARGETS}"
@@ -1245,50 +1512,13 @@ jobs:
         run: |
           set -euo pipefail
           uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
-          regression_args=()
-          if [[ "${{ matrix.shard }}" == "desktop-installer-contracts" ]]; then
-            # Recheck every failed or unfinished file from this shard before
-            # starting its full run; other shards retain the environment probe.
-            regression_args+=(
-              tests/test_ci/test_architecture_import_contracts.py
-              tests/test_engine/turn_runner/test_stage_test_boundaries.py
-              tests/test_engine/test_runtime_artifacts.py
-              tests/test_engine/test_tokenjuice_tool_result_projection.py
-              tests/test_tools/test_tool_upgrade_compatibility.py
-              tests/test_gateway/test_goal_rpc.py
-              tests/test_tools/test_dispatch_legacy_coverage.py
-              tests/unit/cli/repl/test_slash_bridge.py
-            )
-          elif [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
-            regression_args+=(
-              tests/test_gateway/test_channel_turn_ingress.py
-              tests/test_gateway/test_goal_registry_cleanup.py
-              tests/test_gateway/test_task_runtime_terminal_cleanup.py
-              tests/test_gateway/test_task_runtime_wait_slots.py
-              tests/test_gateway/test_goal_turn_authority.py
-              tests/test_gateway/test_task_progress_projection.py
-              tests/functional/test_gateway_silent_reply_process_e2e.py
-            )
-          elif [[ "${{ matrix.shard }}" == "recovery-migration" ]]; then
-            regression_args+=(
-              tests/test_sandbox/test_windows_shell_process_runtime.py
-              tests/test_live_long_task_case_driver.py
-            )
-          elif [[ "${{ matrix.shard }}" == "core" ]]; then
-            regression_args+=(
-              tests/test_cli/test_chat_cmd.py
-              tests/test_engine/test_cancelled_turn_segments.py
-              tests/test_tools/test_shell_workdir.py
-              tests/test_sandbox/test_shell_code_network_hints.py
-              tests/test_tools/test_shell_runtime_preflight.py
-            )
-          fi
+          # Shard regressions run in the full step below. Keep the small
+          # environment smoke common to every runner here.
           uv run pytest \
             tests/test_sandbox/test_trusted_sandbox_execution.py \
             tests/test_tools/test_approval_unification.py \
             tests/test_live_multi_provider_matrix.py \
             tests/test_live_provider_profile_smoke.py \
-            "${regression_args[@]}" \
             -vv --tb=short -o faulthandler_timeout=60 --maxfail=3 \
             2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
 
@@ -1296,10 +1526,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           worker_args=()
-          if [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+          family="${{ matrix.shard }}"
+          family="${family%-*}"
+          if [[ "${family}" == "gateway-sqlite" ]]; then
             # Gateway tests start subprocesses and touch shared SQLite/logging
             # state.  Match the bounded Windows shard fan-out instead of
             # letting the Ubuntu default start four competing workers.
@@ -1313,6 +1545,7 @@ jobs:
 
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
+            --platform ubuntu \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             "${worker_args[@]}" \
@@ -1346,6 +1579,41 @@ jobs:
         if: ${{ !cancelled() && steps.ubuntu-report.outcome == 'failure' }}
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  python-stress:
+    name: Python capacity and soak tests
+    needs: plan-ci
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'python-stress') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.15"
+      - name: Install locked test dependencies
+        run: uv sync --frozen --extra dev
+      - name: Run isolated capacity checks
+        # One controller process, no xdist pool or duplicate preflight. Keep
+        # this target list in sync when admitting another stress test.
+        run: >-
+          uv run --no-sync pytest
+          tests/test_gateway/test_task_runtime_terminal_cleanup.py
+          -m stress -n 0 -vv --tb=short --durations=10
+          --junitxml=${{ runner.temp }}/python-stress.xml
+      - name: Preserve capacity check results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-stress-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/python-stress.xml
+          if-no-files-found: error
+          retention-days: 14
 
   windows-full:
     name: Windows high-risk (${{ matrix.shard }})
@@ -1390,6 +1658,13 @@ jobs:
         run: |
           printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Native metadata parity needs Windows volume IDs; the older WebUI
+          # build runtime reports zero. Pin the validated native-test runtime.
+          node-version: '22.23.3'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1474,6 +1749,8 @@ jobs:
             python --version
             uv --version
             uv run pytest --version
+            node --version
+            node -p 'process.execPath'
           } >> "${CI_REPORT_DIR}/environment.txt" 2>&1
 
       - name: Provision distinct Windows test volumes
@@ -1521,7 +1798,20 @@ jobs:
           }
 
       - name: Preflight offline test environment
+        # The four replacements for the former gateway-sqlite-5 share one
+        # preflight owner, including targeted plans that omit the original cell.
+        if: >-
+          ${{
+            !contains(fromJSON('["gateway-sqlite-9","gateway-sqlite-10","gateway-sqlite-11"]'), matrix.shard) ||
+            (!contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'gateway-sqlite-5') &&
+              (matrix.shard == 'gateway-sqlite-9' ||
+                (!contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'gateway-sqlite-9') &&
+                  (matrix.shard == 'gateway-sqlite-10' ||
+                    !contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'gateway-sqlite-10')))))
+          }}
         shell: bash
+        env:
+          PLANNED_WINDOWS_SHARDS: ${{ toJSON(fromJSON(needs.plan-ci.outputs.python_matrix).windows) }}
         run: |
           set -euo pipefail
           uv run python -c "import pathlib, subprocess, sys, opensquilla; print('cwd:', pathlib.Path.cwd().resolve()); print('git:', subprocess.check_output(['git', 'rev-parse', '--show-toplevel', 'HEAD'], text=True).strip()); print('python:', sys.executable); print('package:', pathlib.Path(opensquilla.__file__).resolve())"
@@ -1529,32 +1819,24 @@ jobs:
           shard="${{ matrix.shard }}"
           family="${shard%-*}"
           if [[ "${family}" == "desktop-installer-contracts" ]]; then
-            # Recheck every failed or unfinished file from this shard before
-            # starting its full run; other shards retain the environment probe.
+            # Retain regression smoke for sibling partitions in this family.
             regression_args+=(
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
               tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tool_concurrency.py
               tests/test_engine/test_tokenjuice_tool_result_projection.py
               tests/test_tools/test_tool_upgrade_compatibility.py
               tests/test_gateway/test_goal_rpc.py
               tests/test_tools/test_dispatch_legacy_coverage.py
               tests/unit/cli/repl/test_slash_bridge.py
             )
-          elif [[ "${family}" == "gateway-sqlite" ]]; then
-            regression_args+=(
-              tests/test_gateway/test_channel_turn_ingress.py
-              tests/test_gateway/test_goal_registry_cleanup.py
-              tests/test_gateway/test_task_runtime_terminal_cleanup.py
-              tests/test_gateway/test_task_runtime_wait_slots.py
-              tests/test_gateway/test_goal_turn_authority.py
-              tests/test_gateway/test_task_progress_projection.py
-              tests/functional/test_gateway_silent_reply_process_e2e.py
-            )
           elif [[ "${family}" == "recovery-migration" ]]; then
             regression_args+=(
               tests/test_sandbox/test_windows_shell_process_runtime.py
               tests/test_live_long_task_case_driver.py
+              tests/test_ci/test_upgrade_baselines.py
+              tests/test_engine/test_runtime_router_fallback.py
             )
           elif [[ "${family}" == "core" ]]; then
             regression_args+=(
@@ -1565,7 +1847,32 @@ jobs:
               tests/test_tools/test_shell_workdir.py
               tests/test_sandbox/test_shell_code_network_hints.py
               tests/test_tools/test_shell_runtime_preflight.py
+              tests/test_tools/test_shell_blocking_launch.py
+              tests/test_ci/test_rpc_architecture_contracts.py
+              tests/test_skills/test_hub_management_service.py
             )
+          elif [[ "${family}" == "gateway-sqlite" ]]; then
+            regression_args+=(
+              tests/test_gateway/test_native_attachment_import.py
+              tests/test_gateway/test_recovery_scheduler.py
+              tests/test_gateway/test_goal_user_input.py
+              tests/test_gateway/test_manual_compaction_contract.py
+              tests/test_gateway/test_sandbox_token_rpc_workers.py
+              tests/test_live_provider_profile_gateway_e2e.py
+            )
+          fi
+          # Every selected physical owner is mandatory in CI result. Retain
+          # sibling smoke only when its owner is absent from this partial plan.
+          # Invalid/missing plans or failed inventory must stop before filtering.
+          if (( ${#regression_args[@]} )); then
+            owned_files=$(uv run python .github/scripts/windows_test_shards.py list "${shard}" --platform windows --planned-windows-shards "${PLANNED_WINDOWS_SHARDS}" | tr -d '\r')
+            sibling_regressions=()
+            for path in "${regression_args[@]}"; do
+              if ! grep -Fxq -- "${path}" <<< "${owned_files}"; then
+                sibling_regressions+=("${path}")
+              fi
+            done
+            regression_args=("${sibling_regressions[@]}")
           fi
           # Windows workers hit access violations during timed stack dumps.
           # Related frame-race report: python/cpython#140815. Disable only
@@ -1581,9 +1888,11 @@ jobs:
 
       - name: Test Windows shard
         shell: bash
+        env:
+          PLANNED_PLATFORM_MATRIX: ${{ needs.plan-ci.outputs.platform_matrix }}
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not stress and not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
           maxfail_args=()
           if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             maxfail_args+=(--maxfail=3)
@@ -1591,6 +1900,10 @@ jobs:
 
           shard="${{ matrix.shard }}"
           family="${shard%-*}"
+          delegate_args=()
+          if [[ "${shard}" == "desktop-installer-contracts-1" ]]; then
+            delegate_args+=(--delegate-bundle --planned-platform-matrix "${PLANNED_PLATFORM_MATRIX}")
+          fi
           worker_args=()
           if [[ "${family}" == "recovery-migration" ||
                 "${family}" == "gateway-sqlite" ||
@@ -1610,10 +1923,12 @@ jobs:
           # Pass the same timer override to both parallel and serial phases.
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
+            --platform windows \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             "${worker_args[@]}" \
+            "${delegate_args[@]}" \
             -- \
             -vv --tb=short -o faulthandler_timeout=0 \
             -m "${markers}" \
@@ -1659,6 +1974,121 @@ jobs:
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
 
+  windows-bundle:
+    name: Windows bundle (${{ matrix.shard }}/4)
+    needs: plan-ci
+    if: >-
+      ${{ !cancelled() && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-high-risk')
+          && contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'desktop-installer-contracts-1') }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      UV_PYTHON: "3.12"
+      PYTHONPATH: ${{ github.workspace }}
+      OPENSQUILLA_TURN_CALL_LOG: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+      - name: Configure runtime directories
+        shell: bash
+        run: |
+          printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.3'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        shell: bash
+        run: uv sync --extra dev --extra recommended --extra mcp --frozen
+      - name: Test bundle partition
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bundle-report"
+          uv run python .github/scripts/bundle_test_shards.py run \
+            --shard "${{ matrix.shard }}" \
+            --output-dir "${RUNNER_TEMP}/bundle-report" \
+            2>&1 | tee "${RUNNER_TEMP}/bundle-report/pytest.log"
+      - name: Upload required bundle report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bundle-report/*.json
+            ${{ runner.temp }}/bundle-report/*.xml
+            ${{ runner.temp }}/bundle-report/pytest.log
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-bundle-coverage:
+    name: Windows bundle coverage
+    needs: [plan-ci, windows-bundle]
+    if: >-
+      ${{ !cancelled() && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-high-risk')
+          && contains(fromJSON(needs.plan-ci.outputs.python_matrix).windows, 'desktop-installer-contracts-1') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download bundle partition 1
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-1-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/1
+      - name: Download bundle partition 2
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-2-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/2
+      - name: Download bundle partition 3
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-3-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/3
+      - name: Download bundle partition 4
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-bundle-4-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-reports/4
+      - name: Verify all bundle cases execute exactly once
+        if: ${{ !cancelled() }}
+        run: >-
+          python .github/scripts/bundle_test_shards.py verify
+          --reports-dir "${{ runner.temp }}/bundle-reports"
+          --output "${{ runner.temp }}/bundle-coverage.json"
+      - name: Upload bundle coverage proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle-coverage-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle-coverage.json
+          if-no-files-found: error
+          retention-days: 14
+
   macos-recovery:
     name: macOS profile recovery and native no-replace (3.12)
     needs: plan-ci
@@ -1701,6 +2131,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -1731,6 +2166,9 @@ jobs:
             tests/test_recovery
             tests/test_migration/test_opensquilla_home_migration.py
             tests/test_desktop/test_electron_startup_contract.py
+            tests/test_desktop/test_process_cleanup.py
+            tests/test_desktop/test_posix_quit_process_cleanup.py
+            tests/test_mcp/test_stdio_client.py
             tests/test_engine/test_request_execution_identity.py
             tests/test_gateway/test_session_model_routing_rpc.py
             tests/test_tools/test_execution_status.py
@@ -1760,6 +2198,21 @@ jobs:
             tests/test_persistence/test_migration_compatibility.py
             tests/test_migrations/test_v045_goal_runtime_accounting.py
             tests/test_tools/test_plan_access.py
+            tests/test_sandbox/test_run_context.py
+            tests/test_sandbox/test_run_context_grants.py
+            tests/test_sandbox/test_user_grants_workers.py
+            tests/test_sandbox/test_user_grants_service_workers.py
+            tests/test_sandbox/test_user_grants_mutation_order.py
+            tests/test_sandbox/test_startup_without_canaries.py
+            tests/test_gateway/test_rpc_run_mode_preference.py
+            tests/test_gateway/test_rpc_sandbox_setup.py
+            tests/test_gateway/test_admission_preparation.py
+            tests/test_gateway/test_project_workspace_execution.py
+            tests/test_gateway/test_full_policy_preparation_workers.py
+            tests/test_gateway/test_sandbox_policy_workers.py
+            tests/test_scripts/test_verify_webui_artifact.py
+            tests/test_scripts/test_stage_webui_artifact.py
+            tests/test_packaging/test_webui_build_contract.py
             -vv
             --tb=short
             -o faulthandler_timeout=60
@@ -1801,6 +2254,12 @@ jobs:
         if: ${{ !cancelled() && steps.macos-report.outcome == 'failure' }}
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  desktop-native-probes:
+    name: Desktop native platform probes
+    needs: plan-ci
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-recovery-e2e') }}
+    uses: ./.github/workflows/desktop-native-probes.yml
 
   desktop-recovery-e2e:
     # Every matrix cell gets a fresh hosted runner.  Keep ownership and the
@@ -1896,100 +2355,6 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
-      - name: Verify recommended PTY and managed execution on the native platform
-        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # This probe fails when the recommended backend is absent; the
-          # optional-dependency skip in the core pytest suite cannot mask it.
-          uv run --no-sync python desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
-            2>&1 | tee "${CI_REPORT_DIR}/pty-capability.log"
-          uv run --no-sync pytest \
-            tests/test_tools/test_shell_process_isolation.py::test_unified_exec_real_pty_reports_tty_and_accepts_input \
-            -vv --tb=short \
-            2>&1 | tee "${CI_REPORT_DIR}/pty-managed-execution.log"
-
-      - name: Verify MCP transports and Desktop bridge on the native platform
-        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv run --no-sync pytest \
-            tests/test_mcp tests/test_mcp_server \
-            tests/test_desktop/test_gateway_functional_probes.py::test_mcp_probe_uses_real_stdio_server_and_gateway \
-            -vv --tb=short \
-            2>&1 | tee "${CI_REPORT_DIR}/mcp-transports.log"
-
-      - name: Verify the frozen production MCP probe and bridge
-        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          uv sync --extra dev --extra recommended --extra mcp --group desktop-build --frozen
-          uv run --no-sync python desktop/electron/scripts/verify-mcp-frozen.py \
-            --output-dir "${CI_REPORT_DIR}/mcp-frozen" \
-            2>&1 | tee "${CI_REPORT_DIR}/mcp-frozen.log"
-
-      - name: Build production Docker image and verify MCP
-        if: ${{ runner.os == 'Linux' && (matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all') }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
-          mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
-          docker build --file Dockerfile --tag "${mcp_image}" \
-            --build-arg OPENSQUILLA_FORBID_PERSONAL_BGM=1 . \
-            2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
-          docker image inspect --format '{{json .Size}}' "${mcp_image}" \
-            | tee "${CI_REPORT_DIR}/mcp-docker-size-bytes.json"
-          docker run --rm -i --entrypoint python \
-            --mount "type=bind,source=${GITHUB_WORKSPACE}/tests/test_mcp/fixtures,target=/mcp-fixtures,readonly" \
-            "${mcp_image}" - <<'PY' 2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-smoke.log"
-          import asyncio
-          import json
-          import sys
-          from importlib.metadata import version
-
-          from mcp import Client
-          from mcp_types import LATEST_PROTOCOL_VERSION
-
-          from opensquilla.mcp.stdio import MCPStdioClient
-          from opensquilla.mcp.types import MCPServerConfig
-          from opensquilla.mcp_server import create_mcp_server
-
-          async def check():
-              sdk_version = version("mcp")
-              assert sdk_version == "2.2.0", sdk_version
-              async with Client(create_mcp_server(), mode="auto") as server:
-                  assert server.protocol_version == LATEST_PROTOCOL_VERSION
-                  tools = sorted(tool.name for tool in (await server.list_tools()).tools)
-              assert tools == sorted([
-                  "conversations_list", "session_resolve", "messages_read",
-                  "messages_send", "events_wait", "transcript_export",
-              ]), tools
-              for fixture, arguments, tool in [
-                  ("fastmcp_server.py", [], "ping"),
-                  ("legacy_server.py", ["normal"], "echo"),
-              ]:
-                  client = MCPStdioClient(MCPServerConfig(
-                      name="container-probe", transport="stdio", command=sys.executable,
-                      args=["-u", "/mcp-fixtures/" + fixture, *arguments],
-                      tool_timeout_seconds=10,
-                  ))
-                  try:
-                      await client.connect()
-                      assert [item.name for item in await client.list_tools()] == [tool]
-                      result = await client.call_tool(tool, {"text": "container-mcp"})
-                      assert not result.is_error and result.content == "container-mcp"
-                  finally:
-                      await client.close()
-              print(json.dumps({"sdkVersion": sdk_version, "tools": tools,
-                                "stdioPeers": ["modern", "legacy"]}))
-
-          asyncio.run(asyncio.wait_for(check(), timeout=60))
-          PY
-
       - name: Install Desktop dependencies
         working-directory: desktop/electron
         shell: bash
@@ -2050,16 +2415,14 @@ jobs:
           set -euo pipefail
           npm run test:e2e -- \
             history-hydration.spec.ts \
+            plan-presentation.spec.ts task-progress.spec.ts goal-mode.spec.ts \
             --project=chromium \
             --workers=1 \
-            --grep "@session-hang-recovery" \
+            --grep "@session-hang-recovery|@plan-goal-runtime" \
             --retries=0 \
+            --trace retain-on-failure \
+            --output "${CI_REPORT_DIR}/session-hang-recovery-results" \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
-          npm run test:e2e -- \
-            plan-presentation.spec.ts task-progress.spec.ts goal-mode.spec.ts \
-            --project=chromium --workers=1 --retries=0 \
-            --grep "@plan-goal-runtime" \
-            2>&1 | tee "${CI_REPORT_DIR}/plan-goal-runtime.log"
 
       - name: Run cross-platform modern session recovery contracts
         if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
@@ -2073,6 +2436,8 @@ jobs:
           npm run test:e2e -- \
             modern-session-recovery.spec.ts \
             --project=chromium --workers=1 --retries=0 \
+            --trace retain-on-failure \
+            --output "${CI_REPORT_DIR}/modern-session-recovery-results" \
             2>&1 | tee "${CI_REPORT_DIR}/modern-session-recovery.log"
 
       - name: Install Desktop workbench browser
@@ -2110,6 +2475,9 @@ jobs:
         run: npm run build
 
       - name: Verify compiled Desktop Router against Gateway provider mutations
+        # Keep these checks in their original cells; dedicated profile scripts
+        # reuse the compiled Desktop but do not duplicate the Router tests.
+        if: ${{ !startsWith(matrix.shard, 'profiles-') }}
         env:
           OPENSQUILLA_REQUIRE_DESKTOP_ROUTER_BRIDGE: '1'
         run: uv run --no-sync pytest -q tests/test_desktop/test_router_provider_bridge.py tests/test_desktop/test_router_catalog_generation.py
@@ -2118,6 +2486,7 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         env:
+          PLANNED_DESKTOP_MATRIX: ${{ needs.plan-ci.outputs.desktop_matrix }}
           OPENSQUILLA_DESKTOP_CONSOLIDATION_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/consolidated-primary.png
           OPENSQUILLA_DESKTOP_IMPORT_SCREENSHOT_DIR: ${{ runner.temp }}/desktop-recovery-e2e/profile-import-screenshots
         run: |
@@ -2127,6 +2496,9 @@ jobs:
             local name="$1"
             local script="$2"
             local attempt="$3"
+            if [[ "${RUNNER_OS}" == "Linux" && "${name}" == "profile-import-flow" ]]; then
+              local -x DEBUG="${DEBUG:+${DEBUG},}pw:browser"
+            fi
             local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"
             local telemetry_path="${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
             local telemetry=(
@@ -2178,22 +2550,11 @@ jobs:
           )
 
           # Retry only a single case for narrowly identified hosted-runner
-          # handoff/input failures.  Generic timeouts, connection failures,
+          # environment/input failures.  Generic timeouts, connection failures,
           # crashes, assertion errors, and product output mismatches are not
           # retryable.  Case + OS binding prevents a coincidental message in
           # another functional assertion from matching.
           rules = (
-              {
-                  "id": "windows-delete-helper-handoff-timeout-v1",
-                  "os": "Windows",
-                  "cases": {"desktop-cleanup-flow"},
-                  "pattern": re.compile(
-                      r"^Error: Timed out waiting for post-exit delete-all helper completion:"
-                      r"\s*; pending synthetic targets: .+$",
-                      re.MULTILINE,
-                  ),
-                  "companion_patterns": (),
-              },
               {
                   "id": "windows-isolated-acl-worker-timeout-v1",
                   "os": "Windows",
@@ -2362,6 +2723,14 @@ jobs:
           PY
           }
 
+          select_windows_profile_cases() {
+            python ../../.github/scripts/windows_profile_cases.py select \
+              --shard "${{ matrix.shard }}" \
+              --planned-desktop-matrix "${PLANNED_DESKTOP_MATRIX}" \
+              --report-dir "${CI_REPORT_DIR}" | tr -d '\r' > "${CI_REPORT_DIR}/profile-entries.txt"
+            mapfile -t entries < "${CI_REPORT_DIR}/profile-entries.txt"
+          }
+
           case "${{ matrix.shard }}" in
             all)
               entries=(
@@ -2372,6 +2741,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
@@ -2389,20 +2759,30 @@ jobs:
               fi
               ;;
             profiles)
-              entries=(
-                'onboarding-flow:scripts/test-onboarding-flow.mjs'
-                'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
-                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
-                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
-                'profile-import-flow:scripts/test-profile-import-flow.mjs'
-                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
-              )
+              if [[ "${RUNNER_OS}" == "Windows" ]]; then
+                # Browser/Router checks remain here. The validated six cells
+                # own the Electron scripts on separate Windows runners.
+                select_windows_profile_cases
+              else
+                entries=(
+                  'onboarding-flow:scripts/test-onboarding-flow.mjs'
+                  'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
+                  'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                  'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                  'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                  'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+                )
+              fi
+              ;;
+            profiles-*)
+              select_windows_profile_cases
               ;;
             ownership)
               entries=(
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
               )
               ;;
@@ -2411,6 +2791,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'desktop-quit-interaction:scripts/test-desktop-quit-native-acceptance.mjs'
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
@@ -2496,7 +2877,24 @@ jobs:
           set -euo pipefail
           test -s "${CI_REPORT_DIR}/environment.txt"
           test -s "${CI_REPORT_DIR}/first-failure.txt"
-          test -s "${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+          if [[ "${RUNNER_OS}" == "Windows" && "${{ matrix.shard }}" == 'profiles' ]]; then
+            test -s "${CI_REPORT_DIR}/windows-profile-manifest.json"
+            test -f "${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+          else
+            test -s "${CI_REPORT_DIR}/desktop-e2e-cases.jsonl"
+          fi
+
+      - name: Upload required Windows profiles execution evidence
+        if: ${{ always() && runner.os == 'Windows' && (matrix.shard == 'profiles' || startsWith(matrix.shard, 'profiles-')) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-profiles-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/desktop-recovery-e2e/windows-profile-manifest.json
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload Desktop recovery summary
         id: desktop-summary
@@ -2519,6 +2917,8 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
             ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/*.json
+            ${{ runner.temp }}/desktop-recovery-e2e/desktop-quit-native-acceptance/*.png
           if-no-files-found: error
           retention-days: 14
 
@@ -2542,6 +2942,79 @@ jobs:
         if: ${{ !cancelled() && steps.desktop-failure.outcome == 'failure' }}
         shell: bash
         run: echo "::warning::Diagnostic report upload failed; test and cleanup results remain authoritative."
+
+  windows-profiles-coverage:
+    name: Windows profiles exact-once coverage
+    needs: [plan-ci, desktop-recovery-e2e]
+    if: >-
+      ${{ !cancelled() && needs.plan-ci.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'desktop-recovery-e2e')
+          && needs.plan-ci.outputs.windows_profiles_split == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download Windows profiles evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles
+      - name: Download Windows profiles-onboarding-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-onboarding-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-onboarding-flow
+      - name: Download Windows profiles-onboarding-first-chat evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-onboarding-first-chat-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-onboarding-first-chat
+      - name: Download Windows profiles-profile-consolidation-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-profile-consolidation-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-profile-consolidation-flow
+      - name: Download Windows profiles-primary-repair-accessibility evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-primary-repair-accessibility-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-primary-repair-accessibility
+      - name: Download Windows profiles-profile-import-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-profile-import-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-profile-import-flow
+      - name: Download Windows profiles-desktop-cleanup-flow evidence
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/download-required-artifact
+        with:
+          name: windows-profiles-profiles-desktop-cleanup-flow-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-reports/profiles-desktop-cleanup-flow
+      - name: Verify all six Windows profile scripts execute exactly once
+        if: ${{ !cancelled() }}
+        run: >-
+          python .github/scripts/windows_profile_cases.py verify
+          --reports-dir "${{ runner.temp }}/windows-profiles-reports"
+          --output "${{ runner.temp }}/windows-profiles-coverage.json"
+      - name: Upload Windows profiles coverage proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-profiles-coverage-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-profiles-coverage.json
+          if-no-files-found: error
+          retention-days: 14
 
   skill-hub:
     name: skill-hub-contract (${{ matrix.os }})
@@ -2584,11 +3057,10 @@ jobs:
             tests/test_skills_bundled_baseline.py \
             tests/test_skills_hot_reload.py \
             tests/test_skill_catalog_projection.py \
-            tests/test_gateway/test_meta_catalog_compatibility.py \
+            tests/test_skills/test_retired_workflows.py \
             tests/test_gateway/test_rpc_commands.py \
             tests/test_migration/test_legacy_config_fixtures.py \
             tests/test_skills/test_catalog_upgrade_retirement.py \
-            tests/test_skills/test_sop_compiler.py \
             tests/unit/cli/tui/test_opentui_completion_catalog.py \
             tests/test_skills_loader_namespaces.py \
             tests/test_skills_tree.py \
@@ -2606,16 +3078,18 @@ jobs:
             tests/test_engine/test_skill_install_settlement.py \
             tests/test_gateway/test_skill_install_status.py \
             tests/test_skills/test_hub_install_operations.py \
+            tests/test_skills/test_install_operation_io.py \
             tests/test_skills/test_staging_io_worker.py \
             tests/test_skills_hub_streaming.py \
             tests/test_skills_hub_streaming_faults.py \
             tests/test_skills/test_hub_management_service.py \
+            tests/test_skills/test_hub_rollback_serialization.py \
             tests/test_skills/test_hub_scanner.py \
             tests/test_skills/test_hub_transaction_recovery.py \
             tests/test_skills/test_hub_transaction_process_gates.py \
             tests/test_gateway/test_rpc_skills_install_visibility.py \
             tests/test_gateway/test_rpc_skills_exact_identity.py \
-            tests/test_gateway/test_rpc_skills_coding_gate.py \
+            tests/test_gateway/test_retired_product_config.py \
             tests/test_gateway/test_rpc_skills_reload.py \
             tests/test_gateway/test_skill_management_service_injection.py \
             tests/test_tools/test_skill_view_resources.py \
@@ -2790,9 +3264,12 @@ jobs:
 
   windows-nsis-regression:
     name: Windows NSIS acceptance
-    needs: plan-ci
-    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-nsis-regression') }}
+    needs: [plan-ci, frontend-artifact]
+    if: ${{ !cancelled() && needs.plan-ci.result == 'success' && needs.frontend-artifact.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-nsis-regression') }}
     uses: ./.github/workflows/windows-nsis-upgrade-regression.yml
+    with:
+      acceptance_profile: ${{ needs.plan-ci.outputs.windows_nsis_profile }}
+      frontend_artifact_name: opensquilla-webui-dist
 
   ci-result:
     name: CI result
@@ -2804,17 +3281,27 @@ jobs:
       - readme-locale-check
       - frontend-artifact
       - frontend-check
+      - frontend-unit-tests
+      - gateway-contract-linux
+      - wheel-webui-roundtrip
       - gateway-contract-verification-linux
       - gateway-contract-windows
+      - gateway-contract-verification-windows
       - gateway-contract-compare
       - webui-chat-recovery
+      - webui-capacity
       - tui-check
       - desktop-check
       - ubuntu-quality
       - ubuntu-full
+      - python-stress
       - windows-full
+      - windows-bundle
+      - windows-bundle-coverage
       - macos-recovery
       - desktop-recovery-e2e
+      - windows-profiles-coverage
+      - desktop-native-probes
       - skill-hub
       - release-packaging
       - managed-toolchain-artifacts
@@ -2912,17 +3399,29 @@ jobs:
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
           RESULT_FRONTEND_ARTIFACT: ${{ needs.frontend-artifact.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
+          RESULT_FRONTEND_UNIT: ${{ needs.frontend-unit-tests.result }}
+          RESULT_CONTRACT_LINUX: ${{ needs.gateway-contract-linux.result }}
+          RESULT_WHEEL_WEBUI: ${{ needs.wheel-webui-roundtrip.result }}
           RESULT_CONTRACT_VERIFICATION_LINUX: ${{ needs.gateway-contract-verification-linux.result }}
           RESULT_CONTRACT_WINDOWS: ${{ needs.gateway-contract-windows.result }}
+          RESULT_CONTRACT_VERIFICATION_WINDOWS: ${{ needs.gateway-contract-verification-windows.result }}
           RESULT_CONTRACT_COMPARE: ${{ needs.gateway-contract-compare.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
           RESULT_UBUNTU: ${{ needs.ubuntu-quality.result }}
           RESULT_UBUNTU_FULL: ${{ needs.ubuntu-full.result }}
+          RESULT_PYTHON_STRESS: ${{ needs.python-stress.result }}
           RESULT_WINDOWS_FULL: ${{ needs.windows-full.result }}
+          RESULT_WINDOWS_BUNDLE: ${{ needs.windows-bundle.result }}
+          RESULT_WINDOWS_BUNDLE_COVERAGE: ${{ needs.windows-bundle-coverage.result }}
+          PLANNED_PYTHON_MATRIX: ${{ needs.plan-ci.outputs.python_matrix }}
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
+          RESULT_WINDOWS_PROFILES_COVERAGE: ${{ needs.windows-profiles-coverage.result }}
+          PLANNED_DESKTOP_MATRIX: ${{ needs.plan-ci.outputs.desktop_matrix }}
+          RESULT_DESKTOP_NATIVE: ${{ needs.desktop-native-probes.result }}
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
+          RESULT_WEBUI_CAPACITY: ${{ needs.webui-capacity.result }}
           RESULT_SKILL_HUB: ${{ needs.skill-hub.result }}
           RESULT_WINDOWS_NSIS: ${{ needs.windows-nsis-regression.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}

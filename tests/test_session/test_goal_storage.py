@@ -40,7 +40,7 @@ from opensquilla.session.models import (
     SessionNode,
     TranscriptEntry,
 )
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 
 SESSION_KEY = "agent:main:webchat:goals"
 SESSION_ID = "session-goals"
@@ -368,18 +368,12 @@ async def test_legacy_goal_receipt_replay_omits_retired_policy_without_rewriting
         assert (await cur.fetchone())[0] == 1
 
 
-async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
+async def test_receipt_replay_preserves_goal_context_and_candidate(
     storage: SessionStorage,
 ) -> None:
     set_command = _command("set")
     accepted = await _set_goal(storage, command=set_command)
     assert accepted.goal is not None and accepted.goal_context is not None
-    await storage.stage_meta_launch_draft(
-        session_key=SESSION_KEY,
-        client_request_id=set_command.client_request_id,
-        meta_skill_name="meta-test",
-        launch_text="/meta meta-test -- synthetic stale context draft",
-    )
 
     context_replay = await storage.replay_turn_ingress_receipt(
         source_scope=SOURCE_SCOPE,
@@ -390,7 +384,6 @@ async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
     assert context_replay is not None
     assert context_replay.goal_context == accepted.goal_context
     assert context_replay.goal_candidate is None
-    assert await storage.list_meta_launch_drafts(session_key=SESSION_KEY) == []
 
     candidate = GoalClaimCandidate(
         session_id=SESSION_ID,
@@ -424,12 +417,6 @@ async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
     )
     assert followup.goal_context is None
     assert followup.goal_candidate == candidate
-    await storage.stage_meta_launch_draft(
-        session_key=SESSION_KEY,
-        client_request_id=followup_request_id,
-        meta_skill_name="meta-test",
-        launch_text="/meta meta-test -- synthetic stale candidate draft",
-    )
 
     candidate_replay = await storage.replay_turn_ingress_receipt(
         source_scope="gateway:sessions.send",
@@ -440,91 +427,8 @@ async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
     assert candidate_replay is not None
     assert candidate_replay.goal_context is None
     assert candidate_replay.goal_candidate == candidate
-    assert await storage.list_meta_launch_drafts(session_key=SESSION_KEY) == []
 
 
-async def test_goal_and_meta_control_admission_fails_before_any_turn_write(
-    storage: SessionStorage,
-) -> None:
-    request_id = "mixed-goal-meta-control"
-    intent, _ = await storage.stage_meta_control_intent(
-        session_key=SESSION_KEY,
-        control_kind="manual",
-        correlation_id=f"request:{request_id}",
-        meta_skill_name="meta-test",
-    )
-    control = {
-        "version": 1,
-        "intent_id": intent.intent_id,
-        "kind": "manual",
-        "name": "meta-test",
-        "correlation_id": intent.correlation_id,
-    }
-    await storage.stage_meta_launch_draft(
-        session_key=SESSION_KEY,
-        client_request_id=request_id,
-        meta_skill_name="meta-test",
-        launch_text="/meta meta-test -- must remain staged",
-    )
-    candidate = GoalClaimCandidate(
-        session_id=SESSION_ID,
-        epoch=0,
-        goal_id="synthetic-goal",
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="Goal turns cannot consume a MetaSkill control intent",
-    ):
-        await storage.accept_turn(
-            TranscriptEntry(
-                session_id=SESSION_ID,
-                session_key=SESSION_KEY,
-                message_id="mixed-goal-meta-message",
-                role="user",
-                content="/meta meta-test -- must remain staged",
-                created_at=300,
-                turn_context={"meta_control": control},
-            ),
-            expected_epoch=0,
-            updated_at=300,
-            task_record=AgentTaskRecord(
-                task_id="mixed-goal-meta-task",
-                session_key=SESSION_KEY,
-                status=AgentTaskStatus.QUEUED,
-                created_at=300,
-                updated_at=300,
-                details={"metadata": {"meta_control": control}},
-            ),
-            source_scope="gateway:sessions.send",
-            request_session_key=SESSION_KEY,
-            client_request_id=request_id,
-            request_fingerprint=hashlib.sha256(b"mixed-goal-meta").hexdigest(),
-            meta_control_intent_id=intent.intent_id,
-            goal_mutation=ClaimGoalMutation(candidate=candidate),
-        )
-
-    assert await storage.get_transcript(SESSION_ID) == []
-    assert await storage.get_agent_task("mixed-goal-meta-task") is None
-    assert await storage.get_turn_ingress_receipt(
-        source_scope="gateway:sessions.send",
-        request_session_key=SESSION_KEY,
-        client_request_id=request_id,
-    ) is None
-    assert await storage.get_goal(SESSION_KEY) is None
-    drafts = await storage.list_meta_launch_drafts(session_key=SESSION_KEY)
-    assert [draft.client_request_id for draft in drafts] == [request_id]
-    preserved_intent = await storage.get_meta_control_intent(
-        session_key=SESSION_KEY,
-        control_kind="manual",
-        correlation_id=intent.correlation_id,
-    )
-    assert preserved_intent is not None
-    assert preserved_intent.status == "staged"
-    assert preserved_intent.accepted_task_id is None
-    session = await storage.get_session(SESSION_KEY)
-    assert session is not None and session.updated_at == 100
-    assert storage.conn.in_transaction is False
 
 
 async def test_goal_set_conflict_rolls_back_every_turn_artifact(
@@ -823,8 +727,10 @@ async def test_progress_race_respects_state_and_progress_revision_domains(
             )
 
         async def progress_operation():
-            return await progress_storage.update_goal_progress(
-                accepted.goal_context,
+            return await progress_storage.update_task_progress(
+                accepted.goal_context.task_id,
+                session_key=SESSION_KEY, session_id=accepted.goal_context.session_id,
+                session_epoch=accepted.goal_context.epoch,
                 explanation="Race-safe progress",
                 steps=[{"step": "Linearize writes", "status": "in_progress"}],
                 now_ms=310,
@@ -847,13 +753,10 @@ async def test_progress_race_respects_state_and_progress_revision_domains(
 
         assert not isinstance(command_result, BaseException)
         assert await command_storage.get_goal_command_receipt(command) is not None
-        if first_actor == "command" and command_action in {"edit", "clear"}:
-            assert isinstance(progress_result, GoalConflictError)
-            assert progress_result.code == (
-                "GOAL_NOT_FOUND" if command_action == "clear" else "STALE_GOAL"
-            )
-        else:
-            assert not isinstance(progress_result, BaseException)
+        assert not isinstance(progress_result, BaseException)
+        task = await progress_storage.get_agent_task(accepted.goal_context.task_id)
+        assert task is not None and task.status == AgentTaskStatus.RUNNING
+        assert task.details["metadata"]["progress"] == progress_result
 
         current = await command_storage.get_goal(SESSION_KEY)
         if command_action == "clear":
@@ -874,8 +777,11 @@ async def test_progress_race_respects_state_and_progress_revision_domains(
                 assert current.status == "active"
                 assert current.objective_revision == 2
                 assert current.objective == "Ship the revised race-safe Goal runtime."
-                assert current.progress_json is None
-                assert current.progress_revision == (1 if first_actor == "command" else 2)
+                assert current.progress_json == (
+                    {key: value for key, value in progress_result.items() if key != "revision"}
+                    if first_actor == "command" else None
+                )
+                assert current.progress_revision == 2
 
 
 @pytest.mark.parametrize("command_action", ["pause", "edit", "clear"])
@@ -992,12 +898,16 @@ async def test_edit_invalidates_old_objective_tools_but_old_task_still_settles(
     accepted = await _set_goal(storage)
     await storage.update_agent_task("task-1", status=AgentTaskStatus.RUNNING, started_at=200)
     assert accepted.goal is not None and accepted.goal_context is not None
-    progressed = await storage.update_goal_progress(
-        accepted.goal_context,
+    await storage.update_task_progress(
+        accepted.goal_context.task_id,
+        session_key=SESSION_KEY, session_id=accepted.goal_context.session_id,
+        session_epoch=accepted.goal_context.epoch,
         explanation="Working",
         steps=[{"step": "Inspect", "status": "in_progress"}],
         now_ms=250,
     )
+    progressed = await storage.get_goal(SESSION_KEY)
+    assert progressed is not None
     assert progressed.progress_revision == 1
     assert progressed.state_revision == accepted.goal.state_revision
     async with storage.conn.execute(
@@ -1119,12 +1029,16 @@ async def test_running_edit_adoption_switches_tool_authority_only_after_apply(
     assert applied_detail["appliedIteration"] == 2
     assert applied_detail["modelCallId"] == "model-call-rev2"
 
-    progressed = await storage.update_goal_progress(
-        applied.context,
+    await storage.update_task_progress(
+        applied.context.task_id,
+        session_key=SESSION_KEY, session_id=applied.context.session_id,
+        session_epoch=applied.context.epoch,
         explanation="The revised objective is now authoritative.",
         steps=[{"step": "Adopt revision two", "status": "completed"}],
         now_ms=330,
     )
+    progressed = await storage.get_goal(SESSION_KEY)
+    assert progressed is not None
     assert progressed.objective_revision == 2
     assert progressed.progress_revision == 2
     completed = await storage.commit_goal_terminal(
@@ -1310,12 +1224,16 @@ async def test_newer_running_edit_supersedes_claimed_but_unapplied_revision(
     assert GoalTurnContext.from_task_detail(
         final_task.details.get(GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY)
     ) == applied_three.context
-    progressed = await storage.update_goal_progress(
-        applied_three.context,
+    await storage.update_task_progress(
+        applied_three.context.task_id,
+        session_key=SESSION_KEY, session_id=applied_three.context.session_id,
+        session_epoch=applied_three.context.epoch,
         explanation=None,
         steps=[{"step": "Honor revision three", "status": "in_progress"}],
         now_ms=360,
     )
+    progressed = await storage.get_goal(SESSION_KEY)
+    assert progressed is not None
     assert progressed.objective_revision == 3
 
 
@@ -1432,14 +1350,18 @@ async def test_clear_after_claim_rejects_late_apply_without_advancing_authority(
         task_after_late_apply.details.get(GOAL_OBJECTIVE_UPDATE_DETAIL_KEY)
     )
     assert revoked is not None and revoked.status == "revoked"
-    with pytest.raises(GoalConflictError) as exc_info:
-        await storage.update_goal_progress(
-            claimed.context,
-            explanation=None,
-            steps=[{"step": "Must not recreate the Goal", "status": "completed"}],
-            now_ms=330,
-        )
-    assert exc_info.value.code == "GOAL_NOT_FOUND"
+    progress = await storage.update_task_progress(
+        claimed.context.task_id,
+        session_key=SESSION_KEY, session_id=claimed.context.session_id,
+        session_epoch=claimed.context.epoch,
+        explanation=None,
+        steps=[{"step": "Finish the remaining task", "status": "completed"}],
+        now_ms=330,
+    )
+    task_after_progress = await storage.get_agent_task(claimed.context.task_id)
+    assert task_after_progress is not None
+    assert task_after_progress.status == AgentTaskStatus.RUNNING
+    assert task_after_progress.details["metadata"]["progress"] == progress
     assert await storage.get_goal(SESSION_KEY) is None
 
 
@@ -1589,7 +1511,7 @@ async def test_revoked_claim_is_not_reclaimable_after_storage_restart(
         await restarted.close()
 
 
-async def test_goal_tool_writes_require_exact_durable_task_context(
+async def test_goal_terminal_write_requires_exact_durable_task_context(
     storage: SessionStorage,
 ) -> None:
     accepted = await _set_goal(storage)
@@ -1607,15 +1529,6 @@ async def test_goal_tool_writes_require_exact_durable_task_context(
             now_ms=250,
         )
     assert terminal_exc.value.code == "STALE_GOAL"
-
-    with pytest.raises(GoalConflictError) as progress_exc:
-        await storage.update_goal_progress(
-            forged,
-            explanation="Forged",
-            steps=[{"step": "Should not persist", "status": "in_progress"}],
-            now_ms=260,
-        )
-    assert progress_exc.value.code == "STALE_GOAL"
 
     current = await storage.get_goal(SESSION_KEY)
     assert current is not None
@@ -1916,12 +1829,16 @@ async def test_edit_reactivates_only_a_settled_complete_goal(
     accepted = await _set_goal(storage)
     await storage.update_agent_task("task-1", status=AgentTaskStatus.RUNNING, started_at=200)
     assert accepted.goal is not None and accepted.goal_context is not None
-    progressed = await storage.update_goal_progress(
-        accepted.goal_context,
+    await storage.update_task_progress(
+        accepted.goal_context.task_id,
+        session_key=SESSION_KEY, session_id=accepted.goal_context.session_id,
+        session_epoch=accepted.goal_context.epoch,
         explanation="The first objective was delivered.",
         steps=[{"step": "Deliver it", "status": "completed"}],
         now_ms=225,
     )
+    progressed = await storage.get_goal(SESSION_KEY)
+    assert progressed is not None
     completed = await storage.commit_goal_terminal(
         accepted.goal_context,
         status="complete",
@@ -2791,14 +2708,15 @@ async def test_manager_reset_removes_active_goal_and_fences_old_owner(
             now_ms=400,
         )
     assert terminal_exc.value.code == "GOAL_NOT_FOUND"
-    with pytest.raises(GoalConflictError) as progress_exc:
-        await storage.update_goal_progress(
-            accepted.goal_context,
+    with pytest.raises(StaleEpochError, match="generation changed"):
+        await storage.update_task_progress(
+            accepted.goal_context.task_id,
+            session_key=SESSION_KEY, session_id=accepted.goal_context.session_id,
+            session_epoch=accepted.goal_context.epoch,
             explanation="stale",
             steps=[],
             now_ms=410,
         )
-    assert progress_exc.value.code == "GOAL_NOT_FOUND"
 
     await storage.update_agent_task(
         accepted.goal_context.task_id,
@@ -2869,14 +2787,15 @@ async def test_atomic_turn_reset_removes_active_goal_and_preserves_receipt(
             now_ms=410,
         )
     assert terminal_exc.value.code == "GOAL_NOT_FOUND"
-    with pytest.raises(GoalConflictError) as progress_exc:
-        await storage.update_goal_progress(
-            accepted.goal_context,
+    with pytest.raises(StaleEpochError, match="generation changed"):
+        await storage.update_task_progress(
+            accepted.goal_context.task_id,
+            session_key=SESSION_KEY, session_id=accepted.goal_context.session_id,
+            session_epoch=accepted.goal_context.epoch,
             explanation=None,
             steps=[],
             now_ms=420,
         )
-    assert progress_exc.value.code == "GOAL_NOT_FOUND"
     await storage.update_agent_task(
         accepted.goal_context.task_id,
         status=AgentTaskStatus.SUCCEEDED,

@@ -6,7 +6,7 @@ const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 test.describe('Code block syntax highlighting', () => {
   test('idle chat renders no highlighted code blocks', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('code.hljs')).toHaveCount(0)
     await expect(page.locator('.code-lang')).toHaveCount(0)
@@ -17,7 +17,7 @@ test.describe('Code block syntax highlighting', () => {
     test.setTimeout(240000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await page.locator('.chat-textarea').fill(
       'Reply with exactly one fenced python code block (```python) defining def greet(name): return f"hello {name}" — keep the def keyword and the string literal. No prose outside the block.',
@@ -50,7 +50,7 @@ test.describe('Code block syntax highlighting', () => {
 
     // Highlighting survives a reload: history replays through the same renderer.
     await page.reload()
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
     const replayed = page.locator('.msg-ai .msg-ai-text pre code.hljs .hljs-keyword').first()
     await expect(replayed).toBeVisible({ timeout: 30000 })
   })

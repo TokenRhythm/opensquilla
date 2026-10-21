@@ -4,10 +4,12 @@ import { createApp, defineComponent, h, nextTick, type App } from 'vue'
 
 const mocks = vi.hoisted(() => ({
   copy: vi.fn().mockResolvedValue(undefined),
+  download: vi.fn(),
 }))
 
 vi.mock('@/utils/browser', () => ({
   copyTextWithFallback: mocks.copy,
+  downloadText: mocks.download,
 }))
 
 import ActivityToolDetails from '@/components/chat/ActivityToolDetails.vue'
@@ -74,12 +76,30 @@ afterEach(() => {
 })
 
 describe('ActivityToolDetails adaptive detail window', () => {
+  it('keeps a truncated saved generic result distinct from a complete record', async () => {
+    const { el } = await mountDetails(call({ result: 'line\n'.repeat(2000), resultTruncated: true }))
+    expect(el.querySelector('[data-testid="activity-tool-detail-download"]')?.getAttribute('aria-label')).toBe('Download')
+    expect(el.querySelectorAll('.activity-tool-details__truncated')).toHaveLength(1)
+    expect(el.querySelector('.activity-tool-details__truncated')?.textContent).toBe('Only part of the content was retained.')
+  })
+  it('shares the preview budget across raw input and result, and saves the retained full text', async () => {
+    const inputRaw = 'i'.repeat(600) + '\n'
+    const result = `${'r'.repeat(600)}\n`.repeat(600) + 'LAST LINE'
+    const { el } = await mountDetails(call({ inputRaw: inputRaw.repeat(600), result }))
+    const visible = Array.from(el.querySelectorAll('pre'), element => element.textContent || '').join('')
+    expect(new TextEncoder().encode(visible).length).toBeLessThanOrEqual(256 * 1024)
+    expect(visible).not.toContain('LAST LINE')
+    expect(el.querySelector('[data-testid="activity-tool-detail-copy"]')).toBeNull()
+    el.querySelector<HTMLButtonElement>('[data-testid="activity-tool-detail-download"]')!.click()
+    await vi.waitFor(() => expect(mocks.download).toHaveBeenCalled())
+    expect(mocks.download.mock.calls[mocks.download.mock.calls.length - 1]?.[2]).toContain('LAST LINE')
+  })
   it.each([
-    ['360 characters', 'x'.repeat(360), false],
+    ['360 characters', 'x'.repeat(360), true],
     ['361 characters', 'x'.repeat(361), true],
-    ['6 lines', Array.from({ length: 6 }, (_, index) => `line ${index}`).join('\n'), false],
+    ['6 lines', Array.from({ length: 6 }, (_, index) => `line ${index}`).join('\n'), true],
     ['7 lines', Array.from({ length: 7 }, (_, index) => `line ${index}`).join('\n'), true],
-  ])('uses the bounded window beyond the %s threshold', async (_name, input, bounded) => {
+  ])('keeps %s of generic detail inline in one scroll window', async (_name, input, bounded) => {
     const { el } = await mountDetails(call({
       inputRaw: input,
       inputPreview: input.slice(0, 200),
@@ -90,7 +110,7 @@ describe('ActivityToolDetails adaptive detail window', () => {
     expect(el.querySelector('[data-testid="activity-tool-detail-copy"]') !== null).toBe(bounded)
   })
 
-  it('shows real redacted lines, copies safe full detail, and preserves View full', async () => {
+  it('shows and copies complete redacted command content without a second viewer', async () => {
     const secret = 'sk-secretvalue123456789'
     const command = [
       'echo begin',
@@ -99,7 +119,7 @@ describe('ActivityToolDetails adaptive detail window', () => {
     ].join('\n')
     const inputRaw = JSON.stringify({ command })
     const result = Array.from(
-      { length: 40 },
+      { length: 400 },
       (_, index) => `output line ${index + 1}`,
     ).join('\n')
     const toolCall = call({
@@ -111,7 +131,7 @@ describe('ActivityToolDetails adaptive detail window', () => {
     })
     const { el, onShowResult } = await mountDetails(toolCall, 'command.run')
 
-    const window = el.querySelector('.activity-tool-details__window')
+    const window = el.querySelector('.activity-code-details__viewport')
     const copy = el.querySelector<HTMLButtonElement>(
       '[data-testid="activity-tool-detail-copy"]',
     )
@@ -119,35 +139,25 @@ describe('ActivityToolDetails adaptive detail window', () => {
 
     expect(window?.textContent).toContain('echo begin')
     expect(window?.textContent).toContain('command line 9')
-    expect(window?.textContent).toContain('output line 40')
+    expect(window?.textContent).toContain('output line 400')
     expect(window?.textContent).toContain('[redacted]')
     expect(window?.textContent).not.toContain(secret)
     expect(window?.textContent).not.toContain('Run command')
     expect(el.querySelector('.activity-tool-details__summary')).toBeNull()
-    expect(el.querySelector('.activity-tool-details__fade')).not.toBeNull()
+    expect(el.querySelector('.activity-tool-details__fade')).toBeNull()
     expect(copy?.getAttribute('aria-label')).toBe('Copy')
-    expect(viewFull?.textContent?.trim()).toBe('expand content')
+    expect(viewFull).toBeNull()
 
     copy?.click()
 
     expect(mocks.copy).toHaveBeenCalledWith(redactActivityDetail(
-      `INPUT\n${inputRaw}\n\nRESULT\n${result}`,
+      `$ ${command}\n\n${result}`,
     ))
     await vi.waitFor(() => {
-      expect(copy?.getAttribute('aria-label')).toBe('Copied')
+      expect(copy?.getAttribute('aria-label')).toBe('Copy')
     })
 
-    viewFull?.click()
-    expect(onShowResult).toHaveBeenCalledWith(
-      redactActivityDetail(`INPUT\n${inputRaw}\n\nRESULT\n${result}`),
-      'Run command · details',
-      {
-        toolName: 'shell',
-        inputRaw: redactActivityDetail(inputRaw),
-        section: undefined,
-        format: undefined,
-      },
-    )
+    expect(onShowResult).not.toHaveBeenCalled()
   })
 
   it('shows file edits as a changes section without exposing raw invocation parameters', async () => {
@@ -164,15 +174,14 @@ describe('ActivityToolDetails adaptive detail window', () => {
       result: 'Edited src/App.vue: replaced 15 chars with 15 chars',
     }), 'file.edit')
 
-    const window = el.querySelector('.activity-tool-details__window')
-    expect(window?.textContent).toContain('changes')
+    const window = el.querySelector('.activity-code-details__viewport')
     expect(window?.textContent).toContain('-const value = 1')
     expect(window?.textContent).toContain('+const value = 2')
     expect(window?.textContent).not.toContain('justification')
     expect(window?.textContent).not.toContain('Edited src/App.vue')
 
-    el.querySelector<HTMLButtonElement>('.activity-tool-details__view')?.click()
-    expect(onShowResult).toHaveBeenCalledWith(
+    el.querySelector<HTMLButtonElement>('[data-testid="activity-tool-detail-copy"]')?.click()
+    expect(mocks.copy).toHaveBeenCalledWith(
       [
         '--- before',
         '+++ after',
@@ -180,13 +189,24 @@ describe('ActivityToolDetails adaptive detail window', () => {
         '-const value = 1',
         '+const value = 2',
       ].join('\n'),
-      'Run command · details',
-      {
-        toolName: 'edit_file',
-        inputRaw,
-        section: 'input',
-        format: 'diff',
-      },
     )
+    expect(onShowResult).not.toHaveBeenCalled()
+  })
+
+  it('keeps an omitted-only file summary from exposing an empty card or raw marker', async () => {
+    const { el } = await mountDetails(call({ name: 'write_file',
+      inputRaw: JSON.stringify({ path: 'index.html', content: '[historical_tool_argument_omitted]\nhead: snippet' }),
+      result: 'Written 5000 bytes',
+    }), 'file.write')
+    expect(el.querySelector('section,pre,button')).toBeNull()
+    expect(el.textContent).not.toContain('historical_tool_argument_omitted')
+  })
+
+  it('keeps complete generic tool content after the previous preview limit', async () => {
+    const result = Array.from({ length: 300 }, (_, i) => `result ${i}`).join('\n')
+    const { el } = await mountDetails(call({ result }))
+    expect(el.querySelector('pre')?.textContent).toBe(result)
+    el.querySelector<HTMLButtonElement>('[data-testid="activity-tool-detail-copy"]')?.click()
+    expect(mocks.copy).toHaveBeenCalledWith(`RESULT\n${result}`)
   })
 })

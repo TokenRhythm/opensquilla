@@ -233,14 +233,17 @@ async def test_external_turn_discovery_error_releases_pending_fence() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("activity_error", [False, True])
+@pytest.mark.parametrize("activity_behavior", ["success", "error", "blocked"])
 async def test_gateway_runtime_connects_to_configured_gateway_target(
     monkeypatch: pytest.MonkeyPatch,
-    activity_error: bool,
+    activity_behavior: str,
 ) -> None:
     from opensquilla.cli.repl import gateway_runtime
 
     calls: list[tuple[str, dict[str, Any]]] = []
+    launch_recorded = asyncio.Event()
+    activity_entered = asyncio.Event()
+    activity_cancelled = asyncio.Event()
 
     class _FakeGatewayClient:
         connected_url: str | None = None
@@ -249,8 +252,17 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
 
         async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             calls.append((method, params))
-            if activity_error and method == "telemetry.product_active.record":
-                raise RuntimeError("synthetic old Gateway")
+            if method == "telemetry.product_active.record":
+                if activity_behavior == "blocked":
+                    activity_entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        activity_cancelled.set()
+                if activity_behavior == "error":
+                    raise RuntimeError("synthetic old Gateway")
+            if method == "telemetry.client_launch.record":
+                launch_recorded.set()
             return {"recorded": True}
 
         async def connect(self, url: str, *, token: str | None = None) -> None:
@@ -293,6 +305,10 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
         on_user_activity=None,
     ) -> None:
         await on_surface_ready()
+        if activity_behavior == "blocked":
+            await asyncio.wait_for(activity_entered.wait(), timeout=2)
+            return
+        await asyncio.wait_for(launch_recorded.wait(), timeout=2)
         await on_user_activity()
 
     deps = gateway_runtime.GatewayRuntimeDependencies(
@@ -304,20 +320,22 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
         notify=lambda _notice: None,
     )
 
-    await gateway_runtime.run_gateway_chat(
+    await asyncio.wait_for(gateway_runtime.run_gateway_chat(
         model=None,
         session_id=None,
         deps=deps,
-    )
+    ), timeout=2)
 
     assert _FakeGatewayClient.connected_url == "ws://127.0.0.1:18790/ws"
     assert _FakeGatewayClient.connected_token == "branch-token"
     assert _FakeGatewayClient.closed is True
-    assert calls == [
+    expected = [
         ("telemetry.product_active.record", {"surface": "tui"}),
         ("telemetry.client_launch.record", {}),
         ("telemetry.product_active.record", {"surface": "tui"}),
     ]
+    assert calls == (expected[:1] if activity_behavior == "blocked" else expected)
+    assert activity_cancelled.is_set() is (activity_behavior == "blocked")
 
 
 @pytest.mark.asyncio

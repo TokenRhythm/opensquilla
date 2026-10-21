@@ -40,6 +40,8 @@ export interface DesktopGatewayConnection {
   profileFingerprint: string
   httpUrl: string | null
   wsUrl: string | null
+  /** Owned Gateway's actual Control UI mount; empty means root. Older shells omit it. */
+  controlUiBasePath?: string
   authToken?: string | null
   error: string | null
   sandboxUpgrade?: SandboxUpgradeReport | null
@@ -90,8 +92,12 @@ export interface DesktopUpdateState {
   canNativeInstall: boolean
   /** Explicit shell permission to launch installation; older manual shells omit it. */
   canInstall?: boolean
+  /** The shell can prepare and verify updates without a download click. Older shells omit it. */
+  canAutoDownload?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
+  /** Validated official release page for latestVersion; never an installer asset URL. */
+  releaseNotesUrl?: string | null
   source: DesktopUpdateSource | null
   fallbackUsed: boolean
 }
@@ -221,11 +227,17 @@ export interface NativeAttachmentReceipt {
 }
 
 export interface PlatformFilesApi {
+  /** Trusted Desktop picker; inserts plain paths without uploading or granting tool access. */
+  chooseLocalFilePaths?: (request: { gatewayInstanceId: string }) => Promise<string[]>
+  /** Resolve an OS-dragged File to its local path without reading its contents. */
+  resolveNativeFilePath?: (file: File) => Promise<string | null>
   chooseAttachments?: (request: NativeAttachmentContext) => Promise<NativeAttachmentSelection[]>
   selectAttachmentFile?: (request: NativeAttachmentContext, file: File) => Promise<NativeAttachmentSelection | null>
   importAttachmentSelection?: (request: NativeAttachmentContext, token: string) => Promise<NativeAttachmentReceipt>
   cancelAttachmentSelections?: () => Promise<void>
   saveArtifact?: (payload: ArtifactOpenRequest) => Promise<{ status: 'saved' | 'cancelled' }>
+  /** Save retained session material without passing its body through the renderer. */
+  saveAttachment?: (payload: { gatewayInstanceId: string; sessionKey: string; sha256: string; name: string }) => Promise<{ status: 'saved' | 'cancelled' }>
   sourceFileAction?: (payload: {
     gatewayInstanceId: string
     sessionKey: string
@@ -283,6 +295,7 @@ export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
   payload: {
     url: string
     scopeId: string
+    contextTargetRef?: string
   }
 }
 
@@ -294,7 +307,9 @@ export type NativeWorkbenchCreateSurfaceRequest =
 export interface NativeWorkbenchCapabilities {
   protocolVersions: Array<NativeWorkbenchProtocolVersion>
   modes: WorkbenchPreviewMode[]
-  maxSurfaces: number
+  navigationActions?: NativeWorkbenchNavigateRequest['action'][]
+  /** Reported only by older desktop hosts that impose a surface count limit. */
+  maxSurfaces?: number
 }
 
 export interface NativeArtifactAnnotationCapabilities {
@@ -303,6 +318,7 @@ export interface NativeArtifactAnnotationCapabilities {
   picker?: boolean
   trustedOverlay?: boolean
   overlayCopyVersion?: 1
+  overlayEditorVersion?: 2
   atomicCloseRearm?: true
   reason?: string
 }
@@ -320,6 +336,8 @@ export interface NativeArtifactAnnotationOverlayRequest {
   annotationId: string
   initialBody?: string
   overlayCopyVersion?: 1
+  overlayEditorVersion?: 2
+  editorState?: NativeArtifactAnnotationEditorState
   copy?: {
     targetLabel: string
     contextLabel: string
@@ -330,6 +348,22 @@ export interface NativeArtifactAnnotationOverlayRequest {
     submitLabel: string
     emptyBodyMessage: string
   }
+}
+
+export interface NativeArtifactAnnotationEditorState {
+  /** Total batch size including the current annotation. */
+  batchCount: number
+  busy: boolean
+  error?: string
+  theme?: 'light' | 'dark' | 'system'
+  action?: 'record' | 'submit'
+}
+
+export interface NativeArtifactAnnotationOverlayUpdateRequest {
+  version: 3 | 4
+  surfaceId: string
+  annotationId: string
+  editorState: NativeArtifactAnnotationEditorState
 }
 
 export interface NativeArtifactAnnotationOverlayCloseRequest {
@@ -382,6 +416,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
 export type NativeWorkbenchSurfaceEventType =
@@ -389,6 +424,9 @@ export type NativeWorkbenchSurfaceEventType =
   | 'ready'
   | 'missing-resource'
   | 'navigation-state'
+  | 'find-requested'
+  | 'find-state'
+  | 'download-state'
   | 'permission-request'
   | 'blocked-action'
   | 'capability-expired'
@@ -398,9 +436,12 @@ export type NativeWorkbenchSurfaceEventType =
   | 'crashed'
   | 'escape'
   | 'browser-opened'
+  | 'browser-closed'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
+  | 'annotation-record-current'
+  | 'annotation-batch-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
 
@@ -415,8 +456,20 @@ export interface NativeWorkbenchSurfaceEvent {
     url?: string
     title?: string
     loading?: boolean
+    pageState?: string
+    navigationError?: { url: string; code: string; errorCode?: number; message: string } | null
     canGoBack?: boolean
     canGoForward?: boolean
+    findQuery?: string
+    findMatches?: number
+    findActiveMatch?: number
+    findFinal?: boolean
+    zoomFactor?: number
+    downloadId?: string
+    downloadName?: string
+    downloadState?: 'progressing' | 'completed' | 'cancelled' | 'interrupted'
+    receivedBytes?: number
+    totalBytes?: number
     action?: string
     code?: string
     surfaceInstanceId?: string
@@ -434,8 +487,13 @@ export interface NativeWorkbenchSurfaceEvent {
 export interface NativeWorkbenchNavigateRequest {
   version: NativeWorkbenchInteractiveProtocolVersion
   surfaceId: string
-  action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
+  action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate' | 'open-external' | 'close'
+    | 'find' | 'find-next' | 'find-stop' | 'zoom' | 'download-open'
   url?: string
+  query?: string
+  forward?: boolean
+  zoomFactor?: number
+  downloadId?: string
 }
 
 export interface NativeWorkbenchPermissionResponse {
@@ -452,6 +510,7 @@ export interface NativeArtifactPreviewLeaseCreateRequest {
   mode: WorkbenchPreviewMode
   authToken?: string
   pagePath?: string
+  snapshot?: boolean
 }
 
 export interface NativeArtifactPreviewLeaseControlRequest {
@@ -472,6 +531,12 @@ export type NativeArtifactPreviewLeaseBrokerResult = {
   message: string
 }
 
+export interface NativeBrowserAutomationState {
+  sessionKey: string
+  taskId: string
+  active: boolean
+}
+
 export interface NativeWorkbenchApi {
   getCapabilities?(): Promise<NativeWorkbenchCapabilities>
   getArtifactAnnotationCapabilities?(): Promise<NativeArtifactAnnotationCapabilities>
@@ -484,7 +549,11 @@ export interface NativeWorkbenchApi {
   closeArtifactAnnotationOverlay?(
     request: NativeArtifactAnnotationOverlayCloseRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
+  updateArtifactAnnotationOverlay?(
+    request: NativeArtifactAnnotationOverlayUpdateRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
   getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
+  setBrowserAutomationState?(request: NativeBrowserAutomationState): Promise<NativeWorkbenchSurfaceResult>
   focusWorkbenchAnnotation?(request: {
     surfaceId: string; targetRef: string; locatorHint: string; pagePath?: string
   }): Promise<NativeWorkbenchSurfaceResult>

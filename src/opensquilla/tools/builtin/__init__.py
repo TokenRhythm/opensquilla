@@ -18,7 +18,6 @@ _NAMES = [
     "goal_control",
     "media",
     "messaging",
-    "meta_tools",
     "nodes",
     "patch",
     "plan_control",
@@ -31,6 +30,7 @@ _NAMES = [
     "web",
     "web_fetch",
     "workspace_preview",
+    "show_widget",
 ]
 
 log = structlog.get_logger(__name__)

@@ -3,6 +3,7 @@
     name="toast-stack"
     tag="div"
     class="toast-host"
+    :class="{ 'toast-host--above-tabbar': mobileTabbarVisible }"
     aria-live="polite"
     data-testid="toast-host"
   >
@@ -12,15 +13,22 @@
       class="toast"
       :class="`toast--${toast.tone}`"
       data-testid="toast"
+      :data-toast-id="toast.id"
+      :aria-busy="toast.busy || undefined"
+      @pointerenter="pauseToast(toast.id, 'pointer')"
+      @pointerleave="resumeToast(toast.id, 'pointer')"
+      @focusin="pauseToast(toast.id, 'focus')"
+      @focusout="onFocusOut($event, toast.id)"
     >
       <span class="toast__message">{{ toast.message }}</span>
       <button
         v-if="toast.action"
         type="button"
         class="toast__action"
-        @click="runAction(toast)"
+        :aria-disabled="toast.busy || undefined"
+        @click="runAction($event, toast)"
       >
-        {{ toast.action.label }}
+        {{ toast.busy ? t('shared.toast.actionPending') : toast.action.label }}
       </button>
       <button
         type="button"
@@ -35,27 +43,46 @@
 </template>
 
 <script setup lang="ts">
+import { nextTick, watchPostEffect } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useToasts, type ToastItem } from '@/composables/useToasts'
 
-const { t } = useI18n()
-const { toasts, dismissToast } = useToasts()
+defineProps<{ mobileTabbarVisible?: boolean }>()
 
-function runAction(toast: ToastItem) {
-  try {
-    toast.action?.onClick()
-  } finally {
-    dismissToast(toast.id)
-  }
+const { t } = useI18n()
+const { toasts, dismissToast, pauseToast, resumeToast, runToastAction } = useToasts()
+
+function onFocusOut(event: FocusEvent, id: number) {
+  if (!(event.currentTarget as HTMLElement).contains(event.relatedTarget as Node | null)) resumeToast(id, 'focus')
 }
+
+async function runAction(event: Event, toast: ToastItem) {
+  const row = (event.currentTarget as HTMLElement).closest('.toast')
+  await runToastAction(toast.id, t('shared.toast.actionFailed'))
+  await nextTick()
+  if (!row?.contains(document.activeElement)) resumeToast(toast.id, 'focus')
+}
+
+// Removing a focused action during a keyed update does not reliably emit focusout.
+watchPostEffect(() => {
+  for (const toast of toasts.value) {
+    void toast.action
+    const row = document.querySelector(`[data-toast-id="${toast.id}"]`)
+    if (!row?.contains(document.activeElement)) resumeToast(toast.id, 'focus')
+  }
+})
 </script>
 
 <style scoped>
 .toast-host {
   position: fixed;
   right: var(--sp-4);
-  bottom: var(--sp-4);
+  bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px));
+  max-width: calc(100% - 2 * var(--sp-4));
+  max-height: 50dvh;
+  overflow: auto;
+  overscroll-behavior: contain;
   z-index: 1000;
   display: flex;
   flex-direction: column;
@@ -67,19 +94,18 @@ function runAction(toast: ToastItem) {
 .toast {
   position: relative;
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: var(--sp-2);
   max-width: 360px;
   padding: 11px 12px 11px 14px;
   overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
+  border: 1px solid var(--border);
   border-radius: var(--radius-card);
-  background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+  background: var(--bg-elevated);
   color: var(--text);
   font-size: var(--fs-sm);
-  box-shadow: var(--elev-3);
-  backdrop-filter: blur(18px) saturate(1.1);
-  -webkit-backdrop-filter: blur(18px) saturate(1.1);
+  box-shadow: var(--shadow-md);
   pointer-events: auto;
 }
 
@@ -87,32 +113,17 @@ function runAction(toast: ToastItem) {
   align-self: stretch;
   width: 3px;
   border-radius: var(--radius-pill);
-  background: var(--accent);
+  background: var(--text-dim);
   content: '';
   flex: 0 0 auto;
-}
-
-.toast--ok {
-  border-color: color-mix(in srgb, var(--ok) 45%, var(--border-strong));
-  background: color-mix(in srgb, var(--ok) 10%, var(--bg-elevated));
 }
 
 .toast--ok::before {
   background: var(--ok);
 }
 
-.toast--warn {
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--border-strong));
-  background: color-mix(in srgb, var(--warn) 10%, var(--bg-elevated));
-}
-
 .toast--warn::before {
   background: var(--warn);
-}
-
-.toast--danger {
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--border-strong));
-  background: color-mix(in srgb, var(--danger) 10%, var(--bg-elevated));
 }
 
 .toast--danger::before {
@@ -133,7 +144,8 @@ function runAction(toast: ToastItem) {
   cursor: pointer;
   flex: 0 0 auto;
   font: inherit;
-  font-weight: 650;
+  font-weight: 600;
+  min-height: 32px;
   padding: var(--sp-1) var(--sp-2);
   text-decoration: underline;
   text-underline-offset: 2px;
@@ -153,6 +165,8 @@ function runAction(toast: ToastItem) {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  min-width: 32px;
+  min-height: 32px;
   padding: var(--sp-1);
   border: none;
   border-radius: var(--radius-sm);
@@ -175,12 +189,12 @@ function runAction(toast: ToastItem) {
 .toast-stack-enter-active {
   transition:
     opacity var(--dur-base) var(--ease-out),
-    transform var(--dur-base) var(--ease-spring);
+    transform var(--dur-base) var(--ease-out);
 }
 
 .toast-stack-leave-active {
-  position: absolute;
-  right: 0;
+  /* Retain its slot until the fade ends so the bounded stack does not clip
+     the last departing notice as soon as it leaves the queue. */
   transition:
     opacity var(--dur-fast) var(--ease-in),
     transform var(--dur-fast) var(--ease-in);
@@ -190,14 +204,10 @@ function runAction(toast: ToastItem) {
   transition: transform var(--dur-base) var(--ease-out);
 }
 
-.toast-stack-enter-from {
-  opacity: 0;
-  transform: translateY(8px) scale(0.97);
-}
-
+.toast-stack-enter-from,
 .toast-stack-leave-to {
   opacity: 0;
-  transform: translateX(12px) scale(0.98);
+  transform: translateY(4px);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -214,8 +224,13 @@ function runAction(toast: ToastItem) {
     align-items: stretch;
   }
 
+  .toast-host--above-tabbar {
+    bottom: calc(var(--mobile-tabbar-h) + env(safe-area-inset-bottom, 0px) + var(--sp-4));
+  }
+
   .toast {
     max-width: none;
   }
 }
+
 </style>

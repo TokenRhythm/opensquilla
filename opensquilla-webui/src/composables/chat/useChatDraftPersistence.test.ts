@@ -1,21 +1,23 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { effectScope, nextTick, ref } from 'vue'
+import { effectScope, nextTick, ref, type Ref } from 'vue'
 
 import {
   RECENT_DRAFT_SESSION_KEY,
+  createMemoryChatDraftStorage,
   recentDraftSessionKey,
   recoverableDraftSessionKey,
   useChatDraftPersistence,
 } from './useChatDraftPersistence'
 
-function mount(sessionKey: ReturnType<typeof ref<string>>, inputText: ReturnType<typeof ref<string>>) {
+function mount(sessionKey: ReturnType<typeof ref<string>>, inputText: ReturnType<typeof ref<string>>, localPaths?: Ref<string[]>) {
   const scope = effectScope()
   const api = scope.run(() =>
     useChatDraftPersistence({
       sessionKey: sessionKey as ReturnType<typeof ref<string>> & { value: string },
       inputText: inputText as ReturnType<typeof ref<string>> & { value: string },
+      localPaths,
     }),
   )!
   return { api, scope }
@@ -27,6 +29,57 @@ afterEach(() => {
 })
 
 describe('useChatDraftPersistence', () => {
+  it('keeps temporary drafts in the owner storage and preserves first-send rebinding', async () => {
+    const parentKey = 'agent:main:webchat:parent'
+    localStorage.setItem(RECENT_DRAFT_SESSION_KEY, parentKey)
+    localStorage.setItem(`opensquilla.chat.draft:${parentKey}`, 'Main draft')
+    const sessionKey = ref('side:panel:draft')
+    const inputText = ref('Side draft')
+    const localPaths = ref(['C:/project/readme.md'])
+    const selectedSkills = ref([{ name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) }])
+    const skillPositions = ref<Record<string, number>>({ 'skill:visualize': 5 })
+    const scope = effectScope()
+    const storage = createMemoryChatDraftStorage()
+    const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, localPaths, storage, selectedSkills, skillPositions }))!
+    api.rebindCurrentDraft('agent:main:webchat:side-child')
+    inputText.value += ' still typing'
+    await nextTick()
+    expect(inputText.value).toBe('Side draft still typing')
+    expect(localPaths.value).toEqual(['C:/project/readme.md'])
+    expect(api.loadDraft(sessionKey.value)).toBe(inputText.value)
+    expect(JSON.parse(storage.getItem(`opensquilla.chat.draft:${sessionKey.value}`)!)).toMatchObject({
+      selectedSkills: selectedSkills.value, skillPositions: { 'skill:visualize': 5 },
+    })
+    expect(localStorage.length).toBe(2)
+    expect(localStorage.getItem(RECENT_DRAFT_SESSION_KEY)).toBe(parentKey)
+    scope.stop()
+    const restoredScope = effectScope()
+    const restoredText = ref('')
+    const restoredSkills = ref<typeof selectedSkills.value>([])
+    const restoredPositions = ref<Record<string, number>>({})
+    restoredScope.run(() => useChatDraftPersistence({ sessionKey, inputText: restoredText, storage,
+      selectedSkills: restoredSkills, skillPositions: restoredPositions, localPaths: ref<string[]>([]) }))
+    expect(restoredText.value).toBe(inputText.value)
+    expect(restoredSkills.value).toEqual(selectedSkills.value)
+    expect(restoredPositions.value).toEqual({ 'skill:visualize': 5 })
+    restoredScope.stop()
+    api.discardRecentDraft()
+    expect(localStorage.getItem(`opensquilla.chat.draft:${parentKey}`)).toBe('Main draft')
+    expect(api.loadDraft(sessionKey.value)).toBe('')
+  })
+
+  it('can disable draft persistence without losing an explicit key rebind', async () => {
+    const sessionKey = ref('temporary')
+    const inputText = ref('not persisted')
+    const scope = effectScope()
+    const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, storage: null }))!
+    api.rebindCurrentDraft('agent:main:webchat:child')
+    await nextTick()
+    expect(inputText.value).toBe('not persisted')
+    expect(localStorage.length).toBe(0)
+    scope.stop()
+  })
+
   it('persists composer text per session and restores it on return', async () => {
     const sessionKey = ref('agent:main:webchat:a')
     const inputText = ref('')
@@ -98,6 +151,22 @@ describe('useChatDraftPersistence', () => {
     sessionKey.value = 'agent:main:webchat:b'
     await nextTick()
     expect(inputText.value).toBe('draft for B')
+  })
+
+  it('binds an edit to its outgoing owner before same-tick navigation restores the target draft', async () => {
+    const sessionKey = ref('agent:main:webchat:a')
+    const inputText = ref('')
+    const { api, scope } = mount(sessionKey, inputText)
+    api.saveDraft('agent:main:webchat:b', 'Existing B draft')
+    inputText.value = 'Latest A edit'
+    sessionKey.value = 'agent:main:webchat:b'
+    await nextTick()
+    expect(inputText.value).toBe('Existing B draft')
+    expect(api.loadDraft('agent:main:webchat:a')).toBe('Latest A edit')
+    sessionKey.value = 'agent:main:webchat:a'
+    await nextTick()
+    expect(inputText.value).toBe('Latest A edit')
+    scope.stop()
   })
 
   it('clears the persisted draft once the composer is emptied (after send)', async () => {
@@ -223,6 +292,85 @@ describe('useChatDraftPersistence', () => {
 })
 
 describe('skill draft persistence', () => {
+  it('keeps inline positions with their own session through switching, rebinding and refresh', async () => {
+    const selectedSkills = ref([{ name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) }])
+    const skillPositions = ref<Record<string, number>>({ 'skill:visualize': 2 })
+    const sessionKey = ref('agent:main:webchat:inline-one')
+    const inputText = ref('中文说明')
+    const scope = effectScope()
+    const api = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills, skillPositions }))!
+    skillPositions.value = { 'skill:visualize': 1 }
+    await nextTick()
+    const saved = JSON.parse(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:inline-one')!)
+    expect(saved.skillPositions).toEqual({ 'skill:visualize': 1 })
+    expect(saved.selectedSkills[0]).toEqual({ name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) })
+
+    sessionKey.value = 'agent:main:webchat:inline-two'
+    await nextTick()
+    expect(skillPositions.value).toEqual({})
+    inputText.value = '另一条草稿'
+    await nextTick()
+    sessionKey.value = 'agent:main:webchat:inline-one'
+    await nextTick()
+    expect(inputText.value).toBe('中文说明')
+    expect(skillPositions.value).toEqual({ 'skill:visualize': 1 })
+    api.rebindCurrentDraft('agent:main:webchat:inline-bound')
+    await nextTick()
+    expect(skillPositions.value).toEqual({ 'skill:visualize': 1 })
+    scope.stop()
+
+    const restoredPositions = ref<Record<string, number>>({})
+    const restoredScope = effectScope()
+    const restoredText = ref('')
+    const restoredSkills = ref<typeof selectedSkills.value>([])
+    restoredScope.run(() => useChatDraftPersistence({ sessionKey, inputText: restoredText,
+      selectedSkills: restoredSkills, skillPositions: restoredPositions }))
+    expect(restoredPositions.value).toEqual({ 'skill:visualize': 1 })
+    restoredText.value = ''
+    restoredSkills.value = []
+    restoredPositions.value = {}
+    await nextTick()
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:inline-bound')).toBeNull()
+    restoredScope.stop()
+  })
+
+  it.each([undefined, null, [], { 'skill:visualize': -1 }, { 'skill:visualize': 5 },
+    { 'skill:visualize': 1.5 }, { 'skill:visualize': '2' }, { foreign: 2 }])(
+    'ignores invalid or legacy inline position metadata without losing the draft: %j', (skillPositions) => {
+      const sessionKey = ref('agent:main:webchat:inline-legacy')
+      const skill = { name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) }
+      localStorage.setItem(`opensquilla.chat.draft:${sessionKey.value}`, JSON.stringify({ version: 1,
+        text: '中文说明', selectedSkills: [skill], skillPositions }))
+      const positions = ref<Record<string, number>>({})
+      const selected = ref<typeof skill[]>([])
+      const text = ref('')
+      const scope = effectScope()
+      scope.run(() => useChatDraftPersistence({ sessionKey, inputText: text, selectedSkills: selected, skillPositions: positions }))
+      expect(text.value).toBe('中文说明')
+      expect(selected.value).toEqual([skill])
+      expect(positions.value).toEqual({})
+      scope.stop()
+    },
+  )
+
+  it('saves only bounded positions for currently selected skill identities', async () => {
+    const skill = { name: 'visualize', instanceId: 'skill:visualize', digest: 'a'.repeat(64) }
+    const sessionKey = ref('agent:main:webchat:inline-valid')
+    const inputText = ref('说明')
+    const selectedSkills = ref([skill])
+    const skillPositions = ref<Record<string, number>>({ 'skill:visualize': 0, foreign: 1 })
+    const scope = effectScope()
+    scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills, skillPositions }))
+    skillPositions.value['skill:visualize'] = 2
+    await nextTick()
+    expect(JSON.parse(localStorage.getItem(`opensquilla.chat.draft:${sessionKey.value}`)!).skillPositions)
+      .toEqual({ 'skill:visualize': 2 })
+    skillPositions.value['skill:visualize'] = 3
+    await nextTick()
+    expect(JSON.parse(localStorage.getItem(`opensquilla.chat.draft:${sessionKey.value}`)!).skillPositions).toBeUndefined()
+    scope.stop()
+  })
+
   it('restores skill identity with its own session and preserves it through namespace binding', async () => {
     const selectedSkills = ref([{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }])
     const sessionKey = ref('agent:main:webchat:one')
@@ -250,6 +398,133 @@ describe('skill draft persistence', () => {
     expect(restoredSkills.value).toEqual(selectedSkills.value)
     expect(restoredText.value).toBe(inputText.value)
     restoredScope.stop()
+  })
+})
+
+describe('local path draft persistence', () => {
+  it('restores visible text and explicit paths through session switches, namespace binding and refresh', async () => {
+    const sessionKey = ref('agent:main:webchat:paths')
+    const inputText = ref('')
+    const localPaths = ref<string[]>([])
+    const { api, scope } = mount(sessionKey, inputText, localPaths)
+    inputText.value = 'Compare these files'
+    localPaths.value.push('C:\\项目\\report.pdf', 'C:\\Downloads\\other.html')
+    await nextTick()
+
+    sessionKey.value = 'agent:main:webchat:other'
+    await nextTick()
+    expect(inputText.value).toBe('')
+    expect(localPaths.value).toEqual([])
+    sessionKey.value = 'agent:main:webchat:paths'
+    await nextTick()
+    expect(inputText.value).toBe('Compare these files')
+    expect(localPaths.value).toEqual(['C:\\项目\\report.pdf', 'C:\\Downloads\\other.html'])
+
+    api.rebindCurrentDraft('agent:main:webchat:bound')
+    await nextTick()
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:paths')).toBeNull()
+    scope.stop()
+    const restoredText = ref('')
+    const restoredPaths = ref<string[]>([])
+    const restored = mount(sessionKey, restoredText, restoredPaths)
+    expect(restoredText.value).toBe(inputText.value)
+    expect(restoredPaths.value).toEqual(localPaths.value)
+    restored.scope.stop()
+  })
+
+  it('persists a paths-only draft and clears it when the final path is removed', async () => {
+    const sessionKey = ref('agent:main:webchat:paths')
+    const localPaths = ref<string[]>([])
+    const { scope } = mount(sessionKey, ref(''), localPaths)
+    localPaths.value.push('C:\\file.pdf')
+    await nextTick()
+    expect(JSON.parse(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:paths')!))
+      .toEqual({ version: 1, text: '', selectedSkills: [], localPaths: ['C:\\file.pdf'] })
+    expect(recentDraftSessionKey()).toBe(sessionKey.value)
+    scope.stop()
+
+    const restoredPaths = ref<string[]>([])
+    const restored = mount(sessionKey, ref(''), restoredPaths)
+    expect(restoredPaths.value).toEqual(['C:\\file.pdf'])
+    restoredPaths.value.splice(0)
+    await nextTick()
+    expect(localStorage.getItem('opensquilla.chat.draft:agent:main:webchat:paths')).toBeNull()
+    expect(recentDraftSessionKey()).toBe('')
+    restored.scope.stop()
+  })
+
+  it('does not replace newly selected paths on first activation with a saved draft', () => {
+    localStorage.setItem('opensquilla.chat.draft:agent:main:webchat:paths', 'old draft')
+    const inputText = ref('')
+    const localPaths = ref(['C:\\new.pdf'])
+    const { scope } = mount(ref('agent:main:webchat:paths'), inputText, localPaths)
+    expect(inputText.value).toBe('')
+    expect(localPaths.value).toEqual(['C:\\new.pdf'])
+    scope.stop()
+  })
+
+  it('consumes only an accepted canonical text snapshot, preserving later path changes', async () => {
+    const sourceKey = 'agent:main:webchat:source'
+    const sessionKey = ref(sourceKey)
+    const inputText = ref('Inspect this  ')
+    const localPaths = ref(['C:\\first.pdf'])
+    const { api, scope } = mount(sessionKey, inputText, localPaths)
+    sessionKey.value = 'agent:main:webchat:other'
+    await api.consumeAcceptedDraft(sourceKey, { text: 'Inspect this\nC:\\first.pdf', selectedSkills: [] })
+    expect(localStorage.getItem(`opensquilla.chat.draft:${sourceKey}`)).toBeNull()
+
+    api.saveDraft(sourceKey, 'Inspect this  ', [], ['C:\\second.pdf'])
+    await api.consumeAcceptedDraft(sourceKey, { text: 'Inspect this\nC:\\first.pdf', selectedSkills: [] })
+    expect(JSON.parse(localStorage.getItem(`opensquilla.chat.draft:${sourceKey}`)!)).toMatchObject({ localPaths: ['C:\\second.pdf'] })
+    scope.stop()
+  })
+
+  it('leaves legacy path-looking text as text and supports old consumers without a local path ref', () => {
+    const sessionKey = ref('agent:main:webchat:legacy')
+    const legacy = 'C:\\Downloads\\report.pdf\nPlease inspect it'
+    localStorage.setItem(`opensquilla.chat.draft:${sessionKey.value}`, legacy)
+    const inputText = ref('')
+    const localPaths = ref<string[]>([])
+    const { api, scope } = mount(sessionKey, inputText, localPaths)
+    expect(inputText.value).toBe(legacy)
+    expect(localPaths.value).toEqual([])
+    scope.stop()
+
+    api.saveDraft(sessionKey.value, 'Inspect', [], ['C:\\file.pdf'])
+    const fallbackText = ref('')
+    const fallback = mount(sessionKey, fallbackText)
+    expect(fallbackText.value).toBe('Inspect\nC:\\file.pdf')
+    fallback.scope.stop()
+  })
+
+  it.each([
+    { name: 'empty path', paths: [''] },
+    { name: 'untrimmed path', paths: [' C:\\file.pdf'] },
+    { name: 'control character', paths: ['C:\\bad\nfile.pdf'] },
+    { name: 'overlong path', paths: ['x'.repeat(32_769)] },
+    { name: 'overlong total', paths: Array.from({ length: 4 }, () => 'x'.repeat(30_000)) },
+  ])('does not restore malformed or oversized path metadata as references: $name', ({ paths }) => {
+    const sessionKey = ref('agent:main:webchat:invalid')
+    const raw = JSON.stringify({ version: 1, text: '', selectedSkills: [], localPaths: paths })
+    localStorage.setItem(`opensquilla.chat.draft:${sessionKey.value}`, raw)
+    const inputText = ref('')
+    const localPaths = ref<string[]>([])
+    const { scope } = mount(sessionKey, inputText, localPaths)
+    expect(localPaths.value).toEqual([])
+    expect(inputText.value).toBe(raw)
+    scope.stop()
+  })
+
+  it('uses the existing capped text fallback for overlong drafts without dropping only the paths', async () => {
+    const sessionKey = ref('agent:main:webchat:other')
+    const { api, scope } = mount(sessionKey, ref(''), ref<string[]>([]))
+    const text = 'x'.repeat(99_990)
+    const canonical = `${text}\nC:\\file.pdf`
+    api.saveDraft('agent:main:webchat:source', text, [], ['C:\\file.pdf'])
+    expect(api.loadDraft('agent:main:webchat:source')).toBe(canonical.slice(0, 100_000))
+    await api.consumeAcceptedDraft('agent:main:webchat:source', { text: canonical, selectedSkills: [] })
+    expect(api.loadDraft('agent:main:webchat:source')).toBe('')
+    scope.stop()
   })
 })
 

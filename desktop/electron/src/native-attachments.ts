@@ -3,7 +3,7 @@ import { constants, type BigIntStats } from 'node:fs'
 import { lstat, open, realpath } from 'node:fs/promises'
 import { basename, extname, isAbsolute } from 'node:path'
 
-const MAX_FILE_BYTES = 30 * 1024 * 1024
+const MAX_FILE_BYTES = 50 * 1024 * 1024
 const SELECTION_TTL_MS = 120_000
 const MAX_SELECTIONS = 40
 const SIGNATURE_CONTEXT = 'opensquilla-native-attachment-v1\n'
@@ -63,7 +63,18 @@ function mimeFor(name: string, bytes: Buffer): string {
     '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     '.eml': 'message/rfc822', '.mbox': 'application/mbox', '.msg': 'application/vnd.ms-outlook',
   }
-  if (mapped[extension]) return mapped[extension]!
+  const declared = mapped[extension]
+  if (declared?.startsWith('image/')) {
+    // Match upload admission: image extensions are hints, not authoritative
+    // formats. Keep selection, preview, signed capability and receipt in sync.
+    // This only identifies headers; Gateway still verifies/decodes the pixels.
+    if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png'
+    if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return 'image/jpeg'
+    const signature = bytes.toString('ascii', 0, 6)
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif'
+    if (bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+  }
+  if (declared) return declared
   if (bytes.length <= 4_000_000 && !bytes.includes(0)) {
     try { new TextDecoder('utf-8', { fatal: true }).decode(bytes); return 'text/plain' } catch { /* binary */ }
   }
@@ -144,7 +155,7 @@ export class NativeAttachmentSelections {
     const generation = this.generation(senderId)
     const paths = await picker()
     this.assertCurrent(senderId, context, connection, generation)
-    if (paths.length > 10) throw new Error('Select at most 10 attachments')
+    if (paths.length > 16) throw new Error('Select at most 16 attachments')
     const selected: NativeAttachmentSelection[] = []
     for (const path of paths) {
       selected.push(await this.select(senderId, context, path))
@@ -225,7 +236,11 @@ export class NativeAttachmentSelections {
       result = await readResponse(response)
       check()
     }
-    if (!response.ok) throw new Error(typeof result.error === 'string' ? result.error : `Attachment import failed (${response.status})`)
+    if (!response.ok) {
+      const code = typeof result.code === 'string' && /^[A-Z0-9_]{1,80}$/.test(result.code) ? result.code : null
+      const message = typeof result.error === 'string' ? result.error : `Attachment import failed (${response.status})`
+      throw new Error(code ? `${message} [${code}]` : message)
+    }
     if (typeof result.file_uuid !== 'string' && (!result.workspaceFile || typeof result.workspaceFile !== 'object')) {
       throw new Error('Invalid attachment import receipt')
     }

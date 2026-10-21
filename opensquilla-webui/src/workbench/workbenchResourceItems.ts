@@ -23,6 +23,18 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
 }
 
 /**
+ * A show_widget Document is an internal recovery snapshot for the inline
+ * Visualize canvas.  It remains addressable by its document identity, but it
+ * is not a user-facing file and therefore must not appear in Files.  The
+ * explicit source namespace is the classification boundary; visibility and
+ * presentation describe how that resource is used but are not sufficient to
+ * hide an unrelated internal inline resource.
+ */
+export function isInternalVisualizeResource(resource: WorkbenchResource): boolean {
+  return resource.source?.split('_').join('-').startsWith('show-widget') === true
+}
+
+/**
  * Collapse only server-declared resource lineages for navigation. Raw resource
  * identities remain available to transcript cards, downloads and audit views.
  * Names and content hashes are intentionally ignored: two unrelated files may
@@ -31,15 +43,29 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
 export function canonicalWorkbenchResources(
   resources: readonly WorkbenchResource[],
 ): WorkbenchResource[] {
-  const documentIds = new Set(
-    resources
-      .filter(resource => resource.resource.type === 'document')
-      .map(resource => workbenchResourceRefId(resource.resource)),
-  )
-  return resources.filter((resource) => {
-    if (resource.resource.type === 'document') return true
-    const documentId = resource.relations.documentId || ''
-    return !documentId || !documentIds.has(documentId)
+  const userFacingResources = resources.filter(resource => !isInternalVisualizeResource(resource))
+  const identity = (resource: WorkbenchResource) => {
+    const documentId = resource.resource.type === 'document'
+      ? workbenchResourceRefId(resource.resource) : resource.relations.documentId
+    return documentId ? `document:${documentId}` : workbenchResourceKey(resource.resource)
+  }
+  const representatives = new Map<string, WorkbenchResource>()
+  for (const resource of userFacingResources) {
+    const key = identity(resource)
+    const previous = representatives.get(key)
+    // Prefer the current Document whenever the inventory includes it. When a
+    // projection contains only deliveries, preserve its newest-first ordering
+    // and still count their explicit Document lineage as one independent file.
+    if (!previous || (resource.resource.type === 'document' && previous.resource.type !== 'document')) {
+      representatives.set(key, resource)
+    }
+  }
+  const included = new Set<string>()
+  return userFacingResources.filter(resource => {
+    const key = identity(resource)
+    if (included.has(key) || representatives.get(key) !== resource) return false
+    included.add(key)
+    return true
   })
 }
 
@@ -59,9 +85,9 @@ export function createResourceCollectionWorkbenchItem(options: {
     title: options.title,
     scope: { type: 'session', id: options.sessionKey },
     hostKind: 'dom',
-    retention: 'keep-alive',
+    retention: 'dispose-on-suspend',
     payload: {
-      resources,
+      resourceCount: resources.length,
       sessionKey: options.sessionKey,
     },
   }
@@ -79,6 +105,20 @@ export function resourcesFromWorkbenchItem(
         && 'resource' in resource,
       ))
     : []
+}
+
+/** Refresh inventory without changing the visible owner or resource authority. */
+export function refreshResourceCollectionWorkbenchItem(
+  item: WorkbenchItem,
+  resources: readonly WorkbenchResource[],
+  title: string,
+): WorkbenchItem {
+  if (item.kind !== 'resource-collection') return item
+  return {
+    ...item,
+    title,
+    payload: { sessionKey: item.payload.sessionKey, resourceCount: canonicalWorkbenchResources(resources).length },
+  }
 }
 
 /**
@@ -99,6 +139,7 @@ export function artifactPayloadFromWorkbenchResource(
   return {
     ...(artifactId ? { id: artifactId } : {}),
     name: resource.name,
+    ...(resource.sourcePath ? { sourcePath: resource.sourcePath } : {}),
     mime: resource.mime,
     size: resource.size,
     sha256: resource.sha256,

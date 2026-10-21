@@ -1,7 +1,22 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createV4PlanCenter } from './planCenterV4'
+import { PlanModeConflictError } from '@/modules/planCenter'
 
 describe('createV4PlanCenter', () => {
+  it('exposes validated collaboration conflicts without leaking wire aliases to callers', async () => {
+    const wireError = Object.assign(new Error('revision changed'), {
+      code: 'COLLABORATION_CHANGED', details: { collaboration: { mode: 'plan', revision: 2 } },
+    })
+    const request = vi.fn().mockRejectedValue(wireError)
+    const center = createV4PlanCenter({ request }, { subscribe: vi.fn() })
+    await expect(center.setMode('session', 'default', 0)).rejects.toMatchObject({
+      name: 'PlanModeConflictError', current: { mode: 'plan', revision: 2 }, cause: wireError,
+    })
+    wireError.details.collaboration.revision = -1
+    await expect(center.setMode('session', 'default', 0)).rejects.toBe(wireError)
+    expect(wireError).not.toBeInstanceOf(PlanModeConflictError)
+  })
+
   it('keeps v4 method names inside the adapter', async () => {
     const request = vi.fn(async (_method: string, _params?: Record<string, unknown>, _options?: unknown) => ({ sessionKey: 'agent:main:webchat:one', accepted: true })) as unknown as (<T = unknown>(method: string, params?: Record<string, unknown>, options?: unknown) => Promise<T>)
     const center = createV4PlanCenter({ request }, { subscribe: vi.fn(() => ({ close: vi.fn() })) })

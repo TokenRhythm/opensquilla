@@ -91,7 +91,9 @@ class _HistoryManager:
         limit: int,
         before: tuple[int, int] | None = None,
         after: tuple[int, int] | None = None,
+        content_mode: str = "full",
     ) -> dict[str, Any]:
+        assert content_mode == "bounded"
         self.canonical_calls.append(
             {"session_key": session_key, "limit": limit, "before": before, "after": after}
         )
@@ -132,7 +134,10 @@ class _HistoryManager:
             has_more = True
         return {"entries": page, "has_more": has_more, "canonical_complete": True}
 
-    async def get_transcript(self, session_key: str) -> list[TranscriptEntry]:
+    async def get_transcript(
+        self, session_key: str, *, content_mode: str = "full",
+    ) -> list[TranscriptEntry]:
+        assert content_mode == "bounded"
         self.active_calls.append(session_key)
         self._check_key(session_key)
         return list(self.entries)
@@ -164,6 +169,14 @@ def _expected_for(outcome: str) -> dict[str, Any]:
 def _assert_payload_subset(payload: Any, expected: dict[str, Any]) -> None:
     assert isinstance(payload, dict)
     for key, value in expected.items():
+        if key == "messages":
+            actual = payload.get(key)
+            assert isinstance(actual, list) and len(actual) == len(value)
+            for message, expected_message in zip(actual, value, strict=True):
+                # The manifest permits additive response metadata, including
+                # completeness and source boundaries on projected messages.
+                _assert_payload_subset(message, expected_message)
+            continue
         assert payload.get(key) == value, f"wire field {key!r} changed"
 
 

@@ -2,9 +2,11 @@ import { spawnSync } from 'node:child_process'
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { join, normalize, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
 
 export const DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION = 1
 export const DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL = 'opensquilla-desktop-gateway-ownership-v1'
+export const DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL = 'opensquilla-desktop-lifecycle-v1'
 const DESKTOP_GATEWAY_AUTH_CONTEXT = 'opensquilla-desktop-gateway-auth-v1'
 
 const OWNER_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/
@@ -44,6 +46,54 @@ export interface DesktopGatewayLaunchVerificationOptions {
   verify?: (record: DesktopGatewayOwnershipRecord) => Promise<boolean>
 }
 
+export type DesktopGatewayOwnershipVerificationStage =
+  | 'challenge'
+  | 'record'
+  | 'launch'
+  | 'request'
+  | 'http'
+  | 'payload'
+  | 'fields'
+  | 'proof'
+  | 'verified'
+
+/**
+ * A bounded, value-free explanation of an ownership challenge outcome.
+ *
+ * This is intentionally diagnostic-only: it never carries the launch nonce,
+ * challenge, profile path, response body, or HMAC proof. Callers that only
+ * need the historical contract should continue using the boolean wrappers
+ * below.
+ */
+export interface DesktopGatewayOwnershipVerificationDiagnostic {
+  ok: boolean
+  stage: DesktopGatewayOwnershipVerificationStage
+  reason: string
+  elapsedMs: number
+  statusCode?: number
+  mismatchFields?: string[]
+  errorType?: string
+}
+
+function diagnostic(
+  startedAt: number,
+  result: Omit<DesktopGatewayOwnershipVerificationDiagnostic, 'elapsedMs'>,
+): DesktopGatewayOwnershipVerificationDiagnostic {
+  return {
+    ...result,
+    elapsedMs: Math.max(0, Math.round((performance.now() - startedAt) * 1000) / 1000),
+  }
+}
+
+function diagnosticErrorType(error: unknown): string {
+  const name = error instanceof Error ? error.name : ''
+  if (name === 'TimeoutError') return 'timeout'
+  if (name === 'AbortError') return 'aborted'
+  if (name === 'SyntaxError') return 'invalid_json'
+  if (name === 'TypeError') return 'network_error'
+  return 'internal_error'
+}
+
 /**
  * Bind a record to the launch secret and profile, not the immediate child PID.
  * In development `uv run` is the Electron ChildProcess while the Python
@@ -68,12 +118,52 @@ export async function verifyDesktopGatewayLaunchOwnership(
   authority: DesktopGatewayLaunchAuthority,
   options: DesktopGatewayLaunchVerificationOptions = {},
 ): Promise<boolean> {
-  const loaded = (options.load ?? loadDesktopGatewayOwnershipRecord)(ownershipDir)
-  if (
-    loaded.status !== 'valid'
-    || !desktopGatewayOwnershipMatchesLaunch(loaded.record, authority)
-  ) return false
-  return await (options.verify ?? verifyDesktopGatewayOwnership)(loaded.record)
+  return (await verifyDesktopGatewayLaunchOwnershipDetailed(ownershipDir, authority, options)).ok
+}
+
+export async function verifyDesktopGatewayLaunchOwnershipDetailed(
+  ownershipDir: string,
+  authority: DesktopGatewayLaunchAuthority,
+  options: DesktopGatewayLaunchVerificationOptions = {},
+): Promise<DesktopGatewayOwnershipVerificationDiagnostic> {
+  const startedAt = performance.now()
+  let loaded: DesktopGatewayOwnershipRecordLoad
+  try {
+    loaded = (options.load ?? loadDesktopGatewayOwnershipRecord)(ownershipDir)
+  } catch (error) {
+    return diagnostic(startedAt, {
+      ok: false,
+      stage: 'record',
+      reason: 'record_load_failed',
+      errorType: diagnosticErrorType(error),
+    })
+  }
+  if (loaded.status !== 'valid') {
+    return diagnostic(startedAt, { ok: false, stage: 'record', reason: `record_${loaded.status}` })
+  }
+  const mismatchFields: string[] = []
+  if (loaded.record.instance_nonce !== authority.instanceNonce) mismatchFields.push('instance_nonce')
+  if (loaded.record.profile_fingerprint !== authority.profileFingerprint) mismatchFields.push('profile_fingerprint')
+  if (loaded.record.port !== authority.port) mismatchFields.push('port')
+  if (mismatchFields.length > 0) {
+    return diagnostic(startedAt, { ok: false, stage: 'launch', reason: 'launch_mismatch', mismatchFields })
+  }
+  // Preserve the injected boolean verifier used by existing callers/tests.
+  if (options.verify) {
+    try {
+      const ok = await options.verify(loaded.record)
+      return diagnostic(startedAt, { ok, stage: ok ? 'verified' : 'request', reason: ok ? 'verified' : 'verification_failed' })
+    } catch (error) {
+      return diagnostic(startedAt, {
+        ok: false,
+        stage: 'request',
+        reason: 'verification_failed',
+        errorType: diagnosticErrorType(error),
+      })
+    }
+  }
+  const result = await verifyDesktopGatewayOwnershipDetailed(loaded.record)
+  return diagnostic(startedAt, result)
 }
 
 export interface DesktopGatewayIdentityPayload {
@@ -227,12 +317,14 @@ function canonicalSortedAsciiJson(payload: object): string {
   // Python uses json.dumps(..., sort_keys=True, separators=(',', ':'),
   // ensure_ascii=True). Every value in this protocol is ASCII, so sorted key
   // insertion plus JSON.stringify is byte-identical.
-  const sorted = Object.fromEntries(
-    Object.entries(payload).sort(([left], [right]) => (
-      left < right ? -1 : left > right ? 1 : 0
-    )),
-  )
-  return JSON.stringify(sorted)
+  const sortedValue = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sortedValue)
+    if (!isRecord(value)) return value
+    return Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, item]) => [key, sortedValue(item)]))
+  }
+  return JSON.stringify(sortedValue(payload))
 }
 
 export function canonicalDesktopGatewayIdentityPayload(
@@ -294,12 +386,13 @@ function safeHexEqual(left: string, right: string): boolean {
   return timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'))
 }
 
-function identityMatchesRecord(
+function identityMismatchesRecord(
   identity: DesktopGatewayIdentityPayload,
   record: DesktopGatewayOwnershipRecord,
   challenge: string,
-): boolean {
-  if (identity.challenge !== challenge) return false
+): string[] {
+  const mismatchFields: string[] = []
+  if (identity.challenge !== challenge) mismatchFields.push('challenge')
   for (const key of [
     'schema_version',
     'protocol',
@@ -309,10 +402,9 @@ function identityMatchesRecord(
     'port',
     'version',
   ] as const) {
-    if (identity[key] !== record[key]) return false
+    if (identity[key] !== record[key]) mismatchFields.push(key)
   }
-  const { proof, ...unsigned } = identity
-  return safeHexEqual(proof, desktopGatewayIdentityProof(record.instance_nonce, unsigned))
+  return mismatchFields
 }
 
 export interface DesktopGatewayIdentityVerificationOptions {
@@ -329,8 +421,18 @@ export async function verifyDesktopGatewayOwnership(
   record: DesktopGatewayOwnershipRecord,
   options: DesktopGatewayIdentityVerificationOptions = {},
 ): Promise<boolean> {
+  return (await verifyDesktopGatewayOwnershipDetailed(record, options)).ok
+}
+
+export async function verifyDesktopGatewayOwnershipDetailed(
+  record: DesktopGatewayOwnershipRecord,
+  options: DesktopGatewayIdentityVerificationOptions = {},
+): Promise<DesktopGatewayOwnershipVerificationDiagnostic> {
+  const startedAt = performance.now()
   const challenge = options.challenge ?? randomBytes(32).toString('base64url')
-  if (!OWNER_TOKEN_RE.test(challenge)) return false
+  if (!OWNER_TOKEN_RE.test(challenge)) {
+    return diagnostic(startedAt, { ok: false, stage: 'challenge', reason: 'invalid_challenge' })
+  }
   try {
     const response = await (options.fetchImpl ?? fetch)(
       `http://127.0.0.1:${record.port}/api/desktop/identity`,
@@ -341,11 +443,40 @@ export async function verifyDesktopGatewayOwnership(
         signal: AbortSignal.timeout(options.timeoutMs ?? 1500),
       },
     )
-    if (!response.ok) return false
-    const identity = parseDesktopGatewayIdentityPayload(await response.json().catch(() => null))
-    return Boolean(identity && identityMatchesRecord(identity, record, challenge))
-  } catch {
-    return false
+    if (!response.ok) {
+      return diagnostic(startedAt, { ok: false, stage: 'http', reason: 'http_status', statusCode: response.status })
+    }
+    let payload: unknown
+    try {
+      payload = await response.json()
+    } catch (error) {
+      if (error instanceof Error && error.name === 'SyntaxError') {
+        return diagnostic(startedAt, { ok: false, stage: 'payload', reason: 'invalid_json' })
+      }
+      throw error
+    }
+    const identity = parseDesktopGatewayIdentityPayload(payload)
+    if (!identity) {
+      return diagnostic(startedAt, { ok: false, stage: 'payload', reason: 'invalid_payload' })
+    }
+    const mismatchFields = identityMismatchesRecord(identity, record, challenge)
+    if (mismatchFields.length > 0) {
+      return diagnostic(startedAt, { ok: false, stage: 'fields', reason: 'identity_mismatch', mismatchFields })
+    }
+    const { proof, ...unsigned } = identity
+    if (!safeHexEqual(proof, desktopGatewayIdentityProof(record.instance_nonce, unsigned))) {
+      return diagnostic(startedAt, { ok: false, stage: 'proof', reason: 'proof_mismatch' })
+    }
+    return diagnostic(startedAt, { ok: true, stage: 'verified', reason: 'verified' })
+  } catch (error) {
+    // Only a fixed category crosses the diagnostic boundary. Exception
+    // messages, response bodies and arbitrary error names can contain secrets.
+    return diagnostic(startedAt, {
+      ok: false,
+      stage: 'request',
+      reason: 'request_failed',
+      errorType: diagnosticErrorType(error),
+    })
   }
 }
 
@@ -376,6 +507,161 @@ export async function requestVerifiedDesktopGatewayShutdown(
     return response.status === 202
   } catch {
     return false
+  }
+}
+
+export type DesktopGatewayLifecycleFailure = {
+  kind: 'unsupported' | 'rejected' | 'unreachable'
+}
+
+export interface DesktopGatewayActivity {
+  running: number
+  queued: number
+  waiting: number
+  reservations: number
+  auxiliary: number
+}
+
+export type DesktopGatewayActivityResult = DesktopGatewayLifecycleFailure | {
+  kind: 'ok'
+  activeCount: number
+  activity: DesktopGatewayActivity
+}
+
+export type DesktopGatewayQuitResult = DesktopGatewayLifecycleFailure | {
+  kind: 'quit_accepted'
+  remainingMs: number
+  totalRemainingMs: number
+}
+
+export interface DesktopGatewayQuitOptions extends DesktopGatewayIdentityVerificationOptions {
+  remainingMs: number
+}
+
+export function desktopGatewayLifecycleProof(
+  record: DesktopGatewayOwnershipRecord,
+  challenge: string,
+  action: string,
+  fields: Record<string, unknown> = {},
+): string {
+  const { instance_nonce, ...publicRecord } = record
+  return createHmac('sha256', instance_nonce)
+    .update(canonicalSortedAsciiJson({
+      ...publicRecord,
+      ...fields,
+      lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+      action,
+      challenge,
+    }), 'utf8')
+    .digest('hex')
+}
+
+async function requestDesktopGatewayLifecycle(
+  record: DesktopGatewayOwnershipRecord,
+  action: 'status' | 'shutdown',
+  fields: Record<string, unknown>,
+  options: DesktopGatewayIdentityVerificationOptions,
+): Promise<DesktopGatewayLifecycleFailure | { kind: 'reply'; fields: Record<string, unknown> }> {
+  const challenge = options.challenge ?? randomBytes(32).toString('base64url')
+  if (!OWNER_TOKEN_RE.test(challenge)) return { kind: 'rejected' }
+  try {
+    const response = await (options.fetchImpl ?? fetch)(
+      `http://127.0.0.1:${record.port}/api/desktop/lifecycle`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...fields,
+          lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+          action,
+          challenge,
+          proof: desktopGatewayLifecycleProof(record, challenge, action, fields),
+        }),
+        signal: AbortSignal.timeout(Math.max(1, options.timeoutMs ?? 1000)),
+      },
+    )
+    // The separate endpoint cannot accidentally ask an older Gateway to drain.
+    // Only absence selects legacy compatibility; authentication/ACK failures do not.
+    if (response.status === 404 || response.status === 405) return { kind: 'unsupported' }
+    if (response.status !== (action === 'status' ? 200 : 202)) return { kind: 'rejected' }
+    const payload: unknown = await response.json().catch(() => null)
+    if (!isRecord(payload)) return { kind: 'rejected' }
+    const {
+      proof,
+      challenge: replyChallenge,
+      action: replyAction,
+      lifecycle_protocol: protocol,
+      ...replyFields
+    } = payload
+    if (
+      typeof proof !== 'string'
+      || replyChallenge !== challenge
+      || replyAction !== `${action}_ack`
+      || protocol !== DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL
+      || !safeHexEqual(proof, desktopGatewayLifecycleProof(
+        record, challenge, `${action}_ack`, replyFields,
+      ))
+    ) return { kind: 'rejected' }
+    return { kind: 'reply', fields: replyFields }
+  } catch {
+    return { kind: 'unreachable' }
+  }
+}
+
+/** Read only; counts no task text and never closes task admission. */
+export async function readVerifiedDesktopGatewayActivity(
+  record: DesktopGatewayOwnershipRecord,
+  options: DesktopGatewayIdentityVerificationOptions = {},
+): Promise<DesktopGatewayActivityResult> {
+  const result = await requestDesktopGatewayLifecycle(record, 'status', {}, {
+    ...options,
+    timeoutMs: Math.min(1000, options.timeoutMs ?? 1000),
+  })
+  if (result.kind !== 'reply') return result
+  const activity = result.fields.activity
+  const keys = ['running', 'queued', 'waiting', 'reservations', 'auxiliary'] as const
+  if (
+    !isRecord(activity)
+    || Object.keys(result.fields).length !== 1
+    || Object.keys(activity).length !== keys.length
+    || keys.some(key => !Number.isSafeInteger(activity[key]) || Number(activity[key]) < 0)
+  ) return { kind: 'rejected' }
+  const counts = Object.fromEntries(
+    keys.map(key => [key, Number(activity[key])]),
+  ) as unknown as DesktopGatewayActivity
+  return {
+    kind: 'ok',
+    activeCount: keys.reduce((count, key) => count + counts[key], 0),
+    activity: counts,
+  }
+}
+
+/** An accepted reply proves that this exact instance installed the quit policy. */
+export async function requestVerifiedDesktopGatewayQuit(
+  record: DesktopGatewayOwnershipRecord,
+  options: DesktopGatewayQuitOptions,
+): Promise<DesktopGatewayQuitResult> {
+  if (!Number.isInteger(options.remainingMs) || options.remainingMs < 0
+    || options.remainingMs > 10_000) return { kind: 'rejected' }
+  const result = await requestDesktopGatewayLifecycle(record, 'shutdown', {
+    mode: 'quit',
+    remaining_ms: options.remainingMs,
+  }, { ...options, timeoutMs: Math.min(options.timeoutMs ?? 1000, options.remainingMs) })
+  if (result.kind !== 'reply') return result
+  if (
+    result.fields.accepted_mode !== 'quit'
+    || Object.keys(result.fields).length !== 3
+    || !Number.isInteger(result.fields.remaining_ms)
+    || Number(result.fields.remaining_ms) < 0
+    || Number(result.fields.remaining_ms) > options.remainingMs
+    || !Number.isInteger(result.fields.total_remaining_ms)
+    || Number(result.fields.total_remaining_ms) < Number(result.fields.remaining_ms)
+    || Number(result.fields.total_remaining_ms) > options.remainingMs + 5000
+  ) return { kind: 'rejected' }
+  return {
+    kind: 'quit_accepted',
+    remainingMs: Number(result.fields.remaining_ms),
+    totalRemainingMs: Number(result.fields.total_remaining_ms),
   }
 }
 

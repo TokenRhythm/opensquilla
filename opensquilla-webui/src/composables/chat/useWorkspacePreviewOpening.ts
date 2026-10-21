@@ -1,5 +1,6 @@
 import { onScopeDispose, watch, type Ref } from 'vue'
 import type { ConversationToolContent } from '@/modules/conversationEventContent'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchResource, WorkbenchResourceOpenResponse, WorkbenchResourceRef } from '@/types/workbenchResources'
 import { createWorkbenchResourceRef, workbenchResourceRefId } from '@/types/workbenchResources'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
@@ -14,9 +15,12 @@ export function useWorkspacePreviewOpening(options: {
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   enabled: Ref<boolean>
+  beginRequest?: () => () => boolean
+  getArtifact: (key: string, artifactId: string) => Promise<ArtifactPayload | null>
   resolve: (key: string, ref: WorkbenchResourceRef) => Promise<WorkbenchResource | null>
   openCurrent: (key: string, resource: WorkbenchResource) => Promise<WorkbenchResourceOpenResponse | null>
-  show: (current: CurrentDocument, key: string, previewPagePath?: string) => void
+  prepareCurrent?: (current: CurrentDocument, key: string, isCurrent: () => boolean) => Promise<unknown>
+  show: (current: CurrentDocument, key: string, previewPagePath?: string) => boolean | void
   onError: (error: unknown) => void
 }) {
   let lifetime = 0
@@ -29,17 +33,35 @@ export function useWorkspacePreviewOpening(options: {
   }, { flush: 'sync' })
   onScopeDispose(() => { disposed = true; lifetime += 1 })
 
-  async function open(documentId: string, expectedSessionKey = options.sessionKey.value, previewPagePath?: string) {
+  async function open(target: string | { artifactId: string }, expectedSessionKey = options.sessionKey.value, previewPagePath?: string) {
     const key = options.sessionKey.value
     const started = lifetime
     if (disposed || !key || expectedSessionKey !== key) return
     const request = ++openRequest
-    const isCurrent = () => lifetime === started && options.sessionKey.value === key && request === openRequest
+    const ownerIsCurrent = options.beginRequest?.() ?? (() => true)
+    const isCurrent = () => lifetime === started && options.sessionKey.value === key
+      && request === openRequest && ownerIsCurrent()
+    if (!isCurrent()) return
     const hasPage = (resource: WorkbenchResource) => previewPagePath === undefined
       || (isPreviewPagePath(previewPagePath) && resource.previewPages?.includes(previewPagePath))
     try {
-      if (!options.enabled.value || !/^doc_[\w-]+$/.test(documentId)
+      if (!options.enabled.value
         || (previewPagePath !== undefined && !isPreviewPagePath(previewPagePath))) {
+        throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+      }
+      let documentId = typeof target === 'string' ? target : ''
+      if (typeof target !== 'string') {
+        // Count this lookup as part of the same open request: a slow historical
+        // card must not override a newer click or survive a session switch.
+        const artifact = await options.getArtifact(key, target.artifactId)
+        if (!isCurrent()) return
+        if (artifact?.id !== target.artifactId || artifact.source !== 'workspace-preview'
+          || typeof artifact.documentId !== 'string') {
+          throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+        }
+        documentId = artifact.documentId
+      }
+      if (!options.enabled.value || !/^doc_[\w-]+$/.test(documentId)) {
         throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
       }
       const resource = await options.resolve(key, createWorkbenchResourceRef('document', documentId))
@@ -58,8 +80,12 @@ export function useWorkspacePreviewOpening(options: {
         || !current.resource.capabilities.preview || !hasPage(current.resource)) {
         throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
       }
-      if (previewPagePath === undefined) options.show(current, key)
-      else options.show(current, key, previewPagePath)
+      await options.prepareCurrent?.(current, key, isCurrent)
+      if (!isCurrent()) return
+      const shown = previewPagePath === undefined
+        ? options.show(current, key)
+        : options.show(current, key, previewPagePath)
+      return shown !== false
     } catch (error) {
       if (isCurrent()) options.onError(error)
     }

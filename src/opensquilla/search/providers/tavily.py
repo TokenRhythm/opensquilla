@@ -11,6 +11,7 @@ from opensquilla.search.registry import register_provider
 from opensquilla.search.retry_policy import is_retryable_http_status
 from opensquilla.search.types import Recency, SearchErrorKind, SearchProviderError, SearchResult
 from opensquilla.secrets import clean_header_secret
+from opensquilla.usage_request import accounted_request
 
 _API_URL = "https://api.tavily.com/search"
 _RESULT_METADATA_EXCLUDE = {
@@ -72,6 +73,7 @@ class TavilySearchProvider:
             "include_raw_content": False,
             "include_answer": False,
             "include_images": False,
+            "include_usage": True,
         }
         if recency:
             body["time_range"] = recency
@@ -87,7 +89,15 @@ class TavilySearchProvider:
                 trust_env=self._trust_env,
                 transport=self._transport,
             ) as client:
-                response = await client.post(_API_URL, json=body)
+                response = await accounted_request(
+                    client,
+                    "POST",
+                    _API_URL,
+                    provider=self.name,
+                    operation="web_search",
+                    base_url="https://api.tavily.com",
+                    json=body,
+                )
                 response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise SearchProviderError(

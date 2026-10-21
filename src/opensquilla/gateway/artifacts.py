@@ -12,7 +12,9 @@ from starlette.routing import Route
 from opensquilla.application.artifact_workbench import (
     ArtifactContentApplication,
     ArtifactContentQuery,
+    ContentExportError,
     ContentIntegrityError,
+    ContentMaterial,
     ContentNotFoundError,
     DocumentContentQuery,
     NativeArtifactOpen,
@@ -36,12 +38,13 @@ from opensquilla.gateway.adapters.artifact_native import (
     _open_path_with_default_app as _open_path_with_default_app,
 )
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.html_archive import TemporaryArchiveResponse
 from opensquilla.gateway.origin_guard import (
     forbidden_origin_response,
     request_origin_allowed,
 )
 from opensquilla.gateway.origin_guard import (
-    request_principal_is_owner as _request_principal_is_owner,
+    request_principal_is_owner_async as _request_principal_is_owner,
 )
 
 # Keep the test-facing module handles stable while the implementation lives in
@@ -72,28 +75,59 @@ def register_artifact_routes(
         )
     )
 
+    def export_error(exc: ContentExportError) -> JSONResponse:
+        return JSONResponse(
+            {"error": str(exc), "code": exc.code}, status_code=exc.status_code,
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    def file_response(material: ContentMaterial) -> FileResponse:
+        if material.cleanup is not None:
+            return TemporaryArchiveResponse(material)
+        assert material.path is not None
+        return FileResponse(
+            material.path, media_type=material.media_type, filename=material.filename,
+        )
+
     async def working_file_handler(request: Request) -> Response:
         headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
         if not request_origin_allowed(request, config):
             return forbidden_origin_response()
         # Source paths are host material, unlike an immutable shared delivery.
-        if not _request_principal_is_owner(config, request):
+        if not await _request_principal_is_owner(config, request):
             return JSONResponse({"code": "OWNER_REQUIRED"}, status_code=403, headers=headers)
         format_ = request.query_params.get("format", "content")
-        if format_ not in {"content", "metadata"}:
+        if format_ not in {"content", "metadata", "zip"}:
             return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=headers)
+        if format_ == "zip" and request.method == "HEAD":
+            return Response(status_code=405, headers={**headers, "Allow": "GET"})
         try:
             material = await content.working_file(
                 WorkingFileQuery(
                     request.headers.get("x-opensquilla-session-key", ""),
                     request.path_params["document_id"],
                     request.query_params.get("pagePath"),
+                    format="zip" if format_ == "zip" else "content",
                 )
             )
+        except ContentExportError as exc:
+            return export_error(exc)
         except (ContentNotFoundError, ValueError):
             return JSONResponse(
                 {"code": "WORKING_FILE_UNAVAILABLE"}, status_code=404, headers=headers
             )
+        if isinstance(material, ContentMaterial):
+            try:
+                still_owner = await _request_principal_is_owner(config, request)
+            except BaseException:
+                if material.cleanup is not None:
+                    await material.cleanup()
+                raise
+            if not still_owner:
+                if material.cleanup is not None:
+                    await material.cleanup()
+                return JSONResponse({"code": "OWNER_REQUIRED"}, status_code=403, headers=headers)
+            return file_response(material)
         if format_ == "metadata":
             return JSONResponse(
                 {
@@ -114,7 +148,7 @@ def register_artifact_routes(
         )
         return Response(material.data, media_type=material.media_type, headers=headers)
 
-    async def document_download_handler(request: Request) -> FileResponse | JSONResponse:
+    async def document_download_handler(request: Request) -> Response:
         document_id = request.path_params.get("document_id", "")
         session_key = (
             request.query_params.get("sessionKey")
@@ -122,14 +156,24 @@ def register_artifact_routes(
             or request.headers.get("x-opensquilla-session-key")
             or ""
         )
+        format_ = request.query_params.get("format", "content")
+        if format_ not in {"content", "zip"}:
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400)
+        if format_ == "zip" and request.method == "HEAD":
+            return Response(status_code=405, headers={"Allow": "GET"})
         try:
             material = await content.document(
                 DocumentContentQuery(
                     session_key,
                     str(document_id),
                     request.query_params.get("revisionId"),
+                    format=format_,
                 )
             )
+            if material.path is None:
+                raise ContentNotFoundError("artifact document has no file path")
+        except ContentExportError as exc:
+            return export_error(exc)
         except ContentIntegrityError as exc:
             return JSONResponse(
                 {"error": str(exc), "code": "INTEGRITY_ERROR"},
@@ -140,13 +184,9 @@ def register_artifact_routes(
                 {"error": "Artifact document not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
-        return FileResponse(
-            material.path,
-            media_type=material.media_type,
-            filename=material.filename,
-        )
+        return file_response(material)
 
-    async def download_handler(request: Request) -> FileResponse | JSONResponse:
+    async def download_handler(request: Request) -> Response:
         artifact_id = request.path_params.get("artifact_id", "")
         session_key = (
             request.query_params.get("sessionKey")
@@ -155,14 +195,24 @@ def register_artifact_routes(
             or ""
         )
         want_thumbnail = request.query_params.get("variant") == "thumb"
+        format_ = request.query_params.get("format", "content")
+        if format_ not in {"content", "zip"} or (want_thumbnail and format_ == "zip"):
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400)
+        if format_ == "zip" and request.method == "HEAD":
+            return Response(status_code=405, headers={"Allow": "GET"})
         try:
             material = await content.artifact(
                 ArtifactContentQuery(
                     session_key,
                     str(artifact_id),
                     thumbnail=want_thumbnail,
+                    format=format_,
                 )
             )
+            if material.path is None:
+                raise ContentNotFoundError("artifact has no file path")
+        except ContentExportError as exc:
+            return export_error(exc)
         except ContentIntegrityError as exc:
             return JSONResponse({"error": str(exc), "code": "INTEGRITY_ERROR"}, status_code=409)
         except (ContentNotFoundError, ValueError):
@@ -170,16 +220,12 @@ def register_artifact_routes(
                 {"error": "Artifact not found", "code": "NOT_FOUND"},
                 status_code=404,
             )
-        return FileResponse(
-            material.path,
-            media_type=material.media_type,
-            filename=material.filename,
-        )
+        return file_response(material)
 
     async def open_handler(request: Request) -> JSONResponse:
         if not request_origin_allowed(request, config):
             return forbidden_origin_response()
-        if not _request_principal_is_owner(config, request):
+        if not await _request_principal_is_owner(config, request):
             return JSONResponse(
                 {"error": "Owner privileges required", "code": "OWNER_REQUIRED"},
                 status_code=403,

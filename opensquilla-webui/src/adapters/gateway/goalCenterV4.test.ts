@@ -101,6 +101,20 @@ describe('createV4GoalCenter', () => {
     await expect(createV4GoalCenter(source).set({ sessionKey: 'agent:demo', objective: 'ship', clientRequestId: '550e8400-e29b-41d4-a716-446655440000', clientMessageId: '550e8400-e29b-41d4-a716-446655440001' })).rejects.toMatchObject({ name: 'GoalCenterError', code: 'conflict', retryable: true })
   })
 
+  it('copies explicit local reference metadata into Goal admission', async () => {
+    const source = transport({ sessionKey: 'agent:demo', accepted: true, goal: { status: 'active', goalId: 'g1' } })
+    const localPathReferences = ['C:\\reports\\report.pdf']
+    await createV4GoalCenter(source).set({
+      sessionKey: 'agent:demo',
+      objective: `Review\n${localPathReferences[0]}`,
+      localPathReferences,
+      clientRequestId: '550e8400-e29b-41d4-a716-446655440000',
+      clientMessageId: '550e8400-e29b-41d4-a716-446655440001',
+    })
+    localPathReferences.push('C:\\new-draft.pdf')
+    expect(source.requests[0]?.params?.localPathReferences).toEqual(['C:\\reports\\report.pdf'])
+  })
+
   it('rejects structurally incomplete query and mutation responses', async () => {
     const statusSource = transport({ sessionKey: 'agent:demo', sessionId: 's1', epoch: 1 })
     await expect(createV4GoalCenter(statusSource).status('agent:demo')).rejects.toThrow('invalid response')

@@ -1,10 +1,11 @@
 // @vitest-environment happy-dom
 
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { nextTick, ref } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, nextTick, ref } from 'vue'
 
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import type {
   ChatMessage,
   ChatRenderedMessage,
@@ -13,6 +14,8 @@ import type {
 } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
+import { sliceMessageContent, type ReadMessageText } from '@/utils/chat/historyMessageContent'
+import { interleaveHistoryModelCallSegments, interleaveHydratedHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 
 vi.mock('@/utils/browser', () => ({
   copyTextWithFallback: vi.fn().mockResolvedValue(undefined),
@@ -91,6 +94,45 @@ beforeEach(() => {
 })
 
 describe('useChatMessageActions branching edits', () => {
+  it('restores message reference chips for edit, and the prior draft on cancellation', () => {
+    const path = 'C:\\资料\\book.pdf'
+    const draftPath = 'C:\\draft.html'
+    const { options } = makeOptions([{ role: 'user', text: `Read\n${path}`, ts: null,
+      messageId: 'durable', localPathReferences: [path] }])
+    const draft = useLocalPathDraft()
+    draft.restoreInput(`Draft\n${draftPath}`, [draftPath])
+    options.inputText = draft.inputText
+    options.localPathReferences = draft.localPaths
+    options.restoreInput = draft.restoreInput
+    const api = useChatMessageActions(options)
+    api.editMessage(renderedMessage({ sourceIndex: 0 }))
+    expect(draft.composerText.value).toBe('Read')
+    expect(draft.localPaths.value).toEqual([path])
+    expect(draft.inputText.value).toBe(`Read\n${path}`)
+    expect(api.cancelEdit()).toBe(true)
+    expect(draft.composerText.value).toBe('Draft')
+    expect(draft.localPaths.value).toEqual([draftPath])
+  })
+
+  it('regenerates complete canonical text while retaining explicit reference chips', async () => {
+    const path = 'C:\\book.pdf'
+    const { options } = makeOptions([
+      { role: 'user', text: path, ts: null, messageId: 'durable', localPathReferences: [path] },
+      { role: 'assistant', text: 'done', ts: null },
+    ])
+    const draft = useLocalPathDraft()
+    options.inputText = draft.inputText
+    options.localPathReferences = draft.localPaths
+    options.restoreInput = draft.restoreInput
+    const api = useChatMessageActions(options)
+    expect(api.regenerateMessage(renderedMessage({ role: 'assistant', sourceIndex: 1 }))).toBe(true)
+    await nextTick()
+    expect(draft.composerText.value).toBe('')
+    expect(draft.inputText.value).toBe(path)
+    expect(draft.localPaths.value).toEqual([path])
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
   it('records the edited user message id before trimming local history', () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
@@ -1147,6 +1189,67 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     expect(copyTextWithFallback).toHaveBeenCalledWith('Final answer.\n\nAI generated')
   })
 
+  it('copies only the explicit final answer after a failed tool', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working note.\n\nFinal answer.',
+      terminalFailure: true,
+      turnOutcome: {
+        turnId: 'turn-copy-failed-tool',
+        status: 'failed',
+      },
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: 'Working note.',
+          rawText: 'Working note.',
+          presentation: 'intermediate',
+        },
+        {
+          type: 'tool-group',
+          key: 'failed-tool',
+          group: {
+            groupId: 'failed-tool',
+            operationKey: 'web.search',
+            label: 'Search',
+            iconName: 'search',
+            calls: [{
+              toolId: 'failed-tool',
+              renderKey: 'failed-tool',
+              name: 'web_search',
+              displayName: 'Search',
+              inputRaw: '{}',
+              inputPreview: '{}',
+              isRunning: false,
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: true,
+            status: 'error',
+          },
+        },
+        {
+          type: 'text',
+          key: 'answer',
+          html: 'Final answer.',
+          rawText: 'Final answer.',
+          presentation: 'answer',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('Final answer.\n\nAI generated')
+  })
+
   it('does not copy explicit intermediate-only activity as an answer', async () => {
     const { api } = makeOptions([], text => text, () => 'AI generated')
 
@@ -1316,5 +1419,377 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     expect(copyTextWithFallback).toHaveBeenCalledWith(
       'Working.\n\nPartial delivery.\n\nAI generated',
     )
+  })
+})
+
+
+describe('complete historical message actions', () => {
+  const body = '0123456789'.repeat(2048) + 'EXPECTED_FINAL_TAIL'
+  function fixture() {
+    const { options } = makeOptions([
+      { role: 'user', ts: 1, messageId: 'long-user', text: body.slice(0, 16384), previewComplete: false,
+        contentRef: { version: 1, sessionKey: 'session-a', sessionId: 'physical-a', messageId: 'long-user',
+          source: 'active', view: 'display', revision: 'revision-a' } },
+      { role: 'assistant', ts: 2, messageId: 'answer', text: 'answer' },
+    ])
+    const session = ref('session-a:0')
+    options.sessionIdentity = () => session.value
+    options.inputText.value = 'prior draft'
+    const read = vi.fn<ReadMessageText>(async () => body)
+    options.readMessageText = read
+    const api = useChatMessageActions(options)
+    return { api, options, read, session,
+      user: renderedMessage({ sourceIndex: 0, messageId: 'long-user' }),
+      assistant: renderedMessage({ role: 'assistant', displayRole: 'assistant', sourceIndex: 1, messageId: 'answer' }) }
+  }
+
+  it('edits the complete durable body and cancellation restores the transcript and draft', async () => {
+    const { api, options, read, user } = fixture()
+    const transcript = options.messages.value
+    const pending = api.editMessage(user)
+    expect(options.inputText.value).toBe('prior draft')
+    expect(options.messages.value).toBe(transcript)
+    expect(await pending).toBe(true)
+    expect(read.mock.calls[0]?.[0]).toMatchObject({ contentRef: { sessionId: 'physical-a', revision: 'revision-a' } })
+    expect(options.inputText.value).toBe(body)
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value).toBe(transcript)
+    expect(options.inputText.value).toBe('prior draft')
+  })
+
+  it('regenerates with the full user body, even when the rendered answer has already hydrated', async () => {
+    const { api, options, assistant } = fixture()
+    expect(await api.regenerateMessage(assistant)).toBe(true)
+    await nextTick()
+    expect(options.inputText.value).toBe(body)
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(options.pendingForkBeforeMessageId.value).toBe('long-user')
+  })
+
+  it.each(['edit', 'regenerate'] as const)('does not use a preview when %s cannot read the body', async operation => {
+    const { api, options, read, user, assistant } = fixture()
+    read.mockRejectedValue(new Error('incomplete range'))
+    const transcript = options.messages.value
+    expect(await (operation === 'edit' ? api.editMessage(user) : api.regenerateMessage(assistant))).toBe(false)
+    expect(options.messages.value).toBe(transcript)
+    expect(options.inputText.value).toBe('prior draft')
+    expect(options.pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(options.sendUsageBarrierReplay).not.toHaveBeenCalled()
+  })
+
+  it.each(['cancel', 'session', 'epoch', 'revision', 'draft', 'streaming', 'discard'] as const)(
+    'discards a late complete edit after %s changes', async change => {
+      const { api, options, read, user, session } = fixture()
+      let resolve!: (text: string) => void
+      read.mockImplementation(() => new Promise(done => { resolve = done }))
+      const transcript = options.messages.value
+      const request = api.editMessage(user)
+      if (change === 'cancel') expect(api.cancelEdit()).toBe(true)
+      if (change === 'session') { session.value = 'session-b:0'; session.value = 'session-a:0' }
+      if (change === 'epoch') session.value = 'session-a:1'
+      if (change === 'revision') options.messages.value[0]!.contentRef!.revision = 'new-revision'
+      if (change === 'draft') options.inputText.value = 'new draft'
+      if (change === 'streaming') options.isStreaming.value = true
+      if (change === 'discard') api.discardEditRestorePoint()
+      resolve(body)
+      expect(await request).toBe(false)
+      expect(options.messages.value).toBe(transcript)
+      expect(options.inputText.value).toBe(change === 'draft' ? 'new draft' : 'prior draft')
+      expect(options.pendingForkBeforeMessageId.value).toBeNull()
+      expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    },
+  )
+
+  it('supersedes an in-flight edit with a newer regenerate without applying the older read', async () => {
+    const { api, options, read, user, assistant } = fixture()
+    let resolve!: (text: string) => void
+    read.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    const edit = api.editMessage(user)
+    expect(await api.regenerateMessage(assistant)).toBe(true)
+    resolve(body + 'STALE')
+    expect(await edit).toBe(false)
+    await nextTick()
+    expect(options.inputText.value).toBe(body)
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
+  it('does not send a queued synchronous regenerate after navigating away and back', async () => {
+    const { api, options, assistant, session } = fixture()
+    options.messages.value[0]!.previewComplete = true
+    options.messages.value[0]!.text = body
+    expect(api.regenerateMessage(assistant)).toBe(true)
+    session.value = 'session-b:0'
+    session.value = 'session-a:0'
+    await nextTick()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('reads the full body before a proven usage-barrier replay', async () => {
+    const { api, options, assistant } = fixture()
+    const outcome = safeUsageOutcome('turn', 'long-user')
+    options.messages.value[0]!.turnId = 'turn'
+    options.messages.value[1]!.turnOutcome = outcome
+    assistant.turnOutcome = outcome
+    expect(await api.regenerateMessage(assistant)).toBe(true)
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({ text: body, forkBeforeMessageId: 'long-user' })
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+})
+
+describe('complete historical message copy', () => {
+  const body = '0123456789'.repeat(2048) + '🙂EXPECTED_FINAL_TAIL'
+  const scopes: ReturnType<typeof effectScope>[] = []
+  afterEach(() => scopes.splice(0).forEach(scope => scope.stop()))
+
+  function fixture(role: 'user' | 'assistant' = 'user') {
+    const source: ChatMessage = {
+      role, ts: 1, messageId: 'long-message', text: body.slice(0, 16384), previewComplete: false,
+      contentRef: { version: 1, sessionKey: 'session-a', sessionId: 'physical-a', messageId: 'long-message',
+        source: 'active', view: 'display', revision: 'revision-a' },
+    }
+    const { sanitizeCopyText, stripTimePrefix } = useChatTextRendering()
+    const { options } = makeOptions([source], sanitizeCopyText, () => 'AI generated')
+    options.stripTimePrefix = stripTimePrefix
+    const session = ref('session-a:0')
+    options.sessionIdentity = () => session.value
+    const read = vi.fn<ReadMessageText>(async () => body)
+    options.readMessageText = read
+    const scope = effectScope()
+    scopes.push(scope)
+    const api = scope.run(() => useChatMessageActions(options))!
+    const message = renderedMessage({ ...options.messages.value[0], displayRole: role, sourceIndex: 0 })
+    return { api, options, read, session, scope, message }
+  }
+
+  function deferRead(read: ReturnType<typeof fixture>['read']) {
+    let resolve!: (text: string) => void
+    const result = new Promise<string>(done => { resolve = done })
+    read.mockImplementation(() => result)
+    return resolve
+  }
+
+  it.each(['user', 'assistant'] as const)('waits for the full %s body before copying or reporting success', async role => {
+    const { api, read, message } = fixture(role)
+    const resolve = deferRead(read)
+    let settled = false
+    const pending = api.copyMessage(message).then(result => { settled = true; return result })
+    await nextTick()
+    expect(copyTextWithFallback).not.toHaveBeenCalled()
+    expect(settled).toBe(false)
+    expect(read).toHaveBeenCalledOnce()
+    resolve(body)
+    expect(await pending).toBe(true)
+    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith(
+      role === 'assistant' ? `${body}\n\nAI generated` : body,
+    )
+    expect(message.text).toBe(body.slice(0, 16384))
+  })
+
+  it.each(['missing reader', 'unavailable content', 'incomplete range'])('does not copy a preview after %s', async failure => {
+    const { api, options, read, message } = fixture()
+    if (failure === 'missing reader') options.readMessageText = undefined
+    else read.mockRejectedValue(new Error(failure))
+    expect(await api.copyMessage(message)).toBe(false)
+    expect(copyTextWithFallback).not.toHaveBeenCalled()
+  })
+
+  it.each(['session', 'epoch', 'revision', 'replacement', 'dispose'] as const)(
+    'discards a late copy after %s changes', async change => {
+      const { api, options, read, message, session, scope } = fixture()
+      const resolve = deferRead(read)
+      const pending = api.copyMessage(message)
+      if (change === 'session') { session.value = 'session-b:0'; session.value = 'session-a:0' }
+      if (change === 'epoch') session.value = 'session-a:1'
+      if (change === 'revision') {
+        options.messages.value[0]!.contentRef = { ...options.messages.value[0]!.contentRef!, revision: 'revision-b' }
+      }
+      if (change === 'replacement') options.messages.value[0] = { role: 'user', ts: 2, messageId: 'other', text: 'other' }
+      if (change === 'dispose') scope.stop()
+      resolve(body)
+      expect(await pending).toBe(false)
+      expect(copyTextWithFallback).not.toHaveBeenCalled()
+    },
+  )
+
+  it('lets a newer complete copy supersede an older pending read', async () => {
+    const { api, read, message } = fixture()
+    const resolve = deferRead(read)
+    const pending = api.copyMessage(message)
+    expect(await api.copyMessage(renderedMessage({ text: 'Newer copy', previewComplete: true }))).toBe(true)
+    resolve(body)
+    expect(await pending).toBe(false)
+    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith('Newer copy')
+    expect(read.mock.calls[0]![1].aborted).toBe(true)
+  })
+
+  it('keeps complete short messages on the immediate clipboard path', async () => {
+    const { api, read, message } = fixture()
+    message.previewComplete = true
+    message.text = 'Complete short message'
+    expect(await api.copyMessage(message)).toBe(true)
+    expect(read).not.toHaveBeenCalled()
+    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith(message.text)
+  })
+
+  it('does not treat composer edits or streaming as a copy cancellation', async () => {
+    const { api, options, read, message } = fixture()
+    const resolve = deferRead(read)
+    const pending = api.copyMessage(message)
+    options.inputText.value = 'Keep this unrelated draft'
+    options.isStreaming.value = true
+    resolve(body)
+    expect(await pending).toBe(true)
+    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith(body)
+    expect(options.inputText.value).toBe('Keep this unrelated draft')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('restores full timeline text before choosing and sanitizing the assistant answer', async () => {
+    const { api, read, message } = fixture('assistant')
+    const note = 'Working note.'
+    const answer = `<details>Keep literal details.</details>\n${body}`
+    const full = note + answer
+    read.mockResolvedValue(full)
+    message.text = full.slice(0, 16384)
+    message.historyPayloadPreview = { textUtf16Lengths: [note.length, answer.length] }
+    message.timelineItems = [
+      { type: 'text', key: 'note', rawText: note, html: note, presentation: 'intermediate' },
+      { type: 'text', key: 'answer', rawText: answer.slice(0, 64), html: '', presentation: 'answer' },
+    ]
+    expect(await api.copyMessage(message)).toBe(true)
+    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith(`${answer}\n\nAI generated`)
+    expect(message.timelineItems[1]).toMatchObject({ rawText: answer.slice(0, 64) })
+  })
+
+  it('retains the rendered content slice when asking the shared reader for text', async () => {
+    const { api, read, message } = fixture('assistant')
+    message.contentSlice = { startCodepoint: 12, endCodepoint: 16 }
+    read.mockResolvedValue('😀正文🙂')
+    expect(await api.copyMessage(message)).toBe(true)
+    expect(read.mock.calls[0]?.[0]).toMatchObject({
+      contentSlice: { startCodepoint: 12, endCodepoint: 16 },
+      contentRef: { sessionId: 'physical-a', messageId: 'long-message', revision: 'revision-a', view: 'display' },
+    })
+    expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith('😀正文🙂\n\nAI generated')
+  })
+
+  function steerFixture() {
+    const base = fixture('assistant')
+    const chunks = ['P'.repeat(16390) + '😀', 'Middle🙂', 'Tail𐐀']
+    const full = chunks.join('')
+    const prefixEnd = Array.from(chunks[0]!).length
+    const middleEnd = prefixEnd + Array.from(chunks[1]!).length
+    const assistant: ChatMessage = {
+      ...base.options.messages.value[0]!, text: full.slice(0, 16384), turnId: 'turn',
+      usage: { model_call_segments: [
+        { model_call_id: 'call-a', iteration: 1, start_codepoint: prefixEnd, end_codepoint: middleEnd },
+        { model_call_id: 'call-b', iteration: 2, start_codepoint: middleEnd, end_codepoint: Array.from(full).length },
+      ] },
+    }
+    const steers: ChatMessage[] = [
+      { role: 'user', ts: 1, text: 'First steer', turnId: 'turn', inputDisposition: 'applied',
+        steerModelCallId: 'call-a', steerAppliedIteration: 1 },
+      { role: 'user', ts: 2, text: 'Second steer', turnId: 'turn', inputDisposition: 'applied',
+        steerModelCallId: 'call-b', steerAppliedIteration: 2 },
+    ]
+    base.options.messages.value = [...steers, assistant]
+    function reproject() {
+      const aggregate = { ...assistant, contentRef: { ...assistant.contentRef! } }
+      base.options.messages.value = interleaveHydratedHistoryModelCallSegments([
+        { role: 'user', ts: 0, text: 'Earlier history loaded' }, ...steers, aggregate,
+      ], aggregate, full)
+    }
+    return { ...base, chunks, full, reproject }
+  }
+
+  it.each(['aggregate', 'prefix', 'middle', 'suffix'] as const)(
+    'copies the clicked %s scope while the same body is reprojected', async scope => {
+      const { api, options, read, chunks, full, reproject } = steerFixture()
+      if (scope !== 'aggregate') reproject()
+      const assistants = options.messages.value.flatMap((row, index) => row.role === 'assistant'
+        ? [renderedMessage({ ...row, displayRole: 'assistant', sourceIndex: index })] : [])
+      const segmentIndex = scope === 'middle' ? 1 : scope === 'suffix' ? 2 : 0
+      const clicked = assistants[segmentIndex]!
+      const clickedSlice = clicked.contentSlice && { ...clicked.contentSlice }
+      const resolve = deferRead(read)
+      const pending = api.copyMessage(clicked)
+      reproject()
+      expect(options.messages.value.filter(row => row.role === 'assistant')).toHaveLength(3)
+      expect(options.messages.value.find(row => row.messageId === 'long-message')!.contentSlice).toBeDefined()
+      expect(copyTextWithFallback).not.toHaveBeenCalled()
+      const expected = scope === 'aggregate' ? full : chunks[segmentIndex]!
+      expect(read.mock.calls[0]![0].contentSlice).toEqual(clickedSlice)
+      resolve(sliceMessageContent(read.mock.calls[0]![0], full))
+      expect(await pending).toBe(true)
+      expect(copyTextWithFallback).toHaveBeenCalledExactlyOnceWith(`${expected}\n\nAI generated`)
+    },
+  )
+
+  it.each(['owner', 'turn', 'revision', 'session', 'physical session', 'source', 'view', 'length', 'digest', 'content revision'] as const)(
+    'rejects the pending aggregate copy when reprojection changes its %s identity', async change => {
+      const { api, options, read, full, reproject } = steerFixture()
+      const clicked = renderedMessage({ ...options.messages.value[2]!, displayRole: 'assistant', sourceIndex: 2 })
+      const resolve = deferRead(read)
+      const pending = api.copyMessage(clicked)
+      reproject()
+      const canonical = options.messages.value.find(row => row.messageId === 'long-message')!
+      if (change === 'owner') canonical.messageId = 'another-owner'
+      if (change === 'turn') canonical.turnId = 'another-turn'
+      if (change === 'revision') canonical.contentRef!.revision = 'revision-b'
+      if (change === 'session') canonical.contentRef!.sessionKey = 'another-session'
+      if (change === 'physical session') canonical.contentRef!.sessionId = 'another-physical-session'
+      if (change === 'source') canonical.contentRef!.source = 'compacted'
+      if (change === 'view') canonical.contentRef!.view = 'raw'
+      if (change === 'length') canonical.contentRef!.byteLength = full.length + 1
+      if (change === 'digest') canonical.contentRef!.sha256 = 'another-digest'
+      if (change === 'content revision') canonical.contentRevision = 'another-content-revision'
+      resolve(full)
+      expect(await pending).toBe(false)
+      expect(copyTextWithFallback).not.toHaveBeenCalled()
+    },
+  )
+
+  it('copies only each real Steer slice and fences a synthetic prefix by its source index', async () => {
+    const { api, options, read } = fixture('assistant')
+    const chunks = ['P'.repeat(16390) + '😀', 'Middle🙂', 'Tail𐐀']
+    const full = chunks.join('')
+    const prefixEnd = Array.from(chunks[0]!).length
+    const middleEnd = prefixEnd + Array.from(chunks[1]!).length
+    const assistant = options.messages.value[0]!
+    options.messages.value = interleaveHistoryModelCallSegments([
+      { role: 'user', ts: 1, text: 'First steer', turnId: 'turn', inputDisposition: 'applied',
+        steerModelCallId: 'call-a', steerAppliedIteration: 1 },
+      { role: 'user', ts: 2, text: 'Second steer', turnId: 'turn', inputDisposition: 'applied',
+        steerModelCallId: 'call-b', steerAppliedIteration: 2 },
+      { ...assistant, text: full, turnId: 'turn', usage: { model_call_segments: [
+        { model_call_id: 'call-a', iteration: 1, start_codepoint: prefixEnd, end_codepoint: middleEnd },
+        { model_call_id: 'call-b', iteration: 2, start_codepoint: middleEnd, end_codepoint: Array.from(full).length },
+      ] } },
+    ])
+    const segments = options.messages.value.flatMap((row, index) => {
+      if (row.role !== 'assistant') return []
+      row.text = row.text!.slice(0, 4)
+      return [renderedMessage({ ...row, displayRole: 'assistant', sourceIndex: index,
+        historyPayloadPreview: { textUtf16Lengths: [full.length] },
+        timelineItems: [{ type: 'text', key: 'aggregate', rawText: full, html: '', presentation: 'answer' }],
+      })]
+    })
+    expect(segments).toHaveLength(3)
+    expect(segments[0]!.messageId).toBeUndefined()
+    expect(segments[0]!.clientId).toContain('history-model-call-segment:')
+    expect(segments[2]!.messageId).toBe('long-message')
+    read.mockImplementation(async message => sliceMessageContent(message, full))
+    for (const [index, segment] of segments.entries()) {
+      expect(await api.copyMessage(segment)).toBe(true)
+      expect(copyTextWithFallback).toHaveBeenLastCalledWith(`${chunks[index]}\n\nAI generated`)
+    }
+    const resolve = deferRead(read)
+    const pending = api.copyMessage(segments[0]!)
+    const source = options.messages.value[segments[0]!.sourceIndex!]!
+    source.contentRef = { ...source.contentRef!, revision: 'replacement-revision' }
+    resolve(chunks[0]!)
+    expect(await pending).toBe(false)
+    expect(copyTextWithFallback).toHaveBeenCalledTimes(3)
   })
 })

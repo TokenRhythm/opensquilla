@@ -1,4 +1,5 @@
 import { skillLoadsFromSegments } from '@/types/skillLoads'
+import { normalizeToolFileSnapshot } from '@/utils/chat/toolFileSnapshot'
 import { computed, type Ref } from 'vue'
 import type {
   ChatEnsembleMeta,
@@ -32,12 +33,17 @@ import {
   toolSecondaryText,
 } from '@/utils/chat/toolDisplay'
 import {
-  IMAGE_TIER,
   normalizeRouterTextTier,
   normalizeRouterTier,
   sortRouterTiers,
 } from '@/utils/chat/routerTiers'
 import { normalizeRouterTierSnapshot } from '@/utils/chat/routerTierSnapshot'
+import {
+  hasConfiguredRouterCandidates,
+  resolveRouterCandidates,
+  type RouterCandidateConfiguration,
+} from '@/utils/chat/routerCandidates'
+import { routerCandidateLabels } from '@/utils/chat/routerCandidateLabels'
 import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
 import type { RouterVisualMode } from '@/utils/chat/routerVisualMode'
 import type { ModelRoutingMode } from '@/types/modelRouting'
@@ -93,6 +99,8 @@ export interface UseChatRenderedMessagesOptions {
   /** Next-turn session state; retained for compatibility and never used to classify a turn. */
   modelRoutingMode?: Ref<ModelRoutingMode>
   isStreaming?: Ref<boolean>
+  /** A cached view is readable while current history/live state is being restored. */
+  isPreview?: Readonly<Ref<boolean>>
   currentPlanRevisionId?: Readonly<Ref<string>>
   renderMarkdown: (text: string) => string
   stripGeneratedArtifactMarkers: (text: string) => string
@@ -100,8 +108,6 @@ export interface UseChatRenderedMessagesOptions {
   isSubagentCompletionMessage: (role: string, text: string, options?: ChatMessage) => boolean
   timeTranslator?: TimeTranslator
 }
-
-type ChatRouterRequestKind = 'text' | 'image'
 
 const ROUTER_LEGACY_GRID_CELLS = 15
 const ROUTER_LEGACY_REAL_ANCHORS = [1, 6, 8, 13, 11, 3, 5, 9, 12, 14, 0, 4, 7, 10, 2]
@@ -125,13 +131,10 @@ const ROUTER_LEGACY_DECOY_MODELS = [
 
 function clarifyInterruptFromValue(value: unknown): ToPartsInterrupt | null {
   const data = clarifyRequestFromValue(value)
-  if (!data) return null
-  const composite = `${data.runId}|${data.step}`
-  const approvalId = data.requestId
-    || (composite === '|' ? 'clarify:history' : composite)
+  if (!data?.requestId) return null
   return {
     kind: 'clarify',
-    approvalId,
+    approvalId: data.requestId,
     data,
   }
 }
@@ -365,8 +368,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     let turnResultStartIndex = 0
     let currentTurnHasUserAnchor = false
     let lastAssistantResultIndex = -1
-    let turnRequestKind: ChatRouterRequestKind = 'text'
     let turnRouterDecision: NormalizedRouterDecision | null = null
+    let turnRouterDecisionCallId = ''
+    let turnRouterDecisions = new Map<string, NormalizedRouterDecision>()
 
     // Index of the last user turn — anything after it belongs to the in-flight
     // turn, whose live ensemble strip must survive its own mid-turn done event.
@@ -413,10 +417,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         turnRouterIndexes = new Map()
         turnRouterOrder = []
         turnRouterDecision = null
+        turnRouterDecisionCallId = ''
+        turnRouterDecisions = new Map()
         lastAssistantResultIndex = -1
-        turnRequestKind = msg.role === 'user'
-          ? routerRequestKindFromAttachments(msg.attachments)
-          : 'text'
         turnIdx++
         turnIdentity = messageTurnId
           || msg.clientId
@@ -441,6 +444,10 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         && !msg.text.trim()
         && !msg.attachments?.length
         && !msg.promptAnnotations?.length
+        && msg.previewComplete !== false
+        && msg.contentAvailability !== 'preparing'
+        && msg.contentAvailability !== 'unavailable'
+        && !msg.contentUnavailableReason
       ) {
         prevRole = ''
         continue
@@ -471,6 +478,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const routerDecision = normalizeRouterDecision(msg.routerDecision || (msg.provenanceKind === 'router_decision' ? msg : null))
       if (routerDecision) {
         turnRouterDecision = routerDecision
+        turnRouterDecisionCallId = routerModelCallIdFromMessage(msg)
+        if (turnRouterDecisionCallId) turnRouterDecisions.set(turnRouterDecisionCallId, routerDecision)
         const latestUserTurnId = options.messages.value[lastUserIdx]?.turnId
         const inLiveTurn = options.isStreaming?.value === true && (
           i > lastUserIdx || Boolean(messageTurnId && messageTurnId === latestUserTurnId)
@@ -484,14 +493,18 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           turnIdx,
           i,
           undefined,
-          turnRequestKind,
           turnIdentity,
         )
         if (stripItem) {
           upsertRouterStrip(result, stripItem, turnRouterIndexes, turnRouterOrder)
         }
-        prevRole = ''
-        continue
+        // A decision control row has no conversational body. A live/settled
+        // assistant row may carry the same receipt alongside text, tools and
+        // billing; rendering its route must not discard those capabilities.
+        if (msg.provenanceKind === 'router_decision' || msg.role !== 'assistant') {
+          prevRole = ''
+          continue
+        }
       }
 
       const hasTurnUsage = Boolean(routerUsageFromMessage(msg))
@@ -503,11 +516,25 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ? turnRouterIndexes.get(`call:${callIdentity}`)
         : undefined
       const matchingCall = matchingCallIndex === undefined ? undefined : result[matchingCallIndex]
+      const inheritedDecision = hasTurnUsage
+        ? callIdentity
+          ? turnRouterDecisions.get(callIdentity) || (!turnRouterDecisionCallId ? turnRouterDecision : null)
+          : turnRouterDecision
+        : null
+      const usageRouterDecision = routerDecisionFromUsage(
+        msg, inheritedDecision || inheritedSubagentRoute(msg),
+      )
+      if (usageRouterDecision) {
+        if (callIdentity) turnRouterDecisions.set(callIdentity, usageRouterDecision)
+        // An older call's late receipt must not become the next call's default.
+        if (!callIdentity || !turnRouterDecisionCallId || callIdentity === turnRouterDecisionCallId) {
+          turnRouterDecision = usageRouterDecision
+          if (callIdentity) turnRouterDecisionCallId = callIdentity
+        }
+      }
       const ensemble = ensembleMetaFromMessage(msg)
         ?? (matchingCall?.routerModelCallId === callIdentity ? matchingCall.ensemble : undefined)
       if (ensemble) {
-        const usageRouterDecision = routerDecisionFromUsage(msg, turnRouterDecision)
-        if (usageRouterDecision) turnRouterDecision = usageRouterDecision
         const inLiveTurn = options.isStreaming?.value === true && i > lastUserIdx
         const settledMessage = {
           ...msg,
@@ -520,16 +547,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           callIdentity,
         )
         const priorStrip = priorIndex === undefined ? undefined : result[priorIndex]
-        const stripItem = turnRouterDecision
-          && shouldCombineRouterAndEnsemble(turnRouterDecision, true, msg.restoredFromHistory === true)
+        const stripItem = usageRouterDecision
+          && shouldCombineRouterAndEnsemble(usageRouterDecision, true, msg.restoredFromHistory === true)
           ? renderedCombinedRouterStrip(
               settledMessage,
-              turnRouterDecision,
+              usageRouterDecision,
               ensemble,
               turnIdx,
               i,
               priorStrip?.messageId || `${msg.messageId || i}-router`,
-              turnRequestKind,
               turnIdentity,
             )
           : renderedEnsembleRouterStrip(
@@ -548,21 +574,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         }
         prevRole = ''
       } else {
-        const usageRouterDecision = routerDecisionFromUsage(
-          msg,
-          hasTurnUsage
-            ? turnRouterDecision || inheritedSubagentRoute(msg)
-            : inheritedSubagentRoute(msg),
-        )
         if (usageRouterDecision) {
-          turnRouterDecision = usageRouterDecision
           const stripItem = renderedRouterStrip(
             msg,
             usageRouterDecision,
             turnIdx,
             i,
             `${msg.messageId || i}-router`,
-            turnRequestKind,
             turnIdentity,
           )
           if (stripItem) {
@@ -612,6 +630,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const rendered: ChatRenderedMessage = {
         skillLoads: skillLoadsFromSegments(msg.tool_calls),
         selectedSkills: msg.selectedSkills,
+        localPathReferences: msg.localPathReferences,
         id: `${msg.role}-${i}`,
         ...(msg.clientId ? { clientId: msg.clientId } : {}),
         sourceIndex: i,
@@ -625,6 +644,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
         messageId: msg.messageId,
+        contentRef: msg.contentRef,
+        contentSlice: msg.contentSlice,
+        previewComplete: msg.previewComplete,
+        historyPayloadPreview: msg.historyPayloadPreview,
+        contentRevision: msg.contentRevision,
+        contentAvailability: msg.contentAvailability,
+        contentUnavailableReason: msg.contentUnavailableReason,
         restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         turnId: messageTurnId || undefined,
@@ -644,15 +670,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         // keep real process tools in the Activity timeline.
         toolCalls: normalizedToolCalls.filter(call => !isPlanMessage || call.name !== 'submit_plan'),
         timelineItems: stripBackgroundProcessNoticeTimeline(
-          applyActivityOrdersToTimeline(
-            stripPlanControlToolItems(projectInterruptTimeline(
+          stripPlanControlToolItems(projectInterruptTimeline(
               normalizeMessageTimeline(msg, ownerKey),
               historicalInterrupts,
               terminalOwner,
               options.interruptState?.value,
             ), isPlanMessage),
-            msg.activitySnapshot,
-          ),
           msg.tool_calls ?? [],
           options.renderMarkdown,
         ),
@@ -662,9 +685,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         reasoning: msg.role === 'assistant' ? msg.reasoning : undefined,
         reasoningBlocks: msg.role === 'assistant'
           ? msg.reasoningBlocks?.map(block => ({ ...block }))
-          : undefined,
-        reasoningPresentationPending: msg.role === 'assistant'
-          ? msg.reasoningPresentationPending
           : undefined,
         activitySnapshot: msg.role === 'assistant' ? msg.activitySnapshot : undefined,
         activitySnapshotIncomplete: msg.role === 'assistant'
@@ -742,7 +762,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     turnIdx: number,
     index: number,
     messageId = msg.messageId,
-    requestKind: ChatRouterRequestKind = 'text',
     turnIdentity = `turn-${turnIdx}`,
   ): ChatRenderedMessage | null {
     if (!options.routerVisualEffectsEnabled.value) return null
@@ -765,7 +784,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         turnIdx,
         index,
         messageId,
-        requestKind,
         turnIdentity,
       )
     }
@@ -775,7 +793,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       turnIdx,
       index,
       messageId,
-      requestKind,
       turnIdentity,
     )
   }
@@ -786,22 +803,17 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     turnIdx: number,
     index: number,
     messageId = msg.messageId,
-    requestKind: ChatRouterRequestKind = 'text',
     turnIdentity = `turn-${turnIdx}`,
   ): ChatRenderedMessage | null {
-    const cells = routerDecisionCellsForRequest(decision, requestKind)
+    const { cells, source } = routerDecisionPresentation(decision)
     const fixedSessionRoute = decision.source === 'session_model'
-    const snapshot = normalizeRouterTierSnapshot(
-      decision.router_tier_snapshot ?? decision.routerTierSnapshot,
-    )
-    const hasRequestSnapshot = snapshot?.request_kind === requestKind
     if (
       cells.length === 0
       || (
         cells.length === 1
         && !fixedSessionRoute
-        && !hasRequestSnapshot
-        && currentRouterCandidatePoolAvailable()
+        && source !== 'snapshot'
+        && hasConfiguredRouterCandidates(routerCandidateConfiguration())
       )
     ) return null
     return {
@@ -829,6 +841,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: decision.source || 'none',
       routerObserve: decision.routing_applied === false,
       routerStatic: msg.restoredFromHistory === true,
+      routerReplayed: msg.routerReplayed === true || options.isPreview?.value === true,
       routerSettled: msg.routerSettled === true,
       routerPanel: routerPanelDataset(options.routerVisualMode.value),
       routerMode: 'squilla_router',
@@ -882,7 +895,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     turnIdx: number,
     index: number,
     messageId = msg.messageId,
-    requestKind: ChatRouterRequestKind = 'text',
     turnIdentity = `turn-${turnIdx}`,
   ): ChatRenderedMessage | null {
     const routerStrip = renderedTierRouterStrip(
@@ -891,7 +903,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       turnIdx,
       index,
       messageId,
-      requestKind,
       turnIdentity,
     )
     if (!routerStrip) {
@@ -946,6 +957,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routerSource: 'llm_ensemble',
       routerObserve: false,
       routerStatic: msg.restoredFromHistory === true,
+      routerReplayed: msg.routerReplayed === true || options.isPreview?.value === true,
       routerExecutionModel: executionModelFromMessage(msg) || undefined,
       // Live strips stay unsettled (animating) while members stream in; a member
       // list alone no longer forces 'settled'. History strips are frozen instead.
@@ -1224,106 +1236,36 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
   }
 
   function routerDecisionCells(decision: NormalizedRouterDecision): ChatRouterCell[] {
-    return routerDecisionCellsForRequest(decision, 'text')
+    return routerDecisionPresentation(decision).cells
   }
 
-  function routerDecisionCellsForRequest(decision: NormalizedRouterDecision, requestKind: ChatRouterRequestKind): ChatRouterCell[] {
-    const realCells = realRouterDecisionCellsForRequest(decision, requestKind)
-    if (realCells.length <= 1 || options.routerVisualMode.value !== 'legacy_grid') return realCells
-    return legacyRouterGridCells(realCells)
+  function routerCandidateConfiguration(): RouterCandidateConfiguration {
+    return {
+      slots: options.routerSlots.value,
+      models: options.routerModels.value,
+      configs: options.routerTierConfigs.value,
+    }
   }
 
-  function realRouterDecisionCellsForRequest(decision: NormalizedRouterDecision, requestKind: ChatRouterRequestKind): ChatRouterCell[] {
-    const winnerTier = normalizeRouterTier(decision.tier)
-    const winnerModel = String(decision.model || decision.routed_model || '').trim()
-    const snapshot = normalizeRouterTierSnapshot(
-      decision.router_tier_snapshot ?? decision.routerTierSnapshot,
-    )
-    if (snapshot?.request_kind === requestKind) {
-      return routerCellsFromTierEntries(
-        snapshot.tiers
-          // Keep a recorded legacy winner, never an implicit extra candidate.
-          .filter(entry => entry.tier !== IMAGE_TIER || entry.tier === winnerTier)
-          .map(entry => ({
-            tier: entry.tier,
-            model: entry.model,
-            executionKind: entry.execution_kind,
-          })),
-        winnerTier,
-        winnerModel,
-        true,
-      )
+  function routerDecisionPresentation(decision: NormalizedRouterDecision) {
+    const resolution = resolveRouterCandidates({
+      ...routerCandidateConfiguration(),
+      tier: decision.tier,
+      model: String(decision.model || decision.routed_model || ''),
+      snapshot: decision.router_tier_snapshot ?? decision.routerTierSnapshot,
+    })
+    const labels = routerCandidateLabels(resolution.candidates)
+    const realCells = resolution.candidates.map((candidate, index): ChatRouterCell => ({
+      ...candidate,
+      kind: 'real',
+      displayName: labels[index]!,
+    }))
+    return {
+      source: resolution.source,
+      cells: realCells.length > 1 && options.routerVisualMode.value === 'legacy_grid'
+        ? legacyRouterGridCells(realCells)
+        : realCells,
     }
-
-    const configuredTiers = options.routerSlots.value.length
-      ? options.routerSlots.value.map(normalizeRouterTier).filter(Boolean)
-      : Object.keys(options.routerTierConfigs.value).map(normalizeRouterTier).filter(Boolean)
-    if (winnerTier && !configuredTiers.includes(winnerTier)) configuredTiers.push(winnerTier)
-    const sourceTiers = sortRouterTiers(configuredTiers.length ? configuredTiers : (winnerTier ? [winnerTier] : []))
-    const entries: Array<{
-      tier: string
-      model: string
-      executionKind: 'single_model' | 'ensemble'
-    }> = []
-    for (const tier of sourceTiers) {
-      if (tier === IMAGE_TIER && tier !== winnerTier) continue
-      const tierConfig = routerTierConfig(tier)
-      if (tier !== winnerTier && tierConfig.imageOnly) continue
-      const model = tier === winnerTier && winnerModel
-        ? winnerModel
-        : tierConfig.model || options.routerModels.value[tier] || ''
-      if (!model && tier !== winnerTier) continue
-      entries.push({
-        tier,
-        model,
-        executionKind: tierConfig.ensembleEnabled === true ? 'ensemble' : 'single_model',
-      })
-    }
-    return routerCellsFromTierEntries(entries, winnerTier, winnerModel, false)
-  }
-
-  function routerCellsFromTierEntries(
-    sourceEntries: Array<{
-      tier: string
-      model: string
-      executionKind: 'single_model' | 'ensemble'
-    }>,
-    winnerTier: string,
-    winnerModel: string,
-    preserveOrder: boolean,
-  ): ChatRouterCell[] {
-    const entries = sourceEntries.map(entry => ({ ...entry }))
-    const winnerEntry = entries.find(entry => entry.tier === winnerTier)
-    if (winnerEntry && winnerModel) {
-      winnerEntry.model = winnerModel
-    } else if (!winnerEntry && winnerTier && winnerModel) {
-      entries.push({ tier: winnerTier, model: winnerModel, executionKind: 'single_model' })
-    }
-
-    const realByModel = new Map<string, ChatRouterCell>()
-    for (const entry of entries) {
-      const { tier, model, executionKind } = entry
-      if (!model) continue
-      const displayName = shortModelName(routerFxStripProvider(model)) || (tier === winnerTier ? 'selected model' : tier)
-      const key = `${executionKind}:${model}`
-      const existing = realByModel.get(key)
-      if (existing) {
-        existing.tiers = [...(existing.tiers || []), tier]
-        continue
-      }
-      realByModel.set(key, {
-        kind: 'real',
-        tier,
-        tiers: [tier],
-        displayName,
-        model,
-        executionKind,
-      })
-    }
-    const cells = Array.from(realByModel.values())
-    return preserveOrder
-      ? cells
-      : cells.sort((a, b) => (a.displayName || a.tier).localeCompare(b.displayName || b.tier))
   }
 
   function legacyRouterGridCells(realCells: ChatRouterCell[]): ChatRouterCell[] {
@@ -1340,33 +1282,17 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     return cells
   }
 
-  function routerTierConfig(tier: string): ChatRouterTierConfig {
-    const normalized = normalizeRouterTier(tier)
-    return options.routerTierConfigs.value[normalized] || {
-      model: options.routerModels.value[normalized] || '',
-      imageOnly: false,
-    }
-  }
-
-  function currentRouterCandidatePoolAvailable(): boolean {
-    const configuredTiers = options.routerSlots.value.length
-      ? options.routerSlots.value
-      : Object.keys(options.routerTierConfigs.value)
-    return configuredTiers.some((rawTier) => {
-      const tier = normalizeRouterTier(rawTier)
-      const config = routerTierConfig(tier)
-      const model = config.model || options.routerModels.value[tier] || ''
-      return Boolean(tier !== IMAGE_TIER && model && !config.imageOnly)
-    })
-  }
-
   function normalizeMessageTimeline(msg: ChatMessage, ownerKey: string): ChatStreamTimelineItem[] {
     if (msg.role !== 'assistant') return []
     const explicitTimeline = Array.isArray(msg.timeline) ? msg.timeline : []
     if (explicitTimeline.length) {
       const calls = normalizeToolCalls(msg.tool_calls)
       return sanitizeAssistantTimelineItems(
-        timelineFromSegments(explicitTimeline, calls, ownerKey, msg.interrupts),
+        applyActivityOrdersToTimeline(
+          timelineFromSegments(explicitTimeline, calls, ownerKey, msg.interrupts),
+          msg.activitySnapshot,
+          msg.historyPayloadPreview?.textUtf16Lengths,
+        ),
         { inputMode: msg.turnInputMode, runKind: msg.turnRunKind },
       )
     }
@@ -1374,7 +1300,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const hasPersistedTimeline = rawSegments.some(seg => ['text', 'tool_use', 'tool_result'].includes(String(seg?.type || '')))
     if (!hasPersistedTimeline) return []
     return sanitizeAssistantTimelineItems(
-      timelineFromPersistedSegments(rawSegments, ownerKey),
+      applyActivityOrdersToTimeline(
+        timelineFromPersistedSegments(rawSegments, ownerKey),
+        msg.activitySnapshot,
+        msg.historyPayloadPreview?.textUtf16Lengths,
+      ),
       { inputMode: msg.turnInputMode, runKind: msg.turnRunKind },
     )
   }
@@ -1467,12 +1397,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           html: options.renderMarkdown(raw),
           rawText: raw,
           presentation,
+          activityOrder: seg.activityOrder,
         }] : []
       }
       if (seg?.type === 'tool-group') {
         const groupId = String(seg.groupId || seg.group_id || '')
         const group = groupId ? groupsById.get(groupId) : null
-        return group ? [{ type: 'tool-group', key: groupId, group }] : []
+        return group ? [{ type: 'tool-group', key: groupId, group, activityOrder: seg.activityOrder }] : []
       }
       if (seg?.type === 'interrupt') {
         const approvalId = String(seg.approvalId || seg.approval_id || '')
@@ -1483,6 +1414,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
               key: part.key || `${ownerKey}:interrupt:${approvalId}`,
               approvalId,
               part,
+              activityOrder: seg.activityOrder,
             }]
           : []
       }
@@ -1594,6 +1526,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         call.isError = toolResultIsError(segment)
         call.status = call.isError ? 'error' : 'success'
         call.result = resultStr
+        Object.assign(call, toolResultMetadata(segment))
         if (typeof segment.execution_log_handle === 'string') {
           call.executionLogHandle = segment.execution_log_handle
         }
@@ -1729,6 +1662,7 @@ function upsertRouterStrip(
   if (previousIndex >= 0) {
     if (options.settleReplacement !== false) stripItem.routerSettled = true
     const previous = result[previousIndex]
+    if (previous?.routerReplayed) stripItem.routerReplayed = true
     if (options.settlement && !stripItem.routerExecutionModel) {
       stripItem.routerExecutionModel = previous?.routerExecutionModel
     }
@@ -1746,12 +1680,6 @@ function upsertRouterStrip(
   indexes.set(identity, index)
   if (stripItem.routerModelCallId) indexes.set(`call:${stripItem.routerModelCallId}`, index)
   order.push(index)
-}
-
-function routerRequestKindFromAttachments(attachments: ChatMessage['attachments']): ChatRouterRequestKind {
-  return attachments?.some(att => String(att.mime || '').toLowerCase().startsWith('image/'))
-    ? 'image'
-    : 'text'
 }
 
 export function fmtTok(n: number): string {
@@ -1810,20 +1738,16 @@ function routerDecisionFromUsage(
   const source = typeof immutablePlan?.source === 'string'
     ? immutablePlan.source
     : usage.routing_source || 'none'
-  const planHasSnapshot = Boolean(
-    immutablePlan
-    && (
-      Object.prototype.hasOwnProperty.call(immutablePlan, 'router_tier_snapshot')
-      || Object.prototype.hasOwnProperty.call(immutablePlan, 'routerTierSnapshot')
-    ),
-  )
-  const usageHasSnapshot = Object.prototype.hasOwnProperty.call(usage, 'router_tier_snapshot')
-    || Object.prototype.hasOwnProperty.call(usage, 'routerTierSnapshot')
-  const routerTierSnapshot = planHasSnapshot
-    ? immutablePlan?.router_tier_snapshot ?? immutablePlan?.routerTierSnapshot
-    : usageHasSnapshot
-      ? usage.router_tier_snapshot ?? usage.routerTierSnapshot
-      : inheritedRoute?.router_tier_snapshot ?? inheritedRoute?.routerTierSnapshot
+  // Partial completion receipts must not erase a complete accepted snapshot.
+  // Choose a whole valid snapshot; never combine candidates from different sources.
+  const routerTierSnapshot = [
+    immutablePlan?.router_tier_snapshot,
+    immutablePlan?.routerTierSnapshot,
+    usage.router_tier_snapshot,
+    usage.routerTierSnapshot,
+    inheritedRoute?.router_tier_snapshot,
+    inheritedRoute?.routerTierSnapshot,
+  ].map(normalizeRouterTierSnapshot).find(snapshot => snapshot !== null)
   return normalizeRouterDecision({
     tier,
     model: immutablePlan?.model || usage.routed_model || usage.model || msg.model || '',
@@ -1834,7 +1758,8 @@ function routerDecisionFromUsage(
       ? immutablePlan.routing_applied
       : usage.routing_applied !== false,
     rollout_phase: usage.rollout_phase || 'full',
-    accepted_routing_mode: msg.turnOutcome?.acceptedRoutingMode,
+    accepted_routing_mode: msg.turnOutcome?.acceptedRoutingMode
+      || inheritedRoute?.accepted_routing_mode || inheritedRoute?.acceptedRoutingMode,
     router_tier_snapshot: routerTierSnapshot,
   })
 }
@@ -1900,13 +1825,6 @@ export function shortModelName(model: string): string {
   return last
 }
 
-function routerFxStripProvider(name: string): string {
-  const raw = String(name || '').trim()
-  if (!raw) return ''
-  const idx = raw.lastIndexOf('/')
-  return idx >= 0 ? raw.slice(idx + 1) : raw
-}
-
 export function routerFxSortTiers(list: string[]): string[] {
   return sortRouterTiers(list)
 }
@@ -1918,6 +1836,27 @@ export function routerWinnerCellIndex(cells: ChatRouterCell[], tier: string): nu
 
 export function routerPanelDataset(mode: RouterVisualMode): string {
   return mode === 'legacy_grid' ? 'legacy-grid' : 'real-candidates'
+}
+
+function toolResultMetadata(value: {
+  resultTruncated?: unknown
+  resultOriginalChars?: unknown
+  result_truncated?: unknown
+  result_original_chars?: unknown
+  file_snapshot?: unknown
+  fileSnapshot?: unknown
+}): Pick<ChatToolCall, 'resultTruncated' | 'resultOriginalChars' | 'fileSnapshot'> {
+  const resultTruncated = value.resultTruncated ?? value.result_truncated
+  const resultOriginalChars = value.resultOriginalChars ?? value.result_original_chars
+  const fileSnapshot = normalizeToolFileSnapshot(value.fileSnapshot ?? value.file_snapshot)
+  return {
+    ...(fileSnapshot ? { fileSnapshot } : {}),
+    ...(typeof resultTruncated === 'boolean' ? { resultTruncated } : {}),
+    ...(typeof resultOriginalChars === 'number'
+      && Number.isSafeInteger(resultOriginalChars) && resultOriginalChars >= 0
+      ? { resultOriginalChars }
+      : {}),
+  }
 }
 
 function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall[] {
@@ -1954,6 +1893,7 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
         sources: undefined,
         isOpen: false,
         presentation,
+        activityOrder: typeof tc.activityOrder === 'number' ? tc.activityOrder : undefined,
       }
       byId.set(toolId, item)
       merged.push(item)
@@ -1969,7 +1909,16 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
       item.resultPreview = truncate(resultStr, 200)
       item.status = isError ? 'error' : 'success'
     }
+    // Persisted history without execution metadata stays settled. A live
+    // conversation projection uses the same renderer and carries an explicit
+    // running receipt until the tool-result arrives, including empty results.
+    if (executionStatus === 'running' || executionStatus === 'pending') item.isRunning = true
+    if (['done', 'success', 'completed', 'error', 'timeout', 'cancelled'].includes(executionStatus) || String(tc.type) === 'tool_result') {
+      item.isRunning = false
+      item.status = isError ? 'error' : 'success'
+    }
     if (tc.sources !== undefined) item.sources = tc.sources
+    Object.assign(item, toolResultMetadata(tc))
     if (typeof tc.execution_log_handle === 'string') {
       item.executionLogHandle = tc.execution_log_handle
     }
@@ -1991,9 +1940,11 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
     isError: item.isError,
     result: item.result,
     resultPreview: item.resultPreview,
+    ...toolResultMetadata(item),
     executionLogHandle: item.executionLogHandle,
     sources: item.sources,
     isOpen: false,
     presentation: item.presentation,
+    activityOrder: item.activityOrder,
   }))
 }

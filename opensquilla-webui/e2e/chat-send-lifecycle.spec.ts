@@ -7,6 +7,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:e2e-send-lifecycle'
 const GENERATION = 'send-lifecycle-generation'
@@ -17,6 +18,7 @@ type Request = { id: string; method: string; params?: Record<string, unknown>; t
 const SKILL = { name: 'xlsx', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
 async function installGateway(page: Page, holdFirstSend = false, serverQueue = false, skills = false) {
   let candidateCalls = 0
+  let pendingListCalls = 0
   let skillReceipts: Array<Record<string, unknown>> = []
   const sends: Array<Record<string, unknown>> = []
   const enqueues: Array<Record<string, unknown>> = []
@@ -161,6 +163,7 @@ async function installGateway(page: Page, holdFirstSend = false, serverQueue = f
         finish('cancelled')
         return
       }
+      if (frame.method === 'sessions.pending_inputs.list') pendingListCalls += 1
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -195,6 +198,7 @@ async function installGateway(page: Page, holdFirstSend = false, serverQueue = f
   return {
     sends, aborts, finish, enqueues, dispatches,
     candidateCalls: () => candidateCalls,
+    pendingListCalls: () => pendingListCalls,
     loadSkill: (source: 'user' | 'auto' = 'user') => {
       if (!activeTask) throw new Error('No active synthetic task')
       const receipt = { ...SKILL, source, status: 'loaded', turnId: activeTask.task_id }
@@ -229,7 +233,7 @@ async function openChat(page: Page, expectedState: 'idle' | 'running' = 'idle') 
   const root = process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP === '1'
     ? 'opensquilla-app://desktop/' : '/control/'
   await page.goto(`${root}chat?session=${encodeURIComponent(SESSION)}`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
   const readyAction = expectedState === 'running'
     ? page.getByRole('button', { name: 'Stop current response' })
     : page.locator('.chat-send-btn[aria-label="Send"]')
@@ -257,8 +261,11 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
     } else gateway.finish(status)
 
     await expect(stop).toHaveCount(0)
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText(
+      status === 'succeeded' ? 'Completed' : status === 'failed' ? 'Failed' : 'Interrupted',
+    )
     await expect(send).toBeEnabled()
-    await expect(input).toHaveValue('Synthetic next request without changing projects.')
+    await expectComposerValue(input, 'Synthetic next request without changing projects.')
     await send.click()
     await expect.poll(() => gateway.sends.length).toBe(2)
     expect(gateway.sends[1]).toMatchObject({
@@ -267,10 +274,24 @@ for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
     expect(page.url()).toBe(originalUrl)
     expect(gateway.connectionCount()).toBe(1)
     await expect(stop).toBeVisible()
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('')
     gateway.finish('succeeded')
     await expect(send).toBeEnabled()
+    await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('Completed')
   })
 }
+
+test('switching away from a live chat does not announce completion', async ({ page }) => {
+  const gateway = await installGateway(page)
+  await openChat(page)
+  await page.locator('.chat-textarea').fill('Synthetic request while navigating.')
+  await page.locator('.chat-send-btn[aria-label="Send"]').click()
+  await expect.poll(() => gateway.sends.length).toBe(1)
+  await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+  await page.locator('.sidebar-new-session').click()
+  await expect(page).toHaveURL(/\/chat\/new/)
+  await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('')
+})
 
 test('pending admission is visible and a rejected send restores an editable retry', async ({ page }) => {
   const gateway = await installGateway(page, true)
@@ -289,10 +310,10 @@ test('pending admission is visible and a rejected send restores an editable retr
   await expect(page.locator('.msg-user')).toContainText('Synthetic request to retry.')
 
   gateway.rejectHeldSend()
-  await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('The task did not finish. Please try again later.')
+  await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('This request did not finish.')
   await expect(page.locator('body')).not.toContainText(REJECTION)
   await expect(page.locator('body')).not.toContainText('SYNTHETIC_ADMISSION_FAILURE')
-  await expect(input).toHaveValue('Synthetic request to retry.')
+  await expectComposerValue(input, 'Synthetic request to retry.')
   await expect(send).toBeEnabled()
   await expect(page.locator('.chat-composer-send-pending')).toHaveCount(0)
   await expect(page.locator('.chat-send-tooltip')).toHaveCount(0)
@@ -315,19 +336,21 @@ for (const { changeAuthority, reload, label } of [
     await openChat(page)
     const input = page.locator('.chat-textarea')
     const send = page.locator('.chat-send-btn[aria-label="Send"]')
+    // Connection readiness does not await durable identity hashing / WAL hydration.
+    await expect.poll(gateway.pendingListCalls).toBeGreaterThan(0)
     gateway.disconnect()
-    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
     await input.fill('Synthetic never-sent offline draft.')
     await expect(send).toBeEnabled()
     await send.click()
     await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')
-    await expect(input).toHaveValue('')
+    await expectComposerValue(input, '')
     expect(gateway.sends).toHaveLength(0)
     expect(gateway.enqueues).toHaveLength(0)
 
     gateway.reconnect(changeAuthority)
     if (reload) await page.reload()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible()
     if (changeAuthority) {
       await expect(page.locator('.chat-pending-save-status')).toContainText('changed')
       expect(gateway.sends).toHaveLength(0)
@@ -350,8 +373,10 @@ test('a new browser tab recovers the original identity and durable offline draft
   test.skip(process.env.OPENSQUILLA_E2E_NATIVE_DESKTOP === '1', 'Browser tab replacement uses a browser context')
   const gateway = await installGateway(page, false, true)
   await openChat(page)
+  // The server queue read proves the identity required by this offline scenario.
+  await expect.poll(gateway.pendingListCalls).toBeGreaterThan(0)
   gateway.disconnect()
-  await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toHaveCount(0)
   await page.locator('.chat-textarea').fill('Synthetic durable draft for a replacement tab.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect(page.locator('.chat-pending-save-status')).toContainText('Saved locally')
@@ -384,7 +409,9 @@ test('unified slash selects bilingual skills lazily and shows real load receipts
   const input = page.locator('.chat-textarea')
   await input.fill('/')
   await expect(page.locator('.chat-slash-item[data-skill-name]')).toHaveCount(12)
-  await expect(page.locator('.chat-slash-group').filter({ hasText: 'Skills' })).toHaveText('Skills 12')
+  // The group heading intentionally contains only its localized label; the
+  // item count is asserted by the locator immediately above.
+  await expect(page.locator('.chat-slash-group').filter({ hasText: 'Skills' })).toHaveText('Skills')
   const lastSkill = page.locator('[role="option"][data-skill-name="synthetic-skill-11"]')
   await lastSkill.scrollIntoViewIfNeeded()
   await expect(lastSkill).toBeInViewport()
@@ -393,21 +420,23 @@ test('unified slash selects bilingual skills lazily and shows real load receipts
   const option = page.locator('[role="option"][data-skill-name="xlsx"]')
   await expect(option).toHaveCSS('display', 'flex')
   await expect(option).toHaveCSS('border-top-width', '0px')
-  await expect(option.locator('.chat-slash-desc')).toHaveCSS('text-overflow', 'ellipsis')
-  await expect(option.locator('.chat-slash-desc')).toHaveCSS('white-space', 'nowrap')
+  await expect(option.locator('.composer-capability__description')).toHaveCSS('text-overflow', 'ellipsis')
+  await expect(option.locator('.composer-capability__description')).toHaveCSS('white-space', 'nowrap')
   expect((await option.boundingBox())!.height).toBeLessThanOrEqual(44)
   expect(gateway.candidateCalls()).toBe(1)
   await input.fill('Analyze /SPREADSHEET')
   await page.locator('[role="option"][data-skill-name="xlsx"]').click()
-  await expect(input).toHaveValue('Analyze ')
-  await expect(page.getByTestId('selected-skills')).toContainText('xlsx')
-  await expect(page.getByTestId('selected-skills')).toHaveCSS('display', 'flex')
-  await expect(page.getByTestId('selected-skills')).toHaveCSS('flex-wrap', 'wrap')
+  await expectComposerValue(input, 'Analyze ')
+  const selectedSkills = page.locator('.chat-inline-editor__skill[data-skill-id]')
+  await expect(selectedSkills).toHaveCount(1)
+  await expect(selectedSkills).toContainText('xlsx')
+  await expect(selectedSkills).toHaveCSS('display', 'inline-flex')
+  await expect(selectedSkills).toHaveCSS('white-space', 'nowrap')
   expect(gateway.candidateCalls()).toBe(1)
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
   await expect.poll(() => gateway.sends.length).toBe(1)
   expect(gateway.sends[0]?.selectedSkills).toEqual([SKILL])
-  await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+  await expect(selectedSkills).toHaveCount(0)
   await expect(page.getByTestId('sent-selected-skills')).toHaveCSS('display', 'flex')
   await expect(page.getByTestId('sent-selected-skills')).toHaveCSS('flex-wrap', 'wrap')
   await expect(page.getByTestId('skill-load-status')).toHaveCount(0)
@@ -446,13 +475,15 @@ test('skill drafts survive refresh and narrow palettes preserve the surrounding 
   expect(bounds!.x).toBeGreaterThanOrEqual(0)
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(360)
   await input.press('Enter')
-  await expect(input).toHaveValue('Analyze  carefully')
+  await expectComposerValue(input, 'Analyze  carefully')
   await page.reload()
-  await expect(page.getByTestId('selected-skills')).toContainText('xlsx')
-  await expect(input).toHaveValue('Analyze  carefully')
+  const selectedSkills = page.locator('.chat-inline-editor__skill[data-skill-id]')
+  await expect(selectedSkills).toHaveCount(1)
+  await expect(selectedSkills).toContainText('xlsx')
+  await expectComposerValue(input, 'Analyze  carefully')
   expect(gateway.sends).toHaveLength(0)
   await page.getByRole('button', { name: 'Remove xlsx from this message' }).click()
-  await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+  await expect(selectedSkills).toHaveCount(0)
 })
 
 test('busy skill messages enter the durable queue and retain their exact identity on dispatch', async ({ page }) => {
@@ -472,7 +503,7 @@ test('busy skill messages enter the durable queue and retain their exact identit
   })
   expect(gateway.sends).toHaveLength(1)
   await expect(page.locator('.chat-pending')).toContainText('xlsx')
-  await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+  await expect(page.locator('.chat-inline-editor__skill[data-skill-id]')).toHaveCount(0)
   gateway.finish('succeeded')
   await expect.poll(() => gateway.sends.length).toBe(2)
   expect(gateway.dispatches).toHaveLength(1)

@@ -187,6 +187,8 @@ async function pasteSyntheticClipboard(page: Page): Promise<ClipboardPaste> {
 async function copyImage(page: Page, resource: Locator) {
   await resource.getByTestId('copy-image').click()
   await expect(resource.locator('.image-copy-actions')).toHaveAttribute('data-state', 'ok')
+  await expect(resource.getByTestId('copy-image')).toHaveAttribute('aria-label', 'Copy image')
+  await expect(resource.locator('.image-copy-actions [role="status"]')).toHaveText('')
   const pasted = await pasteSyntheticClipboard(page)
   expect(pasted.files).toEqual([{ type: 'image/png', width: 12, height: 8,
     left: [255, 0, 0, 255], right: [0, 0, 0, 0] }])
@@ -236,13 +238,20 @@ test.describe('Image copy through the system clipboard', () => {
   test('generated SVG copies a transparent PNG and exact UTF-8 source', async ({ page }, testInfo) => {
     const { resource } = await openFixture(page, { body: SVG_SOURCE, name: 'drawing.svg', mime: 'image/svg+xml' })
     await copyImage(page, resource)
-    await resource.getByTestId('image-copy-more').click()
+    await expect(resource.locator('button[aria-haspopup="menu"]')).toHaveCount(1)
+    await expect(resource.getByTestId('image-copy-more')).toHaveCount(0)
+    await resource.locator('.resource-actions-trigger').click()
+    await expect(page.getByRole('menuitem', { name: 'Copy SVG source', exact: true })).toHaveCount(1)
     await page.screenshot({ path: testInfo.outputPath('svg-copy-menu.png') })
-    await page.getByTestId('copy-svg-source').click()
-    await expect(resource.locator('.image-copy-actions')).toHaveAttribute('data-state', 'ok')
-    const pasted = await pasteSyntheticClipboard(page)
-    expect(pasted.text).toBe(SVG_SOURCE)
-    expect(pasted.files).toEqual([])
+    await page.getByRole('menuitem', { name: 'Copy SVG source', exact: true }).click()
+    let pasted: Awaited<ReturnType<typeof pasteSyntheticClipboard>> | undefined
+    await expect.poll(async () => {
+      pasted = await pasteSyntheticClipboard(page)
+      // Windows native text paste exposes CRLF line endings.
+      return process.platform === 'win32' ? pasted.text.replace(/\r\n/g, '\n') : pasted.text
+    }).toBe(SVG_SOURCE)
+    expect(pasted!.files).toEqual([])
+    await expect(page.getByText('SVG source copied', { exact: true })).toHaveCount(0)
   })
 
   test('generated SVG with text/plain MIME copies from its file card', async ({ page }) => {

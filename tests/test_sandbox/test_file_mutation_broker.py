@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -54,7 +55,12 @@ def test_non_recursive_symlink_delete_never_deletes_directory_referent(
     referent.mkdir()
     (referent / "important.txt").write_text("important", encoding="utf-8")
     link = tmp_path / "discard-link"
-    link.symlink_to(referent, target_is_directory=True)
+    try:
+        link.symlink_to(referent, target_is_directory=True)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
     broker = FileMutationBroker(
         policy=_policy(),
         vault=BackupVault(tmp_path / "vault"),

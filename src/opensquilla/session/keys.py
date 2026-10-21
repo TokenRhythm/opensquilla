@@ -119,6 +119,12 @@ def is_subagent_key(session_key: str) -> bool:
     return key.startswith("subagent:") or bool(re.match(r"^agent:[^:]+:subagent:[^:]+$", key))
 
 
+def is_sidechat_key(session_key: str | None) -> bool:
+    """Identify the server-generated side-conversation key namespace."""
+    parts = canonicalize_session_key(session_key).split(":")
+    return len(parts) == 4 and parts[0] == "agent" and parts[2] == "sidechat" and bool(parts[3])
+
+
 def is_guest_webchat_key(session_key: str | None) -> bool:
     """Return True for server-owned anonymous WebChat session keys."""
 

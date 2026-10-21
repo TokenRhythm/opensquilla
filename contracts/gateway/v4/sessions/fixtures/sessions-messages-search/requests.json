@@ -1,0 +1,96 @@
+{
+  "format_version": 1,
+  "kind": "request",
+  "cases": [
+    {
+      "id": "request.initial-search",
+      "coverage": "request.initial-search",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.initial-search",
+        "method": "sessions.messages.search",
+        "params": {
+          "key": "agent:main:webchat:search-fixture",
+          "query": "中文🙂"
+        }
+      }
+    },
+    {
+      "id": "request.continuation",
+      "coverage": "request.continuation",
+      "expectation": "exact",
+      "wire": {
+        "type": "req",
+        "id": "request.continuation",
+        "method": "sessions.messages.search",
+        "params": {
+          "key": "agent:main:webchat:search-fixture",
+          "query": "中文🙂",
+          "session_id": "session-fixture",
+          "session_epoch": 2,
+          "cursor": "opaque:next",
+          "limit": 100
+        }
+      }
+    },
+    {
+      "id": "request.empty-query",
+      "coverage": "request.empty-query",
+      "expectation": "reject",
+      "wire": {
+        "type": "req",
+        "id": "request.empty-query",
+        "method": "sessions.messages.search",
+        "params": {
+          "key": "agent:main:webchat:search-fixture",
+          "query": ""
+        }
+      }
+    },
+    {
+      "id": "request.oversized-limit",
+      "coverage": "request.oversized-limit",
+      "expectation": "reject",
+      "wire": {
+        "type": "req",
+        "id": "request.oversized-limit",
+        "method": "sessions.messages.search",
+        "params": {
+          "key": "agent:main:webchat:search-fixture",
+          "query": "中文🙂",
+          "limit": 101
+        }
+      }
+    },
+    {
+      "id": "request.negative-epoch",
+      "coverage": "request.negative-epoch",
+      "expectation": "reject",
+      "wire": {
+        "type": "req",
+        "id": "request.negative-epoch",
+        "method": "sessions.messages.search",
+        "params": {
+          "key": "agent:main:webchat:search-fixture",
+          "query": "中文🙂",
+          "session_epoch": -1
+        }
+      }
+    },
+    {
+      "id": "request.oversized-query",
+      "coverage": "request.oversized-query",
+      "expectation": "reject",
+      "wire": {
+        "type": "req",
+        "id": "request.oversized-query",
+        "method": "sessions.messages.search",
+        "params": {
+          "key": "agent:main:webchat:search-fixture",
+          "query": "字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字字"
+        }
+      }
+    }
+  ]
+}

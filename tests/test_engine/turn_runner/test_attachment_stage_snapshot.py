@@ -259,11 +259,11 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
         expected_extra_is_none=False,
         expected_kinds=("ContentBlockText", "ContentBlockImage"),
     ),
-    # Production cap is _MAX_ATTACHMENT_COUNT = 10; supply 11.
+    # Production cap is _MAX_ATTACHMENT_COUNT = 16; supply 17.
     _case(
         "count_cap_exceeded_value_error",
         message="hi",
-        attachments=[_img_attachment() for _ in range(11)],
+        attachments=[_img_attachment() for _ in range(17)],
         expected_extra_is_none=False,
         expected_kinds=(),
         raises_value_error=True,

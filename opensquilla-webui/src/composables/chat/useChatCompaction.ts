@@ -1,7 +1,9 @@
+import type { ProviderRecovery } from '@/types/parts'
 import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import {
   compactionCompletedLabelCode,
+  compactionSkippedProviderFailure,
   compactionFailurePresentation,
   compactionSkippedLabelCode,
   compactionSkipIsInformational,
@@ -11,6 +13,9 @@ export type ChatCompactStatusTone = 'info' | 'ok' | 'warn' | 'err' | string
 export type ChatCompactionPlacement = 'activity' | 'standalone'
 
 export interface ChatCompactStatus {
+  providerRecovery?: ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   visible: boolean
   message: string
   detail: string
@@ -24,6 +29,9 @@ export interface ChatCompactStatus {
 }
 
 export interface ShowCompactStatusOptions {
+  providerRecovery?: ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   tone?: ChatCompactStatusTone
   detail?: string
   dismissMs?: number
@@ -40,6 +48,8 @@ export interface UseChatCompactionOptions {
 }
 
 interface ChatCompactPayload extends Record<string, unknown> {
+  compactionRecovery?: ProviderRecovery
+  compactionFailure?: { httpStatus?: number; failureKind?: string }
   key?: string
   status?: string
   compacted?: boolean
@@ -162,6 +172,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       && !(isBusy && !previous.isBusy)
       && (statusOptions.compactionId === undefined
         || statusOptions.compactionId === previous.compactionId)
+    const recovery = isBusy ? statusOptions.providerRecovery ?? (carryMetadata && previous.isBusy ? previous.providerRecovery : undefined) : undefined
     compactStatus.value = {
       visible: true,
       message,
@@ -173,6 +184,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       compactionId: statusOptions.compactionId ?? (carryMetadata ? previous.compactionId : ''),
       durability: statusOptions.durability ?? (carryMetadata ? previous.durability : ''),
       reason: statusOptions.reason ?? (carryMetadata ? previous.reason : ''),
+      providerRecovery: recovery,
+      httpStatus: status === 'failed' ? statusOptions.httpStatus : isBusy ? recovery?.httpStatus : undefined,
+      failureKind: status === 'failed' ? statusOptions.failureKind : undefined,
     }
     if (statusOptions.dismissMs && statusOptions.dismissMs > 0) {
       dismissTimer = setTimeout(() => {
@@ -184,9 +198,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
 
   function compactFailureBlocksPending(payload: ChatCompactPayload): boolean {
     if (!payload) return false
-    if (payload.refused === true || payload.safe_to_send === false || payload.safeToSend === false) return true
-    const reason = String(payload.reason || payload.error_reason || payload.errorClass || payload.error_class || payload.error?.reason || payload.error?.code || '').toLowerCase()
-    return ['compaction_insufficient', 'context_overflow'].includes(reason)
+    // Refusing a summary does not prove that execution cannot use a local
+    // window. Only an explicit execution-safety verdict retains the queue.
+    return payload.safe_to_send === false || payload.safeToSend === false
   }
 
   function settleCompactInFlight(payload: ChatCompactPayload = {}, settleOptions: SettleCompactOptions = {}) {
@@ -290,11 +304,18 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     meta: ChatCompactMeta = {},
   ): false | ChatCompactionPlacement {
     let status = String(payload.status || '').toLowerCase()
+    if (compactionSkippedProviderFailure(status, payload.reason || payload.skip_reason, payload.compactionFailure?.failureKind)) status = 'failed'
     if (!status && Object.prototype.hasOwnProperty.call(payload, 'compacted')) {
       status = payload.compacted ? 'completed' : 'skipped'
     }
-    const source = String(payload.source || '').toLowerCase()
     const compactionId = payloadCompactionId(payload)
+    // Legacy terminal events may omit their source. Retain the source only
+    // for the same operation; never borrow it from an unrelated receipt.
+    const source = String(payload.source
+      || (compactionId && compactionId === compactStatus.value.compactionId ? compactStatus.value.source : '')
+      || (compactInFlight.value && (!compactionId || compactionId === activeCompactionId.value) ? 'manual' : '')
+      || '').toLowerCase()
+    const manualFailure = source === 'manual' || !source
     // Capture the active id before a terminal event settles it. Legacy id-less
     // lifecycles still get one stable slot per source.
     const placementKey = compactionId
@@ -386,6 +407,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
         tone: 'info',
         detail: stage,
+        providerRecovery: payload.compactionRecovery,
       })
       return placement
     }
@@ -422,9 +444,11 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       if (inActivity) return placement
       const reason = String(payload.reason || payload.skip_reason || payload.error_reason || '')
       const failure = compactionFailurePresentation(reason)
-      showCompactStatus('failed', i18n.global.t(failure.title), {
-        tone: failure.warning ? 'warn' : 'err',
-        detail: source === 'manual' ? i18n.global.t(failure.detail) : '',
+      showCompactStatus('failed', i18n.global.t(manualFailure ? failure.title : 'chat.compact.incomplete'), {
+        tone: !manualFailure ? 'info' : failure.warning ? 'warn' : 'err',
+        httpStatus: payload.compactionFailure?.httpStatus,
+        failureKind: payload.compactionFailure?.failureKind,
+        detail: manualFailure ? i18n.global.t(failure.detail) : '',
         source,
         compactionId,
         reason,
@@ -439,9 +463,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       })
       if (inActivity) return placement
       const failure = compactionFailurePresentation('timed_out')
-      showCompactStatus('timed_out', i18n.global.t(failure.title), {
-        tone: 'warn',
-        detail: source === 'manual' ? i18n.global.t(failure.detail) : '',
+      showCompactStatus('timed_out', i18n.global.t(manualFailure ? failure.title : 'chat.compact.incomplete'), {
+        tone: manualFailure ? 'warn' : 'info',
+        detail: manualFailure ? i18n.global.t(failure.detail) : '',
         source,
         compactionId,
         reason: 'compaction_deadline_exceeded',
@@ -462,10 +486,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       settleCompactInFlight(payload || {})
       if (inActivity) return placement
       showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.temporarilyReduced'), {
-        tone: 'warn',
-        detail: typeof payload.detail === 'string'
-          ? payload.detail
-          : i18n.global.t('chat.compact.requestScoped'),
+        tone: 'ok',
         source,
         compactionId,
         durability: 'request_scoped',

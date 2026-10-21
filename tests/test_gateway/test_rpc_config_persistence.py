@@ -52,37 +52,123 @@ def _write_small_config(path) -> None:
 # --- sparse persist -----------------------------------------------------------
 
 
+@pytest.mark.parametrize("writer", ["set", "patch", "apply", "telemetry"])
+@pytest.mark.parametrize(
+    ("image_fields", "primary", "implicit"),
+    [
+        ("", "openai/gpt-image-2.5-flare", True),
+        ('primary = "openai/gpt-image-2.5-flare"\n', "openai/gpt-image-2.5-flare", False),
+        ('primary = "openai/gpt-image-1"\n', "openai/gpt-image-1", True),
+        ('binding = "custom"\nprimary = "openai/gpt-image-1"\n', "openai/gpt-image-1", False),
+    ],
+)
+async def test_unrelated_config_writes_preserve_image_routing_provenance(
+    cfg_path, monkeypatch, writer, image_fields, primary, implicit,
+) -> None:
+    from opensquilla.gateway.rpc_telemetry import _commit_record
+    from opensquilla.onboarding.config_store import load_config
+    from opensquilla.tools.builtin import media
+
+    for key in (
+        "OPENAI_API_KEY", "OPENROUTER_API_KEY", "TOKENRHYTHM_API_KEY", "QWEN_TOKEN_PLAN_API_KEY",
+        "OPENSQUILLA_IMAGE_GENERATION_PRIMARY", "OPENSQUILLA_IMAGE_GENERATION_BINDING",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    cfg_path.write_text(
+        '[llm]\nprovider = "openrouter"\napi_key = "synthetic-openrouter-key"\n'
+        f'[image_generation]\nenabled = true\n{image_fields}'
+    )
+    cfg = load_config(cfg_path)
+    expected_fields = cfg.image_generation.model_fields_set & {"primary", "binding"}
+    ctx = _ctx(cfg)
+    try:
+        if writer == "set":
+            await _handle_config_set({"path": "naming.enabled", "value": False}, ctx)
+        elif writer == "patch":
+            await _handle_config_patch({"patches": {"naming.enabled": False}}, ctx)
+        elif writer == "apply":
+            payload = cfg.model_dump(mode="python")
+            payload["naming"]["enabled"] = False
+            await _handle_config_apply({"config": payload}, ctx)
+        else:
+            assert _commit_record(ctx=ctx, enabled=cfg.privacy.disable_network_observability)
+
+        expected = [primary]
+        if implicit:
+            expected.append("openrouter/google/gemini-3.1-flash-image-preview")
+        for current in (cfg, load_config(cfg_path)):
+            assert current.image_generation.model_fields_set & {"primary", "binding"} == (
+                expected_fields
+            )
+            media.configure_image_generation(current.image_generation, llm_config=current.llm)
+            assert media._resolve_image_generation_candidates(None, current.image_generation) == (
+                expected
+            )
+    finally:
+        media.configure_image_generation(None)
+
+
 @pytest.mark.parametrize("writer", ["set", "patch", "apply"])
-async def test_config_writers_reject_provider_only_compaction(
+@pytest.mark.parametrize(
+    ("field", "value"), [("primary", "openai/gpt-image-2.5-flare"), ("binding", "custom")],
+)
+async def test_explicit_config_writes_select_default_image_route(cfg_path, writer, field, value):
+    from opensquilla.onboarding.config_store import load_config
+    from opensquilla.tools.builtin import media
+
+    cfg_path.write_text(
+        '[llm]\nprovider = "openrouter"\napi_key = "synthetic-openrouter-key"\n'
+        '[image_generation]\nenabled = true\n'
+    )
+    cfg = load_config(cfg_path)
+    ctx = _ctx(cfg)
+    try:
+        if writer == "set":
+            await _handle_config_set({"path": f"image_generation.{field}", "value": value}, ctx)
+        elif writer == "patch":
+            await _handle_config_patch({"patches": {f"image_generation.{field}": value}}, ctx)
+        else:
+            payload = cfg.model_dump(mode="python")
+            payload["image_generation"] = {"enabled": True, field: value}
+            await _handle_config_apply({"config": payload}, ctx)
+
+        for current in (cfg, load_config(cfg_path)):
+            assert field in current.image_generation.model_fields_set
+            media.configure_image_generation(current.image_generation, llm_config=current.llm)
+            assert media._resolve_image_generation_candidates(None, current.image_generation) == [
+                "openai/gpt-image-2.5-flare",
+            ]
+    finally:
+        media.configure_image_generation(None)
+
+
+@pytest.mark.parametrize("writer", ["set", "patch", "apply"])
+async def test_config_writers_preserve_deprecated_provider_only_compaction(
     cfg_path,
     writer: str,
 ) -> None:
     cfg = GatewayConfig(config_path=str(cfg_path))
     ctx = _ctx(cfg)
 
-    with pytest.raises(
-        ValueError,
-        match="compaction.provider requires compaction.model",
-    ):
-        if writer == "set":
-            await _handle_config_set(
-                {"path": "compaction.provider", "value": "openai"},
-                ctx,
-            )
-        elif writer == "patch":
-            await _handle_config_patch(
-                {"patches": {"compaction.provider": "openai"}},
-                ctx,
-            )
-        else:
-            payload = cfg.model_dump(mode="python")
-            payload["compaction"]["provider"] = "openai"
-            payload["compaction"]["model"] = None
-            await _handle_config_apply({"config": payload}, ctx)
+    if writer == "set":
+        await _handle_config_set(
+            {"path": "compaction.provider", "value": "openai"},
+            ctx,
+        )
+    elif writer == "patch":
+        await _handle_config_patch(
+            {"patches": {"compaction.provider": "openai"}},
+            ctx,
+        )
+    else:
+        payload = cfg.model_dump(mode="python")
+        payload["compaction"]["provider"] = "openai"
+        payload["compaction"]["model"] = None
+        await _handle_config_apply({"config": payload}, ctx)
 
-    assert cfg.compaction.provider is None
-    assert cfg.compaction.model is None
-    assert not cfg_path.exists()
+    assert ctx.config.compaction.provider == "openai"
+    assert ctx.config.compaction.model is None
+    assert tomllib.loads(cfg_path.read_text())["compaction"]["provider"] == "openai"
 
 
 async def test_config_writer_accepts_complete_compaction_deployment(cfg_path) -> None:

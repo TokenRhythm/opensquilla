@@ -2,20 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
-from opensquilla.git_runtime import GitCapability, GitCapabilityState
 from opensquilla.skills import eligibility, runtime_env
 from opensquilla.skills.hub import deps
-from opensquilla.skills.meta.executors import skill_exec
-from opensquilla.skills.meta.types import MetaStep
 from opensquilla.skills.runtime_env import MEDIA_FONTS_DIR_ENV
 from opensquilla.skills.toolchains import ActiveComponentStatus, DownloadVerificationError
 from opensquilla.skills.toolchains.manager import (
@@ -29,28 +24,6 @@ from opensquilla.skills.types import (
     SkillRequires,
     SkillSpec,
 )
-
-
-class _FakeOwnedProcess:
-    pid = 4242
-    returncode = 0
-
-    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
-        assert input is None
-        return b"ok\n", b""
-
-
-def _mock_skill_exec_launcher(
-    monkeypatch: pytest.MonkeyPatch,
-) -> dict[str, Any]:
-    captured: dict[str, Any] = {}
-
-    async def fake_spawn(*argv: str, **kwargs: Any) -> _FakeOwnedProcess:
-        captured.update(argv=argv, kwargs=kwargs)
-        return _FakeOwnedProcess()
-
-    monkeypatch.setattr(skill_exec, "create_owned_subprocess_exec", fake_spawn)
-    return captured
 
 
 @pytest.mark.asyncio
@@ -298,174 +271,3 @@ def test_toolchain_inventory_is_sanitized_and_reports_active_capability(
         }
     ]
     assert "verified-managed" not in str(result)
-
-
-@pytest.mark.asyncio
-async def test_skill_exec_receives_managed_runtime_environment(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    spec = SimpleNamespace(
-        base_dir=str(tmp_path),
-        entrypoint={"command": "python", "parse": "text"},
-    )
-    loader = SimpleNamespace(get_by_name=lambda _name: spec)
-
-    def fake_env(base: object) -> dict[str, str]:
-        assert isinstance(base, dict)
-        assert base is not os.environ
-        assert base.get("PATH") == os.environ.get("PATH")
-        assert "PYTEST_CURRENT_TEST" not in base
-        return {"PATH": "/managed:/system", MEDIA_FONTS_DIR_ENV: "/managed/fonts"}
-
-    monkeypatch.setattr(skill_exec, "managed_skill_env", fake_env)
-    spawned = _mock_skill_exec_launcher(monkeypatch)
-
-    output = await skill_exec.run_skill_exec_step(
-        MetaStep(id="run", skill="fake", kind="skill_exec"),
-        "fake",
-        {},
-        {},
-        skill_loader=loader,
-        workspace_dir=str(tmp_path),
-    )
-
-    assert output == "ok"
-    expected_env = {
-        "PATH": "/managed:/system",
-        MEDIA_FONTS_DIR_ENV: "/managed/fonts",
-    }
-    if os.name == "nt":
-        expected_env.update({
-            "PYTHONIOENCODING": "utf-8",
-            "PYTHONUTF8": "1",
-        })
-    assert spawned["argv"] == (sys.executable,)
-    assert spawned["kwargs"]["env"] == expected_env
-
-
-@pytest.mark.asyncio
-async def test_skill_exec_pins_resolved_git_ahead_of_apple_shim(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    spec = SimpleNamespace(
-        base_dir=str(tmp_path),
-        entrypoint={"command": "python", "parse": "text"},
-        metadata=SimpleNamespace(requires=SimpleNamespace(bins=["git"])),
-    )
-    loader = SimpleNamespace(get_by_name=lambda _name: spec)
-    safe_git = Path("/opt/homebrew/bin/git")
-    monkeypatch.setattr(
-        skill_exec,
-        "resolve_git_capability",
-        lambda: GitCapability(
-            state=GitCapabilityState.AVAILABLE,
-            executable=safe_git,
-            source="host",
-        ),
-    )
-    monkeypatch.setattr(
-        skill_exec,
-        "managed_skill_env",
-        lambda _base: {"PATH": f"/usr/bin{os.pathsep}{safe_git.parent}"},
-    )
-    spawned = _mock_skill_exec_launcher(monkeypatch)
-
-    output = await skill_exec.run_skill_exec_step(
-        MetaStep(id="run", skill="fake", kind="skill_exec"),
-        "fake",
-        {},
-        {},
-        skill_loader=loader,
-        workspace_dir=str(tmp_path),
-    )
-
-    assert output == "ok"
-    assert spawned["kwargs"]["env"]["PATH"] == (
-        f"{safe_git.parent}{os.pathsep}/usr/bin"
-    )
-
-
-@pytest.mark.asyncio
-async def test_git_skill_exec_fails_before_spawn_when_git_becomes_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    spec = SimpleNamespace(
-        base_dir=str(tmp_path),
-        entrypoint={"command": "python", "parse": "text"},
-        metadata=SimpleNamespace(requires=SimpleNamespace(bins=["git"])),
-    )
-    loader = SimpleNamespace(get_by_name=lambda _name: spec)
-    monkeypatch.setattr(
-        skill_exec,
-        "resolve_git_capability",
-        lambda: GitCapability(
-            state=GitCapabilityState.UNAVAILABLE,
-            reason="git_not_found",
-        ),
-    )
-    monkeypatch.setattr(
-        skill_exec,
-        "create_owned_subprocess_exec",
-        lambda *_args, **_kwargs: pytest.fail("unavailable Git must not spawn a skill"),
-    )
-
-    with pytest.raises(RuntimeError, match=r"^GIT_UNAVAILABLE:"):
-        await skill_exec.run_skill_exec_step(
-            MetaStep(id="run", skill="fake", kind="skill_exec"),
-            "fake",
-            {},
-            {},
-            skill_loader=loader,
-            workspace_dir=str(tmp_path),
-        )
-
-
-@pytest.mark.parametrize("font_override", ["/operator/fonts", ""])
-@pytest.mark.asyncio
-async def test_skill_exec_preserves_explicit_operator_font_environment(
-    font_override: str,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    spec = SimpleNamespace(
-        base_dir=str(tmp_path),
-        entrypoint={"command": "python", "parse": "text"},
-    )
-    loader = SimpleNamespace(get_by_name=lambda _name: spec)
-
-    def passthrough_env(base: object) -> dict[str, str]:
-        assert isinstance(base, dict)
-        assert base[MEDIA_FONTS_DIR_ENV] == font_override
-        return dict(base)
-
-    monkeypatch.setenv(MEDIA_FONTS_DIR_ENV, font_override)
-    monkeypatch.setattr(skill_exec, "managed_skill_env", passthrough_env)
-    spawned = _mock_skill_exec_launcher(monkeypatch)
-
-    output = await skill_exec.run_skill_exec_step(
-        MetaStep(id="run", skill="fake", kind="skill_exec"),
-        "fake",
-        {},
-        {},
-        skill_loader=loader,
-        workspace_dir=str(tmp_path),
-    )
-
-    assert output == "ok"
-    env = spawned["kwargs"]["env"]
-    assert isinstance(env, dict)
-    assert env[MEDIA_FONTS_DIR_ENV] == font_override
-
-
-def test_skill_exec_normalizes_nested_base_dir_separators_for_windows(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(skill_exec.os, "sep", "\\")
-
-    assert skill_exec._normalize_base_dir_argument(
-        r"C:\runtime\paper/scripts/run.py",
-        r"C:\runtime\paper",
-    ) == r"C:\runtime\paper\scripts\run.py"

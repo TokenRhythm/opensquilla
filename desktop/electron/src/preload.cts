@@ -22,8 +22,17 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
+  saveAttachment: (payload: unknown) => ipcRenderer.invoke('desktop:attachment:save', payload),
   sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
   workspaceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:workspace-file:action', payload),
+  chooseLocalFilePaths: (request: unknown) => ipcRenderer.invoke('desktop:files:choose-paths', request),
+  resolveNativeFilePath: (file: File) => {
+    // OS drags retain their native backing path. Resolving it is metadata-only;
+    // content reads remain in the ordinary attachment path for images and
+    // browser/constructed Files.
+    const path = webUtils.getPathForFile(file)
+    return Promise.resolve(path || null)
+  },
   chooseAttachments: (request: unknown) => ipcRenderer.invoke('desktop:attachments:choose', request),
   selectAttachmentFile: (request: unknown, file: File) => {
     // Electron validates the actual browser File backing store. Constructed
@@ -51,7 +60,11 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   closeArtifactAnnotationOverlay: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:annotation:close-overlay', payload)
   ),
+  updateArtifactAnnotationOverlay: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:annotation:update-overlay', payload)
+  ),
   getWorkbenchBrowserTarget: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:target', payload),
+  setBrowserAutomationState: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:automation-state', payload),
   focusWorkbenchAnnotation: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:annotation:focus', payload),
   captureWorkbenchScreenshot: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:screenshot', payload),
   createArtifactPreviewLease: (payload: unknown) => (
@@ -91,6 +104,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume'),
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
+  quitDialogRespond: (response: unknown) => ipcRenderer.send('desktop:quit-dialog-response', response),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),
   retryProfileConsolidation: () => ipcRenderer.invoke('desktop:recovery:retry-consolidation'),
   chooseRecoveryWorkspace: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-workspace', payload),

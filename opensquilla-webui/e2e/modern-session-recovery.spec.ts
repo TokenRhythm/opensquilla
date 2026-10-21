@@ -6,6 +6,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:modern-recovery'
 const OTHER = 'agent:main:webchat:modern-recovery-other'
@@ -41,6 +42,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const snapshots = new Map<string, { id: string; bytes: Buffer; subscribed: boolean }>()
   const rejectedResumes: Observed[] = []
   const heldSubscriptions: Observed[] = []
+  const hydratedPlanRevisions: string[] = []
   const sentHistory: Array<Record<string, unknown>> = []
   const liveFrames: string[] = []
   let activeTurn: { socket: WebSocketRoute; key: string; task: string } | null = null
@@ -181,6 +183,22 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
         emitTurn('task.running', { status: 'running' })
         return
       }
+      if (frame.method === 'sessions.messages.hydrate' && mode === 'lost-subscribe') {
+        // The initial read can predate the missed plan update. Recovery must
+        // fetch current control state rather than reinstall its cached Promise.
+        const revision = hydratedPlanRevisions.length === 0 ? 'initial-plan' : 'recovered-plan'
+        hydratedPlanRevisions.push(revision)
+        respond(sessionMessagesHydratePayload(key, {
+          ...metadata(),
+          currentPlan: {
+            revisionId: revision, planId: 'recovery-plan', generation: hydratedPlanRevisions.length,
+            title: revision === 'initial-plan' ? 'Outdated recovery proposal' : 'Current recovery proposal',
+            markdown: 'Synthetic proposal changed while delivery was unavailable.',
+            current: true, steps: [{ stepId: 'inspect', title: 'Inspect the recovered state' }],
+          },
+        }))
+        return
+      }
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -211,7 +229,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const tick = () => sockets.forEach(socket => socket.send(JSON.stringify({
     type: 'event', event: 'tick', payload: { time_ms: Date.now() }, seq: 1,
   })))
-  return { sockets, requests, held, staged, tick, rejectedResumes, heldSubscriptions,
+  return { sockets, requests, held, staged, tick, rejectedResumes, heldSubscriptions, hydratedPlanRevisions,
     beginReply: () => emitTurn('session.event.text_delta', { text: REPLY }),
     finishReply: () => {
       if (!activeTurn) throw new Error('No explicit user turn to finish')
@@ -244,7 +262,12 @@ function calls(requests: Observed[], method: string, connection?: number) {
 test('automatically replaces a stale snapshot after a lost subscribe and hydrates the recovered ACK', async ({ page }) => {
   const gateway = await prepare(page, 'lost-subscribe')
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
-  await expect.poll(() => calls(gateway.requests, READ).length).toBe(1)
+  // This is the first Chromium page in the job. Bound its cold startup and
+  // mocked Gateway handshake separately from the fake-clock recovery budgets.
+  await expect.poll(() => ({
+    connects: calls(gateway.requests, 'connect').length,
+    reads: calls(gateway.requests, READ).length,
+  }), { timeout: 15_000 }).toEqual({ connects: 1, reads: 1 })
   await expect.poll(() => gateway.staged.length).toBe(1)
   const input = page.locator('.chat-textarea')
   const send = page.locator('.chat-send-btn[aria-label="Send"]')
@@ -275,10 +298,13 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   expect(calls(gateway.requests, RELEASE).map(call => call.params.sync_revision)).toEqual([reads[0]!.params.sync_revision])
   expect(gateway.heldSubscriptions.length).toBeGreaterThan(0)
   expect(calls(gateway.requests, 'sessions.messages.subscribe')).toHaveLength(gateway.heldSubscriptions.length + 1)
-  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(1)
+  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(2)
+  expect(gateway.hydratedPlanRevisions).toEqual(['initial-plan', 'recovered-plan'])
+  await expect(page.getByText('Current recovery proposal', { exact: true })).toBeVisible()
+  await expect(page.getByText('Outdated recovery proposal', { exact: true })).toHaveCount(0)
   await expect(notice).toHaveCount(0)
   await expect(send).toBeEnabled()
-  await expect(input).toHaveValue(DRAFT)
+  await expectComposerValue(input, DRAFT)
   expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
   expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
   expect(page.url()).toBe(originalUrl)
@@ -287,9 +313,10 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await expect(page.getByText('Synthetic cached history remains available.', { exact: true })).toHaveCount(1)
   await advance(page, 15_000)
   expect(calls(gateway.requests, RESUME)).toHaveLength(2)
-  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(1)
+  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(2)
+  expect(gateway.hydratedPlanRevisions).toEqual(['initial-plan', 'recovered-plan'])
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
-  await expect(input).toHaveValue(DRAFT)
+  await expectComposerValue(input, DRAFT)
   expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
   expect(page.url()).toBe(originalUrl)
 
@@ -298,7 +325,7 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await input.press('Enter')
   await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
   expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
-  await expect(input).toHaveValue('')
+  await expectComposerValue(input, '')
   gateway.beginReply()
   const reply = page.locator('.msg-ai-text').filter({ hasText: REPLY })
   await expect(reply).toHaveCount(1)
@@ -341,7 +368,7 @@ test('stays degraded beyond the foreground deadline and does not resurrect a dis
     })
     await advance(page, 5_000)
     await expect(notice).toHaveCount(0)
-    await expect(page.locator('.chat-textarea')).toHaveValue(DRAFT)
+    await expectComposerValue(page.locator('.chat-textarea'), DRAFT)
   }
   expect(gateway.sockets).toHaveLength(1)
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
@@ -380,7 +407,7 @@ test('finishes a progressing 48 second transfer with its original sync revision'
   await expect.poll(() => calls(gateway.requests, RESUME).length).toBe(1)
   expect(calls(gateway.requests, RESUME)[0]!.params.sync_revision).toBe(revision)
   await expect(notice).toHaveCount(0)
-  await expect(page.locator('.chat-textarea')).toHaveValue(DRAFT)
+  await expectComposerValue(page.locator('.chat-textarea'), DRAFT)
   expect(calls(gateway.requests, READ)).toHaveLength(8)
   expect(calls(gateway.requests, RELEASE)).toHaveLength(0)
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
@@ -402,7 +429,7 @@ test('reconnects through modern resume while preserving the draft and sends it e
   await advance(page, 2_000)
   await expect.poll(() => calls(gateway.requests, RESUME, 2).length).toBe(1)
   await expect(send).toBeEnabled()
-  await expect(input).toHaveValue(DRAFT)
+  await expectComposerValue(input, DRAFT)
   expect(page.url()).toBe(originalUrl)
   expect(calls(gateway.requests, READ, 2)[0]!.params.sync_revision).not.toBe(firstRevision)
   expect(calls(gateway.requests, RELEASE, 2).some(item => item.params.sync_revision === firstRevision)).toBe(false)
@@ -410,7 +437,7 @@ test('reconnects through modern resume while preserving the draft and sends it e
   await input.press('Enter')
   await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
   expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
-  await expect(input).toHaveValue('')
+  await expectComposerValue(input, '')
   await advance(page, 10_000)
   expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
   expect(gateway.sockets).toHaveLength(2)

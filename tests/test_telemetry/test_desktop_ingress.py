@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
+import threading
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -624,3 +626,104 @@ def test_desktop_ingress_has_no_raw_enqueue_escape_hatch() -> None:
 
     assert "recorders" in parameters
     assert "enqueue" not in parameters
+
+
+@pytest.mark.parametrize("operation", ["scandir", "read"])
+async def test_blocked_spool_filesystem_keeps_agent_loop_responsive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    _write_ready(tmp_path, "reliability", _reliability_payload())
+    entered = threading.Event()
+    release = threading.Event()
+    owner_thread = threading.get_ident()
+    filesystem_operation = getattr(os, operation)
+
+    def blocked_filesystem(*args, **kwargs):
+        entered.set()
+        assert threading.get_ident() != owner_thread
+        assert release.wait(timeout=5), "filesystem worker was not released"
+        return filesystem_operation(*args, **kwargs)
+
+    monkeypatch.setattr(os, operation, blocked_filesystem)
+    received: list[object] = []
+
+    def record_on_owner_loop(event: object) -> None:
+        assert threading.get_ident() == owner_thread
+        received.append(event)
+
+    config = _config()
+    draining = asyncio.create_task(
+        drain_desktop_early_spool(
+            tmp_path,
+            config=config,
+            recorders=_recorders(config, record_on_owner_loop),
+            env={},
+            now=NOW,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        agent_steps = []
+        for step in range(3):
+            await asyncio.sleep(0)
+            agent_steps.append(step)
+        assert agent_steps == [0, 1, 2]
+        assert not draining.done()
+        assert received == []
+    finally:
+        release.set()
+        stats = await draining
+        monkeypatch.setattr(os, operation, filesystem_operation)
+
+    assert stats.enqueued == 1
+    assert len(received) == 1
+    assert not list(tmp_path.rglob("*.processing.*"))
+
+
+async def test_cancelled_spool_read_finishes_worker_before_returning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ready(tmp_path, "reliability", _reliability_payload())
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    real_read = os.read
+
+    def blocked_read(*args):
+        entered.set()
+        assert release.wait(timeout=5), "filesystem worker was not released"
+        try:
+            return real_read(*args)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(os, "read", blocked_read)
+    config = _config()
+    received: list[object] = []
+    draining = asyncio.create_task(
+        drain_desktop_early_spool(
+            tmp_path,
+            config=config,
+            recorders=_recorders(config, received.append),
+            env={},
+            now=NOW,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        draining.cancel()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not draining.done()
+        assert not completed.is_set()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await draining
+
+    assert completed.is_set()
+    assert received == []
+    assert list(tmp_path.rglob("*.processing.*"))

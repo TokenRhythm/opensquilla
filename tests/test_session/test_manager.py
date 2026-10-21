@@ -22,9 +22,16 @@ from opensquilla.session.attachment_manifest import (
     build_attachment_manifest,
     manifest_context_state,
 )
-from opensquilla.session.compaction import CompactionConfig, CompactionResult
+from opensquilla.session.compaction import (
+    CompactionConfig,
+    CompactionResult,
+    compaction_replay_summary,
+)
 from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError
-from opensquilla.session.compaction_state import StructuredCompactionSummary
+from opensquilla.session.compaction_state import (
+    StructuredCompactionSummary,
+    render_structured_summary,
+)
 from opensquilla.session.context_view import (
     build_compaction_context_records,
     compaction_replay_is_complete,
@@ -681,13 +688,13 @@ async def test_existing_session_mutations_do_not_recreate_deleted_generation(
 ):
     key = "agent:main:generation-race"
     await manager.create(key)
-    original_upsert = manager._storage.upsert_session
+    original_patch = manager._storage.update_session_fields
 
-    async def delete_before_upsert(node, **kwargs):
+    async def delete_before_patch(session_key, fields, **kwargs):
         await manager._storage.delete_session(key)
-        return await original_upsert(node, **kwargs)
+        return await original_patch(session_key, fields, **kwargs)
 
-    monkeypatch.setattr(manager._storage, "upsert_session", delete_before_upsert)
+    monkeypatch.setattr(manager._storage, "update_session_fields", delete_before_patch)
 
     with pytest.raises(KeyError, match="Session generation changed"):
         if operation == "resume":
@@ -715,13 +722,13 @@ async def test_update_expected_owner_rejects_epoch_change_before_write(
 ):
     key = "agent:main:update-owner-race"
     admitted = await manager.create(key)
-    original_upsert = manager._storage.upsert_session
+    original_patch = manager._storage.update_session_fields
 
-    async def advance_epoch_before_upsert(node, **kwargs):
+    async def advance_epoch_before_patch(session_key, fields, **kwargs):
         await manager._storage.increment_epoch(key)
-        return await original_upsert(node, **kwargs)
+        return await original_patch(session_key, fields, **kwargs)
 
-    monkeypatch.setattr(manager._storage, "upsert_session", advance_epoch_before_upsert)
+    monkeypatch.setattr(manager._storage, "update_session_fields", advance_epoch_before_patch)
 
     with pytest.raises(KeyError, match="Session generation changed"):
         await manager.update(
@@ -1497,7 +1504,7 @@ async def test_branch_through_turn_materializes_target_from_canonical_archive(ma
         ],
         compaction_id="cmp-archived-through-turn",
     )
-    assert installed is True
+    assert installed.applied is True
     await manager._storage.create_agent_task(
         AgentTaskRecord(
             task_id=target_turn_id,
@@ -3000,7 +3007,8 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     original_contents = [entry.content for entry in await manager.get_transcript("agent:main:main")]
 
     result = await manager.compact_with_result(
-        "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        "agent:main:main", context_window_tokens=32768, config=synthetic_compaction_config(),
+        trigger_reason="manual",
     )
 
     assert result.summary
@@ -3011,10 +3019,10 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     assert transcript
     assert all(entry.role != "system" for entry in transcript)
     summaries = await manager.get_summaries("agent:main:main")
-    assert [summary.summary_text for summary in summaries] == [result.summary]
+    assert [summary.summary_text for summary in summaries] == [compaction_replay_summary(result)]
     assert summaries[0].summary_format == "structured_v1"
     assert summaries[0].summary_source == result.summary_source
-    assert summaries[0].coverage_status in {"unknown", "pass", "pass_with_backfill"}
+    assert summaries[0].coverage_status in {"unknown", "pass", "fail_reported"}
     assert summaries[0].summary_payload is not None
     assert summaries[0].summary_payload["schema_version"] == 1
     assert summaries[0].compaction_id
@@ -3041,7 +3049,7 @@ async def test_compact_with_result_returns_source_and_persists(manager):
         ),
         pytest.param(
             CompactionConfig(compaction_profile="coding"),
-            12,
+            2,
             id="profile-protection",
         ),
     ],
@@ -3523,6 +3531,7 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
             "Goal: finish continuity work.\n"
             "Constraint: do not enable coverage blocking by default.\n"
             "Keep src/opensquilla/session/models.py and docs/Long Task Report.md."
+            + " Earlier background discussion and completed work." * 120
         ),
         token_count=500,
     )
@@ -3542,13 +3551,17 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
         "agent:main:main",
         "assistant",
         "Next I will run uv run pytest tests/test_session/test_manager.py.",
-        tool_calls=[{"id": "call_exec_1", "type": "function"}],
+        tool_calls=[{
+            "id": "call_exec_1", "name": "exec_command",
+            "arguments": {"command": "uv run pytest tests/test_session/test_manager.py"},
+        }],
         token_count=250,
     )
     await manager.append_message(
         "agent:main:main",
         "tool",
         (
+            "exit_code=1\n"
             "Command failed: uv run pytest tests/test_session/test_manager.py\n"
             "Exit code 1\n"
             "Error: missing summary_payload column"
@@ -3566,31 +3579,28 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=1_200,
+        context_window_tokens=32768,
         config=synthetic_compaction_config(safety_margin=1.2),
+        trigger_reason="manual",
     )
 
     assert result.removed_count > 0
     summaries = await manager.get_summaries("agent:main:main")
     summary = summaries[0]
-    assert summary.summary_text == result.summary
+    assert summary.summary_text == compaction_replay_summary(result)
     assert summary.summary_format == "structured_v1"
     assert summary.summary_payload is not None
-    assert summary.coverage_status == "pass"
-    assert summary.missing_obligations == []
+    assert summary.coverage_status == "fail_reported"
+    assert summary.missing_obligations
     assert summary.critical_carry_forward == []
     payload = summary.summary_payload
     assert payload is not None
-    assert "src/opensquilla/session/models.py" in str(payload)
-    assert {"id": "call_exec_1"} in payload["tool_results_to_remember"]
-    assert any(
-        "missing summary_payload column" in failure.get("detail", "")
-        for failure in payload["known_failures"]
-    )
-    assert any(
-        "pytest tests/test_session/test_manager.py" in command
-        for command in payload["executed_commands_and_tests"]
-    )
+    assert payload["tool_results_to_remember"] == []
+    assert payload["known_failures"] == []
+    assert payload["executed_commands_and_tests"] == []
+    canonical = await manager.get_canonical_transcript("agent:main:main")
+    assert any(entry.tool_call_id == "call_exec_1" for entry in canonical)
+    assert any("missing summary_payload column" in entry.content for entry in canonical)
     assert "call_exec_1" not in payload["pending_tool_and_approval_ids"]
     transcript = await manager.get_transcript("agent:main:main")
     assert not any(entry.tool_call_id == "call_exec_1" for entry in transcript)
@@ -3602,13 +3612,13 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
 
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
-async def test_compact_with_result_strict_coverage_installs_verified_backfill(manager):
+async def test_compact_with_result_legacy_strict_flag_does_not_backfill_or_block(manager):
     node = await manager.create("agent:main:main")
     late_critical_path = "src/opensquilla/session/critical_continuity.py"
     await manager.append_message(
         "agent:main:main",
         "user",
-        "Goal: preserve strict continuity. " + ("padding " * 40) + late_critical_path,
+        "Goal: preserve strict continuity. " + ("padding " * 400) + late_critical_path,
         token_count=650,
     )
     for index in range(4):
@@ -3622,21 +3632,24 @@ async def test_compact_with_result_strict_coverage_installs_verified_backfill(ma
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=300,
+        context_window_tokens=32768,
         config=synthetic_compaction_config(safety_margin=1.0, coverage_blocking=True),
+        trigger_reason="manual",
     )
 
     assert result.removed_count > 0
     assert result.skip_reason is None
-    assert result.coverage_status == "pass"
-    assert result.missing_obligations == []
-    assert late_critical_path in str(result.summary_payload)
+    assert result.coverage_status == "fail_reported"
+    assert result.missing_obligations
+    assert late_critical_path not in str(result.summary_payload)
     assert len(await manager.get_transcript("agent:main:main")) < len(
         original_transcript
     )
     summaries = await manager.get_summaries("agent:main:main")
     assert len(summaries) == 1
-    assert late_critical_path in str(summaries[0].summary_payload)
+    assert late_critical_path not in str(summaries[0].summary_payload)
+    assert any(late_critical_path in entry.content
+               for entry in await manager.get_canonical_transcript("agent:main:main"))
     assert await manager.get_context_states("agent:main:main")
     current_node = await manager._storage.get_session("agent:main:main")
     assert current_node is not None
@@ -3661,7 +3674,8 @@ async def test_compact_with_result_writes_portable_context_state(
     await manager.append_message(
         "agent:main:main",
         "user",
-        "Goal: keep portable state. File src/opensquilla/session/models.py.",
+        "Goal: keep portable state. File src/opensquilla/session/models.py."
+        + " Earlier completed discussion and ordinary details." * 100,
         token_count=1500,
     )
     for i in range(8):
@@ -3704,13 +3718,13 @@ async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(mana
     await manager.append_message(
         "agent:main:main",
         "user",
-        "ancient request",
+        "ancient request " * 100,
         token_count=500,
     )
     await manager.append_message(
         "agent:main:main",
         "assistant",
-        "ancient answer",
+        "ancient answer " * 100,
         token_count=500,
     )
     await manager.append_message(
@@ -4119,7 +4133,10 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
     ]
     summaries = await manager._storage.get_all_summaries(node.session_id)
     assert len(summaries) == 1
-    assert summaries[0].summary_text == "short summary"
+    assert summaries[0].summary_text == render_structured_summary(
+        summaries[0].summary_payload,
+    )
+    assert "short summary" in summaries[0].summary_text
     assert summaries[0].compaction_id == "cmp_inline_1"
     assert summaries[0].trigger_reason == "agent_inline_overflow"
     assert summaries[0].removed_count == 3
@@ -4186,9 +4203,24 @@ async def test_compaction_atomically_persists_attachment_manifest_with_summary(
     assert len(summaries) == 1
     assert summaries[0].summary_payload is not None
     assert summaries[0].summary_payload["files_and_artifacts"] == []
-    assert occurrence.attachment_id in summaries[0].summary_payload[
-        "important_identifiers"
-    ]
+    # Attachment identity belongs to the typed manifest, not keyword-based
+    # summary sidecars. The original archived envelope remains addressable.
+    assert summaries[0].summary_payload["important_identifiers"] == []
+    from opensquilla.session.attachment_manifest import AttachmentManifestStore
+
+    reloaded = await AttachmentManifestStore(manager._storage).load(
+        node.session_key, session_id=node.session_id,
+    )
+    assert reloaded.by_id(occurrence.attachment_id) == occurrence
+    fragment = await manager.get_canonical_transcript_fragment(
+        node.session_key, message_id=occurrence.source_message_id,
+        expected_session_id=node.session_id, expected_session_epoch=node.epoch,
+    )
+    assert fragment["source"] == "compacted"
+    assert fragment["total_chars"] <= len(fragment["text"])
+    original_envelope = json.loads(json.loads(fragment["text"])["content"])
+    assert original_envelope["attachments"][0]["attachment_id"] == occurrence.attachment_id
+    assert original_envelope["attachments"][0]["data"] == image_data
     serialized_summary = json.dumps(summaries[0].summary_payload, sort_keys=True)
     assert "/private/tmp" not in serialized_summary
     assert image_data not in serialized_summary
@@ -4355,7 +4387,7 @@ async def test_inline_compaction_preserves_queued_append_only_suffix(manager):
         source_boundary_entry_id=source.boundary_entry_id,
     )
 
-    assert installed is True
+    assert installed.applied is True
     transcript = await manager.get_transcript(node.session_key)
     assert [entry.message_id for entry in transcript] == [
         active_user.message_id,
@@ -4446,7 +4478,7 @@ async def test_inline_compaction_preserves_metadata_from_concurrent_suffix_appen
         source_boundary_entry_id=source.boundary_entry_id,
     )
 
-    assert installed is True
+    assert installed.applied is True
     current = await manager._storage.get_session(node.session_key)
     assert current is not None
     assert current.total_tokens == 117
@@ -4492,7 +4524,7 @@ async def test_inline_compaction_rejects_stale_source_without_partial_install(ma
         source_boundary_entry_id=source.boundary_entry_id,
     )
 
-    assert installed is False
+    assert installed.applied is False
     transcript = await manager.get_transcript(node.session_key)
     assert [entry.message_id for entry in transcript] == [
         old_user.message_id,
@@ -5358,12 +5390,21 @@ async def test_suffix_manual_compaction_preserves_sqlite_source_until_valid_summ
     result = await manager.compact_with_result(
         node.session_key, context_window_tokens=1000, config=config, trigger_reason="manual",
     )
-    assert len(requests) == 1
+    assert len(requests) == (2 if failure == "oversized" else 1)
     messages, tools, sent_config = requests[0]
-    assert sent_config.system == "Current system"
+    assert "conversation compactor" in sent_config.system
+    assert sent_config.system != "Current system"
     assert sent_config.max_tokens == 4096
     assert tools[0].name == "lookup"
-    assert "portable checkpoint" in messages[-1].content
+    assert "structured checkpoint" in messages[-1].content
+    for section in (
+        "Primary Request and Intent", "Key Technical Concepts", "Files and Code",
+        "Errors and Fixes", "Pending Jobs", "Current Work", "Next Step", "Critical Context",
+    ):
+        assert f"## {section}" in messages[-1].content
+    assert "Output only the checkpoint; do not answer the conversation or call tools." in (
+        messages[-1].content
+    )
     after = await manager.get_transcript(node.session_key)
     summaries = await manager.get_summaries(node.session_key)
     async with manager._storage.conn.execute(
@@ -5424,8 +5465,8 @@ async def test_precomputed_compaction_revalidates_artifact_before_removing_rows(
         source_context_fingerprint=source.context_fingerprint,
     )
 
-    if invalid == "long_valid":
-        assert installed is True
+    if invalid in {"long_valid", "missing_fact"}:
+        assert installed.applied is True
         assert await manager.get_transcript(node.session_key) == before[-1:]
         assert await manager.get_canonical_transcript(node.session_key) == before
         records = build_compaction_context_records(
@@ -5438,7 +5479,7 @@ async def test_precomputed_compaction_revalidates_artifact_before_removing_rows(
         assert compaction_replay_is_complete(texts, replay)
         assert (await manager.get_session(node.session_key)).compaction_count == 1
         return
-    assert installed is False
+    assert installed.applied is False
     assert await manager.get_transcript(node.session_key) == before
     assert await manager.get_canonical_transcript(node.session_key) == before
     assert await manager.get_summaries(node.session_key) == []
@@ -5496,7 +5537,14 @@ async def test_precomputed_summary_replacement_checks_source_context_and_commit_
         ),
     )
 
-    assert installed is (change == "none")
+    # The writer enforces source/CAS and structural integrity. Semantic
+    # keyword coverage is diagnostic; it must not block an otherwise valid
+    # model-authored checkpoint or revive the old task by backfilling prose.
+    assert installed.applied is (change in {"none", "lost_fact"})
+    assert installed.reason == {
+        "none": "", "lost_fact": "", "missing_proof": "stale_context_state",
+        "before_persist": "stale_context_state", "at_commit": "stale_preimage",
+    }[change]
     summaries = await manager.get_summaries(node.session_key)
     assert summaries[0].id == old_summary.id
     assert summaries[0].summary_text == prior
@@ -5505,8 +5553,14 @@ async def test_precomputed_summary_replacement_checks_source_context_and_commit_
         assert await manager.get_transcript(node.session_key) == before[2:]
         assert len(summaries) == 2
         assert summaries[-1].coverage_status == "pass"
-        assert summaries[-1].summary_payload["source_coverage"]["checked_obligations"] > 0
-        assert "src/required_checkpoint.py" in summaries[-1].summary_text
+        assert summaries[-1].summary_payload["current_status"] == payload["current_status"]
+        assert summaries[-1].summary_payload["source_coverage"]["replaces_prior_context"]
+        records = build_compaction_context_records(
+            context_states=await manager.get_context_states(node.session_key), summaries=summaries,
+        )
+        assert len(records) == 1
+        assert payload["current_status"] in records[0].text
+        assert ("src/required_checkpoint.py" in records[0].text) is (change != "lost_fact")
     else:
         assert await manager.get_transcript(node.session_key) == before
         assert len(summaries) == (2 if change in {"before_persist", "at_commit"} else 1)
@@ -5558,7 +5612,7 @@ async def test_precomputed_append_validates_all_final_checkpoints(
     assert len(summaries) == 2
     assert await manager.get_transcript(node.session_key) == original[2:]
     assert await manager.get_canonical_transcript(node.session_key) == original
-    assert (await manager.get_session(node.session_key)).compaction_count == int(installed)
+    assert (await manager.get_session(node.session_key)).compaction_count == int(installed.applied)
 
 
 @pytest.mark.asyncio
@@ -5607,7 +5661,6 @@ async def test_precomputed_summary_only_replacement_preserves_coverage_boundary(
     ("invalid", "expected_reason"),
     [
         ("empty", "empty_summary"),
-        ("missing_fact", "coverage_blocked"),
         ("overcapacity", "consumer_admission_failed"),
         ("boundary", "invalid_source_boundary"),
         ("overrun", "invalid_source_boundary"),
@@ -5665,3 +5718,65 @@ async def test_manager_final_candidate_gate_preserves_original_context(
     assert await manager.get_summaries(node.session_key) == []
     assert await manager.get_context_states(node.session_key) == []
     assert (await manager.get_session(node.session_key)).compaction_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["active", "in_turn"])
+async def test_compaction_writers_preserve_aggregated_prose_without_semantic_backfill(
+    manager, monkeypatch, writer,
+):
+    node = await manager.create(f"agent:main:coverage-report-{writer}")
+    failures = "\n".join(f"Error: 测试 case_{i} 失败，等待统一修复。" for i in range(40))
+    await manager.append_message(node.session_key, "user", "检查这些失败。\n" + failures)
+    await manager.append_message(node.session_key, "assistant", "已汇总失败，继续修复。")
+    await manager.append_message(node.session_key, "user", "继续当前修复，不重复已完成步骤。")
+    source = await manager.capture_compaction_source(node.session_key)
+    before = await manager.get_canonical_transcript(node.session_key)
+    prose = "当前有40项测试失败。继续修复并运行测试；不重复已完成步骤。"
+    payload = StructuredCompactionSummary(
+        current_status=prose,
+        source_coverage={"status": "fail_reported", "checked_obligations": 40},
+    ).model_dump(mode="json")
+    if writer == "active":
+        async def candidate(request):
+            return CompactionResult(
+                summary=prose, summary_format="structured_v1", summary_payload=payload,
+                kept_entries=request.entries[2:], kept_start_index=2, removed_count=2,
+                chunks_processed=1, summary_source="llm", coverage_status="fail_reported",
+                missing_obligations=["diagnostic sample only"],
+            )
+
+        monkeypatch.setattr(session_manager_module, "compact_context", candidate)
+        result = await manager.compact_with_result(
+            node.session_key, context_window_tokens=32768, trigger_reason="manual",
+        )
+        assert result.removed_count == 2
+        assert result.coverage_status == "fail_reported"
+    else:
+        installed = await manager.persist_compaction_result(
+            node.session_key, prose,
+            [{"role": "user", "content": before[-1].content}],
+            summary_payload=payload, summary_format="structured_v1",
+            coverage_status="fail_reported", removed_count=2,
+            source_entries=source.entries, source_preimage=source.preimage,
+            source_context_fingerprint=source.context_fingerprint,
+        )
+        assert installed.applied
+    summaries = await manager.get_summaries(node.session_key)
+    states = await manager.get_context_states(node.session_key)
+    assert len(summaries) == len(states) == 1
+    stored = summaries[0]
+    assert stored.summary_text == render_structured_summary(stored.summary_payload)
+    assert "case_39" not in stored.summary_text
+    assert stored.summary_payload["known_failures"] == []
+    assert stored.summary_payload["critical_carry_forward"] == []
+    assert stored.coverage_status == "fail_reported"
+    assert await manager.get_canonical_transcript(node.session_key) == before
+    assert len(await manager.get_transcript(node.session_key)) == 1
+    # A legacy reader failure must use the full checkpoint body from the same
+    # committed generation, not revive a previous task or discard its content.
+    damaged = states[0].model_copy(update={"payload": {
+        **states[0].payload, "known_failures": [{"count": 40}],
+    }})
+    records = build_compaction_context_records(context_states=[damaged], summaries=summaries)
+    assert [record.text for record in records] == [stored.summary_text.strip()]

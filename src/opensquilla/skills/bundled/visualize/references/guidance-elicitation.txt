@@ -1,0 +1,13 @@
+Generated from generative-frame 0.0.5 (MIT), adapted for OpenSquilla.
+Copyright (c) 2026 AgentbaseAI Inc. See LICENSE.generative-frame.txt and upstream-guidance.json.
+Do not edit this generated file; run npm run visualize:guidance:write in opensquilla-webui.
+
+## Module: elicitation
+
+Use a form widget when you need several pieces of information from the user at once and asking in prose would take many turns.
+
+- One `<form>` with grouped `<fieldset>`s and a `<legend>` each. Every control has a `<label>`. Use radio buttons or a segmented row of buttons for up to five options and a `<select>` beyond that.
+- Pre-fill sensible defaults and mark optional fields; keep it to about seven fields.
+- Validate inputs and show messages next to the fields. If a local form submit is useful for validation, call `preventDefault()`. Publish valid task conditions with `await visual.setContext({ summary, data, suggestedPrompt })`; use a concise summary of the actual values and a task-specific suggestedPrompt. The host supplies the action that adds these conditions to the conversation. Do not duplicate it with a generic continue-discussion button.
+- Keep fields editable after preparing context. Update or clear context when fields change, become invalid, or reset. A successful setContext acknowledgement means conditions are available, not that a message was sent or a model has answered.
+- Never ask for passwords, payment details, government identifiers, or other secrets.

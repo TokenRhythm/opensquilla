@@ -7,6 +7,7 @@ import {
   SANDBOX_RUNTIME_KEY,
   type SandboxChatRuntime,
   type SandboxSetupOutcome,
+  type SandboxSetupOptions,
 } from '@/modules/sandboxRuntime'
 import type {
   SandboxRunMode,
@@ -32,9 +33,9 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
     if (!ensuring.value) outcome.value = 'idle'
   }
 
-  async function runSetup(): Promise<boolean> {
+  async function runSetup(options?: SandboxSetupOptions): Promise<boolean> {
     try {
-      const result = await sandbox.ensureReady()
+      const result = await sandbox.ensureReady(options)
       status.value = result.status
       outcome.value = result.outcome
       if (!result.ready) {
@@ -55,12 +56,12 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
     }
   }
 
-  function startSafeSetup(): Promise<boolean> {
+  function startSafeSetup(options?: SandboxSetupOptions): Promise<boolean> {
     if (inFlight) return inFlight
     intendedMode.value = 'safe'
     ensuring.value = true
     outcome.value = 'idle'
-    inFlight = runSetup().finally(() => {
+    inFlight = runSetup(options).finally(() => {
       ensuring.value = false
       inFlight = null
     })

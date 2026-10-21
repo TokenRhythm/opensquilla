@@ -1672,6 +1672,7 @@ async def test_windows_stdin_exec_retains_output_through_slow_disk(
         original_append(spool, chunk)
 
     def create_process(_command, **kwargs):
+        kwargs.pop("cancel_event", None)
         return subprocess.Popen([
             sys.executable, "-c",
             "import sys;data=sys.stdin.buffer.read();"

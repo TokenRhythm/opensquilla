@@ -32,6 +32,32 @@ export function collectClipboardFiles(data: DataTransfer | null): File[] {
   return files
 }
 
+/** Return plain clipboard text without treating rich HTML as the model input. */
+export function collectClipboardText(data: DataTransfer | null): string {
+  if (!data) return ''
+  const text = data.getData('text/plain')
+  return typeof text === 'string' ? text : ''
+}
+
+// Keep the UI trigger close to Codex-style paste behavior. The Gateway keeps
+// its separate 20k raw-text safety backstop for clients that do not attach in
+// the composer.
+export const LONG_PASTE_CHARS = 5_000
+
+export function isLongPlainTextPaste(text: string): boolean {
+  return text.length >= LONG_PASTE_CHARS
+}
+
+export function pastedTextAttachmentName(text: string, now = Date.now()): string {
+  const firstLine = text.split(/\r?\n/).map(line => line.trim()).find(Boolean) || ''
+  const safeTitle = firstLine
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .slice(0, 80)
+    .trim()
+  return safeTitle ? `${safeTitle}${firstLine.length > 80 ? '…' : ''}.txt` : `pasted-text-${now}.txt`
+}
+
 /**
  * Decide whether a document-level file paste belongs to the chat composer.
  * Pastes aimed at another editable surface — clarify/approval inputs, the
@@ -41,12 +67,20 @@ export function collectClipboardFiles(data: DataTransfer | null): File[] {
  */
 export function shouldCaptureFilePaste(
   target: EventTarget | null,
-  options: { composerTextareaFocused: boolean, dialogLayerOpen: boolean },
+  options: { composerTextareaFocused: boolean, dialogLayerOpen: boolean, composerEditor?: HTMLElement | null },
 ): boolean {
   if (options.dialogLayerOpen) return false
   if (target instanceof HTMLTextAreaElement) return options.composerTextareaFocused
   if (target instanceof HTMLInputElement) return false
-  if (target instanceof HTMLElement && target.isContentEditable) return false
+  if (target instanceof HTMLElement) {
+    // Inline capability references add child nodes to the composer. Only the
+    // exact supplied editor may claim their clipboard events; other editors
+    // and their descendants still own their pastes.
+    if (options.composerEditor && (target === options.composerEditor || options.composerEditor.contains(target))) {
+      return options.composerTextareaFocused
+    }
+    if (target.isContentEditable || target.closest('[contenteditable="true"], [contenteditable="plaintext-only"], [contenteditable=""]')) return false
+  }
   return true
 }
 
@@ -139,6 +173,7 @@ export function serializeSendableAttachment(attachment: SendableAttachment): Cha
       file_uuid: attachment.file_uuid,
       mime: attachment.mime,
       name: attachment.name,
+      ...(attachment.origin ? { origin: attachment.origin } : {}),
     }
   }
   return {
@@ -146,6 +181,7 @@ export function serializeSendableAttachment(attachment: SendableAttachment): Cha
     data: attachment.data,
     mime: attachment.mime,
     name: attachment.name,
+    ...(attachment.origin ? { origin: attachment.origin } : {}),
   }
 }
 
@@ -175,6 +211,7 @@ export function serializeDisplayAttachment(attachment: SendableAttachment): Disp
     name: attachment.name,
     mime: attachment.mime,
     size: attachment.size,
+    ...(attachment.origin ? { origin: attachment.origin } : {}),
   }
   if (attachment.kind === 'workspace') {
     return { ...base, kind: 'file', workspaceFile: attachment.workspaceFile }
@@ -235,6 +272,9 @@ export function normalizeDisplayAttachment(
     mime,
   )
   const rawKind = typeof record.kind === 'string' ? record.kind : ''
+  const rawMissingReason = record.missingReason ?? record.missing_reason
+  const missingReason = typeof rawMissingReason === 'string'
+    ? rawMissingReason.trim().slice(0, 256) || undefined : undefined
   const kind: DisplayAttachment['kind'] = rawKind === 'staged' || sha
     ? 'staged'
     : rawKind === 'inline' || data || dataUrl
@@ -266,11 +306,13 @@ export function normalizeDisplayAttachment(
         ? record.download_url
         : undefined,
     sha256_ref: sha || undefined,
+    missingReason,
     attachmentId: typeof record.attachmentId === 'string' && record.attachmentId.trim()
       ? record.attachmentId.trim()
       : typeof record.attachment_id === 'string' && record.attachment_id.trim()
         ? record.attachment_id.trim()
         : undefined,
+    origin: record.origin === 'paste' ? 'paste' : undefined,
   }
 }
 

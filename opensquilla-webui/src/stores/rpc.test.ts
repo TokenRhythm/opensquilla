@@ -1,9 +1,13 @@
 // @vitest-environment happy-dom
 
 import { createPinia, setActivePinia } from 'pinia'
+import { computed, nextTick } from 'vue'
+import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRpcStore } from './rpc'
 import { createV4GatewayAccess } from '@/adapters/gateway/gatewayAccessV4'
+import { createRpcWorkbenchResourceProvider } from '@/adapters/gateway/workbenchResourcesV4'
+import { useWorkbenchResourcesStore } from './workbenchResources'
 
 const connectCalls: Array<{ url: string; token?: string }> = []
 const clients: Array<{
@@ -76,6 +80,7 @@ describe('rpc link-token bootstrap', () => {
     vi.unstubAllGlobals()
   })
   beforeEach(() => {
+    vi.stubGlobal('indexedDB', new IDBFactory())
     vi.stubGlobal('navigator', {
       locks: { request: vi.fn(async (_name: string, action: () => unknown) => action()) },
     })
@@ -86,6 +91,91 @@ describe('rpc link-token bootstrap', () => {
     sessionStorage.clear()
     delete window.opensquillaDesktop
     window.history.replaceState(null, '', '/control/sessions')
+  })
+
+  it('loads requested attachment inventory when Hello advertises resources after initial mount', async () => {
+    const rpc = useRpcStore()
+    rpc.init()
+    const attachment = {
+      resource: { type: 'attachment', attachmentId: 'hello-attachment' },
+      name: 'report.html', mime: 'text/html',
+      capabilities: { preview: true, download: true }, relations: {},
+    }
+    const call = vi.fn(async (_method: string, _params?: Record<string, unknown>) => ({ resources: [attachment], totalCount: 1,
+      pageSize: 500, returnedCount: 1, hasMore: false, nextCursor: null }))
+    const resources = useWorkbenchResourcesStore()
+    resources.setProvider(createRpcWorkbenchResourceProvider({ hasRpcMethod: rpc.hasRpcMethod, call }))
+
+    await resources.load('main-session')
+    await resources.load('side-session')
+    await resources.load('retired-session')
+    resources.clearSession('retired-session')
+    expect(resources.snapshot('main-session')).toMatchObject({ loaded: true, available: false })
+    expect(call).not.toHaveBeenCalled()
+
+    clients[0].emit('_hello', { ...deliveryHello(), features: { methods: [] } })
+    await nextTick()
+    expect(call).not.toHaveBeenCalled()
+
+    clients[0].emit('_hello', { ...deliveryHello(), features: { methods: ['workbench.resources.list'] } })
+    await vi.waitFor(() => expect(resources.snapshot('main-session').resources).toHaveLength(1))
+    expect(resources.snapshot('side-session').resources).toHaveLength(1)
+    expect(resources.snapshot('main-session').resources[0]?.capabilities.preview).toBe(true)
+    expect(resources.snapshot('retired-session').loaded).toBe(false)
+    expect(call.mock.calls.map(([, params]) => params)).toEqual([
+      expect.objectContaining({ sessionKey: 'main-session' }),
+      expect.objectContaining({ sessionKey: 'side-session' }),
+    ])
+    resources.$dispose()
+    rpc.$dispose()
+  })
+
+  it('does not resurrect a cleared session from a delayed post-Hello resource response', async () => {
+    const rpc = useRpcStore()
+    rpc.init()
+    let resolve!: (value: unknown) => void
+    const call = vi.fn(() => new Promise(done => { resolve = done }))
+    const resources = useWorkbenchResourcesStore()
+    resources.setProvider(createRpcWorkbenchResourceProvider({ hasRpcMethod: rpc.hasRpcMethod, call }))
+    await resources.load('departed-session')
+
+    clients[0].emit('_hello', { ...deliveryHello(), features: { methods: ['workbench.resources.list'] } })
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    resources.clearSession('departed-session')
+    resolve({ resources: [], totalCount: 0, pageSize: 500, returnedCount: 0, hasMore: false, nextCursor: null })
+    await nextTick()
+    await nextTick()
+    expect(resources.snapshot('departed-session')).toMatchObject({ loaded: false, available: false, resources: [] })
+    resources.$dispose()
+    rpc.$dispose()
+  })
+
+  it('exposes the reactive browser connection target independently of saved endpoint drift', async () => {
+    const initial = 'ws://localhost:3000/ws'
+    localStorage.setItem('opensquilla.wsUrl', initial)
+    const store = useRpcStore()
+    const endpoint = computed(() => store.getConnectionEndpoint())
+    const access = createV4GatewayAccess(store)
+    const unavailableReason = computed(() => access.supportBundleUnavailableReason)
+    expect(endpoint.value).toBeNull()
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    expect(endpoint.value).toBe(initial)
+    expect(unavailableReason.value).toBeNull()
+    localStorage.setItem('opensquilla.wsUrl', 'ws://other-tab.example/ws')
+    expect(endpoint.value).toBe(initial)
+    expect(unavailableReason.value).toBeNull()
+    await store.connect('ws://remote.example:18791/ws', 'synthetic-token')
+    clients[0].emit('_hello', deliveryHello())
+    expect(endpoint.value).toBe('ws://remote.example:18791/ws')
+    expect(unavailableReason.value).toBe('differentGateway')
+    localStorage.setItem('opensquilla.wsUrl', initial)
+    expect(endpoint.value).toBe('ws://remote.example:18791/ws')
+    expect(unavailableReason.value).toBe('differentGateway')
+    store.disconnect()
+    expect(endpoint.value).toBeNull()
+    expect(unavailableReason.value).toBe('disconnected')
+    store.$dispose()
   })
 
   it('retains proven delivery identity through transport retry but retires blocked or malformed authority', async () => {
@@ -215,6 +305,7 @@ describe('rpc link-token bootstrap', () => {
     expect(createV4GatewayAccess(first).deliveryIdentity).toBeNull()
     expect(createV4GatewayAccess(second).deliveryIdentity).toBeNull()
     waiting[0]!()
+    await vi.waitFor(() => expect(localStorage.getItem('opensquilla.deliverySalt.v1')).not.toBeNull())
     const salt = localStorage.getItem('opensquilla.deliverySalt.v1')
     waiting[1]!()
     expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBe(salt)
@@ -225,22 +316,25 @@ describe('rpc link-token bootstrap', () => {
     second.$dispose()
   })
 
-  it('without Web Locks only reuses an existing shared salt and keeps first-use transport working', async () => {
+  it('creates a stable HTTP identity without Web Locks or SubtleCrypto', async () => {
     vi.stubGlobal('navigator', {})
+    vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) })
     const first = useRpcStore()
     first.init()
     clients[0].emit('_hello', deliveryHello())
     await Promise.resolve()
     expect(connectCalls).toHaveLength(1)
-    expect(createV4GatewayAccess(first).deliveryIdentity).toBeNull()
-    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBeNull()
+    await vi.waitFor(() => expect(createV4GatewayAccess(first).deliveryIdentity).not.toBeNull())
+    const identity = createV4GatewayAccess(first).deliveryIdentity
+    const salt = localStorage.getItem('opensquilla.deliverySalt.v1')
+    expect(salt).toMatch(/^[0-9a-f]{32}$/)
     first.$dispose()
-    localStorage.setItem('opensquilla.deliverySalt.v1', '1'.repeat(32))
     setActivePinia(createPinia())
     const next = useRpcStore()
     next.init()
     clients[1].emit('_hello', deliveryHello())
-    await vi.waitFor(() => expect(createV4GatewayAccess(next).deliveryIdentity).not.toBeNull())
+    await vi.waitFor(() => expect(createV4GatewayAccess(next).deliveryIdentity).toBe(identity))
+    expect(localStorage.getItem('opensquilla.deliverySalt.v1')).toBe(salt)
     next.$dispose()
   })
 
@@ -334,6 +428,39 @@ describe('rpc link-token bootstrap', () => {
     store.$dispose()
   })
 
+  it('revokes proven delivery authority when another tab changes the shared salt', async () => {
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(access.deliveryIdentity).not.toBeNull())
+    const oldSalt = localStorage.getItem('opensquilla.deliverySalt.v1')
+    const newSalt = 'e'.repeat(32)
+    localStorage.setItem('opensquilla.deliverySalt.v1', newSalt)
+    window.dispatchEvent(new StorageEvent('storage', { key: 'opensquilla.deliverySalt.v1', oldValue: oldSalt, newValue: newSalt }))
+    expect(access.deliveryIdentity).toBeNull()
+    expect(store.isConnected).toBe(true)
+    clients[0].emit('_hello', deliveryHello())
+    expect(access.deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
+  it('does not publish delayed hashing after its salt changes, even before a storage event', async () => {
+    let finish!: (value: ArrayBuffer) => void
+    vi.spyOn(crypto.subtle, 'digest').mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    localStorage.setItem('opensquilla.deliverySalt.v1', 'e'.repeat(32))
+    finish(new ArrayBuffer(32))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(access.deliveryIdentity).toBeNull()
+    store.$dispose()
+  })
+
   it('keeps transport startup working without offline authority when hashing is unavailable', async () => {
     const digest = vi.spyOn(crypto.subtle, 'digest').mockRejectedValue(new Error('Synthetic crypto restriction'))
     const store = useRpcStore()
@@ -356,7 +483,7 @@ describe('rpc link-token bootstrap', () => {
     await Promise.resolve()
     expect(connectCalls).toHaveLength(1)
     expect(store.isConnected).toBe(true)
-    expect(write).toHaveBeenCalled()
+    await vi.waitFor(() => expect(write).toHaveBeenCalled())
     expect(createV4GatewayAccess(store).deliveryIdentity).toBeNull()
     store.$dispose()
   })
@@ -583,12 +710,21 @@ describe('rpc link-token bootstrap', () => {
     expect(store.isLocalOwner).toBe(true)
     expect(store.canManageProjectWorkspaces).toBe(true)
     expect(store.canChooseProject).toBe(true)
+    expect(store.canCreateProjectWorkspace).toBe(false)
+
+    clients[0].emit('_hello', {
+      auth: { principal: { isOwner: true } },
+      features: { methods: ['workspaces.list', 'workspaces.open', 'workspaces.create'] },
+    })
+    expect(store.canCreateProjectWorkspace).toBe(true)
 
     clients[0].emit('_state', 'connecting')
     expect(store.auth).toBeNull()
     expect(store.methods).toEqual([])
     expect(store.events).toEqual([])
     expect(store.canManageProjectWorkspaces).toBe(false)
+
+    expect(store.canCreateProjectWorkspace).toBe(false)
 
     clients[0].emit('_state', 'connected')
     clients[0].emit('_hello', {
@@ -629,6 +765,7 @@ describe('rpc link-token bootstrap', () => {
     expect(access.availability).toBe('preparing')
     expect(access.isRuntimeStarting).toBe(true)
     expect(access.isAvailable).toBe(false)
+    expect(store.getConnectionEndpoint()).toBeNull()
 
     publishRef.current?.({
       schemaVersion: 1,
@@ -648,6 +785,7 @@ describe('rpc link-token bootstrap', () => {
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('desktop-instance-token')
     expect(access.isRuntimeStarting).toBe(false)
     expect(localStorage.getItem('opensquilla.wsUrl')).toBeNull()
+    expect(store.getConnectionEndpoint()).toBe('ws://127.0.0.1:18791/ws')
 
     publishRef.current?.({
       schemaVersion: 1,
@@ -666,6 +804,7 @@ describe('rpc link-token bootstrap', () => {
     expect(access.availability).toBe('unavailable')
     expect(access.isRuntimeStarting).toBe(false)
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
+    expect(store.getConnectionEndpoint()).toBeNull()
   })
   it('applies same-address token rotation and never revives an old token for an empty descriptor', async () => {
     let publish!: (payload: unknown) => void
@@ -870,6 +1009,7 @@ describe('rpc link-token bootstrap', () => {
     await access.connect({ endpoint: 'ws://desktop/ws', credential: 'stale-form-token' })
     expect(getConnection).toHaveBeenCalledTimes(2)
     expect(connectCalls[connectCalls.length - 1]).toEqual({ url: next.wsUrl, token: next.authToken })
+    expect(store.getConnectionEndpoint()).toBe(next.wsUrl)
     expect(localStorage.getItem('opensquilla.wsUrl')).toBeNull()
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBe(next.authToken)
     store.$dispose()
@@ -909,6 +1049,7 @@ describe('rpc link-token bootstrap', () => {
     expect(store.error).toBeTruthy()
     expect(store.state).toBe('connected')
     expect(store.isLocalOwner).toBe(true)
+    expect(store.getConnectionEndpoint()).toBe(payload.wsUrl)
     expect(connectCalls).toHaveLength(1)
     expect(clients[0].disconnect).not.toHaveBeenCalled()
     expect(access.deliveryIdentity).not.toBeNull()

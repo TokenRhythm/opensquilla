@@ -15,9 +15,14 @@ from opensquilla.tools.types import PlanAccess, SafeToolError, current_tool_cont
     name="browser",
     description=(
         "Observe and interact with browser pages in this session, including the existing "
-        "right-side preview. Use targetRef to identify the actual page. Snapshots provide "
-        "element refs valid for that page document. Screenshots are supplied as images when "
-        "the current model supports vision. Browser DOM changes do not save source files."
+        "right-side preview. Use targetRef to identify the actual page. "
+        "Prefer the desktop-browser MCP tools for URL pages when available; use this tool "
+        "for workspace artifact previews. "
+        "Opening a new page without a URL creates a blank page; navigating an existing "
+        "targetRef requires a URL. "
+        "Snapshots provide element refs valid for that page document. Screenshots are supplied "
+        "as images when the current model supports vision. "
+        "Browser DOM changes do not save source files."
     ),
     params={
         "type": "object",

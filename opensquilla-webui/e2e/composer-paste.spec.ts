@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { expectComposerValue } from './utils'
 
 const CONTROL_URL = '/control/chat/new'
 
@@ -8,7 +9,7 @@ test('clipboard paste restores send readiness after stale IME composition', asyn
     window.localStorage.setItem('opensquilla-locale', 'en')
   })
   await page.goto(CONTROL_URL)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
 
   const textarea = page.locator('.chat-textarea')
   const sendButton = page.locator('.chat-send-btn[aria-label="Send"]')
@@ -24,6 +25,58 @@ test('clipboard paste restores send readiness after stale IME composition', asyn
   await textarea.dispatchEvent('compositionstart')
   await page.keyboard.press('ControlOrMeta+V')
 
-  await expect(textarea).toHaveValue(pastedText)
+  await expectComposerValue(textarea, pastedText)
   await expect(sendButton).toHaveClass(/is-ready/)
+})
+
+test('long plain-text clipboard paste becomes a pasted-text attachment', async ({ context, page }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
+  await page.goto(CONTROL_URL)
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
+
+  const textarea = page.locator('.chat-textarea')
+  await textarea.focus()
+  const pastedText = `${'line with pasted content\n'.repeat(900)}tail`
+  await page.evaluate(async text => navigator.clipboard.writeText(text), pastedText)
+  await page.keyboard.press('ControlOrMeta+V')
+
+  const chip = page.locator('.attachment-chip')
+  await expect(chip).toHaveCount(1)
+  await expect(chip).toContainText('Pasted text')
+  await expectComposerValue(textarea, '')
+})
+
+test('post-insertion paste fallback attaches text before send', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('opensquilla-locale', 'en')
+  })
+  await page.goto(CONTROL_URL)
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10_000 })
+
+  const textarea = page.locator('.chat-textarea')
+  const instruction = 'Summarize the pasted text: '
+  const pastedText = `${'fallback paste content\n'.repeat(900)}tail`
+  // Seed the post-insertion DOM and caret without routing the large payload
+  // through a normal fill event, then deliver the paste-shaped input event
+  // that the long-paste fallback consumes.
+  await textarea.evaluate((element, payload) => {
+    element.textContent = payload.fullText
+    const setSelectionRange = (element as HTMLElement & {
+      setSelectionRange?: (start: number, end?: number) => void
+    }).setSelectionRange
+    setSelectionRange?.call(element, payload.fullText.length, payload.fullText.length)
+    element.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      inputType: 'insertFromPaste',
+      data: payload.pastedText,
+    }))
+  }, { fullText: `${instruction}${pastedText}`, pastedText })
+
+  const chip = page.locator('.attachment-chip')
+  await expect(chip).toHaveCount(1)
+  await expect(chip).toContainText('Pasted text')
+  await expectComposerValue(textarea, instruction)
 })

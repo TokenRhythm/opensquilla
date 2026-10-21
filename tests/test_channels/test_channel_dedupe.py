@@ -95,8 +95,8 @@ async def test_msteams_enqueue_dedupes_retried_activity_id() -> None:
         metadata={"activity_id": "activity-1"},
     )
 
-    channel.enqueue(msg)
-    channel.enqueue(msg)
+    (await channel.enqueue(msg))
+    (await channel.enqueue(msg))
 
     assert channel._queue.qsize() == 1  # noqa: SLF001
     assert (await channel.receive()).content == "make a deck"

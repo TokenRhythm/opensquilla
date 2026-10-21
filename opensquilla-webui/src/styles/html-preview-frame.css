@@ -1,0 +1,8 @@
+/* An embedded document gets a browser canvas, independent of the app theme.
+   Transparent/default HTML otherwise exposes a dark host behind black text.
+   This underlay does not inject CSS into the document: author backgrounds and
+   explicit document color-scheme continue to paint over it normally. */
+.html-preview-frame {
+  color-scheme: normal;
+  background: Canvas;
+}

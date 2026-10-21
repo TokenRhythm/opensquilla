@@ -225,7 +225,7 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
 
 async function openChat(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 10000 })
   await expect(page.locator('.chat-header')).toBeVisible({ timeout: 10000 })
 }
 
@@ -354,11 +354,12 @@ test.describe('Vue behavior contracts', () => {
         task_id: 'task-e2e-running',
         stream_seq: 1,
         tool_use_id: 'tool-e2e-clarify',
-        name: 'meta-step:project_clarify',
+        name: 'request_user_input',
         result: 'paused: awaiting user input',
         arguments: {
           kind: 'user_input',
           paused: true,
+          request_id: 'request-e2e',
           run_id: 'run-e2e',
           step: 'project_clarify',
           clarify_schema: {

@@ -94,20 +94,20 @@ function panel() {
 async function mountPanel(panelValue = panel()) {
   const resetCapability = vi.fn()
   const updateField = vi.fn()
-  const useImageRecommendation = vi.fn()
+  const imageProviderChange = vi.fn()
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(SetupCapabilitiesPanel, {
     panel: panelValue,
     onResetCapability: resetCapability,
     onUpdateField: updateField,
-    onUseImageRecommendation: useImageRecommendation,
+    onImageProviderChange: imageProviderChange,
   })
   app.use(i18n)
   app.mount(el)
   mounted.push(app)
   await nextTick()
-  return { el, resetCapability, updateField, useImageRecommendation }
+  return { el, resetCapability, updateField, imageProviderChange }
 }
 
 afterEach(() => {
@@ -303,7 +303,7 @@ describe('SetupCapabilitiesPanel', () => {
     expect(updateField).toHaveBeenCalledWith('image', 'enabled', false)
   })
 
-  it('renders a catalog-backed image recommendation without selecting it', async () => {
+  it('keeps the recommended provider selectable without a recommendation card', async () => {
     i18n.global.locale.value = 'en'
     const recommended = panel()
     recommended.form.imageProvider = ''
@@ -319,25 +319,22 @@ describe('SetupCapabilitiesPanel', () => {
       actionRequired: true,
       registrationUrl: 'https://tokenrhythm.studio/register',
     }
-    const { el, useImageRecommendation } = await mountPanel(recommended)
+    const { el, imageProviderChange } = await mountPanel(recommended)
 
     const select = el.querySelector<HTMLSelectElement>('[name="setup_image_provider"]')
     const card = el.querySelector<HTMLElement>('[data-testid="image-provider-recommendation"]')
     const groups = Array.from(select?.querySelectorAll('optgroup') || [])
-    const useButton = Array.from(card?.querySelectorAll<HTMLButtonElement>('button') || [])
-      .find(button => button.textContent?.includes('Use TokenRhythm Images'))
-    const registration = card?.querySelector<HTMLAnchorElement>('a')
 
     expect(select?.value).toBe('')
     expect(groups.map(group => group.label)).toEqual(['Recommended', 'Other providers'])
-    expect(card?.getAttribute('role')).toBe('note')
-    expect(card?.textContent).toContain('Recommended: TokenRhythm Images')
-    expect(registration?.getAttribute('target')).toBe('_blank')
-    expect(registration?.getAttribute('rel')).toBe('noopener noreferrer')
-    expect(registration?.getAttribute('aria-label')).toContain('opens in a new tab')
+    expect(groups[0]?.textContent).toContain('TokenRhythm Images')
+    expect(card).toBeNull()
+    expect(el.querySelector('a[href="https://tokenrhythm.studio/register"]')).toBeNull()
+    expect(imageProviderChange).not.toHaveBeenCalled()
 
-    useButton!.click()
-    expect(useImageRecommendation).toHaveBeenCalledWith('tokenrhythm')
+    select!.value = 'tokenrhythm'
+    select!.dispatchEvent(new Event('change'))
+    expect(imageProviderChange).toHaveBeenCalledWith('tokenrhythm')
   })
 
   it('keeps a non-actionable recommendation in the picker without showing a setup card', async () => {
@@ -365,7 +362,7 @@ describe('SetupCapabilitiesPanel', () => {
     expect(el.querySelector('[data-testid="image-provider-recommendation"]')).toBeNull()
   })
 
-  it('does not ask for registration when the recommended provider can reuse the LLM key', async () => {
+  it('omits the recommendation card when the recommended provider can reuse the LLM key', async () => {
     i18n.global.locale.value = 'en'
     const recommended = panel()
     recommended.form.imageProvider = ''
@@ -383,8 +380,8 @@ describe('SetupCapabilitiesPanel', () => {
     const { el } = await mountPanel(recommended)
 
     const card = el.querySelector<HTMLElement>('[data-testid="image-provider-recommendation"]')
-    expect(card).not.toBeNull()
-    expect(card?.querySelector('a')).toBeNull()
+    expect(card).toBeNull()
+    expect(el.querySelector('a[href="https://tokenrhythm.studio/register"]')).toBeNull()
   })
 
   it('shows a reusable model-provider credential without duplicating the key field', async () => {

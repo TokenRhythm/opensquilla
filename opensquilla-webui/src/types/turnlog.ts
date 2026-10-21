@@ -1,5 +1,5 @@
 import type { ArtifactPayload } from '@/types/artifacts'
-import type { ToolPresentation } from '@/types/chat'
+import type { ToolFileSnapshot, ToolPresentation } from '@/types/chat'
 import type {
   InterruptApprovalData,
   InterruptClarifyData,
@@ -40,6 +40,7 @@ type FrameBody =
       name: string
       result: string
       executionLogHandle?: string
+      fileSnapshot?: ToolFileSnapshot
       isError: boolean
       input: string
       at: number
@@ -96,6 +97,9 @@ type FrameBody =
       // moves to a new phase so the finished turn can show what the agent was
       // doing; the fold accumulates these into a per-turn activity history.
       kind: 'status'
+      providerRecovery?: import('./parts').ProviderRecovery
+      httpStatus?: number
+      failureKind?: string
       seq: number
       action: string   // stable phase key (streamActivity.key)
       label: string    // human label (streamActivity.label)

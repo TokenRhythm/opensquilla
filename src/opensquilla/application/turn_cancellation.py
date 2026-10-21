@@ -58,7 +58,7 @@ class CancellationPrimitives(Protocol):
 
     async def cancel_processes(self, key: str) -> int: ...
 
-    def reject_approvals(self, key: str) -> int: ...
+    async def reject_approvals(self, key: str) -> int: ...
 
     async def drain(self, key: str, task_ids: tuple[str, ...], deadline: float) -> None: ...
 
@@ -245,6 +245,7 @@ class TurnCancellation:
         requested_tasks: set[str] = set()
         cancelled_sessions: set[str] = set()
         cancelled_tasks = cancelled_groups = approvals = 0
+        cancellation_unknown = False
         # Re-scan after drains: an in-flight child may have committed another spawn.
         for pass_index in range(self._timing.tree_passes):
             if pass_index > 0 and self._clock() >= deadline:
@@ -296,11 +297,14 @@ class TurnCancellation:
                     ports.cancel_runtime(candidate, None, source),
                     deadline,
                     "cancel_runtime_tasks",
-                    0,
+                    None,
                 )
+                if count is None:
+                    cancellation_unknown = True
+                    count = 0
                 cancelled_tasks += count
                 cancelled_this_pass += count
-                approvals += ports.reject_approvals(candidate)
+                approvals += await ports.reject_approvals(candidate)
                 if count > 0:
                     requested_tasks.update(new_tasks)
                     cancelled_sessions.add(candidate)
@@ -323,10 +327,13 @@ class TurnCancellation:
                 "broadcast_abort_terminal",
                 None,
             )
-        return {
+        result: CancelTurnResult = {
             "aborted": aborted,
             "key": key,
             "cancelled_tasks": cancelled_tasks,
             "cancelled_sessions": len(cancelled_sessions),
             "cancelled_compactions": compaction_count,
         }
+        if cancellation_unknown:
+            result["reason"] = "task_cancel_unknown"
+        return result

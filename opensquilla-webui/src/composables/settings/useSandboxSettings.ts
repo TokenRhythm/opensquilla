@@ -105,11 +105,18 @@ export function useSandboxSettings() {
     runtimes: '',
   })
   let saveQueue: Promise<void> = Promise.resolve()
+  const pendingSaveCount = ref(0)
+  const preparingToLeave = ref(false)
+  let leavePreparation: Promise<boolean> | null = null
+  let saveFailureVersion = 0
   let defaultRunModeSequence = 0
   const sectionSaveTimers: Partial<Record<SandboxPolicySection, ReturnType<typeof setTimeout>>> = {}
   let disposed = false
   let capabilityRequestGeneration = 0
   let runtimeStatusRequestGeneration = 0
+  let runtimeStatusWork: Promise<SandboxRuntimePackStatus | null> | null = null
+  let runtimeStatusController: AbortController | null = null
+  let runtimeStatusReloadNeeded = false
   let runtimeViewActive = false
   let runtimePollTimer: ReturnType<typeof setTimeout> | null = null
   let sandboxStartupPollTimer: ReturnType<typeof setTimeout> | null = null
@@ -119,10 +126,11 @@ export function useSandboxSettings() {
   const canRequestSandboxSetup = computed(() => {
     const state = sandboxSetupStatus.value?.state
     const isWindows = sandboxSetupStatus.value?.platform === 'win32'
-    // Windows startup is intentionally passive. A marker can therefore look
-    // ready while its offline-account password is stale; an explicit Safe
-    // selection must be allowed to revalidate/repair it. Failed setup is also
-    // retryable, while an active or permanently unavailable setup is not.
+    // Windows startup is intentionally passive. Keep the explicit repair path
+    // available for a ready marker that needs revalidation, while ordinary
+    // Safe selection can persist an authoritative ready status without opening
+    // administrator setup. Failed setup is also retryable, while an active or
+    // permanently unavailable setup is not.
     return Boolean(
       platform.capabilities.isDesktop
       && capability.value?.setupSupported !== false
@@ -134,6 +142,13 @@ export function useSandboxSettings() {
     if (!baseline.value || !draft.value) return false
     return JSON.stringify(baseline.value[section]) !== JSON.stringify(draft.value[section])
   }
+
+  const hasUnsettledChanges = computed(() => (
+    pendingSaveCount.value > 0
+    || preparingToLeave.value
+    || defaultRunMode.value !== defaultRunModeBaseline.value
+    || (['files', 'commands', 'network', 'runtimes'] as const).some(sectionDirty)
+  ))
 
   async function load(): Promise<void> {
     loading.value = true
@@ -212,7 +227,6 @@ export function useSandboxSettings() {
     const report = await loadCapability()
     if (disposed) return
     const status = sandboxSetupStatus.value
-    if (status && status.state !== 'ready') capability.value = null
     if (status !== null) sandboxStartupPending = status.state === 'setting_up'
     else if (report !== null) sandboxStartupPending = report.code === 'setting_up'
     // These reads only follow an initialization already in progress. Failed or
@@ -245,6 +259,8 @@ export function useSandboxSettings() {
     disposed = true
     capabilityRequestGeneration += 1
     runtimeStatusRequestGeneration += 1
+    runtimeStatusReloadNeeded = false
+    runtimeStatusController?.abort()
     if (runtimePollTimer) clearTimeout(runtimePollTimer)
     if (sandboxStartupPollTimer) clearTimeout(sandboxStartupPollTimer)
     for (const timer of Object.values(sectionSaveTimers)) {
@@ -277,28 +293,48 @@ export function useSandboxSettings() {
   async function loadRuntimeStatus(): Promise<SandboxRuntimePackStatus | null> {
     if (disposed || runtimeStatusSupported.value === false) return null
     clearRuntimePoll()
-    const requestGeneration = ++runtimeStatusRequestGeneration
-    runtimeStatusLoading.value = true
-    runtimeStatusError.value = ''
+    if (runtimeStatusWork) {
+      // Re-entry waits for the retired observation instead of overlapping it.
+      if (runtimeStatusController?.signal.aborted) runtimeStatusReloadNeeded = true
+      return runtimeStatusWork
+    }
+    const work = (async () => {
+      let result: SandboxRuntimePackStatus | null = null
+      do {
+        runtimeStatusReloadNeeded = false
+        const requestGeneration = runtimeStatusRequestGeneration
+        const controller = new AbortController()
+        runtimeStatusController = controller
+        runtimeStatusLoading.value = true
+        runtimeStatusError.value = ''
+        try {
+          const status = await sandbox.runtimeStatus({ signal: controller.signal })
+          if (disposed || controller.signal.aborted
+            || requestGeneration !== runtimeStatusRequestGeneration) continue
+          runtimeStatus.value = status
+          runtimeStatusSupported.value = status !== null
+          result = status
+        } catch (error) {
+          if (!disposed && !controller.signal.aborted
+            && requestGeneration === runtimeStatusRequestGeneration) {
+            runtimeStatusError.value = errorMessage(error)
+          }
+        }
+      } while (!disposed && runtimeStatusReloadNeeded && runtimeStatusSupported.value !== false)
+      return result
+    })()
+    runtimeStatusWork = work
     try {
-      const status = await sandbox.runtimeStatus()
-      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
-      if (!status) {
-        runtimeStatus.value = null
-        runtimeStatusSupported.value = false
-        return null
-      }
-      runtimeStatus.value = status
-      runtimeStatusSupported.value = true
-      return status
-    } catch (error) {
-      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
-      runtimeStatusError.value = errorMessage(error)
-      return null
+      return await work
     } finally {
-      if (!disposed && requestGeneration === runtimeStatusRequestGeneration) {
-        runtimeStatusLoading.value = false
-        scheduleRuntimePoll()
+      if (runtimeStatusWork === work) {
+        runtimeStatusWork = null
+        runtimeStatusController = null
+        if (!disposed) {
+          runtimeStatusLoading.value = false
+          if (runtimeStatusReloadNeeded) void loadRuntimeStatus()
+          else scheduleRuntimePoll()
+        }
       }
     }
   }
@@ -307,6 +343,12 @@ export function useSandboxSettings() {
     runtimeViewActive = active
     clearRuntimePoll()
     if (active) void loadRuntimeStatus()
+    else {
+      runtimeStatusRequestGeneration += 1
+      runtimeStatusReloadNeeded = false
+      runtimeStatusController?.abort()
+      runtimeStatusLoading.value = false
+    }
   }
 
   function applyRuntimeOperation(operation: SandboxRuntimeOperation): boolean {
@@ -342,20 +384,23 @@ export function useSandboxSettings() {
         return false
       }
       const receipt = await action()
+      if (disposed) return true
       clearRuntimePoll()
       runtimeStatusRequestGeneration += 1
+      runtimeStatusController?.abort()
+      runtimeStatusReloadNeeded = Boolean(runtimeStatusWork && runtimeViewActive)
       runtimeStatusLoading.value = false
       if (receipt.kind === 'status') {
         runtimeStatus.value = receipt.status
         runtimeStatusSupported.value = true
-      } else if (!applyRuntimeOperation(receipt.operation)) {
+      } else if (!applyRuntimeOperation(receipt.operation) && runtimeViewActive) {
         await loadRuntimeStatus()
       }
-      scheduleRuntimePoll()
+      if (!runtimeStatusWork) scheduleRuntimePoll()
       return true
     } catch (error) {
       runtimeActionError[componentId] = errorMessage(error)
-      if (actionKind === 'discard') void loadRuntimeStatus()
+      if (actionKind === 'discard' && runtimeViewActive) void loadRuntimeStatus()
       return false
     } finally {
       runtimeActionPending[componentId] = false
@@ -427,7 +472,14 @@ export function useSandboxSettings() {
   }
 
   function queueSave<T>(operation: () => Promise<T>): Promise<T> {
-    const queued = saveQueue.then(operation)
+    pendingSaveCount.value += 1
+    const queued = saveQueue.then(operation).then(result => {
+      if (result === false) saveFailureVersion += 1
+      return result
+    }, error => {
+      saveFailureVersion += 1
+      throw error
+    }).finally(() => { pendingSaveCount.value -= 1 })
     saveQueue = queued.then(() => undefined, () => undefined)
     return queued
   }
@@ -455,7 +507,7 @@ export function useSandboxSettings() {
       } catch (error) {
         if (sequence === defaultRunModeSequence) {
           defaultRunModeError.value = errorMessage(error)
-          defaultRunMode.value = defaultRunModeBaseline.value
+          if (!preparingToLeave.value) defaultRunMode.value = defaultRunModeBaseline.value
           reportSaveFailure()
         }
         return false
@@ -528,11 +580,11 @@ export function useSandboxSettings() {
               Object.assign(draft.value, { [other]: currentDraft[other] })
             }
           }
-          if (sectionChangedWhileSaving) {
+          if (sectionChangedWhileSaving || preparingToLeave.value) {
             Object.assign(draft.value, { [section]: currentDraft[section] })
           }
         }
-      } else if (!sectionChangedWhileSaving && baseline.value && draft.value) {
+      } else if (!preparingToLeave.value && !sectionChangedWhileSaving && baseline.value && draft.value) {
         Object.assign(draft.value, {
           [section]: JSON.parse(JSON.stringify(baseline.value[section])),
         })
@@ -576,6 +628,38 @@ export function useSandboxSettings() {
     sectionError[section] = ''
   }
 
+  function prepareToLeave(): Promise<boolean> {
+    if (leavePreparation) return leavePreparation
+    preparingToLeave.value = true
+    const failureVersion = saveFailureVersion
+    const sections = ['files', 'commands', 'network', 'runtimes'] as const
+    const work = (async () => {
+      while (true) {
+        for (const section of sections) clearSectionSaveTimer(section)
+        const observedQueue = saveQueue
+        await observedQueue
+        // An edit made while awaiting a save can arm another debounce timer.
+        for (const section of sections) clearSectionSaveTimer(section)
+        if (saveFailureVersion !== failureVersion) return false
+        // A successful save can append another save for newer edits.
+        if (saveQueue !== observedQueue) continue
+        if (defaultRunMode.value !== defaultRunModeBaseline.value) {
+          await setDefaultRunMode(defaultRunMode.value)
+        }
+        for (const section of sections) {
+          if (sectionDirty(section)) await flushSectionSave(section)
+        }
+        if (saveQueue === observedQueue) return true
+      }
+    })()
+    const tracked = work.finally(() => {
+      preparingToLeave.value = false
+      if (leavePreparation === tracked) leavePreparation = null
+    })
+    leavePreparation = tracked
+    return tracked
+  }
+
   return {
     loading,
     capabilityLoading,
@@ -605,6 +689,8 @@ export function useSandboxSettings() {
     sectionPending,
     sectionError,
     sectionDirty,
+    hasUnsettledChanges,
+    prepareToLeave,
     load,
     loadRuntimeStatus,
     setRuntimeViewActive,

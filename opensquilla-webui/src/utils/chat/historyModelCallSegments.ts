@@ -30,6 +30,7 @@ function syntheticAssistantSegment(
   text: string,
   segmentKey: string,
   projectRouter = false,
+  contentSlice?: ChatMessage['contentSlice'],
 ): ChatMessage {
   const routerUsage = projectRouter ? source.usage || source.turn_usage : undefined
   const routerModelCallId = String(
@@ -45,6 +46,12 @@ function syntheticAssistantSegment(
     clientId: `history-model-call-segment:${source.messageId || source.clientId || 'assistant'}:${segmentKey}`,
     turnId: source.turnId,
     restoredFromHistory: true,
+    ...(source.contentRef ? { contentRef: { ...source.contentRef } } : {}),
+    previewComplete: source.previewComplete,
+    contentRevision: source.contentRevision,
+    contentAvailability: source.contentAvailability,
+    contentUnavailableReason: source.contentUnavailableReason,
+    ...(contentSlice ? { contentSlice } : {}),
     ...(routerUsage ? { routerUsage } : {}),
     ...(routerModelCallId ? { routerModelCallId } : {}),
     ...(routerIteration ? { routerIteration } : {}),
@@ -54,20 +61,24 @@ function syntheticAssistantSegment(
 function interleaveAssistantAt(
   messages: ChatMessage[],
   assistantIndex: number,
+  completeText?: string,
 ): ChatMessage[] | null {
   const assistant = messages[assistantIndex]
   if (
     !assistant
     || assistant.role !== 'assistant'
     || !assistant.turnId
-    || !assistant.text
+    || assistant.contentSlice
+    || (!assistant.text && completeText === undefined)
   ) {
     return null
   }
+  const rawSegments = usageSegments(assistant.usage || assistant.turn_usage)
+  if (!rawSegments.length) return null
   const codepoints = Array.from(assistant.text)
   const segments = normalizeModelCallSegments(
-    usageSegments(assistant.usage || assistant.turn_usage),
-    codepoints.length,
+    rawSegments,
+    completeText === undefined ? codepoints.length : Array.from(completeText).length,
   )
   if (segments.length === 0) return null
 
@@ -109,6 +120,7 @@ function interleaveAssistantAt(
         codepoints.slice(0, firstStart).join(''),
         `prefix-${firstStart}`,
         true,
+        { startCodepoint: 0, endCodepoint: firstStart },
       ),
     )
   }
@@ -121,13 +133,29 @@ function interleaveAssistantAt(
       .join('')
     const isLast = segmentIndex === segments.length - 1
     if (isLast) {
-      replacement.push({ ...assistant, text })
-    } else if (text) {
+      replacement.push({
+        ...assistant,
+        text,
+        ...(assistant.contentRef
+          ? {
+              contentSlice: {
+                startCodepoint: segment.startCodepoint,
+                endCodepoint: segment.endCodepoint,
+              },
+            }
+          : {}),
+      })
+    } else if (segment.endCodepoint > segment.startCodepoint) {
       replacement.push(
         syntheticAssistantSegment(
           assistant,
           text,
           `${segment.modelCallId}-${segment.startCodepoint}-${segment.endCodepoint}`,
+          false,
+          {
+            startCodepoint: segment.startCodepoint,
+            endCodepoint: segment.endCodepoint,
+          },
         ),
       )
     }
@@ -147,14 +175,58 @@ function interleaveAssistantAt(
 export function interleaveHistoryModelCallSegments(
   messages: ChatMessage[],
 ): ChatMessage[] {
-  let result = messages
+  let result = discardSupersededHistorySegments(messages)
   for (let index = 0; index < result.length; index++) {
     const transformed = interleaveAssistantAt(result, index)
     if (!transformed) continue
     result = transformed
-    // The canonical assistant row has moved to the end of the replacement.
-    // Rescanning it is harmless (its shortened text fails range validation),
-    // and lets later turns in the same page be transformed as well.
+    // The canonical assistant row has moved to the end of the replacement;
+    // its contentSlice prevents splitting that row again.
   }
   return result
+}
+
+type HydratedHistoryMessage = Pick<ChatMessage, 'messageId' | 'contentRef' | 'contentRevision'>
+
+function contentIdentity(message: HydratedHistoryMessage): string {
+  const ref = message.contentRef
+  return JSON.stringify([message.contentRevision, ref?.version,
+    ref?.sessionKey, ref?.sessionId, ref?.messageId, ref?.source, ref?.view,
+    ref?.revision, ref?.byteLength, ref?.sha256])
+}
+
+function contentOwner(message: HydratedHistoryMessage): string {
+  const ref = message.contentRef
+  return JSON.stringify([ref?.sessionKey, ref?.sessionId, ref?.messageId])
+}
+
+function discardSupersededHistorySegments(messages: ChatMessage[]): ChatMessage[] {
+  // Synthetic slices have no independent durable identity. A newly returned
+  // aggregate supersedes them even if its new revision cannot be split yet.
+  const aggregateOwners = new Set(messages.filter(message => message.role === 'assistant'
+    && !message.contentSlice && message.contentRef).map(message => JSON.stringify([message.turnId, contentOwner(message)])))
+  const current = messages.filter(message => !(message.clientId?.startsWith('history-model-call-segment:')
+    && message.contentRef && aggregateOwners.has(JSON.stringify([message.turnId, contentOwner(message)]))))
+  return current.length === messages.length ? messages : current
+}
+
+/** Validate against the full body, but retain only the existing bounded preview. */
+export function interleaveHydratedHistoryModelCallSegments(
+  messages: ChatMessage[],
+  source: HydratedHistoryMessage,
+  text: string,
+): ChatMessage[] {
+  if (!source.contentRef || source.contentRef.view !== 'display') return messages
+  const identity = contentIdentity(source)
+  const index = messages.findIndex(message => message.role === 'assistant'
+    && message.messageId === source.messageId
+    && !message.contentSlice && message.previewComplete !== true
+    && !message.planRevisions?.length
+    && message.turnRunKind !== 'plan_implementation'
+    && message.provenanceKind !== 'plan_implementation'
+    && contentIdentity(message) === identity)
+  const assistant = messages[index]
+  if (!assistant || !text.startsWith(assistant.text)) return messages
+  const aggregate = discardSupersededHistorySegments(messages)
+  return interleaveAssistantAt(aggregate, aggregate.indexOf(assistant), text) ?? messages
 }

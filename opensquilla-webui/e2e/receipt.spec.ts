@@ -6,7 +6,7 @@ const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 test.describe('Assistant receipt meta', () => {
   test('draft chat renders no receipt meta or usage popover', async ({ page }) => {
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await expect(page.locator('.msg-ai-meta')).toHaveCount(0)
     await expect(page.locator('.msg-meta-popover')).toHaveCount(0)
@@ -17,7 +17,7 @@ test.describe('Assistant receipt meta', () => {
     test.setTimeout(240000)
 
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 
     await page.locator('.chat-textarea').fill('Reply with the single word ok.')
     await page.locator('.chat-send-btn[aria-label="Send"]').click()

@@ -108,7 +108,7 @@ import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ImageCopyActions from '@/components/ImageCopyActions.vue'
-import { useArtifactImageLightbox, type ImageLightboxItem } from '@/composables/chat/useArtifactImageLightbox'
+import { useArtifactImageLightbox, attachmentImagePreviewKey, type ImageLightboxItem } from '@/composables/chat/useArtifactImageLightbox'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useToasts } from '@/composables/useToasts'
@@ -209,6 +209,10 @@ function loadFull(image: ImageLightboxItem, sessionKey: string) {
     fullSize: true,
     ...(image.kind === 'attachment' ? {
       loadBlob: async (signal: AbortSignal) => {
+        const source = controller.request.value?.attachmentPreview
+        const retained = source?.key === attachmentImagePreviewKey(image.attachment, sessionKey)
+          ? source.readBlob() : null
+        if (retained) return retained
         const result = await artifactWorkbench.content.fetchAttachment(image.attachment, {
           sessionKey,
           signal,

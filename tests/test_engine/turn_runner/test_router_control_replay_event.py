@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,6 +24,7 @@ from opensquilla.provider import (
 )
 from opensquilla.provider import ToolUseEndEvent as ProviderToolEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolStart
+from opensquilla.provider.selector import ProviderConfig
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools import get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext
@@ -77,10 +77,10 @@ class _ReplayProvider:
 class _SelectorClone:
     def __init__(self, provider: _ReplayProvider) -> None:
         self.provider = provider
-        self.current_config = SimpleNamespace(model=provider.model)
+        self.current_config = ProviderConfig(provider="openrouter", model=provider.model)
 
     def override_model(self, model: str) -> None:
-        self.current_config = SimpleNamespace(model=model)
+        self.current_config = replace(self.current_config, model=model)
         self.provider.model = model
 
     def resolve(self) -> _ReplayProvider:
@@ -113,6 +113,7 @@ async def test_router_control_replay_event_replays_turn_once(monkeypatch) -> Non
         tool_registry=get_default_registry(),
         config=cfg,
     )
+    initial_deployments: list[str] = []
 
     events = [
         event
@@ -122,6 +123,9 @@ async def test_router_control_replay_event_replays_turn_once(monkeypatch) -> Non
             tool_context=ToolContext(is_owner=True, caller_kind=CallerKind.CLI),
             history_has_persisted_user=False,
             no_memory_capture=True,
+            on_initial_provider_ready=lambda deployment: initial_deployments.append(
+                deployment.model
+            ),
         )
     ]
 
@@ -133,7 +137,8 @@ async def test_router_control_replay_event_replays_turn_once(monkeypatch) -> Non
     assert replay_events[0].target_tier == "c3"
     # Initial turn routes to c1 (the strategy returns c1); the router_control
     # hold replays it at c3. Models follow the default tier profile.
-    assert provider.calls == ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3"]
+    assert provider.calls == ["deepseek/deepseek-v4.1-flash-1017", "moonshotai/kimi-k3"]
+    assert initial_deployments == [provider.calls[0]]
     assert done_events[-1].text == "new final"
     assert text.endswith("new final")
 
@@ -318,15 +323,15 @@ async def test_router_control_replay_persists_distinct_usage_executions(
     # Guard the premise: the replay really ran, at two different models.
     assert len([e for e in events if isinstance(e, RouterControlReplayEvent)]) == 1
     assert not any(isinstance(e, ErrorEvent) for e in events)
-    assert provider.calls == ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3"]
+    assert provider.calls == ["deepseek/deepseek-v4.1-flash-1017", "moonshotai/kimi-k3"]
 
     # Both provider legs are real spend and must survive the ledger's identity
     # guards as separate finalized rows under one logical turn.
     assert len(rows) == 2
     assert {row.status for row in rows} == {"finalized"}
     rows_by_model = {row.model: row for row in rows}
-    first = rows_by_model["deepseek/deepseek-v4-flash-0731"]
-    second = rows_by_model["z-ai/glm-5.3"]
+    first = rows_by_model["deepseek/deepseek-v4.1-flash-1017"]
+    second = rows_by_model["moonshotai/kimi-k3"]
     assert first.turn_id is not None
     assert second.turn_id == first.turn_id
     assert first.execution_id == first.turn_id

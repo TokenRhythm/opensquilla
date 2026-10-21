@@ -26,6 +26,7 @@ LEGACY_PYTHON = (
     ROOT / ".venv-contract-legacy" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 )
 LEGACY_TYPESCRIPT_PACKAGE = ROOT / "opensquilla-webui/node_modules/json-schema-to-typescript-legacy"
+PYTHON_GENERATOR_VERSION = "0.81.0"
 
 
 @dataclass(frozen=True)
@@ -143,8 +144,10 @@ def render() -> Rendered:
         ],
         env=env,
     ).strip()
-    if version != "0.75.1":
-        raise RuntimeError(f"Frozen Python generator must be 0.75.1; got {version}")
+    if version != PYTHON_GENERATOR_VERSION:
+        raise RuntimeError(
+            f"Frozen Python generator must be {PYTHON_GENERATOR_VERSION}; got {version}"
+        )
     package = json.loads((LEGACY_TYPESCRIPT_PACKAGE / "package.json").read_text(encoding="utf-8"))
     if package.get("name") != "json-schema-to-typescript" or package.get("version") != "15.0.4":
         raise RuntimeError("Frozen TypeScript generator must be json-schema-to-typescript 15.0.4")

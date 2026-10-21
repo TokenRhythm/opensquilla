@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import structlog
@@ -22,7 +23,12 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
-from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+)
 from .protocol import ProviderModelListingResponseError
 from .request_proof import (
     ProviderRequestBudgetExceededError,
@@ -66,7 +72,7 @@ def _build_ollama_tool(tool: ToolDefinition) -> dict[str, Any]:
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema.model_dump(exclude_none=True),
+            "parameters": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
         },
     }
 
@@ -422,6 +428,7 @@ class OllamaProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            http_status=safe_http_status(response.status_code),
                             retry_after_s=retry_after_from_headers(
                                 response.status_code, getattr(response, "headers", None)
                             ),
@@ -587,10 +594,12 @@ class OllamaProvider:
                                 yield ErrorEvent(message=message, code="incomplete_tool_call")
                                 return
                             key = tools_acc.next_int_key()
+                            # The accumulator key restarts per response, but downstream
+                            # operation receipts require a distinct ID for each new call.
                             tool_use_id = (
                                 raw_tool_id
                                 if isinstance(raw_tool_id, str)
-                                else f"call_{key}"
+                                else f"call_{uuid4().hex}"
                             )
                             tool_name = fn.get("name", "")
                             arguments = fn.get("arguments", {})

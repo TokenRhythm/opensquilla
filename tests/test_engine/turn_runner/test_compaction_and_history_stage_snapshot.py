@@ -7,10 +7,10 @@ BEFORE-turn helpers the slice owns (``_maybe_preflight_compact``, ``_load_histor
 patch helpers from the agent-bootstrap snapshot harness so the slice
 runs against deterministic stubs.
 
-It then probes ``_build_attachment_messages`` (the line immediately
-after the slice in ``_run_turn``) to capture the post-slice locals and
-raise a sentinel ``BaseException`` that halts the generator without
-touching downstream stages. The raising-stub cases (#12 raising
+It probes ``Agent.run_turn`` after the slice installs its context and
+raises a sentinel ``BaseException`` before provider execution. The
+snapshot pins the merged model-visible context, not its storage field.
+The raising-stub cases (#12 raising
 CompactionHook, #13 raising HistoryLoader) exercise the hook-isolation
 contract and the exception-propagation contract.
 """
@@ -19,14 +19,15 @@ from __future__ import annotations
 
 import base64
 import json
-import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
+from opensquilla.engine import Agent
 from opensquilla.engine.hooks.types import CompactionState
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.turn_runner import (
@@ -36,6 +37,7 @@ from opensquilla.engine.turn_runner import (
 from opensquilla.engine.turn_runner.outcome import StageOutcome
 from opensquilla.engine.types import ErrorEvent
 from opensquilla.provider import Message
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.types import ContentBlockImage
 
 # Reuse upstream patch helpers from's equivalence harness — this
@@ -66,32 +68,6 @@ from .test_agent_bootstrap_stage_snapshot import (
 class _SliceCapture(BaseException):
     def __init__(self, snapshot: dict[str, Any]) -> None:
         self.snapshot = snapshot
-
-
-def _capture_locals_at_post_slice() -> dict[str, Any]:
-    """Read ``_run_turn``'s locals at the boundary right after the slice.
-
-    The probe is hooked onto ``_build_attachment_messages`` (the very
-    next call site after the compaction-and-history slice). At entry,
-    the caller's frame contains every local the compaction/history boundary
-    must populate.
-    """
-
-    frame = sys._getframe(2)
-    while frame is not None:
-        if "agent" in frame.f_locals and "agent_config" in frame.f_locals:
-            break
-        frame = frame.f_back
-    assert frame is not None, "could not locate _run_turn frame"
-    locs = frame.f_locals
-
-    agent = locs.get("agent")
-    return {
-        "outcome": "success",
-        "agent_request_context_prompt_after": getattr(
-            getattr(agent, "config", None), "request_context_prompt", None
-        ),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +139,7 @@ def _patch_load_history(runner, *, return_value=None, raises=None, calls=None):
     runner._load_history = _load.__get__(runner, TurnRunner)
 
 
-def _patch_post_slice_probe(runner):
+def _patch_post_slice_probe(runner, configs):
     """Stop at Agent.run_turn, after compaction/history output is installed."""
 
     factory = runner._agent_bootstrap_stage._agent_factory
@@ -178,13 +154,11 @@ def _patch_post_slice_probe(runner):
                 *_args: Any,
                 **_kwargs: Any,
             ):
+                configs.append(probe_agent.config)
+                message = probe_agent._current_request_context_message()
                 snapshot = {
                     "outcome": "success",
-                    "agent_request_context_prompt_after": getattr(
-                        getattr(probe_agent, "config", None),
-                        "request_context_prompt",
-                        None,
-                    ),
+                    "agent_request_context_message_after": message.content if message else None,
                 }
                 raise _SliceCapture(snapshot)
                 yield  # pragma: no cover
@@ -251,6 +225,12 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
         history_return="[Context Summary] body",
         expected_final_request_context="[Context Summary] body",
     ),
+    _case(
+        "summary_and_dynamic_context",
+        history_return="SUMMARY-X",
+        request_context_in="DYNAMIC-MARKER",
+        expected_final_request_context="SUMMARY-X\n\nDYNAMIC-MARKER",
+    ),
     _case("trim_last_user_true", history_has_persisted_user=True),
     _case("trim_last_user_false", history_has_persisted_user=False),
     _case("compaction_hook_registered", hook=_RecordingCompactionHook()),
@@ -315,7 +295,7 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
     _patch_memory_helpers(runner)
     _patch_observability(runner)
 
-    call_log: dict[str, list] = {"preflight": [], "history": []}
+    call_log: dict[str, list] = {"preflight": [], "history": [], "agent_configs": []}
     _patch_preflight(
         runner,
         raises=case["preflight_raises"],
@@ -327,7 +307,7 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
         raises=case["history_raises"],
         calls=call_log["history"],
     )
-    _patch_post_slice_probe(runner)
+    _patch_post_slice_probe(runner, call_log["agent_configs"])
 
     hook = case["hook"]
     if hook is not None:
@@ -415,11 +395,12 @@ async def test_compaction_and_history_stage_snapshot(
     assert raised is None, f"{case_id} raised: {raised}"
     assert captured is not None, f"{case_id} captured nothing"
 
+    expected_message = Agent._request_context_message(case["expected_final_request_context"])
     expected_snapshot = {
         "outcome": "success",
-        "agent_request_context_prompt_after": case[
-            "expected_final_request_context"
-        ],
+        "agent_request_context_message_after": (
+            expected_message.content if expected_message else None
+        ),
     }
     assert captured == expected_snapshot, (
         f"case={case_id}: snapshot diverged.\n"
@@ -434,6 +415,63 @@ async def test_compaction_and_history_stage_snapshot(
         call_log["history"][0]["trim_last_user"]
         is case["history_has_persisted_user"]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ["SUMMARY-X", "[Context Summary] body"])
+@pytest.mark.parametrize("dynamic", [None, "DYNAMIC-MARKER"])
+async def test_loaded_summary_and_dynamic_context_reach_adapter_once(
+    monkeypatch: pytest.MonkeyPatch, summary: str, dynamic: str | None,
+) -> None:
+    case = dict(_CASE_BASE, history_return=summary, request_context_in=dynamic)
+    runner, calls = _setup_runner(case)
+    captured, yielded, raised = await _drive(runner, case)
+    assert raised is None and captured is not None, yielded
+    assert len(calls["agent_configs"]) == 1
+    config = replace(
+        calls["agent_configs"][0], model_id="probe-model", system_prompt="BASE",
+        max_tokens=1024, context_window_tokens=200_000, max_provider_retries=0,
+    )
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        chunks = [
+            {"choices": [{"index": 0, "delta": {"content": "Ready."}, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 100, "completion_tokens": 2}},
+        ]
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content="".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            + "data: [DONE]\n\n",
+        )
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "opensquilla.provider.openai.httpx.AsyncClient",
+        lambda **kwargs: client(**{**kwargs, "transport": httpx.MockTransport(respond)}),
+    )
+    agent = Agent(
+        provider=OpenAIProvider(
+            api_key="offline-only", model="probe-model", provider_kind="openrouter",
+            base_url="https://offline.invalid/v1",
+        ), config=config,
+    )
+    events = [event async for event in agent.run_turn("LATEST-USER")]
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "error" for event in events)
+    assert len(requests) == 1
+    contents = [message.get("content", "") for message in requests[0]["messages"]]
+    combined = "\n\n".join(part for part in (summary, dynamic) if part)
+    expected = Agent._request_context_message(combined)
+    assert expected is not None
+    assert contents.count(expected.content) == 1
+    wire = json.dumps(requests[0]["messages"])
+    assert wire.count(summary) == 1
+    if dynamic:
+        assert wire.count(dynamic) == 1
+    assert wire.count("LATEST-USER") == 1
 
 
 @pytest.mark.asyncio
@@ -498,11 +536,14 @@ async def test_runtime_compaction_keeps_file_paths_with_image_retention_disabled
     }
     seen: dict[str, Any] = {}
 
-    async def summarize(**kwargs: Any) -> str:
-        seen["summary_input"] = kwargs["chunk_text"]
-        return "Continue reviewing the original document."
+    async def summarize(self, messages, tools=None, config=None):
+        from opensquilla.provider.types import DoneEvent, TextDeltaEvent
 
-    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", summarize)
+        seen["summary_input"] = json.dumps([message.model_dump() for message in messages])
+        yield TextDeltaEvent(text="Continue reviewing the original document.")
+        yield DoneEvent(stop_reason="stop", output_tokens=10)
+
+    monkeypatch.setattr("opensquilla.provider.openai.OpenAIProvider.chat", summarize)
 
     async def preflight(
         self: TurnRunner, *args: Any, attachment_path_resolver=None, **kwargs: Any,
@@ -523,6 +564,7 @@ async def test_runtime_compaction_keeps_file_paths_with_image_retention_disabled
             config=CompactionConfig(
                 model="synthetic-model", api_key="synthetic-key", safety_margin=1.0,
                 protected_recent_messages=2, attachment_path_resolver=attachment_path_resolver,
+                preserve_historical_images=False,
             ), forced_prefix_cut=2, trigger="message_count",
         ))
         seen["result"] = result

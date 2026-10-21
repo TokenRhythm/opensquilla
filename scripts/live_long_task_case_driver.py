@@ -98,10 +98,29 @@ _MAX_BROWSER_RESULT_BYTES: Final = 64 * 1024
 _HISTORY_SETTLE_TIMEOUT_SECONDS: Final = 5.0
 _HISTORY_SETTLE_EVENT_WAIT_SECONDS: Final = 0.05
 _STARTUP_PHASES: Final = frozenset({
-    "config", "ownership", "services", "profile_recovery", "app",
+    "config", "ownership", "runtime_import", "services", "profile_recovery", "app",
     "runtime_state", "listener", "gateway_ready",
 })
 _STARTUP_LOG_TAIL_BYTES: Final = 64 * 1024
+_STARTUP_SERVICE_EVENTS: Final = frozenset({
+    "build_services.agent_workspace_ready",
+    "build_services.sandbox_upgrade_started", "build_services.sandbox_upgrade_finished",
+    "build_services.sandbox_upgrade_failed", "build_services.sandbox_ready",
+    "build_services.migrations_started", "build_services.migrations_ready",
+    "build_services.session_storage_started", "build_services.session_storage_ready",
+    "build_services.usage_ledger_ready", "build_services.provider_ready",
+    "build_services.provider_pending_configuration",
+    "build_services.model_catalog_ready", "build_services.model_catalog_failed",
+    "build_services.pricing_cache_ready", "build_services.pricing_cache_failed",
+    "build_services.model_catalog_pricing_deferred",
+    "build_services.memory_started", "build_services.memory_ready",
+    "build_services.memory_deferred", "build_services.skill_loader_initialized",
+    "build_services.skill_tools_registered", "build_services.skill_loader_failed",
+    "build_services.cron_scheduler_initialized", "build_services.cron_scheduler_failed",
+    "build_services.external_services_deferred", "build_services.ready",
+})
+_STARTUP_SERVICE_EVENT_LIMIT: Final = 32
+_GITHUB_WINDOWS_CI: Final = os.name == "nt" and os.environ.get("GITHUB_ACTIONS") == "true"
 _PERFORMANCE_FIXTURE: Final = {
     "historyMessages": 200,
     "reasoningDeltas": 20_000,
@@ -565,6 +584,9 @@ class GatewayProcess:
         self._stdout: Any = None
         self._stderr: Any = None
         self._startup_log_offsets: dict[str, int] = {}
+        self._startup_health: dict[str, Any] = {}
+        self._has_reached_health = False
+        self._startup_recovery_used = False
 
     @property
     def http_url(self) -> str:
@@ -610,74 +632,139 @@ class GatewayProcess:
         )
         return env
 
+    def _open_health(self) -> Any:
+        # Readiness belongs to the loopback process we launched. A user proxy
+        # or globally installed urllib opener must not answer on its behalf.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(f"{self.http_url}/health", timeout=1)
+
     def start(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             raise RuntimeError("Gateway is already running")
-        if not self.port:
-            # Fault proxies bind between construction and the first start.
-            # Select afterward so they cannot take our released ephemeral
-            # port; retain it on restart for existing browser/RPC clients.
-            self.port = _free_port()
-        self._stdout = (self.root / "gateway.stdout.log").open("ab")
-        self._stderr = (self.root / "gateway.stderr.log").open("ab")
-        # Restarts append to the raw logs so cleanup can scan every attempt.
-        # Diagnostics must only describe the process launched by this start().
-        self._startup_log_offsets = {
-            "gateway.stdout.log": self._stdout.tell(),
-            "gateway.stderr.log": self._stderr.tell(),
-        }
-        self.proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "opensquilla.cli.main",
-                "gateway",
-                "run",
-                "--port",
-                str(self.port),
-                "--bind",
-                "127.0.0.1",
-            ],
-            cwd=self.workspace_dir,
-            env=self._child_env(),
-            stdin=subprocess.DEVNULL,
-            stdout=self._stdout,
-            stderr=self._stderr,
-        )
-        started_at = time.monotonic()
-        deadline = started_at + 45
-        last_health_status: int | None = None
-        while time.monotonic() < deadline:
+        while True:
+            if not self.port:
+                # Fault proxies bind between construction and the first start.
+                # Select afterward so they cannot take our released ephemeral
+                # port; retain it on restart for existing browser/RPC clients.
+                self.port = _free_port()
+            self._stdout = (self.root / "gateway.stdout.log").open("ab")
+            self._stderr = (self.root / "gateway.stderr.log").open("ab")
+            # Restarts append to the raw logs so cleanup can scan every attempt.
+            # Diagnostics must only describe the process launched by this start().
+            self._startup_log_offsets = {
+                "gateway.stdout.log": self._stdout.tell(),
+                "gateway.stderr.log": self._stderr.tell(),
+            }
+            self.proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "opensquilla.cli.main",
+                    "gateway",
+                    "run",
+                    "--port",
+                    str(self.port),
+                    "--bind",
+                    "127.0.0.1",
+                ],
+                cwd=self.workspace_dir,
+                env=self._child_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=self._stdout,
+                stderr=self._stderr,
+            )
+            started_at = time.monotonic()
+            deadline = started_at + 45
+            self._startup_health = {
+                "attempts": 0, "failures": {}, "last_failure": None,
+                "probe_elapsed_ms": 0, "last_probe_elapsed_ms": 0,
+            }
+            last_health_status: int | None = None
+            while time.monotonic() < deadline:
+                exit_code = self.proc.poll()
+                if exit_code is not None:
+                    raise self._startup_failure(
+                        "Gateway exited during startup", started_at, exit_code,
+                        last_health_status,
+                    )
+                probe_started_at = time.monotonic()
+                failure_category = None
+                try:
+                    with self._open_health() as response:
+                        last_health_status = response.status
+                        if response.status == 200:
+                            self._has_reached_health = True
+                            return
+                        failure_category = "non_200_response"
+                except urllib.error.HTTPError as exc:
+                    last_health_status = exc.code
+                    failure_category = "http_error"
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    # The Gateway may still be binding; retry until the bounded deadline.
+                    cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                    if isinstance(cause, TimeoutError):
+                        failure_category = "timeout"
+                    elif isinstance(cause, ConnectionRefusedError):
+                        failure_category = "connection_refused"
+                    elif isinstance(cause, ConnectionResetError):
+                        failure_category = "connection_reset"
+                    else:
+                        failure_category = "url_error" if isinstance(
+                            exc, urllib.error.URLError,
+                        ) else "os_error"
+                finally:
+                    duration_ms = min(3_600_000, max(
+                        0, int((time.monotonic() - probe_started_at) * 1000),
+                    ))
+                    health = self._startup_health
+                    health["attempts"] = min(10_000, health["attempts"] + 1)
+                    health["last_probe_elapsed_ms"] = duration_ms
+                    health["probe_elapsed_ms"] = min(
+                        3_600_000, health["probe_elapsed_ms"] + duration_ms,
+                    )
+                    if failure_category is not None:
+                        failures = health["failures"]
+                        failures[failure_category] = min(
+                            10_000, failures.get(failure_category, 0) + 1,
+                        )
+                        health["last_failure"] = failure_category
+                time.sleep(0.25)
             exit_code = self.proc.poll()
-            if exit_code is not None:
-                raise self._startup_failure(
-                    "Gateway exited during startup", started_at, exit_code, last_health_status,
-                )
+            failure = self._startup_failure(
+                "Gateway did not become healthy", started_at, exit_code, last_health_status,
+            )
+            if not self._can_recover_initial_windows_startup(
+                exit_code=exit_code, last_health_status=last_health_status,
+            ):
+                raise failure
+            self._startup_recovery_used = True
             try:
-                with urllib.request.urlopen(f"{self.http_url}/health", timeout=1) as response:
-                    last_health_status = response.status
-                    if response.status == 200:
-                        return
-            except urllib.error.HTTPError as exc:
-                last_health_status = exc.code
-            except (urllib.error.URLError, TimeoutError, OSError):
-                # The Gateway may still be binding; retry until the bounded deadline.
-                pass
-            time.sleep(0.25)
-        raise self._startup_failure(
-            "Gateway did not become healthy", started_at, self.proc.poll(), last_health_status,
-        )
+                self.stop(force=True)
+            except Exception:
+                # Preserve the existing bounded, redacted startup diagnostic;
+                # cleanup errors may contain local paths.
+                raise failure from None
 
-    def _startup_failure(
+    def _can_recover_initial_windows_startup(
         self,
-        reason: str,
-        started_at: float,
+        *,
         exit_code: int | None,
         last_health_status: int | None,
-    ) -> DriverConfigurationError:
-        # Raw live-case logs must still be scanned and deleted by cleanup().
-        # Retain only known startup states and bounded numeric evidence.
-        phases: dict[str, dict[str, int | str]] = {}
+    ) -> bool:
+        # Hosted Windows runners have repeatedly left this isolated child alive
+        # before it binds a listener after the shard's parallel phase. Keep the
+        # recovery CI-only and fail closed for exits, HTTP responses, later boot
+        # phases, post-ready restarts, and any repeated occurrence.
+        return (
+            _GITHUB_WINDOWS_CI
+            and not self._has_reached_health
+            and not self._startup_recovery_used
+            and exit_code is None
+            and last_health_status is None
+            and set(self._startup_phases()) == {"config", "ownership"}
+        )
+
+    def _startup_log_records(self) -> Iterable[tuple[str, dict[str, Any]]]:
         for name in ("gateway.stdout.log", "gateway.stderr.log"):
             try:
                 with (self.root / name).open("rb") as stream:
@@ -696,21 +783,59 @@ class GatewayProcess:
                     record = json.loads(payload if prefix else line)
                 except (ValueError, RecursionError):
                     continue
-                if (
-                    not isinstance(record, dict)
-                    or record.get("event") != "gateway.startup_phase"
-                    or not isinstance(record.get("phase"), str)
-                    or record["phase"] not in _STARTUP_PHASES
-                    or record.get("status") != "ready"
-                ):
-                    continue
-                durations = {
-                    key: record.get(key) for key in ("duration_ms", "startup_elapsed_ms")
-                }
-                if any(type(value) is not int or not 0 <= value <= 3_600_000
-                       for value in durations.values()):
-                    continue
-                phases[record["phase"]] = {"status": "ready", **durations}
+                if isinstance(record, dict):
+                    yield name, record
+
+    def _startup_phases(self) -> dict[str, dict[str, int | str]]:
+        phases: dict[str, dict[str, int | str]] = {}
+        for _name, record in self._startup_log_records():
+            if (
+                record.get("event") != "gateway.startup_phase"
+                or not isinstance(record.get("phase"), str)
+                or record["phase"] not in _STARTUP_PHASES
+                or record.get("status") != "ready"
+            ):
+                continue
+            durations = {
+                key: record.get(key) for key in ("duration_ms", "startup_elapsed_ms")
+            }
+            if any(type(value) is not int or not 0 <= value <= 3_600_000
+                   for value in durations.values()):
+                continue
+            phases[record["phase"]] = {"status": "ready", **durations}
+        return phases
+
+    def _startup_service_events(self) -> list[dict[str, Any]]:
+        # These observations never influence readiness or startup recovery.
+        # Keep stream identity: stdout/stderr tails do not establish a shared
+        # chronological order. Never preserve error prose or arbitrary fields.
+        events: list[dict[str, Any]] = []
+        for name, record in self._startup_log_records():
+            event = record.get("event")
+            if not isinstance(event, str) or event not in _STARTUP_SERVICE_EVENTS:
+                continue
+            numbers = {
+                key: record[key] for key in ("duration_ms", "count", "agents") if key in record
+            }
+            if any(type(value) is not int or not 0 <= value <= 3_600_000
+                   for value in numbers.values()):
+                continue
+            events.append({
+                "stream": "stdout" if name == "gateway.stdout.log" else "stderr",
+                "event": event, **numbers,
+            })
+        return events[-_STARTUP_SERVICE_EVENT_LIMIT:]
+
+    def _startup_failure(
+        self,
+        reason: str,
+        started_at: float,
+        exit_code: int | None,
+        last_health_status: int | None,
+    ) -> DriverConfigurationError:
+        # Raw live-case logs must still be scanned and deleted by cleanup().
+        # Retain only known startup states and bounded numeric evidence.
+        phases = self._startup_phases()
         evidence = {
             "elapsed_ms": min(3_600_000, max(0, int((time.monotonic() - started_at) * 1000))),
             "exit_code": exit_code if type(exit_code) is int and -(2**31) <= exit_code < 2**32
@@ -718,6 +843,8 @@ class GatewayProcess:
             "last_health_status": last_health_status
             if type(last_health_status) is int and 100 <= last_health_status <= 599 else None,
             "phases": phases,
+            "service_events": self._startup_service_events(),
+            "health": self._startup_health,
         }
         return DriverConfigurationError(f"{reason}; startup={json.dumps(evidence, sort_keys=True)}")
 

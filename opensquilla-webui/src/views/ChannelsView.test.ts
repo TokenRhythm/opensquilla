@@ -141,6 +141,7 @@ async function mountChannelsView(options: {
   channelRows?: Array<Record<string, unknown>>
   /** Override the channels.get response (drill configuration seeding). */
   channelsGet?: (params?: Record<string, unknown>) => unknown
+  channelUpsert?: (params?: Record<string, unknown>) => unknown
   locale?: string
 } = {}) {
   vi.resetModules()
@@ -262,6 +263,7 @@ async function mountChannelsView(options: {
       return { status: 'validated', connected: false, restartRequired: true, warnings: [] }
     }
     if (method === 'onboarding.channel.upsert') {
+      if (options.channelUpsert) return options.channelUpsert(params)
       const entry = params?.entry as Record<string, unknown> | undefined
       return { changed: true, restartRequired: true, entry: { name: entry?.name } }
     }
@@ -534,16 +536,18 @@ describe('ChannelsView dashboard home', () => {
   })
 
   it('runs Test and Restart from the card without drilling in', async () => {
-    const { app, el, flush, rpcCall, push } = await mountChannelsView()
+    const { app, el, flush, rpcCall, push, pushToast } = await mountChannelsView()
     try {
       await flush()
       const ops = channelCard(el, 'ops-slack')
       buttonWithText(ops, 'Test').click()
       await flush()
       expect(rpcCall).toHaveBeenCalledWith('channels.probe', { name: 'ops-slack' })
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith('ops-slack verified in 17 ms', { tone: 'ok' })
       buttonWithText(ops, 'Restart').click()
       await flush()
       expect(rpcCall).toHaveBeenCalledWith('channels.restart', { name: 'ops-slack' })
+      expect(pushToast).toHaveBeenCalledTimes(1)
       // The quick actions never navigate: still on the dashboard.
       expect(el.querySelector('.chd')).toBeNull()
       expect(push).not.toHaveBeenCalled()
@@ -648,7 +652,8 @@ describe('ChannelsView dashboard home', () => {
         channelName: 'ops-slack',
         pairingId: 'pair-pending',
       })
-      expect(pushToast).toHaveBeenCalledWith('Rejected the pairing request from Pending User', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
+      expect(el.querySelector('[aria-label="Reject the pairing request from Pending User"]')).toBeNull()
     } finally {
       app.unmount()
     }
@@ -922,16 +927,51 @@ describe('ChannelsView dashboard home', () => {
       await nextTick()
       ops.querySelector<HTMLButtonElement>('[aria-label="Approve access for Pending User"]')!.click()
       await flush()
-      // The approval committed but the grant failed: plain approve success
-      // plus an actionable warning — never a false admin-success toast.
-      expect(pushToast).toHaveBeenCalledWith('Approved pairing access for Pending User', { tone: 'ok' })
-      expect(pushToast).toHaveBeenCalledWith(
+      // The approval committed but the grant failed: one partial-success
+      // warning, without contradictory success and failure notifications.
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(
         'Approved Pending User, but the admin grant failed — retry from the members list.',
-        { tone: 'danger' },
+        { tone: 'warn' },
       )
       expect(pushToast).not.toHaveBeenCalledWith('Approved Pending User as a channel admin', { tone: 'ok' })
     } finally {
       app.unmount()
+    }
+  })
+
+  it('does not offer an acknowledged card approval again when the follow-up read fails', async () => {
+    let readFails = false
+    const ctx = await mountChannelsView({
+      adminGrantFails: true,
+      loadPairings: async () => {
+        if (readFails) throw new Error('read unavailable')
+        return { pairings: [
+          { pairingId: 'pair-pending', channelName: 'ops-slack', senderId: 'U-PENDING', senderName: 'Pending User', status: 'pending' },
+          { pairingId: 'pair-approved', channelName: 'ops-slack', senderId: 'U-APPROVED', senderName: 'Approved User', status: 'approved' },
+        ] }
+      },
+    })
+    try {
+      await ctx.flush()
+      const ops = channelCard(ctx.el, 'ops-slack')
+      const box = ops.querySelector<HTMLInputElement>('[aria-label="Approve Pending User as a channel admin"]')!
+      box.checked = true
+      box.dispatchEvent(new Event('change', { bubbles: true }))
+      await ctx.nextTick()
+      readFails = true
+      ops.querySelector<HTMLButtonElement>('[aria-label="Approve access for Pending User"]')!.click()
+      await ctx.flush()
+      await ctx.flush()
+      expect(ops.querySelector('[aria-label="Approve access for Pending User"]')).toBeNull()
+      const membersLabel = Array.from(ops.querySelectorAll('dt')).find(item => item.textContent?.trim() === 'Members')
+      expect(membersLabel?.nextElementSibling?.textContent).toBe('2')
+      expect(ctx.rpcCall.mock.calls.filter(([method]) => method === 'channels.pairing.approve')).toHaveLength(1)
+      expect(ctx.pushToast).toHaveBeenCalledExactlyOnceWith(
+        'Approved Pending User, but the admin grant failed — retry from the members list.',
+        { tone: 'warn' },
+      )
+    } finally {
+      ctx.app.unmount()
     }
   })
 })
@@ -1021,7 +1061,7 @@ describe('ChannelsView drill-in page', () => {
       await flush()
       // The clipboard always receives the FULL id, not the display form.
       expect(writeText).toHaveBeenCalledWith('U-BOT-FEED-0123456789')
-      expect(pushToast).toHaveBeenCalledWith('Bot ID copied', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalledWith('Bot ID copied', { tone: 'ok' })
     } finally {
       app.unmount()
     }
@@ -1131,6 +1171,34 @@ describe('ChannelsView drill-in page', () => {
     }
   })
 
+  it('finishes the initial configuration load after Esc exits a cold edit deep link', async () => {
+    let resolveInitial!: (value: unknown) => void
+    const initial = new Promise(resolve => { resolveInitial = resolve })
+    const ctx = await mountChannelsView({
+      routeQuery: { channel: 'ops-slack', tab: 'configuration', edit: '1' },
+      channelsGet: () => initial,
+    })
+    try {
+      await ctx.flush()
+      expect(ctx.rpcCall).toHaveBeenCalledWith('channels.get', { name: 'ops-slack' })
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      await ctx.flush()
+      resolveInitial({
+        entry: { name: 'ops-slack', type: 'slack', token: '***', signing_secret: '***', connection_mode: 'webhook' },
+        secretFields: ['token', 'signing_secret'],
+      })
+      await ctx.flush()
+      const page = ctx.el.querySelector<HTMLElement>('.chd')!
+      expect(page.querySelectorAll('.cfge [data-field]').length).toBeGreaterThan(0)
+      expect(page.querySelector('[data-field="slack_channel_id"] input')).toBeNull()
+      buttonWithText(page, 'Edit').click()
+      await ctx.flush()
+      expect(page.querySelector('[data-field="slack_channel_id"] input')).toBeTruthy()
+    } finally {
+      ctx.app.unmount()
+    }
+  })
+
   it('folds the legacy tab=capabilities deep link into diagnostics', async () => {
     const ctx = await mountChannelsView({
       routeQuery: { channel: 'ops-slack', tab: 'capabilities' },
@@ -1178,7 +1246,7 @@ describe('ChannelsView members section', () => {
         channelName: 'ops-slack',
         pairingId: 'pair-pending',
       })
-      expect(pushToast).toHaveBeenCalledWith('Approved pairing access for Pending User', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
       expect(panel.querySelector('[aria-label="Approve access for Pending User"]')).toBeNull()
 
       panel.querySelector<HTMLButtonElement>('[aria-label="Revoke access for Approved User"]')!.click()
@@ -1190,7 +1258,7 @@ describe('ChannelsView members section', () => {
         channelName: 'ops-slack',
         pairingId: 'pair-approved',
       })
-      expect(pushToast).toHaveBeenCalledWith('Revoked pairing access for Approved User', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
       expect(panel.querySelector('[aria-label="Revoke access for Approved User"]')).toBeNull()
 
       // A revoked request can be re-approved via the same approve RPC.
@@ -1397,7 +1465,7 @@ describe('ChannelsView members section', () => {
         pairingId: 'pair-pending',
         asAdmin: true,
       })
-      expect(pushToast).toHaveBeenCalledWith('Approved Pending User as a channel admin', { tone: 'ok' })
+      expect(pushToast).not.toHaveBeenCalled()
     } finally {
       app.unmount()
     }
@@ -1417,10 +1485,9 @@ describe('ChannelsView members section', () => {
       await nextTick()
       panel.querySelector<HTMLButtonElement>('[aria-label="Approve access for Pending User"]')!.click()
       await flush()
-      expect(pushToast).toHaveBeenCalledWith('Approved pairing access for Pending User', { tone: 'ok' })
-      expect(pushToast).toHaveBeenCalledWith(
+      expect(pushToast).toHaveBeenCalledExactlyOnceWith(
         'Approved Pending User, but the admin grant failed — retry from the members list.',
-        { tone: 'danger' },
+        { tone: 'warn' },
       )
       // The members list still reloads: the approval itself committed.
       expect(panel.querySelector('[aria-label="Approve access for Pending User"]')).toBeNull()
@@ -1488,6 +1555,135 @@ describe('ChannelsView in-place configuration editor', () => {
     if (!node) throw new Error('editor action bar not found')
     return node
   }
+
+  it('saves the visible channel when a previous configuration arrives after entering edit mode', async () => {
+    let resolveFirst!: (value: unknown) => void
+    const firstLoad = new Promise(resolve => { resolveFirst = resolve })
+    const stored = (name: string) => ({
+      entry: { name, type: 'slack', connection_mode: 'webhook', token: '***', signing_secret: '***' },
+      secretFields: ['token', 'signing_secret'],
+    })
+    const ctx = await mountChannelsView({
+      channelsGet: params => params?.name === 'ops-slack' ? firstLoad : stored(String(params?.name)),
+    })
+    try {
+      await ctx.flush()
+      const first = await openDrill(ctx, 'ops-slack')
+      first.querySelector<HTMLButtonElement>('.chd__back')!.click()
+      await ctx.flush()
+      const page = await openDrill(ctx, 'boot-failed-slack')
+      await enterEditMode(ctx, page)
+      setField(page, 'slack_channel_id', 'C-SECOND')
+      await ctx.flush()
+
+      resolveFirst(stored('ops-slack'))
+      await ctx.flush()
+      expect(page.querySelector<HTMLInputElement>('[data-field="slack_channel_id"] input')?.value).toBe('C-SECOND')
+      expect(page.querySelector('[data-field="name"]')?.textContent).toContain('boot-failed-slack')
+      buttonWithText(bar(ctx.el), 'Save changes').click()
+      await ctx.flush()
+      await ctx.flush()
+      expect(ctx.rpcCall).toHaveBeenCalledWith('onboarding.channel.upsert', {
+        entry: expect.objectContaining({ name: 'boot-failed-slack', slack_channel_id: 'C-SECOND' }),
+      })
+      const upserts = ctx.rpcCall.mock.calls.filter(([method]) => method === 'onboarding.channel.upsert')
+      expect(upserts).toHaveLength(1)
+    } finally {
+      ctx.app.unmount()
+    }
+  })
+
+  it('keeps a new edit open when a previous channel save completes after leaving it', async () => {
+    let resolveSave!: (value: unknown) => void
+    const pendingSave = new Promise(resolve => { resolveSave = resolve })
+    const ctx = await mountChannelsView({
+      channelUpsert: () => pendingSave,
+      channelsGet: params => ({
+        entry: { name: params?.name, type: 'slack', connection_mode: 'webhook', token: '***', signing_secret: '***' },
+        secretFields: ['token', 'signing_secret'],
+      }),
+    })
+    try {
+      const first = await openConfiguration(ctx)
+      await enterEditMode(ctx, first)
+      setField(first, 'slack_channel_id', 'C-FIRST')
+      await ctx.flush()
+      buttonWithText(bar(ctx.el), 'Save changes').click()
+      await ctx.flush()
+      expect(ctx.rpcCall.mock.calls.some(([method]) => method === 'onboarding.channel.upsert')).toBe(true)
+
+      first.querySelector<HTMLButtonElement>('.chd__back')!.click()
+      await ctx.flush()
+      buttonWithText(bar(ctx.el), 'Discard').click()
+      await ctx.flush()
+      const page = await openDrill(ctx, 'boot-failed-slack')
+      await enterEditMode(ctx, page)
+      setField(page, 'slack_channel_id', 'C-SECOND')
+      await ctx.flush()
+
+      resolveSave({ changed: true, restartRequired: true })
+      await ctx.flush()
+      await ctx.flush()
+      expect(page.querySelector<HTMLInputElement>('[data-field="slack_channel_id"] input')?.value).toBe('C-SECOND')
+      expect(page.querySelector('[data-field="name"]')?.textContent).toContain('boot-failed-slack')
+      expect(buttonWithText(bar(ctx.el), 'Save changes').disabled).toBe(false)
+      expect(ctx.pushToast).not.toHaveBeenCalled()
+    } finally {
+      ctx.app.unmount()
+    }
+  })
+
+  it.each([false, true])('refreshes a discarded save baseline only while still read-only (new draft: %s)', async resumeEdit => {
+    let resolveSave!: (value: unknown) => void
+    const pendingSave = new Promise(resolve => { resolveSave = resolve })
+    let storedChannelId = 'C-OLD'
+    const ctx = await mountChannelsView({
+      channelUpsert: () => pendingSave,
+      channelsGet: params => ({
+        entry: {
+          name: params?.name, type: 'slack', connection_mode: 'webhook', token: '***', signing_secret: '***',
+          slack_channel_id: storedChannelId,
+        },
+        secretFields: ['token', 'signing_secret'],
+      }),
+    })
+    try {
+      const page = await openConfiguration(ctx)
+      await enterEditMode(ctx, page)
+      setField(page, 'slack_channel_id', 'C-SAVED')
+      await ctx.flush()
+      buttonWithText(bar(ctx.el), 'Save changes').click()
+      await ctx.flush()
+      expect(ctx.rpcCall.mock.calls.some(([method]) => method === 'onboarding.channel.upsert')).toBe(true)
+      // The first Esc blurs a focused input, the second requests discard.
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      await ctx.flush()
+      buttonWithText(bar(ctx.el), 'Discard').click()
+      await ctx.flush()
+      expect(page.querySelector('[data-field="slack_channel_id"] input')).toBeNull()
+      if (resumeEdit) {
+        await enterEditMode(ctx, page)
+        setField(page, 'slack_channel_id', 'C-NEW-DRAFT')
+        await ctx.flush()
+      }
+
+      storedChannelId = 'C-SAVED'
+      resolveSave({ changed: true, restartRequired: true })
+      await ctx.flush()
+      await ctx.flush()
+      if (!resumeEdit) {
+        expect(page.querySelector('[data-field="slack_channel_id"]')?.textContent).toContain('C-SAVED')
+        await enterEditMode(ctx, page)
+      }
+      expect(page.querySelector<HTMLInputElement>('[data-field="slack_channel_id"] input')?.value)
+        .toBe(resumeEdit ? 'C-NEW-DRAFT' : 'C-SAVED')
+      const reads = ctx.rpcCall.mock.calls.filter(([method]) => method === 'channels.get')
+      expect(reads).toHaveLength(resumeEdit ? 1 : 2)
+    } finally {
+      ctx.app.unmount()
+    }
+  })
 
   it('flips read → edit onto the same field skeleton, name locked', async () => {
     const ctx = await mountChannelsView()
@@ -1590,8 +1786,8 @@ describe('ChannelsView in-place configuration editor', () => {
     }
   })
 
-  it('saves via probe → upsert, resets the baseline, and drops edit mode', async () => {
-    const ctx = await mountChannelsView()
+  it.each([true, false])('saves via probe → upsert, with restart required %s, resets the baseline, and drops edit mode', async restartRequired => {
+    const ctx = await mountChannelsView({ channelUpsert: () => ({ changed: true, restartRequired }) })
     const { el, flush, rpcCall, pushToast } = ctx
     try {
       const page = await openConfiguration(ctx)
@@ -1610,10 +1806,12 @@ describe('ChannelsView in-place configuration editor', () => {
       const entry = (upsertCall[1] as { entry: Record<string, unknown> }).entry
       expect(entry).toMatchObject({ name: 'ops-slack', slack_channel_id: 'C123' })
       expect(JSON.stringify(entry)).not.toContain('***')
-      expect(pushToast).toHaveBeenCalledWith(
-        'Channel saved — configuration validated locally; use Test connection to verify credentials',
-        { tone: 'ok' },
-      )
+      if (restartRequired) {
+        expect(pushToast).toHaveBeenCalledWith(
+          'Channel saved — configuration validated locally; use Test connection to verify credentials',
+          { tone: 'ok' },
+        )
+      } else expect(pushToast).not.toHaveBeenCalled()
       // Baseline reset from the reseed: read mode, no dirty dot, no bar.
       expect(page.querySelector('[data-field="slack_channel_id"] input')).toBeNull()
       expect(page.querySelector('.ch-tab-dirty')).toBeNull()

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { ArtifactPayload } from '@/types/artifacts'
+import { createResourceCollectionWorkbenchItem } from './workbenchResourceItems'
 import {
   artifactFromWorkbenchItem,
+  artifactResourceRefFromWorkbenchItem,
+  isFixedArtifactPreview,
   fileActionArtifactFromWorkbenchItem,
   artifactWorkbenchItemId,
   createArtifactPreviewWorkbenchItem,
@@ -11,6 +14,7 @@ import {
   preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
+  sessionKeyFromWorkbenchItem,
 } from './artifactItems'
 
 const artifact: ArtifactPayload = {
@@ -22,6 +26,19 @@ const artifact: ArtifactPayload = {
 }
 
 describe('artifact Workbench items', () => {
+  it('uses only typed resource identities for Document authority and leaves legacy artifact IDs unresolved', () => {
+    const legacy = createArtifactPreviewWorkbenchItem({ artifact: { ...artifact, documentId: 'doc-current' },
+      nativeHtml: false, sessionKey: 'child', resourceIdentity: 'legacy-artifact-id' })
+    expect(artifactResourceRefFromWorkbenchItem(legacy)).toBeNull()
+    expect(isFixedArtifactPreview(legacy)).toBe(true)
+    const delivered = { ...legacy, payload: { ...legacy.payload, resourceIdentity: 'deliverable:artifact-1' } }
+    expect(artifactResourceRefFromWorkbenchItem(delivered)).toMatchObject({ type: 'deliverable', artifactId: 'artifact-1' })
+    expect(isFixedArtifactPreview(delivered)).toBe(true)
+    const current = { ...legacy, payload: { ...legacy.payload, artifact: { ...artifact,
+      workbenchResourceType: 'document', workbenchResourceId: 'doc-current' } } }
+    expect(artifactResourceRefFromWorkbenchItem(current)).toMatchObject({ type: 'document', documentId: 'doc-current' })
+    expect(isFixedArtifactPreview(current)).toBe(false)
+  })
   it('file menu follows current Document and the observed child, including Web leases without workingDocumentId', () => {
     const item = createArtifactPreviewWorkbenchItem({ artifact: { ...artifact, documentId: 'doc_one', previewPagePath: 'minimal.html' },
       sessionKey: 'session-one', resourceIdentity: 'document:doc_one', nativeHtml: false })
@@ -32,7 +49,7 @@ describe('artifact Workbench items', () => {
     expect(fileActionArtifactFromWorkbenchItem(item, { ...state, workingFilePageUnknown: true })).toBeUndefined()
     expect(fileActionArtifactFromWorkbenchItem(item, { ...state, currentUrl: 'https://elsewhere.example/index.html' })).toBeUndefined()
     const delivery = createArtifactPreviewWorkbenchItem({ artifact: { ...artifact, documentId: 'doc_one' }, sessionKey: 'session-one', resourceIdentity: 'deliverable:artifact-1', nativeHtml: false })
-    expect(fileActionArtifactFromWorkbenchItem(delivery, {})).toEqual({ ...artifact, documentId: 'doc_one' })
+    expect(fileActionArtifactFromWorkbenchItem(delivery, {})).toEqual({ ...artifact, source: 'artifact', documentId: 'doc_one', download_url: undefined })
   })
   it('uses stable session-scoped identities without embedding raw session keys', () => {
     const first = artifactWorkbenchItemId('agent:main:webchat:private', artifact)
@@ -41,6 +58,27 @@ describe('artifact Workbench items', () => {
     expect(second).toBe(first)
     expect(first).not.toContain('agent:main')
     expect(first).not.toContain('artifact-1')
+  })
+
+  it('keeps side preview visibility scoped to the parent but reads authorized by the child', () => {
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact: { ...artifact, documentId: 'doc_side' },
+      nativeHtml: false,
+      sessionKey: 'agent:main:sidechat:child',
+      resourceIdentity: 'document:doc_side',
+    })
+    const parentScoped = { ...item, scope: { type: 'session' as const, id: 'agent:main:webchat:parent' } }
+
+    expect(sessionKeyFromWorkbenchItem(parentScoped)).toBe('agent:main:sidechat:child')
+  })
+
+  it('keeps collection authority explicit and preserves legacy scope fallbacks', () => {
+    const item = createResourceCollectionWorkbenchItem({ resources: [], sessionKey: 'child', title: 'Files' })
+    item.scope = { type: 'session', id: 'parent' }
+    expect(sessionKeyFromWorkbenchItem(item)).toBe('child')
+    expect(sessionKeyFromWorkbenchItem({ ...item, payload: {} })).toBe('parent')
+    expect(sessionKeyFromWorkbenchItem({ ...item, payload: { sessionKey: '  ' } })).toBe('parent')
+    expect(sessionKeyFromWorkbenchItem(null)).toBe('')
   })
 
   it('does not alias distinct legacy artifacts that collided under the old 32-bit key', () => {

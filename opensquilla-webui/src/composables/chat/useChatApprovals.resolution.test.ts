@@ -85,9 +85,7 @@ function approvalHarness(statusResponse: Record<string, unknown> = {
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
     stream: {
-      isStreaming: ref(false),
       appendInterruptFrame: vi.fn(),
-      ensureInterruptBubble: vi.fn(),
     },
     interruptState,
   })

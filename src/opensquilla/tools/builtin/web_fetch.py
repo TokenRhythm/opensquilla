@@ -15,6 +15,7 @@ import httpx
 import structlog
 from cachetools import TTLCache
 
+from opensquilla.provider.metered_http import accounted_request
 from opensquilla.result_budget import (
     DEFAULT_TOOL_RUN_BUDGET_POLICY,
     ToolRunBudgetPolicy,
@@ -25,6 +26,7 @@ from opensquilla.sandbox.operation_runtime import (
     NetworkOperationRequest,
     SandboxToolDescriptor,
 )
+from opensquilla.tools.fetch_work import run_blocking_fetch_work as _run_blocking
 from opensquilla.tools.registry import tool
 from opensquilla.tools.ssrf import environment_proxy_url as _environment_proxy_url
 from opensquilla.tools.ssrf import pinned_transport as _pinned_transport
@@ -62,7 +64,7 @@ _RETRY_DELAY_SECONDS = 0.25
 _WEB_FETCH_DEFAULT_MAX_CHARS = 20_000
 _WEB_FETCH_MAX_CHARS_ENV = "OPENSQUILLA_WEB_FETCH_MAX_CHARS"
 _MAX_REDIRECTS = 5
-
+_FETCH_PREPARATION_TIMEOUT_SECONDS = 30.0
 _XML_ATTR_ESCAPES = {
     "<": "&lt;",
     ">": "&gt;",
@@ -72,6 +74,31 @@ _XML_ATTR_ESCAPES = {
 }
 
 _RAW_TOOL_RESULT_KEY = "_raw_tool_result"
+
+
+async def _check_ssrf_async(url: str) -> list[str]:
+    async with asyncio.timeout(_FETCH_PREPARATION_TIMEOUT_SECONDS):
+        return await _run_blocking(_check_ssrf, url)
+
+
+def _timeout_payload(url: str) -> dict[str, Any]:
+    return {
+        "url": url,
+        "final_url": url,
+        "status": 0,
+        "content_type": "",
+        "title": "",
+        "extract_mode": "markdown",
+        "extractor": "none",
+        "truncated": False,
+        "length": 0,
+        "text": "",
+        "error": "timed_out",
+        "hint": (
+            "The source timed out while loading; skip it, retry later, "
+            "or use another source."
+        ),
+    }
 
 
 def _web_fetch_request(args: Mapping[str, Any]) -> NetworkOperationRequest:
@@ -113,6 +140,17 @@ def _web_fetch_httpx_client_kwargs(
         **managed_kwargs,
     }
     if "proxy" in managed_kwargs:
+        # AsyncClient constructs its default AsyncHTTPTransport synchronously.
+        # This function already runs in the bounded fetch worker, so construct
+        # the managed transport here and pass the ready instance to the event
+        # loop.  Keep the explicit proxy and trust_env semantics while avoiding
+        # proxy/TLS setup on Gateway's loop.
+        proxy = managed_kwargs.get("proxy")
+        client_kwargs.pop("proxy", None)
+        client_kwargs["transport"] = httpx.AsyncHTTPTransport(
+            proxy=proxy,
+            trust_env=bool(managed_kwargs.get("trust_env")),
+        )
         return client_kwargs
 
     trust_env = bool(managed_kwargs.get("trust_env"))
@@ -168,8 +206,13 @@ async def _try_firecrawl(url: str, api_key: str) -> tuple[str, str, str] | None:
             timeout=30.0,
             **managed_network_httpx_kwargs(),
         ) as client:
-            resp = await client.post(
+            resp = await accounted_request(
+                client,
+                "POST",
                 "https://api.firecrawl.dev/v2/scrape",
+                provider="firecrawl",
+                operation="web_fetch",
+                base_url="https://api.firecrawl.dev",
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -257,7 +300,10 @@ async def run_web_fetch_payload(
     _search_excerpt: bool = False,
 ) -> dict[str, Any]:
     # --- SSRF guard ---
-    _check_ssrf(url)
+    try:
+        await _check_ssrf_async(url)
+    except TimeoutError:
+        return {**_timeout_payload(url), "extract_mode": extract_mode}
     from opensquilla.tools.builtin.web import _sensitive_body_block, _sensitive_url_marker
 
     marker = _sensitive_url_marker(url)
@@ -308,7 +354,7 @@ async def run_web_fetch_payload(
             }
         extracted_content, extractor_used, title = fc_result
         if extract_mode == "text":
-            extracted_content = _markdown_to_text(extracted_content)
+            extracted_content = await _run_blocking(_markdown_to_text, extracted_content)
         firecrawl_payload = {
             "url": url,
             "final_url": url,
@@ -339,14 +385,15 @@ async def run_web_fetch_payload(
         managed_kwargs = managed_network_httpx_kwargs()
         current_url = url
         for _redirect_count in range(_MAX_REDIRECTS + 1):
-            vetted = _check_ssrf(current_url)
-            marker = _sensitive_url_marker(current_url)
-            if marker is not None:
-                raise ValueError("Blocked redirect URL containing sensitive data")
+            async with asyncio.timeout(_FETCH_PREPARATION_TIMEOUT_SECONDS):
+                vetted = await _run_blocking(_check_ssrf, current_url)
+                marker = _sensitive_url_marker(current_url)
+                if marker is not None:
+                    raise ValueError("Blocked redirect URL containing sensitive data")
 
-            client_kwargs = _web_fetch_httpx_client_kwargs(
-                current_url, vetted, headers, managed_kwargs
-            )
+                client_kwargs = await _run_blocking(
+                    _web_fetch_httpx_client_kwargs, current_url, vetted, headers, managed_kwargs
+                )
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.get(current_url)
             if response.status_code not in {301, 302, 303, 307, 308}:
@@ -371,24 +418,8 @@ async def run_web_fetch_payload(
             status, final_url, content_type, raw_html = await _do_fetch(user_agent)
         except SSRFBlockedError:
             raise
-        except httpx.TimeoutException:
-            return {
-                "url": url,
-                "final_url": url,
-                "status": 0,
-                "content_type": "",
-                "title": "",
-                "extract_mode": extract_mode,
-                "extractor": "none",
-                "truncated": False,
-                "length": 0,
-                "text": "",
-                "error": "timed_out",
-                "hint": (
-                    "The source timed out while loading; skip it, retry later, "
-                    "or use another source."
-                ),
-            }
+        except (httpx.TimeoutException, TimeoutError):
+            return {**_timeout_payload(url), "extract_mode": extract_mode}
         except Exception as exc:
             last_error = str(exc)
             if attempt_idx == 0:
@@ -469,7 +500,7 @@ async def run_web_fetch_payload(
     extractor_used = "html2text"
 
     # 1. readability-lxml (local, free, main-content extraction)
-    rd_result = _try_readability(raw_html)
+    rd_result = await _run_blocking(_try_readability, raw_html)
     if rd_result is not None:
         title, extracted_content, extractor_used = rd_result
 
@@ -491,11 +522,11 @@ async def run_web_fetch_payload(
 
     # 3. html2text fallback — always succeeds on valid HTML
     if not extracted_content:
-        title, extracted_content, extractor_used = _try_html2text(raw_html)
+        title, extracted_content, extractor_used = await _run_blocking(_try_html2text, raw_html)
 
     # --- Mode conversion ---
     if extract_mode == "text":
-        extracted_content = _markdown_to_text(extracted_content)
+        extracted_content = await _run_blocking(_markdown_to_text, extracted_content)
 
     result = {
         "url": url,

@@ -5,6 +5,7 @@ import { CHAT_SEND_METHOD } from '@/contracts/generated/v4/chatSend'
 import { SESSIONS_PENDING_INPUTS_DISPATCH_METHOD } from '@/contracts/generated/v4/pendingInputsDispatch'
 import { SESSIONS_PENDING_INPUTS_STEER_METHOD } from '@/contracts/generated/v4/pendingInputsSteer'
 import { SESSIONS_STEER_V2_METHOD } from '@/contracts/generated/v4/sessionsSteerV2'
+import { TURNS_RECEIPT_GET_METHOD } from '@/contracts/generated/v4/turnsReceiptGet'
 
 import {
   createV4TurnCommands,
@@ -12,8 +13,161 @@ import {
   toWireSendParams,
 } from './turnCommandsV4'
 import type { TurnCommandsTransport } from './turnCommandsV4'
+import type { TurnReceiptRequest } from '@/modules/turnCommands'
+
+describe('explicit local path display metadata', () => {
+  it.each(['pageContext', 'page_context'])('rejects invalid %s at the final wire boundary', key => {
+    const context = { annotations: Array.from({ length: 17 }, () => ({ text: 'Keep this change' })) }
+    expect(() => toWireSendParams({ message: 'Keep my message', sessionKey: 's', [key]: context }))
+      .toThrow(expect.objectContaining({ failureCode: 'INVALID_REQUEST', accepted: false }))
+    expect(context.annotations).toHaveLength(17)
+  })
+
+
+  it('copies references without replacing the complete provider text', () => {
+    const paths = ['C:\\资料\\book.pdf']
+    const text = `Summarize\n${paths[0]}`
+    const wire = toWireSendParams({ message: text, sessionKey: 'session', localPathReferences: paths })
+    expect(wire.message).toBe(text)
+    expect(wire.localPathReferences).toEqual(paths)
+    expect(wire.localPathReferences).not.toBe(paths)
+  })
+
+  it('drops mismatched metadata but preserves manually typed text', () => {
+    const text = 'C:\\different.pdf'
+    expect(toWireSendParams({ message: text, sessionKey: 'session', localPathReferences: ['C:\\book.pdf'] }))
+      .toEqual({ message: text, sessionKey: 'session' })
+  })
+})
+
+describe('read-only delivery receipt adapter', () => {
+  const send: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn', params: {
+    message: 'frozen text', sessionKey: 'source', clientRequestId: 'request-1',
+    attachments: [{ type: 'text/plain', mime: 'text/plain', name: 'note.txt', file_uuid: 'original-token' }],
+    source: { runMode: 'safe' },
+  } } }
+  const found = () => ({ status: 'found', accepted: true, requestFingerprint: `sha256:${'a'.repeat(64)}`, receipt: {
+    requestSessionKey: 'source', sessionKey: 'target', sessionId: 'incarnation-1',
+    clientRequestId: 'request-1', messageId: 'message-1', sessionEpoch: 2,
+    taskId: 'task-1', taskStatus: 'running',
+  } })
+
+  it('looks up the frozen request as a fenced safe read and retains the authoritative target', async () => {
+    const request = vi.fn().mockResolvedValue(found())
+    const commands = createV4TurnCommands({ request, supports: method => method === TURNS_RECEIPT_GET_METHOD })
+    const controller = new AbortController()
+    expect(commands.supportsReceiptLookup?.()).toBe(true)
+    await expect(commands.lookupReceipt?.(send, { signal: controller.signal, expectedGeneration: 7 })).resolves.toEqual({
+      status: 'found', response: { ok: true, sessionKey: 'target', messageId: 'message-1', userMessageId: 'message-1',
+        replayed: true, taskId: 'task-1', taskStatus: 'running',
+        metadata: { requestFingerprint: `sha256:${'a'.repeat(64)}`, sessionId: 'incarnation-1', sessionEpoch: 2 } },
+    })
+    expect(request).toHaveBeenCalledExactlyOnceWith(TURNS_RECEIPT_GET_METHOD, {
+      operation: CHAT_SEND_METHOD, originalRequest: {
+        message: 'frozen text', sessionKey: 'source', clientRequestId: 'request-1',
+        attachments: [{ type: 'text/plain', mime: 'text/plain', name: 'note.txt', file_uuid: 'original-token' }],
+        _source: { runMode: 'safe' },
+      },
+    }, { signal: controller.signal, expectedGeneration: 7, recoveryClass: 'safe-read' })
+  })
+
+  it.each([false, undefined])('does not make any request to a Gateway without the advertised capability (%s)', async supported => {
+    const request = vi.fn()
+    const commands = createV4TurnCommands({ request, ...(supported !== undefined ? { supports: () => supported } : {}) })
+    await expect(commands.lookupReceipt?.(send)).resolves.toEqual({ status: 'unsupported' })
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it.each(['METHOD_NOT_FOUND', 'UNSUPPORTED'])('does not fall back to a send when %s is returned', async code => {
+    const request = vi.fn().mockRejectedValue(Object.assign(new Error('unsupported'), { code }))
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await expect(commands.lookupReceipt?.(send)).resolves.toEqual({ status: 'unsupported' })
+    expect(request).toHaveBeenCalledTimes(1)
+    expect(request.mock.calls[0]?.[0]).toBe(TURNS_RECEIPT_GET_METHOD)
+  })
+
+  it('treats a missing or deleted receipt as unknown without admitting anything', async () => {
+    const request = vi.fn().mockResolvedValue({ status: 'not_found', accepted: null })
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await expect(commands.lookupReceipt?.(send)).resolves.toEqual({ status: 'not-found' })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['clientRequestId', 'requestSessionKey'] as const)('rejects a valid receipt for another %s', async field => {
+    const value = found()
+    value.receipt[field] = 'another'
+    const commands = createV4TurnCommands({ request: vi.fn().mockResolvedValue(value), supports: () => true })
+    await expect(commands.lookupReceipt?.(send)).rejects.toBeInstanceOf(TurnCommandContractError)
+  })
+
+  it('projects a durable Steer receipt without permitting fallback to a new turn', async () => {
+    const value = found()
+    const request = vi.fn().mockResolvedValue({ ...value, receipt: { ...value.receipt, steer: {
+      key: 'target', session_key: 'target', session_id: 'incarnation-1', task_id: 'task-1',
+      turn_id: 'task-1', client_request_id: 'request-1', client_message_id: 'client-1',
+      user_message_id: 'message-1', surface_id: null, disposition: 'applied', status: 'accepted',
+      accepted: true, replayed: true, revision: 3, fallback_safe: false,
+    } } })
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await expect(commands.lookupReceipt?.({ kind: 'steer', request: {
+      key: 'source', message: 'adjust', expectedTurnId: 'task-1', clientRequestId: 'request-1', clientMessageId: 'client-1',
+    } })).resolves.toMatchObject({ status: 'found', response: {
+      accepted: true, replayed: true, sessionKey: 'target', taskId: 'task-1',
+      clientRequestId: 'request-1', disposition: 'applied', revision: 3, fallbackSafe: false,
+    } })
+  })
+
+  it.each(['FINGERPRINT_CONFLICT', 'FORBIDDEN'])('propagates %s without allowing automatic submission', async code => {
+    const request = vi.fn().mockRejectedValue(Object.assign(new Error('paused'), { code, accepted: null }))
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await expect(commands.lookupReceipt?.(send)).rejects.toMatchObject({ failureCode: code, accepted: null })
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    [{ kind: 'send', request: { kind: 'pending-input', params: { key: 'source', pendingInputId: 'pending-1',
+      clientRequestId: 'request-1', requestFingerprint: 'b'.repeat(64) } } }, SESSIONS_PENDING_INPUTS_DISPATCH_METHOD],
+    [{ kind: 'steer', request: { key: 'source', message: 'adjust', expectedTurnId: 'turn-1',
+      clientRequestId: 'request-1', clientMessageId: 'client-1' } }, SESSIONS_STEER_V2_METHOD],
+    [{ kind: 'steer', request: { key: 'source', message: 'adjust', expectedTurnId: 'turn-1',
+      clientRequestId: 'request-1', clientMessageId: 'client-1', pendingInputId: 'pending-1',
+      requestFingerprint: 'b'.repeat(64) } }, SESSIONS_PENDING_INPUTS_STEER_METHOD],
+  ] as const)('selects the original operation for %j', async (query, method) => {
+    const request = vi.fn().mockResolvedValue({ status: 'not_found', accepted: null })
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    await commands.lookupReceipt?.(query as TurnReceiptRequest)
+    expect(request.mock.calls[0]?.[1]).toMatchObject({ operation: method })
+    expect(request.mock.calls[0]?.[0]).toBe(TURNS_RECEIPT_GET_METHOD)
+  })
+})
 
 describe('v4 TurnCommands Adapter', () => {
+  it('fences an exact task Stop to the current generation and preserves an explicit older fence', async () => {
+    const request = vi.fn().mockResolvedValue({ aborted: true })
+    const commands = createV4TurnCommands({ request, generation: 7 })
+    const stop = { sessionKey: 'session-1', taskId: 'task-1', scope: 'task' }
+    await commands.cancel(stop)
+    await commands.cancel(stop, { expectedGeneration: 6 })
+    expect(request).toHaveBeenNthCalledWith(1, CHAT_ABORT_METHOD, stop, {
+      expectedGeneration: 7, recoveryClass: 'task-control',
+    })
+    expect(request).toHaveBeenNthCalledWith(2, CHAT_ABORT_METHOD, stop, {
+      expectedGeneration: 6, recoveryClass: 'task-control',
+    })
+  })
+
+  it.each([
+    { sessionKey: 'session-1' },
+    { sessionKey: 'session-1', scope: 'task' },
+    { sessionKey: 'session-1', taskId: 'task-1' },
+    { sessionKey: 'session-1', taskId: ' ', scope: 'task' },
+  ])('does not bypass recovery for an unscoped or unknown Stop %j', async stop => {
+    const request = vi.fn().mockResolvedValue({ aborted: false })
+    const commands = createV4TurnCommands({ request, generation: 7 })
+    await commands.cancel(stop)
+    expect(request).toHaveBeenCalledExactlyOnceWith(CHAT_ABORT_METHOD, stop)
+  })
+
   it('maps semantic admission to chat.send without changing the payload', async () => {
     const request = vi.fn(async <T = unknown>() => (
       {
@@ -46,6 +200,15 @@ describe('v4 TurnCommands Adapter', () => {
     expect(request).toHaveBeenCalledWith(CHAT_SEND_METHOD, params)
   })
 
+  it('preserves a narrow ordinary-turn command and rejects malformed descriptors', () => {
+    const turnCommand = { name: 'project.init' as const, args: 'retain existing rules' }
+    expect(toWireSendParams({ message: '/init retain existing rules', sessionKey: 's', turnCommand }))
+      .toMatchObject({ turnCommand })
+    expect(() => toWireSendParams({ message: '/init', sessionKey: 's',
+      turnCommand: { name: 'anything', args: '' } as never }))
+      .toThrow(expect.objectContaining({ failureCode: 'INVALID_REQUEST', accepted: false }))
+  })
+
   it('validates a pinned first turn with selected skills, workspace references and imported files', async () => {
     const request = vi.fn(async <T>() => ({ sessionKey: 'agent:main:test' } as T)) as TurnCommandsTransport['request']
     const commands = createV4TurnCommands({ request, supports: () => true })
@@ -53,6 +216,7 @@ describe('v4 TurnCommands Adapter', () => {
       message: 'edit the notes', sessionKey: 'agent:main:test',
       intent: 'new_chat', initialModel: 'model-a', initialProvider: 'provider-a', initialRoutingMode: 'direct' as const,
       selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }],
+      requiredServices: ['desktop_browser'],
       workspaceFiles: [{ workspaceId: 'project-1', relativePath: 'docs/notes.md', name: 'notes.md', mime: 'text/markdown' }],
       attachments: [{ type: 'application/pdf', mime: 'application/pdf', name: 'original.pdf', file_uuid: 'fixture-file' }],
     }

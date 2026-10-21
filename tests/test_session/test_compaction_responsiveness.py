@@ -22,53 +22,6 @@ def _rounds(count):
     ]
 
 
-@pytest.mark.parametrize("wire_round_limit", [1, 7, 256])
-def test_chunk_projection_work_is_bounded(monkeypatch, wire_round_limit):
-    entries = _rounds(256)
-    original = deepcopy(entries)
-    measured = []
-    projected_entries = 0
-
-    def measure(group):
-        measured.append(group)
-        return len(group)
-
-    def request_fits(chunk, _later):
-        nonlocal projected_entries
-        projected_entries += len(chunk)
-        return len(chunk) <= wire_round_limit * 2
-
-    monkeypatch.setattr(compaction, "_compaction_input_tokens", measure)
-    chunks = compaction._chunk_entries(entries, 10000, request_fits=request_fits)
-
-    assert entries == original
-    assert [entry for chunk in chunks for entry in chunk] == original
-    assert all(len(chunk) <= wire_round_limit * 2 for chunk in chunks)
-    assert all(len(chunk) % 2 == 0 for chunk in chunks)
-    assert all(len(chunk) == wire_round_limit * 2 for chunk in chunks[:-1])
-    assert len(measured) == 256
-    # Count actual input work, not just function calls: probing the entire
-    # remaining history for every tiny wire chunk would still be quadratic.
-    assert projected_entries <= len(entries) * 10
-
-
-def test_oversized_tool_round_is_preserved_for_send_admission(monkeypatch):
-    tool_round = [
-        {"role": "user", "content": "Read the synthetic source"},
-        {"role": "assistant", "tool_calls": [{"id": "call-synthetic"}]},
-        {"role": "tool", "tool_call_id": "call-synthetic", "content": "large " * 50},
-    ]
-    entries = _rounds(1) + tool_round + _rounds(1)
-    monkeypatch.setattr(compaction, "_compaction_input_tokens", lambda group: len(group))
-
-    chunks = compaction._chunk_entries(
-        entries, 2, request_fits=lambda chunk, _later: len(chunk) <= 2,
-    )
-
-    assert chunks == [entries[:2], tool_round, entries[-2:]]
-    assert [entry for chunk in chunks for entry in chunk] == entries
-
-
 def _request():
     return compaction.CompactionRequest(
         session_id="synthetic-responsive-compaction",
@@ -81,7 +34,7 @@ def _request():
 
 
 @pytest.mark.parametrize("preparation", [
-    "_compaction_source_size", "_chunk_entries", "_fit_compaction_input_to_target",
+    "_compaction_source_size", "_bound_summary_history", "_fit_compaction_input_to_target",
 ])
 async def test_slow_compaction_preparation_allows_storage_reads(monkeypatch, preparation):
     loop = asyncio.get_running_loop()
@@ -125,11 +78,11 @@ async def test_cancellation_during_preparation_does_not_start_provider(monkeypat
     request = _request()
     source = deepcopy(request.entries)
 
-    def slow_measure(entries):
+    def slow_measure(entries, **kwargs):
         loop.call_soon_threadsafe(entered.set)
         try:
             assert released.wait(5)
-            return original(entries)
+            return original(entries, **kwargs)
         finally:
             loop.call_soon_threadsafe(finished.set)
 

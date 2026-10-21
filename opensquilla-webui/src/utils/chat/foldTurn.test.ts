@@ -59,6 +59,52 @@ describe('foldTurn — tool result preservation', () => {
 })
 
 describe('foldTurn — text, thinking, status, artifacts', () => {
+  it.each([
+    ['read_file', 'intermediate'],
+    ['exec', 'intermediate'],
+    ['update_plan', 'answer'],
+    ['functions.updatePlan', 'answer'],
+    ['plan_run_checkpoint', 'answer'],
+  ])('classifies text before %s consistently in live snapshots and replay', (name, presentation) => {
+    const events: Frame[] = [
+      { kind: 'text', seq: 0, text: 'Before the tool.', presentation: 'answer', activityOrder: 10 },
+      { kind: 'tool-start', seq: 1, toolId: 'tool', name, input: '{}', at: 1, activityOrder: 11 },
+      { kind: 'tool-result', seq: 2, toolId: 'tool', name, input: '{}', result: 'failed', isError: true, at: 2 },
+      { kind: 'text', seq: 3, text: 'Final answer.', presentation: 'answer', activityOrder: 20 },
+      // Repeated results for an earlier call must not displace the answer.
+      { kind: 'tool-result', seq: 4, toolId: 'tool', name, input: '{}', result: 'failed', isError: true, at: 3 },
+    ]
+    const accumulator = new TurnAccumulator()
+    events.forEach(event => accumulator.append(event))
+    for (const projection of [fold(events), accumulator.snapshot(renderMarkdown, toolCallGroups)]) {
+      expect(projection.timelineSegments.filter(segment => segment.type === 'text')).toEqual([
+        { type: 'text', raw: 'Before the tool.', presentation, activityOrder: 10 },
+        { type: 'text', raw: 'Final answer.', presentation: 'answer', activityOrder: 20 },
+      ])
+      expect(projection.toolCalls[0]).toMatchObject({ isError: true, status: 'error' })
+    }
+  })
+
+  it.each(['Canonical replacement.', ''])('retains authoritative snapshot replacement after publishing narration: %j', replacement => {
+    const events: Frame[] = [
+      { kind: 'text', seq: 0, text: 'Provisional preface.', presentation: 'answer' },
+      { kind: 'tool-start', seq: 1, toolId: 'tool', name: 'exec', input: '{}', at: 1 },
+    ]
+    const accumulator = new TurnAccumulator()
+    events.forEach(event => accumulator.append(event))
+    const before = accumulator.snapshot(renderMarkdown, toolCallGroups)
+    expect(before.timelineSegments[0]).toMatchObject({ presentation: 'intermediate' })
+    const final: Frame = { kind: 'final-text', seq: 2, text: replacement }
+    accumulator.append(final)
+    for (const projection of [fold([...events, final]), accumulator.snapshot(renderMarkdown, toolCallGroups)]) {
+      expect(projection.rawText).toBe(replacement)
+      expect(projection.timelineSegments.filter(segment => segment.type === 'text').map(segment => segment.raw))
+        .toEqual(replacement ? [replacement] : [])
+      expect(projection.toolCalls).toHaveLength(1)
+    }
+    expect(before.timelineSegments[0]).toMatchObject({ raw: 'Provisional preface.', presentation: 'intermediate' })
+  })
+
   it('keeps a resolved approval in its true position between later timeline events', () => {
     const interruptState = new Map<string, InterruptViewState>([
       ['approval-1', { resolution: 'approved', busy: false, error: '' }],
@@ -505,6 +551,21 @@ describe('execution log reference preservation', () => {
       expect(projection.toolCalls[0]).toMatchObject({
         executionLogHandle: handle, result: 'model-sized preview', status: 'error',
       })
+    }
+  })
+})
+
+describe('recorded file snapshot preservation', () => {
+  it.each([false, true])('keeps success snapshots and discards failed snapshots in both reducers: isError=%s', isError => {
+    const fileSnapshot = { kind: 'edit' as const, path: 'a.ts', content: '-before\n+after' }
+    const event: Frame = {
+      kind: 'tool-result', seq: 0, toolId: 'edit-1', name: 'edit_file', input: '{}',
+      result: isError ? 'Permission denied' : 'Applied edit', fileSnapshot, isError, at: 1,
+    }
+    const accumulator = new TurnAccumulator()
+    accumulator.append(event)
+    for (const projection of [fold([event]), accumulator.snapshot(renderMarkdown, toolCallGroups)]) {
+      expect(projection.toolCalls[0]?.fileSnapshot).toEqual(isError ? undefined : fileSnapshot)
     }
   })
 })

@@ -30,6 +30,8 @@ from opensquilla.provider import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
+from opensquilla.session.models import SessionNode
+from opensquilla.session.storage import SessionStorage
 
 MODEL = "qwen3:4b"
 OBJECTIVE = "Produce and verify a deterministic release report"
@@ -114,7 +116,10 @@ class DeterministicGoalProvider:
                     or "&quot;progress&quot;: null" in request_context
                 ),
                 "firstReplyInAssistantHistory": expected_first_reply in assistant_history,
-                "requestHasInternalContinuation": "[INTERNAL SYSTEM EVENT]" in message_text,
+                "requestHasInternalContinuation": (
+                    "[GOAL CONTINUATION]" in message_text
+                    or "[INTERNAL SYSTEM EVENT]" in message_text
+                ),
                 "historyHasSilentSentinel": (
                     "NO_REPLY" in assistant_history or "HEARTBEAT_OK" in assistant_history
                 ),
@@ -142,7 +147,7 @@ class DeterministicGoalProvider:
             )
             return
         if call_number == 2:
-            # This first automatic continuation is an internal system event.
+            # This first automatic continuation is an internal Goal context.
             # Hold Done after the raw provider delta so Playwright can prove no
             # marker escapes into either the WebSocket stream or live DOM.
             yield TextDeltaEvent(text=SILENT_MIXED_REPLY)
@@ -230,7 +235,7 @@ class DeterministicGoalProvider:
             # The browser releases this only after proving that Task 1 settled,
             # Goal state stayed active, and the automatic Task 2 reached the
             # provider with the original objective and transcript history. The
-            # first Task intentionally did not call update_goal_progress.
+            # first Task intentionally did not call update_plan.
             await self._wait_for_release(call_number, self._second_release_file)
             yield ToolUseStartEvent(
                 tool_use_id="goal-complete-2",
@@ -339,6 +344,19 @@ async def main() -> None:
     workspace_dir = state_dir / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
+    # Read-only browser fixtures need durable identities for the real V2 lease
+    # protocol. Seed these before Gateway startup without invoking a Provider.
+    initial_keys = json.loads(
+        os.environ.get("OPENSQUILLA_WEBUI_GOAL_E2E_INITIAL_SESSION_KEYS", "[]"),
+    )
+    if initial_keys:
+        storage = await SessionStorage.open(state_dir / "sessions.db")
+        try:
+            for key in initial_keys:
+                await storage.upsert_session(SessionNode(session_key=key, agent_id="main"))
+        finally:
+            await storage.close()
+
     config = GatewayConfig(
         host="127.0.0.1",
         port=port,
@@ -356,7 +374,6 @@ async def main() -> None:
     config.naming.enabled = False
     config.compaction.enabled = False
     config.memory.ttl_sweep_interval_minutes = 0
-    config.meta_skill.enabled = False
     config.heartbeat.enabled = False
     config.goal.execution_enabled = True
     config.task_runtime.max_concurrency = 1

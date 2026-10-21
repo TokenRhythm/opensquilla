@@ -30,12 +30,12 @@ const parsed = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, tr
 const declarations = new Map(parsed.statements.filter(ts.isFunctionDeclaration)
   .filter(node => node.name).map(node => [node.name.text, node]))
 const names = [
-  'windowsInstallerActionsSupported', 'windowsUpdateDownloadDirectory', 'clearWindowsUpdateCache',
+  'windowsInstallerActionsSupported', 'desktopUpdateAutomaticDownloadSupported', 'windowsUpdateDownloadDirectory', 'clearWindowsUpdateCache',
   'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache', 'revalidateReadyWindowsInstaller',
   'activeDesktopUpdateSnoozeFor', 'clearDesktopUpdateSnoozeIfVersionChanged',
   'desktopUpdateSnapshot', 'publishDesktopUpdateState', 'setDesktopUpdateState',
-  'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate',
-  'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates',
+  'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate', 'runDesktopUpdateDownload',
+  'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkDesktopUpdateCandidate', 'checkForUpdates',
   'desktopUpdatePlatform', 'desktopUpdateLocaleTags',
   'fetchDesktopUpdateChannelFromRoot', 'fetchDesktopUpdateChannelFromGithubReleases', 'fetchDesktopUpdateChannel',
   'probeDesktopUpdateSource', 'chooseDesktopUpdateSource', 'rememberSuccessfulUpdateSource',
@@ -120,12 +120,14 @@ function fixture(options = {}) {
     desktopUpdateCandidate: null, nativeUpdateReady: null, downloadedUpdateVersion: null,
     verifiedManualInstallerPath: null, windowsUpdateCacheDescriptor: null,
     windowsUpdateCacheRestore: null, windowsUpdateCacheRestoreAttempted: false,
+    desktopUpdateDownloadTask: null, desktopUpdateDownloadOrigin: null,
     updateApplying: false, updateDownloadInProgress: false, manualInstallerActionInProgress: false,
     isQuitting: false, desktopWriters: new DesktopWriterAdmission(), lastSuccessfulUpdateSource: null,
     loadDesktopUpdatePersistence: () => {}, persistDesktopUpdateState: async () => {},
     verifyCachedInstaller: (cacheDirectory, descriptor, version, constraints = {}) => verifyCachedInstaller(
       cacheDirectory, descriptor, version, { ...constraints, verifySignature: async verifiedPath => {
         calls.signatures += 1
+        if (options.signatureGate) await options.signatureGate
         assert.equal(verifiedPath, await realpath(path), 'the signer seam receives only this synthetic cache file')
         assert.equal(createHash('sha256').update(await readFile(verifiedPath)).digest('hex'), digest)
         assert.ok(await loadWindowsUpdateCache(directory), 'verified download metadata must precede the signer seam')
@@ -156,6 +158,7 @@ function fixture(options = {}) {
       }
       if (url.href === installerUrl) {
         if (range) { assert.equal(range, 'bytes=0-0'); return new Response(bytes.subarray(0, 1), { status: 206 }) }
+        if (options.downloadGate) await options.downloadGate
         const body = options.tamperedDownload ? Buffer.alloc(bytes.length, 0x58) : bytes
         return new Response(body, { headers: { 'Content-Length': String(body.length) } })
       }
@@ -188,6 +191,71 @@ async function check(name, test) {
 
 try {
   let completed
+  await check('automatic check downloads and verifies without a renderer download or installer reveal', async () => {
+    const f = fixture()
+    await f.subject.checkForUpdates(false)
+    assert.ok(f.context.desktopUpdateDownloadTask, 'discovery schedules the production shared flight')
+    await f.context.desktopUpdateDownloadTask
+    const state = f.state()
+    assert.equal(state.status, 'downloaded')
+    assert.equal(state.canAutoDownload, true)
+    assert.equal(state.canInstall, true)
+    assert.equal(state.releaseNotesUrl, candidate.releaseUrl)
+    assert.notEqual(state.releaseNotesUrl, state.releaseUrl, 'release notes must not use the Windows installer URL')
+    assert.equal(f.calls.signatures, 1)
+    assert.deepEqual(f.calls.reveals, [])
+    assert.equal(f.calls.states.some(state => state.status === 'applying'), false)
+  })
+  await check('100 percent bytes remain downloading until signature verification finishes', async () => {
+    let releaseSignature
+    const signatureGate = new Promise(resolve => { releaseSignature = resolve })
+    const f = fixture({ signatureGate })
+    await f.subject.checkForUpdates(false)
+    while (f.calls.signatures === 0) await new Promise(setImmediate)
+    assert.equal(f.state().progress, 100)
+    assert.equal(f.state().status, 'downloading')
+    assert.equal(f.calls.states.some(state => state.status === 'downloaded'), false)
+    const flight = f.context.desktopUpdateDownloadTask
+    releaseSignature()
+    await flight
+    assert.equal(f.state().status, 'downloaded')
+  })
+  await check('user download joins a background flight without duplicate bytes or opening Explorer', async () => {
+    let releaseDownload
+    const downloadGate = new Promise(resolve => { releaseDownload = resolve })
+    const f = fixture({ downloadGate })
+    await f.subject.checkForUpdates(false)
+    const flight = f.context.desktopUpdateDownloadTask
+    assert.ok(flight)
+    assert.equal(f.context.desktopUpdateDownloadOrigin, 'automatic')
+    assert.equal(f.subject.downloadDesktopUpdate(), flight)
+    assert.equal(f.context.desktopUpdateDownloadOrigin, 'user')
+    releaseDownload()
+    await flight
+    assert.equal(f.state().status, 'downloaded')
+    assert.equal(f.calls.requests.filter(request => request.url === installerUrl && !request.range).length, 1)
+    assert.deepEqual(f.calls.reveals, [])
+  })
+  await check('automatic verification failure remains unready and preserves diagnostics without a reveal', async () => {
+    const f = fixture({ signatureError: 'signature_unavailable' })
+    await f.subject.checkForUpdates(false)
+    await f.context.desktopUpdateDownloadTask
+    assert.equal(f.state().status, 'error')
+    assert.equal(f.state().errorCode, 'signature_unavailable')
+    assert.equal(f.calls.states.some(state => state.status === 'downloaded'), false)
+    assert.deepEqual(f.calls.reveals, [])
+    assert.equal(f.context.desktopUpdateDownloadTask, null)
+    assert.equal(f.context.desktopUpdateDownloadOrigin, null)
+    assert.ok(await loadWindowsUpdateCache(f.directory), 'verified bytes are reusable when the OS verifier recovers')
+  })
+  await check('manual-only channels remain available until a user requests download', async () => {
+    const f = fixture({ disableInstall: true })
+    await f.subject.checkForUpdates(false)
+    assert.equal(f.state().canAutoDownload, false)
+    assert.equal(f.state().status, 'available')
+    assert.equal(f.context.desktopUpdateDownloadTask, null)
+    assert.equal(f.calls.requests.some(request => request.url === installerUrl && !request.range), false)
+  })
   await check('OSS-only discovery, feed probe, checksum, download and cache verification succeed without GitHub', async () => {
     const f = fixture()
     await discover(f)

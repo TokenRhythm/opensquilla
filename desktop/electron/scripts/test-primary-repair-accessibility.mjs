@@ -134,6 +134,10 @@ function launchEnvironment(isolatedHome) {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
+    APPDATA: join(isolatedHome, 'AppData', 'Roaming'),
+    LOCALAPPDATA: join(isolatedHome, 'AppData', 'Local'),
+    TEMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
+    TMP: join(isolatedHome, 'AppData', 'Local', 'Temp'),
     OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
     OPENSQUILLA_USER_STATE_DIR: join(isolatedHome, 'user-state'),
@@ -166,7 +170,10 @@ async function createFixture(locale, blockingCase) {
 
   await mkdir(primaryWorkspace, { recursive: true })
   await mkdir(primaryState, { recursive: true })
-  await mkdir(isolatedHome, { recursive: true })
+  await Promise.all([
+    mkdir(join(isolatedHome, 'AppData', 'Roaming'), { recursive: true }),
+    mkdir(join(isolatedHome, 'AppData', 'Local', 'Temp'), { recursive: true }),
+  ])
   for (const [name, text] of [
     ['USER.md', 'synthetic accessibility user\n'],
     ['SOUL.md', 'synthetic accessibility soul\n'],

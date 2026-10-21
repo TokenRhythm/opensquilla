@@ -6,6 +6,7 @@ import copy
 import ipaddress
 import logging
 import os
+import re
 import threading
 import warnings
 from enum import StrEnum
@@ -41,13 +42,14 @@ from opensquilla.application.config_secrets import (
 from opensquilla.application.config_secrets import (
     redact_public_config as redact_public_config,
 )
+from opensquilla.compaction_timing import DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
 from opensquilla.gateway.config_migration import (
     DEPRECATED_MEMORY_LEAVES,
     LATEST_CONFIG_VERSION,
     ConfigParseError,
-    backup_and_write_migrated_config,
     handle_deprecated_skill_filter_env,
     migrate_config_payload,
+    rewrite_migrated_config_best_effort,
     strip_deprecated_skill_filter_settings,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -55,11 +57,18 @@ from opensquilla.provider.credentials import (
     credential_provider_hint,
     endpoint_provider_hint,
 )
+from opensquilla.provider.image_generation_policy import DEFAULT_IMAGE_GENERATION_PRIMARY
 from opensquilla.provider.preset_registry import (
     PREVIOUS_RECOMMENDED_TEXT_MODELS,
     get_preset,
     legacy_profile_ids,
     router_ladder_provider,
+)
+from opensquilla.provider.video_generation_policy import (
+    VIDEO_GENERATION_DEFAULT_ENV_KEYS,
+    VIDEO_GENERATION_OFFICIAL_BASE_URLS,
+    conflicting_video_generation_endpoint_provider,
+    is_valid_video_generation_base_url,
 )
 from opensquilla.router_tiers import (
     CUSTOM_B5_MAX_PROPOSERS,
@@ -167,10 +176,7 @@ class AuthConfig(BaseSettings):
             ipaddress.IPv4Network(value)
             for value in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
         )
-        private_v6 = tuple(
-            ipaddress.IPv6Network(value)
-            for value in ("::1/128", "fc00::/7")
-        )
+        private_v6 = tuple(ipaddress.IPv6Network(value) for value in ("::1/128", "fc00::/7"))
         normalized: list[str] = []
         for raw in values:
             network = ipaddress.ip_network(str(raw).strip(), strict=False)
@@ -223,7 +229,7 @@ class AttachmentsConfig(BaseSettings):
     # into a provider prompt — they are staged into the agent workspace for
     # tool access only. False restores the rendered-types-only admission gate.
     accept_opaque: bool = True
-    opaque_max_bytes: int = 30 * 1024 * 1024
+    opaque_max_bytes: int = 50 * 1024 * 1024
     # Aggregate byte ceiling for the temporary staged-upload store. When
     # reached, new uploads are rejected (HTTP 507 UPLOAD_STORE_FULL) instead
     # of evicting staged entries, preserving the file_uuid TTL promise.
@@ -241,6 +247,15 @@ class RateLimitConfig(BaseSettings):
     enabled: bool = True
     max_requests: int = 100
     window_seconds: int = 60
+    # Content reads are a separate, bounded capability.  A transcript is
+    # deliberately read in 1 MiB ranges, so charging those requests to the
+    # small control/API bucket makes a normal history or export compete with
+    # startup traffic.  Keep an independent request budget instead of
+    # disabling abuse protection altogether.  The content endpoint enforces
+    # the per-range byte limit; this budget therefore caps the aggregate
+    # amount a client can read in one window as well.
+    content_max_requests: int = 1200
+    content_window_seconds: int = 60
 
 
 class ControlUiConfig(BaseSettings):
@@ -355,10 +370,7 @@ class PrivacyConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _migrate_scoped_telemetry_preferences(self) -> PrivacyConfig:
-        if (
-            self.reliability_diagnostics_enabled is False
-            or self.product_analytics_enabled is False
-        ):
+        if self.reliability_diagnostics_enabled is False or self.product_analytics_enabled is False:
             self.disable_network_observability = True
         for field_name in _SCOPED_TELEMETRY_CONSENT_FIELDS:
             setattr(self, field_name, None)
@@ -391,11 +403,6 @@ class SkillsConfig(BaseSettings):
     # Names of skills the operator has turned off (e.g. via the control-UI
     # plugin toggle). A disabled skill is gated out of the agent's view.
     disabled: list[str] = Field(default_factory=list)
-    # Coding mode (control-UI toggle). When ON, the agent operates in a
-    # locked coding mode: the code-task plugin is available and a directive
-    # steers every turn through it. When OFF, code-task is unreachable through
-    # every skill API. Default OFF — coding mode is opt-in.
-    coding_mode: bool = False
     max_skills_prompt_chars: int = 8000
     # "system" = full system prompt (default)
     # "user_context" = ephemeral user-role context, after history and before current user
@@ -406,7 +413,9 @@ class SkillsConfig(BaseSettings):
     @classmethod
     def _ignore_retired_filter_settings(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            return strip_deprecated_skill_filter_settings(data)
+            return strip_deprecated_skill_filter_settings(
+                {key: value for key, value in data.items() if key != "coding_mode"}
+            )
         return data
 
 
@@ -420,13 +429,6 @@ class ToolsConfig(BaseModel):
             "memory_only",
             "coding",
             "messaging",
-            "repo_coding_source_edit",
-            "repo_coding_source_edit_strict",
-            "repo_coding_source_edit_v2",
-            "repo_coding_source_edit_balanced",
-            "repo_coding_source_edit_patch_fallback",
-            "repo_coding_scaffold_edit",
-            "repo_coding_scaffold_patch",
         ]
         | None
     ) = None
@@ -439,6 +441,21 @@ class ToolsConfig(BaseModel):
     file_edit_requires_fresh_read: bool | None = None
     file_edit_flexible_recovery: bool | None = None
     trusted_fake_ip_cidrs: list[str] = Field(default_factory=list)
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _retire_repo_coding_profiles(cls, value: object) -> object:
+        if value in (
+            "repo_coding_source_edit",
+            "repo_coding_source_edit_strict",
+            "repo_coding_source_edit_v2",
+            "repo_coding_source_edit_balanced",
+            "repo_coding_source_edit_patch_fallback",
+            "repo_coding_scaffold_edit",
+            "repo_coding_scaffold_patch",
+        ):
+            return "coding"
+        return value
 
     @field_validator("trusted_fake_ip_cidrs")
     @classmethod
@@ -460,6 +477,10 @@ class TaskRuntimeConfig(BaseModel):
     """Server-side task-runtime queue settings."""
 
     max_concurrency: int = Field(default=8, ge=1)
+    # Resident admission spans reservations, queued/running turns and terminal
+    # settlement. It is separate from per-session pending limits so many
+    # sessions cannot exhaust the process with inert durable work.
+    max_resident_tasks: int = Field(default=256, ge=1)
     max_pending_per_session: int = Field(default=64, ge=1)
     # Per-channel-adapter in-flight semaphore (separate from
     # task_runtime._global_sem). Configured here so OPENSQUILLA_CHANNEL_INFLIGHT_CAP
@@ -500,9 +521,7 @@ class TaskRuntimeConfig(BaseModel):
             PendingOverflowPolicy(value)
         except ValueError as exc:
             valid = ", ".join(member.value for member in PendingOverflowPolicy)
-            raise ValueError(
-                f"pending_overflow_policy must be one of {{{valid}}}"
-            ) from exc
+            raise ValueError(f"pending_overflow_policy must be one of {{{valid}}}") from exc
         return value
 
     @field_validator("pending_overflow_policy_per_channel")
@@ -516,8 +535,7 @@ class TaskRuntimeConfig(BaseModel):
                 PendingOverflowPolicy(policy)
             except ValueError as exc:
                 raise ValueError(
-                    f"pending_overflow_policy_per_channel[{channel!r}] "
-                    f"must be one of {{{valid}}}"
+                    f"pending_overflow_policy_per_channel[{channel!r}] must be one of {{{valid}}}"
                 ) from exc
         return value
 
@@ -752,8 +770,7 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.min_successful_proposers"
             )
         if (
-            self.selection_mode
-            in STATIC_B5_SELECTION_MODES
+            self.selection_mode in STATIC_B5_SELECTION_MODES
             and self.target_successful_proposers is not None
             and self.target_successful_proposers > 4
         ):
@@ -813,9 +830,8 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.min_successful_proposers cannot exceed the "
                 f"custom_b5 proposer count ({len(proposers)})"
             )
-        if (
-            self.target_successful_proposers is not None
-            and self.target_successful_proposers > len(proposers)
+        if self.target_successful_proposers is not None and self.target_successful_proposers > len(
+            proposers
         ):
             raise ValueError(
                 "llm_ensemble.target_successful_proposers cannot exceed the "
@@ -849,9 +865,7 @@ def _configured_static_b5_selection_modes(config: Any) -> tuple[str, ...]:
             getattr(router, "tiers", None),
             shared_selection_mode=global_mode,
         )
-        modes.extend(
-            mode for mode in tier_modes.values() if mode in STATIC_B5_SELECTION_MODES
-        )
+        modes.extend(mode for mode in tier_modes.values() if mode in STATIC_B5_SELECTION_MODES)
     return tuple(dict.fromkeys(modes))
 
 
@@ -1080,8 +1094,6 @@ class PromptConfig(BaseModel):
         "full",
         "minimal",
         "none",
-        "headless_source_edit",
-        "headless_repo_coding_scaffold",
     ] = "auto"
     platform_hint_enabled: bool = True
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
@@ -1090,6 +1102,13 @@ class PromptConfig(BaseModel):
     finalize_evidence_gate: bool = False
     # Deprecated, unused. Accepted so existing configuration still loads.
     legacy_prompt_style: bool = False
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def retire_headless_modes(cls, value: object) -> object:
+        if value in ("headless_source_edit", "headless_repo_coding_scaffold"):
+            return "auto"
+        return value
 
 
 MemoryEmbeddingProvider = Literal[
@@ -1314,54 +1333,6 @@ class RouterBudgetConfig(BaseModel):
     include_next_turn_estimate: bool = False
 
 
-class RouterSelfLearningConfig(BaseModel):
-    """Squilla Router self-learning loop (capture + offline retrain).
-
-    Opt-in. ``enabled`` is the master switch; capture and training each have
-    their own sub-toggle so an operator can collect data without yet training.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False  # master switch; off => zero overhead on the hot path
-    capture_enabled: bool = True  # gates inference-time feature emission
-    enable_mlp: bool = False  # also store raw_bge_1536 for MLP fine-tune (phase 2)
-    store_audit_summary: bool = False  # opt-in redacted summary, audit only
-    # Trigger gating (evaluated cheaply on each post-dream hook).
-    train_min_samples: int = Field(default=200, ge=1)
-    idle_hours: float = Field(default=2.0, ge=0.0)
-    cooldown_hours: float = Field(default=72.0, ge=0.0)
-    retention_days: int = Field(default=30, ge=1)
-    # Training (LightGBM incremental) — consumed by the offline trainer/worker.
-    num_boost_round: int = Field(default=60, ge=1)
-    train_timeout_seconds: float = Field(default=900.0, gt=0.0)
-    # Promotion / rollback.
-    auto_rollback: bool = True
-    golden_eval_path: str | None = None
-    cost_tolerance_pct: float = Field(default=5.0, ge=0.0)
-    max_critical_under_routing: float = Field(default=0.30, ge=0.0, le=1.0)
-    min_golden_agreement: float = Field(default=0.5, ge=0.0, le=1.0)
-    # Online rollback monitor (M4).
-    min_monitor_samples: int = Field(default=30, ge=1)
-    complaint_regression_delta: float = Field(default=0.05, ge=0.0, le=1.0)
-    # Second rollback trigger: explicit down-vote-rate regression (F7).
-    # Feedback is far sparser than samples, hence its own minimum and a
-    # wider delta than the complaint monitor.
-    min_feedback_monitor_samples: int = Field(default=5, ge=1)
-    downvote_regression_delta: float = Field(default=0.15, ge=0.0, le=1.0)
-    # Rolling holdout (per-agent progress metric).
-    holdout_pct: float = Field(default=0.10, ge=0.0, le=0.5)
-    holdout_repeats: int = Field(default=5, ge=1)
-    holdout_min_size: int = Field(default=30, ge=1)
-    holdout_granularity: Literal["session", "alignment_group"] = "session"
-
-
-# Resolve this model's own forward refs (Literal) before it is nested below, so
-# rebuilding the parent does not leave it "not fully defined" under the
-# unregistered-module exec path used by tests. See the rebuild note below.
-RouterSelfLearningConfig.model_rebuild()
-
-
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -1436,7 +1407,6 @@ class SquillaRouterConfig(BaseSettings):
     # rollback-tolerant).
     budget: RouterBudgetConfig = Field(default_factory=RouterBudgetConfig)
     estimated_output_savings_pct: float = 0.03
-    self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
     # Deprecated compatibility fields: active history is retained until compaction;
     # image routing no longer imposes a separate turn window.
     vision_history_lookback_turns: int = Field(default=8, ge=0)
@@ -1505,8 +1475,7 @@ class SquillaRouterConfig(BaseSettings):
                 )
                 if raw_enabled is not None and not isinstance(raw_enabled, bool):
                     raise ValueError(
-                        f"squilla_router.tiers.{tier_name}.ensemble_enabled "
-                        "must be a boolean"
+                        f"squilla_router.tiers.{tier_name}.ensemble_enabled must be a boolean"
                     )
             selection_mode = TierConfig.from_value(raw_tier).ensemble_selection_mode
             if selection_mode and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES:
@@ -1517,11 +1486,7 @@ class SquillaRouterConfig(BaseSettings):
         return self
 
 
-# Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
-# (``from __future__ import annotations`` makes it a string). Without this the
-# model stays "not fully defined" when this file is exec'd as an unregistered
-# module (e.g. tests load it via spec_from_file_location), since pydantic falls
-# back to ``sys.modules[__module__]`` which is absent in that scenario.
+# Resolve nested routing models for callers loading this module by file path.
 SquillaRouterConfig.model_rebuild()
 
 
@@ -1545,16 +1510,17 @@ class AgentTokenSavingConfig(BaseSettings):
 class CompactionLlmConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_COMPACTION_")
 
-    # A provider is meaningful only together with ``model``.  Model-only
-    # remains the backwards-compatible "override the selected provider's
-    # model" form; a complete pair selects an explicit physical deployment.
-    provider: str | None = None
-    model: str | None = None  # None = use session model
-    timeout_seconds: float = 90.0
-    # Absolute budget shared by all summarization chunks and fallbacks.  The
+    # Deprecated load/save compatibility. Summary generation always uses the
+    # current physical deployment; keep old values without rewriting profiles.
+    provider: str | None = Field(default=None, json_schema_extra={"deprecated": True})
+    model: str | None = Field(default=None, json_schema_extra={"deprecated": True})
+    # Legacy explicit values remain semantic idle limits. None inherits the
+    # normal request timeout; it never replaces the provider's I/O policy.
+    timeout_seconds: float | None = None
+    # Absolute budget shared by all summarization chunks and revisions. The
     # durable commit has separate bounded SQLite semantics and is reconciled if
     # cancellation races with commit completion.
-    total_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    total_timeout_seconds: float = Field(default=DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS, gt=0.0)
     heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
@@ -1564,42 +1530,23 @@ class CompactionLlmConfig(BaseSettings):
     def _normalize_explicit_deployment(self) -> CompactionLlmConfig:
         self.provider = str(self.provider or "").strip() or None
         self.model = str(self.model or "").strip() or None
-        if self.provider and not self.model:
-            logger.warning(
-                "Ignoring compaction.provider=%s because compaction.model is not set",
-                self.provider,
-            )
-            self.provider = None
         return self
 
 
 def validate_compaction_deployment_write(payload: dict[str, Any]) -> None:
-    """Reject newly saved provider-only compaction deployments.
-
-    Load-time validation remains deliberately tolerant so an older hand-written
-    config cannot brick gateway startup. Config writers call this stricter
-    validator on their post-mutation payload before persistence.
-    """
-
-    compaction = payload.get("compaction")
-    if not isinstance(compaction, dict):
-        return
-    provider = str(compaction.get("provider") or "").strip()
-    model = str(compaction.get("model") or "").strip()
-    if provider and not model:
-        raise ValueError(
-            "compaction.provider requires compaction.model when saving config"
-        )
+    """Compatibility hook: deprecated target fields have no routing effect."""
 
 
 class SessionNamingConfig(BaseSettings):
     """LLM-generated session titles (auto-naming).
 
-    After the first user message, a one-shot LLM call summarizes it into a short
-    title written to SessionNode.derived_title. Explicit ``model`` and ``tier``
-    settings override the mode-specific default: direct routing follows the
-    resolved session/provider model, while Router and Ensemble use the router's
-    default text tier.
+    After the first user message, a bounded LLM operation summarizes it into a
+    short title written to SessionNode.derived_title. Transient failures can be
+    retried twice within ``timeout_seconds``. Explicit ``model`` and ``tier``
+    settings override the selected physical deployment: routed turns reuse the
+    chosen model and Ensemble turns reuse their aggregator, through a separate
+    naming request. Legacy callers without a selected deployment retain their
+    mode-specific session/router default.
     """
 
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_NAMING_")
@@ -1729,7 +1676,7 @@ class ImageGenerationConfig(BaseSettings):
     # intent. Existing image sections load as ``custom`` so upgrades never
     # silently replace an operator-owned route or re-enable a disabled tool.
     binding: Literal["custom", "follow_llm"] = "custom"
-    primary: str = "openai/gpt-image-1"
+    primary: str = DEFAULT_IMAGE_GENERATION_PRIMARY
     fallbacks: list[str] = Field(default_factory=list)
     size: str = "1024x1024"
     timeout_seconds: float = 180.0
@@ -1737,6 +1684,254 @@ class ImageGenerationConfig(BaseSettings):
     providers: ImageGenerationProvidersConfig = Field(
         default_factory=ImageGenerationProvidersConfig
     )
+
+
+def _default_video_aspect_ratios() -> list[Literal["16:9", "9:16"]]:
+    return ["16:9", "9:16"]
+
+
+def _default_video_resolutions() -> list[Literal["720p", "1080p"]]:
+    return ["720p", "1080p"]
+
+
+_VIDEO_OPENROUTER_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
+_VIDEO_GEMINI_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+_VIDEO_PROVIDER_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+_VIDEO_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+class VideoGenerationProviderConfig(BaseModel):
+    base_url: str
+    api_key: str = ""
+    api_key_env: str
+    # Internal endpoint binding for a stored direct key. Generic config patches
+    # may change base_url without re-entering the key; the old key then remains
+    # unusable until the operator supplies a new key for the new origin.
+    api_key_base_url: str = Field(default="", json_schema_extra={"readOnly": True})
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        if not is_valid_video_generation_base_url(value):
+            raise ValueError("video provider base_url must be a safe HTTP(S) API root")
+        return value
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _validate_api_key_env(cls, value: str) -> str:
+        if value and not _VIDEO_ENV_NAME.fullmatch(value):
+            raise ValueError("video provider api_key_env must be an environment variable name")
+        return value
+
+    @model_validator(mode="after")
+    def _bind_new_direct_key(self) -> VideoGenerationProviderConfig:
+        if self.api_key and not self.api_key_base_url:
+            self.api_key_base_url = self.base_url
+        return self
+
+
+class VideoGenerationOpenRouterProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["openrouter"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["openrouter"]
+
+
+class VideoGenerationGeminiProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["gemini"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["gemini"]
+
+
+class VideoGenerationXaiProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["xai"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["xai"]
+
+
+class VideoGenerationQwenProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["qwen"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["qwen"]
+
+
+class VideoGenerationTokenRhythmProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["tokenrhythm"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["tokenrhythm"]
+
+
+class VideoGenerationQwenTokenPlanProviderConfig(VideoGenerationProviderConfig):
+    base_url: str = VIDEO_GENERATION_OFFICIAL_BASE_URLS["qwen_token_plan"]
+    api_key_env: str = VIDEO_GENERATION_DEFAULT_ENV_KEYS["qwen_token_plan"]
+
+
+class VideoGenerationProvidersConfig(BaseModel):
+    openrouter: VideoGenerationOpenRouterProviderConfig = Field(
+        default_factory=VideoGenerationOpenRouterProviderConfig
+    )
+    gemini: VideoGenerationGeminiProviderConfig = Field(
+        default_factory=VideoGenerationGeminiProviderConfig
+    )
+    xai: VideoGenerationXaiProviderConfig = Field(default_factory=VideoGenerationXaiProviderConfig)
+    qwen: VideoGenerationQwenProviderConfig = Field(
+        default_factory=VideoGenerationQwenProviderConfig
+    )
+    tokenrhythm: VideoGenerationTokenRhythmProviderConfig = Field(
+        default_factory=VideoGenerationTokenRhythmProviderConfig
+    )
+    qwen_token_plan: VideoGenerationQwenTokenPlanProviderConfig = Field(
+        default_factory=VideoGenerationQwenTokenPlanProviderConfig
+    )
+
+    @model_validator(mode="after")
+    def _validate_provider_origins(self) -> VideoGenerationProvidersConfig:
+        for provider_id in VIDEO_GENERATION_OFFICIAL_BASE_URLS:
+            base_url = getattr(self, provider_id).base_url
+            conflicting_provider = conflicting_video_generation_endpoint_provider(
+                provider_id, base_url
+            )
+            if conflicting_provider is not None:
+                raise ValueError(
+                    f"video_generation.providers.{provider_id}.base_url points to "
+                    f"{conflicting_provider}'s official origin"
+                )
+        return self
+
+
+class VideoGenerationConfig(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OPENSQUILLA_VIDEO_GENERATION_",
+        env_nested_delimiter="__",
+    )
+
+    enabled: bool = False
+    # An omitted provider preserves the original OpenRouter-only config format.
+    # New configurations should select a provider explicitly.
+    provider: Literal[
+        "", "openrouter", "gemini", "xai", "qwen", "tokenrhythm", "qwen_token_plan"
+    ] = ""
+    primary: str = Field(
+        default="",
+        description=(
+            "Provider-native video model ID, such as google/veo-3.1-fast "
+            "for OpenRouter or veo-3.1-generate-preview for Gemini."
+        ),
+    )
+    # Leave duration unset to use the provider/model default at request time.
+    duration_seconds: int | None = Field(default=None, ge=1)
+    aspect_ratio: Literal["16:9", "9:16"] = "16:9"
+    allowed_aspect_ratios: list[Literal["16:9", "9:16"]] = Field(
+        default_factory=_default_video_aspect_ratios
+    )
+    resolution: Literal["720p", "1080p"] = "720p"
+    allowed_resolutions: list[Literal["720p", "1080p"]] = Field(
+        default_factory=_default_video_resolutions
+    )
+    timeout_seconds: float = Field(default=600.0, ge=30.0, le=1800.0)
+    max_output_bytes: int = Field(default=100 * 1024 * 1024, ge=1, le=500 * 1024 * 1024)
+    providers: VideoGenerationProvidersConfig = Field(
+        default_factory=VideoGenerationProvidersConfig
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_duration_limit(cls, data: Any) -> Any:
+        # Older profiles stored an extra operator cap. It no longer affects
+        # requests; tolerate even invalid legacy values without exposing a
+        # configurable field or weakening validation of the remaining fields.
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if key != "max_duration_seconds"}
+        return data
+
+    @field_validator("primary")
+    @classmethod
+    def _normalize_primary(cls, value: str) -> str:
+        return value.strip()
+
+    @property
+    def effective_provider(
+        self,
+    ) -> Literal["", "openrouter", "gemini", "xai", "qwen", "tokenrhythm", "qwen_token_plan"]:
+        if self.provider:
+            return self.provider
+        return "openrouter" if self.primary else ""
+
+    @model_validator(mode="after")
+    def _validate_generation_settings(self) -> VideoGenerationConfig:
+        if self.enabled:
+            if not self.effective_provider:
+                raise ValueError("video_generation.provider and primary are required when enabled")
+            if self.effective_provider == "openrouter" and (
+                not _VIDEO_OPENROUTER_MODEL_ID.fullmatch(self.primary)
+                or any(segment in {"", ".", ".."} for segment in self.primary.split("/"))
+                or "/" not in self.primary
+            ):
+                raise ValueError(
+                    "video_generation.primary must be a raw OpenRouter model ID "
+                    "such as google/veo-3.1-fast"
+                )
+            if self.effective_provider == "gemini" and not _VIDEO_GEMINI_MODEL_ID.fullmatch(
+                self.primary
+            ):
+                raise ValueError(
+                    "video_generation.primary must be a Gemini model ID "
+                    "such as veo-3.1-generate-preview"
+                )
+            if self.effective_provider in {"xai", "qwen", "tokenrhythm", "qwen_token_plan"} and (
+                not _VIDEO_PROVIDER_MODEL_ID.fullmatch(self.primary)
+                or self.primary in {".", ".."}
+            ):
+                raise ValueError(
+                    "video_generation.primary must be a raw provider video model ID "
+                    "without a prefix"
+                )
+        if self.effective_provider == "gemini":
+            if self.duration_seconds is not None and self.duration_seconds not in {4, 6, 8}:
+                raise ValueError("Gemini Veo duration_seconds must be 4, 6, or 8")
+            if self.resolution == "1080p":
+                if self.duration_seconds is not None and self.duration_seconds != 8:
+                    raise ValueError("Gemini Veo 1080p requires duration_seconds of 8")
+        if self.enabled:
+            if self.effective_provider in {"qwen", "qwen_token_plan", "tokenrhythm"}:
+                minimum = (
+                    3
+                    if self.effective_provider in {"qwen", "qwen_token_plan"}
+                    and self.primary.startswith("happyhorse-")
+                    else 2
+                )
+                if self.duration_seconds is not None and self.duration_seconds < minimum:
+                    raise ValueError(
+                        f"{self.effective_provider} duration_seconds must be at least {minimum}"
+                    )
+            provider_duration_max = {
+                "xai": 15,
+                "qwen": 15,
+                "qwen_token_plan": 15,
+                "tokenrhythm": 30,
+            }.get(self.effective_provider)
+            if (
+                provider_duration_max is not None
+                and self.duration_seconds is not None
+                and self.duration_seconds > provider_duration_max
+            ):
+                raise ValueError(
+                    f"{self.effective_provider} duration_seconds must be at most "
+                    f"{provider_duration_max}"
+                )
+            if (
+                self.effective_provider == "xai"
+                and self.primary == "grok-imagine-video"
+                and self.resolution == "1080p"
+            ):
+                raise ValueError("grok-imagine-video supports at most 720p")
+        if (
+            not self.allowed_aspect_ratios
+            or len(self.allowed_aspect_ratios) != len(set(self.allowed_aspect_ratios))
+            or self.aspect_ratio not in self.allowed_aspect_ratios
+        ):
+            raise ValueError("allowed_aspect_ratios must be unique and contain aspect_ratio")
+        if (
+            not self.allowed_resolutions
+            or len(self.allowed_resolutions) != len(set(self.allowed_resolutions))
+            or self.resolution not in self.allowed_resolutions
+        ):
+            raise ValueError("allowed_resolutions must be unique and contain resolution")
+        return self
 
 
 class AudioElevenLabsProviderConfig(BaseModel):
@@ -1750,9 +1945,7 @@ class AudioElevenLabsProviderConfig(BaseModel):
 
 
 class AudioProvidersConfig(BaseModel):
-    elevenlabs: AudioElevenLabsProviderConfig = Field(
-        default_factory=AudioElevenLabsProviderConfig
-    )
+    elevenlabs: AudioElevenLabsProviderConfig = Field(default_factory=AudioElevenLabsProviderConfig)
 
 
 class AudioTTSConfig(BaseModel):
@@ -1807,15 +2000,14 @@ class ConfiguredChannelEntry(BaseModel):
             value = value.split(",")
         if not isinstance(value, list | tuple | set | frozenset):
             return value
-        return list(
-            dict.fromkeys(str(item).strip() for item in value if str(item).strip())
-        )
+        return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
     @model_validator(mode="after")
     def _validate_dm_access(self) -> ConfiguredChannelEntry:
         if self.dm_access == "allowlist" and not self.allowed_senders:
             raise ValueError("dm_access=allowlist requires allowed_senders")
         return self
+
     # Group conversations are isolated by sender by default. Deployments that
     # intentionally want one transcript shared by the whole room can opt in.
     group_session_scope: Literal["per_sender", "shared_room"] = "per_sender"
@@ -1880,9 +2072,7 @@ class FeishuChannelEntry(ConfiguredChannelEntry):
             and not self.verification_token.strip()
             and not self.encrypt_key.strip()
         ):
-            raise ValueError(
-                "feishu webhook channels require verification_token or encrypt_key"
-            )
+            raise ValueError("feishu webhook channels require verification_token or encrypt_key")
         return self
 
 
@@ -1933,9 +2123,7 @@ class WeComChannelEntry(ConfiguredChannelEntry):
     def validate_wecom_mode(self) -> WeComChannelEntry:
         if self.connection_mode == "websocket":
             missing = [
-                field
-                for field in ("bot_id", "bot_secret")
-                if not str(getattr(self, field)).strip()
+                field for field in ("bot_id", "bot_secret") if not str(getattr(self, field)).strip()
             ]
             if missing:
                 raise ValueError(
@@ -2017,9 +2205,7 @@ class TelegramChannelEntry(ConfiguredChannelEntry):
             if not self.webhook_url:
                 raise ValueError("webhook_url is required for telegram webhook mode")
             if not self.webhook_secret_token:
-                raise ValueError(
-                    "webhook_secret_token is required for telegram webhook mode"
-                )
+                raise ValueError("webhook_secret_token is required for telegram webhook mode")
         return self
 
 
@@ -2168,95 +2354,6 @@ class SubagentsGatewayConfig(BaseModel):
     """When enabled, subagent bootstrap prompts keep only AGENTS.md."""
 
 
-class MetaSkillPersistenceConfig(BaseSettings):
-    """Persistence/audit ledger for meta-skill executions (G4)."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_PERSISTENCE_",
-        extra="forbid",
-    )
-    enabled: bool = True
-    orphan_cleanup_age_seconds: int = 3600
-    # Per-DAG memory persist: when False the orchestrator skips any step
-    # whose ``skill`` is "memory" (the conventional last-step pattern that
-    # archives DAG output to memory/*.md). Defaults to True to preserve
-    # existing behaviour. Toggle off for exploratory runs where polluting
-    # the long-term memory store is undesirable.
-    memory_persist_enabled: bool = True
-
-
-class MetaSkillAutoProposeConfig(BaseSettings):
-    """Unattended synthesis: drive meta-skill-creator from co-occurrence
-    patterns observed in ``~/.opensquilla/logs/decisions-*.jsonl``.
-
-    Two independent triggers feed the same library function
-    (``skills.creator.auto_propose``):
-      * ``enabled`` schedules a recurring cron job
-      * ``on_dream_complete`` piggybacks on memory-consolidation dreams
-
-    Both default off. Operators flip them on after reviewing
-    meta-skill-creator's gated output once.
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_AUTO_PROPOSE_",
-        extra="forbid",
-    )
-
-    enabled: bool = False
-    """Path 1: schedule the auto-propose cron job. When false no
-    handler is registered at all (zero-impact code path)."""
-
-    cron: str = "0 5 * * *"
-    """Cron expression (5-field, local time) for the scheduled job."""
-
-    window_days: int = Field(default=30, ge=1, le=365)
-    """How many days of decision-log history to aggregate."""
-
-    min_freq: int = Field(default=3, ge=1)
-    """Drop co-occurrence chains observed fewer than this many times."""
-
-    top_k: int = Field(default=5, ge=1, le=50)
-    """At most this many distinct patterns considered per fire."""
-
-    on_dream_complete: bool = False
-    """Path 2: also run after a successful memory-consolidation dream.
-    Independent of ``enabled`` — either, both, or neither may be on."""
-
-    auto_enable: bool = False
-    """When true, eligible low-risk proposals are promoted to MANAGED
-    automatically after the creator gates pass. Defaults off."""
-
-    auto_enable_max_risk: Literal["low", "medium", "high"] = "low"
-    """Highest deterministic risk class that unattended promotion may accept."""
-
-    agent_ids: list[str] = Field(default_factory=list)
-    """Restrict to these agent IDs; empty = all configured agents."""
-
-
-class MetaSkillConfig(BaseSettings):
-    """Top-level meta-skill subsystem configuration."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_",
-        env_nested_delimiter="__",
-        extra="forbid",
-    )
-    enabled: bool = True
-    auto_trigger: bool = False
-    """When False (default), meta-skills are manual-only: no prompt guidance, no
-    keyword/semantic auto-trigger, ``meta_invoke`` is not exposed for automatic
-    invocation, and meta-skills are hidden from ``<available_skills>``. They run
-    only via the explicit ``/meta`` command. Set True to restore automatic
-    activation."""
-    persistence: MetaSkillPersistenceConfig = Field(
-        default_factory=MetaSkillPersistenceConfig,
-    )
-    auto_propose: MetaSkillAutoProposeConfig = Field(
-        default_factory=MetaSkillAutoProposeConfig,
-    )
-
-
 class TlsConfig(BaseSettings):
     """Optional TLS termination at the gateway itself.
 
@@ -2400,8 +2497,7 @@ class ModelOverrideConfig(BaseModel):
         if normalized not in KNOWN_REASONING_FORMATS:
             allowed = ", ".join(sorted(KNOWN_REASONING_FORMATS))
             raise ValueError(
-                f"reasoning_format {value!r} is not a known dialect; "
-                f"expected one of {allowed}"
+                f"reasoning_format {value!r} is not a known dialect; expected one of {allowed}"
             )
         return normalized
 
@@ -2441,7 +2537,8 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
             # Old nested environment/dotenv settings can survive an upgrade
             # even after the TOML migration. Keep new explicit payloads strict.
             values["memory"] = {
-                key: value for key, value in memory.items()
+                key: value
+                for key, value in memory.items()
                 if key.lower() not in DEPRECATED_MEMORY_LEAVES
             }
         return values
@@ -2462,7 +2559,9 @@ class GoalConfig(BaseSettings):
     )
 
     execution_enabled: bool = True
-    max_turns: int = Field(default=50, ge=1, le=500)
+    # Match the reference Goal drivers' long-lived round cap. Semantic
+    # no-progress and explicit terminal decisions remain the normal exits.
+    max_turns: int = Field(default=256, ge=1, le=500)
     # Accumulated running time only. Queued, paused, and process downtime are
     # deliberately excluded from this limit.
     runtime_budget_seconds: int = Field(default=3_600, ge=60, le=86_400)
@@ -2535,19 +2634,26 @@ class GatewayConfig(BaseSettings):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     goal: GoalConfig = Field(default_factory=GoalConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
+    video_generation: VideoGenerationConfig = Field(default_factory=VideoGenerationConfig)
     audio: AudioConfig = Field(default_factory=AudioConfig)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     agents: list[AgentEntryConfig] = Field(default_factory=list)
     agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
-    meta_skill: MetaSkillConfig = Field(default_factory=MetaSkillConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     diagnostics_enabled: bool = False
     channel_admin_senders: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_product_features(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if key != "meta_skill"}
+        return data
 
     @property
     def effective_run_mode(self) -> str:
@@ -2636,33 +2742,23 @@ class GatewayConfig(BaseSettings):
         }
         if "provider" not in fields_set:
             profile = str(getattr(self.squilla_router, "tier_profile", "") or "")
-            router_fields_set = set(
-                getattr(self.squilla_router, "model_fields_set", set())
-            )
-            legacy_intent = bool(
-                {"model", "base_url", "api_key", "api_key_env"} & fields_set
-            ) or (
+            router_fields_set = set(getattr(self.squilla_router, "model_fields_set", set()))
+            legacy_intent = bool({"model", "base_url", "api_key", "api_key_env"} & fields_set) or (
                 "tier_profile" in router_fields_set
                 and profile.strip().lower() == LEGACY_DEFAULT_LLM_PROVIDER
             )
             credential_hints = {
                 hint
                 for hint in (
-                    credential_provider_hint(
-                        llm.api_key if "api_key" in fields_set else ""
-                    ),
+                    credential_provider_hint(llm.api_key if "api_key" in fields_set else ""),
                     credential_provider_hint(
                         "",
-                        api_key_env=(
-                            llm.api_key_env if "api_key_env" in fields_set else ""
-                        ),
+                        api_key_env=(llm.api_key_env if "api_key_env" in fields_set else ""),
                     ),
                 )
                 if hint
             }
-            origin_hint = endpoint_provider_hint(
-                llm.base_url if "base_url" in fields_set else ""
-            )
+            origin_hint = endpoint_provider_hint(llm.base_url if "base_url" in fields_set else "")
             explicit_profile_hint = (
                 LEGACY_DEFAULT_LLM_PROVIDER
                 if "tier_profile" in router_fields_set
@@ -2715,16 +2811,13 @@ class GatewayConfig(BaseSettings):
                 }
             elif legacy_intent or (env_openrouter and not env_tokenrhythm):
                 provider = LEGACY_DEFAULT_LLM_PROVIDER
-                explicit_openrouter = (
-                    strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER}
-                    or (env_openrouter and not env_tokenrhythm and not legacy_intent)
+                explicit_openrouter = strong_hints == {LEGACY_DEFAULT_LLM_PROVIDER} or (
+                    env_openrouter and not env_tokenrhythm and not legacy_intent
                 )
                 resolution = {
                     "status": "legacy_inferred",
                     "effective_provider": provider,
-                    "source": (
-                        "strong_evidence" if explicit_openrouter else "legacy_compat"
-                    ),
+                    "source": ("strong_evidence" if explicit_openrouter else "legacy_compat"),
                     "reason_code": (
                         "providerless_openrouter_evidence"
                         if explicit_openrouter
@@ -2811,9 +2904,14 @@ class GatewayConfig(BaseSettings):
                             # belong to the shipped ladder being upgraded.
                             tier.update(previous)
                             for key in (
-                                "provider", "model", "description", "supports_image",
-                                "ensemble_enabled", "ensemble_selection_mode",
-                                "ensembleEnabled", "ensembleSelectionMode",
+                                "provider",
+                                "model",
+                                "description",
+                                "supports_image",
+                                "ensemble_enabled",
+                                "ensemble_selection_mode",
+                                "ensembleEnabled",
+                                "ensembleSelectionMode",
                             ):
                                 tier.pop(key, None)
                                 if key in defaults[name]:
@@ -2926,8 +3024,7 @@ class GatewayConfig(BaseSettings):
     # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
     # long built-in runtime default; ``0`` disables the runtime budget.
     agent_runtime_timeout_seconds: float | None = None
-    # Optional safety cap for ordinary interactive Web chat turns. Coding and
-    # meta turns retain the regular agent runtime budget. Disabled by default;
+    # Optional safety cap for interactive Web chat turns. Disabled by default;
     # an explicit TurnRunner timeout still has priority when the cap is enabled.
     web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
     # Deprecated, unused: provider inactivity and tool deadlines are separate.
@@ -2992,9 +3089,7 @@ class GatewayConfig(BaseSettings):
     search_provider: str = "duckduckgo"
     search_api_key: str = ""
     search_api_key_env: str = ""
-    search_max_results: int = Field(
-        default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS
-    )
+    search_max_results: int = Field(default=DEFAULT_SEARCH_MAX_RESULTS, ge=1, le=MAX_SEARCH_RESULTS)
     search_proxy: str = ""
     search_use_env_proxy: bool = False
     search_fallback_policy: Literal["off", "network"] = "off"
@@ -3169,6 +3264,7 @@ class GatewayConfig(BaseSettings):
             "capture_roll_max_chars": str(self.memory.capture_roll_max_chars),
             "dream_enabled": str(self.memory.dream.enabled).lower(),
         }
+
     _runtime_secret_paths: set[str] = PrivateAttr(default_factory=set)
     # Paths whose secret value was explicitly entered by the operator (set by
     # ``clear_runtime_secret``): value-coincidence redaction heuristics in
@@ -3209,6 +3305,20 @@ class GatewayConfig(BaseSettings):
     def to_toml_dict(self) -> dict[str, Any]:
         """Convert config to a TOML-writable dict."""
         data: dict[str, Any] = self.model_dump(exclude_none=True, exclude_defaults=False)
+        video = data.get("video_generation")
+        video_providers = video.get("providers") if isinstance(video, dict) else None
+        if isinstance(video_providers, dict):
+            for provider_id, provider in video_providers.items():
+                if isinstance(provider, dict):
+                    if (
+                        f"video_generation.providers.{provider_id}.api_key"
+                        in self._runtime_secret_paths
+                    ):
+                        provider.pop("api_key", None)
+                    if not provider.get("api_key"):
+                        provider.pop("api_key", None)
+                    if not provider.get("api_key_base_url"):
+                        provider.pop("api_key_base_url", None)
         if not data.get("agents"):
             data.pop("agents", None)
         llm = data.get("llm")
@@ -3283,6 +3393,14 @@ class GatewayConfig(BaseSettings):
     def to_public_dict(self) -> dict[str, Any]:
         """Return a redacted config view safe for public control surfaces."""
         data = cast(dict[str, Any], redact_public_config(self.model_dump()))
+        video = data.get("video_generation")
+        video_providers = video.get("providers") if isinstance(video, dict) else None
+        if isinstance(video_providers, dict):
+            for provider in video_providers.values():
+                if isinstance(provider, dict):
+                    provider.pop("api_key_base_url", None)
+                    if not provider.get("api_key"):
+                        provider.pop("api_key", None)
         llm = data.get("llm")
         if isinstance(llm, dict):
             llm.pop("extra_body", None)
@@ -3558,7 +3676,7 @@ class GatewayConfig(BaseSettings):
         cfg._mark_env_absorbed_secrets(data)
         cls._apply_profile_path_overrides(cfg, target)
         if migration.changed:
-            _rewrite_migrated_config_best_effort(target, migration)
+            rewrite_migrated_config_best_effort(target, migration)
         return cfg
 
     @classmethod
@@ -3599,7 +3717,7 @@ class GatewayConfig(BaseSettings):
                 cfg = cls(**migration.payload)
                 cls._apply_profile_path_overrides(cfg, path)
                 if migration.changed and not read_only:
-                    _rewrite_migrated_config_best_effort(path, migration)
+                    rewrite_migrated_config_best_effort(path, migration)
                 cfg.config_path = str(path)
                 cfg._mark_env_absorbed_secrets(data)
                 cfg.set_persist_snapshot(cfg.to_toml_dict(), migration.payload)
@@ -3607,9 +3725,7 @@ class GatewayConfig(BaseSettings):
 
         cfg = cls()
         default_config_path = (
-            candidates[0]
-            if candidates
-            else default_opensquilla_home().expanduser() / "config.toml"
+            candidates[0] if candidates else default_opensquilla_home().expanduser() / "config.toml"
         )
         cls._apply_profile_path_overrides(cfg, default_config_path)
         cfg._mark_env_absorbed_secrets(None)
@@ -3640,26 +3756,6 @@ class GatewayConfig(BaseSettings):
 
 # --- bind-address resolution ----------------------------------------------
 
-
-def _rewrite_migrated_config_best_effort(path: Path, migration: Any) -> None:
-    """Persist a migrated config, degrading to a warning when not writable.
-
-    The migrated payload already validated and the gateway can run from it;
-    a read-only config location (mounted backup, locked-down home) must not
-    turn that into a boot failure. The rewrite is retried on the next load.
-    """
-    try:
-        backup_and_write_migrated_config(path, migration.payload, migration)
-    except OSError as error:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "OpenSquilla config migration could not rewrite %s (%s); running "
-            "from the migrated payload in memory. Make the file writable to "
-            "persist the migration and silence this warning.",
-            path,
-            error,
-        )
 
 # Wildcard addresses that expose the gateway on every interface. Used by the
 # boot banner and the install-script post-install message.

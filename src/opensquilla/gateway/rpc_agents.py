@@ -22,7 +22,6 @@ from opensquilla.gateway.rpc import (
 from opensquilla.identity.bootstrap import (
     CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
     RETIRED_WORKSPACE_FILENAMES,
-    ensure_agent_workspace,
 )
 from opensquilla.session.keys import normalize_agent_id
 
@@ -47,7 +46,7 @@ def _workspace_file_root(ctx: RpcContext, agent_id: str) -> Path | None:
     config = getattr(ctx, "config", None)
     if not getattr(config, "workspace_dir", None):
         return None
-    return ensure_agent_workspace(resolve_agent_workspace_dir(agent_id, config)).workspace_dir
+    return resolve_agent_workspace_dir(agent_id, config).expanduser()
 
 
 def _validate_workspace_file_name(name: str) -> str:
@@ -155,6 +154,7 @@ def _write_workspace_agent_file(root: Path, name: str, content: Any) -> dict[str
     safe_name, path = _resolve_workspace_agent_file(root, name)
     text = content if isinstance(content, str) else str(content)
     data = text.encode("utf-8")
+    root.mkdir(parents=True, exist_ok=True)
     fd = _open_workspace_agent_file_for_write(path)
     try:
         _validate_safe_file_stat(os.fstat(fd))
@@ -175,37 +175,13 @@ async def _handle_agents_list(
     return await _agent_catalog(ctx).list(params)
 
 
-async def _handle_agents_create(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
-    return await _agent_catalog(ctx).create(params)
-
-
-async def _handle_agents_update(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
-    return await _agent_catalog(ctx).update(params)
-
-
-async def _handle_agents_delete(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> None:
-    return await _agent_catalog(ctx).remove(params)
-
-
-for _agent_catalog_method, _agent_catalog_implementation in (
-    ("agents.list", _handle_agents_list),
-    ("agents.create", _handle_agents_create),
-    ("agents.update", _handle_agents_update),
-    ("agents.delete", _handle_agents_delete),
-):
-    register_agent_catalog_contract(
-        _d,
-        _agent_catalog_method,
-        _agent_catalog_implementation,
-        internal_error=RpcHandlerError,
-        guest_allowed_checker=is_guest_rpc_method_allowed,
-    )
+register_agent_catalog_contract(
+    _d,
+    "agents.list",
+    _handle_agents_list,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("agents.files.list", scope="operator.read")
@@ -269,19 +245,27 @@ async def _handle_agents_files_set(params: dict | None, ctx: RpcContext) -> dict
 
     content = params["content"]
 
-    agent_registry = getattr(ctx, "agent_registry", None)
-    if agent_registry is None:
-        agent_id = normalize_agent_id(params["agentId"])
-        root = _workspace_file_root(ctx, agent_id)
-        if root is None:
-            raise RpcUnavailableError("Agent registry not available")
-        return _write_workspace_agent_file(root, name, content)
-    result = await agent_registry.set_agent_file(
-        normalize_agent_id(params["agentId"]),
-        name,
-        content,
-    )
-    return cast(dict, result)
+    agent_id = normalize_agent_id(params["agentId"])
+    try:
+        agent_registry = getattr(ctx, "agent_registry", None)
+        if agent_registry is None:
+            root = _workspace_file_root(ctx, agent_id)
+            if root is None:
+                raise RpcUnavailableError("Agent registry not available")
+            return _write_workspace_agent_file(root, name, content)
+        result = await agent_registry.set_agent_file(agent_id, name, content)
+        return cast(dict, result)
+    finally:
+        # A failed write may already have changed the source. Evict derived
+        # snapshots conservatively without changing the legacy RPC contract.
+        runner = getattr(ctx, "turn_runner", None)
+        invalidate = getattr(runner, "invalidate_profile_snapshot", None)
+        if callable(invalidate):
+            invalidate(agent_id)
+        if name in {"MEMORY.md", "memory.md"}:
+            invalidate_memory = getattr(runner, "invalidate_memory_snapshot", None)
+            if callable(invalidate_memory):
+                invalidate_memory(agent_id)
 
 
 @_d.method("agent.identity.get", scope="operator.read")

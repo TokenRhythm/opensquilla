@@ -17,9 +17,7 @@ const RESTORABLE = new Set<string>([
   '/channels',
   '/cron',
   '/skills',
-  '/overview',
   '/usage',
-  '/logs',
 ])
 
 export function isRestorableRoute(path: string): boolean {
@@ -44,6 +42,10 @@ export function saveLastRoute(path: string): void {
 export function readLastRoute(): string | null {
   try {
     const saved = localStorage.getItem(LAST_ROUTE_KEY)
+    // The former Overview/Usage hub restores to its surviving page. Logs was
+    // a diagnostic view; a saved Logs route should use the normal Chat default
+    // rather than reopen the Settings modal without a background page.
+    if (saved === '/overview' || saved === '/health') return '/usage'
     return saved && isRestorableRoute(saved) ? saved : null
   } catch {
     return null

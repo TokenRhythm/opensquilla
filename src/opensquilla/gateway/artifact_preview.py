@@ -51,7 +51,6 @@ from opensquilla.paths import media_root_from_config, native_io_path
 log = structlog.get_logger(__name__)
 
 PREVIEW_LEASE_IDLE_SECONDS = 8 * 60 * 60
-PREVIEW_LEASE_LIMIT_PER_SESSION = 8
 _PREVIEW_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _PREVIEW_AUTHORITY_RE = re.compile(r"^p-([0-9a-f]{32})\.localhost:([0-9]{1,5})$")
 _HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
@@ -72,10 +71,6 @@ class PreviewLeaseExpiredError(PreviewLeaseError):
     """Raised when a known lease has expired or has been revoked."""
 
 
-class PreviewLeaseLimitError(PreviewLeaseError):
-    """Raised when a session already owns the maximum number of leases."""
-
-
 @dataclass(slots=True)
 class ArtifactPreviewLease:
     lease_id: str
@@ -90,6 +85,7 @@ class ArtifactPreviewLease:
     created_at: float
     last_access_at: float
     working_files: WorkingFiles | None = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,12 +106,10 @@ class ArtifactPreviewLeaseService:
         *,
         config: GatewayConfig,
         idle_seconds: int = PREVIEW_LEASE_IDLE_SECONDS,
-        max_per_session: int = PREVIEW_LEASE_LIMIT_PER_SESSION,
         clock: Any = time.time,
     ) -> None:
         self._config = config
         self._idle_seconds = idle_seconds
-        self._max_per_session = max_per_session
         self._clock = clock
         self._lock = threading.RLock()
         self._leases_by_id: dict[str, ArtifactPreviewLease] = {}
@@ -145,6 +139,7 @@ class ArtifactPreviewLeaseService:
         session_key: str,
         mode: str,
         client: str,
+        snapshot: bool = False,
     ) -> tuple[ArtifactPreviewLease, str]:
         now = float(self._clock())
         store = self._store()
@@ -210,11 +205,6 @@ class ArtifactPreviewLeaseService:
 
         with self._lock:
             self._purge_expired_locked(now)
-            active_for_session = sum(
-                lease.session_id == session_id for lease in self._leases_by_id.values()
-            )
-            if active_for_session >= self._max_per_session:
-                raise PreviewLeaseLimitError("preview lease limit reached")
             token = secrets.token_hex(16)
             token_hash = _token_hash(token)
             lease = ArtifactPreviewLease(
@@ -229,7 +219,10 @@ class ArtifactPreviewLeaseService:
                 source=source,
                 created_at=now,
                 last_access_at=now,
-                working_files=self._working_files.get((session_id, artifact_id)),
+                working_files=(
+                    None if snapshot else self._working_files.get((session_id, artifact_id))
+                ),
+                snapshot=snapshot,
             )
             self._leases_by_id[lease.lease_id] = lease
             self._lease_id_by_token_hash[token_hash] = lease.lease_id
@@ -335,6 +328,8 @@ class ArtifactPreviewLeaseService:
                     del self._working_files[key]
             self._working_files[(session_id, artifact_id)] = binding
             for lease in self._leases_by_id.values():
+                if lease.snapshot:
+                    continue
                 if lease.session_id == session_id and (
                     lease.artifact_id == artifact_id
                     or (
@@ -480,6 +475,7 @@ class GatewayPreviewMaterialPort(PreviewMaterialPort):
             working_document_id=(
                 lease.working_files.document_id if lease.working_files is not None else None
             ),
+            snapshot=lease.snapshot,
         )
 
     async def create_lease(self, command: PreviewLeaseCreate) -> PreviewLeaseGrant:
@@ -490,6 +486,7 @@ class GatewayPreviewMaterialPort(PreviewMaterialPort):
             session_key=command.session_key,
             mode=command.mode,
             client=command.client,
+            snapshot=command.snapshot,
         )
         return self._grant(lease, token)
 
@@ -573,12 +570,15 @@ def register_artifact_preview_routes(
         version = body.get("version")
         mode = body.get("mode")
         client = body.get("client")
+        snapshot = body.get("snapshot", False)
         if version != 1 or isinstance(version, bool):
             return _api_error("version must be 1", "INVALID_REQUEST", 400)
         if mode not in {"full", "offline"}:
             return _api_error("mode must be full or offline", "INVALID_REQUEST", 400)
         if client not in {"desktop", "web"}:
             return _api_error("client must be desktop or web", "INVALID_REQUEST", 400)
+        if type(snapshot) is not bool:
+            return _api_error("snapshot must be a boolean", "INVALID_REQUEST", 400)
         page_path = body.get("pagePath")
         if "pagePath" in body and not is_html_preview_path(page_path):
             return _api_error(
@@ -617,10 +617,9 @@ def register_artifact_preview_routes(
                     artifact_id=artifact_id,
                     mode=effective_mode,
                     client=client,
+                    snapshot=snapshot,
                 )
             )
-        except PreviewLeaseLimitError:
-            return _api_error("Preview lease limit reached", "PREVIEW_LEASE_LIMIT", 429)
         except ArtifactBundleUnsupportedError:
             return _api_error(
                 "Artifact bundle version is unsupported",
@@ -998,6 +997,7 @@ def _lease_payload(
         "expires_at": grant.expires_at,
         "idle_timeout_seconds": PREVIEW_LEASE_IDLE_SECONDS,
         "source": grant.source,
+        **({"snapshot": True} if grant.snapshot else {}),
         **(
             {"workingDocumentId": grant.working_document_id}
             if include_working_document and grant.working_document_id else {}

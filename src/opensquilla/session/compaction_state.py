@@ -7,16 +7,20 @@ state, not in this structured summary payload.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from opensquilla.execution_status import execution_status_for_tool_result
+
 
 class StructuredCompactionSummary(BaseModel):
-    """Portable, inspectable task state produced by local compaction."""
+    """Portable checkpoint retaining the v1 compatibility field types."""
 
     schema_version: int = 1
     user_goal: str = ""
@@ -39,7 +43,7 @@ class StructuredCompactionSummary(BaseModel):
 
 
 class CompactionObligation(BaseModel):
-    """Small continuity fact that should survive transcript compaction."""
+    """Extracted historical fact used for best-effort coverage diagnostics."""
 
     kind: str
     value: str
@@ -80,7 +84,8 @@ class CompactionReport(BaseModel):
 
 
 _MAX_OBLIGATION_VALUE_CHARS = 240
-_MAX_CRITICAL_CARRY_FORWARD = 32
+_MAX_COVERAGE_OBLIGATIONS = 64
+_MAX_COVERAGE_MISSING_LABELS = 32
 _PATH_RE = re.compile(
     # The slash in a closing markup tag is not an absolute filesystem path.
     r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\.{1,2}/|(?<!<)/|[A-Za-z0-9_.@()+-]+/)"
@@ -135,7 +140,7 @@ def _after_label(line: str) -> str:
 
 
 def _obligation_label(obligation: CompactionObligation) -> str:
-    return f"{obligation.kind}: {obligation.value}"
+    return f"{obligation.kind[:64]}: {obligation.value[:_MAX_OBLIGATION_VALUE_CHARS]}"
 
 
 _OBLIGATION_CONTINUITY_PRIORITY: dict[str, int] = {
@@ -146,6 +151,7 @@ _OBLIGATION_CONTINUITY_PRIORITY: dict[str, int] = {
     "do_not_repeat_action": 5,
     "decision_or_rationale": 7,
     "command": 8,
+    "command_reference": 8,
     "tool_result_fact": 9,
     "tool_result_id": 10,
     "important_identifier": 11,
@@ -245,8 +251,8 @@ class _BoundedObligationBuffer:
             if candidate is not None:
                 _select(candidate)
 
-        # Pending operations are structural continuity, not optional historical
-        # detail. Keep every pending ID that fits after the current task anchors.
+        # Prioritize pending IDs in the diagnostic sample. Execution/protocol
+        # protection belongs to the host, not this historical text extractor.
         for candidate in ranked_candidates:
             if candidate.obligation.kind == "pending_tool_or_approval_id":
                 _select(candidate)
@@ -357,6 +363,7 @@ def _extract_rendered_structured_obligations(
                 "tool_result_fact",
                 "failed_command_or_error",
                 "command",
+                "command_reference",
                 "pending_tool_or_approval_id",
                 "decision_or_rationale",
                 "important_identifier",
@@ -408,6 +415,7 @@ def extract_compaction_obligations(
     seen: set[tuple[str, str]] = set()
     issued_tool_call_ids: dict[str, int] = {}
     completed_tool_call_ids: set[str] = set()
+    command_calls: dict[str, str] = {}
     tool_call_order = 0
     for entry in entries:
         role = _string_value(_entry_value(entry, "role")) or None
@@ -427,6 +435,19 @@ def extract_compaction_obligations(
         cleaned_tool_result_id = _clean_obligation_text(tool_call_id)
         if cleaned_tool_result_id:
             completed_tool_call_ids.add(cleaned_tool_result_id)
+            if (
+                role == "tool"
+                and cleaned_tool_result_id in command_calls
+                and _command_result_proves_execution(
+                    content, _entry_value(entry, "execution_status"),
+                )
+            ):
+                _add_obligation(
+                    obligations, seen, kind="command",
+                    value=command_calls[cleaned_tool_result_id],
+                    source_role=role, source_entry_id=source_entry_id,
+                    max_obligations=max_obligations,
+                )
         _add_obligation(
             obligations,
             seen,
@@ -510,6 +531,10 @@ def extract_compaction_obligations(
                     call_id = call.get("id") or call.get("tool_use_id")
                     cleaned_call_id = _clean_obligation_text(call_id)
                     is_result = call.get("type") == "tool_result" or "result" in call
+                    if not is_result and role == "assistant" and cleaned_call_id:
+                        command = _command_input(call)
+                        if command:
+                            command_calls[cleaned_call_id] = command
                     execution_status = call.get("execution_status")
                     if isinstance(execution_status, Mapping):
                         status_name = _string_value(
@@ -580,6 +605,16 @@ def extract_compaction_obligations(
                         result_text = _string_value(
                             call.get("result") or call.get("content")
                         )
+                        if (
+                            cleaned_call_id in command_calls
+                            and _command_result_proves_execution(result_text, execution_status)
+                        ):
+                            _add_obligation(
+                                obligations, seen, kind="command",
+                                value=command_calls[cleaned_call_id],
+                                source_role=role, source_entry_id=source_entry_id,
+                                max_obligations=max_obligations,
+                            )
                         _add_obligation(
                             obligations,
                             seen,
@@ -617,7 +652,7 @@ def extract_compaction_obligations(
                             _add_obligation(
                                 obligations,
                                 seen,
-                                kind="command",
+                                kind="command_reference",
                                 value=match.group(0).rstrip("."),
                                 source_role=role,
                                 source_entry_id=source_entry_id,
@@ -671,7 +706,7 @@ def extract_compaction_obligations(
             _add_obligation(
                 obligations,
                 seen,
-                kind="command",
+                kind="command_reference",
                 value=match.group(0).rstrip("."),
                 source_role=role,
                 source_entry_id=source_entry_id,
@@ -694,6 +729,39 @@ def extract_compaction_obligations(
     return obligations.values()
 
 
+def _command_input(call: Mapping[str, Any]) -> str:
+    """Use the actual shell input, never commands mentioned in prose/output."""
+    function = call.get("function")
+    source = function if isinstance(function, Mapping) else call
+    if source.get("name") != "exec_command":
+        return ""
+    arguments = source.get("arguments", source.get("input"))
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return ""
+    if not isinstance(arguments, Mapping):
+        return ""
+    command = arguments.get("command", arguments.get("cmd"))
+    return command if isinstance(command, str) else ""
+
+
+def _command_result_proves_execution(content: str, status: Any) -> bool:
+    if not isinstance(status, Mapping) or status.get("reason") == "legacy_missing_status":
+        status = execution_status_for_tool_result("exec_command", content)
+    if not isinstance(status, Mapping):
+        return False
+    # Approval, validation/runtime errors and cancellation may occur before a
+    # child process starts. A terminal tool record alone is not execution proof.
+    exit_code = status.get("exit_code")
+    return (
+        type(exit_code) is int
+        or status.get("status") == "success"
+        or (status.get("status") == "error" and status.get("reason") == "nonzero_exit")
+    )
+
+
 def verify_summary_coverage(
     summary_text: str,
     obligations: Sequence[CompactionObligation],
@@ -701,36 +769,34 @@ def verify_summary_coverage(
     backfill_missing: bool = True,
     block_missing_critical: bool = False,
 ) -> CoverageResult:
-    """Check extracted continuity facts, not the semantic completeness of prose."""
+    """Report a bounded sample of string matches, never repair or reject prose.
 
-    obligations = [item for item in obligations if item.kind not in _MODEL_UPDATED_STATE_KINDS]
-    search_text = summary_text.casefold()
-    missing_obligations = [
-        obligation for obligation in obligations if obligation.value.casefold() not in search_text
-    ]
-    missing = [_obligation_label(obligation) for obligation in missing_obligations]
-    blocked = block_missing_critical and any(
-        obligation.critical for obligation in missing_obligations
-    )
-    if not obligations:
-        status = "unknown"
-    elif blocked:
-        status = "fail_blocked"
-    elif not missing:
-        status = "pass"
-    elif backfill_missing:
-        status = "pass_with_backfill"
-    else:
-        status = "fail_reported"
-    carry_forward = missing[:_MAX_CRITICAL_CARRY_FORWARD] if backfill_missing or blocked else []
-    return CoverageResult(
-        status=status,
-        checked_obligations=len(obligations),
-        covered_obligations=len(obligations) - len(missing),
-        missing_obligations=missing,
-        critical_carry_forward=carry_forward,
-        blocked=blocked,
-    )
+    The legacy keyword arguments remain accepted for older callers, but neither
+    enables backfill or blocking. This diagnostic is not semantic validation.
+    """
+
+    try:
+        search_text = summary_text.casefold()
+        checked = covered = 0
+        missing: list[str] = []
+        for obligation in islice(obligations, _MAX_COVERAGE_OBLIGATIONS):
+            if obligation.kind in _MODEL_UPDATED_STATE_KINDS:
+                continue
+            checked += 1
+            if obligation.value.casefold() in search_text:
+                covered += 1
+            elif len(missing) < _MAX_COVERAGE_MISSING_LABELS:
+                missing.append(_obligation_label(obligation))
+        return CoverageResult(
+            status="unknown" if not checked else "pass" if checked == covered else "fail_reported",
+            checked_obligations=checked,
+            covered_obligations=covered,
+            missing_obligations=missing,
+        )
+    except Exception:
+        # Observability must not become another reason to lose a valid summary.
+        # BaseException (including cancellation) deliberately propagates.
+        return CoverageResult()
 
 
 def build_structured_summary_from_text(
@@ -738,71 +804,30 @@ def build_structured_summary_from_text(
     obligations: Sequence[CompactionObligation],
     *,
     block_missing_critical: bool = False,
+    verified_attachment_paths: Sequence[str] = (),
 ) -> tuple[StructuredCompactionSummary, CoverageResult]:
-    """Build portable structured state from existing summary text plus obligations."""
+    """Keep model-authored prose in the v1 payload without semantic sidecars.
 
-    obligations = [item for item in obligations if item.kind not in _MODEL_UPDATED_STATE_KINDS]
-    initial_coverage = verify_summary_coverage(
-        summary_text,
-        obligations,
-        backfill_missing=True,
-        # Missing facts are materialized into the OpenSquilla-owned sidecar
-        # below. Blocking against the model's prose here would reject the
-        # very backfill that makes deterministic recovery safe.
-        block_missing_critical=False,
-    )
-    first_by_kind: dict[str, str] = {}
-    values_by_kind: dict[str, list[str]] = {}
-    for obligation in obligations:
-        first_by_kind.setdefault(obligation.kind, obligation.value)
-        values_by_kind.setdefault(obligation.kind, []).append(obligation.value)
+    Existing v1 fields and their renderer remain readable for old checkpoints.
+    New checkpoints do not turn extracted historical facts into current state.
+    """
 
+    coverage = verify_summary_coverage(summary_text, obligations)
     summary = StructuredCompactionSummary(
-        user_goal=first_by_kind.get("user_goal", ""),
         current_status=summary_text,
-        files_and_artifacts=[{"path": value} for value in values_by_kind.get("file_path", [])]
-        + [{"artifact": value} for value in values_by_kind.get("artifact_path_or_name", [])],
-        tool_results_to_remember=[
-            {"id": value} for value in values_by_kind.get("tool_result_id", [])
-        ]
-        + [{"fact": value} for value in values_by_kind.get("tool_result_fact", [])],
-        known_failures=[
-            {"detail": value} for value in values_by_kind.get("failed_command_or_error", [])
+        # These are host-materialized references, not facts extracted from prose.
+        # Keep the existing v1 field types so old readers can replay them too.
+        files_and_artifacts=[
+            {"path": path, "provenance": "verified_attachment"}
+            for path in sorted(set(verified_attachment_paths))
+            if path
         ],
-        executed_commands_and_tests=values_by_kind.get("command", []),
-        pending_tool_and_approval_ids=values_by_kind.get(
-            "pending_tool_or_approval_id",
-            [],
-        ),
-        decisions_and_rationale=[
-            {"detail": value} for value in values_by_kind.get("decision_or_rationale", [])
-        ],
-        important_identifiers=values_by_kind.get("important_identifier", []),
-        constraints_and_preferences=values_by_kind.get("user_constraint_or_preference", []),
-        do_not_repeat=values_by_kind.get("do_not_repeat_action", []),
-        critical_carry_forward=initial_coverage.critical_carry_forward,
         source_coverage={
-            "status": initial_coverage.status,
-            "checked_obligations": initial_coverage.checked_obligations,
-            "covered_obligations": initial_coverage.covered_obligations,
-        },
-    )
-    coverage = initial_coverage
-    if block_missing_critical:
-        # The durable artifact is the rendered structured checkpoint, not the
-        # free-form model prose. Re-check after deterministic sidecar backfill;
-        # only obligations still absent from the actual replay may block.
-        coverage = verify_summary_coverage(
-            render_structured_summary(summary),
-            obligations,
-            backfill_missing=False,
-            block_missing_critical=True,
-        )
-        summary.source_coverage = {
             "status": coverage.status,
             "checked_obligations": coverage.checked_obligations,
             "covered_obligations": coverage.covered_obligations,
-        }
+        },
+    )
     return summary, coverage
 
 

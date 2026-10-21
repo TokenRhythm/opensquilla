@@ -5,6 +5,7 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { helloOkResponse } from './support/gateway-fixture'
+import { expectComposerValue } from './utils'
 
 const TOKEN = 'synthetic-browser-gateway-token'
 
@@ -152,7 +153,7 @@ for (const lateHello of [false, true]) {
       }
       await expect.poll(() => wire.hellos.length).toBe(1)
       await expect(send).toBeEnabled()
-      await expect(input).toHaveValue('Synthetic guest draft retained through its first handshake.')
+      await expectComposerValue(input, 'Synthetic guest draft retained through its first handshake.')
       const owner = wire.hellos[0].principal.guestOwnerId
       expect(owner).toMatch(/^[0-9a-f]{64}$/)
       const subscriptions = () => wire.sent.filter(item => item.method === 'sessions.messages.subscribe')
@@ -165,7 +166,7 @@ for (const lateHello of [false, true]) {
       expect((await request.post(`${gateway.httpUrl}/reconnect`)).ok()).toBe(true)
       await expect.poll(() => wire.hellos.length).toBe(2)
       await expect(send).toBeEnabled()
-      await expect(input).toHaveValue('Synthetic guest draft retained through its first handshake.')
+      await expectComposerValue(input, 'Synthetic guest draft retained through its first handshake.')
       expect(subscriptions().at(-1)!.sessionKey).toBe(key)
       expect(wire.hellos[1].principal.guestOwnerId).toBe(owner)
       expect(wire.connections).toBe(2)
@@ -235,8 +236,8 @@ test('keeps an empty-token tab connected as a legal guest after enabling token a
     await prepare(page, gateway.wsUrl)
     const wire = observe(page)
     await page.goto('/control/sessions')
-    const connection = page.getByRole('button', { name: /^(Manage gateway connection|Connection:)/ })
-    await expect(connection).toHaveText('Connected')
+    const connection = page.locator('.topbar')
+    await expect(connection).toHaveAttribute('data-connection-state', 'connected')
     await expect.poll(() => wire.hellos.length).toBe(1)
     expect(wire.hellos[0].principal.authState).toBe('authenticated')
     expect(await page.evaluate(() => sessionStorage.getItem('opensquilla.wsToken'))).toBeNull()
@@ -244,8 +245,10 @@ test('keeps an empty-token tab connected as a legal guest after enabling token a
     expect((await request.post(`${gateway.httpUrl}/enable-token`)).ok()).toBe(true)
     await expect.poll(() => wire.hellos.length).toBe(2)
     expect(wire.hellos[1].principal).toMatchObject({ authenticated: false, authState: 'guest' })
-    await expect(connection).toHaveText('Connected')
-    await connection.click()
+    await expect(connection).toHaveAttribute('data-connection-state', 'connected')
+    await page.locator('.sidebar-foot button[data-icon="settings"]').click()
+    await page.getByRole('tab', { name: /^Gateway:/ }).click()
+    await page.locator('#settings-connection-details > summary').click()
     const token = page.locator('#conn-ws-token')
     await expect(page.locator('.conn-status__pill')).toHaveText('Connected')
     await expect(page.locator('.conn-status__reason')).not.toContainText('Authentication failed')
@@ -299,23 +302,31 @@ test('keeps connection settings navigation when a policy close settles the initi
       }
     })
   })
-  const connection = page.getByRole('button', { name: /^(Manage gateway connection|Connection:)/ })
-  await page.route(/\/(?:assets\/ChatView-[^/]+\.js|src\/views\/ChatView\.vue)(?:\?.*)?$/, async route => {
-    // Give the draft a connected bootstrap rather than an immediate offline result.
-    await expect(connection).toHaveText('Connected')
-    await route.continue()
-  })
+  const connection = page.locator('.topbar')
   await page.route(/\/(?:assets\/SettingsView-[^/]+\.js|src\/views\/web\/SettingsView\.vue)(?:\?.*)?$/, async route => {
     // Reproduce a slow first load of Settings while the initial draft completes.
     socket.close({ code: 1008, reason: 'origin_policy_rejected' })
-    await expect(connection).toHaveText('Disconnected')
+    await expect(connection).toHaveAttribute('data-connection-state', 'disconnected')
     await route.continue()
   })
-  await page.goto('/control/sessions')
+  // Establish the connection before mounting ChatView. A cold entry can
+  // canonicalize its offline bootstrap before the later held subscription,
+  // which does not exercise a pending initial draft at all. A native Back
+  // navigation from Usage gives both dev and built bundles the same ordering.
+  await page.goto('/control/usage')
+  await expect(connection).toHaveAttribute('data-connection-state', 'connected')
+  await page.evaluate(() => {
+    history.replaceState(null, '', '/control/chat')
+    history.pushState(null, '', '/control/usage')
+  })
+  await page.goBack()
   await expect.poll(() => subscribed).toBe(true)
+  await expect(connection).toHaveAttribute('data-connection-state', 'connected')
   await expect(page).toHaveURL(/\/control\/chat$/)
-  await connection.click()
-  await expect(page).toHaveURL(/\/settings\/gateway#connection$/)
+  await page.locator('.sidebar-foot button[data-icon="settings"]').click()
+  await page.getByRole('tab', { name: /^Gateway:/ }).click()
+  await expect(page).toHaveURL(/\/settings\/gateway$/)
+  await page.locator('#settings-connection-details > summary').click()
   const token = page.locator('#conn-ws-token')
   await expect(token).toBeVisible()
   await expect(page.locator('.conn-status__pill')).not.toHaveText('Token required')

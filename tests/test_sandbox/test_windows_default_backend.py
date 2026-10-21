@@ -29,6 +29,40 @@ from opensquilla.sandbox.types import (
 from opensquilla.tools.types import ToolContext, current_tool_context
 
 
+class _ProcessStream:
+    def __init__(self, process, index):
+        self.process = process
+        self.index = index
+        self.offset = 0
+
+    async def read(self, size):
+        output = (await self.process._communicated())[self.index]
+        chunk = output[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
+class _PipeProcess:
+    """Expose stream reads for existing in-memory process fixtures."""
+
+    @property
+    def stdout(self):
+        return _ProcessStream(self, 0)
+
+    @property
+    def stderr(self):
+        return _ProcessStream(self, 1)
+
+    async def _communicated(self):
+        if not hasattr(self, "_output_task"):
+            self._output_task = asyncio.create_task(self.communicate())
+        return await self._output_task
+
+    async def wait(self):
+        await self._communicated()
+        return self.returncode
+
+
 def _directory_link(link: Path, target: Path) -> None:
     try:
         link.symlink_to(target, target_is_directory=True)
@@ -1317,7 +1351,7 @@ async def test_backend_readonly_cwd_does_not_prepare_or_rehome_cache(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 0
 
         async def communicate(self):
@@ -1365,7 +1399,7 @@ async def test_backend_returns_helper_result(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         def __init__(self):
             self.returncode = returncode
 
@@ -1449,7 +1483,7 @@ async def test_backend_authenticates_timeout_before_stderr_truncation(
         b'\nOPENSQUILLA_WINDOWS_DEFAULT_HELPER_TIMEOUT {"nonce":"timeout-test","timed_out":true}\n'
     )
 
-    class Proc:
+    class Proc(_PipeProcess):
         returncode = 124
 
         async def communicate(self):
@@ -1484,7 +1518,7 @@ async def test_backend_cancellation_kills_and_reaps_helper(
     communicating = asyncio.Event()
     never_finishes = asyncio.Event()
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = None
         killed = False
         waited = False
@@ -1530,7 +1564,7 @@ async def test_frozen_backend_uses_internal_child_role(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 0
 
         async def communicate(self):
@@ -1565,7 +1599,7 @@ async def test_backend_raises_terminal_error_for_authenticated_helper_failure(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 1
 
         async def communicate(self):
@@ -1595,7 +1629,7 @@ async def test_invalid_helper_cwd_is_classified_as_launch_failure_without_host_f
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 1
 
         async def communicate(self):
@@ -1630,7 +1664,7 @@ async def test_helper_root_error_keeps_its_stable_code(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 1
 
         async def communicate(self):
@@ -1660,7 +1694,7 @@ async def test_backend_waits_for_helper_grace_beyond_command_timeout(
     from opensquilla.sandbox.backend import windows_default as mod
     from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
 
-    class _Proc:
+    class _Proc(_PipeProcess):
         returncode = 0
 
         async def communicate(self):

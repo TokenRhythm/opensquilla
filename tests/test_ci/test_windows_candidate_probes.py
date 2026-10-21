@@ -191,7 +191,7 @@ def test_startup_recovery_and_migration_are_independent_required_candidate_probe
     job = workflow("windows-candidate-probes.yml")["jobs"]["candidate-probe"]
     assert job["strategy"]["fail-fast"] is False
     assert set(job["strategy"]["matrix"]["probe"]) == {
-        "startup-compat", "ownership", "migration", "session",
+        "startup-compat-gateway", "startup-compat-desktop", "ownership", "migration", "session",
     }
     assert "needs" not in job
     assert not job.get("continue-on-error")
@@ -205,6 +205,15 @@ def test_startup_recovery_and_migration_are_independent_required_candidate_probe
     assert "candidate_artifact_id" in signed["internal-windows-candidate-probes"]["if"]
     assert "internal-windows-candidate-probes" in signed["internal-windows-acceptance"]["needs"]
     controller = (ROOT / ".github/scripts/verify-windows-candidate-probe.ps1").read_text()
+    # Both startup suites retain every scenario and restart in their original
+    # harness, while legacy callers can still request the combined selector.
+    assert "{ $_ -in @('startup-compat', 'startup-compat-gateway') }" in controller
+    assert "{ $_ -in @('startup-compat', 'startup-compat-desktop') }" in controller
+    assert (
+        "python .github/scripts/verify-packaged-startup-compatibility.py --gateway $gateway"
+        in controller
+    )
+    assert "--output (Join-Path $evidence 'electron.json') --scenario compatibility" in controller
     recovery_command = next(
         line for line in controller.splitlines()
         if "node desktop/electron/scripts/test-packaged-session-recovery.mjs" in line

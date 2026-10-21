@@ -18,6 +18,7 @@ from opensquilla.search.types import (
     SearchResult,
 )
 from opensquilla.secrets import clean_header_secret
+from opensquilla.usage_request import accounted_request
 
 _API_URL = "https://api.exa.ai/search"
 _RESULT_METADATA_EXCLUDE = {
@@ -102,8 +103,13 @@ class ExaSearchProvider:
                 trust_env=self._trust_env,
                 transport=self._transport,
             ) as client:
-                response = await client.post(
+                response = await accounted_request(
+                    client,
+                    "POST",
                     _API_URL,
+                    provider=self.name,
+                    operation="web_search",
+                    base_url="https://api.exa.ai",
                     json=body,
                     headers={
                         "Content-Type": "application/json",

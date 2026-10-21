@@ -7,7 +7,6 @@ from contextlib import contextmanager
 
 from opensquilla.application.admission_failures import (
     AdmissionIngressConflictError,
-    AdmissionMetaControlConflictError,
     AdmissionPendingInputConflictError,
     AdmissionPlanConflictError,
     AdmissionPlanSessionBusyError,
@@ -16,8 +15,8 @@ from opensquilla.application.admission_failures import (
     AdmissionTaskCollectionUnavailableError,
 )
 from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
+from opensquilla.session.sidechat import SidechatAdmissionRejectedError
 from opensquilla.session.storage import (
-    MetaControlIntentConflictError,
     PendingChatInputConflictError,
     PlanImplementationSessionBusyError,
     StaleEpochError,
@@ -29,6 +28,10 @@ from opensquilla.session.storage import (
 
 def admission_failure(error: Exception) -> Exception | None:
     """Preserve failure identity and retry facts without exposing native models."""
+    if isinstance(error, SidechatAdmissionRejectedError):
+        from opensquilla.application.admission_errors import AdmissionError
+
+        return AdmissionError("INVALID_REQUEST", str(error), accepted=False, retryable=False)
     if isinstance(error, StorageBusyError):
         return AdmissionStorageBusyError(
             error.operation,
@@ -47,8 +50,6 @@ def admission_failure(error: Exception) -> Exception | None:
         return AdmissionIngressConflictError(str(error))
     if isinstance(error, PendingChatInputConflictError):
         return AdmissionPendingInputConflictError(str(error))
-    if isinstance(error, MetaControlIntentConflictError):
-        return AdmissionMetaControlConflictError(str(error))
     if isinstance(error, TaskCollectionUnavailableError):
         return AdmissionTaskCollectionUnavailableError(str(error))
     if isinstance(error, (PlanConflictError, PlanRunConflictError)):

@@ -1,14 +1,70 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdtemp, mkdir, readFile, realpath, rm, rmdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { runInNewContext } from 'node:vm'
-import { AUDIT_MARKER, AUDIT_PURPOSE, assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, parseAuditManifest, parseSyntheticCredential, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
+import { AUDIT_MARKER, AUDIT_PURPOSE, assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, collectSqliteProcessCensus, parseAuditManifest, parseSyntheticCredential, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
+import { collectRetainedGatewayDiagnostics, sameLogFileIdentity } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
+import { captureFirstSendDiagnostic } from './packaged-first-send-cleanup.mjs'
+import { rendererConnectionMatches, waitForRendererConnection } from './renderer-connection-probe.mjs'
+
+function rendererStateFixture(states, expected) {
+  return runInNewContext(`(${rendererConnectionMatches.toString()})(expected)`, {
+    expected,
+    // A ready Desktop descriptor and composer deliberately coexist with every
+    // transport state. Neither is sufficient renderer connection evidence.
+    window: { opensquillaDesktop: { getGatewayConnection: () => ({ status: 'ready' }) } },
+    document: {
+      querySelectorAll: selector => selector === '.topbar[data-connection-state]'
+        ? states.map(state => ({ getAttribute: () => state })) : [{ disabled: false }],
+    },
+  })
+}
+
+test('renderer readiness requires the real connected state, not a ready Desktop or composer', () => {
+  for (const state of ['connecting', 'disconnected', 'ready', null]) {
+    assert.equal(rendererStateFixture([state], 'connected'), false)
+  }
+  assert.equal(rendererStateFixture(['connected'], 'connected'), true)
+})
+
+test('a missing, ambiguous or unmounted shell cannot stand in for a child-crash observation', () => {
+  for (const states of [[], [null], ['ready'], ['connected'], ['connected', 'disconnected']]) {
+    assert.equal(rendererStateFixture(states, 'not-connected'), false)
+  }
+  assert.equal(rendererStateFixture(['connecting'], 'not-connected'), true)
+  assert.equal(rendererStateFixture(['disconnected'], 'not-connected'), true)
+})
+
+test('renderer probe observes disconnect and reconnect independently with the caller deadline', async () => {
+  const observations = []
+  let states = ['connected']
+  let disposed = 0
+  const page = { async waitForFunction(predicate, expected, options) {
+    assert.equal(predicate, rendererConnectionMatches)
+    assert.equal(options.timeout, 75)
+    if (!rendererStateFixture(states, expected)) throw new Error('Expected transport state not observed')
+    observations.push(expected)
+    return { dispose: async () => { disposed += 1 } }
+  } }
+  await waitForRendererConnection(page, 'connected', { timeout: 75 })
+  await assert.rejects(waitForRendererConnection(page, 'not-connected', { timeout: 75 }), /not observed/)
+  states = []
+  await assert.rejects(waitForRendererConnection(page, 'not-connected', { timeout: 75 }), /not observed/)
+  states = ['disconnected']
+  await waitForRendererConnection(page, 'not-connected', { timeout: 75 })
+  await assert.rejects(waitForRendererConnection(page, 'connected', { timeout: 75 }), /not observed/)
+  states = ['connected']
+  await waitForRendererConnection(page, 'connected', { timeout: 75 })
+  assert.deepEqual(observations, ['connected', 'not-connected', 'connected'])
+  assert.equal(disposed, 3)
+  await assert.rejects(waitForRendererConnection(page, 'ready'), /Expected connected or not-connected/)
+})
 
 // Pure fixture/loopback tests: never execute the dummy .exe, Electron, Gateway,
 // an installer, or a real profile. These results are not native acceptance.
@@ -48,6 +104,284 @@ test('pinned synthetic inputs validate without rewriting credentials/config', as
   await assertPreservedInputs(plan)
   assert.equal(await readFile(plan.credentialPath, 'utf8'), JSON.stringify(credential()))
 })
+
+async function diagnosticFixture(t) {
+  const f = await fixture(t)
+  const plan = await verifyAuditInputs(f.manifestPath, f.outputDir)
+  for (const path of [join(plan.userDataDir, 'logs'), join(plan.profile, 'logs')]) await mkdir(path)
+  return { ...f, plan, gatewayLog: join(plan.userDataDir, 'logs/gateway.log'), debugLog: join(plan.profile, 'logs/debug.log') }
+}
+
+test('log identity permits only Windows unknown path device without weakening inode checks', () => {
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 123, ino: 456 }, platform), true)
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 789, ino: 456 }, platform), false)
+    assert.equal(sameLogFileIdentity({ dev: 0, ino: 456 }, { dev: 123, ino: 456 }, platform), platform === 'win32')
+    assert.equal(sameLogFileIdentity({ dev: 0, ino: 456 }, { dev: 123, ino: 789 }, platform), false)
+    assert.equal(sameLogFileIdentity({ dev: 123, ino: 456 }, { dev: 0, ino: 456 }, platform), false)
+  }
+})
+
+test('failure diagnostics retain database holder and exception evidence while redacting credentials', async t => {
+  const { plan, gatewayLog, debugLog } = await diagnosticFixture(t)
+  const record = JSON.stringify({ event: 'session_storage.operation_busy', operation: 'save_session',
+    attrs: { operation: 'read.archive' }, hold_ms: 2200, exception_type: 'OperationalError',
+    token: 'private-token-value', authorization: 'Bearer private-bearer-value',
+    path: join(plan.userDataDir, 'synthetic.log') }) + '\n'
+  await writeFile(gatewayLog, record)
+  await writeFile(debugLog, record)
+  await writeFile(debugLog + '.1', record)
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.deepEqual(rows.map(row => row.name), ['gateway.log', 'debug.log', 'debug.log.1'])
+  for (const row of rows) {
+    assert.match(row.tail, /session_storage.operation_busy/)
+    assert.match(row.tail, /read.archive/)
+    assert.match(row.tail, /OperationalError/)
+    assert.match(row.tail, /2200/)
+    assert.doesNotMatch(row.tail, /private-token-value|private-bearer-value/)
+    assert.equal(row.truncated, false)
+  }
+  await assertPreservedInputs(plan)
+})
+
+test('failure diagnostics retain safe SQLite codes and bounded connection states', async t => {
+  const { plan, gatewayLog } = await diagnosticFixture(t)
+  const evidence = {
+    event: 'session_storage.transaction_timing', operation: 'synthetic_contender',
+    sqlite_error_code: 517, sqlite_primary_code: 5, sqlite_error_name: 'SQLITE_BUSY_SNAPSHOT',
+    sqlite_version: '3.51.3', backend: 'sqlite3_fallback', connection_in_transaction: false,
+    connections: [
+      { connection_id: 1, role: 'session_writer', backend: 'sqlite3_fallback', status: 'open', connection_in_transaction: false },
+      { connection_id: 2, role: 'content_length_writer', backend: 'aiosqlite', status: 'open', connection_in_transaction: true },
+    ],
+    connections_observed: 2, connections_omitted: 0, connections_truncated: false,
+    current_unregistered: false,
+    process_registry_omitted: 0, process_registry_capacity: 64, registry_truncated: false,
+    process_id: 123,
+  }
+  await writeFile(gatewayLog, JSON.stringify({ ...evidence, token: 'private-diagnostic-token',
+    path: join(plan.userDataDir, 'private-synthetic-database.sqlite') }) + '\n')
+  const [row] = await collectRetainedGatewayDiagnostics(plan)
+  const observed = JSON.parse(row.tail)
+  for (const [key, value] of Object.entries(evidence)) assert.deepEqual(observed[key], value)
+  assert.doesNotMatch(row.tail, /private-diagnostic-token/)
+  assert.equal(row.tail.includes(plan.userDataDir), false)
+})
+
+test('log reads and redacted output are bounded; partial and oversized lines are omitted', async t => {
+  const { plan, gatewayLog, debugLog } = await diagnosticFixture(t)
+  const content = 'token=' + 'x'.repeat(70_000) + '\n' + 'z'.repeat(9000) + '\n'
+    + 'token=x\n'.repeat(6000) + 'session_storage.operation_busy hold_ms=2000\n' + 'unfinished-secret'
+  for (const path of [gatewayLog, debugLog, debugLog + '.1']) await writeFile(path, content)
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  for (const row of rows) {
+    assert.ok(row.capturedBytes <= 64 * 1024)
+    assert.ok(Buffer.byteLength(row.tail) <= 64 * 1024)
+    assert.equal(row.truncated, true)
+    assert.equal(row.leadingPartialLine, true)
+    assert.equal(row.trailingPartialLine, true)
+    assert.equal(row.oversizedLines, 1)
+    assert.match(row.tail, /session_storage.operation_busy hold_ms=2000/)
+    assert.doesNotMatch(row.tail, /unfinished-secret|token=x|z{20}|x{20}/)
+  }
+  assert.ok(rows.reduce((bytes, row) => bytes + Buffer.byteLength(row.tail), 0) <= 192 * 1024)
+})
+
+test('missing logs and non-file diagnostics do not prevent other log capture', async t => {
+  const { plan, gatewayLog, debugLog } = await diagnosticFixture(t)
+  await mkdir(gatewayLog)
+  await writeFile(debugLog, 'session_storage.operation_busy\n')
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.deepEqual(rows[0], { name: 'gateway.log', unavailable: true, code: 'UNSAFE_PATH' })
+  assert.match(rows[1].tail, /operation_busy/)
+  assert.deepEqual(rows[2], { name: 'debug.log.1', unavailable: true, code: 'ENOENT' })
+})
+
+test('diagnostics reject a profile outside the verified synthetic root and hard-linked logs', async t => {
+  const { root, plan, gatewayLog } = await diagnosticFixture(t)
+  const external = join(root, 'external-private.log')
+  await writeFile(external, 'external-private-content\n')
+  await link(external, gatewayLog)
+  const linked = await collectRetainedGatewayDiagnostics(plan)
+  assert.equal(linked[0].code, 'UNSAFE_PATH')
+  const outside = await collectRetainedGatewayDiagnostics({ ...plan, profile: root })
+  assert.ok(outside.every(row => row.code === 'UNSAFE_PATH'))
+  assert.doesNotMatch(JSON.stringify([linked, outside]), /external-private-content/)
+})
+
+test('diagnostics reject redirected log directories without reading outside the synthetic profile', async t => {
+  const { root, plan, gatewayLog } = await diagnosticFixture(t)
+  const external = join(root, 'external-logs')
+  await mkdir(external)
+  await writeFile(join(external, 'gateway.log'), 'external-private-content\n')
+  await rmdir(dirname(gatewayLog))
+  try { await symlink(external, dirname(gatewayLog), process.platform === 'win32' ? 'junction' : 'dir') }
+  catch (error) {
+    if (['EPERM', 'EACCES'].includes(error.code)) { t.skip('Creating a test directory link requires host privileges'); return }
+    throw error
+  }
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.equal(rows[0].code, 'UNSAFE_PATH')
+  assert.doesNotMatch(JSON.stringify(rows), /external-private-content/)
+})
+
+test('diagnostics reject a symbolic log file when the host permits creating one', async t => {
+  const { root, plan, gatewayLog } = await diagnosticFixture(t)
+  const external = join(root, 'external-private.log')
+  await writeFile(external, 'external-private-content\n')
+  try { await symlink(external, gatewayLog, 'file') }
+  catch (error) {
+    if (['EPERM', 'EACCES'].includes(error.code)) { t.skip('Creating a test file symlink requires host privileges'); return }
+    throw error
+  }
+  const rows = await collectRetainedGatewayDiagnostics(plan)
+  assert.equal(rows[0].code, 'UNSAFE_PATH')
+  assert.doesNotMatch(JSON.stringify(rows), /external-private-content/)
+})
+
+test('diagnostic timeout preserves the original failure and probe captures before cleanup', async () => {
+  const source = (await readFile(new URL('./test-packaged-retained-interaction.mjs', import.meta.url), 'utf8')).replace(/\r\n/g, '\n')
+  const start = source.indexOf('} catch (error) {\n  Object.assign(report')
+  const end = source.indexOf('\n} finally {', start)
+  assert.ok(start >= 0 && end > start)
+  const phases = []
+  const report = {}
+  const processState = { exitCode: 0 }
+  // Execute the real failure body without importing/starting Electron. A hung
+  // diagnostic and unreadable Desktop log must leave the initial error intact.
+  await runInNewContext(`(async () => {${source.slice(start + '} catch (error) {'.length, end)}\n})()`, {
+    error: Object.assign(new Error('original first-send timeout'), { code: 'FIRST_SEND_TIMEOUT' }),
+    report, outputCreated: true, active: undefined, plan: { outputDir: 'synthetic-evidence', logPath: 'synthetic-log' },
+    provider: { snapshot: () => ({}), close: async () => { phases.push('provider-close') } },
+    persist: async () => {}, join,
+    collectRetainedGatewayDiagnostics: () => { phases.push('logs'); return new Promise(() => {}) },
+    collectSqliteProcessCensus: () => { phases.push('processes'); return new Promise(() => {}) },
+    runFile: async () => {},
+    captureFirstSendDiagnostic: operation => captureFirstSendDiagnostic(operation, 10),
+    copyFile: async () => { throw Object.assign(new Error('unreadable-log'), { code: 'EACCES' }) },
+    console: { error() {} }, process: processState,
+  })
+  assert.deepEqual(phases, ['logs', 'processes', 'provider-close'])
+  assert.equal(report.error, 'original first-send timeout')
+  assert.equal(report.errorCode, 'FIRST_SEND_TIMEOUT')
+  assert.equal(report.ok, false)
+  assert.match(report.gatewayDiagnostics.diagnosticError, /timed out/)
+  assert.match(report.sqliteProcesses.diagnosticError, /timed out/)
+  assert.equal(report.desktopLogDiagnosticError, 'EACCES')
+  assert.equal(processState.exitCode, 1)
+})
+
+async function retainedSendHelpers(scope) {
+  const source = (await readFile(new URL('./test-packaged-retained-interaction.mjs', import.meta.url), 'utf8')).replace(/\r\n/g, '\n')
+  const start = source.indexOf('function remainingSendTime(')
+  const end = source.indexOf('async function quit()', start)
+  assert.ok(start >= 0 && end > start)
+  return runInNewContext(`${source.slice(start, end)}\n({ send, waitForRetainedGatewayIdle })`, { assert, ...scope })
+}
+
+test('real Send waits for signed Gateway idle after the answer and Send button are ready', async () => {
+  let now = 0
+  let releaseActivity
+  let completed = false
+  let snapshots = 0
+  const activityStarted = new Promise(resolve => { releaseActivity = resolve })
+  let resolveActivity
+  const firstActivity = new Promise(resolve => { resolveActivity = resolve })
+  const ownership = { pid: 123, instance_nonce: 'synthetic-instance' }
+  const requests = []
+  const deadlines = []
+  const report = {}
+  const { send } = await retainedSendHelpers({
+    Date: { now: () => now }, timeoutMs: 45_000, active: { ownership }, report,
+    ready: async () => {},
+    waitFor: async (check, label, timeout) => {
+      deadlines.push({ label, timeout })
+      assert.equal(await check(), true)
+    },
+    delay: async ms => { now += ms },
+    readVerifiedDesktopGatewayActivity: async (record, options) => {
+      assert.equal(record, ownership, 'The request must verify this launch, not a newly loaded owner')
+      requests.push(options.timeoutMs)
+      if (requests.length === 1) { releaseActivity(); return firstActivity }
+      return { kind: 'ok', activeCount: 0 }
+    },
+    snapshot: async () => {
+      snapshots += 1
+      return { requests: [{ method: 'chat.send', params: { message: 'synthetic turn' } }] }
+    },
+  })
+  const button = {
+    count: async () => 1, isEnabled: async () => true,
+    click: async ({ timeout }) => { assert.equal(timeout, 45_000); now += 100 },
+  }
+  const page = { locator: selector => {
+    if (selector === '.chat-textarea') return { fill: async () => {} }
+    if (selector === '.chat-send-btn.btn--primary') return button
+    assert.equal(selector, '.msg-ai-text')
+    return { filter: () => ({ last: () => ({ waitFor: async ({ timeout }) => {
+      assert.equal(timeout, 44_900)
+      now += 200
+    } }) }) }
+  } }
+  const sending = send(page, 'synthetic turn', 'synthetic answer').then(() => { completed = true })
+  await activityStarted
+  assert.equal(completed, false, 'Visible answer and enabled Send must not permit quit yet')
+  assert.equal(snapshots, 0)
+  resolveActivity({ kind: 'ok', activeCount: 1 })
+  await sending
+  assert.equal(completed, true)
+  assert.equal(snapshots, 1)
+  assert.deepEqual(requests, [1_000, 1_000])
+  assert.deepEqual(deadlines, [
+    { label: 'enabled real Send', timeout: 45_000 },
+    { label: 'completed real Send', timeout: 44_700 },
+  ])
+  assert.deepEqual(report.lastActivity, { kind: 'ok', activeCount: 0 })
+})
+
+test('retained completion rejects non-idle and unverified responses within the original deadline', async () => {
+  for (const activity of [
+    { kind: 'ok', activeCount: 1 }, { kind: 'unreachable' }, { kind: 'rejected' },
+  ]) {
+    let now = 44_800
+    const requests = []
+    const report = {}
+    const { waitForRetainedGatewayIdle } = await retainedSendHelpers({
+      Date: { now: () => now }, report,
+      delay: async ms => { now += ms },
+      readVerifiedDesktopGatewayActivity: async (_record, options) => {
+        requests.push(options.timeoutMs)
+        now += 100
+        return activity
+      },
+    })
+    await assert.rejects(waitForRetainedGatewayIdle({ pid: 123 }, 45_000), /did not become idle within its completion budget/)
+    assert.deepEqual(requests, [200], 'Activity requests consume only remaining time')
+    assert.equal(now, 45_000)
+    assert.equal(report.lastActivity, activity)
+  }
+})
+
+test('retained completion does not accept idle arriving after its deadline or without an owner', async () => {
+  let now = 44_990
+  let requests = 0
+  const { waitForRetainedGatewayIdle } = await retainedSendHelpers({
+    Date: { now: () => now }, report: {}, delay: async () => {},
+    readVerifiedDesktopGatewayActivity: async (_record, options) => {
+      requests += 1
+      assert.equal(options.timeoutMs, 10)
+      now = 45_001
+      return { kind: 'ok', activeCount: 0 }
+    },
+  })
+  await assert.rejects(waitForRetainedGatewayIdle(null, 45_000), /verified Gateway identity/)
+  assert.equal(requests, 0)
+  await assert.rejects(waitForRetainedGatewayIdle({ pid: 123 }, 45_000), /completion budget/)
+  assert.equal(requests, 1)
+  await assert.rejects(waitForRetainedGatewayIdle({ pid: 123 }, 45_000), /completion budget/)
+  assert.equal(requests, 1, 'An expired completion budget must not start another request')
+})
+
 test('redirected temporary parents yield canonical fixtures while audit aliases remain rejected', async t => {
   const parent = await fixture(t)
   const target = join(parent.root, 'temporary-target')
@@ -135,6 +469,40 @@ test('Desktop process guard rejects any existing Desktop and every incomplete ce
   await assert.rejects(assertNoExistingDesktop(async () => assert.fail('Invalid SystemRoot must not spawn a process'), 'relative-directory'), /absolute SystemRoot/)
 })
 
+test('failure process census keeps fixed images and PID evidence without arbitrary metadata', async () => {
+  const windowsDirectory = join(tmpdir(), 'Windows')
+  const signal = new AbortController().signal
+  const rows = [
+    '"OpenSquilla.exe","42","Private Session","1","26,228 K"',
+    '"opensquilla-gateway.exe","50","Private Session","1","26,228 K"',
+    '"opensquilla-gateway.exe","51","Private Session","1","26,228 K"',
+    '"python.exe","99","Private Session","1","26,228 K"',
+    '"private-document-name.exe","100","Private Session","1","26,228 K"',
+  ]
+  const census = await collectSqliteProcessCensus(async (_command, _args, options) => {
+    assert.equal(options.signal, signal)
+    return { stdout: rows.join('\r\n'), stderr: '' }
+  }, windowsDirectory, signal)
+  assert.deepEqual(census, { scope: 'image_and_pid_only', processes: [
+    { name: 'opensquilla.exe', pid: 42 },
+    { name: 'opensquilla-gateway.exe', pid: 50 },
+    { name: 'opensquilla-gateway.exe', pid: 51 },
+    { name: 'python.exe', pid: 99 },
+  ], truncated: false })
+  assert.doesNotMatch(JSON.stringify(census), /Private Session|private-document/)
+  const many = await collectSqliteProcessCensus(async () => ({ stdout: Array.from({ length: 40 }, (_, index) =>
+    `"python.exe","${index + 1}","Console","1","8 K"`).join('\r\n') }), windowsDirectory)
+  assert.equal(many.processes.length, 32)
+  assert.equal(many.truncated, true)
+  for (const stdout of ['', 'malformed', '"python.exe","9999999999999999","Console","1","8 K"']) {
+    assert.deepEqual(await collectSqliteProcessCensus(async () => ({ stdout }), windowsDirectory),
+      { unavailable: true, code: 'PROCESS_CENSUS_UNAVAILABLE' })
+  }
+  const failed = await collectSqliteProcessCensus(async () => { throw Object.assign(
+    new Error('private process command line'), { code: 'ABORT_ERR' }) }, windowsDirectory)
+  assert.deepEqual(failed, { unavailable: true, code: 'ABORT_ERR' })
+})
+
 const stopSnapshot = () => ({ requests: [{ method: 'chat.abort', params: { sessionKey: 'session-a', taskId: 'task-a', source: 'webui_stop', scope: 'task' } }], events: [{ taskId: 'task-a', reason: 'aborted' }] })
 test('Stop requires one real UI abort and the matching cancelled task', () => {
   assert.equal(assertStopEvidence(stopSnapshot(), 'session-a').taskId, 'task-a')
@@ -173,6 +541,19 @@ test('browser observation forwards every original frame and records terminal eve
   socket.incoming({ type: 'event', event: 'session.event.done', payload: { session_key: 'session-a', turn_id: 'task-a', reason: 'aborted', content: 'do not persist arbitrary transcript' } })
   assert.equal(assertStopEvidence(context.__retainedAuditRpc, 'session-a').taskId, 'task-a')
   assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('do not persist'), false)
+  const request = JSON.stringify({ type: 'req', id: 'snapshot-1', method: 'sessions.snapshot', params: { token: 'private-token' } })
+  assert.equal(socket.send(request), 'original-return')
+  socket.incoming({ type: 'res', id: 'snapshot-1', ok: false, error: { code: 'SNAPSHOT_STALE', message: 'private-details' }, payload: { content: 'private-transcript' } })
+  const transport = JSON.parse(JSON.stringify(context.__retainedAuditRpc.transport))
+  assert.deepEqual(transport.slice(-2).map(({ at, ...entry }) => {
+    assert.equal(typeof at, 'number')
+    return entry
+  }), [
+    { type: 'req', id: 'snapshot-1', method: 'sessions.snapshot' },
+    { type: 'res', id: 'snapshot-1', ok: false, code: 'SNAPSHOT_STALE' },
+  ])
+  assert.equal(JSON.stringify(context.__retainedAuditRpc).includes('private-'), false)
+  assert.equal(socket.sent.at(-1), request, 'Diagnostics must forward the unmodified request')
 })
 
 async function providerFixture(t) {

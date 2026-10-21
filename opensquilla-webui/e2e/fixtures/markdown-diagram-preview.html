@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-Hans" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>图表渲染验收 · OpenSquilla</title>
+    <style>
+      body { margin: 0; }
+      html body #app { display: block; height: auto; min-height: 100vh; overflow: visible; }
+      .diagram-preview { width: min(880px, calc(100% - 48px)); margin: 0 auto; padding: 36px 0 64px; }
+      .diagram-preview__header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 1px solid var(--hairline); }
+      .diagram-preview__title { margin: 0 0 6px; font-size: 20px; font-weight: 600; color: var(--text); }
+      .diagram-preview__caption { margin: 0; color: var(--text-muted); font-size: 13px; }
+      .diagram-preview__controls { display: flex; align-items: center; gap: 8px; }
+      .diagram-preview__controls select, .diagram-preview__controls button { padding: 7px 10px; border: 1px solid var(--hairline); border-radius: var(--radius-control); background: var(--bg); color: var(--text); font: inherit; font-size: 13px; }
+      .diagram-preview__controls button { cursor: pointer; }
+      .diagram-preview__controls :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .diagram-preview__status { min-height: 22px; color: var(--text-muted); font-size: 12px; margin-bottom: 12px; }
+      @media (max-width: 640px) { .diagram-preview { width: calc(100% - 32px); padding-top: 24px; } }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="./markdown-diagram-preview.ts"></script>
+  </body>
+</html>

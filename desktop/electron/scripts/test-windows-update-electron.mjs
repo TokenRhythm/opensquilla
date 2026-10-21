@@ -32,19 +32,59 @@ await writeFile(reportPath, `${JSON.stringify({ ok: false, status: 'running', ru
 const isolationRoot = await mkdtemp(join(tmpdir(), 'opensquilla-update-electron-'))
 let runningApp
 const results = []
+
+async function closeFixtureAfterFailure(app) {
+  return await closeElectronWithDeadline({
+    app: {
+      process: () => app.process(),
+      close: async () => {
+        // Failed assertions can leave these test-only gates held. Release them
+        // only in teardown, after the original failure has been recorded.
+        await app.evaluate(() => {
+          globalThis.windowsUpdateFixture?.releaseVerification()
+          globalThis.windowsUpdateFixture?.releaseDrain()
+        })
+        await app.close()
+      },
+    },
+    phase: 'Windows update fixture cleanup',
+    timeoutMs: 10_000,
+  })
+}
+
+
+function waitForElectronExit(app) {
+  const child = app.process()
+  if (child.exitCode !== null) return Promise.resolve(child.exitCode)
+  return new Promise((resolveExit, rejectExit) => {
+    const timeout = setTimeout(() => {
+      child.removeListener('exit', onExit)
+      rejectExit(new Error('The Electron process did not exit within 15 seconds.'))
+    }, 15_000)
+    const onExit = (code, signal) => {
+      clearTimeout(timeout)
+      if (code !== 0 || signal) rejectExit(new Error(`Electron exited with code ${code}, signal ${signal}`))
+      else resolveExit(code)
+    }
+    // app.exit() may close the native process before CDP reports the separate
+    // ElectronApplication "close" event. Observe the process that owns Gateway.
+    child.once('exit', onExit)
+  })
+}
 try {
 const source = await readFile(join(packageRoot, 'src/main.ts'), 'utf8')
 const parsed = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
 const functions = new Map(parsed.statements.filter(ts.isFunctionDeclaration).filter(node => node.name)
   .map(node => [node.name.text, node.getText(parsed)]))
 const names = [
-  'windowsInstallerActionsSupported', 'windowsUpdateDownloadDirectory', 'clearWindowsUpdateCache',
+  'windowsInstallerActionsSupported', 'desktopUpdateAutomaticDownloadSupported', 'windowsUpdateDownloadDirectory', 'clearWindowsUpdateCache',
   'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache', 'revalidateReadyWindowsInstaller',
   'desktopUpdateSnapshot', 'publishDesktopUpdateState', 'setDesktopUpdateState',
   'restoreDownloadedUpdateRetryState', 'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage',
   'applyWindowsInstaller', 'applyDownloadedUpdate', 'handleMainWindowClose', 'trustedMainWindowControlIpc',
-  'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates', 'showUpdateError',
+  'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkDesktopUpdateCandidate', 'downloadDesktopUpdate', 'runDesktopUpdateDownload', 'checkForUpdates', 'showUpdateError',
   'desktopUpdatePlatform', 'resolveDesktopUpdate', 'desktopGatewayConnectionSuspendedForExit',
+  'holdQuitForTaskConfirmation',
 ]
 for (const name of names) assert.ok(functions.has(name), `production ${name} must exist`)
 const statements = []
@@ -83,7 +123,7 @@ await writeFile(rendererHtml, '<!doctype html><html lang="en" data-theme="light"
 await writeFile(rendererEntry, `
 import { createApp, h } from 'vue'
 import { createI18n } from 'vue-i18n'
-import Indicator from ${sourceImport('src/components/DesktopUpdateIndicator.vue')}
+import Indicator from ${sourceImport('src/components/SidebarDesktopUpdate.vue')}
 import Panel from ${sourceImport('src/components/settings/SettingsUpdatePanel.vue')}
 import en from ${sourceImport('src/locales/en.json')}
 import ${sourceImport('src/assets/base.css')}
@@ -169,8 +209,9 @@ async function launchCase(name, { installEnabled = true } = {}) {
     assert.equal(refreshed.counts.launches, 0)
     await f.page.locator('[data-testid="settings-update-relaunch"]').waitFor({ state: 'hidden' })
     await f.screenshot('available-c')
-    const closed = f.app.waitForEvent('close', { timeout: 15_000 })
-    await f.app.evaluate(({ app }) => app.quit())
+    const closed = waitForElectronExit(f.app)
+    void closed.catch(() => {})
+    await f.app.close()
     await closed
     runningApp = null
     results.push({ case: f.name, passed: true, canInstall: false, from: '0.5.5', to: '0.5.6' })
@@ -208,11 +249,15 @@ async function launchCase(name, { installEnabled = true } = {}) {
     await waitFor(async () => (await f.snapshot()).verificationHeld, 'retry verification before Quit')
     await f.app.evaluate(({ app }) => { globalThis.windowsUpdateFixture.closeWindow(); app.quit() })
     const deferred = await f.snapshot()
-    assert.equal(deferred.visible, false)
+    assert.equal(deferred.visible, true, 'held verification must keep the protected update visible')
     assert.equal(deferred.destroyed, false)
     assert.equal(deferred.quitRequestedDuringUpdateDrain, true)
-    const closed = f.app.waitForEvent('close', { timeout: 15_000 })
-    await f.app.evaluate(() => globalThis.windowsUpdateFixture.releaseVerification())
+    const closed = waitForElectronExit(f.app)
+    void closed.catch(() => {})
+    // Release after Playwright detaches its Node inspector; otherwise Node waits
+    // for that debugger at app.exit() despite the production drain completing.
+    await f.app.evaluate(() => { setTimeout(() => globalThis.windowsUpdateFixture.releaseVerification(), 250) })
+    await f.app.close()
     await closed
     runningApp = null
     const logs = (await readFile(f.logPath, 'utf8')).trim().split('\n').map(JSON.parse)
@@ -243,13 +288,15 @@ async function launchCase(name, { installEnabled = true } = {}) {
     assert.equal((await f.snapshot()).counts.stops, 2, 'duplicate real renderer IPC cannot begin another drain')
     await f.app.evaluate(({ app }) => { globalThis.windowsUpdateFixture.closeWindow(); app.quit(); app.quit() })
     const deferred = await f.snapshot()
-    assert.equal(deferred.visible, false)
+    assert.equal(deferred.visible, true, 'held Gateway drain must keep the protected update visible')
     assert.equal(deferred.destroyed, false)
     assert.equal(deferred.gatewayPids.length, 1)
     assert.equal(deferred.counts.launches, 1)
     assert.equal(deferred.updateInstallHandoffReady, false)
-    const closed = f.app.waitForEvent('close', { timeout: 15_000 })
-    await f.app.evaluate(() => globalThis.windowsUpdateFixture.releaseDrain())
+    const closed = waitForElectronExit(f.app)
+    void closed.catch(() => {})
+    await f.app.evaluate(() => { setTimeout(() => globalThis.windowsUpdateFixture.releaseDrain(), 250) })
+    await f.app.close()
     await closed
     runningApp = null
     const logs = (await readFile(f.logPath, 'utf8')).trim().split('\n').map(JSON.parse)
@@ -266,7 +313,7 @@ async function launchCase(name, { installEnabled = true } = {}) {
       'desktop/electron/src/update-channel.ts', 'desktop/electron/src/update-check-scheduler.ts',
       'desktop/electron/src/windows-update-cache.ts', 'desktop/electron/src/windows-update-coordinator.ts',
       'desktop/electron/src/windows-update-handoff.ts', 'desktop/electron/src/desktop-window-lifecycle.ts',
-      'opensquilla-webui/src/components/DesktopUpdateIndicator.vue',
+      'opensquilla-webui/src/components/SidebarDesktopUpdate.vue',
       'opensquilla-webui/src/components/settings/SettingsUpdatePanel.vue',
       'opensquilla-webui/src/composables/useDesktopUpdate.ts',
       'opensquilla-webui/src/composables/useDesktopUpdatePresentation.ts',
@@ -281,7 +328,7 @@ async function launchCase(name, { installEnabled = true } = {}) {
   await writeFile(reportPath, `${JSON.stringify({ ok: false, status: 'failed', runId, error: String(error), results }, null, 2)}\n`).catch(() => {})
   throw error
 } finally {
-  if (runningApp) await closeElectronWithDeadline({ app: runningApp, phase: 'Windows update fixture cleanup', timeoutMs: 10_000 }).catch(() => {})
+  if (runningApp) await closeFixtureAfterFailure(runningApp).catch(() => {})
   const cleanup = resolve(isolationRoot)
   const fromTemp = relative(resolve(tmpdir()), cleanup)
   assert.ok(fromTemp && !fromTemp.startsWith('..') && !fromTemp.includes(':'))

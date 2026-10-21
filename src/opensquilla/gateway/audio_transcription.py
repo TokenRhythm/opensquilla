@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from starlette.applications import Starlette
@@ -36,6 +38,8 @@ def register_audio_transcription_routes(
     *,
     config: GatewayConfig,
     provider_factory: Callable[[GatewayConfig], Any] = _default_provider_factory,
+    usage_event_sink: Any | None = None,
+    session_manager: Any | None = None,
 ) -> None:
     """Register POST /api/audio/transcribe for browser-recorded audio."""
 
@@ -101,16 +105,65 @@ def register_audio_transcription_routes(
         language_code_value = form.get("language_code")
         language_code = language_code_value if isinstance(language_code_value, str) else None
 
-        try:
-            result = await provider_factory(config).transcribe_audio(
-                ElevenLabsSpeechToTextRequest(
-                    audio_bytes=payload,
-                    filename=str(filename),
-                    mime_type=mime_type,
-                    model_id=model_id,
-                    language_code=language_code or None,
+        from opensquilla.engine.usage_accounting import (
+            UsageAccountingScope,
+            UsageExecutionContext,
+            bind_usage_accounting_scope,
+        )
+        from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
+
+        # Resolve the recording owner before any provider call. A pre-turn
+        # recording has a durable draft identity rather than a fabricated turn.
+        owner = form.get("session_key")
+        scope = None
+        if usage_event_sink is not None:
+            if isinstance(owner, str) and owner:
+                scope = await build_session_usage_scope(
+                    usage_event_sink,
+                    session_manager,
+                    owner,
+                    run_kind="audio_transcription",
                 )
-            )
+                expected_id = form.get("session_id")
+                expected_epoch = form.get("session_epoch")
+                if (
+                    scope is None
+                    or not scope.context.session_id
+                    or expected_id != scope.context.session_id
+                    or expected_epoch != str(scope.context.session_epoch)
+                ):
+                    return JSONResponse(
+                        {"error": "recording session is unavailable", "code": "INVALID_SESSION"},
+                        status_code=409,
+                    )
+                scope = UsageAccountingScope(
+                    sink=scope.sink,
+                    context=replace(scope.context, turn_id=None),
+                )
+            else:
+                execution_id = uuid.uuid4().hex
+                scope = UsageAccountingScope(
+                    sink=usage_event_sink,
+                    context=UsageExecutionContext(
+                        execution_id=execution_id,
+                        agent_run_id=execution_id,
+                        session_id=f"usage-draft:{uuid.uuid4().hex}",
+                        run_kind="audio_transcription",
+                        agent_id="main",
+                    ),
+                )
+
+        try:
+            with bind_usage_accounting_scope(scope):
+                result = await provider_factory(config).transcribe_audio(
+                    ElevenLabsSpeechToTextRequest(
+                        audio_bytes=payload,
+                        filename=str(filename),
+                        mime_type=mime_type,
+                        model_id=model_id,
+                        language_code=language_code or None,
+                    )
+                )
         except Exception as exc:
             return JSONResponse(
                 {"error": str(exc), "code": "PROVIDER_ERROR"},
@@ -122,6 +175,8 @@ def register_audio_transcription_routes(
             "provider": result.provider,
             "model": result.model,
         }
+        if scope is not None:
+            response["usage_owner_id"] = scope.context.session_id
         if result.language_code is not None:
             response["language_code"] = result.language_code
         if result.language_probability is not None:

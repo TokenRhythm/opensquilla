@@ -18,6 +18,13 @@ from opensquilla.session.models import SessionNode, SessionStatus
 from opensquilla.session.storage import SessionStorage
 
 GUEST_KEY = "osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+V2_SESSION_READ_METHODS = (
+    "sessions.read.open.v2",
+    "sessions.read.state.v2",
+    "sessions.read.install.v2",
+    "sessions.read.close.v2",
+    "sessions.history.page.v2",
+)
 
 
 def _guest(*, owner_id: str = "a" * 64) -> Principal:
@@ -133,6 +140,81 @@ async def test_anonymous_node_role_cannot_bypass_guest_allowlist() -> None:
 def test_guest_policy_rejects_unowned_session_methods(method: str, params: dict[str, str]) -> None:
     with pytest.raises(GuestRpcPolicyError):
         GuestRpcPolicy.authorize(method, params, _ctx())
+
+
+@pytest.mark.parametrize("method", V2_SESSION_READ_METHODS)
+def test_guest_v2_reads_preserve_owned_session_and_lease_proof(method: str) -> None:
+    owned = guest_owned_session_key("a" * 64, "mine")
+    params = {"key": owned, "lease_id": "lease", "recovery_id": "recovery",
+              "consumed_through_seq": 12, "ack_through_seq": 12}
+    assert GuestRpcPolicy.authorize(method, params, _ctx()) == params
+
+
+@pytest.mark.parametrize("method", V2_SESSION_READ_METHODS)
+@pytest.mark.parametrize("key", [None, "agent:main:webchat:owner",
+                                   f"agent:main:webchat:guest:{'b' * 64}:other"])
+def test_guest_v2_reads_reject_missing_owner_and_other_browser_keys(method: str, key) -> None:
+    with pytest.raises(GuestRpcPolicyError):
+        GuestRpcPolicy.authorize(method, {"key": key, "lease_id": "lease"}, _ctx())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", V2_SESSION_READ_METHODS[1:4])
+@pytest.mark.parametrize("forgery", ["connection", "key", "lease_id", "recovery_id"])
+async def test_guest_v2_lease_methods_keep_connection_and_recovery_fences(
+    monkeypatch, method, forgery,
+) -> None:
+    from opensquilla.gateway import rpc_sessions, websocket
+
+    registry = websocket.ConnectionRegistry()
+    monkeypatch.setattr(websocket, "_registry", registry)
+    monkeypatch.setattr(rpc_sessions, "_V2_READ_LEASES", {})
+    monkeypatch.setattr(rpc_sessions, "_V2_READ_OPEN_BY_CONNECTION", {})
+    monkeypatch.setattr(rpc_sessions, "_V2_READ_CONNECTION_OWNERS", {})
+
+    async def identity(ctx, key):
+        return f"id:{key}", 1
+
+    monkeypatch.setattr(rpc_sessions, "_snapshot_session_identity", identity)
+    ctx = _ctx()
+    conn = websocket.WsConnection(ctx.conn_id, SimpleNamespace())
+    conn.principal = ctx.principal
+    registry.register(conn)
+    key = guest_owned_session_key("a" * 64, "mine")
+    dispatcher = get_dispatcher()
+    try:
+        opened = await dispatcher.dispatch("open", "sessions.read.open.v2", {"key": key}, ctx)
+        assert opened.ok, opened.error
+        params = {"key": key, "lease_id": opened.payload["lease_id"],
+                  "recovery_id": opened.payload["recovery_id"]}
+        if forgery == "connection":
+            ctx = RpcContext(conn_id="another-connection", principal=ctx.principal)
+        elif forgery == "key":
+            params["key"] = guest_owned_session_key("a" * 64, "another-owned-session")
+        else:
+            params[forgery] = "forged"
+        response = await dispatcher.dispatch("forged", method, params, ctx)
+        assert not response.ok
+        assert response.error.code == "READ_STALE"
+        assert (conn.conn_id, opened.payload["lease_id"]) in rpc_sessions._V2_READ_LEASES
+    finally:
+        conn._cleanup_transport()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("session_id", "forged"), ("session_epoch", 9)])
+async def test_guest_v2_history_rejects_forged_session_identity(monkeypatch, field, value):
+    from opensquilla.gateway import rpc_sessions
+
+    async def identity(ctx, key):
+        return "actual-session", 1
+
+    monkeypatch.setattr(rpc_sessions, "_snapshot_session_identity", identity)
+    params = {"key": guest_owned_session_key("a" * 64, "mine"),
+              "direction": "before", field: value}
+    response = await get_dispatcher().dispatch("forged", "sessions.history.page.v2", params, _ctx())
+    assert not response.ok
+    assert response.error.code == "REBASE_REQUIRED"
 
 
 def test_guest_chat_send_rewrites_client_key_into_server_owner_namespace() -> None:

@@ -137,12 +137,28 @@ def collect_install_telemetry(
                         skipped_reason="endpoint_empty",
                     )
 
+            # Probe only when an event is needed. Cold Windows queries can enter
+            # WMI, so keep them outside the cross-process state transaction.
+            platform_details = _platform_details()
+            with _state_transaction(path):
+                # Another collector may have uploaded while the probe ran.
+                # Select the event and identity again from its latest state.
+                state = _load_or_create_state(path)
+                event = _next_event(state, current_version)
+                if event is None:
+                    return InstallTelemetryResult(
+                        state_path=path,
+                        endpoint_configured=True,
+                        skipped_reason="already_uploaded",
+                    )
+
                 now = _utc_now()
                 payload = _build_payload(
                     state,
                     event=event,
                     current_version=current_version,
                     sent_at=now,
+                    platform_details=platform_details,
                 )
                 skip_reason = _telemetry_skip_reason(config=config)
                 if skip_reason:
@@ -558,22 +574,32 @@ def _add_uploaded_version(state: dict[str, Any], current_version: str) -> None:
     state["uploaded_versions"] = versions
 
 
+def _platform_details() -> tuple[str, str, str]:
+    return (
+        _safe_str(platform.system()),
+        _safe_str(platform.release()),
+        _safe_str(platform.machine()),
+    )
+
+
 def _build_payload(
     state: dict[str, Any],
     *,
     event: str,
     current_version: str,
     sent_at: str,
+    platform_details: tuple[str, str, str] | None = None,
 ) -> dict[str, Any]:
+    system, release, machine = platform_details or _platform_details()
     return {
         "schema_version": TELEMETRY_SCHEMA_VERSION,
         "event": event,
         "install_id": state["install_id"],
         "opensquilla_version": current_version,
         "install_method": _detect_install_method(),
-        "os": _safe_str(platform.system()),
-        "os_version": _safe_str(platform.release()),
-        "architecture": _safe_str(platform.machine()),
+        "os": system,
+        "os_version": release,
+        "architecture": machine,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         "first_seen_at": state["first_seen_at"],
         "sent_at": sent_at,
@@ -611,7 +637,9 @@ def _post_payload(
     try:
         import httpx
 
-        with httpx.Client(timeout=timeout) as client:
+        from opensquilla.observability.http_client import observability_httpx_kwargs
+
+        with httpx.Client(timeout=timeout, **observability_httpx_kwargs()) as client:
             response = client.post(endpoint, json=payload)
         if response.status_code in _SUCCESS_STATUS_CODES:
             return True, None

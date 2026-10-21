@@ -131,6 +131,40 @@ def test_new_repository_release_promotes_existing_legacy_channels() -> None:
     assert should_promote(preview, candidate, channel="preview/0.5.5.json") is True
 
 
+@pytest.mark.parametrize("owner", ["TokenRhythm", "opensquilla"])
+def test_draft_temporary_url_is_normalized_only_for_rehearsal(owner: str) -> None:
+    release = _release("v0.5.6", prerelease=False)
+    release["isDraft"] = True
+    release["url"] = (
+        f"https://github.com/{owner}/opensquilla/releases/tag/untagged-f2312b8f42ee782605f3"
+    )
+    original = copy.deepcopy(release)
+    manifest = build_draft_rehearsal_manifest(release, _assets("0.5.6"))
+    assert (
+        manifest["releaseUrl"] == "https://github.com/opensquilla/opensquilla/releases/tag/v0.5.6"
+    )
+    assert release == original
+    release["isDraft"] = False
+    with pytest.raises(ManifestError, match="canonical GitHub Release URL"):
+        build_manifest(release, _assets("0.5.6"))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/other/opensquilla/releases/tag/untagged-123abc",
+        "https://github.com/TokenRhythm/other/releases/tag/untagged-123abc",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/untagged-123abc?x=1",
+        "https://github.com/TokenRhythm/opensquilla/releases/tag/untagged-123abc/extra",
+    ],
+)
+def test_draft_rehearsal_rejects_untrusted_temporary_urls(url: str) -> None:
+    release = _release("v0.5.6", prerelease=False)
+    release.update(isDraft=True, url=url)
+    with pytest.raises(ManifestError, match="canonical GitHub Release URL"):
+        build_draft_rehearsal_manifest(release, _assets("0.5.6"))
+
+
 def test_builds_prerelease_manifest_and_scoped_targets() -> None:
     manifest, targets = build_manifest(_release("v0.5.0rc4", prerelease=True), _assets("0.5.0-rc4"))
 

@@ -37,10 +37,15 @@ def test_manual_envelope_has_real_prompt_and_tools_without_invocation(
     config = SimpleNamespace(
         llm=SimpleNamespace(thinking="high"),
         prompt_cache=SimpleNamespace(effective_mode=cache_mode),
-        compaction=SimpleNamespace(protected_recent_messages=5, compaction_profile="coding"),
+        compaction=SimpleNamespace(
+            protected_recent_messages=5, compaction_profile="coding",
+            timeout_seconds=90.0, total_timeout_seconds=120.0,
+        ),
         tools=SimpleNamespace(deny=["write_file"]),
     )
     runner = TurnRunner(provider_selector=Mock(), tool_registry=registry, config=config)
+    request_timeout = Mock(return_value=245.0)
+    monkeypatch.setattr(runner, "_resolve_agent_request_timeout", request_timeout)
     monkeypatch.setattr(runner, "_resolve_bootstrap_workspace_dir", lambda _agent: tmp_path)
     monkeypatch.setattr(runner, "_resolve_memory_source_dir", lambda _agent: tmp_path)
     no_pipeline = AsyncMock(side_effect=AssertionError("must not execute a turn pipeline"))
@@ -67,6 +72,7 @@ def test_manual_envelope_has_real_prompt_and_tools_without_invocation(
         agent.config.system_prompt, agent.config.request_context_prompt,
     ]))
     assert "approved conventions." in prompt
+    assert "## Visual Presentation" not in prompt
     assert "read_file" in prompt
     assert [definition.name for definition in agent.tool_definitions] == ["read_file"]
     assert agent.config.model_id == "fixture-model"
@@ -76,6 +82,12 @@ def test_manual_envelope_has_real_prompt_and_tools_without_invocation(
     assert agent.config.provider_request_proof_max_chars == 700_000
     assert agent.config.compaction_profile == "coding"
     assert agent.config.compaction_protected_recent_messages == 5
+    assert agent.config.compaction_timeout_seconds == 90.0
+    assert agent.config.compaction_total_timeout_seconds == 120.0
+    assert agent.config.request_timeout == 245.0
+    assert agent.build_compaction_request_context().chat_config.timeout == 245.0
+    request_timeout.assert_called_once_with(session.session_key, None)
+    assert agent.config.preserve_historical_images is True
     assert agent.config.thinking == "high"
     assert bool(agent.config.cache_breakpoints) is (cache_mode == "auto")
     assert agent.tool_handler is None
@@ -95,7 +107,8 @@ def test_manual_envelope_copies_explicit_tool_policy_context(
     for name in ("read_file", "write_file"):
         registry.register(ToolSpec(name, name, {}), handler)
     runner = TurnRunner(provider_selector=Mock(), tool_registry=registry)
-    monkeypatch.setattr(runner, "_assemble_prompt", lambda *_args, **_kwargs: "known instructions")
+    assemble = Mock(return_value="known instructions")
+    monkeypatch.setattr(runner, "_assemble_prompt", assemble)
     caller = ToolContext(
         session_key="agent:main:webchat:manual-envelope",
         caller_kind=CallerKind.WEB,
@@ -118,6 +131,7 @@ def test_manual_envelope_copies_explicit_tool_policy_context(
     )
 
     assert [definition.name for definition in agent.tool_definitions] == ["read_file"]
+    assert assemble.call_args.kwargs["webui_rendering"] is True
     assert caller.denied_tools == original_denied
     assert caller.surfaced_tools == original_surfaced
     assert caller.authorized_tool_names is None

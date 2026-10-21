@@ -1,12 +1,21 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  allowedComposerRunModes,
   completeComposerSafeSetup,
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
 } from './composerRunMode'
 
 describe('effectiveComposerRunMode', () => {
+  it('allows an already available Safe backend during a preparation check', () => {
+    const status = { state: 'setting_up', platform: 'win32', message: '', requiresAdmin: false } as const
+    expect(allowedComposerRunModes(['full', 'safe'], status, true, true)).toEqual(['full', 'safe'])
+    expect(composerRunModeSelectionAction('safe', status, false, true, true)).toBe('persist')
+    expect(allowedComposerRunModes(['full', 'safe'], status, true, false)).toEqual(['full'])
+    expect(composerRunModeSelectionAction('safe', status, false, true, false)).toBe('ignore')
+  })
+
   it.each(['not_setup', 'setting_up', 'failed', 'unavailable'] as const)(
     'never turns a saved Safe preference into Full Access while setup is %s',
     (state) => {
@@ -42,14 +51,14 @@ describe('effectiveComposerRunMode', () => {
     )).toBe('safe')
   })
 
-  it('routes a repairable Safe selection into setup instead of persistence', () => {
+  it('persists Safe when readiness is ready and only routes setup states to repair', () => {
     const status = { state: 'not_setup', platform: 'win32', message: '', requiresAdmin: true } as const
 
     expect(composerRunModeSelectionAction('safe', status, true)).toBe('setup')
     expect(composerRunModeSelectionAction('safe', status, false)).toBe('ignore')
     expect(composerRunModeSelectionAction('full', status, true)).toBe('persist')
     expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, false)).toBe('persist')
-    expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, true)).toBe('setup')
+    expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, true)).toBe('persist')
   })
 
   it('ignores Safe selection until the initial setup check resolves', () => {

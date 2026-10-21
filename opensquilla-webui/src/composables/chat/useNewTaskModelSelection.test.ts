@@ -18,7 +18,7 @@ function memoryStorage() {
     removeItem: (key: string) => { values.delete(key) },
   }
 }
-function harness(input: { catalogAvailable?: boolean; capable?: boolean; storage?: ReturnType<typeof memoryStorage>; list?: () => Promise<ModelCatalogResult> } = {}) {
+function harness(input: { catalogAvailable?: boolean; capable?: boolean; autoRefresh?: boolean; storage?: ReturnType<typeof memoryStorage>; list?: () => Promise<ModelCatalogResult> } = {}) {
   const sessionKey = ref('agent:main:webchat:one')
   const draft = ref(true)
   const capable = ref(input.capable ?? true)
@@ -32,11 +32,88 @@ function harness(input: { catalogAvailable?: boolean; capable?: boolean; storage
   const api = scope.run(() => useNewTaskModelSelection({
     catalog: { list }, sessionKey, isDraft: () => draft.value,
     capable, catalogAvailable, routingMode, busy, connectionEpoch, storage,
+    autoRefresh: input.autoRefresh,
   }))!
   return { api, list, sessionKey, draft, capable, catalogAvailable, routingMode, busy, connectionEpoch, storage, scope }
 }
 
 describe('new-task model selection', () => {
+  it('does not discover provider models until the explicit picker refresh', async () => {
+    const h = harness({ catalogAvailable: true, autoRefresh: false })
+    await nextTick()
+    expect(h.list).not.toHaveBeenCalled()
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledTimes(1)
+    h.scope.stop()
+  })
+
+  it('revalidates an explicitly opened picker after reconnect', async () => {
+    const h = harness({ catalogAvailable: true, autoRefresh: false })
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledTimes(1)
+    h.connectionEpoch.value = 2
+    await vi.waitFor(() => expect(h.list).toHaveBeenCalledTimes(2))
+    expect(h.list.mock.calls[1]).toEqual([expect.objectContaining({ cacheOnly: true })])
+    h.scope.stop()
+  })
+
+  it('uses an older gateway response once without requiring snapshot metadata', async () => {
+    const h = harness()
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledExactlyOnceWith({
+      scope: 'configured', cacheOnly: true, signal: expect.any(AbortSignal),
+    })
+    expect(h.api.models.value).toEqual([MODEL])
+    expect(h.api.loading.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it('does not refresh a fresh empty snapshot', async () => {
+    const h = harness({ list: async () => ({ models: [], errors: [],
+      catalog: { cacheHit: true, stale: false, lastSyncedAt: '2026-01-01T00:00:00Z' } }) })
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledTimes(1)
+    expect(h.api.models.value).toEqual([])
+    expect(h.api.loading.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it.each(['transport_transient', 'provider_overloaded', 'rate_limited', 'probe_timeout'])(
+    'keeps the previous provider list on %s and replaces it on successful empty', async kind => {
+      const h = harness()
+      await h.api.refresh()
+      h.api.select(PIN)
+      h.list.mockResolvedValueOnce({ models: [], errors: [{ provider: MODEL.provider, kind, detail: '' }] })
+      await h.api.refresh()
+      expect(h.api.models.value).toEqual([MODEL])
+      expect(h.api.providerErrors.value[0]?.kind).toBe(kind)
+      h.list.mockResolvedValueOnce({ models: [], errors: [] })
+      await h.api.refresh()
+      expect(h.api.models.value).toEqual([])
+      expect(h.api.selection.value).toEqual(PIN)
+      h.scope.stop()
+    },
+  )
+
+  it('renders a stale snapshot before refresh and preserves an explicit pin after rejection', async () => {
+    let finish!: (value: ModelCatalogResult) => void
+    let calls = 0
+    const h = harness({ list: async () => {
+      if (++calls === 1) return { models: [MODEL], errors: [],
+        catalog: { cacheHit: true, stale: true, lastSyncedAt: null } }
+      return new Promise(resolve => { finish = resolve })
+    } })
+    await vi.waitFor(() => expect(calls).toBe(2))
+    expect(h.list.mock.calls[0]).toEqual([expect.objectContaining({ cacheOnly: true })])
+    expect(h.api.models.value).toEqual([MODEL])
+    expect(h.api.loading.value).toBe(true)
+    h.api.select(PIN)
+    finish({ models: [], errors: [{ provider: MODEL.provider, kind: 'auth_invalid', detail: '' }] })
+    await h.api.refresh()
+    expect(h.api.models.value).toEqual([])
+    expect(h.api.selection.value).toEqual(PIN)
+    h.scope.stop()
+  })
   it('shares one catalog with existing tasks without enabling a draft pin there', async () => {
     const h = harness({ catalogAvailable: true })
     await h.api.refresh()

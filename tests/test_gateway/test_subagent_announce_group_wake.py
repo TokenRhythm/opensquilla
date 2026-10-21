@@ -141,8 +141,10 @@ def _clean_tracker():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("desktop_quitting", [False, True])
 async def test_completion_event_carries_persisted_message_id_without_polluting_business_payloads(
     monkeypatch: pytest.MonkeyPatch,
+    desktop_quitting: bool,
 ) -> None:
     child = "agent:worker:subagent:message-id"
     manager = _SessionManager(
@@ -181,17 +183,22 @@ async def test_completion_event_carries_persisted_message_id_without_polluting_b
         parent_task_id=PARENT_TASK,
     )
 
+    runtime = _TaskRuntime()
+    runtime.desktop_quitting = desktop_quitting
     await announce_subagent_completion(
         event,
         session_manager=manager,
         event_emitter=emit,
         channel_manager=object(),
-        task_runtime=_TaskRuntime(),
+        task_runtime=runtime,
     )
 
     assert emitted[0]["message_id"] == "parent-message-1"
     assert "message_id" not in json.loads(manager.messages[0][2])
-    assert "message_id" not in channel_payloads[0]
+    if desktop_quitting:
+        assert channel_payloads == []
+    else:
+        assert "message_id" not in channel_payloads[0]
     assert "message_id" not in wake_payloads[0]
 
 

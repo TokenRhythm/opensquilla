@@ -7,6 +7,7 @@ import {
   sessionMessagesSnapshotPayload,
   sessionMessagesSubscribePayload,
 } from './support/session-read-fixtures'
+import { expectComposerValue } from './utils'
 
 const SESSION = 'agent:main:webchat:legacy-ensemble-new-task'
 const TITLE = 'Synthetic legacy ensemble task'
@@ -236,6 +237,14 @@ test('New Task removes ensemble DOM after a late legacy progress from an earlier
     }
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
     await capture('before-new-task')
+    const readingAnchor = await page.locator('.chat-thread').evaluate(element => {
+      const top = element.getBoundingClientRect().top
+      const row = [...element.querySelectorAll<HTMLElement>('[data-chat-message-key]')]
+        .find(item => item.getBoundingClientRect().bottom > top)
+      if (!row) throw new Error('Expected a visible historical message before leaving')
+      return { key: row.dataset.chatMessageKey!, offset: row.getBoundingClientRect().top - top }
+    })
+    await expect(page.locator('.chat-thread')).toHaveClass(/chat-thread--reading-history/)
 
     await page.getByRole('button', { name: 'New task', exact: true }).click()
     await expect(page.locator('.chat--new-landing')).toBeVisible()
@@ -247,7 +256,7 @@ test('New Task removes ensemble DOM after a late legacy progress from an earlier
       expect(draft.raw!.streaming).toBe(false)
     }
     await expect(page.locator('.router-fx')).toHaveCount(0)
-    await expect(page.locator('.chat-textarea')).toHaveValue('')
+    await expectComposerValue(page.locator('.chat-textarea'), '')
 
     // Release the previous task's actual outstanding history replies, then
     // deliver more old-session events after the draft has taken ownership.
@@ -269,6 +278,16 @@ test('New Task removes ensemble DOM after a late legacy progress from an earlier
     expect(sends[2]!.key).not.toBe(SESSION)
     await expect(page.locator('.router-fx')).toHaveCount(1)
     await page.getByRole('button', { name: TITLE, exact: true }).click()
+    // Returning preserves the historical viewport; the newest answer may be virtualized.
+    await expect(page.locator('.chat-thread')).toHaveClass(/chat-thread--reading-history/)
+    // Virtualized spacer estimates may change scrollTop; the same message and
+    // its viewport offset are the reader-visible continuity contract.
+    await expect.poll(() => page.locator('.chat-thread').evaluate((element, anchor) => {
+      const row = [...element.querySelectorAll<HTMLElement>('[data-chat-message-key]')]
+        .find(item => item.dataset.chatMessageKey === anchor.key)
+      return row ? Math.abs(row.getBoundingClientRect().top - element.getBoundingClientRect().top - anchor.offset) : Infinity
+    }, readingAnchor)).toBeLessThanOrEqual(2)
+    await page.locator('.chat-jump-latest').click()
     await expect(page.locator('.chat-thread')).toContainText('Synthetic completed answer 2.')
     await expect(page.locator('.router-fx')).toHaveCount(1)
     await expect(page.locator('.router-fx')).toContainText('3 candidates')

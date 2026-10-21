@@ -2,15 +2,27 @@ import { normalizeWorkspaceFileReferenceV1, type WorkspaceFileReferenceV1 } from
 import type { WorkspaceFile } from '@/modules/workspaceFiles'
 import type { WorkbenchItem } from './types'
 
-export function createWorkspaceFileItem(sessionKey: string, reference: WorkspaceFileReferenceV1): WorkbenchItem {
+export function createWorkspaceFilesWorkbenchItem(sessionKey: string): WorkbenchItem {
+  return {
+    id: `workspace-files:${sessionKey}`,
+    kind: 'workspace-files',
+    title: 'Workspace files',
+    scope: { type: 'session', id: sessionKey },
+    hostKind: 'dom',
+    retention: 'dispose-on-suspend',
+    payload: {},
+  }
+}
+
+export function createWorkspaceFileItem(sessionKey: string, reference: WorkspaceFileReferenceV1, ownerSessionKey = sessionKey): WorkbenchItem {
   return {
     id: `file:${sessionKey}:${reference.scope.workspaceId ?? ''}:${reference.locator.relativePath}`,
     kind: 'file',
     title: reference.locator.relativePath,
-    scope: { type: 'session', id: sessionKey },
+    scope: { type: 'session', id: ownerSessionKey },
     hostKind: 'dom',
     retention: 'dispose-on-suspend',
-    payload: { reference },
+    payload: { reference, sessionKey },
   }
 }
 
@@ -20,16 +32,22 @@ export function createWorkspaceFileItem(sessionKey: string, reference: Workspace
  * and binding opaque to the Workbench payload; no host filesystem path is
  * exposed to the renderer.
  */
-export function createResolvedWorkspaceFileItem(sessionKey: string, file: WorkspaceFile): WorkbenchItem {
+export function createResolvedWorkspaceFileItem(sessionKey: string, file: WorkspaceFile, ownerSessionKey = sessionKey): WorkbenchItem {
   return {
     id: `file:${sessionKey}:${file.workspaceBinding}:${file.path}`,
     kind: 'file',
     title: file.path,
-    scope: { type: 'session', id: sessionKey },
+    scope: { type: 'session', id: ownerSessionKey },
     hostKind: 'dom',
     retention: 'dispose-on-suspend',
-    payload: { file },
+    payload: { file, sessionKey },
   }
+}
+
+export function workspaceFileSessionKey(item: WorkbenchItem): string {
+  if (item.scope.type !== 'session') return ''
+  return typeof item.payload.sessionKey === 'string' && item.payload.sessionKey.trim()
+    ? item.payload.sessionKey : item.scope.id
 }
 
 export function workspaceFileReference(item: WorkbenchItem): WorkspaceFileReferenceV1 | null {

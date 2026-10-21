@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 
+from opensquilla.file_snapshot import MAX_FILESYSTEM_REPLY_BYTES
 from opensquilla.process_tree import (
     capture_process_tree_owner,
     create_owned_subprocess_exec,
@@ -1196,7 +1197,16 @@ class SeatbeltBackend(Backend):
                 memory_watch = asyncio.create_task(resource_guard.watch(proc))
             try:
                 communicate_task = asyncio.create_task(
-                    _communicate_capped(proc, input_data=request.stdin)
+                    _communicate_capped(
+                        proc,
+                        input_data=request.stdin,
+                        # Only run_operation supplies this private transport.
+                        # Its stdout is complete worker JSON, not a log preview.
+                        stdout_byte_cap=(
+                            MAX_FILESYSTEM_REPLY_BYTES
+                            if private_transport is not None else _OUTPUT_BYTE_CAP
+                        ),
+                    )
                 )
                 wait_set: set[asyncio.Task[object]] = {communicate_task}
                 if memory_watch is not None:
@@ -1259,7 +1269,11 @@ class SeatbeltBackend(Backend):
                         await communicate_task
 
             elapsed = time.monotonic() - started
-            stdout, decoded_trunc_out = _decode_capped(stdout_bytes)
+            stdout, decoded_trunc_out = (
+                (stdout_bytes.decode("utf-8", errors="replace"), False)
+                if private_transport is not None
+                else _decode_capped(stdout_bytes)
+            )
             stderr, decoded_trunc_err = _decode_capped(stderr_bytes)
             trunc_out = trunc_out or decoded_trunc_out
             trunc_err = trunc_err or decoded_trunc_err
@@ -1361,6 +1375,8 @@ async def _finish_communication(
 
 async def _read_capped_stream(
     stream: asyncio.StreamReader | None,
+    *,
+    byte_cap: int = _OUTPUT_BYTE_CAP,
 ) -> tuple[bytes, bool]:
     if stream is None:
         return b"", False
@@ -1370,8 +1386,8 @@ async def _read_capped_stream(
         chunk = await stream.read(64 * 1024)
         if not chunk:
             break
-        if len(retained) < _OUTPUT_BYTE_CAP:
-            remaining = _OUTPUT_BYTE_CAP - len(retained)
+        if len(retained) < byte_cap:
+            remaining = byte_cap - len(retained)
             retained.extend(chunk[:remaining])
             truncated = truncated or len(chunk) > remaining
         else:
@@ -1383,15 +1399,16 @@ async def _communicate_capped(
     proc: asyncio.subprocess.Process,
     *,
     input_data: bytes | None = None,
+    stdout_byte_cap: int = _OUTPUT_BYTE_CAP,
 ) -> tuple[bytes, bytes, bool, bool]:
-    """Drain both pipes incrementally, retaining at most one MiB per stream."""
+    """Drain logs and structured replies within their separate finite budgets."""
 
     stdout_stream = getattr(proc, "stdout", None)
     stderr_stream = getattr(proc, "stderr", None)
     if stdout_stream is None and stderr_stream is None:
         stdout, stderr = await proc.communicate(input=input_data)
         return stdout or b"", stderr or b"", False, False
-    stdout_task = asyncio.create_task(_read_capped_stream(stdout_stream))
+    stdout_task = asyncio.create_task(_read_capped_stream(stdout_stream, byte_cap=stdout_byte_cap))
     stderr_task = asyncio.create_task(_read_capped_stream(stderr_stream))
     try:
         # Start both readers before writing stdin. A child is allowed to fill

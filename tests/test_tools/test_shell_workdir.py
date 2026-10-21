@@ -180,13 +180,16 @@ async def test_execution_authorization_precedes_workdir_diagnostics(
             retryable=False,
         ), None, None
 
+    async def deny_elevation(*_args, **_kwargs):
+        return {"status": "denied", "reason": "synthetic"}
+
     monkeypatch.setattr(shell, "_validate_explicit_workdir", no_validation)
     if gate == "action":
         monkeypatch.setattr(shell, "gate_action", deny_action)
     else:
         monkeypatch.setattr(
             shell, "_gate_shell_elevation",
-            lambda *_args, **_kwargs: {"status": "denied", "reason": "synthetic"},
+            deny_elevation,
         )
     payload = json.loads(await shell.exec_command(
         "echo ran", workdir=str(tmp_path / "missing"),

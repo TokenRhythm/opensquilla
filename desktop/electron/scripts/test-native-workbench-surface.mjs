@@ -2,6 +2,38 @@ import { readFile } from 'node:fs/promises'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { DesktopBrowserError } from '../dist/desktop-browser.js'
+import { BROWSER_BLANK_URL } from '../dist/browser-action-contract.js'
+import { WorkbenchResourceBudget } from '../dist/workbench-resource-budget.js'
+
+// Creation and async cleanup both occupy admission slots. Ordinary visibility
+// changes have no release operation and cannot silently discard an existing page.
+const retentionBudget = new WorkbenchResourceBudget({ browser: 2, preview: 1 })
+const browserA = retentionBudget.acquire('browser')
+const browserB = retentionBudget.acquire('browser')
+assert.ok(browserA && browserB)
+browserA.setPhase('resident')
+const replacementHold = browserA.retain()
+browserA.release()
+assert.equal(retentionBudget.acquire('browser'), null, 'replacement keeps its slot while old cleanup releases')
+replacementHold.release()
+const restoredA = retentionBudget.acquire('browser')
+assert.ok(restoredA)
+restoredA.setPhase('resident')
+browserB.setPhase('disposing')
+assert.equal(retentionBudget.acquire('browser'), null)
+const independentPreview = retentionBudget.acquire('preview')
+assert.ok(independentPreview)
+browserB.release()
+browserB.release()
+const replacementBrowser = retentionBudget.acquire('browser')
+assert.ok(replacementBrowser)
+assert.equal(retentionBudget.acquire('browser'), null)
+assert.deepEqual(retentionBudget.snapshot().map(entry => entry.phase), ['resident', 'creating', 'creating'])
+browserA.release()
+restoredA.release()
+independentPreview.release()
+replacementBrowser.release()
+assert.deepEqual(retentionBudget.snapshot(), [])
 import {
   parseNativeWorkbenchAnnotationGeometry,
   parseNativeWorkbenchAnnotationModeRequest,
@@ -35,7 +67,7 @@ const nativeWorkbenchSurfaceRuntime = await readFile(
   'utf8',
 )
 const annotationFocusStart = nativeWorkbenchSurfaceRuntime.indexOf('    async focusAnnotation(')
-const annotationFocusEnd = nativeWorkbenchSurfaceRuntime.indexOf('    async executeBrowser(', annotationFocusStart)
+const annotationFocusEnd = nativeWorkbenchSurfaceRuntime.indexOf('\n    }', annotationFocusStart + 1) + 6
 assert.ok(annotationFocusStart >= 0 && annotationFocusEnd > annotationFocusStart)
 const focusAnnotation = new Function(
   'DesktopBrowserError', 'randomUUID', 'NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION',
@@ -54,7 +86,7 @@ async function checkSubpageAnnotationFocus({
   const record = {
     kind: 'artifact-preview', expectedOrigin: 'http://p-test.localhost:1234',
     annotationDocumentGeneration: 1,
-    view: { webContents: { getURL: () => url } },
+    contents: { getURL: () => url },
   }
   let replaced = false
   const interrupt = phase => {
@@ -111,9 +143,9 @@ const browserExecutorStart = nativeWorkbenchSurfaceRuntime.indexOf('    async ex
 const browserExecutorEnd = nativeWorkbenchSurfaceRuntime.indexOf('    async snapshotBrowser(', browserExecutorStart)
 assert.ok(browserExecutorStart >= 0 && browserExecutorEnd > browserExecutorStart)
 const executeBrowser = new Function(
-  'DesktopBrowserError', 'randomUUID', 'parseNativeWorkbenchNavigationUrl', 'NATIVE_WORKBENCH_PROTOCOL_VERSION_V4',
+  'DesktopBrowserError', 'randomUUID', 'parseNativeWorkbenchNavigationUrl', 'NATIVE_WORKBENCH_PROTOCOL_VERSION_V4', 'BROWSER_BLANK_URL',
   `return ({${nativeWorkbenchSurfaceRuntime.slice(browserExecutorStart, browserExecutorEnd)}}).executeBrowser`,
-)(DesktopBrowserError, randomUUID, parseNativeWorkbenchNavigationUrl, NATIVE_WORKBENCH_PROTOCOL_VERSION_V4)
+)(DesktopBrowserError, randomUUID, parseNativeWorkbenchNavigationUrl, NATIVE_WORKBENCH_PROTOCOL_VERSION_V4, BROWSER_BLANK_URL)
 const viewportInitializerStart = nativeWorkbenchSurfaceRuntime.indexOf('    initializeHiddenBrowserViewport(')
 const viewportInitializerEnd = nativeWorkbenchSurfaceRuntime.indexOf('    cdpCommand(', viewportInitializerStart)
 assert.ok(viewportInitializerStart >= 0 && viewportInitializerEnd > viewportInitializerStart)
@@ -121,7 +153,8 @@ const initializeHiddenBrowserViewport = new Function('DesktopBrowserError',
   `return ({${nativeWorkbenchSurfaceRuntime.slice(viewportInitializerStart, viewportInitializerEnd)}}).initializeHiddenBrowserViewport`,
 )(DesktopBrowserError)
 
-async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpening, failure = null, adoptBeforeSend = false) {
+async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpening, failure = null, adoptBeforeSend = false,
+  url = 'https://example.test/background') {
   const foreground = { id: 'foreground', visible: true, requestedRect: { x: 180, y: 90, width: 700, height: 500 } }
   const switched = { id: 'switched', visible: false, requestedRect: { x: 240, y: 110, width: 620, height: 480 } }
   const events = []
@@ -139,6 +172,13 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
     surfaces: new Map([[foreground.id, foreground], [switched.id, switched]]),
     activeSurfaceId: foreground.id,
     initializeHiddenBrowserViewport,
+    async touchBrowserPointer() {},
+    browserHostBlockers: () => [],
+    noteBrowserNavigationFailure(record, url, code) { record.browserNavigationError = { url, code, message: code } },
+    browserNavigationFailure(record) {
+      return new DesktopBrowserError(record.browserNavigationError.code === 'ERR_TIMED_OUT' ? 'TIMEOUT' : 'PAGE_NOT_READY',
+        record.browserNavigationError.message, 409, { targetRef: record.targetRef })
+    },
     isPrivilegedGatewayTarget: () => false,
     async createSurface(request) {
       openingRecord = {
@@ -146,8 +186,8 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
         url: request.payload.url, targetRef: `target-${request.surfaceId}`, visible: false,
         owner: { isDestroyed: () => ownerDestroyed },
         requestedRect: null,
-        view: { getBounds: () => ({ x: 0, y: 0, width: 960, height: 720 }),
-          webContents: { isDestroyed: () => false } },
+        view: { getBounds: () => ({ x: 0, y: 0, width: 960, height: 720 }) },
+        contents: { isDestroyed: () => false },
       }
       this.surfaces.set(request.surfaceId, openingRecord)
       await opening
@@ -188,7 +228,7 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
     getBrowserTarget(surfaceId) { return this.describeBrowserRecord(this.surfaces.get(surfaceId)) },
     emit(record, type, detail) { events.push({ surfaceId: record.id, type, detail }) },
   }
-  const pending = executeBrowser.call(manager, { operation: 'open', sessionKey, url: 'https://example.test/background' }, controller.signal)
+  const pending = executeBrowser.call(manager, { operation: 'open', sessionKey, url }, controller.signal)
   if (switchWhileOpening) {
     foreground.visible = false
     switched.visible = true
@@ -198,8 +238,7 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
   let target
   if (failure) {
     await assert.rejects(pending, error => {
-      if (failure === 'set' || failure === 'both') return error === setError
-      if (failure === 'clear') return error === clearError
+      if (failure === 'set' || failure === 'both' || failure === 'clear') return error.code === 'PAGE_NOT_READY'
       return error.code === (failure === 'cancel' ? 'TIMEOUT' : 'TARGET_NOT_FOUND')
     })
   } else target = await pending
@@ -222,8 +261,16 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
     }
   }
   if (failure) {
-    assert.deepEqual(events, [])
-    if (failure !== 'replace' && failure !== 'close') assert.deepEqual(destroyed, [openingRecord])
+    if (['replace', 'close', 'owner-close'].includes(failure)) {
+      assert.deepEqual(events, [])
+      if (failure === 'owner-close') assert.deepEqual(destroyed, [openingRecord])
+    } else {
+      assert.deepEqual(destroyed, [], 'initialization and timeout failures must retain a live tab')
+      assert.equal(manager.surfaces.get(openingRecord.id), openingRecord)
+      assert.equal(events.length, 1)
+      assert.equal(events[0].type, 'browser-opened')
+      assert.equal(events[0].detail.targetRef, openingRecord.targetRef)
+    }
     return
   }
   assert.deepEqual(destroyed, [])
@@ -243,6 +290,28 @@ for (const failure of ['set', 'clear', 'both', 'cancel', 'replace', 'close', 'ow
   await assertBrowserOpenPreservesForeground('background-session', false, failure)
 }
 await assertBrowserOpenPreservesForeground('background-session', false, null, true)
+await assertBrowserOpenPreservesForeground('blank-session', false, null, false, BROWSER_BLANK_URL)
+await assertBrowserOpenPreservesForeground('blank-session', true, null, true, BROWSER_BLANK_URL)
+
+const navigationPolicyStart = nativeWorkbenchSurfaceRuntime.indexOf('    v2TopLevelNavigationAllowed(')
+const navigationPolicyEnd = nativeWorkbenchSurfaceRuntime.indexOf('    isPrivilegedGatewayTarget(', navigationPolicyStart)
+assert.ok(navigationPolicyStart >= 0 && navigationPolicyEnd > navigationPolicyStart)
+const v2TopLevelNavigationAllowed = new Function('BROWSER_BLANK_URL', 'nativeWorkbenchV2NetworkUrlAllowed',
+  `return ({${nativeWorkbenchSurfaceRuntime.slice(navigationPolicyStart, navigationPolicyEnd)}}).v2TopLevelNavigationAllowed`,
+)(BROWSER_BLANK_URL, nativeWorkbenchV2NetworkUrlAllowed)
+const navigationPolicy = { isPrivilegedGatewayTarget: value => value === 'http://127.0.0.1:18791/' }
+for (const [kind, mode, allowed] of [
+  ['url-preview', 'full', true], ['url-preview', 'offline', false],
+  ['artifact-preview', 'full', false], ['artifact-html', 'full', false],
+]) {
+  assert.equal(v2TopLevelNavigationAllowed.call(navigationPolicy, { kind, mode }, BROWSER_BLANK_URL), allowed)
+}
+for (const url of ['about:blank#fragment', 'about:blank?query', 'about:blank/path', 'about:config',
+  'data:text/html,synthetic', 'file:///synthetic/file', 'javascript:0', 'http://127.0.0.1:18791/']) {
+  assert.equal(v2TopLevelNavigationAllowed.call(navigationPolicy, { kind: 'url-preview', mode: 'full' }, url), false)
+}
+assert.equal(v2TopLevelNavigationAllowed.call(navigationPolicy,
+  { kind: 'url-preview', mode: 'full' }, 'https://example.test/'), true)
 
 const annotationHighlightConfig = nativeWorkbenchSurfaceRuntime.match(
   /const NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG = Object\.freeze\(\{([\s\S]*?)\n\}\);/,
@@ -272,7 +341,7 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
-  /surfaceInstanceId: randomUUID\(\)[\s\S]*?return \{ ok: true, surfaceInstanceId: record\.surfaceInstanceId \}/,
+  /surfaceInstanceId: randomUUID\(\)[\s\S]*?return \{ ok: true, surfaceInstanceId: record\.surfaceInstanceId[, }]/,
   'surface creation must return the exact instance identity used to fence late picker events',
 )
 assert.match(
@@ -441,8 +510,22 @@ assert.throws(
     kind: 'url-preview',
     payload: { url: 'file:///synthetic/secret', scopeId: 'synthetic:url' },
   }),
-  /HTTP or HTTPS/,
+  /HTTP.*HTTPS/,
 )
+for (const version of [2, 3, 4]) {
+  const blankCreate = { version, surfaceId: `browser:blank:${version}`, kind: 'url-preview',
+    payload: { url: BROWSER_BLANK_URL, scopeId: 'synthetic:blank' } }
+  assert.deepEqual(parseNativeWorkbenchCreateRequest(blankCreate), blankCreate)
+  const blankNavigation = { version, surfaceId: blankCreate.surfaceId, action: 'navigate', url: BROWSER_BLANK_URL }
+  assert.deepEqual(parseNativeWorkbenchNavigationRequest(blankNavigation), blankNavigation)
+  assert.throws(() => parseNativeWorkbenchNavigationRequest({ ...blankNavigation, action: 'open-external' }), /HTTP or HTTPS/)
+  for (const url of ['about:blank#fragment', 'about:blank?query', 'about:blank/path', 'about:config',
+    'data:text/html,synthetic', 'file:///synthetic/blocked', 'javascript:0']) {
+    assert.throws(() => parseNativeWorkbenchCreateRequest({ ...blankCreate,
+      payload: { ...blankCreate.payload, url } }), /HTTP.*HTTPS/)
+    assert.throws(() => parseNativeWorkbenchNavigationRequest({ ...blankNavigation, url }), /HTTP.*HTTPS/)
+  }
+}
 assert.deepEqual(
   parseNativeWorkbenchNavigationRequest({
     version: 2,

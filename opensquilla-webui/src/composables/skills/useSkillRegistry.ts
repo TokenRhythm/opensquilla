@@ -280,6 +280,7 @@ export function useSkillRegistry(
   const installingDepsId = ref<string | null>(null)
   const uninstallingName = ref<string | null>(null)
   let searchRequestId = 0
+  let searchInFlight: { key: string; requestId: number; promise: Promise<void> } | null = null
   let cancelRequestedOperationId = ''
 
   function showInstallProgress(item: SkillInstallQueueItem, phase: string) {
@@ -334,39 +335,49 @@ export function useSkillRegistry(
   function resetRegistrySearch() {
     // A source switch discards pending responses without clearing the user's query.
     searchRequestId += 1
+    searchInFlight = null
     registryResults.value = []
     registryDiagnostics.value = []
     registrySearchError.value = ''
     registryLoading.value = false
   }
 
-  async function searchRegistry(source: SkillInstallSource = 'clawhub') {
+  function searchRegistry(source: SkillInstallSource = 'clawhub'): Promise<void> {
     const query = registryQuery.value.trim()
+    const limit = 20
+    const key = JSON.stringify([source, query, limit])
+    // A repeated explicit submit joins its current request without retiring it.
+    if (searchInFlight?.key === key) return searchInFlight.promise
     const requestId = ++searchRequestId
     if (!query) {
+      searchInFlight = null
       registryLoading.value = false
-      return
+      return Promise.resolve()
     }
     registryLoading.value = true
     registryResults.value = []
     registryDiagnostics.value = []
     registrySearchError.value = ''
-    try {
-      const data = await catalog.search(query, {
-        limit: 20,
-        source,
-      })
-      if (requestId !== searchRequestId) return
-      registryResults.value = [...data.results]
-      registryDiagnostics.value = [...data.diagnostics]
-      registrySearchError.value = data.message || ''
-    } catch (err) {
-      if (requestId !== searchRequestId) return
-      registrySearchError.value = (err as Error).message
-      pushToast(t('cronSkills.registry.toastSearchFailed', { error: registrySearchError.value }), { tone: 'danger' })
-    } finally {
-      if (requestId === searchRequestId) registryLoading.value = false
-    }
+    const operation = (async () => {
+      try {
+        const data = await catalog.search(query, { limit, source })
+        if (requestId !== searchRequestId) return
+        registryResults.value = [...data.results]
+        registryDiagnostics.value = [...data.diagnostics]
+        registrySearchError.value = data.message || ''
+      } catch (err) {
+        if (requestId !== searchRequestId) return
+        registrySearchError.value = (err as Error).message
+        pushToast(t('cronSkills.registry.toastSearchFailed', { error: registrySearchError.value }), { tone: 'danger' })
+      } finally {
+        if (requestId === searchRequestId) registryLoading.value = false
+      }
+    })()
+    const promise = operation.finally(() => {
+      if (searchInFlight?.requestId === requestId) searchInFlight = null
+    })
+    searchInFlight = { key, requestId, promise }
+    return promise
   }
 
   function uniqueRequests(requests: SkillInstallRequest[]): SkillInstallRequest[] {
@@ -684,7 +695,6 @@ export function useSkillRegistry(
         ...(instanceId ? { instanceId } : {}),
       })
       if (res.success) {
-        pushToast(res.message || t('cronSkills.registry.installed'), { tone: 'ok' })
         const still = res.missing_still || {}
         const missingStill = {
           bins: [...(still.bins || [])],
@@ -694,6 +704,9 @@ export function useSkillRegistry(
         const stillMissing = missingStill.bins.length
           + missingStill.env.length
           + missingStill.env_any.length
+        if (stillMissing > 0) {
+          pushToast(res.message || t('cronSkills.skillDetail.installIncomplete', { count: stillMissing }), { tone: 'warn' })
+        }
         if (!(await loadData())) {
           pushToast(t('cronSkills.skillsView.reloadListFailed'), { tone: 'warn' })
         }

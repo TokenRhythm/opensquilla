@@ -26,6 +26,19 @@ const server = http.createServer(async (request, response) => {
   })
 
   response.setHeader('content-type', 'application/json')
+  if (['/api/v1/artifacts/art-history/preview-leases',
+    '/api/v1/artifacts/art-ignores-history/preview-leases'].includes(request.url)) {
+    assert.equal(JSON.parse(body).snapshot, true)
+    response.statusCode = 201
+    response.end(JSON.stringify({
+      version: 1, lease_id: leaseId, effective_mode: 'full',
+      launch_url: `${previewOrigin}/index.html`, entrypoint: 'index.html',
+      expires_at: expiresAt, preview_origin: previewOrigin, idle_timeout_seconds: 28_800,
+      ...(request.url.includes('art-history/') ? { snapshot: true } : {}),
+      source: { kind: 'bundle', collection_status: 'complete', file_count: 3, total_bytes: 42, warning_codes: [] },
+    }))
+    return
+  }
   if (['/api/v1/artifacts/art-subpage/preview-leases',
     '/api/v1/artifacts/art-ignores-page/preview-leases'].includes(request.url)) {
     const { pagePath } = JSON.parse(body)
@@ -148,6 +161,24 @@ try {
   const broker = new ArtifactPreviewLeaseBroker({
     getOwnedGatewayUrl: () => gatewayUrl,
   })
+
+  assert.throws(() => parseArtifactPreviewLeaseCreateRequest({
+    version: 1, artifactId: 'art-history', scopeId, mode: 'full', snapshot: 'true',
+  }))
+  const history = await broker.create({
+    version: 1, artifactId: 'art-history', scopeId, mode: 'full', snapshot: true,
+  })
+  assert.equal(history.ok, true, JSON.stringify(history))
+  assert.equal(history.payload.snapshot, true)
+  assert.equal(history.payload.source.file_count, 3)
+  await broker.revoke({ version: 1, leaseId, scopeId })
+  const ignoredHistory = await broker.create({
+    version: 1, artifactId: 'art-ignores-history', scopeId, mode: 'full', snapshot: true,
+  })
+  assert.equal(ignoredHistory.ok, false)
+  assert.equal(ignoredHistory.code, 'PREVIEW_SNAPSHOT_UNSUPPORTED')
+  assert.equal(requests.at(-1).method, 'DELETE')
+  requests.length = 0
 
   assert.deepEqual(parseArtifactPreviewLeaseCreateRequest({
     version: 1,
@@ -460,6 +491,7 @@ try {
     true,
     'cleanup for an old renderer generation must not revoke a concurrent replacement lease',
   )
+  cleanupBroker.clear()
 
   let markDeferredPostStarted
   const deferredPostStarted = new Promise(resolve => {
@@ -700,12 +732,146 @@ try {
     authorization: 'Bearer clear-inflight-token',
     scopeId: `${scopeId}:clear-inflight`,
   })
+
+  const deferred = () => {
+    let resolve
+    const promise = new Promise(accept => { resolve = accept })
+    return { promise, resolve }
+  }
+  const leaseResponse = (suffix, expires = expiresAt) => new Response(JSON.stringify({
+    version: 1,
+    lease_id: `apl-shutdown_${suffix}`,
+    effective_mode: 'full',
+    launch_url: `${previewOrigin}/${suffix}.html`,
+    entrypoint: `${suffix}.html`,
+    expires_at: expires,
+    preview_origin: previewOrigin,
+    idle_timeout_seconds: 28_800,
+    source: {
+      kind: 'single_file',
+      collection_status: 'not_applicable',
+      file_count: 1,
+      total_bytes: 42,
+      warning_codes: [],
+    },
+  }), { status: 201, headers: { 'content-type': 'application/json' } })
+  const shutdownRequest = suffix => ({
+    version: 1,
+    artifactId: `art-shutdown-${suffix}`,
+    scopeId,
+    mode: 'full',
+  })
+  const grantFrom = payload => ({
+    launchUrl: payload.launch_url,
+    expectedOrigin: payload.preview_origin,
+    scopeId,
+    mode: 'full',
+  })
+  const postAfterAbort = deferred()
+  const shutdownCalls = []
+  const shutdownBroker = new ArtifactPreviewLeaseBroker({
+    getOwnedGatewayUrl: () => gatewayUrl,
+    timeoutMs: 100,
+    fetchImpl: async (input, init) => {
+      const path = new URL(String(input)).pathname
+      shutdownCalls.push({ path, method: init.method, signal: init.signal })
+      if (path.includes('/art-shutdown-active/')) return leaseResponse('active')
+      if (path.includes('/art-shutdown-pending/')) return await postAfterAbort.promise
+      if (path.endsWith('/apl-shutdown_pending')) return new Response(null, { status: 204 })
+      // Deliberately ignore AbortSignal in both renewal and existing-lease DELETE.
+      return await new Promise(() => {})
+    },
+  })
+  const activeLease = await shutdownBroker.create(shutdownRequest('active'))
+  assert.equal(activeLease.ok, true)
+  const activeGrant = grantFrom(activeLease.payload)
+  assert.equal(shutdownBroker.authorizesSurface(activeGrant), true)
+  const renewalAtShutdown = shutdownBroker.renew({
+    version: 1,
+    leaseId: activeLease.payload.lease_id,
+    scopeId,
+  })
+  const createAtShutdown = shutdownBroker.create(shutdownRequest('pending'))
+  const quitBudget = new AbortController()
+  const shutdown = shutdownBroker.shutdown({ signal: quitBudget.signal })
+  assert.equal(shutdownBroker.shutdown(), shutdown, 'repeated shutdown must join its first budget')
+  assert.equal(shutdownBroker.authorizesSurface(activeGrant), false)
+  assert.equal(shutdownCalls.some(call => call.path.endsWith('/apl-shutdown_active')), true)
+  const requestCountAtShutdown = shutdownCalls.length
+  assert.equal((await shutdownBroker.create(shutdownRequest('rejected'))).code, 'PREVIEW_BROKER_SHUTTING_DOWN')
+  assert.equal((await shutdownBroker.renew({
+    version: 1,
+    leaseId: activeLease.payload.lease_id,
+    scopeId,
+  })).code, 'PREVIEW_BROKER_SHUTTING_DOWN')
+  assert.equal(shutdownCalls.length, requestCountAtShutdown)
+  quitBudget.abort()
+  await shutdown
+  assert.equal((await createAtShutdown).ok, false)
+  assert.equal((await renewalAtShutdown).ok, false)
+  assert.equal(shutdownCalls.every(call => call.signal.aborted), true)
+
+  postAfterAbort.resolve(leaseResponse('pending'))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(shutdownCalls.at(-1).path, '/api/v1/artifact-preview-leases/apl-shutdown_pending')
+  assert.equal(shutdownCalls.at(-1).method, 'DELETE')
+  assert.equal(shutdownBroker.authorizesSurface({
+    ...activeGrant,
+    launchUrl: `${previewOrigin}/pending.html`,
+  }), false, 'a late creation must be revoked without restoring authority')
+  shutdownBroker.clear()
+  await shutdownBroker.revokeAll()
+  assert.equal((await shutdownBroker.create(shutdownRequest('still-rejected'))).code, 'PREVIEW_BROKER_SHUTTING_DOWN')
+
+  const pendingPost = deferred()
+  const pendingShutdownDeletes = []
+  const pendingShutdownBroker = new ArtifactPreviewLeaseBroker({
+    getOwnedGatewayUrl: () => gatewayUrl,
+    fetchImpl: async (input, init) => {
+      const path = new URL(String(input)).pathname
+      if (init.method === 'DELETE') {
+        pendingShutdownDeletes.push(path)
+        return new Response(null, { status: 204 })
+      }
+      return path.includes('/art-shutdown-existing/')
+        ? leaseResponse('existing')
+        : await pendingPost.promise
+    },
+  })
+  const existing = await pendingShutdownBroker.create(shutdownRequest('existing'))
+  assert.equal(existing.ok, true)
+  const pendingCreate = pendingShutdownBroker.create(shutdownRequest('inflight'))
+  const pendingShutdown = pendingShutdownBroker.shutdown()
+  pendingPost.resolve(leaseResponse('inflight'))
+  await pendingShutdown
+  assert.equal((await pendingCreate).code, 'PREVIEW_LEASE_RETIRED')
+  assert.deepEqual(pendingShutdownDeletes, [
+    '/api/v1/artifact-preview-leases/apl-shutdown_existing',
+    '/api/v1/artifact-preview-leases/apl-shutdown_inflight',
+  ])
+  assert.equal(pendingShutdownBroker.authorizesSurface({
+    ...activeGrant,
+    launchUrl: `${previewOrigin}/inflight.html`,
+  }), false)
+
+  for (const hungPhase of ['fetch', 'body']) {
+    const requestTimeoutBroker = new ArtifactPreviewLeaseBroker({
+      getOwnedGatewayUrl: () => gatewayUrl,
+      timeoutMs: 20,
+      fetchImpl: async () => hungPhase === 'fetch'
+        ? await new Promise(() => {})
+        : new Response(new ReadableStream({ start() {} }), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        }),
+    })
+    const timeoutResult = await requestTimeoutBroker.create(shutdownRequest(`timeout-${hungPhase}`))
+    assert.equal(timeoutResult.code, 'PREVIEW_BROKER_UNAVAILABLE', `${hungPhase} must obey the request deadline`)
+    await requestTimeoutBroker.shutdown()
+  }
 } finally {
   await new Promise(resolve => server.close(resolve))
 }
-
-console.log('artifact preview lease broker tests passed')
-
 
 // Exercise the strict authenticated response parser through the actual broker.
 for (const marker of [undefined, 'document-fixture', null, 4, '', ' document-fixture', 'document-fixture\n', 'x'.repeat(513)]) {
@@ -734,3 +900,322 @@ for (const marker of [undefined, 'document-fixture', null, 4, '', ' document-fix
   await identityBroker.revokeAll()
 }
 console.log('working document lease identity tests passed (8 cases)')
+
+function retryHarness() {
+  let now = Date.parse('2026-01-01T00:00:00Z')
+  let timer = null
+  let sequence = 0
+  let deleteReply = async () => 429
+  let renewalReply = null
+  let postGate = null
+  let ownedGatewayUrl = 'http://127.0.0.1:18791'
+  const deletes = []
+  const remoteLeases = new Set()
+  const broker = new ArtifactPreviewLeaseBroker({
+    getOwnedGatewayUrl: () => ownedGatewayUrl,
+    now: () => now,
+    scheduleRetry(callback, delayMs) {
+      assert.equal(timer, null, 'all pending cleanup must share one timer')
+      assert.ok(delayMs >= 0 && delayMs <= 60_000)
+      const scheduled = { callback, at: now + delayMs, delayMs }
+      timer = scheduled
+      return () => { if (timer === scheduled) timer = null }
+    },
+    fetchImpl: async (input, init) => {
+      const url = new URL(input)
+      if (init.method === 'DELETE') {
+        const leaseId = url.pathname.split('/').at(-1)
+        deletes.push({ leaseId, origin: url.origin,
+          scopeId: init.headers['x-opensquilla-session-key'],
+          authorization: init.headers.Authorization })
+        const status = await deleteReply(leaseId)
+        if ([204, 404, 410].includes(status)) remoteLeases.delete(leaseId)
+        return new Response(status === 204 ? null : JSON.stringify({ code: 'SYNTHETIC' }),
+          { status, headers: { 'content-type': 'application/json' } })
+      }
+      assert.equal(init.method, 'POST')
+      if (url.pathname.endsWith('/renew')) {
+        assert.ok(renewalReply, 'revoked cleanup records must never allow a renewal request')
+        return renewalReply()
+      }
+      if (postGate) await postGate
+      const leaseId = `apl-retry_${++sequence}`
+      const origin = `http://p-${String(sequence).padStart(32, '0')}.localhost:48721`
+      remoteLeases.add(leaseId)
+      return new Response(JSON.stringify({
+        version: 1, lease_id: leaseId, effective_mode: 'full',
+        launch_url: `${origin}/index.html`, entrypoint: 'index.html',
+        expires_at: new Date(now + 28_800_000).toISOString(), preview_origin: origin,
+        idle_timeout_seconds: 28_800, source: { kind: 'single_file',
+          collection_status: 'not_applicable', file_count: 1, total_bytes: 42, warning_codes: [] },
+      }), { status: 201, headers: { 'content-type': 'application/json' } })
+    },
+  })
+  const flush = () => new Promise(resolve => setImmediate(resolve))
+  return {
+    broker, deletes, remoteLeases, flush,
+    timer: () => timer,
+    setDeleteReply: reply => { deleteReply = reply },
+    setRenewalReply: reply => { renewalReply = reply },
+    setPostGate: gate => { postGate = gate },
+    setGateway: url => { ownedGatewayUrl = url },
+    advanceNow: milliseconds => { now += milliseconds },
+    async runTimer({ advanceMs = 0 } = {}) {
+      assert.ok(timer, 'a retry must be scheduled')
+      now = Math.max(now + advanceMs, timer.at)
+      const callback = timer.callback
+      timer = null
+      callback()
+      await flush()
+    },
+    async create(extra = {}) {
+      const result = await broker.create({ version: 1, artifactId: 'art-retry',
+        scopeId, mode: 'full', authToken: 'synthetic-retry-token', ...extra })
+      assert.equal(result.ok, true, JSON.stringify(result))
+      return {
+        control: { version: 1, leaseId: result.payload.lease_id, scopeId },
+        grant: { launchUrl: result.payload.launch_url, expectedOrigin: result.payload.preview_origin,
+          scopeId, mode: 'full' },
+      }
+    },
+  }
+}
+
+// Shutdown retries retained cleanup immediately without reopening local authority.
+{
+  const h = retryHarness()
+  const { control, grant } = await h.create()
+  await h.broker.revoke(control)
+  assert.ok(h.timer())
+  h.setDeleteReply(async () => 204)
+  await h.broker.shutdown()
+  assert.equal(h.deletes.length, 2)
+  assert.equal(h.remoteLeases.size, 0)
+  assert.equal(h.broker.authorizesSurface(grant), false)
+  assert.equal(h.timer(), null, 'shutdown must not leave background retry work')
+}
+
+// An active cleanup attempt is joined once, under the shared shutdown deadline.
+for (const abort of [false, true]) {
+  const h = retryHarness()
+  const { control } = await h.create()
+  await h.broker.revoke(control)
+  let releaseDelete
+  h.setDeleteReply(() => new Promise(resolve => { releaseDelete = resolve }))
+  await h.runTimer()
+  const budget = new AbortController()
+  const shutdown = h.broker.shutdown({ signal: budget.signal })
+  let settled = false
+  void shutdown.then(() => { settled = true })
+  await h.flush()
+  assert.equal(settled, false, 'shutdown must join cleanup already in progress')
+  assert.equal(h.deletes.length, 2, 'shutdown must not duplicate an active DELETE')
+  if (abort) budget.abort()
+  else releaseDelete(204)
+  await shutdown
+  assert.equal(h.timer(), null)
+  if (abort) {
+    releaseDelete(429)
+    await h.flush()
+    assert.equal(h.timer(), null, 'a late failure cannot resume retries after shutdown')
+  } else {
+    assert.equal(h.remoteLeases.size, 0)
+  }
+}
+
+{
+  const h = retryHarness()
+  const { control } = await h.create()
+  await h.broker.revoke(control)
+  h.setGateway('http://127.0.0.1:18792')
+  await h.broker.shutdown()
+  assert.equal(h.deletes.length, 1, 'shutdown cannot retry credentials against another Gateway')
+  assert.equal(h.timer(), null)
+}
+
+// A caller awaits only the first attempt, even when a remote DELETE fails.
+for (const transient of [408, 429, 503, 'network']) {
+  const h = retryHarness()
+  h.setDeleteReply(async () => {
+    if (transient === 'network') throw new Error('synthetic network failure')
+    return transient
+  })
+  const { control, grant } = await h.create()
+  const revoked = h.broker.revoke(control)
+  assert.equal(h.broker.authorizesSurface(grant), false, 'local authority is removed synchronously')
+  assert.equal((await revoked).ok, false)
+  assert.equal(h.remoteLeases.has(control.leaseId), true)
+  assert.equal((await h.broker.renew(control)).status, 404)
+  assert.equal((await h.broker.revoke({ ...control, scopeId: 'synthetic:wrong-scope' })).status, 404)
+  assert.equal(h.deletes.length, 1, 'wrong-scope retry cannot use stored credentials')
+  h.setDeleteReply(async () => 204)
+  // Resource reads can extend backend idle expiry without updating the broker.
+  await h.runTimer({ advanceMs: 9 * 60 * 60 * 1000 })
+  assert.equal(h.remoteLeases.size, 0, 'retry must not discard cleanup using cached expiry')
+  assert.equal(h.deletes.length, 2)
+  assert.ok(h.deletes.every(request => request.scopeId === scopeId
+    && request.authorization === 'Bearer synthetic-retry-token'))
+  assert.equal(h.broker.authorizesSurface(grant), false)
+  assert.equal(h.timer(), null)
+  h.broker.clear()
+}
+
+for (const terminalStatus of [404, 410]) {
+  const h = retryHarness()
+  const { control } = await h.create()
+  await h.broker.revoke(control)
+  h.setDeleteReply(async () => terminalStatus)
+  await h.runTimer()
+  assert.equal(h.remoteLeases.size, 0)
+  assert.equal(h.timer(), null, 'already-gone leases finish cleanup')
+  assert.equal((await h.broker.revoke(control)).code, 'BROKER_LEASE_NOT_FOUND')
+  h.broker.clear()
+}
+
+{
+  const h = retryHarness()
+  const { control } = await h.create()
+  await h.broker.revoke(control)
+  for (let attempt = 0; attempt < 9; attempt += 1) {
+    const baseDelay = Math.min(1000 * 2 ** Math.min(attempt, 6), 60_000)
+    assert.ok(h.timer().delayMs >= baseDelay * 0.8 && h.timer().delayMs <= baseDelay,
+      'retry delays must back off with bounded jitter')
+    await h.runTimer()
+  }
+  h.broker.clear()
+  assert.equal(h.timer(), null, 'clear cancels the pending timer')
+}
+
+// Bulk retirement does not wait for backoff, and retries one lease at a time.
+{
+  const h = retryHarness()
+  const first = await h.create()
+  const second = await h.create()
+  await h.broker.revokeAll()
+  assert.equal(h.deletes.length, 2)
+  assert.equal(h.broker.authorizesSurface(first.grant), false)
+  assert.equal(h.broker.authorizesSurface(second.grant), false)
+  const replacement = await h.create()
+  let releaseDelete
+  const deletePending = new Promise(resolve => { releaseDelete = resolve })
+  h.setDeleteReply(async () => { await deletePending; return 204 })
+  await h.runTimer({ advanceMs: 60_000 })
+  assert.equal(h.deletes.length, 3, 'only one background DELETE may be in flight')
+  assert.equal(h.timer(), null)
+  releaseDelete()
+  await h.flush()
+  assert.equal(h.deletes.length, 4)
+  assert.deepEqual([...h.remoteLeases], [replacement.control.leaseId])
+  assert.equal(h.broker.authorizesSurface(replacement.grant), true,
+    'cleanup must not consume replacement renderer leases')
+  h.broker.clear()
+}
+
+// Slow failures at the front of the queue must not starve other due cleanup.
+{
+  const h = retryHarness()
+  const leases = await Promise.all(Array.from({ length: 10 }, () => h.create()))
+  await h.broker.revokeAll()
+  const slowLeases = new Set(leases.slice(0, 5).map(lease => lease.control.leaseId))
+  let attempts = 0
+  h.setDeleteReply(async leaseId => {
+    attempts += 1
+    // Bound the simulation even if the queue keeps selecting failed leases.
+    if (attempts === 100) h.broker.clear()
+    if (slowLeases.has(leaseId)) {
+      h.advanceNow(15_000)
+      return 503
+    }
+    return 204
+  })
+  await h.runTimer({ advanceMs: 60_000 })
+  assert.deepEqual(h.remoteLeases, slowLeases,
+    'healthy cleanup must progress while earlier requests repeatedly fail slowly')
+  h.broker.clear()
+}
+
+// A stale in-flight create and its failed compensating DELETE share retry ownership.
+for (const retire of ['revokeAll', 'clear']) {
+  const h = retryHarness()
+  let releasePost
+  h.setPostGate(new Promise(resolve => { releasePost = resolve }))
+  const created = h.broker.create({ version: 1, artifactId: 'art-retry', scopeId, mode: 'full' })
+  const cleanup = h.broker[retire]()
+  releasePost()
+  assert.equal((await created).code, 'PREVIEW_LEASE_RETIRED')
+  await cleanup
+  assert.equal(h.deletes.length, 1)
+  if (retire === 'revokeAll') {
+    h.setDeleteReply(async () => 204)
+    await h.runTimer()
+    assert.equal(h.remoteLeases.size, 0)
+  } else {
+    assert.equal(h.timer(), null, 'a late create cannot reinstall retries after lifecycle clear')
+  }
+  h.broker.clear()
+}
+
+for (const change of ['clear', 'gateway']) {
+  const h = retryHarness()
+  const { control } = await h.create()
+  await h.broker.revoke(control)
+  if (change === 'clear') {
+    h.broker.clear()
+  } else {
+    h.setGateway('http://127.0.0.1:18792')
+    await h.runTimer()
+  }
+  assert.equal(h.deletes.length, 1, 'retired credentials must never be retried against another Gateway')
+  assert.equal(h.timer(), null)
+  h.broker.clear()
+}
+
+// Clear also fences an already-running retry from scheduling itself again.
+{
+  const h = retryHarness()
+  const { control } = await h.create()
+  await h.broker.revoke(control)
+  let releaseDelete
+  h.setDeleteReply(() => new Promise(resolve => { releaseDelete = resolve }))
+  await h.runTimer()
+  h.broker.clear()
+  releaseDelete(429)
+  await h.flush()
+  assert.equal(h.timer(), null)
+}
+
+for (const status of [400, 401, 403]) {
+  const h = retryHarness()
+  h.setDeleteReply(async () => status)
+  const { control } = await h.create()
+  assert.equal((await h.broker.revoke(control)).status, status)
+  if (status === 400) assert.equal(h.timer(), null, 'invalid requests remain dormant')
+  else assert.ok(h.timer().delayMs >= 48_000, 'authorization failures retry slowly')
+  h.setDeleteReply(async () => 204)
+  assert.equal((await h.broker.revoke({ ...control, authToken: 'synthetic-refreshed-token' })).ok, true)
+  assert.equal(h.deletes.at(-1).authorization, 'Bearer synthetic-refreshed-token')
+  assert.equal(h.remoteLeases.size, 0)
+  assert.equal(h.timer(), null)
+  h.broker.clear()
+}
+
+for (const bodyFailure of ['network', 'abort', 'malformed']) {
+  const h = retryHarness()
+  const { control, grant } = await h.create()
+  h.setRenewalReply(() => new Response(bodyFailure === 'malformed' ? '{broken-json' : new ReadableStream({
+    start(controller) {
+      controller.error(bodyFailure === 'network'
+        ? new TypeError('synthetic connection reset during body read')
+        : new DOMException('synthetic body read cancellation', 'AbortError'))
+    },
+  }), { status: 200, headers: { 'content-type': 'application/json' } }))
+  const result = await h.broker.renew(control)
+  assert.equal(result.ok, false)
+  assert.equal(result.status, bodyFailure === 'malformed' ? 502 : 503)
+  assert.equal(result.code, bodyFailure === 'malformed' ? 'INVALID_RESPONSE' : 'PREVIEW_BROKER_UNAVAILABLE')
+  assert.equal(h.broker.authorizesSurface(grant), true,
+    'a failed renewal response must not discard the existing local grant')
+  h.broker.clear()
+}
+
+console.log('artifact preview lease broker tests passed, including background revocation recovery')

@@ -40,6 +40,7 @@ async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str,
         raise ValueError("params.scope must be active or configured")
     catalog = ModelCatalog(GatewayModelCatalogPort(
         ctx.provider_selector, ctx.config, include_configured_defaults=scope == "configured",
+        cache_only=query.get("cacheOnly", False),
     ))
     return cast(
         dict[str, Any],

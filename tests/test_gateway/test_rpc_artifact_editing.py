@@ -24,6 +24,7 @@ from opensquilla.artifacts import (
 )
 from opensquilla.gateway.artifacts import register_artifact_routes
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 
@@ -53,6 +54,7 @@ async def artifact_editing_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         state_dir=str(tmp_path / "state"),
         workspace_dir=str(tmp_path / "workspace"),
         config_path=None,
+        sandbox=SandboxSettings(),
     )
     ctx = RpcContext(
         conn_id="artifact-editing-test",
@@ -122,12 +124,12 @@ async def test_office_format_capabilities_are_independently_fail_closed(
     for artifact_format in ("docx", "xlsx", "pptx"):
         capabilities = described.payload["formats"][artifact_format]
         assert capabilities["download"] is True
-        assert capabilities["preview"] is False
-        assert capabilities["selectionContext"] is False
+        assert capabilities["preview"] is True
+        assert capabilities["selectionContext"] is True
         assert capabilities["manualEdit"] is False
-        assert capabilities["agentEdit"] is False
-        assert capabilities["publish"] is False
-        assert capabilities["unavailableReason"] == "office_adapter_not_available"
+        assert capabilities["agentEdit"] is True
+        assert capabilities["publish"] is True
+        assert "unavailableReason" not in capabilities
 
 
 
@@ -489,7 +491,15 @@ async def test_session_reset_and_delete_fence_documents(
     )
     assert opened.error is None
 
-    approval_queue = SimpleNamespace(expire_pending_for_session=lambda _key: None)
+    expired_sessions = []
+
+    async def expire_pending_for_session(session_key):
+        # The real async queue is awaited before the irreversible delete.
+        assert await env.storage.get_session(session_key) is not None
+        expired_sessions.append(session_key)
+        return 0
+
+    approval_queue = SimpleNamespace(expire_pending_for_session_async=expire_pending_for_session)
     monkeypatch.setattr(
         "opensquilla.gateway.approval_queue.get_approval_queue",
         lambda: approval_queue,
@@ -497,6 +507,8 @@ async def test_session_reset_and_delete_fence_documents(
     deleted = await _dispatch(env, "sessions.delete", {"key": SESSION_KEY})
     assert deleted.error is None, deleted.error
     assert deleted.payload["deleted"] == [SESSION_KEY]
+    assert deleted.payload["errors"] == []
+    assert expired_sessions == [SESSION_KEY]
 
     recreated = await env.manager.create(SESSION_KEY)
     assert recreated.session_id not in {

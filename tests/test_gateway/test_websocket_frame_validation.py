@@ -88,40 +88,44 @@ class _CapabilityDispatcher:
         )
 
 
-class _BlockingMetaDispatcher:
+class _BlockingOptionalReadDispatcher:
     def __init__(self) -> None:
-        self.meta_started = asyncio.Event()
-        self.meta_cancelled = asyncio.Event()
+        self.read_started = asyncio.Event()
+        self.read_cancelled = asyncio.Event()
 
     def list_methods(self) -> list[str]:
-        return ["health", "meta.drafts.list"]
+        return ["health", "workspaces.list"]
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
-        if method == "meta.drafts.list":
-            self.meta_started.set()
+        if method == "workspaces.list":
+            self.read_started.set()
             try:
                 await asyncio.Future()
             finally:
-                self.meta_cancelled.set()
+                self.read_cancelled.set()
         if method == "health":
-            await asyncio.wait_for(self.meta_started.wait(), timeout=1.0)
+            await asyncio.wait_for(self.read_started.wait(), timeout=1.0)
         return make_ok_res(req_id, {"method": method})
 
 
-class _CancellationResistantMetaDispatcher(_BlockingMetaDispatcher):
+class _CancellationResistantReadDispatcher(_BlockingOptionalReadDispatcher):
     def __init__(self) -> None:
         super().__init__()
         self.release = asyncio.Event()
+        self.read_finished = asyncio.Event()
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
-        if method != "meta.drafts.list":
+        if method != "workspaces.list":
             return await super().dispatch(req_id, method, params, ctx)
-        self.meta_started.set()
+        self.read_started.set()
         try:
-            await self.release.wait()
-        except asyncio.CancelledError:
-            self.meta_cancelled.set()
-            await self.release.wait()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.read_cancelled.set()
+                await self.release.wait()
+        finally:
+            self.read_finished.set()
         return make_ok_res(req_id, {"method": method})
 
 
@@ -221,16 +225,16 @@ async def test_non_string_req_id_gets_error_res_and_connection_survives() -> Non
     assert ws.close_codes == []
 
 
-async def test_slow_meta_draft_list_does_not_block_the_next_rpc_on_the_socket() -> None:
-    dispatcher = _BlockingMetaDispatcher()
+async def test_slow_optional_read_does_not_block_the_next_rpc_on_the_socket() -> None:
+    dispatcher = _BlockingOptionalReadDispatcher()
     ws = _WaitForResponseWebSocket(
         [
             _CONNECT_FRAME,
             json.dumps({
                 "type": "req",
-                "id": "slow-meta",
-                "method": "meta.drafts.list",
-                "params": {"agentId": "main"},
+                "id": "slow-read",
+                "method": "workspaces.list",
+                "params": {},
             }),
             json.dumps({"type": "req", "id": "ordinary", "method": "health"}),
         ],
@@ -241,34 +245,46 @@ async def test_slow_meta_draft_list_does_not_block_the_next_rpc_on_the_socket() 
 
     responses = ws.responses()
     assert [response["id"] for response in responses] == ["ordinary"]
-    assert dispatcher.meta_started.is_set()
-    assert dispatcher.meta_cancelled.is_set()
+    assert dispatcher.read_started.is_set()
+    assert dispatcher.read_cancelled.is_set()
 
 
-async def test_disconnect_does_not_wait_forever_for_a_cancellation_resistant_meta_query() -> None:
-    dispatcher = _CancellationResistantMetaDispatcher()
+async def test_disconnect_does_not_wait_forever_for_a_cancellation_resistant_read() -> None:
+    dispatcher = _CancellationResistantReadDispatcher()
     ws = _WaitForResponseWebSocket(
         [
             _CONNECT_FRAME,
             json.dumps({
                 "type": "req",
-                "id": "slow-meta",
-                "method": "meta.drafts.list",
-                "params": {"agentId": "main"},
+                "id": "slow-read",
+                "method": "workspaces.list",
+                "params": {},
             }),
             json.dumps({"type": "req", "id": "ordinary", "method": "health"}),
         ],
         "ordinary",
     )
 
-    await asyncio.wait_for(
+    connection_task = asyncio.create_task(
         handle_ws_connection(ws, _config(), dispatcher=dispatcher),
-        timeout=1.0,
     )
-    assert dispatcher.meta_cancelled.is_set()
-
-    dispatcher.release.set()
-    await asyncio.sleep(0)
+    try:
+        # wait_for would await cancellation of a regressed serial handler,
+        # whose deliberately resistant fake cannot finish until cleanup runs.
+        done, _ = await asyncio.wait({connection_task}, timeout=1.0)
+        assert connection_task in done
+        await connection_task
+        assert dispatcher.read_cancelled.is_set()
+    finally:
+        dispatcher.release.set()
+        if not connection_task.done():
+            connection_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(connection_task, return_exceptions=True), timeout=1.0,
+        )
+        if dispatcher.read_started.is_set():
+            await asyncio.wait_for(dispatcher.read_finished.wait(), timeout=1.0)
+        await asyncio.sleep(0)
     assert [response["id"] for response in ws.responses()] == ["ordinary"]
 
 

@@ -31,6 +31,32 @@ beforeEach(() => {
 })
 
 describe('useCronRuns', () => {
+  it('keeps a first-load failure distinct from an empty history and supports retry', async () => {
+    mocks.rpcCall.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce({ runs: [run('restored')] })
+    const selectedId = ref<string | null>('job-a')
+    const state = useCronRuns(scheduler, selectedId)
+    await state.loadRuns('job-a')
+    expect(state.error.value).toBe('offline')
+    expect(state.runs.value).toEqual([])
+    expect(state.runsLoading.value).toBe(false)
+    await state.loadRuns('job-a')
+    expect(state.error.value).toBeNull()
+    expect(state.runs.value[0]?.summary).toBe('restored')
+  })
+
+  it('keeps last-good history on refresh but clears it when selecting another job', async () => {
+    mocks.rpcCall.mockResolvedValueOnce({ runs: [run('old')] }).mockRejectedValue(new Error('offline'))
+    const selectedId = ref<string | null>('job-a')
+    const state = useCronRuns(scheduler, selectedId)
+    await state.loadRuns('job-a')
+    await state.loadRuns('job-a')
+    expect(state.runs.value[0]?.summary).toBe('old')
+    expect(state.error.value).toBe('offline')
+    selectedId.value = 'job-b'
+    await nextTick()
+    expect(state.runs.value).toEqual([])
+    await vi.waitFor(() => expect(state.error.value).toBe('offline'))
+  })
   it('ignores an older response after the selected job changes', async () => {
     const first = deferred<{ runs: CronRun[] }>()
     const second = deferred<{ runs: CronRun[] }>()

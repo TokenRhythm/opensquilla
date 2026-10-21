@@ -71,6 +71,8 @@ export interface ChatSendAttachmentPayload {
   name: string
   data?: string
   file_uuid?: string
+  /** Client provenance used by the Gateway to preserve pasted-text semantics. */
+  origin?: 'paste'
 }
 
 /** Exact editable document head bound to one chat send attempt. */
@@ -82,6 +84,7 @@ export interface ChatDocumentContext {
 export interface SessionSteerV2Params {
   key: string
   message: string
+  localPathReferences?: string[]
   expected_turn_id: string
   client_request_id: string
   client_message_id: string
@@ -108,6 +111,8 @@ export interface Attachment {
   workspaceFile?: WorkspaceFileReference
   /** Server-owned bytes restored from the durable pending-input queue. */
   durable_material?: true
+  /** User pasted plain text; the Gateway owns the final preview policy. */
+  origin?: 'paste'
 }
 
 export interface DisplayAttachment {
@@ -126,8 +131,13 @@ export interface DisplayAttachment {
   localFile?: File
   download_url?: string
   sha256_ref?: string
+  /** Bounded server display diagnostic; it does not revoke a usable read source. */
+  missingReason?: string
+  /** Exact historical write to recover lazily when its saved material is absent. */
+  fileSnapshotRef?: { messageId: string; toolUseId: string }
   /** Session-scoped opaque identity for Workbench preview/import actions. */
   attachmentId?: string
+  origin?: 'paste'
 }
 
 /**
@@ -152,9 +162,11 @@ export interface PendingSteerAttempt {
 }
 
 export interface ChatPendingItem {
+  turnCommand?: import('./turnCommand').ProjectInitTurnCommand
   /** Stable local identity for keyed rendering and UI actions across peer edits. */
   pendingUiId: string
   text: string
+  localPathReferences?: string[]
   /** Annotation batch retained when a follow-up is queued behind an active turn. */
   draftIds?: string[]
   /** Upgrade recovery requires the user to select the page again before sending. */
@@ -165,7 +177,7 @@ export interface ChatPendingItem {
   intent: string | null
   /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
   confirmedPlainText?: boolean
-  /** Generic non-v2 queue/hidden-control delivery lease. V2 Steer uses `steerAttempt`. */
+  /** Generic non-v2 queue delivery lease. V2 Steer uses `steerAttempt`. */
   deliveryState?: 'steering' | 'retryable'
   /** Canonical transport identity/state for a not-yet-durable steer. */
   steerAttempt?: PendingSteerAttempt
@@ -173,22 +185,6 @@ export interface ChatPendingItem {
   ownerSessionKey?: string
   /** chat.send request whose canonical response may carry this item to a child. */
   ownerRequestId?: string
-  // Hidden control sends (e.g. meta-preflight confirmation) carry the provider
-  // text in `text`, the visible bubble in `displayTextOverride`, and skip the
-  // normal user-bubble push / composer consumption on drain.
-  hiddenControl?: boolean
-  displayTextOverride?: string
-  // Stable ingress identity for a queued hidden control. Provider-setup
-  // handoffs reuse it across remounts/tabs so Gateway idempotency can collapse
-  // duplicate resumes of the same original intent.
-  clientRequestId?: string
-  /** Session that owns a durable hidden-control intent. */
-  hiddenControlSessionKey?: string
-  /** Stable transport identity for retrying a hidden control exactly once. */
-  hiddenClientRequestId?: string
-  hiddenClientMessageId?: string
-  /** The visible confirmation bubble was already rendered optimistically. */
-  hiddenVisibleCommitted?: boolean
   /** Stable identity shared by IndexedDB WAL and the Gateway staged queue. */
   pendingInputId?: string
   pendingClientRequestId?: string
@@ -218,52 +214,36 @@ export interface ChatPendingItem {
     | 'cancelling'
 }
 
-export type HiddenControlDispatchStatus =
-  | 'accepted'
-  | 'queued'
-  | 'rejected'
-  | 'unknown'
-
-export type HiddenControlDispatchReason =
-  | 'accepted'
-  | 'queued'
-  | 'already_queued'
-  | 'queue_full'
-  | 'discarded'
-  | 'invalid_request'
-  | 'outbox_conflict'
-  | 'outbox_persist_failed'
-  | 'send_rejected'
-  | 'response_unknown'
-
-/**
- * Machine-owned result for a hidden control send. `accepted` is the only state
- * that proves the Gateway durably owns the request; `queued` is recoverable
- * local work and must keep its persisted source intent until a later accepted
- * result arrives.
- */
-export interface HiddenControlDispatchResult {
-  status: HiddenControlDispatchStatus
-  reason: HiddenControlDispatchReason
-  clientRequestId: string
-  sessionKey: string
-}
-
 export interface ChatRouterCell {
   kind: 'real' | 'decoy'
   tier: string
   tiers: string[]
   displayName: string
   model?: string
+  provider?: string
   executionKind?: 'single_model' | 'ensemble'
 }
 
 export interface ChatRouterTierConfig {
   model: string
+  provider?: string
   /** Accepted from legacy snapshots, not used to determine capability. */
   supportsImage?: boolean
   imageOnly: boolean
   ensembleEnabled?: boolean
+}
+
+/** UI-only immutable content captured by a successful filesystem operation. */
+export interface ToolFileSnapshot {
+  kind: 'write' | 'edit'
+  path: string
+  content: string
+  /** Large bodies use session-owned material; content is only a transport preview. */
+  sha256_ref?: string
+  bytes?: number
+  /** Verified display marker; the backend validates original replay only on access. */
+  legacy_ref?: { message_id: string; tool_use_id: string; sha256: string; original_chars: number }
+  content_unavailable?: true
 }
 
 export interface ChatToolCall {
@@ -278,7 +258,11 @@ export interface ChatToolCall {
   isError: boolean
   result: string
   resultPreview: string
+  /** Persisted history may contain an excerpt instead of the full output. */
+  resultTruncated?: boolean
+  resultOriginalChars?: number
   executionLogHandle?: string
+  fileSnapshot?: ToolFileSnapshot
   sources?: unknown
   isOpen: boolean
   activityOrder?: number
@@ -437,6 +421,8 @@ export interface ChatTurnOutcome {
   documentMutationOutcome?: DocumentMutationOutcome
   errorClass?: string
   failureKind?: string
+  /** null prevents conflicting/invalid HTTP evidence from being restored by merges. */
+  httpStatus?: number | null
   /** null retains invalid/conflicting evidence across notice merges. */
   errorId?: string | null
   terminalMessage?: string
@@ -500,6 +486,11 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   tool_name?: string
   input?: unknown
   result?: unknown
+  file_snapshot?: ToolFileSnapshot
+  result_truncated?: boolean
+  result_original_chars?: number
+  resultTruncated?: boolean
+  resultOriginalChars?: number
   user_input_request?: unknown
   content?: unknown
   output?: unknown
@@ -695,6 +686,9 @@ export interface ActivitySnapshotV2 {
 
 /** A non-conversational maintenance event rendered inside transcript chronology. */
 export interface ChatMaintenanceEvent {
+  providerRecovery?: import('./parts').ProviderRecovery
+  httpStatus?: number
+  failureKind?: string
   kind: 'context_compaction'
   compactionId: string
   source: string
@@ -710,17 +704,23 @@ export interface ChatMaintenanceEvent {
   canonicalComplete?: boolean | null
 }
 
+/** Visible range in a durable assistant body shared by split history rows. */
+export interface ChatContentSlice {
+  startCodepoint: number
+  endCodepoint: number
+}
+
 export interface ChatMessage {
   role: ChatRole
   text: string
+  /** Explicit local selections; presentation only, canonical paths remain in text. */
+  localPathReferences?: string[]
   ts: string | number | null
   /** Stable client-only identity for optimistic rows before the backend assigns messageId. */
   clientId?: string
   reasoning?: ChatReasoning
   /** Structured physical-call reasoning retained across live-to-history sync. */
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
-  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
-  reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
   /** Live physical execution model; never overwrites the logical route decision. */
@@ -764,10 +764,38 @@ export interface ChatMessage {
   interrupted?: boolean
   routerState?: string
   routerSettled?: boolean
+  /** Display-only replay provenance; the router may still belong to an active turn. */
+  routerReplayed?: boolean
   // Live-accumulated ensemble members for the in-flight router strip, grown by
   // `session.event.ensemble_progress` deltas before the final `done` arrives.
   ensemble?: ChatEnsembleMeta
   messageId?: string
+  /** Metadata-only pointer for bounded legacy transcript reads. */
+  contentRef?: {
+    version: 1
+    sessionKey: string
+    sessionId: string
+    messageId: string
+    source?: 'active' | 'compacted'
+    view?: 'raw' | 'display'
+    byteLength?: number
+    revision?: string
+    sha256?: string
+  }
+  /** Visible codepoint range when this row was split from a durable body. */
+  contentSlice?: ChatContentSlice
+  /** Display body completeness, separate from history page completeness. */
+  previewComplete?: boolean
+  historyPayloadPreview?: import('@/modules/sessionReadLifecycle').SessionReadPayloadPreview
+  /** Locally hydrated details, retained only across the same storage revision. */
+  detailsCompleteRevision?: string
+  contentRevision?: string
+  contentAvailability?: 'ready' | 'preparing' | 'unavailable'
+  /** Bounded history has no safe contentRef for this row; body remains authoritative in storage. */
+  contentUnavailableReason?:
+    | 'content_metadata_pending'
+    | 'display_projection_too_large'
+    | 'content_reference_unavailable'
   usage?: ChatUsagePayload
   turn_usage?: ChatUsagePayload
   model?: string
@@ -820,6 +848,8 @@ export interface ChatCreatedSessionLink {
 }
 
 export interface ChatRenderedMessage {
+  /** Ephemeral input drafts, attached by the live owner only; absent in history. */
+  toolInputPreviews?: import('./toolInputPreview').LiveToolInputPreview[]
   id?: string
   clientId?: string
   sourceIndex?: number
@@ -828,6 +858,7 @@ export interface ChatRenderedMessage {
   displayRole: string
   roleLabel: string
   text: string
+  localPathReferences?: string[]
   timeStr: string
   /** Raw message timestamp (epoch ms or ISO string) so components can derive a
    *  live relative + absolute label without re-running the renderedMessages map. */
@@ -835,6 +866,17 @@ export interface ChatRenderedMessage {
   showHeader: boolean
   isStreaming?: boolean
   messageId?: string
+  /** Metadata-only pointer for bounded historical transcript content. */
+  contentRef?: ChatMessage['contentRef']
+  /** Visible codepoint range when this row was split from a durable body. */
+  contentSlice?: ChatContentSlice
+  /** Display body completeness, separate from history page completeness. */
+  previewComplete?: boolean
+  historyPayloadPreview?: ChatMessage['historyPayloadPreview']
+  contentRevision?: string
+  contentAvailability?: ChatMessage['contentAvailability']
+  /** Bounded history has no safe contentRef for this row; body remains authoritative in storage. */
+  contentUnavailableReason?: ChatMessage['contentUnavailableReason']
   restoredFromHistory?: boolean
   /** Durable server turn identity restored from transcript context once assigned. */
   turnId?: string
@@ -865,8 +907,6 @@ export interface ChatRenderedMessage {
   reasoning?: ChatReasoning
   /** Structured physical-call reasoning retained across live-to-history sync. */
   reasoningBlocks?: import('./turnlog').ReasoningBlock[]
-  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
-  reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
   interrupted?: boolean
@@ -886,6 +926,8 @@ export interface ChatRenderedMessage {
   routerSource?: string
   routerObserve?: boolean
   routerStatic?: boolean
+  /** Freeze an already observed route without claiming that its active call completed. */
+  routerReplayed?: boolean
   routerSettled?: boolean
   routerPanel?: string
   routerMode?: import('./modelRouting').ModelRoutingMode

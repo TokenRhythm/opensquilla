@@ -537,6 +537,8 @@ def test_subagent_schema_hides_publish_artifact_without_artifact_context() -> No
     names = {tool.name for tool in registry.to_tool_definitions(subagent_ctx)}
 
     assert "publish_artifact" not in names
+    assert "video_generate" not in names
+    assert "video_status" not in names
 
 
 def test_owner_only_tools_are_hidden_from_non_owner_schema() -> None:
@@ -745,3 +747,14 @@ async def test_catalog_and_effective_names_agree_for_unattended_cli_context() ->
     catalog_names = {tool["name"] for tool in catalog}
     effective_names = {tool["name"] for tool in effective}
     assert catalog_names == effective_names == {"read_file", "sessions_list"}
+
+
+def test_default_agent_retains_coding_tools_after_feature_retirement() -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.tools.registry import get_default_registry
+
+    registry = get_default_registry()
+    ctx = ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
+    available = {tool.name for tool in registry.to_tool_definitions(ctx)}
+    assert {"read_file", "write_file", "edit_file", "exec_command", "process"} <= available
+    assert registry.get("meta_invoke") is None

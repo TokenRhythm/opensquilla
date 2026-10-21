@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from opensquilla.artifacts import (
+    ArtifactBudgetError,
     ArtifactBundle,
     ArtifactBundleSourceFile,
     ArtifactRef,
@@ -25,6 +26,13 @@ from opensquilla.artifacts import (
     artifact_bundle_manifest,
     collect_artifact_bundle,
 )
+from opensquilla.office_format import (
+    MAX_OFFICE_BYTES,
+    OfficeFormatError,
+    office_format,
+    validate_office_bytes,
+)
+from opensquilla.paths import native_io_path
 
 from .errors import ArtifactConflictError, ArtifactValidationError
 from .models import (
@@ -35,6 +43,17 @@ from .models import (
     CommitResult,
     Revision,
     RevisionSource,
+)
+from .office_materialization import (
+    OfficeFilePlan,
+    apply_office_file,
+    assert_office_fingerprint,
+    cleanup_office_plan,
+    matching_office_fingerprint,
+    office_stage_unconsumed,
+    read_office_file,
+    reconcile_office_file,
+    stage_office_file,
 )
 from .service import ArtifactSessionService
 
@@ -62,13 +81,15 @@ def checked_path(root: Path, relative: str) -> Path:
     ):
         raise ArtifactValidationError("Invalid working resource path")
     path = root
-    if root.is_symlink() or root.resolve() != root.absolute():
+    native_root = native_io_path(root)
+    if native_root.is_symlink() or native_root.resolve() != native_root.absolute():
         raise ArtifactValidationError("Working directory contains a link")
     for part in logical.parts:
         path = path / part
-        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+        native_path = native_io_path(path)
+        if native_path.is_symlink() or getattr(native_path, "is_junction", lambda: False)():
             raise ArtifactValidationError("Working resource contains a link")
-    if not path.resolve().is_relative_to(root.resolve()):
+    if not native_io_path(path).resolve().is_relative_to(native_root.resolve()):
         raise ArtifactValidationError("Working resource is outside its directory")
     return path
 
@@ -108,12 +129,16 @@ class WorkingFiles:
         return checked_path(self.root, self.entrypoint)
 
     def bundle(self, *, read_guard: Callable[[Path], None] | None = None) -> ArtifactBundle:
-        if self.source_path is not None and self.bundle_mode == "none":
+        if (self.source_path is not None and self.bundle_mode == "none") or office_format(
+            self.entrypoint, self.entry_mime,
+        ):
             entry = self.entry
             if read_guard is not None:
                 read_guard(entry)
             return ArtifactBundle(entrypoint=self.entrypoint, files=(ArtifactBundleSourceFile(
-                path=self.entrypoint, mime=self.entry_mime, data=_read_regular_bundle_file(entry),
+                path=self.entrypoint, mime=self.entry_mime,
+                data=(read_office_file(entry) if office_format(self.entrypoint, self.entry_mime)
+                      else _read_regular_bundle_file(entry)),
             ),))
         bundle = collect_artifact_bundle(
             self.entry,
@@ -246,6 +271,31 @@ def load_version_bundle(store: ArtifactStore, artifact_id: str, session_id: str)
             raise ArtifactValidationError("Stored version failed its integrity check")
         sources.append(ArtifactBundleSourceFile(path=logical_path, mime=resource.mime, data=data))
     return ArtifactBundle(entrypoint=entrypoint, files=tuple(sources))
+
+
+def _load_office_version_bundle(
+    store: ArtifactStore, artifact_id: str, session_id: str,
+) -> ArtifactBundle:
+    try:
+        ref, payload, manifest = store.read_verified_material(
+            artifact_id, session_id=session_id, max_bytes=MAX_OFFICE_BYTES, validate_bundle=True,
+        )
+    except ArtifactBudgetError as exc:
+        raise OfficeFormatError("office_size_unsupported") from exc
+    if manifest is not None and len(manifest.files) != 1:
+        raise ArtifactValidationError("Office working versions must contain one package")
+    entrypoint = manifest.entrypoint if manifest is not None else ref.name
+    return ArtifactBundle(entrypoint=entrypoint, files=(ArtifactBundleSourceFile(
+        path=entrypoint, mime=ref.mime, data=payload,
+    ),))
+
+
+def _office_revision_format(revision: Revision) -> str | None:
+    # Display-name changes do not change the immutable package's format or
+    # disable its pending recovery protocol.
+    return office_format(revision.filename, revision.media_type) or office_format(
+        "", revision.media_type,
+    )
 
 
 def _restore_source(
@@ -438,7 +488,7 @@ async def _binding_for_version(
         )
 
 
-async def ensure_working_files(
+async def _ensure_working_files_legacy(
     service: ArtifactSessionService,
     store: ArtifactStore,
     *,
@@ -522,7 +572,7 @@ async def ensure_working_files(
             return binding
 
 
-async def restore_working_revision(
+async def _restore_working_revision_legacy(
     service: ArtifactSessionService,
     store: ArtifactStore,
     *,
@@ -649,6 +699,10 @@ async def save_working_version(
     async with _lock(document_id):
         binding = await get_working_files(service, document_id)
         if binding is None:
+            return None
+        if office_format(binding.entrypoint, binding.entry_mime):
+            # Office is readonly in the viewer. Only the pinned candidate transaction
+            # below may create an Agent revision, including when publish_artifact is used.
             return None
         head = await service.get_document_head(document_id)
         if head.document.session_key != session_key or head.document.session_id != session_id:
@@ -847,4 +901,778 @@ async def save_working_version(
             await service.mark_document_publish_promoted(
                 session_id=session_id, idempotency_key=publication_key
             )
+        return result
+
+
+
+async def _settle_office_io(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not operation.cancelled():
+            operation.exception()
+        raise
+
+
+async def _stage_office_materialization(
+    binding: WorkingFiles,
+    payload: bytes,
+    *,
+    expected_sha256: str | None,
+    allow_existing: bool,
+) -> OfficeFilePlan:
+    operation = asyncio.create_task(
+        asyncio.to_thread(
+            stage_office_file,
+            document_id=binding.document_id,
+            workspace=binding.workspace,
+            target=binding.entry.relative_to(binding.workspace).as_posix(),
+            payload=payload,
+            expected_sha256=expected_sha256,
+            allow_existing=allow_existing,
+        )
+    )
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not operation.cancelled() and operation.exception() is None:
+            await _settle_office_io(cleanup_office_plan, operation.result(), preserve_backup=False)
+        raise
+
+
+async def _apply_office_materialization(plan: OfficeFilePlan) -> None:
+    await _settle_office_io(apply_office_file, plan)
+
+
+async def _reserve_office_materialization(
+    service: ArtifactSessionService,
+    head: CommitResult,
+    binding: WorkingFiles,
+    plan: OfficeFilePlan,
+    *,
+    operation_id: str,
+) -> None:
+    async with service.repository._transaction("office_materialization.reserve") as conn:
+        current = await service.repository._get_document_on_conn(conn, binding.document_id)
+        if (
+            current.head_revision_id != head.revision.revision_id
+            or current.state_revision != head.document.state_revision
+        ):
+            raise ArtifactConflictError("Office document changed while staging")
+        cursor = await conn.execute(
+            "SELECT 1 FROM artifact_office_materializations WHERE document_id=?",
+            (binding.document_id,),
+        )
+        if await cursor.fetchone() is not None:
+            raise ArtifactConflictError("Office document has a pending materialization")
+        await conn.execute(
+            "INSERT INTO artifact_office_materializations "
+            "(document_id,operation_id,session_key,session_id,workspace,expected_revision_id,"
+            "plan_json,status) VALUES (?,?,?,?,?,?,?,'prepared')",
+            (
+                binding.document_id,
+                operation_id,
+                head.document.session_key,
+                head.document.session_id,
+                binding.workspace,
+                head.revision.revision_id,
+                json.dumps(plan.to_dict(), separators=(",", ":")),
+            ),
+        )
+
+
+async def _office_materialization_applied(
+    conn: Any, plan: OfficeFilePlan, revision_id: str
+) -> None:
+    cursor = await conn.execute(
+        "UPDATE artifact_office_materializations SET status='applied',result_revision_id=? "
+        "WHERE document_id=? AND status='prepared'",
+        (revision_id, plan.document_id),
+    )
+    if cursor.rowcount != 1:
+        raise ArtifactConflictError("Office materialization receipt changed")
+
+
+async def _reconcile_office_materialization_locked(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    document_id: str,
+    *,
+    explicit_restore: bool = False,
+) -> bool:
+    async with service.repository._read_transaction("office_materialization.receipt") as conn:
+        cursor = await conn.execute(
+            "SELECT * FROM artifact_office_materializations WHERE document_id=?",
+            (document_id,),
+        )
+        raw = await cursor.fetchone()
+        if raw is None:
+            return False
+        record = dict(raw)
+    plan = OfficeFilePlan.from_dict(json.loads(record["plan_json"]))
+    head = await service.get_document_head(document_id)
+    binding = await get_working_files(service, document_id)
+    if (
+        plan.document_id != document_id
+        or plan.workspace != record["workspace"]
+        or head.document.session_key != record["session_key"]
+        or head.document.session_id != record["session_id"]
+    ):
+        raise ArtifactValidationError("Office recovery identity does not match its document")
+    if binding is not None:
+        expected_target = binding.entry.relative_to(binding.workspace).as_posix()
+        if binding.workspace != plan.workspace or plan.target != expected_target:
+            raise ArtifactValidationError("Office recovery target does not match its binding")
+    else:
+        # A first bind may die after replacing the file but before inserting the binding.
+        # Derive its only authorized path from the immutable version, not plan_json.
+        revision = await service.get_revision(record["expected_revision_id"])
+        if revision.document_id != document_id:
+            raise ArtifactValidationError("Office recovery version belongs to another document")
+        bundle = await asyncio.to_thread(
+            _load_office_version_bundle,
+            store,
+            revision.artifact_id,
+            record["session_id"],
+        )
+        expected_root = f"artifacts/{hashlib.sha256(document_id.encode()).hexdigest()[:24]}"
+        if len(bundle.files) != 1 or plan.target != f"{expected_root}/{bundle.entrypoint}":
+            raise ArtifactValidationError("Office recovery target is outside its owned package")
+    applied = record["status"] == "applied"
+    unconsumed = not applied and await asyncio.to_thread(office_stage_unconsumed, plan)
+    retain_material = False
+    try:
+        # An unconsumed original stage proves that no canonical replacement took
+        # place. A failed CAS or concurrent external edit can retire this intent.
+        if not unconsumed:
+            if applied:
+                if (
+                    head.revision.revision_id != record["result_revision_id"]
+                    or head.revision.artifact_sha256 != plan.new_sha256
+                    or binding is None
+                    or binding.base_revision_id != record["result_revision_id"]
+                ):
+                    raise ArtifactConflictError(
+                        "Office recovery receipt no longer matches its head"
+                    )
+            elif head.revision.revision_id != record["expected_revision_id"]:
+                raise ArtifactConflictError("Office recovery cannot replace a newer document")
+            await _settle_office_io(
+                reconcile_office_file,
+                plan,
+                applied=applied,
+                committed_payload=lambda: (
+                    _load_office_version_bundle(
+                        store,
+                        head.revision.artifact_id,
+                        record["session_id"],
+                    )
+                    .files[0]
+                    .data
+                ),
+            )
+    except ArtifactConflictError:
+        if not explicit_restore:
+            raise
+        # Only an authorized, CAS-checked explicit restore may resolve an
+        # external conflict. Keep all old intent material; the new restore also
+        # backs up the current external bytes before replacing the canonical.
+        retain_material = True
+    if not retain_material:
+        await _settle_office_io(
+            cleanup_office_plan,
+            plan,
+            preserve_backup=plan.preserve_backup and (applied or unconsumed),
+        )
+    async with service.repository._transaction("office_materialization.resolved") as conn:
+        await conn.execute(
+            "DELETE FROM artifact_office_materializations WHERE document_id=? AND operation_id=?",
+            (document_id, record["operation_id"]),
+        )
+    return True
+
+
+async def _authorize_office_scope(
+    service: ArtifactSessionService,
+    *,
+    document_id: str,
+    session_key: str,
+    session_id: str,
+    workspace: str | None = None,
+) -> CommitResult:
+    """Check caller authority before recovery is allowed to mutate any file."""
+    head = await service.get_document_head(document_id)
+    if head.document.session_key != session_key or head.document.session_id != session_id:
+        raise ArtifactValidationError("Working document belongs to another session")
+    if workspace is not None:
+        resolved = str(Path(workspace).resolve())
+        binding = await get_working_files(service, document_id)
+        if binding is not None and binding.workspace != resolved:
+            raise ArtifactConflictError("Working document belongs to another workspace")
+        if binding is None:
+            async with service.repository._read_transaction("office_materialization.scope") as conn:
+                cursor = await conn.execute(
+                    "SELECT workspace FROM artifact_office_materializations WHERE document_id=?",
+                    (document_id,),
+                )
+                row = await cursor.fetchone()
+            if row is not None and row["workspace"] != resolved:
+                raise ArtifactConflictError("Working document belongs to another workspace")
+    return head
+
+
+async def _finish_office_materialization(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    plan: OfficeFilePlan,
+) -> None:
+    # Preserve the document lock until both a cancelled SQL commit and recovery settle.
+    async def finish() -> None:
+        async with service.repository._read_transaction("office_materialization.owner") as conn:
+            cursor = await conn.execute(
+                "SELECT plan_json FROM artifact_office_materializations WHERE document_id=?",
+                (plan.document_id,),
+            )
+            row = await cursor.fetchone()
+        if row is not None and json.loads(row["plan_json"]).get("token") != plan.token:
+            await asyncio.to_thread(cleanup_office_plan, plan, preserve_backup=False)
+            return
+        found = await _reconcile_office_materialization_locked(service, store, plan.document_id)
+        if not found:
+            await asyncio.to_thread(cleanup_office_plan, plan, preserve_backup=False)
+
+    operation = asyncio.create_task(finish())
+    interrupted = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            interrupted = exc
+            continue
+    operation.result()
+    if interrupted is not None:
+        raise interrupted
+
+
+async def reconcile_office_materializations(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+) -> tuple[int, int]:
+    """Only visit durable pending intents; never scan workspace directories."""
+    recovered = conflicted = 0
+    after = ""
+    while True:
+        async with service.repository._read_transaction("office_materialization.pending") as conn:
+            cursor = await conn.execute(
+                "SELECT document_id FROM artifact_office_materializations "
+                "WHERE document_id>? ORDER BY document_id LIMIT 100",
+                (after,),
+            )
+            rows = await cursor.fetchall()
+        if not rows:
+            return recovered, conflicted
+        for row in rows:
+            after = document_id = row["document_id"]
+            try:
+                async with _lock(document_id):
+                    recovered += await _reconcile_office_materialization_locked(
+                        service, store, document_id
+                    )
+            except Exception:
+                conflicted += 1
+                logging.getLogger(__name__).warning("Office recovery retained unresolved material")
+
+
+async def _write_office_binding(conn: Any, binding: WorkingFiles) -> None:
+    await conn.execute(
+        "INSERT INTO artifact_working_files VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(document_id) DO UPDATE SET workspace=excluded.workspace, "
+        "relative_root=excluded.relative_root,entrypoint=excluded.entrypoint,"
+        "base_revision_id=excluded.base_revision_id",
+        (
+            binding.document_id,
+            binding.workspace,
+            binding.relative_root,
+            binding.entrypoint,
+            binding.base_revision_id,
+        ),
+    )
+    if binding.source_path is not None:
+        await _save_source_binding(conn, binding)
+
+
+async def ensure_working_files(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    *,
+    document_id: str,
+    session_key: str,
+    session_id: str,
+    workspace: str,
+) -> WorkingFiles:
+    head = await service.get_document_head(document_id)
+    if _office_revision_format(head.revision) is None:
+        return await _ensure_working_files_legacy(
+            service,
+            store,
+            document_id=document_id,
+            session_key=session_key,
+            session_id=session_id,
+            workspace=workspace,
+        )
+    async with _lock(document_id):
+        await _authorize_office_scope(
+            service,
+            document_id=document_id,
+            session_key=session_key,
+            session_id=session_id,
+            workspace=workspace,
+        )
+        await _reconcile_office_materialization_locked(service, store, document_id)
+        head = await service.get_document_head(document_id)
+        if head.document.session_key != session_key or head.document.session_id != session_id:
+            raise ArtifactValidationError("Working document belongs to another session")
+        current = await get_working_files(service, document_id)
+        resolved_workspace = str(Path(workspace).resolve())
+        if current is not None and current.workspace != resolved_workspace:
+            raise ArtifactConflictError("Working document belongs to another workspace")
+        if current is not None and current.base_revision_id == head.revision.revision_id:
+            current.entry
+            return current
+        bundle = await asyncio.to_thread(
+            _load_office_version_bundle, store, head.revision.artifact_id, session_id
+        )
+        if len(bundle.files) != 1:
+            raise ArtifactValidationError("Office working versions must contain one package")
+        if current is None:
+            binding = WorkingFiles(
+                document_id,
+                resolved_workspace,
+                f"artifacts/{hashlib.sha256(document_id.encode()).hexdigest()[:24]}",
+                bundle.entrypoint,
+                head.revision.revision_id,
+                entry_mime=head.revision.media_type,
+            )
+        else:
+            async with service.repository._read_transaction(
+                "office_materialization.binding"
+            ) as conn:
+                binding = await _binding_for_version(conn, current, head.revision, bundle)
+            if binding.entry != current.entry:
+                raise ArtifactConflictError("Office working file location changed")
+        plan = await _stage_office_materialization(
+            binding,
+            bundle.files[0].data,
+            expected_sha256=None,
+            allow_existing=current is not None,
+        )
+        try:
+            await _reserve_office_materialization(
+                service, head, binding, plan, operation_id=f"bind:{plan.token}"
+            )
+            async with service.repository._transaction("office_materialization.bind") as conn:
+                document = await service.repository._get_document_on_conn(conn, document_id)
+                if (
+                    document.head_revision_id != head.revision.revision_id
+                    or document.state_revision != head.document.state_revision
+                ):
+                    raise ArtifactConflictError("Office document changed before binding")
+                await _apply_office_materialization(plan)
+                await _write_office_binding(conn, binding)
+                await _office_materialization_applied(conn, plan, head.revision.revision_id)
+        except BaseException:
+            await _finish_office_materialization(service, store, plan)
+            raise
+        await _finish_office_materialization(service, store, plan)
+        return binding
+
+
+async def restore_working_revision(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    *,
+    document_id: str,
+    session_key: str,
+    session_id: str,
+    target_revision_id: str,
+    expected_head_revision_id: str,
+    expected_state_revision: int,
+    actor: Actor,
+    turn_id: str,
+) -> tuple[CommitResult, ChangeSet, bool]:
+    head = await service.get_document_head(document_id)
+    if _office_revision_format(head.revision) is None:
+        return await _restore_working_revision_legacy(
+            service,
+            store,
+            document_id=document_id,
+            session_key=session_key,
+            session_id=session_id,
+            target_revision_id=target_revision_id,
+            expected_head_revision_id=expected_head_revision_id,
+            expected_state_revision=expected_state_revision,
+            actor=actor,
+            turn_id=turn_id,
+        )
+    async with _lock(document_id):
+        head = await _authorize_office_scope(
+            service,
+            document_id=document_id,
+            session_key=session_key,
+            session_id=session_id,
+        )
+
+        async def restore(
+            conn: Any, *, no_op: bool = False
+        ) -> tuple[CommitResult, ChangeSet, bool]:
+            result, change, replayed = await service.repository._restore_revision_on_conn(
+                conn,
+                document_id=document_id,
+                target_revision_id=target_revision_id,
+                expected_head_revision_id=expected_head_revision_id,
+                expected_state_revision=expected_state_revision,
+                actor=actor,
+                turn_id=turn_id,
+                no_op=no_op,
+            )
+            assert change is not None  # This API always supplies a durable turn id.
+            return result, change, replayed
+
+        # Replay is authoritative even when a subsequent version advanced the head.
+        if (
+            await service.get_change_set_by_turn(document_id=document_id, turn_id=turn_id)
+            is not None
+        ):
+            await _reconcile_office_materialization_locked(service, store, document_id)
+            async with service.repository._transaction("working_files.restore") as conn:
+                return await restore(conn)
+        if (
+            head.revision.revision_id != expected_head_revision_id
+            or head.document.state_revision != expected_state_revision
+        ):
+            raise ArtifactConflictError("Document changed before version restoration")
+        target = await service.get_revision(target_revision_id)
+        if target.document_id != document_id:
+            raise ArtifactValidationError("Target revision belongs to another document")
+        await _reconcile_office_materialization_locked(
+            service,
+            store,
+            document_id,
+            explicit_restore=True,
+        )
+        current = await get_working_files(service, document_id)
+        if current is None:
+            async with service.repository._transaction("working_files.restore") as conn:
+                return await restore(conn, no_op=target_revision_id == head.revision.revision_id)
+        bundle = await asyncio.to_thread(
+            _load_office_version_bundle, store, target.artifact_id, session_id
+        )
+        if len(bundle.files) != 1:
+            raise ArtifactValidationError("Office working versions must contain one package")
+        async with service.repository._read_transaction("office_materialization.binding") as conn:
+            binding = await _binding_for_version(conn, current, target, bundle)
+        if binding.entry != current.entry:
+            raise ArtifactConflictError("Office working file location changed")
+        if target_revision_id == head.revision.revision_id:
+            fingerprint = await asyncio.to_thread(
+                matching_office_fingerprint,
+                binding.entry,
+                head.revision.artifact_sha256,
+            )
+            if fingerprint is not None:
+                async with service.repository._transaction("working_files.restore") as conn:
+                    assert_office_fingerprint(binding.entry, fingerprint)
+                    return await restore(conn, no_op=True)
+        plan = await _stage_office_materialization(
+            binding,
+            bundle.files[0].data,
+            expected_sha256=None,
+            allow_existing=True,
+        )
+        # The immutable head already preserves clean canonical bytes. Keep an
+        # extra backup only when this operation overwrites unsaved external data.
+        plan = replace(plan, preserve_backup=plan.old_sha256 != head.revision.artifact_sha256)
+        try:
+            await _reserve_office_materialization(
+                service, head, binding, plan, operation_id=turn_id
+            )
+            async with service.repository._transaction("working_files.restore") as conn:
+                result, change, replayed = await restore(conn)
+                await _apply_office_materialization(plan)
+                updated = replace(binding, base_revision_id=result.revision.revision_id)
+                await _write_office_binding(conn, updated)
+                await _office_materialization_applied(conn, plan, result.revision.revision_id)
+        except BaseException:
+            await _finish_office_materialization(service, store, plan)
+            raise
+        await _finish_office_materialization(service, store, plan)
+        return result, change, replayed
+
+
+def office_candidate_path(binding: WorkingFiles, candidate: dict[str, Any]) -> Path:
+    identity = f"{binding.document_id}\0{candidate['candidateId']}".encode()
+    directory = hashlib.sha256(identity).hexdigest()
+    return checked_path(
+        Path(binding.workspace),
+        f"artifacts/.office-candidates/{directory}/{PurePosixPath(binding.entrypoint).name}",
+    )
+
+
+async def _checked_office_candidate(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    candidate: dict[str, Any],
+    *,
+    session_key: str,
+    session_id: str,
+    workspace: str,
+) -> tuple[Any, WorkingFiles, ArtifactBundle]:
+    head = await service.get_document_head(candidate["documentId"])
+    if head.document.session_key != session_key or head.document.session_id != session_id:
+        raise ArtifactValidationError("Office candidate belongs to another session")
+    if (
+        head.revision.revision_id != candidate["revisionId"]
+        or head.revision.artifact_sha256 != candidate["sha256"]
+        or head.document.state_revision != candidate["stateRevision"]
+    ):
+        raise ArtifactConflictError("Selected Office version changed; reopen and select again")
+    binding = await get_working_files(service, head.document.document_id)
+    if (
+        binding is None
+        or binding.workspace != str(Path(workspace).resolve())
+        or binding.base_revision_id != candidate["revisionId"]
+    ):
+        raise ArtifactConflictError("Office working file changed")
+    modern = _office_revision_format(head.revision)
+    if modern is None:
+        raise ArtifactValidationError("Candidate is not a supported Office document")
+    original = await asyncio.to_thread(
+        _load_office_version_bundle,
+        store,
+        head.revision.artifact_id,
+        session_id,
+    )
+    if len(original.files) != 1:
+        raise ArtifactValidationError("Office candidates must contain one package")
+    await asyncio.to_thread(validate_office_bytes, original.files[0].data, modern)
+    if await asyncio.to_thread(binding.digest) != _working_bundle_digest(original):
+        raise ArtifactConflictError("Office working file has unsaved changes")
+    return head, binding, original
+
+
+async def prepare_office_candidate(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    candidate: dict[str, Any],
+    *,
+    session_key: str,
+    session_id: str,
+    workspace: str,
+) -> Path:
+    """Called immediately before Agent execution, never while a request is queued.
+
+    The pure JSON descriptor survives durable queue replay. Existing candidates
+    are not overwritten on retry; all authority is checked against stored state.
+    """
+    async with _lock(candidate["documentId"]):
+        await _authorize_office_scope(
+            service,
+            document_id=candidate["documentId"],
+            session_key=session_key,
+            session_id=session_id,
+            workspace=workspace,
+        )
+        await _reconcile_office_materialization_locked(service, store, candidate["documentId"])
+        _head, binding, original = await _checked_office_candidate(
+            service,
+            store,
+            candidate,
+            session_key=session_key,
+            session_id=session_id,
+            workspace=workspace,
+        )
+        operation = asyncio.create_task(
+            asyncio.to_thread(
+                _write_office_candidate,
+                binding,
+                candidate,
+                original.files[0].data,
+            )
+        )
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled. Settle its write before releasing
+            # the document lock and allowing the caller to clean up the file.
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not operation.cancelled():
+                operation.exception()
+            raise
+
+
+def _write_office_candidate(
+    binding: WorkingFiles,
+    candidate: dict[str, Any],
+    payload: bytes,
+) -> Path:
+    path = office_candidate_path(binding, candidate)
+    native_io_path(path.parent).mkdir(parents=True, exist_ok=True)
+    # Revalidate all ancestors after creation and use exclusive creation.
+    path = office_candidate_path(binding, candidate)
+    if not native_io_path(path).exists():
+        with native_io_path(path).open("xb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    else:
+        read_office_file(path)
+    return path
+
+
+async def discard_office_candidate(
+    service: ArtifactSessionService,
+    candidate: dict[str, Any],
+    *,
+    workspace: str,
+) -> None:
+    binding = await get_working_files(service, candidate["documentId"])
+    if binding is None or binding.workspace != str(Path(workspace).resolve()):
+        return
+    path = office_candidate_path(binding, candidate)
+    # Only delete our exact file; do not follow links or remove Agent-created siblings.
+    native_io_path(path).unlink(missing_ok=True)
+    try:
+        native_io_path(path.parent).rmdir()
+    except OSError:
+        pass
+
+
+async def commit_office_candidate(
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    candidate: dict[str, Any],
+    *,
+    session_key: str,
+    session_id: str,
+    workspace: str,
+    actor_id: str,
+) -> CommitResult | None:
+    """Stage outside SQLite, then CAS and atomically replace one owned package."""
+    async with _lock(candidate["documentId"]):
+        await _authorize_office_scope(
+            service,
+            document_id=candidate["documentId"],
+            session_key=session_key,
+            session_id=session_id,
+            workspace=workspace,
+        )
+        await _reconcile_office_materialization_locked(service, store, candidate["documentId"])
+        revision_id = (
+            "rev_office_"
+            + hashlib.sha256(
+                f"{candidate['documentId']}\0{candidate['candidateId']}".encode(),
+            ).hexdigest()
+        )
+        async with service.repository._read_transaction("office_candidate.replay") as conn:
+            cursor = await conn.execute(
+                "SELECT 1 FROM artifact_revisions WHERE revision_id=? AND document_id=?",
+                (revision_id, candidate["documentId"]),
+            )
+            if await cursor.fetchone() is not None:
+                return None
+        head, binding, original = await _checked_office_candidate(
+            service,
+            store,
+            candidate,
+            session_key=session_key,
+            session_id=session_id,
+            workspace=workspace,
+        )
+        path = office_candidate_path(binding, candidate)
+        payload = await asyncio.to_thread(read_office_file, path)
+        modern = _office_revision_format(head.revision)
+        assert modern is not None
+        await asyncio.to_thread(validate_office_bytes, payload, modern)
+        if hashlib.sha256(payload).hexdigest() == candidate["sha256"]:
+            return None
+        bundle = ArtifactBundle(
+            entrypoint=binding.entrypoint,
+            files=(
+                ArtifactBundleSourceFile(
+                    path=binding.entrypoint,
+                    mime=head.revision.media_type,
+                    data=payload,
+                ),
+            ),
+        )
+        ref = await asyncio.to_thread(
+            store.publish_bundle,
+            bundle,
+            session_id=session_id,
+            session_key=session_key,
+            name=head.document.name,
+            mime=head.revision.media_type,
+            source="working_files",
+            visibility="internal",
+        )
+        plan = await _stage_office_materialization(
+            binding,
+            payload,
+            expected_sha256=head.revision.artifact_sha256,
+            allow_existing=True,
+        )
+        try:
+            await _reserve_office_materialization(
+                service,
+                head,
+                binding,
+                plan,
+                operation_id=revision_id,
+            )
+            async with service.repository._transaction("office_candidate.commit") as conn:
+                result = await service.repository._commit_revision_on_conn(
+                    conn,
+                    document_id=head.document.document_id,
+                    expected_head_revision_id=candidate["revisionId"],
+                    expected_state_revision=candidate["stateRevision"],
+                    artifact=ArtifactBlobRef(
+                        artifact_id=ref.id,
+                        sha256=ref.sha256,
+                        filename=ref.name,
+                        media_type=ref.mime,
+                        byte_size=ref.size,
+                    ),
+                    actor=Actor(kind=ActorKind.AGENT, actor_id=actor_id),
+                    source=RevisionSource.AGENT,
+                    revision_id=revision_id,
+                )
+                updated = replace(binding, base_revision_id=result.revision.revision_id)
+                await _apply_office_materialization(plan)
+                await _write_office_binding(conn, updated)
+                await _office_materialization_applied(conn, plan, result.revision.revision_id)
+        except BaseException:
+            await _finish_office_materialization(service, store, plan)
+            raise
+        await _finish_office_materialization(service, store, plan)
         return result

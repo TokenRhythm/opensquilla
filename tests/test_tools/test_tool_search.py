@@ -50,6 +50,25 @@ def test_bm25_index_matches_underscore_name_and_stemmed_description() -> None:
     assert hits[0].name == "create_calendar_event"
 
 
+def test_tool_search_uses_json_schema_keyword_names() -> None:
+    definition = ToolDefinition(
+        name="lookup",
+        description="Lookup",
+        input_schema=ToolInputSchema(
+            properties={"query": {"type": "string"}},
+            required=["query"],
+            additional_properties=False,
+            **{"oneOf": [{"required": ["query"]}]},
+        ),
+    )
+
+    hit = ToolSearchIndex.from_definitions([definition]).search("lookup")[0]
+
+    assert hit.input_schema["additionalProperties"] is False
+    assert "additional_properties" not in hit.input_schema
+    assert hit.input_schema["oneOf"] == [{"required": ["query"]}]
+
+
 def test_exact_tool_name_is_always_the_first_match() -> None:
     index = ToolSearchIndex.from_definitions(
         [

@@ -36,7 +36,13 @@ from .codex_auth import (
     refresh_codex_credentials,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
-from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
+from .failures import (
+    CONNECTION_FAILED_CODE,
+    is_connection_failure,
+    retry_after_from_headers,
+    safe_http_status,
+    structured_provider_error_code,
+)
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
@@ -115,11 +121,7 @@ def _codex_tool(tool: ToolDefinition) -> dict[str, Any]:
         "name": tool.name,
         "description": tool.description,
         "strict": False,
-        "parameters": {
-            "type": tool.input_schema.type,
-            "properties": tool.input_schema.properties,
-            "required": tool.input_schema.required,
-        },
+        "parameters": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
     }
 
 
@@ -400,6 +402,10 @@ class OpenAICodexProvider:
                                     max_len=2000,
                                 ),
                                 code=str(response.status_code),
+                                http_status=safe_http_status(response.status_code),
+                                provider_code=structured_provider_error_code(
+                                    response.text
+                                ),
                                 retry_after_s=retry_after_from_headers(
                                     response.status_code, getattr(response, "headers", None)
                                 ),

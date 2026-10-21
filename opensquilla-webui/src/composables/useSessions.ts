@@ -407,6 +407,13 @@ export function useSessions(directory: SessionDirectory) {
     isLoadingMore.value = false
   }
 
+  function applyConfirmedTitle(key: string, title: string) {
+    // A completed rename is newer than every directory read already in flight.
+    // Update only an existing row; the next successful snapshot remains authoritative.
+    cancelPendingRequests()
+    sessionsList.value = sessionsList.value.map(item => item.key === key ? { ...item, title } : item)
+  }
+
   const allSessions = computed((): SessionItem[] =>
     [...sessionsList.value].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
   )
@@ -549,5 +556,6 @@ export function useSessions(directory: SessionDirectory) {
     loadSessions,
     loadMoreSessions,
     cancelPendingRequests,
+    applyConfirmedTitle,
   }
 }

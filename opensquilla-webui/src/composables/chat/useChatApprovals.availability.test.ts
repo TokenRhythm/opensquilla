@@ -38,7 +38,7 @@ function harness(initial: GatewayAvailability = 'preparing') {
     sessionKey,
     runStatus: ref({ status: 'idle', label: '', task: null }),
     interruptState: ref<ReadonlyMap<string, InterruptViewState>>(new Map()),
-    stream: { isStreaming: ref(false), appendInterruptFrame, ensureInterruptBubble: vi.fn() },
+    stream: { appendInterruptFrame },
     onSnapshotCount,
   }))!
   const unsubscribe = approvals.subscribe()

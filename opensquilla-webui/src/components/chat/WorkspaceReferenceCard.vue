@@ -17,8 +17,8 @@
         </div>
       </details>
     </div>
-    <p v-if="busy || errorKey || copied" role="status" aria-live="polite" class="workspace-reference__status">
-      {{ t(busy ? 'workspaceReference.loading' : errorKey || 'workspaceReference.copied') }}
+    <p v-if="busy || errorKey" role="status" aria-live="polite" class="workspace-reference__status">
+      {{ t(busy ? 'workspaceReference.loading' : errorKey) }}
     </p>
   </div>
 </template>
@@ -28,21 +28,24 @@ import { computed, inject, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { WORKSPACE_REFERENCES_KEY, workspaceReferenceErrorKey } from '@/modules/workspaceReferences'
+import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { CONVERSATION_WORKBENCH_OWNER_KEY } from '@/modules/conversationPolicy'
 import type { WorkspaceFileReferenceV1 } from '@/types/references'
 import { copyTextWithFallback } from '@/utils/browser'
 import { useWorkbenchStore } from '@/workbench/store'
-import { createWorkspaceFileItem } from '@/workbench/workspaceFileItems'
+import { createResolvedWorkspaceFileItem, createWorkspaceFileItem } from '@/workbench/workspaceFileItems'
 
 const props = defineProps<{ reference: WorkspaceFileReferenceV1; sessionKey: string }>()
 const { t } = useI18n()
 const access = inject(WORKSPACE_REFERENCES_KEY, null)
+const files = inject(WORKSPACE_FILES_KEY, null)
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
+const workbenchOwner = inject(CONVERSATION_WORKBENCH_OWNER_KEY, null)
 const referenceGatewayEndpoint = gateway?.loadConnectionEndpoint() ?? null
 const store = useWorkbenchStore()
 const busy = ref(false)
 const errorKey = ref('')
-const copied = ref(false)
 const blocked = computed(() => props.reference.state?.available === false
   || props.reference.capabilities.open === false
   || Boolean(props.reference.scope.gatewayInstanceId)
@@ -58,11 +61,12 @@ const label = computed(() => {
   return relativePath + (startLine ? `:${startLine}${endLine && endLine !== startLine ? `-${endLine}` : ''}` : '')
 })
 let pending: AbortController | null = null
-function cancel() { pending?.abort(); pending = null; busy.value = false; errorKey.value = ''; copied.value = false }
+function cancel() { pending?.abort(); pending = null; busy.value = false; errorKey.value = '' }
 // Streaming may recreate the same reference object for each token. Cancel
 // only when the resource identity, permissions, or Gateway context changes.
 watch([
   () => props.sessionKey,
+  () => workbenchOwner?.value,
   () => props.reference.id,
   () => props.reference.scope.sessionKey,
   () => props.reference.scope.workspaceId,
@@ -87,22 +91,37 @@ async function open() {
   pending = attempt
   busy.value = true
   errorKey.value = ''
-  copied.value = false
   const sessionKey = props.sessionKey
+  const ownerSessionKey = workbenchOwner?.value || sessionKey
+  const activeWorkbenchSession = store.activeSessionId
   const gatewayEpoch = gateway?.subscriptionEpoch
-  try {
-    const snapshot = await access.read(sessionKey, props.reference, attempt.signal)
-    if (
+  const isCurrent = () => !(
       attempt.signal.aborted
       || pending !== attempt
       || sessionKey !== props.sessionKey
+      || ownerSessionKey !== (workbenchOwner?.value || props.sessionKey)
+      || activeWorkbenchSession !== store.activeSessionId
       || blocked.value
       || gateway?.subscriptionEpoch !== gatewayEpoch
       || (gateway && gateway.loadConnectionEndpoint() !== referenceGatewayEndpoint)
-    ) return
-    if (!store.openItem(createWorkspaceFileItem(sessionKey, snapshot.reference))) {
-      errorKey.value = 'workbench.itemLimitReached'
+    )
+  try {
+    if (files?.resolveReference && /\.(?:html?|docx|pptx|xlsx)$/i.test(props.reference.locator.relativePath)) {
+      // The server validates the reference's session/workspace scope before
+      // returning file metadata. Binary files do not pass through UTF-8.
+      const matches = await files.resolveReference(sessionKey, props.reference, attempt.signal)
+      if (!isCurrent()) return
+      const file = matches.find(candidate => candidate.path === props.reference.locator.relativePath)
+      if (file) {
+        const item = createResolvedWorkspaceFileItem(sessionKey, file, ownerSessionKey)
+        if (store.openItem(item) && store.activeItemId === item.id) store.requestReveal()
+        return
+      }
     }
+    const snapshot = await access.read(sessionKey, props.reference, attempt.signal)
+    if (!isCurrent()) return
+    const item = createWorkspaceFileItem(sessionKey, snapshot.reference, ownerSessionKey)
+    if (store.openItem(item) && store.activeItemId === item.id) store.requestReveal()
   } catch (error) {
     if (!attempt.signal.aborted) errorKey.value = workspaceReferenceErrorKey(error)
   } finally {
@@ -114,10 +133,8 @@ async function copy(value: string, event: Event) {
   closeMenu(event)
   try {
     await copyTextWithFallback(value)
-    copied.value = true
     errorKey.value = ''
   } catch {
-    copied.value = false
     errorKey.value = 'workspaceReference.copyFailed'
   }
 }

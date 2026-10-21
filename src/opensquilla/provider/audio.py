@@ -11,6 +11,7 @@ import httpx
 
 from opensquilla.endpoint_identity import credential_env_for_endpoint
 from opensquilla.env import trust_env as _trust_env
+from opensquilla.provider.metered_http import accounted_audio_request
 from opensquilla.secrets import clean_header_secret
 
 _ELEVENLABS_DEFAULT_API_KEY_ENV = "ELEVENLABS_API_KEY"
@@ -346,8 +347,12 @@ class ElevenLabsAudioProductionProvider:
             trust_env=_trust_env(),
             transport=self._transport,
         ) as client:
-            response = await client.post(
+            response = await accounted_audio_request(
+                client,
                 self._api_url(f"/v1/text-to-speech/{request.voice}"),
+                operation="text_to_speech",
+                model=request.model_id,
+                base_url=self._base_url,
                 headers=self._headers(api_key),
                 params={"output_format": request.output_format},
                 json=payload,
@@ -391,8 +396,12 @@ class ElevenLabsAudioProductionProvider:
             trust_env=_trust_env(),
             transport=self._transport,
         ) as client:
-            response = await client.post(
+            response = await accounted_audio_request(
+                client,
                 self._api_url("/v1/speech-to-text"),
+                operation="speech_to_text",
+                model=request.model_id,
+                base_url=self._base_url,
                 headers=self._headers(api_key),
                 data=data,
                 files=files,
@@ -447,8 +456,12 @@ class ElevenLabsAudioProductionProvider:
             trust_env=_trust_env(),
             transport=self._transport,
         ) as client:
-            response = await client.post(
+            response = await accounted_audio_request(
+                client,
                 self._api_url("/v1/voices/add"),
+                operation="voice_clone",
+                model="voice_clone",
+                base_url=self._base_url,
                 headers=self._headers(api_key),
                 data=data,
                 files=files,
@@ -494,8 +507,12 @@ class ElevenLabsAudioProductionProvider:
             trust_env=_trust_env(),
             transport=self._transport,
         ) as client:
-            response = await client.post(
+            response = await accounted_audio_request(
+                client,
                 self._api_url(f"/v1/speech-to-speech/{request.target_voice}"),
+                operation="voice_conversion",
+                model=request.model_id,
+                base_url=self._base_url,
                 headers=self._headers(api_key),
                 params={"output_format": request.output_format},
                 data={"model_id": request.model_id},
@@ -538,8 +555,12 @@ class ElevenLabsAudioProductionProvider:
             trust_env=_trust_env(),
             transport=self._transport,
         ) as client:
-            response = await client.post(
+            response = await accounted_audio_request(
+                client,
                 self._api_url("/v1/dubbing"),
+                operation="dubbing",
+                model="dubbing",
+                base_url=self._base_url,
                 headers=self._headers(api_key),
                 data=data,
                 files=files,
@@ -647,8 +668,12 @@ class ElevenLabsAudioProductionProvider:
             trust_env=_trust_env(),
             transport=self._transport,
         ) as client:
-            response = await client.post(
+            response = await accounted_audio_request(
+                client,
                 self._api_url("/v1/music"),
+                operation="music_generation",
+                model=request.model_id,
+                base_url=self._base_url,
                 headers=self._headers(api_key),
                 params={"output_format": request.output_format},
                 json=payload,

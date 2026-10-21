@@ -1,6 +1,7 @@
 import { TurnCommandError } from '@/modules/turnCommands'
 import { useToasts } from '@/composables/useToasts'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
+import { RpcTransportError } from '@/lib/rpc'
 import { computed, ref } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -9,7 +10,7 @@ import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnota
 import type { Attachment, ChatMessage } from '@/types/chat'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { UseChatSendOptions } from './useChatSend'
-import { useChatSend } from './useChatSend'
+import { createChatSendHarness } from './chatSendTestHarness'
 
 function snapshot(annotationId: string, sentOrder: number): PromptAnnotationSnapshot {
   return {
@@ -57,7 +58,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     appendFrame: vi.fn(),
     appendToolEnd: vi.fn(),
   }
-  const options: UseChatSendOptions = {
+  const options: Omit<UseChatSendOptions, 'durableDelivery'> = {
     turnCommands: createV4TurnCommandsFromRpcClient(rpc),
     inputText: ref(''),
     messages: ref<ChatMessage[]>([]),
@@ -110,8 +111,96 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     scrollToBottom: vi.fn(),
     ...overrides,
   }
-  return { api: useChatSend(options), options, rpc }
+  return { ...createChatSendHarness(options), rpc }
 }
+
+describe('annotation batch preflight and receipt identity', () => {
+  it('rejects 17 annotations without truncating or consuming the composer', async () => {
+    const result = createHarness({ draftIds: ref(Array.from({ length: 17 }, (_, index) => `draft-${index}`)),
+      inputText: ref('Keep this instruction') })
+    await result.api.onSend()
+    expect(result.rpc.call).not.toHaveBeenCalled()
+    expect(result.options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(result.options.inputText.value).toBe('Keep this instruction')
+    expect(result.options.draftIds?.value).toHaveLength(17)
+    result.api.dispose()
+  })
+
+  it('keeps local target metadata in receipts while sending only the frozen wire target', async () => {
+    const result = createHarness({ draftIds: ref(['annotation-1']),
+      promptAnnotationSnapshots: () => [{ ...snapshot('annotation-1', 0), targetText: 'original display label' }] })
+    await result.api.onSend()
+    expect(result.options.acknowledgePromptAnnotations).toHaveBeenCalledWith([
+      expect.objectContaining({ targetText: 'original display label', quote: '<button>', locatorHint: '#button' }),
+    ], expect.anything(), undefined)
+    expect(result.rpc.call.mock.calls[0]?.[1].pageContext.annotations[0]).not.toHaveProperty('targetText')
+    result.api.dispose()
+  })
+
+  it('marks a rejected source version for reselection while retaining the draft', async () => {
+    const invalidatePromptAnnotations = vi.fn()
+    const result = createHarness({ invalidatePromptAnnotations, inputText: ref('Keep my message') })
+    result.rpc.call.mockRejectedValueOnce(new TurnCommandError('rejected', 'Source changed', 'DOCUMENT_CHANGED', false, false))
+    await result.api.onSend()
+    expect(invalidatePromptAnnotations).toHaveBeenCalledWith([
+      expect.objectContaining({ annotationId: 'annotation-2' }),
+      expect.objectContaining({ annotationId: 'annotation-1' }),
+    ])
+    expect(result.options.inputText.value).toBe('Keep my message')
+    expect(result.options.acknowledgePromptAnnotations).not.toHaveBeenCalled()
+    result.api.dispose()
+  })
+
+  it('checks the original receipt while a newer annotation batch exceeds the budget', async () => {
+    const draftIds = ref(['original'])
+    let receiptAvailable = false
+    const rpc = {
+      call: vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.send') throw new RpcTransportError('Connection closed', null)
+        const original = params?.originalRequest as Record<string, unknown>
+        return {
+          status: 'found', accepted: true, requestFingerprint: `sha256:${'b'.repeat(64)}`,
+          receipt: {
+            requestSessionKey: original.sessionKey, sessionKey: original.sessionKey,
+            sessionId: 'synthetic-session', sessionEpoch: 1,
+            clientRequestId: original.clientRequestId, messageId: 'accepted-message',
+            taskId: 'accepted-task', taskStatus: 'succeeded',
+          },
+        }
+      }),
+    }
+    const harness = createHarness({
+      draftIds,
+      turnCommands: createV4TurnCommandsFromRpcClient(
+        rpc as unknown as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
+        method => receiptAvailable && method === 'turns.receipt.get',
+      ),
+      promptAnnotationSnapshots: ids => ids.map((id, index) => ({
+        ...snapshot(id, index), revisionId: 'original-revision', sha256: 'a'.repeat(64),
+        quote: id === 'original' ? 'Original heading' : 'x'.repeat(16_384),
+      })),
+    })
+    await harness.api.onSend()
+    const original = rpc.call.mock.calls[0]?.[1]
+    draftIds.value = ['new-1', 'new-2', 'new-3', 'new-4']
+    receiptAvailable = true
+    const delivery = harness.api.deliveryRecoveryEntries.value[0]
+    expect(delivery).toBeDefined()
+    await harness.api.checkDelivery(delivery!.id)
+
+    expect(rpc.call.mock.calls.filter(([method]) => method === 'chat.send')).toHaveLength(1)
+    expect(rpc.call).toHaveBeenCalledWith('turns.receipt.get', expect.objectContaining({
+      originalRequest: original,
+    }), expect.anything())
+    expect(draftIds.value).toEqual(['new-1', 'new-2', 'new-3', 'new-4'])
+    expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
+      [expect.objectContaining({
+        annotationId: 'original', revisionId: 'original-revision', sha256: 'a'.repeat(64),
+      })],
+      'agent:main:webchat:test', undefined,
+    )
+  })
+})
 
 describe('sending with empty page annotation drafts', () => {
   beforeEach(() => {
@@ -132,6 +221,7 @@ describe('sending with empty page annotation drafts', () => {
     const draft = {
       annotationId: 'empty-draft', sessionKey, documentId: 'document-1',
       documentName: 'page.html', resourceId: 'document:document-1', body: ' \n\t ',
+      revisionId: 'revision-1', sha256: 'a'.repeat(64),
       selection: {
         selectionId: 'selection-1', targetRef: 'target-1', tagName: 'h1',
         elementPath: 'h1', selectionText: 'Welcome', locatorHint: 'h1',
@@ -161,7 +251,7 @@ describe('sending with empty page annotation drafts', () => {
       pageContext: expect.objectContaining({
         annotations: [{ text: 'Enlarge this heading', selectionText: 'Welcome', locatorHint: 'h1' }],
       }),
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
   })
 
@@ -170,7 +260,7 @@ describe('sending with empty page annotation drafts', () => {
     await harness.api.onSend()
     expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       message: 'Update the page title',
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params).not.toHaveProperty('pageContext')
     expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
@@ -217,7 +307,7 @@ describe('sending with empty page annotation drafts', () => {
       attachments: [
         { file_uuid: 'reference-file', type: 'image/png', mime: 'image/png', name: 'reference.png' },
       ],
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params).not.toHaveProperty('pageContext')
     expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
@@ -246,7 +336,7 @@ describe('ordinary page annotation input', () => {
           { text: 'Change annotation-1', selectionText: '<button>', locatorHint: '#button' },
         ],
       },
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params).not.toHaveProperty('promptAnnotationIds')
     expect(params).not.toHaveProperty('documentContext')
@@ -321,7 +411,62 @@ describe('ordinary page annotation input', () => {
       pendingUiId: 'pending-1', text: 'Update the heading', attachments: [], intent: null,
       ownerSessionKey: 'agent:main:webchat:test', pageContext,
     })
-    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({ pageContext }))
+    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({ pageContext }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
+  })
+
+  it.each(['editing', 'stale'])('sends a frozen queued batch independently of a %s live annotation', async reason => {
+    const harness = createHarness({
+      draftIds: ref([]), inputText: ref('Keep the new composer'),
+      sendBlockedReason: ref(reason), queuedSendBlockedReason: ref(null),
+    })
+    const pageContext = {
+      resourceId: 'document:queued', revisionId: 'queued-revision', sha256: 'a'.repeat(64),
+      annotations: [{ text: 'Change the queued target', locatorHint: 'h1' }],
+    }
+    const outcome = await harness.api.sendQueuedFollowup({
+      pendingUiId: 'frozen-batch', text: '', attachments: [], intent: null,
+      ownerSessionKey: 'agent:main:webchat:test', pageContext, draftIds: ['queued-annotation'],
+    })
+    expect(outcome).toBe('accepted')
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(harness.rpc.call.mock.calls[0]?.[1].pageContext).toEqual(pageContext)
+    expect(harness.options.inputText.value).toBe('Keep the new composer')
+
+    await harness.api.onSend()
+    expect(harness.rpc.call).toHaveBeenCalledOnce()
+    expect(harness.options.inputText.value).toBe('Keep the new composer')
+  })
+
+  it.each([false, true])('keeps queue admission gates revocable during preparation: %s', revokeDuringPreparation => {
+    const queuedSendBlockedReason = ref<string | null>(revokeDuringPreparation ? null : 'Disconnected')
+    const harness = createHarness({
+      draftIds: ref([]), queuedSendBlockedReason,
+      validateActiveProjectBeforeSend: async () => {
+        queuedSendBlockedReason.value = 'Workspace changed'
+        return null
+      },
+    })
+    return harness.api.sendQueuedFollowup({
+      pendingUiId: 'frozen-batch', text: '', attachments: [], intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pageContext: { resourceId: 'document:queued', annotations: [{ text: 'Retain this change' }] },
+    }).then(outcome => {
+      expect(outcome).toBe('deferred')
+      expect(harness.rpc.call).not.toHaveBeenCalled()
+    })
+  })
+
+  it('rejects invalid queued context without consuming its preserved batch', async () => {
+    const harness = createHarness({ draftIds: ref([]), inputText: ref('Keep current composer') })
+    const item = {
+      pendingUiId: 'pending-invalid', text: 'Keep queued message', attachments: [], intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pageContext: { annotations: Array.from({ length: 17 }, () => ({ text: 'Keep every change' })) },
+    }
+    expect(await harness.api.sendQueuedFollowup(item)).toBe('not_sent')
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.inputText.value).toBe('Keep current composer')
+    expect(item.pageContext.annotations).toHaveLength(17)
   })
 })
 
@@ -417,7 +562,7 @@ describe('explicit skill send boundaries', () => {
     return result
   }
 
-  it.each(['/compact', '/meta report -- summarize', '/plan', '!pwd'])('keeps explicit selection out of %s controls', async command => {
+  it.each(['/compact', '/plan', '!pwd'])('keeps explicit selection out of %s controls', async command => {
     const result = harness()
     result.options.inputText.value = command
     result.options.classifySlashCommand = vi.fn(async () => 'registered' as const)
@@ -471,7 +616,7 @@ describe('explicit skill send boundaries', () => {
     accepted({ sessionKey: 'agent:main:webchat:test', task_id: 'task-one' })
     await sending
     expect(result.options.consumeAcceptedDraft).toHaveBeenCalledExactlyOnceWith(
-      'agent:main:webchat:test', { text: 'Make a table', selectedSkills: [skill] },
+      'agent:main:webchat:test', { text: 'Make a table', selectedSkills: [skill], localPathReferences: [] },
     )
     expect(result.options.selectedSkills!.value).toEqual([other])
     expect(result.options.inputText.value).toBe('Other session')
@@ -554,4 +699,85 @@ it('consumes the accepted skill snapshot before acknowledged annotations mutate 
   })
   expect(draftIds.value).toEqual([])
   expect(result.options.selectedSkills!.value).toEqual([])
+})
+
+describe('send failure notification recovery', () => {
+  const notifications = useToasts()
+  function clear() { for (const toast of [...notifications.toasts.value]) notifications.dismissToast(toast.id) }
+  beforeEach(clear)
+  afterEach(clear)
+
+  async function rejectedSend() {
+    const blocked = ref<string | null>(null)
+    const identity = ref<string | null>('synthetic-identity')
+    const result = createHarness({ inputText: ref('Original message'), draftIds: ref([]), sendBlockedReason: blocked, deliveryIdentity: identity })
+    result.rpc.call.mockRejectedValueOnce(new TurnCommandError('rejected', 'Try again', 'NOT_READY', false, true))
+    await result.api.onSend()
+    const toast = notifications.toasts.value.find(item => item.action)!
+    expect(toast?.action).toBeDefined()
+    expect(toast.tone).toBe('danger')
+    expect(result.options.inputText.value).toBe('Original message')
+    return { ...result, toast, blocked, identity }
+  }
+
+  it('hands a valid retry to the existing send flow once and dismisses only its own notice', async () => {
+    const result = await rejectedSend()
+    const firstId = result.rpc.call.mock.calls[0]?.[1].clientRequestId
+    await Promise.all([
+      notifications.runToastAction(result.toast.id, 'Failed'),
+      notifications.runToastAction(result.toast.id, 'Failed'),
+    ])
+    expect(result.rpc.call).toHaveBeenCalledTimes(2)
+    expect(result.rpc.call.mock.calls[1]?.[1].clientRequestId).toBe(firstId)
+    expect(notifications.toasts.value.some(t => t.id === result.toast.id)).toBe(false)
+  })
+
+  it.each(['session', 'draft', 'identity', 'blocked', 'streaming', 'disposed'])('invalidates %s recovery without sending or losing the current draft', async kind => {
+    const result = await rejectedSend()
+    if (kind === 'session') result.options.sessionKey.value = 'agent:main:webchat:other'
+    if (kind === 'draft') result.options.inputText.value = 'New draft'
+    if (kind === 'identity') result.identity.value = 'different-profile'
+    if (kind === 'blocked') result.blocked.value = 'blocked'
+    if (kind === 'streaming') result.options.stream.isStreaming.value = true
+    if (kind === 'disposed') result.api.dispose()
+    const draft = result.options.inputText.value
+    await notifications.runToastAction(result.toast.id, 'Failed')
+    expect(result.rpc.call).toHaveBeenCalledOnce()
+    expect(result.options.inputText.value).toBe(draft)
+    expect(notifications.toasts.value).toHaveLength(1)
+    expect(notifications.toasts.value[0]).toMatchObject({ id: result.toast.id, tone: 'info' })
+    expect(notifications.toasts.value[0]?.action).toBeUndefined()
+    expect(notifications.toasts.value[0]?.message).not.toBe('Try again')
+  })
+
+  it('does not consume a new send failure emitted during the retry', async () => {
+    const result = await rejectedSend()
+    result.rpc.call.mockRejectedValueOnce(new TurnCommandError('rejected', 'Still unavailable', 'NOT_READY', false, true))
+    await notifications.runToastAction(result.toast.id, 'Failed')
+    expect(result.rpc.call).toHaveBeenCalledTimes(2)
+    expect(notifications.toasts.value).toHaveLength(1)
+    expect(notifications.toasts.value[0]?.id).not.toBe(result.toast.id)
+    expect(notifications.toasts.value[0]?.tone).toBe('danger')
+    expect(notifications.toasts.value[0]?.action).toBeDefined()
+  })
+
+  it.each(['blocked', 'rejected', 'draft', 'session', 'streaming'])('retains feedback when async send preflight becomes %s', async kind => {
+    const result = await rejectedSend()
+    result.options.validateActiveProjectBeforeSend = vi.fn(async () => {
+      await Promise.resolve()
+      if (kind === 'rejected') throw new Error('Project unavailable')
+      if (kind === 'blocked') return 'workspace-unavailable'
+      if (kind === 'draft') result.options.inputText.value = 'New draft during preflight'
+      if (kind === 'session') result.options.sessionKey.value = 'agent:main:webchat:other'
+      if (kind === 'streaming') result.options.stream.isStreaming.value = true
+      return null
+    })
+    await notifications.runToastAction(result.toast.id, 'Failed')
+    expect(result.rpc.call).toHaveBeenCalledOnce()
+    expect(result.options.inputText.value).toBe(kind === 'draft' ? 'New draft during preflight' : 'Original message')
+    expect(notifications.toasts.value).toHaveLength(1)
+    expect(notifications.toasts.value[0]).toMatchObject({ id: result.toast.id, tone: 'info' })
+    expect(notifications.toasts.value[0]?.action).toBeUndefined()
+    expect(notifications.toasts.value[0]?.message).not.toBe('Try again')
+  })
 })

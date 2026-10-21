@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -212,6 +213,136 @@ async def test_native_watcher_debounces_to_one_invalidation(
     await watcher.stop()
 
     assert invalidations == ["watch"]
+
+
+@pytest.mark.asyncio
+async def test_native_watcher_filesystem_probes_leave_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Root existence checks must run off the Gateway event-loop thread."""
+    loader, root = _loader(tmp_path)
+    _write_skill(root)
+    main_thread = threading.get_ident()
+    probe_threads: list[int] = []
+    real_is_dir = Path.is_dir
+
+    def guarded_is_dir(path: Path) -> bool:
+        probe_threads.append(threading.get_ident())
+        if threading.get_ident() == main_thread:
+            raise AssertionError("watcher performed a filesystem probe on the event loop")
+        return real_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+
+    async def fake_awatch(*_paths: Path, **kwargs: object):
+        yield {("modified", str(root / "demo" / "SKILL.md"))}
+        stop_event = kwargs["stop_event"]
+        assert isinstance(stop_event, asyncio.Event)
+        await stop_event.wait()
+
+    monkeypatch.setattr(watcher_module, "_awatch", fake_awatch)
+    watcher = watcher_module.SkillCatalogWatcher(loader, debounce_ms=1)
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(watcher._watch_loop(stop_event))
+    try:
+        async with asyncio.timeout(5):
+            while len(probe_threads) < 3:
+                if task.done():
+                    await task
+                await asyncio.sleep(0.01)
+    finally:
+        stop_event.set()
+        if not task.done():
+            await asyncio.wait_for(task, timeout=5)
+
+    assert len(probe_threads) >= 3  # roots + current presence + initial presence
+    assert all(thread_id != main_thread for thread_id in probe_threads)
+
+
+@pytest.mark.asyncio
+async def test_native_watcher_loader_callbacks_do_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A catalog lock held by a loader callback must not stall control tasks."""
+    root = tmp_path / "skills"
+    root.mkdir()
+    main_thread = threading.get_ident()
+    roots_release = threading.Event()
+    dirty_entered = threading.Event()
+    dirty_release = threading.Event()
+    dirty_done = threading.Event()
+    callback_threads: list[tuple[str, int]] = []
+    invalidations: list[str] = []
+
+    class BlockingLoader:
+        def watch_roots(self) -> tuple[Path, ...]:
+            callback_threads.append(("roots", threading.get_ident()))
+            if threading.get_ident() == main_thread:
+                raise AssertionError("watch_roots ran on the event loop")
+            assert roots_release.wait(timeout=5)
+            return (root,)
+
+        def mark_dirty(self, reason: str) -> None:
+            callback_threads.append(("dirty", threading.get_ident()))
+            if threading.get_ident() == main_thread:
+                raise AssertionError("mark_dirty ran on the event loop")
+            invalidations.append(reason)
+            dirty_entered.set()
+            assert dirty_release.wait(timeout=5)
+            dirty_done.set()
+
+    async def fake_awatch(*_paths: Path, **kwargs: object):
+        yield {("modified", str(root / "SKILL.md"))}
+        stop_event = kwargs["stop_event"]
+        assert isinstance(stop_event, asyncio.Event)
+        await stop_event.wait()
+
+    monkeypatch.setattr(watcher_module, "_awatch", fake_awatch)
+    watcher = watcher_module.SkillCatalogWatcher(BlockingLoader())
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    gaps: list[float] = []
+    heartbeat_stop = asyncio.Event()
+
+    async def heartbeat() -> None:
+        previous = loop.time()
+        while not heartbeat_stop.is_set():
+            await asyncio.sleep(0.01)
+            current = loop.time()
+            gaps.append(current - previous)
+            previous = current
+
+    async def release_dirty_after_callback() -> None:
+        await asyncio.to_thread(dirty_entered.wait, 5)
+        await asyncio.sleep(0.25)
+        dirty_release.set()
+
+    # Hold the equivalent of the loader refresh lock in the callback.  A
+    # timer releases it from another thread so the pre-fix synchronous path
+    # cannot deadlock the test; it still produces a visible event-loop gap.
+    threading.Timer(0.25, roots_release.set).start()
+    task = asyncio.create_task(watcher._watch_loop(stop_event))
+    heartbeat_task = asyncio.create_task(heartbeat())
+    release_task = asyncio.create_task(release_dirty_after_callback())
+    try:
+        async with asyncio.timeout(5):
+            await asyncio.to_thread(dirty_done.wait, 5)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        heartbeat_stop.set()
+        await heartbeat_task
+        await release_task
+        if not task.done():
+            task.cancel()
+            await task
+
+    assert invalidations == ["watch"]
+    assert callback_threads
+    assert all(thread_id != main_thread for _kind, thread_id in callback_threads)
+    assert gaps and max(gaps) < 0.2
 
 
 @pytest.mark.asyncio

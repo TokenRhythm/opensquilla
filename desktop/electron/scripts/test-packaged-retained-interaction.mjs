@@ -1,19 +1,22 @@
+import { waitForRendererConnection } from './renderer-connection-probe.mjs'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { _electron as electron } from 'playwright'
 import { environmentWithoutProviderSecrets, requiredOption, waitFor } from './packaged-smoke-helpers.mjs'
-import { captureElectronProcessIdentity, closeElectronAndObserveExit } from './packaged-first-send-cleanup.mjs'
+import { captureElectronProcessIdentity, captureFirstSendDiagnostic, closeElectronAndObserveExit } from './packaged-first-send-cleanup.mjs'
 import { desktopShutdownEvidenceSince, gatewayProcessSnapshot } from './e2e-shutdown-helpers.mjs'
-import { desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, verifyDesktopGatewayOwnership } from '../dist/desktop-gateway-ownership.js'
+import { desktopProfileFingerprint, loadDesktopGatewayOwnershipRecord, readVerifiedDesktopGatewayActivity, verifyDesktopGatewayOwnership } from '../dist/desktop-gateway-ownership.js'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
-import { assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
+import { assertNoExistingDesktop, assertPreservedInputs, assertStopEvidence, auditMessages, collectSqliteProcessCensus, sha256, verifyAuditInputs } from './fixtures/packaged-retained-interaction/contract.mjs'
 import { installRetainedRpcProbe } from './fixtures/packaged-retained-interaction/browser-probe.mjs'
 import { startRetainedProvider } from './fixtures/packaged-retained-interaction/provider.mjs'
+import { collectRetainedGatewayDiagnostics } from './fixtures/packaged-retained-interaction/diagnostics.mjs'
 
 // This is an opt-in native probe. It never creates/reconfigures a Desktop
 // profile, installs software, or weakens the existing fresh-profile gate.
@@ -66,7 +69,7 @@ async function screenshot(page, name) {
   report.screenshots.push({ path, sha256: sha256(await readFile(path)) })
 }
 async function ready(page) {
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: timeoutMs })
+  await waitForRendererConnection(page, 'connected', { timeout: timeoutMs })
   await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: timeoutMs })
 }
 async function launch(name) {
@@ -80,7 +83,10 @@ async function launch(name) {
   const app = await electron.launch({
     executablePath: plan.executablePath,
     args: ['--use-mock-keychain', `--user-data-dir=${plan.userDataDir}`],
-    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
+    // This synthetic fixture enables existing payload-free transaction timings
+    // (256 records per storage instance); SQL and probe budgets stay unchanged.
+    // Its strict provider accepts only the audited conversation/tool turns.
+    env: { ...env, OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1', OPENSQUILLA_RECOVERY_OFFLINE: '1', OPENSQUILLA_STORAGE_DIAGNOSTICS: '1', OPENSQUILLA_NAMING_ENABLED: 'false', OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0', NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' },
     timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs,
   })
   active = { app, name }
@@ -92,7 +98,7 @@ async function launch(name) {
   const page = await app.firstWindow()
   active.page = page
   await page.waitForURL(url => url.protocol === 'opensquilla-app:' && url.hostname === 'desktop', { timeout: timeoutMs })
-  await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs })
+  await waitForRendererConnection(page, 'connected', { timeout: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + timeoutMs })
   const pageErrors = []
   page.on('pageerror', error => pageErrors.push(error.message))
   active.pageErrors = pageErrors
@@ -128,14 +134,36 @@ async function oldSessionUi(page, name) {
   await page.getByText(expected, { exact: true }).first().waitFor({ state: 'visible', timeout: timeoutMs })
   await screenshot(page, `${name}-old-session`)
 }
+function remainingSendTime(deadline) {
+  const remaining = deadline - Date.now()
+  assert.ok(remaining > 0, 'Real Send did not finish within its completion budget')
+  return remaining
+}
+async function waitForRetainedGatewayIdle(ownership, deadline) {
+  assert.ok(ownership, 'The active launch must have a verified Gateway identity')
+  let activity
+  while (Date.now() < deadline) {
+    activity = await readVerifiedDesktopGatewayActivity(ownership, {
+      timeoutMs: Math.min(1_000, remainingSendTime(deadline)),
+    })
+    report.lastActivity = activity
+    if (Date.now() < deadline && activity.kind === 'ok' && activity.activeCount === 0) return
+    await delay(Math.max(0, Math.min(200, deadline - Date.now())))
+  }
+  throw new Error(`Real Send did not become idle within its completion budget: ${JSON.stringify(activity)}`)
+}
 async function send(page, message, answer) {
   await ready(page)
   await page.locator('.chat-textarea').fill(message)
   const button = page.locator('.chat-send-btn.btn--primary')
   await waitFor(async () => await button.count() === 1 && await button.isEnabled(), 'enabled real Send', timeoutMs)
-  await button.click()
-  await page.locator('.msg-ai-text').filter({ hasText: answer }).last().waitFor({ state: 'visible', timeout: timeoutMs })
-  await waitFor(async () => await button.count() === 1 && await button.isEnabled(), 'completed real Send', timeoutMs)
+  // Rendering the answer and restoring Send can precede Gateway finalization.
+  // Observe signed idle within the same completion budget before any quit.
+  const deadline = Date.now() + timeoutMs
+  await button.click({ timeout: remainingSendTime(deadline) })
+  await page.locator('.msg-ai-text').filter({ hasText: answer }).last().waitFor({ state: 'visible', timeout: remainingSendTime(deadline) })
+  await waitFor(async () => await button.count() === 1 && await button.isEnabled(), 'completed real Send', remainingSendTime(deadline))
+  await waitForRetainedGatewayIdle(active?.ownership, deadline)
   const rpc = await snapshot(page)
   assert.equal(rpc.requests.filter(request => request.method === 'chat.send' && request.params.message === message).length, 1, 'One user click must produce exactly one chat.send')
 }
@@ -170,7 +198,7 @@ try {
   await mkdir(plan.outputDir)
   outputCreated = true
   Object.assign(report, { auditId: plan.auditId, sourceSha: plan.sourceSha, executableSha256: plan.executableSha256, credentialSha256: plan.credentialSha256, configSha256: plan.configSha256, markerSha256: plan.markerSha256 })
-  report.probeSources = await Promise.all(['test-packaged-retained-interaction.mjs', 'fixtures/packaged-retained-interaction/contract.mjs', 'fixtures/packaged-retained-interaction/provider.mjs', 'fixtures/packaged-retained-interaction/browser-probe.mjs'].map(async file => ({ file, sha256: sha256(await readFile(join(scriptDir, file))) })))
+  report.probeSources = await Promise.all(['test-packaged-retained-interaction.mjs', 'fixtures/packaged-retained-interaction/contract.mjs', 'fixtures/packaged-retained-interaction/provider.mjs', 'fixtures/packaged-retained-interaction/browser-probe.mjs', 'fixtures/packaged-retained-interaction/diagnostics.mjs'].map(async file => ({ file, sha256: sha256(await readFile(join(scriptDir, file))) })))
   await noExistingDesktop('retained-profile')
   await stage('preservation-before')
   await preserved('before')
@@ -241,8 +269,18 @@ try {
   console.log(JSON.stringify({ ok: true, report: join(plan.outputDir, 'report.json') }))
 } catch (error) {
   Object.assign(report, { ok: false, status: 'failed', error: error.message, errorCode: error.code, errorSignal: error.signal, errorKilled: error.killed, failedAt: new Date().toISOString(), provider: provider?.snapshot(), activeProcess: active?.identity })
+  await persist()
+  if (outputCreated) {
+    report.gatewayDiagnostics = await captureFirstSendDiagnostic(() => collectRetainedGatewayDiagnostics(plan))
+    report.sqliteProcesses = await captureFirstSendDiagnostic(() => collectSqliteProcessCensus(runFile))
+    await persist()
+  }
   if (active?.page) {
-    try { await screenshot(active.page, 'failure') } catch { /* Keep the primary failure. */ }
+    report.pageErrorCount = active.pageErrors?.length ?? 0
+    const rpc = await captureFirstSendDiagnostic(() => snapshot(active.page))
+    report.failureRpc = rpc?.diagnosticError ? { unavailable: true } : rpc
+    await captureFirstSendDiagnostic(() => screenshot(active.page, 'failure'))
+    await persist()
   }
   // Freeze Stop evidence before cleanup. Closing this fixture cannot be
   // credited as a user cancellation. Only this launch's app may be asked to
@@ -258,6 +296,10 @@ try {
     }
   }
   if (active) report.operatorQuitRequired = true
+  if (outputCreated) {
+    try { await copyFile(plan.logPath, join(plan.outputDir, 'desktop.log')) }
+    catch (diagnosticError) { report.desktopLogDiagnosticError = diagnosticError.code || 'unavailable' }
+  }
   await persist()
   console.error(JSON.stringify({ ok: false, stage: report.stage, error: error.message, report: outputCreated ? join(plan.outputDir, 'report.json') : null }))
   process.exitCode = 1

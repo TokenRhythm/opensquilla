@@ -1,7 +1,9 @@
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
-import { normalizePageContext } from '@/types/pageContext'
+import { assertPageContextWithinLimits, normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { copyTurnCommand, isProjectInitTurnCommand } from '@/types/turnCommand'
 import { readTransportFailure } from './transportTypes'
 import {
   CHAT_ABORT_METHOD,
@@ -39,12 +41,24 @@ import {
   validateSessionsSteerV2Result,
 } from '@/contracts/generated/v4/sessionsSteerV2Validators.mjs'
 import {
+  TURNS_RECEIPT_GET_METHOD,
+  type TurnReceiptSteer,
+  type TurnsReceiptGetParams,
+  type TurnsReceiptGetResult,
+} from '@/contracts/generated/v4/turnsReceiptGet'
+import {
+  validateTurnsReceiptGetParams,
+  validateTurnsReceiptGetResult,
+} from '@/contracts/generated/v4/turnsReceiptGetValidators.mjs'
+import {
   type TurnSendRequest,
   type TurnCancelRequest,
   type TurnCancelResponse,
   type TurnCommandCapability,
   type TurnCommands,
   type TurnCommandRequestOptions,
+  type TurnReceiptRequest,
+  type TurnReceiptResult,
   TurnCommandError,
   type TurnSendParams,
   type TurnSendResponse,
@@ -87,6 +101,7 @@ function mapTurnCommandError(error: unknown): TurnCommandError {
 
 /** Narrow wire port owned by this Adapter. */
 export interface TurnCommandsTransport {
+  readonly generation?: number
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -252,7 +267,7 @@ function projectCancelResult(raw: ChatAbortResult): TurnCancelResponse {
   return metadata ? { ...result, metadata } : result
 }
 
-function projectSteerResult(raw: SessionsSteerV2Result | SessionsPendingInputsSteerResult): TurnSteerResponse {
+function projectSteerResult(raw: SessionsSteerV2Result | SessionsPendingInputsSteerResult | TurnReceiptSteer): TurnSteerResponse {
   const object = asObject(raw)
   const disposition = optionalDisposition(object.disposition)
   const result: TurnSteerResponse = {
@@ -334,11 +349,13 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
   const sourceRecord = request as TurnSendParams & Record<string, unknown>
   const {
     message,
+    turnCommand,
     sessionKey,
     clientRequestId,
     clientMessageId,
     pageContext,
     selectedSkills,
+    localPathReferences,
     promptAnnotationIds: retiredAnnotationIds,
     documentContext: retiredDocumentContext,
     source,
@@ -353,6 +370,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     attachments,
     workspaceFiles,
     queueMode,
+    requiredServices,
     // Legacy aliases can exist in handoff WAL records written by an older
     // client. They are removed when a canonical value is present below, but
     // remain available as a fallback when only the old spelling was stored.
@@ -371,6 +389,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     initial_provider: legacyInitialProvider,
     fork_before_message_id: legacyForkBeforeMessageId,
     display_text: legacyDisplayText,
+    local_path_references: legacyLocalPathReferences,
     ...extensions
   } = sourceRecord
 
@@ -381,11 +400,23 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
   if (selectedSkills !== undefined && !isSelectedSkills(selectedSkills)) {
     throw new TurnCommandError('rejected', 'Invalid selected skill references.', 'INVALID_REQUEST', false)
   }
-  const context = normalizePageContext(pageContext ?? legacyPageContext)
+  if (turnCommand !== undefined && !isProjectInitTurnCommand(turnCommand)) {
+    throw new TurnCommandError('rejected', 'Invalid turn command.', 'INVALID_REQUEST', false)
+  }
+  const rawPageContext = pageContext ?? legacyPageContext
+  try {
+    if (rawPageContext != null) assertPageContextWithinLimits(rawPageContext)
+  } catch (error) {
+    throw new TurnCommandError('rejected', error instanceof Error ? error.message : 'Invalid page context.', 'INVALID_REQUEST', false)
+  }
+  const context = normalizePageContext(rawPageContext)
 
   return {
     ...extensions,
     message,
+    ...(turnCommand ? { turnCommand: copyTurnCommand(turnCommand) } : {}),
+    ...(copyLocalPathReferences(localPathReferences ?? legacyLocalPathReferences, String(displayText ?? legacyDisplayText ?? message)).length
+      ? { localPathReferences: copyLocalPathReferences(localPathReferences ?? legacyLocalPathReferences, String(displayText ?? legacyDisplayText ?? message)) } : {}),
     ...(selectedSkills?.length ? { selectedSkills: copySelectedSkills(selectedSkills) } : {}),
     ...(sessionKey !== undefined
       ? { sessionKey }
@@ -445,6 +476,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     ...(attachments !== undefined ? { attachments } : {}),
     ...(workspaceFiles !== undefined ? { workspaceFiles } : {}),
     ...(queueMode !== undefined ? { queueMode } : {}),
+    ...(requiredServices !== undefined ? { requiredServices } : {}),
   }
 }
 
@@ -453,6 +485,7 @@ function toWireSteerParams(request: TurnSteerRequest): Record<string, unknown> {
   const {
     key,
     message,
+    localPathReferences,
     expectedTurnId,
     clientRequestId,
     clientMessageId,
@@ -467,6 +500,8 @@ function toWireSteerParams(request: TurnSteerRequest): Record<string, unknown> {
     ...extensions,
     key,
     message,
+    ...(copyLocalPathReferences(localPathReferences, message).length
+      ? { localPathReferences: copyLocalPathReferences(localPathReferences, message) } : {}),
     ...(expectedTurnId !== undefined ? { expected_turn_id: expectedTurnId } : {}),
     ...(clientRequestId !== undefined ? { client_request_id: clientRequestId } : {}),
     ...(clientMessageId !== undefined ? { client_message_id: clientMessageId } : {}),
@@ -478,15 +513,22 @@ function toWireSteerParams(request: TurnSteerRequest): Record<string, unknown> {
   }
 }
 
-function requestOptions(options?: TurnCommandRequestOptions): RpcCallOptions | undefined {
-  return options?.signal ? { signal: options.signal } : undefined
+function requestOptions(options?: RpcCallOptions): RpcCallOptions | undefined {
+  if (!options?.signal && options?.expectedGeneration === undefined && !options?.recoveryClass) return undefined
+  return {
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.expectedGeneration !== undefined
+      ? { expectedGeneration: options.expectedGeneration }
+      : {}),
+    ...(options.recoveryClass ? { recoveryClass: options.recoveryClass } : {}),
+  }
 }
 
 function forward<T>(
   transport: TurnCommandsTransport,
   method: string,
   params: Record<string, unknown>,
-  options?: TurnCommandRequestOptions,
+  options?: RpcCallOptions,
 ): Promise<T> {
   const rpcOptions = requestOptions(options)
   const request = rpcOptions
@@ -519,7 +561,7 @@ function forwardContract<T>(
   method: string,
   params: Record<string, unknown>,
   responseValidator: ContractValidator,
-  options?: TurnCommandRequestOptions,
+  options?: RpcCallOptions,
 ): Promise<T> {
   return forward<unknown>(transport, method, params, options).then(raw => (
     response<T>(method, responseValidator, raw)
@@ -540,6 +582,62 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
   )
 
   return {
+    supportsReceiptLookup: () => hasRpcMethod(TURNS_RECEIPT_GET_METHOD),
+
+    lookupReceipt: async (
+      query: TurnReceiptRequest,
+      options?: TurnCommandRequestOptions,
+    ): Promise<TurnReceiptResult> => {
+      if (!hasRpcMethod(TURNS_RECEIPT_GET_METHOD)) return { status: 'unsupported' }
+      const originalRequest = query.kind === 'steer'
+        ? toWireSteerParams(query.request)
+        : query.request.kind === 'pending-input'
+          ? { ...query.request.params }
+          : toWireSendParams(query.request.params)
+      const operation = query.kind === 'steer'
+        ? query.request.pendingInputId ? SESSIONS_PENDING_INPUTS_STEER_METHOD : SESSIONS_STEER_V2_METHOD
+        : query.request.kind === 'pending-input' ? SESSIONS_PENDING_INPUTS_DISPATCH_METHOD : CHAT_SEND_METHOD
+      const params = response<TurnsReceiptGetParams>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetParams, { operation, originalRequest })
+      let raw: unknown
+      try {
+        raw = await transport.request(TURNS_RECEIPT_GET_METHOD, params as unknown as Record<string, unknown>, {
+          ...requestOptions(options), recoveryClass: 'safe-read',
+        })
+      } catch (error) {
+        const failure = readTransportFailure(error)
+        if (failure.code === 'METHOD_NOT_FOUND' || failure.code === 'UNSUPPORTED') return { status: 'unsupported' }
+        throw mapTurnCommandError(error)
+      }
+      const result = response<TurnsReceiptGetResult>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetResult, raw)
+      if (result.status === 'not_found') return { status: 'not-found' }
+      const { receipt } = result
+      // A valid shape is not enough to bind a late response to this logical
+      // delivery. Fail closed before it can supply a target to a pending Stop.
+      if (receipt.clientRequestId !== firstDefined(originalRequest, 'clientRequestId', 'client_request_id')
+        || receipt.requestSessionKey !== firstDefined(originalRequest, 'sessionKey', 'session_key', 'key')) {
+        throw new TurnCommandContractError(TURNS_RECEIPT_GET_METHOD)
+      }
+      if (query.kind === 'steer') {
+        if (!receipt.steer || receipt.steer.client_request_id !== receipt.clientRequestId) {
+          throw new TurnCommandContractError(TURNS_RECEIPT_GET_METHOD)
+        }
+        return { status: 'found', response: projectSteerResult(receipt.steer) }
+      }
+      return {
+        status: 'found',
+        response: {
+          ok: true, sessionKey: receipt.sessionKey, messageId: receipt.messageId,
+          userMessageId: receipt.messageId, replayed: true,
+          ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
+          ...(receipt.taskStatus ? { taskStatus: receipt.taskStatus } : {}),
+          metadata: {
+            requestFingerprint: result.requestFingerprint,
+            sessionId: receipt.sessionId, sessionEpoch: receipt.sessionEpoch,
+          },
+        },
+      }
+    },
+
     send: async (
       request: TurnSendRequest,
       options?: TurnCommandRequestOptions,
@@ -573,12 +671,20 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
       options?: TurnCommandRequestOptions,
     ): Promise<TurnCancelResponse> => {
       const params = request as unknown as ChatAbortParams
+      const generation = options?.expectedGeneration ?? transport.generation
+      // Only a known task may bypass the health gate. Never queue a Stop or
+      // widen an unknown admission/session-tree Stop while recovering.
+      const exactTask = request.scope === 'task'
+        && Boolean(request.taskId?.trim()) && Boolean(request.sessionKey.trim())
+      const cancelOptions: RpcCallOptions | undefined = exactTask && generation !== undefined
+        ? { ...options, expectedGeneration: generation, recoveryClass: 'task-control' }
+        : options
       return forwardContract<ChatAbortResult>(
         transport,
         CHAT_ABORT_METHOD,
         params as unknown as Record<string, unknown>,
         validateChatAbortResult,
-        options,
+        cancelOptions,
       ).then(projectCancelResult)
     },
 
@@ -620,6 +726,7 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
  * tests while production composition uses `createPrivateGatewayTransports`.
  */
 export function createV4TurnCommandsFromRpcClient(client: {
+  readonly connectionGeneration?: number
   call<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -628,6 +735,7 @@ export function createV4TurnCommandsFromRpcClient(client: {
   hasRpcMethod?(method: string): boolean
 }, hasRpcMethod?: (method: string) => boolean): TurnCommands {
   return createV4TurnCommands({
+    get generation() { return client.connectionGeneration },
     request: (method, params, options) => options
       ? client.call(method, params, options)
       : client.call(method, params),

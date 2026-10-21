@@ -39,6 +39,42 @@ def test_exact_sentinel_is_suppressed_for_compatibility(token: str, reason: str)
 
 
 @pytest.mark.parametrize(
+    ("payload", "sentinel", "reason"),
+    [
+        ("[NO_REPLY]", NO_REPLY_TOKEN, "no_reply"),
+        ("  [HEARTBEAT_OK]\n", HEARTBEAT_ACK_TOKEN, "heartbeat_ack"),
+    ],
+)
+def test_goal_continuation_accepts_only_observed_bracketed_aliases(
+    payload: str, sentinel: str, reason: str,
+) -> None:
+    result = normalize_silent_reply(
+        payload,
+        run_kind="goal",
+        input_mode="goal_continuation",
+    )
+
+    assert result.text == ""
+    assert result.changed is True
+    assert result.suppressed is True
+    assert result.sentinel == sentinel
+    assert result.suppression_reason == reason
+
+
+def test_goal_continuation_keeps_mixed_sentinel_like_text_actionable() -> None:
+    payload = "NO_REPLY\nConcrete progress details."
+    result = normalize_silent_reply(
+        payload,
+        run_kind="goal",
+        input_mode="goal_continuation",
+    )
+
+    assert result.text == "Concrete progress details."
+    assert result.changed is True
+    assert result.suppressed is False
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         "NO_REPLY\nStill working.",

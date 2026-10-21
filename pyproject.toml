@@ -1,6 +1,6 @@
 [project]
 name = "opensquilla"
-version = "0.5.5"
+version = "0.5.6"
 description = "OpenSquilla — microkernel Python agent runtime with MCP-native tools and multi-channel messaging"
 license = "Apache-2.0"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
@@ -28,7 +28,8 @@ dependencies = [
     "httpx>=0.27",
     "mcp>=2.2.0,<3",
     # Security floors for HTTP and parsing dependencies used by base features.
-    "aiohttp>=3.14.3",
+    "aiohttp>=3.14.4",
+    "multidict>=6.9.1",
     "idna>=3.19",
     "urllib3>=2.7.0",
     "brotli>=1.1",
@@ -52,9 +53,9 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "soupsieve>=2.9.2",
     "cachetools>=5.3",
-    "certifi>=2026.7.22",
+    "certifi>=2026.10.19",
     "pdfplumber>=0.11.10",
-    "pillow>=12.3.0",
+    "pillow>=13.0.0",
     "croniter>=6.2.4",
     "tomli-w>=1.0",
     "yoyo-migrations>=8.2,<10",
@@ -107,6 +108,7 @@ recommended = [
     "scikit-learn>=1.9.1",
     "onnxruntime>=1.30.0",
     "tokenizers>=0.23.2",
+    "fsspec>=2026.6.0",
     # Standard installations include the managed execution PTY backend.  The
     # imports remain lazy so ordinary closed/pipe execution keeps its startup
     # path; the explicit ``pty`` extra below remains for core/minimal callers.
@@ -154,7 +156,6 @@ exclude = [
     "src/opensquilla/skills/bundled/**/skill-card.md",
     "src/opensquilla/skills/bundled/**/references/*.md",
     "src/opensquilla/skills/exp/**",
-    "src/opensquilla/skills/meta/META_SKILL_AUTHORING.md",
     # The core distribution may carry the OpenTUI JavaScript sources for
     # explicit source-development mode, but never local dependency installs or
     # compiled platform artifacts. Those belong to opensquilla-tui-host.
@@ -180,19 +181,22 @@ exclude = [
 [tool.hatch.build.targets.sdist]
 # Published sdists remain self-contained: downstream wheel builds do not need
 # Node.js because release CI embeds the already-verified WebUI artifact here.
-# Standard sdists deliberately reject ignored personal BGM so an ordinary
-# source-archive build cannot leak private or copyrighted audio. Developers who
-# need a private customized artifact can build a direct local wheel instead.
+# Retired local media is not a build input and never belongs in source archives.
 artifacts = ["src/opensquilla/gateway/static/dist/**"]
+exclude = ["opensquilla-webui/public/music", "opensquilla-webui/public/music/**"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "desktop/electron/runtime/runtime-pack-catalog.json" = "desktop/electron/runtime/runtime-pack-catalog.json"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Capacity/soak checks run in the required python-stress CI suite. Explicit
+# `-m stress` (or `-m ''` for everything) overrides this local default.
+addopts = "-m 'not stress'"
 asyncio_mode = "auto"
 norecursedirs = ["tests/_private", "tests/fixtures", ".omx", ".codex", ".claude"]
 markers = [
+    "stress: capacity or soak tests run separately from ordinary offline regressions",
     "ci_serial: tests that must run outside the parallel CI pytest worker pool",
     "llm: marks tests that make real external model/provider API calls (deselect with '-m \"not llm\"')",
     "llm_smoke: low-cost live LLM smoke tests",
@@ -226,26 +230,6 @@ select = ["E", "F", "I", "N", "W", "UP"]
 # example code meant to be copy-pasted verbatim; reformatting would
 # harm readability. E402 imports-after-sys.path-munge is intentional.
 "src/opensquilla/skills/bundled/skill-creator/scripts/*.py" = ["E501", "N806", "E402"]
-"src/opensquilla/skills/bundled/skill-creator-linter/scripts/*.py" = ["E402", "I001"]
-# meta-short-drama subprocess scripts: long lines hold argv arrays,
-# ffmpeg filter graphs, Chinese error strings, and OpenRouter payload
-# field comments meant to stay readable as one unit.
-"src/opensquilla/skills/bundled/ai-video-script/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/AwesomeWebpageMetaSkill/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/nano-banana-pro/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/seedance-2-prompt/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/srt-from-script/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/subtitle-burner/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/text-file-read/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/title-card-image/scripts/*.py" = ["E501"]
-"src/opensquilla/skills/bundled/video-merger/scripts/*.py" = ["E501"]
-# video-merger src/ is vendored from upstream MIT-0 clawhub package; keep
-# its Chinese docstrings + ffmpeg argv lines unwrapped.
-"src/opensquilla/skills/bundled/video-merger/src/*.py" = ["E501", "F401"]
-"src/opensquilla/skills/bundled/video-still-animator/scripts/*.py" = ["E501"]
-# meta-short-drama DAG generator: template strings embed YAML blocks
-# whose original line breaks must be preserved.
-"scripts/_gen_meta_short_drama.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -256,9 +240,6 @@ warn_unused_configs = true
 exclude = [
     "^src/opensquilla/squilla_router/models/",
     "^src/opensquilla/skills/bundled/.*/scripts/",
-    # video-merger ships an upstream MIT-0 library under src/; same
-    # treatment as the per-skill scripts/ trees.
-    "^src/opensquilla/skills/bundled/video-merger/src/",
 ]
 
 [[tool.mypy.overrides]]
@@ -286,7 +267,7 @@ ignore_missing_imports = true
 desktop-build = ["pyinstaller==6.22.3"]
 wheelhouse-build = ["pip==26.2.1"]
 # Frozen sessions.list types are regenerated in a separate, locked environment.
-legacy-contract-codegen = ["datamodel-code-generator==0.75.1"]
+legacy-contract-codegen = ["datamodel-code-generator==0.81.0"]
 dev = [
     "datamodel-code-generator==0.81.0",
     "laboratory>=1.0.2",

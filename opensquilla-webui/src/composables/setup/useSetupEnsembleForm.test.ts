@@ -200,8 +200,8 @@ describe('useSetupEnsembleForm — partial payload building', () => {
 
     expect(f.payload()).toEqual({
       candidates: [
-        { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: 'proposer' },
-        { provider: 'openrouter', model: 'qwen/qwen3.7-max', source: 'custom', enabled: true, role: 'proposer' },
+        { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: 'proposer', thinking_level: '' },
+        { provider: 'openrouter', model: 'qwen/qwen3.7-max', source: 'custom', enabled: true, role: 'proposer', thinking_level: '' },
       ],
     })
   })
@@ -492,7 +492,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
     expect(f.candidates.value).toEqual(expectedCandidates)
     expect(makePanel(f, 'a').value.custom.proposerCount).toBe(3)
     expect(f.minSuccessfulProposers.value).toBe(3)
-    expect(f.payload()).toEqual({ candidates: expectedCandidates })
+    expect(f.payload()).toEqual({ candidates: expectedCandidates.map(candidate => ({ ...candidate, thinking_level: '' })) })
 
     const beforeDuplicate = {
       candidates: f.candidates.value.map(candidate => ({ ...candidate })),
@@ -551,7 +551,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
     ]
     expect(f.candidates.value).toEqual(expectedCandidates)
     expect(makePanel(f, 'a').value.custom.proposerCount).toBe(2)
-    expect(f.payload()).toEqual({ candidates: expectedCandidates })
+    expect(f.payload()).toEqual({ candidates: expectedCandidates.map(candidate => ({ ...candidate, thinking_level: '' })) })
   })
 
   it('preserves aggregator source metadata when replacing its deployment', () => {
@@ -1147,5 +1147,71 @@ describe('staticB5ModeForProvider', () => {
     expect(staticB5ModeForProvider('deepseek')).toBeNull()
     expect(staticB5ModeForProvider('')).toBeNull()
     expect(staticB5ModeForProvider(undefined)).toBeNull()
+  })
+})
+
+
+describe('ensemble thinking by role', () => {
+  it('keeps the same model independent across roles and explicitly clears an override', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: [
+      { provider: 'custom', model: 'shared-model', role: 'proposer', thinking_level: 'low' },
+      { provider: 'custom', model: 'shared-model', role: 'aggregator', thinking_level: 'high' },
+    ] })
+    const panel = makePanel(f, 'custom')
+    f.setCandidateThinking(panel.value.custom.proposers[0]!, '')
+    expect(panel.value.custom.proposers[0]!.thinkingLevel).toBe('')
+    expect(panel.value.custom.aggregator!.thinkingLevel).toBe('high')
+    expect(f.payload().candidates).toEqual([
+      expect.objectContaining({ role: 'proposer', thinking_level: '' }),
+      expect.objectContaining({ role: 'aggregator', thinking_level: 'high' }),
+    ])
+    f.initFromConfig({ selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: f.candidates.value })
+    expect(f.isDirty.value).toBe(false)
+    expect(makePanel(f, 'custom').value.custom.proposers[0]!.thinkingLevel).toBe('')
+  })
+
+  it('materializes an inherited aggregator only when given an explicit override', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ selection_mode: CUSTOM_B5_SELECTION_MODE, candidates: [
+      { provider: 'custom', model: 'shared-model', role: 'proposer', thinking_level: 'low' },
+    ] })
+    const target = { provider: 'custom', model: 'shared-model', role: 'aggregator' }
+    f.setCandidateThinking(target, '')
+    expect(f.isDirty.value).toBe(false)
+    f.setCandidateThinking(target, 'high')
+    expect(f.payload().candidates).toEqual([
+      expect.objectContaining({ role: 'proposer', thinking_level: 'low' }),
+      expect.objectContaining({ role: 'aggregator', thinking_level: 'high' }),
+    ])
+  })
+})
+
+
+describe('thinking edits in a custom lineup with a stored preset', () => {
+  it.each(['proposer', 'aggregator'])('pins custom mode and saves the %s thinking level', role => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5', candidates: [
+      { provider: 'ollama', model: 'example-a', role: 'proposer' },
+      { provider: 'ollama', model: 'example-b', role: 'proposer' },
+      { provider: 'ollama', model: 'example-a', role: 'aggregator' },
+    ] })
+    const panel = makePanel(f, 'ollama')
+    expect(panel.value.scheme).toBe('custom')
+    const candidate = role === 'aggregator' ? panel.value.custom.aggregator! : panel.value.custom.proposers[0]!
+    f.setCandidateThinking(candidate, 'high')
+    expect(f.isDirty.value).toBe(true)
+    expect(f.payload().selectionMode).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.payload().candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider: 'ollama', model: 'example-a', role, thinking_level: 'high' }),
+    ]))
+  })
+
+  it('does not change the stored preset for an absent candidate', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    f.setCandidateThinking({ provider: 'ollama', model: 'absent', role: 'proposer' }, 'high')
+    expect(f.isDirty.value).toBe(false)
+    expect(f.payload()).toEqual({})
   })
 })

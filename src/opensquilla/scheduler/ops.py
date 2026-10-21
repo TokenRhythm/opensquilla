@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -302,10 +303,24 @@ class SchedulerOps:
 
     async def update(self, job_id: str, **patch) -> CronJob | None:
         """Apply a partial update to an existing job. Returns None if not found."""
-        job = await self._store.get(job_id)
-        if job is None:
-            return None
+        return await self._edit(job_id, lambda job: self._apply_update(job, dict(patch)))
 
+    async def _edit(
+        self, job_id: str, apply: Callable[[CronJob], None],
+    ) -> CronJob | None:
+        while True:
+            previous = await self._store.get(job_id)
+            if previous is None:
+                return None
+            job = deepcopy(previous)
+            apply(job)
+            # Finalizers use updated_at as their configuration fence. Frozen or
+            # backwards clocks must not make distinct edits share that fence.
+            job.updated_at = max(job.updated_at, previous.updated_at + timedelta(microseconds=1))
+            if await self._store.update_configuration(job, previous):
+                return job
+
+    def _apply_update(self, job: CronJob, patch: dict) -> None:
         now_local = self._now()
         now = now_local.astimezone(UTC)
         payload_patch = patch.pop("payload", None)
@@ -412,8 +427,6 @@ class SchedulerOps:
                     job.next_run_at = _next_run(job, now)
 
         job.updated_at = now
-        await self._store.save(job)
-        return job
 
     async def remove(self, job_id: str) -> bool:
         """Delete a job. Returns True if it existed."""
@@ -425,20 +438,17 @@ class SchedulerOps:
 
     async def pause(self, job_id: str) -> CronJob | None:
         """Set job status to PAUSED. Returns None if not found."""
-        job = await self._store.get(job_id)
-        if job is None:
-            return None
-        job.status = JobStatus.PAUSED
-        job.updated_at = datetime.now(UTC)
-        await self._store.save(job)
-        return job
+        def apply(job: CronJob) -> None:
+            job.status = JobStatus.PAUSED
+            job.updated_at = datetime.now(UTC)
+
+        return await self._edit(job_id, apply)
 
     async def resume(self, job_id: str) -> CronJob | None:
         """Set job status to PENDING and recompute next_run_at. Returns None if not found."""
-        job = await self._store.get(job_id)
-        if job is None:
-            return None
+        return await self._edit(job_id, self._apply_resume)
 
+    def _apply_resume(self, job: CronJob) -> None:
         now = datetime.now(UTC)
         job.status = JobStatus.PENDING
         # Reviving a DISABLED/FAILED job must clear the flags the due-job query
@@ -460,9 +470,6 @@ class SchedulerOps:
                 job.next_run_at = now + timedelta(seconds=int(job.cron_expr))
         else:
             job.next_run_at = _next_run(job, now)
-
-        await self._store.save(job)
-        return job
 
     async def get(self, job_id: str) -> CronJob | None:
         """Retrieve a job by ID."""

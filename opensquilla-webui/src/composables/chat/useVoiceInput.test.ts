@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import { useVoiceInput as useVoiceInputComposable } from './useVoiceInput'
-import { AudioTranscriptionError } from '@/modules/audioTranscription'
+import { AudioTranscriptionError, type AudioTranscription } from '@/modules/audioTranscription'
 
 function useVoiceInput() {
   return useVoiceInputComposable({
@@ -167,6 +167,20 @@ afterEach(() => {
 })
 
 describe('useVoiceInput transcription feedback', () => {
+  it('keeps the recording owner when the active chat changes', async () => {
+    let owner = { sessionKey: 'original-session', sessionId: 'original-id', sessionEpoch: 0 }
+    const transcribe = vi.fn(async () => 'recorded text')
+    const voice = useVoiceInputComposable({ transcribe }, () => owner)
+    const onText = vi.fn()
+    await voice.toggleVoiceInput(onText)
+    owner = { sessionKey: 'next-session', sessionId: 'next-id', sessionEpoch: 1 }
+    await voice.toggleVoiceInput(onText)
+    await waitUntil(() => transcribe.mock.calls.length > 0)
+    expect(transcribe).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: 'original-session', sessionId: 'original-id', sessionEpoch: 0,
+    }))
+    voice.cleanup()
+  })
   it('surfaces an "enable in settings" toast when transcription is unavailable (503)', async () => {
     vi.stubGlobal(
       'fetch',
@@ -536,5 +550,33 @@ describe('useVoiceInput hidden-window cancellation', () => {
     expect(onText).not.toHaveBeenCalled()
     // Teardown is not a hidden window: unmount cancellation stays silent.
     expect(toasts.value).toHaveLength(0)
+  })
+
+  it('cleanup aborts transcription and ignores its late success after a conversation owner is replaced', async () => {
+    let complete!: (text: string) => void
+    let signal: AbortSignal | undefined
+    const transcription = { transcribe: vi.fn<AudioTranscription['transcribe']>(({ signal: requestedSignal }) => {
+      signal = requestedSignal
+      return new Promise<string>(resolve => { complete = resolve })
+    }) }
+    const oldText = vi.fn()
+    const owner = useVoiceInputComposable(transcription)
+    await owner.toggleVoiceInput(oldText)
+    await owner.toggleVoiceInput(oldText)
+    expect(transcription.transcribe).toHaveBeenCalledOnce()
+    owner.cleanup()
+    expect(signal?.aborted).toBe(true)
+    const replacementText = vi.fn()
+    const replacement = useVoiceInputComposable({ transcribe: vi.fn(async () => 'Current owner') })
+    complete('Retired owner')
+    await Promise.resolve(); await Promise.resolve()
+    expect(oldText).not.toHaveBeenCalled()
+    expect(replacementText).not.toHaveBeenCalled()
+    expect(toasts.value).toEqual([])
+    await replacement.toggleVoiceInput(replacementText)
+    await replacement.toggleVoiceInput(replacementText)
+    await Promise.resolve(); await Promise.resolve()
+    expect(replacementText).toHaveBeenCalledWith('Current owner')
+    replacement.cleanup()
   })
 })

@@ -13,7 +13,6 @@ from opensquilla.engine.usage_accounting import (
     UsageCallResult,
     UsageCallStart,
 )
-from opensquilla.gateway.boot import _auto_propose_usage_execution_context
 from opensquilla.gateway.usage_ledger_runtime import (
     SessionUsageEventSink,
     UsageLedgerStorageError,
@@ -75,18 +74,6 @@ def _result(*, source: str = "mixed") -> UsageCallResult:
     )
 
 
-def test_auto_propose_uses_stable_synthetic_session_and_unique_runs() -> None:
-    sink = object()
-    first = _auto_propose_usage_execution_context("main", sink)
-    second = _auto_propose_usage_execution_context("main", sink)
-
-    assert first is not None and second is not None
-    assert first.execution_id != second.execution_id
-    assert first.session_id == second.session_id
-    assert first.run_kind == second.run_kind == "auto_propose"
-    assert _auto_propose_usage_execution_context("main", None) is None
-
-
 class _Storage:
     def __init__(self) -> None:
         self.start_attempts = []
@@ -97,7 +84,8 @@ class _Storage:
         self.unknown = []
         self.fail_finalize = 0
 
-    async def start_usage_event(self, event):
+    async def start_usage_event(self, event, *, preserve_session_epoch=False):
+        assert preserve_session_epoch is True
         self.start_attempts.append(event)
         if self.start_failures:
             raise self.start_failures.pop(0)

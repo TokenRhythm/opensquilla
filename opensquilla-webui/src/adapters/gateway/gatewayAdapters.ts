@@ -14,14 +14,14 @@ import { createV4PendingInputQueue } from './pendingInputQueueV4'
 import { createApprovalCenterV4 } from './approvalCenterV4'
 import type { ApprovalCenter } from '@/modules/approvalCenter'
 import type { HttpTransport } from './privateHttpTransport'
+import type { HistoryContentReaderFactory } from '@/modules/historyContent'
+import { createHistoryContentReader } from './historyContentV4'
 import type { GoalCenter } from '@/modules/goalCenter'
 import { createV4GoalCenter } from './goalCenterV4'
 import { createV4GoalContinuity } from './goalContinuityV4'
 import type { GoalContinuity } from '@/modules/goalContinuity'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createV4PlanCenter } from './planCenterV4'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
-import { createV4MetaRunCenter } from './metaRunCenterV4'
 import type { AppSettings } from '@/modules/appSettings'
 import { createV4AppSettings } from './appSettingsV4'
 import type { ProductActivity } from '@/modules/productActivity'
@@ -38,22 +38,20 @@ import type { WorkspaceReferences } from '@/modules/workspaceReferences'
 import { createV4WorkspaceReferences } from './workspaceReferencesV4'
 import type { WorkspaceFiles } from '@/modules/workspaceFiles'
 import { createV4WorkspaceFiles } from './workspaceFilesV4'
+import type { TerminalAccess } from '@/modules/terminal'
+import { createV4TerminalAccess } from './terminalV4'
 import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 import type { UsageReporting } from '@/modules/usageReporting'
 import { createV4UsageReporting } from './usageReportingV4'
 import type { CommandCatalog } from '@/modules/commandCatalog'
 import { createV4CommandCatalog } from './commandCatalogV4'
-import type { RouteFeedback } from '@/modules/routeFeedback'
-import { createV4RouteFeedback } from './routeFeedbackV4'
 import type { PromptCacheLease } from '@/modules/promptCacheLease'
 import { createV4PromptCacheLease } from './promptCacheLeaseV4'
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 import { createV4ClarificationSubmission } from './clarificationSubmissionV4'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import { createV4SessionMaintenance } from './sessionMaintenanceV4'
-import type { SessionProcesses } from '@/modules/sessionProcesses'
-import { createV4SessionProcesses } from './sessionProcessesV4'
 import type { Observability } from '@/modules/observability'
 import { createV4Observability } from './observabilityV4'
 import type { SkillCatalog } from '@/modules/skillCatalog'
@@ -81,15 +79,19 @@ import { createSessionReadLifecycleFactory } from '@/modules/sessionReadLifecycl
 import { createV4SessionReadPort } from './sessionReadPortV4'
 import type { SessionInspection } from '@/modules/sessionInspection'
 import { createV4SessionInspection } from './sessionInspectionV4'
+import type { SessionMessageSearch } from '@/modules/sessionMessageSearch'
+import { createV4SessionMessageSearch } from './sessionMessageSearchV4'
 
 type RpcStoreTransportSource = Parameters<typeof createPrivateGatewayTransports>[0]
   & Parameters<typeof createV4GatewayAccess>[0]
 
 export interface GatewayAdapters {
+  readonly historyContentReader: HistoryContentReaderFactory
   readonly gatewayAccess: GatewayAccess
   readonly conversationEvents: ConversationEvents
   readonly sessionReadLifecycleFactory: SessionReadLifecycleFactory
   readonly sessionInspection: SessionInspection
+  readonly sessionMessageSearch: SessionMessageSearch
   readonly sessionDirectory: SessionDirectory
   readonly sessionDirectoryChanges: SessionDirectoryChanges
   readonly sessionLifecycle: SessionLifecycle
@@ -100,7 +102,6 @@ export interface GatewayAdapters {
   readonly goalCenter: GoalCenter
   readonly goalContinuity: GoalContinuity
   readonly planCenter: PlanCenter
-  readonly metaRunCenter: MetaRunCenter
   readonly appSettings: AppSettings
   readonly productActivity: ProductActivity
   readonly providerConfiguration: ProviderConfiguration
@@ -109,14 +110,13 @@ export interface GatewayAdapters {
   readonly workspaceCatalog: WorkspaceCatalog
   readonly workspaceReferences: WorkspaceReferences
   readonly workspaceFiles: WorkspaceFiles
+  readonly terminal: TerminalAccess
   readonly sandboxRuntime: SandboxRuntime
   readonly usageReporting: UsageReporting
   readonly commandCatalog: CommandCatalog
-  readonly routeFeedback: RouteFeedback
   readonly promptCacheLease: PromptCacheLease
   readonly clarificationSubmission: ClarificationSubmission
   readonly sessionMaintenance: SessionMaintenance
-  readonly sessionProcesses: SessionProcesses
   readonly observability: Observability
   readonly skillCatalog: SkillCatalog
   readonly agentCatalog: AgentCatalog
@@ -163,9 +163,11 @@ export function createGatewayAdapters(
   )
   const conversationEvents = createConversationEventTransport(transports.events)
   const adapters: GatewayAdapters = {
+    historyContentReader: createHistoryContentReader(http),
     gatewayAccess,
     conversationEvents,
     sessionReadLifecycleFactory,
+    sessionMessageSearch: createV4SessionMessageSearch(transports.rpc),
     sessionInspection: createV4SessionInspection(
       transports.rpc,
       { concurrentHistoryReads },
@@ -183,7 +185,6 @@ export function createGatewayAdapters(
     goalCenter: createV4GoalCenter(transports.rpc),
     goalContinuity: createV4GoalContinuity(transports.rpc, transports.events),
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
-    metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
     appSettings: createV4AppSettings(transports.rpc),
     productActivity: createV4ProductActivity(transports.rpc),
     providerConfiguration: createV4ProviderConfiguration(transports.rpc, transports.events),
@@ -192,15 +193,16 @@ export function createGatewayAdapters(
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
     workspaceReferences: createV4WorkspaceReferences(transports.rpc),
     workspaceFiles: createV4WorkspaceFiles(http),
+    terminal: createV4TerminalAccess(transports.rpc, transports.events),
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     usageReporting: createV4UsageReporting(transports.rpc),
     commandCatalog: createV4CommandCatalog(transports.rpc),
-    routeFeedback: createV4RouteFeedback(transports.rpc),
     promptCacheLease: createV4PromptCacheLease(transports.rpc),
     clarificationSubmission: createV4ClarificationSubmission(transports.rpc),
     sessionMaintenance: createV4SessionMaintenance(transports.rpc),
-    sessionProcesses: createV4SessionProcesses(transports.rpc, { getAuth: () => source.auth }),
-    observability: createV4Observability(transports.rpc, http),
+    observability: createV4Observability(
+      transports.rpc, http, () => gatewayAccess.supportBundleUnavailableReason,
+    ),
     skillCatalog: createV4SkillCatalog(transports.rpc),
     agentCatalog: createV4AgentCatalog(transports.rpc),
     cronScheduler: createV4CronScheduler(transports.rpc, transports.events),

@@ -1,0 +1,96 @@
+{
+  "documentResponse": {
+    "document": {
+      "id": "doc_e0BlkIh6iLQyVxm1PHpocuAN",
+      "sessionKey": "session-office-preview",
+      "sessionId": "session-office-preview",
+      "name": "02_sample_slides.pptx",
+      "kind": "presentation",
+      "format": "pptx",
+      "headRevisionId": "rev_office_202210df61ba9ee96396feb80744d0673ef706219354d759617a8da879eb09f2",
+      "generation": 2,
+      "stateRevision": 2,
+      "capabilities": {
+        "download": true,
+        "versionHistory": true,
+        "publish": true,
+        "preview": true,
+        "source": false,
+        "manualEdit": false,
+        "agentEdit": true,
+        "sourceEdit": false,
+        "browserUse": false,
+        "selectionContext": true,
+        "selection": true,
+        "promptAnnotations": true,
+        "engine": null
+      },
+      "editorState": "preview_ready",
+      "latestDownloadUrl": "/api/v1/artifact-documents/doc_e0BlkIh6iLQyVxm1PHpocuAN",
+      "createdAt": 1791870825133,
+      "updatedAt": 1791873527819,
+      "schemaVersion": 1,
+      "head": {
+        "id": "rev_office_202210df61ba9ee96396feb80744d0673ef706219354d759617a8da879eb09f2",
+        "documentId": "doc_e0BlkIh6iLQyVxm1PHpocuAN",
+        "parentRevisionId": "rev_8dfIFcTedJ2HlF2OVgWGvOek",
+        "generation": 2,
+        "artifactId": "art-Q3cBih_z4Hq7HiF-YxauvhKb",
+        "source": "agent",
+        "actorKind": "agent",
+        "actorId": "75eae669363845e5b37c5b19aecd2651",
+        "changeSetId": null,
+        "copiedFromRevisionId": null,
+        "sha256": "6d14eeed62ac43666451392923b6066b91d7b521b96bda31cf21944af24f49cb",
+        "name": "02_sample_slides.pptx",
+        "mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "size": 31553,
+        "createdAt": 1791873527819,
+        "schemaVersion": 1,
+        "downloadUrl": "/api/v1/artifact-documents/doc_e0BlkIh6iLQyVxm1PHpocuAN?revisionId=rev_office_202210df61ba9ee96396feb80744d0673ef706219354d759617a8da879eb09f2"
+      }
+    }
+  },
+  "revisionsResponse": {
+    "revisions": [
+      {
+        "id": "rev_office_202210df61ba9ee96396feb80744d0673ef706219354d759617a8da879eb09f2",
+        "documentId": "doc_e0BlkIh6iLQyVxm1PHpocuAN",
+        "parentRevisionId": "rev_8dfIFcTedJ2HlF2OVgWGvOek",
+        "generation": 2,
+        "artifactId": "art-Q3cBih_z4Hq7HiF-YxauvhKb",
+        "source": "agent",
+        "actorKind": "agent",
+        "actorId": "75eae669363845e5b37c5b19aecd2651",
+        "changeSetId": null,
+        "copiedFromRevisionId": null,
+        "sha256": "6d14eeed62ac43666451392923b6066b91d7b521b96bda31cf21944af24f49cb",
+        "name": "02_sample_slides.pptx",
+        "mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "size": 31553,
+        "createdAt": 1791873527819,
+        "schemaVersion": 1,
+        "downloadUrl": "/api/v1/artifact-documents/doc_e0BlkIh6iLQyVxm1PHpocuAN?revisionId=rev_office_202210df61ba9ee96396feb80744d0673ef706219354d759617a8da879eb09f2"
+      },
+      {
+        "id": "rev_8dfIFcTedJ2HlF2OVgWGvOek",
+        "documentId": "doc_e0BlkIh6iLQyVxm1PHpocuAN",
+        "parentRevisionId": null,
+        "generation": 1,
+        "artifactId": "art-mQY4WZmDBQKHSntnlg4MFPGQ",
+        "source": "initial",
+        "actorKind": "user",
+        "actorId": "local-owner",
+        "changeSetId": null,
+        "copiedFromRevisionId": null,
+        "sha256": "9f743b460bec1df5b47dce3e4f732a1b271df39ea68176acb1be3f0ad18da1c1",
+        "name": "02_sample_slides.pptx",
+        "mime": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "size": 31550,
+        "createdAt": 1791870825133,
+        "schemaVersion": 1,
+        "downloadUrl": "/api/v1/artifact-documents/doc_e0BlkIh6iLQyVxm1PHpocuAN?revisionId=rev_8dfIFcTedJ2HlF2OVgWGvOek"
+      }
+    ]
+  }
+}

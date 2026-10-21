@@ -1,0 +1,16 @@
+Project instructions for this chat turn:
+Workspace: {{ workspace_root }}
+Apply each file within its listed scope. More specific conventions apply within
+that directory. They do not override explicit current user instructions, system
+requirements, or tool permissions.
+This is a turn-start snapshot. Automatic loading covers the bound workspace root.
+Read relevant deeper-directory instructions when working there. File changes will
+be loaded automatically at the next chat turn.
+
+{% for rule in rules %}
+Source: {{ rule.path }}
+Scope: {{ rule.scope }}
+Read status: {{ rule.read_status }}
+{{ rule.content }}
+
+{% endfor %}

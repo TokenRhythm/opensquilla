@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -31,9 +32,7 @@ from opensquilla.telemetry.growth_sink import (
     GrowthEventSink,
     GrowthMilestoneStatus,
     read_client_launch_state,
-    read_coding_mode_usage_state,
     read_gateway_growth_milestone_state,
-    read_metaskill_usage_state,
     read_product_active_state,
 )
 from opensquilla.telemetry.identity import (
@@ -156,6 +155,140 @@ async def test_product_active_counts_each_surface_daily_without_creating_cohort(
     assert len(runtime.events) == 5
 
 
+
+async def test_daily_activity_cache_skips_state_io_for_repeated_observations(
+    tmp_path, monkeypatch,
+) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    assert await sink.record_product_active(surface=ClientSurface.CLI)
+
+    async def unexpected_io(operation):
+        raise AssertionError("completed daily activity must not read or write state again")
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.run_state_io", unexpected_io)
+    for _ in range(100):
+        assert not await sink.record_product_active(surface=ClientSurface.CLI)
+        sink.observe_product_active(ClientSurface.CLI)
+    assert not sink._tasks
+    assert len(runtime.events) == 1
+    await sink.close()
+
+
+async def test_activity_bursts_share_one_pending_observation(tmp_path) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    for _ in range(1_000):
+        sink.observe_product_active(ClientSurface.CLI)
+    assert len(sink._tasks) == 1
+    await sink.close()
+    assert len(runtime.events) == 1
+
+
+async def test_busy_activity_state_is_skipped_without_waiting_for_writer(tmp_path) -> None:
+    from opensquilla.profile_operation_lock import ProfileOperationLock
+
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_state():
+        with ProfileOperationLock(sink.product_active_path):
+            held.set()
+            release.wait(5)
+
+    writer = asyncio.create_task(asyncio.to_thread(hold_state))
+    try:
+        assert await asyncio.to_thread(held.wait, 1)
+        assert not await asyncio.wait_for(
+            sink.record_product_active(surface=ClientSurface.CLI), 1,
+        )
+        assert not release.is_set()
+        assert not runtime.events
+    finally:
+        release.set()
+        await writer
+    assert await sink.record_product_active(surface=ClientSurface.CLI)
+    await sink.close()
+
+
+async def test_slow_activity_write_does_not_block_the_application_loop(
+    tmp_path, monkeypatch,
+) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+    write_state = sink_module.write_product_active_state
+
+    def delayed_write(path, records):
+        entered.set()
+        assert release.wait(5)
+        write_state(path, records)
+
+    monkeypatch.setattr(sink_module, "write_product_active_state", delayed_write)
+    recording = asyncio.create_task(sink.record_product_active(surface=ClientSurface.CLI))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), 1)
+        assert not recording.done()
+    finally:
+        release.set()
+        await recording
+        await sink.close()
+
+
+async def test_cancelled_state_write_keeps_policy_gate_until_worker_finishes(
+    tmp_path, monkeypatch,
+) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
+    sink = _sink(CapturingRuntime(), _config(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+    write_state = sink_module.write_product_active_state
+
+    def delayed_write(path, records):
+        entered.set()
+        assert release.wait(5)
+        write_state(path, records)
+
+    monkeypatch.setattr(sink_module, "write_product_active_state", delayed_write)
+    recording = asyncio.create_task(sink.record_product_active(surface=ClientSurface.CLI))
+    transitioned = asyncio.Event()
+
+    async def change_policy():
+        async with sink._coordinator.transition(TelemetryScope.GROWTH):
+            transitioned.set()
+
+    transition = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        recording.cancel()
+        await asyncio.sleep(0)
+        recording.cancel()
+        transition = asyncio.create_task(change_policy())
+        await asyncio.sleep(0)
+        assert not transitioned.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await recording
+        await asyncio.wait_for(transition, 1)
+        assert transitioned.is_set()
+        assert sink.product_active_path.is_file()
+    finally:
+        release.set()
+        await asyncio.gather(recording, return_exceptions=True)
+        if transition is not None:
+            await transition
+        await sink.close()
+
+
 @pytest.mark.parametrize("close_during_recovery", [False, True])
 async def test_start_rechecks_lifecycle_after_waiting_for_recovery(
     tmp_path, monkeypatch, close_during_recovery,
@@ -223,15 +356,13 @@ async def test_all_usage_events_share_device_across_profiles_and_surfaces(tmp_pa
                 surface=surface, entrypoint=ClientEntrypoint.CHAT,
                 execution_mode=ExecutionMode.GATEWAY,
             )
-        assert await sink.record_metaskill_usage("synthetic-metaskill-run", STARTED_AT)
-        assert await sink.record_coding_mode_usage("synthetic-coding-run", STARTED_AT)
         await sink.close()
         events.extend(runtime.events)
 
     assert len({event.analytics_user_id for event in events}) == 2
     assert {event.device_id for event in events} == {"1" * 64}
     assert {event.event_name for event in events} == {
-        "product_active", "client_launch", "metaskill_usage", "coding_mode_usage",
+        "product_active", "client_launch",
     }
 
 
@@ -304,8 +435,6 @@ async def test_disabled_growth_never_resolves_device_identity(tmp_path, monkeypa
     runtime = CapturingRuntime()
     sink = _sink(runtime, _config(tmp_path, enabled=False))
     assert not await sink.record_product_active(surface=ClientSurface.CLI)
-    assert not await sink.record_metaskill_usage("synthetic-run", STARTED_AT)
-    assert not await sink.record_coding_mode_usage("synthetic-run", STARTED_AT)
     await sink.record_turn_started(STARTED_AT)
     await sink.close()
     assert runtime.events == []
@@ -346,8 +475,6 @@ async def test_usage_producers_upload_valid_wire_and_keep_durable_deduplication(
         try:
             for surface in ClientSurface:
                 await sink.record_product_active(surface=surface)
-            sink.observe_metaskill_usage("synthetic-meta-run")
-            sink.observe_coding_mode_usage("synthetic-coding-run")
             await sink.close()
             await runtime.upload_once(TelemetryScope.GROWTH)
             outbox = runtime._scopes[TelemetryScope.GROWTH].outbox
@@ -358,8 +485,6 @@ async def test_usage_producers_upload_valid_wire_and_keep_durable_deduplication(
 
     await record_and_upload()
     assert [event.event_name for event in received].count("product_active") == 4
-    assert [event.event_name for event in received].count("metaskill_usage") == 1
-    assert [event.event_name for event in received].count("coding_mode_usage") == 1
     assert len({event.analytics_user_id for event in received}) == 1
     assert all(
         event.source == ("gateway" if event.event_name == "product_active" else "runtime")
@@ -386,13 +511,18 @@ async def test_shutdown_preserves_growth_observation_blocked_behind_stalled_uplo
     )
     entered = asyncio.Event()
     release = asyncio.Event()
+    cancelled = asyncio.Event()
     requests = 0
 
     async def stalled(request: httpx.Request) -> httpx.Response:
         nonlocal requests
         requests += 1
         entered.set()
-        await release.wait()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         return httpx.Response(503)
 
     monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
@@ -404,26 +534,34 @@ async def test_shutdown_preserves_growth_observation_blocked_behind_stalled_uplo
             config=config, base_url="https://telemetry.invalid", env={},
         )
         sink = GrowthEventSink(runtime, config=config)
+        shutdown_task = None
         try:
             assert await sink.record_product_active(surface=ClientSurface.TUI)
             # Keep unrelated Reliability outbox setup outside the shutdown race watchdog.
             assert await runtime._scope_runtime(TelemetryScope.RELIABILITY) is not None
             await runtime.start()
             await asyncio.wait_for(entered.wait(), timeout=1)
-            sink.observe_metaskill_usage("synthetic-run-before-close")
+            sink.observe_product_active(surface=ClientSurface.CLI)
 
             # A pending observation needs the same consent lock as the in-flight
             # send. Begin the network deadline before draining producer tasks.
             runtime.prepare_shutdown()
-            await asyncio.wait_for(sink.close(), timeout=1)
-            record = read_metaskill_usage_state(sink.metaskill_usage_path)[
-                "synthetic-run-before-close"
-            ]
+            shutdown_task = asyncio.create_task(sink.close())
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+            # The network deadline must release the consent lock promptly, but
+            # durable JSON/SQLite writes are allowed to finish after that deadline.
+            await shutdown_task
+            record = next(
+                record for record in read_product_active_state(sink.product_active_path).values()
+                if record.event.surface == ClientSurface.CLI
+            )
             assert record.status is GrowthMilestoneStatus.ENQUEUED
-            await asyncio.wait_for(runtime.close(), timeout=1)
+            await runtime.close()
             assert requests == 1
         finally:
             release.set()
+            if shutdown_task is not None:
+                await asyncio.gather(shutdown_task, return_exceptions=True)
             await sink.close()
             await runtime.close(flush=False)
 
@@ -585,13 +723,11 @@ async def test_repeatable_usage_records_without_desktop_cohort_or_consent_fields
         entrypoint=ClientEntrypoint.CHAT,
         execution_mode=ExecutionMode.STANDALONE,
     )
-    assert await sink.record_metaskill_usage("meta-run", STARTED_AT)
-    assert await sink.record_coding_mode_usage("coding-run", STARTED_AT)
     await sink.record_turn_started(STARTED_AT)
     await sink.record_turn_succeeded(SUCCEEDED_AT)
 
     assert [event.event_name for event in runtime.events] == [
-        "client_launch", "metaskill_usage", "coding_mode_usage",
+        "client_launch",
     ]
     identities = {event.analytics_user_id for event in runtime.events}
     assert len(identities) == 1
@@ -603,7 +739,7 @@ async def test_repeatable_usage_records_without_desktop_cohort_or_consent_fields
     config = _config(tmp_path)
     config.privacy = SimpleNamespace(disable_network_observability=False)
     resumed = _sink(runtime, config)
-    assert await resumed.record_metaskill_usage("second-meta-run", SUCCEEDED_AT)
+    assert await resumed.record_product_active(surface=ClientSurface.CLI)
     assert runtime.events[-1].analytics_user_id in identities
     await resumed.close()
 
@@ -616,8 +752,6 @@ async def test_global_pause_never_creates_usage_identity_and_resumes_existing_id
     runtime = CapturingRuntime()
     sink = _sink(runtime, config)
 
-    assert not await sink.record_metaskill_usage("paused-run", STARTED_AT)
-    assert not await sink.record_coding_mode_usage("paused-coding", STARTED_AT)
     assert not await sink.record_client_launch(
         surface=ClientSurface.TUI,
         entrypoint=ClientEntrypoint.CHAT,
@@ -627,12 +761,12 @@ async def test_global_pause_never_creates_usage_identity_and_resumes_existing_id
     assert runtime.events == []
 
     config.privacy.disable_network_observability = False
-    assert await sink.record_coding_mode_usage("first-use", STARTED_AT)
+    assert await sink.record_product_active(surface=ClientSurface.CLI)
     identity = runtime.events[-1].analytics_user_id
     config.privacy.disable_network_observability = True
-    assert not await sink.record_coding_mode_usage("paused-second", STARTED_AT)
+    assert not await sink.record_product_active(surface=ClientSurface.TUI)
     config.privacy.disable_network_observability = False
-    assert await sink.record_coding_mode_usage("resumed-use", SUCCEEDED_AT)
+    assert await sink.record_product_active(surface=ClientSurface.TUI)
     assert runtime.events[-1].analytics_user_id == identity
     assert not growth_cohort_state_path(config=config).exists()
     await sink.close()
@@ -946,229 +1080,132 @@ async def test_client_launch_retry_reuses_event_id(tmp_path) -> None:
     assert runtime.events[0].event_id == runtime.events[1].event_id
 
 
-async def test_metaskill_usage_counts_new_runs_once_without_payload_details(tmp_path) -> None:
-    config = _config(tmp_path)
-    _activate(config)
+async def test_launch_observations_coalesce_and_close_drains_original_day(
+    tmp_path, monkeypatch,
+) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
     runtime = CapturingRuntime()
-    sink = _sink(runtime, config)
+    sink = _sink(runtime, _config(tmp_path))
+    now = [STARTED_AT]
+    sink._clock = lambda: now[0]
+    entered = threading.Event()
+    release = threading.Event()
+    write_state = sink_module.write_client_launch_state
 
-    first = await sink.record_metaskill_usage("run-001", STARTED_AT)
-    duplicate = await sink.record_metaskill_usage("run-001", SUCCEEDED_AT)
-    second = await sink.record_metaskill_usage("run-002", SUCCEEDED_AT)
+    def delayed_write(path, records):
+        entered.set()
+        assert release.wait(5)
+        write_state(path, records)
 
-    assert first is True
-    assert duplicate is False
-    assert second is True
-    assert [event.event_name for event in runtime.events] == [
-        "metaskill_usage",
-        "metaskill_usage",
-    ]
-    assert all(
-        set(event.model_dump(mode="json"))
-        == {
-            "occurred_at_utc",
-            "event_name",
-            "event_version",
-            "event_id",
-            "source",
-            "app_version",
-            "platform",
-            "outcome",
-            "error_code",
-            "duration_ms",
-            "consent_scope",
-            "notice_version",
-            "sample_rate",
-            "analytics_user_id",
-            "device_id",
-        }
-        for event in runtime.events
-    )
-    records = read_metaskill_usage_state(sink.metaskill_usage_path)
-    assert set(records) == {"run-001", "run-002"}
-    assert all(record.status is GrowthMilestoneStatus.ENQUEUED for record in records.values())
+    monkeypatch.setattr(sink_module, "write_client_launch_state", delayed_write)
+    arguments = {
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }
+    for _ in range(1_000):
+        sink.observe_client_launch(**arguments)
+    assert len(sink._tasks) == 1
+    now[0] += timedelta(days=1)
+    closing = asyncio.create_task(sink.close())
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not closing.done()
+        assert not runtime.events
+    finally:
+        release.set()
+        await asyncio.wait_for(closing, 2)
 
-
-async def test_metaskill_usage_retry_reuses_event_id_after_eviction(tmp_path) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.RECORDED])
-    sink = _sink(runtime, config)
-
-    first = await sink.record_metaskill_usage("run-retry", STARTED_AT)
-    second = await sink.record_metaskill_usage("run-retry", SUCCEEDED_AT)
-
-    assert first is False
-    assert second is True
-    assert runtime.events[0] == runtime.events[1]
+    assert len(runtime.events) == 1
+    event = runtime.events[0]
+    assert event.occurred_at_utc == STARTED_AT
+    assert event.entrypoint is ClientEntrypoint.AGENT
+    assert event.execution_mode is ExecutionMode.ONE_SHOT
+    records = read_client_launch_state(sink._client_launch_path)
+    assert len(records) == 1
+    assert next(iter(records.values())).status is GrowthMilestoneStatus.ENQUEUED
+    assert not sink._tasks
 
 
-async def test_accepted_metaskill_observation_is_drained_during_close(tmp_path) -> None:
-    config = _config(tmp_path)
-    _activate(config)
+@pytest.mark.parametrize("resumed", [False, True])
+async def test_daily_launch_cache_skips_state_io_after_acknowledgement(
+    tmp_path, monkeypatch, resumed,
+) -> None:
     runtime = CapturingRuntime()
-    sink = _sink(runtime, config)
+    sink = _sink(runtime, _config(tmp_path))
+    arguments = {
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }
+    assert await sink.record_client_launch(**arguments)
+    if resumed:
+        await sink.close()
+        sink = _sink(runtime, _config(tmp_path))
+        assert not await sink.record_client_launch(**arguments)
 
-    sink.observe_metaskill_usage("run-before-close")
+    async def unexpected_io(operation):
+        raise AssertionError("completed daily launch must not read or write state again")
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.run_state_io", unexpected_io)
+    for _ in range(100):
+        assert not await sink.record_client_launch(**arguments)
+        sink.observe_client_launch(**arguments)
+    assert not sink._tasks
+    assert len(runtime.events) == 1
     await sink.close()
 
-    assert [event.event_name for event in runtime.events] == ["metaskill_usage"]
-    records = read_metaskill_usage_state(sink.metaskill_usage_path)
-    assert records["run-before-close"].status is GrowthMilestoneStatus.ENQUEUED
 
-
-async def test_coding_mode_usage_counts_started_runs_once_without_payload_details(
-    tmp_path,
-) -> None:
-    config = _config(tmp_path)
-    _activate(config)
+async def test_launch_cache_expires_for_new_days_and_policy_transitions(tmp_path) -> None:
     runtime = CapturingRuntime()
-    sink = _sink(runtime, config)
-
-    first = await sink.record_coding_mode_usage("codetask-001", STARTED_AT)
-    duplicate = await sink.record_coding_mode_usage("codetask-001", SUCCEEDED_AT)
-    second = await sink.record_coding_mode_usage("codetask-002", SUCCEEDED_AT)
-
-    assert first is True
-    assert duplicate is False
-    assert second is True
-    assert [event.event_name for event in runtime.events] == [
-        "coding_mode_usage",
-        "coding_mode_usage",
-    ]
-    assert all(
-        set(event.model_dump(mode="json"))
-        == {
-            "occurred_at_utc",
-            "event_name",
-            "event_version",
-            "event_id",
-            "source",
-            "app_version",
-            "platform",
-            "outcome",
-            "error_code",
-            "duration_ms",
-            "consent_scope",
-            "notice_version",
-            "sample_rate",
-            "analytics_user_id",
-            "device_id",
-        }
-        for event in runtime.events
-    )
-    records = read_coding_mode_usage_state(sink.coding_mode_usage_path)
-    assert set(records) == {"codetask-001", "codetask-002"}
-    assert all(record.status is GrowthMilestoneStatus.ENQUEUED for record in records.values())
+    sink = _sink(runtime, _config(tmp_path))
+    arguments = {
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }
+    assert await sink.record_client_launch(**arguments)
+    async with sink._coordinator.transition(TelemetryScope.GROWTH):
+        sink._client_launch_path.unlink()
+    assert await sink.record_client_launch(**arguments)
+    sink._clock = lambda: STARTED_AT + timedelta(days=1)
+    assert await sink.record_client_launch(**arguments)
+    await sink.close()
+    assert len(runtime.events) == 3
 
 
-async def test_later_turn_retries_pending_feature_usage_with_same_event_id(tmp_path) -> None:
+async def test_start_defers_recovery_io_and_owns_one_drained_worker(tmp_path, monkeypatch) -> None:
+    from opensquilla.telemetry import growth_sink as sink_module
+
     config = _config(tmp_path)
     _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.RECORDED])
-    sink = _sink(runtime, config)
+    sink = _sink(CapturingRuntime(), config)
+    entered = threading.Event()
+    release = threading.Event()
+    read_state = sink_module.read_client_launch_state
 
-    assert await sink.record_metaskill_usage("run-pending", STARTED_AT) is False
-    pending_event = runtime.events[0]
+    def delayed_read(path):
+        entered.set()
+        assert release.wait(5)
+        return read_state(path)
 
-    await sink.record_turn_started(SUCCEEDED_AT)
-
-    assert runtime.events[1] == pending_event
-    records = read_metaskill_usage_state(sink.metaskill_usage_path)
-    assert records["run-pending"].status is GrowthMilestoneStatus.ENQUEUED
-
-
-async def test_client_launch_retries_feature_usage_left_pending_before_restart(
-    tmp_path,
-) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    first_runtime = CapturingRuntime([RecordStatus.EVICTED])
-    first_sink = _sink(first_runtime, config)
-
-    assert await first_sink.record_metaskill_usage("run-before-restart", STARTED_AT) is False
-    pending_event = first_runtime.events[0]
-    await first_sink.close()
-
-    config = _config(tmp_path)
-    resumed_runtime = CapturingRuntime()
-    resumed_sink = _sink(resumed_runtime, config)
-    recorded = await resumed_sink.record_client_launch(
-        surface=ClientSurface.CLI,
-        entrypoint=ClientEntrypoint.CHAT,
-        execution_mode=ExecutionMode.STANDALONE,
-    )
-
-    assert recorded is True
-    assert resumed_runtime.events[0] == pending_event
-    assert resumed_runtime.events[1].event_name == "client_launch"
-    records = read_metaskill_usage_state(resumed_sink.metaskill_usage_path)
-    assert records["run-before-restart"].status is GrowthMilestoneStatus.ENQUEUED
-
-
-async def test_corrupt_coding_ledger_does_not_block_other_growth_events(tmp_path) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime()
-    sink = _sink(runtime, config)
-    sink.coding_mode_usage_path.parent.mkdir(parents=True, exist_ok=True)
-    sink.coding_mode_usage_path.write_text("{not-json", encoding="utf-8")
-
-    assert await sink.record_metaskill_usage("run-valid", STARTED_AT) is True
-    await sink.record_turn_started(SUCCEEDED_AT)
-
-    assert [event.event_name for event in runtime.events] == [
-        "metaskill_usage",
-        "first_turn_started",
-    ]
-    assert sink.coding_mode_usage_path.read_text(encoding="utf-8") == "{not-json"
-
-
-async def test_pending_feature_usage_is_never_removed_by_dedupe_history_limit(
-    tmp_path,
-) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    # Every new observation retries every earlier pending record. Keep every
-    # attempt evicted so all 25 records remain pending at once.
-    runtime = CapturingRuntime([RecordStatus.EVICTED] * 400)
-    sink = _sink(runtime, config)
-
-    for index in range(25):
-        recorded = await sink.record_metaskill_usage(
-            f"run-pending-{index:02d}",
-            STARTED_AT,
-        )
-        assert recorded is False
-
-    records = read_metaskill_usage_state(sink.metaskill_usage_path)
-    assert len(records) == 25
-    assert "run-pending-00" in records
-    assert all(record.status is GrowthMilestoneStatus.PENDING for record in records.values())
-    assert all(revision == 0 for revision in runtime.consent_revisions)
-
-
-async def test_pre_disclosure_feature_ledger_is_not_retried_or_allowed_to_block(
-    tmp_path,
-) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    old_runtime = CapturingRuntime()
-    old_sink = _sink(old_runtime, config)
-    assert await old_sink.record_metaskill_usage("old-run", STARTED_AT) is True
-    await old_sink.close()
-
-    payload = json.loads(old_sink.metaskill_usage_path.read_text(encoding="utf-8"))
-    payload["records"][0]["event"]["notice_version"] = "growth-v1"
-    old_sink.metaskill_usage_path.write_text(json.dumps(payload), encoding="utf-8")
-
-    # Simulate a later process loading the profile after the updated disclosure.
-    config = _config(tmp_path)
-    runtime = CapturingRuntime()
-    sink = _sink(runtime, config)
-    assert await sink.record_metaskill_usage("new-run", SUCCEEDED_AT) is True
-
-    assert [event.event_name for event in runtime.events] == ["metaskill_usage"]
-    assert runtime.events[0].notice_version == "growth-v2"
-    records = read_metaskill_usage_state(sink.metaskill_usage_path)
-    assert set(records) == {"new-run"}
+    monkeypatch.setattr(sink_module, "read_client_launch_state", delayed_read)
+    await asyncio.wait_for(sink.start(), 1)
+    replay_task = sink._retry_task
+    await sink.start()
+    assert sink._retry_task is replay_task
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        closing = asyncio.create_task(sink.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+    finally:
+        release.set()
+        if closing is not None:
+            await asyncio.wait_for(closing, 2)
+        else:
+            await sink.close()
+    assert replay_task.done()
+    assert sink._retry_task is None

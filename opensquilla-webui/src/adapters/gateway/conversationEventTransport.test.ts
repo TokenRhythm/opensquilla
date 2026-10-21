@@ -29,6 +29,65 @@ function harness() {
 }
 
 describe('conversation event transport adapter', () => {
+  it('keeps the main conversation subscribed when a side panel opens and closes', () => {
+    const { rpc, transport } = harness()
+    const main = vi.fn()
+    const side = vi.fn()
+    const closeMain = transport.subscribe({ onEvent: main })
+    const closeSide = transport.subscribe({ onEvent: side })
+    expect(rpc.registered('*')).toBe(1)
+    expect(rpc.registered('_state')).toBe(1)
+    rpc.emit('*', 'sessions.changed', { key: 'main' })
+    expect(main).toHaveBeenCalledOnce()
+    expect(side).toHaveBeenCalledOnce()
+    closeSide()
+    closeSide()
+    rpc.emit('*', 'sessions.changed', { key: 'main' })
+    expect(main).toHaveBeenCalledTimes(2)
+    expect(side).toHaveBeenCalledOnce()
+    expect(rpc.registered('*')).toBe(1)
+    closeMain()
+    expect(rpc.registered('*')).toBe(0)
+  })
+
+  it('combines consumption proof and requires recovery for every affected session', async () => {
+    const consumed = new Map<string, TransportConsumptionHandler>()
+    let gap!: TransportGapHandler
+    const transport = createConversationEventTransport({
+      subscribe: () => ({ close() {} }),
+      subscribeConsumed: (event, handler) => { consumed.set(event, handler); return { close() {} } },
+      subscribeGap: handler => { gap = handler; return { close() {} } },
+    })
+    const recoverMain = vi.fn(async (scope: { keys: readonly string[]; global: boolean }) => scope.global || scope.keys[0] === 'main')
+    const recoverSide = vi.fn(async (scope: { keys: readonly string[]; global: boolean }) => !scope.global && scope.keys[0] === 'side')
+    transport.subscribe({ onEvent: () => 'applied', onRecoveryRequired: recoverMain })
+    const closeSide = transport.subscribe({ onEvent: () => Promise.resolve('dirty'), onRecoveryRequired: recoverSide })
+    const receive = consumed.get('session.event.text_delta')!
+    await expect(receive({ key: 'main', text: 'x' }, {})).resolves.toBe('dirty')
+    await expect(gap({ keys: ['main', 'side'], global: false })).resolves.toBe(true)
+    await expect(gap({ keys: ['main', 'unknown'], global: false })).resolves.toBe(false)
+    await expect(gap({ global: true })).resolves.toBe(false)
+    closeSide()
+    await expect(receive({ key: 'main', text: 'x' }, {})).resolves.toBe('applied')
+    transport.unsubscribe()
+  })
+
+  it('does not acknowledge an async consumer after its panel detached', async () => {
+    const consumed = new Map<string, TransportConsumptionHandler>()
+    const transport = createConversationEventTransport({
+      subscribe: () => ({ close() {} }),
+      subscribeConsumed: (event, handler) => { consumed.set(event, handler); return { close() {} } },
+    })
+    let complete!: (result: string) => void
+    transport.subscribe({ onEvent: () => 'applied' })
+    const closeSide = transport.subscribe({ onEvent: () => new Promise(resolve => { complete = resolve }) })
+    const pending = consumed.get('session.event.text_delta')!({ key: 'side', text: 'x' }, {})
+    closeSide()
+    complete('applied')
+    await expect(pending).rejects.toThrow('superseded')
+    transport.unsubscribe()
+  })
+
   it('projects process completion with distinct durable owner and execution identities', () => {
     const { rpc, transport } = harness()
     const observed = vi.fn<(event: ConversationEvent) => void>()

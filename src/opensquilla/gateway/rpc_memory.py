@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.memory.source_paths import resolve_memory_source_path
 from opensquilla.memory.types import (
     DEFAULT_MEMORY_SEARCH_MIN_SCORE,
     DEFAULT_MEMORY_SEARCH_RESULTS,
@@ -81,22 +83,24 @@ def _result_to_wire(result: Any) -> dict[str, Any]:
     }
 
 
-def _memory_source_rows(root: Path) -> list[dict[str, Any]]:
+def _memory_source_rows(root: Path, *, notes_dir: Path | None = None) -> list[dict[str, Any]]:
     resolved_root = root.resolve()
-    candidates: list[Path] = []
+    candidates: list[tuple[str, Path]] = []
     memory_md = resolved_root / "MEMORY.md"
     if memory_md.is_file():
-        candidates.append(memory_md)
-    memory_dir = resolved_root / "memory"
+        candidates.append(("MEMORY.md", memory_md))
+    memory_dir = notes_dir.resolve() if notes_dir is not None else resolved_root / "memory"
     if memory_dir.is_dir():
-        candidates.extend(path for path in memory_dir.rglob("*.md") if path.is_file())
+        candidates.extend(
+            ((Path("memory") / path.relative_to(memory_dir)).as_posix(), path)
+            for path in memory_dir.rglob("*.md") if path.is_file()
+        )
 
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for file_path in candidates:
+    for rel, _file_path in candidates:
         try:
-            resolved_file = file_path.resolve()
-            rel = resolved_file.relative_to(resolved_root).as_posix()
+            resolved_file = resolve_memory_source_path(resolved_root, memory_dir, rel).resolve()
         except ValueError:
             continue
         if rel in seen or not _is_memory_source_path(rel):
@@ -136,7 +140,7 @@ async def _handle_memory_list(params: dict | None, ctx: RpcContext) -> dict[str,
         raise ValueError("params must be an object")
     agent_id, manager = _require_memory_manager(ctx, (params or {}).get("agentId"))
     root = _memory_root(manager)
-    rows = _memory_source_rows(root)
+    rows = await asyncio.to_thread(_memory_source_rows, root, notes_dir=_memory_notes_dir(manager))
     return {"agentId": agent_id, "count": len(rows), "files": rows}
 
 
@@ -172,6 +176,13 @@ def _memory_root(manager: Any) -> Path:
     if root is None:
         raise RpcUnavailableError("Memory workspace directory is not configured")
     return Path(root)
+
+
+def _memory_notes_dir(manager: Any) -> Path:
+    notes = (
+        getattr(manager, "memory_dir", None) if getattr(manager, "workspace_dir", None) else None
+    )
+    return Path(notes) if notes is not None else _memory_root(manager) / "memory"
 
 
 @_d.method("memory.index", scope="operator.admin")
@@ -254,26 +265,20 @@ def _read_memory_content(
     return "".join(parts), selected_line_count, truncated
 
 
-@_d.method("memory.show", scope="operator.read")
-async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-    raw_path = str(params.get("path") or "")
-    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
-
-    _validate_memory_path(raw_path)
-
-    from_line = params.get("fromLine")
-    if from_line is not None:
-        from_line = _int_param(params, "fromLine", 1, minimum=1, maximum=1_000_000)
-    lines = params.get("lines")
-    if lines is not None:
-        lines = _int_param(params, "lines", 1, minimum=1, maximum=_MAX_MEMORY_SHOW_LINES)
-
-    root = _memory_root(manager).resolve()
-    file_path = (root / raw_path).resolve()
+def _read_memory_source(
+    root: Path,
+    raw_path: str,
+    *,
+    from_line: int | None,
+    lines: int | None,
+    notes_dir: Path | None = None,
+) -> tuple[str, int, bool]:
+    """Keep filesystem authorization and the bounded read in one worker."""
+    root = root.resolve()
     try:
-        file_path.relative_to(root)
+        file_path = resolve_memory_source_path(
+            root, notes_dir if notes_dir is not None else root / "memory", raw_path,
+        ).resolve()
     except ValueError as exc:
         raise ValueError("path traversal is not allowed") from exc
     if not file_path.is_file():
@@ -286,10 +291,35 @@ async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str,
     ):
         raise ValueError("memory source is too large; request a line slice")
 
-    content, selected_line_count, truncated = _read_memory_content(
+    return _read_memory_content(
         file_path,
         from_line=from_line,
         lines=lines,
+    )
+
+
+@_d.method("memory.show", scope="operator.read")
+async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    raw_path = str(params.get("path") or "")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    _validate_memory_path(raw_path)
+
+    from_line = params.get("fromLine")
+    if from_line is not None:
+        from_line = _int_param(params, "fromLine", 1, minimum=1, maximum=1_000_000)
+    lines = params.get("lines")
+    if lines is not None:
+        lines = _int_param(params, "lines", 1, minimum=1, maximum=_MAX_MEMORY_SHOW_LINES)
+
+    content, selected_line_count, truncated = await asyncio.to_thread(
+        _read_memory_source,
+        _memory_root(manager),
+        raw_path,
+        from_line=from_line,
+        lines=lines,
+        notes_dir=_memory_notes_dir(manager),
     )
 
     return {

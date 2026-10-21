@@ -123,7 +123,7 @@ test('native large-window pressure compacts real browser history and stays below
 
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   await page.goto('/control/chat/new')
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 30_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 30_000 })
   const composer = page.locator('.chat-textarea')
   const send = async (text: string, marker?: string) => {
     const before = await evidence()

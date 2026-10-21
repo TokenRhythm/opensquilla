@@ -150,6 +150,7 @@ class AdmitTurn:
     attachments: tuple[dict[str, Any], ...] = ()
     workspace_files: tuple[dict[str, Any], ...] = ()
     selected_skills: tuple[dict[str, str], ...] = ()
+    local_path_references: tuple[str, ...] = ()
     intent: str = "continue"
     intent_was_provided: bool = False
     fork_before_message_id: str | None = None
@@ -163,6 +164,12 @@ class AdmitTurn:
     initial_model: str | None = None
     initial_provider: str | None = None
     pending_input: PendingInputGuard | None = None
+    # Optional external capabilities that must be ready before durable
+    # acceptance. This is an internal producer hint: ordinary chat remains
+    # independent of MCP/channel warmups, while a tool-dependent producer can
+    # fail before it writes a receipt instead of silently running without its
+    # requested tools.
+    required_services: tuple[str, ...] = ()
 
     # Only internal Plan/background producers supply these controls. Gateway
     # decoders never derive them from untrusted request fields.
@@ -193,6 +200,7 @@ class SteerTurn:
     is_web_source: bool = True
     has_non_text_input: bool = False
     pending_input: PendingInputGuard | None = None
+    local_path_references: tuple[str, ...] = ()
 
 
 class TurnIngressPort(Protocol):

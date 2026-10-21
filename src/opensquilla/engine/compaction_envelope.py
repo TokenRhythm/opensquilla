@@ -6,12 +6,13 @@ from dataclasses import fields, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
+from opensquilla.compaction_timing import resolve_compaction_total_timeout
 from opensquilla.engine.agent import Agent
 from opensquilla.engine.collaboration_prompt import with_collaboration_instructions
 from opensquilla.engine.types import AgentConfig
 from opensquilla.provider.model_catalog import shared_catalog
 from opensquilla.provider.protocol import provider_metadata
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import CallerKind, ToolContext
 
 if TYPE_CHECKING:
     from opensquilla.engine.runtime import TurnRunner
@@ -52,6 +53,7 @@ def prepare_manual_compaction_envelope(
     context_window_known: bool,
     provider_request_max_chars: int,
     workspace_dir: str | None,
+    provider_request_max_chars_explicit_cap: int | None = None,
     caller_tool_context: ToolContext | None = None,
 ) -> Agent:
     """Prepare projection only; never route, invoke a tool, or send an LLM request.
@@ -70,6 +72,7 @@ def prepare_manual_compaction_envelope(
         session_key=ctx.session_key,
         extra_context=runner._extra_context_for_tool_context(ctx),
         workspace_dir=workspace_dir,
+        webui_rendering=ctx.caller_kind is CallerKind.WEB,
     )
     prompt = with_collaboration_instructions(prompt, ctx)
     config = runner._turn_config()
@@ -102,20 +105,25 @@ def prepare_manual_compaction_envelope(
         model_capabilities=capabilities,
         workspace_dir=workspace_dir,
         max_tokens=max_output_tokens,
+        request_timeout=runner._resolve_agent_request_timeout(str(session.session_key), None),
         context_window_tokens=context_window_tokens,
         context_window_known=context_window_known,
-        provider_request_proof_max_chars=provider_request_max_chars,
-        provider_request_proof_max_chars_explicit=False,
+        provider_request_proof_max_chars=(
+            provider_request_max_chars_explicit_cap or provider_request_max_chars
+        ),
+        provider_request_proof_max_chars_explicit=bool(provider_request_max_chars_explicit_cap),
         thinking=runner._resolve_turn_thinking(turn),
         temperature=getattr(llm_config, "temperature", None),
         top_p=getattr(llm_config, "top_p", None),
         materialize_historical_attachments=bool(workspace_dir),
         compaction_profile=getattr(compaction_config, "compaction_profile", "conversation"),
+        compaction_enabled=getattr(compaction_config, "enabled", True),
         compaction_protected_recent_messages=getattr(
             compaction_config, "protected_recent_messages", 0,
         ),
-        compaction_total_timeout_seconds=getattr(
-            compaction_config, "total_timeout_seconds", 120.0,
+        compaction_timeout_seconds=getattr(compaction_config, "timeout_seconds", None),
+        compaction_total_timeout_seconds=resolve_compaction_total_timeout(
+            getattr(compaction_config, "total_timeout_seconds", None),
         ),
         compaction_heartbeat_interval_seconds=getattr(
             compaction_config, "heartbeat_interval_seconds", 15.0,
@@ -126,9 +134,12 @@ def prepare_manual_compaction_envelope(
     )
     # No dispatch handler, ToolContext, hooks, session writer, memory warmer or
     # usage sink is bound to this projection-only Agent.
-    return Agent(
+    agent = Agent(
         provider=provider,
         config=agent_config,
         tool_definitions=tool_defs,
         session_key=ctx.session_key,
     )
+    agent._compaction_media_root = runner._attachment_media_root()
+    agent._compaction_session_id = str(getattr(session, "session_id", "") or "")
+    return agent

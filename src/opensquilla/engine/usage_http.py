@@ -1,10 +1,7 @@
-"""Usage accounting for direct OpenAI-compatible JSON requests.
+"""Usage accounting for requests outside the ``Provider.chat`` stream.
 
-Most model traffic flows through ``Provider.chat`` and is accounted by the
-stream wrapper.  A small number of internal helpers intentionally issue a
-non-streaming ``/chat/completions`` request directly.  This module gives those
-helpers the same fail-closed start barrier and terminal receipt semantics
-without coupling them to SQLite or duplicating provider calls.
+Direct chat helpers and media/search adapters share the start barrier and
+terminal receipt handling here. Persistence stays behind the usage event sink.
 """
 
 from __future__ import annotations
@@ -24,6 +21,7 @@ from opensquilla.engine.usage_accounting import (
     mark_usage_call_unknown,
     start_usage_call,
 )
+from opensquilla.provider.media_pricing import media_estimate, media_settlement
 from opensquilla.provider.openai import (
     _billing_result,
     _exact_provider_billing_payload,
@@ -196,6 +194,55 @@ class DirectUsageReservation:
     call: UsageCallStart | None
     base_url: str = ""
     terminal: bool = False
+    operation_kind: str = "llm"
+    measurement_dimensions: Mapping[str, str] | None = None
+
+    async def finalize_measurement(
+        self,
+        *,
+        meters: tuple[Any, ...] = (),
+        settlement: Any = None,
+        token_usage_known: bool = False,
+        done: Any = None,
+    ) -> bool:
+        """Finish a non-token request without inventing a zero-dollar receipt.
+
+        Measurements and money have independent provenance. A successful
+        request with known credits/seconds but no price remains unpriced.
+        """
+        if self.terminal or self.scope is None or self.call is None:
+            return self.scope is None
+        from opensquilla.usage_metering import UsageSettlementRevision
+
+        if done is None:
+            done = SimpleNamespace(kind="done", model=self.call.model, provider=self.call.provider)
+        done.usage_meters = meters
+        done.token_usage_known = token_usage_known
+        done.settlement = settlement or UsageSettlementRevision(
+            revision_id="initial",
+            authority="unknown",
+            status="unknown",
+            reason_code="provider_amount_unavailable",
+        )
+        if settlement is None or (
+            settlement.authority == "unknown" and settlement.status == "pending"
+        ):
+            snapshot, estimate = media_estimate(
+                provider=self.call.provider,
+                model=self.call.model,
+                operation=self.operation_kind,
+                base_url=self.base_url,
+                meters=meters,
+                dimensions=self.measurement_dimensions or {},
+            )
+            if snapshot is not None:
+                done.price_snapshot = snapshot
+            selected_settlement = media_settlement(settlement, estimate)
+            if selected_settlement is not None:
+                done.settlement = selected_settlement
+        self.terminal = True
+        await finalize_usage_call(self.scope, self.call, done)
+        return True
 
     async def finalize_openai_response(
         self,
@@ -214,25 +261,73 @@ class DirectUsageReservation:
 
         if self.terminal or self.scope is None or self.call is None:
             return self.scope is None
+        # Media providers can return a monetary receipt inside ``usage`` while
+        # omitting token counters. Parse the independent receipt first instead
+        # of manufacturing token zeros or discarding a valid charge.
+        if allow_billing_only or self.operation_kind != "llm":
+            from opensquilla.provider.metered_http import response_measurement
+
+            try:
+                if not isinstance(payload, Mapping):
+                    raise ValueError("provider response must be an object")
+                meters, settlement = response_measurement(
+                    provider=self.call.provider,
+                    operation=self.operation_kind,
+                    payload=payload,
+                    base_url=self.base_url,
+                    raw_json=raw_json,
+                    dimensions=self.measurement_dimensions or {},
+                )
+                try:
+                    done = openai_compatible_done_event(
+                        payload,
+                        default_model=self.call.model,
+                        provider_kind=self.call.provider,
+                        base_url=self.base_url,
+                        billing_payload=_exact_provider_billing_payload(
+                            self.call.provider,
+                            payload,
+                            raw_json,
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    done = None
+                token_known = done is not None
+                if done is None and settlement is not None:
+                    billing = _ProviderBillingAccumulator()
+                    billing.update(
+                        self.call.provider,
+                        _exact_provider_billing_payload(self.call.provider, payload, raw_json),
+                    )
+                    _, _, receipt = _billing_result(
+                        provider_kind=self.call.provider,
+                        base_url=self.base_url,
+                        usage=_UsageSnapshotAccumulator(),
+                        billing=billing,
+                        model=self.call.model,
+                    )
+                    done = SimpleNamespace(
+                        kind="done",
+                        model=self.call.model,
+                        provider=self.call.provider,
+                        billing_receipt=receipt,
+                    )
+                if settlement is not None or meters or done is not None:
+                    return await self.finalize_measurement(
+                        meters=meters,
+                        settlement=settlement,
+                        token_usage_known=token_known,
+                        done=done,
+                    )
+            except (TypeError, ValueError, OverflowError):
+                pass
+            await self.mark_unknown("missing_or_invalid_usage_receipt")
+            return False
         try:
             if not isinstance(payload, Mapping):
                 raise ValueError("provider response must be an object")
-            billing_only = allow_billing_only and not isinstance(
-                payload.get("usage"),
-                Mapping,
-            )
-            normalized_payload: Mapping[str, Any] = payload
-            if billing_only:
-                normalized_payload = {
-                    **payload,
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                    },
-                }
             done = openai_compatible_done_event(
-                normalized_payload,
+                payload,
                 default_model=self.call.model,
                 provider_kind=self.call.provider,
                 base_url=self.base_url,
@@ -242,8 +337,6 @@ class DirectUsageReservation:
                     raw_json,
                 ),
             )
-            if billing_only and getattr(done, "billing_receipt", None) is None:
-                raise ValueError("provider response has no trusted billing receipt")
         except (TypeError, ValueError):
             await self.mark_unknown("missing_or_invalid_usage_receipt")
             return False
@@ -263,14 +356,28 @@ async def reserve_direct_usage_call(
     provider: str,
     model: str,
     base_url: str = "",
+    operation_kind: str = "llm",
+    measurement_dimensions: Mapping[str, str] | None = None,
 ) -> DirectUsageReservation:
     """Commit a start row for a direct request when an accounting scope exists."""
 
     scope = current_usage_accounting_scope()
     if scope is None:
-        return DirectUsageReservation(scope=None, call=None, base_url=base_url)
+        return DirectUsageReservation(
+            scope=None,
+            call=None,
+            base_url=base_url,
+            operation_kind=operation_kind,
+            measurement_dimensions=measurement_dimensions,
+        )
     call = await start_usage_call(scope, provider=provider, model=model)
-    return DirectUsageReservation(scope=scope, call=call, base_url=base_url)
+    return DirectUsageReservation(
+        scope=scope,
+        call=call,
+        base_url=base_url,
+        operation_kind=operation_kind,
+        measurement_dimensions=measurement_dimensions,
+    )
 
 
 __all__ = [

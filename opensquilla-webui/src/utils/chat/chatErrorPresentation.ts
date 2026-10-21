@@ -40,7 +40,7 @@ function stableValue(value: unknown): string {
 
 const TIMEOUTS = new Set([
   'timeout', 'llm_timeout', 'iteration_timeout', 'stream_idle_timeout',
-  'hard_deadline_exceeded', 'provider_retry_after_deadline', 'agent_runtime_timeout',
+  'hard_deadline_exceeded', 'agent_runtime_timeout',
 ])
 const STOPPED = new Set(['cancelled', 'cancelled_before_start', 'user_cancelled'])
 const INTERRUPTED = new Set(['abandoned', 'interrupted', 'shutdown_timeout', 'dropped_by_overflow'])
@@ -65,13 +65,14 @@ const INCOMPLETE_RESPONSES = new Set([
   'silent_reply_not_allowed', 'model_repetition_loop_detected',
 ])
 const PROVIDER_PRESENTATIONS = new Map<string, ChatErrorPresentation>([
-  ['rate_limited', presentation('busy')],
+  ['rate_limited', presentation('rateLimited')],
   ['provider_overloaded', presentation('busy')],
   ['auth_invalid', presentation('credentials', 'open-provider-settings')],
   ['context_overflow', presentation('contextLimit', 'choose-model')],
   ['unsupported_feature', presentation('unsupported', 'choose-model')],
   ['insufficient_credits', presentation('credits', 'open-provider-settings')],
-  ['usage_limit_reached', presentation('credits', 'open-provider-settings')],
+  ['usage_limit', presentation('usageLimit')],
+  ['usage_limit_reached', presentation('usageLimit')],
   ['model_not_found', presentation('modelUnavailable', 'choose-model')],
   ['transport_transient', presentation('unavailable')],
   ['policy_refusal', presentation('refused')],
@@ -97,6 +98,9 @@ export function chatErrorPresentation(input: ChatErrorPresentationInput): ChatEr
   if (causes.some(value => INTERRUPTED.has(value))) return presentation('interrupted')
   if (kind === 'interrupted') return presentation('interrupted')
 
+  if (causes.some(value => ['provider_retry_after_deadline', 'rate_limit_retry_exhausted', 'provider_retry_after_wait_ceiling'].includes(value))) return presentation('rateLimitWaitEnded')
+  if (causes.some(value => ['provider_overload_retry_after_deadline', 'provider_overload_retry_wait_exhausted'].includes(value))) return presentation('busyWaitEnded')
+
   if (causes.some(isUsageAccountingBarrier)) {
     return input.replaySafe === true
       ? { messageKey: 'chat.usageAccountingBlockedMessage', action: 'retry-usage-replay' }
@@ -117,12 +121,6 @@ export function chatErrorPresentation(input: ChatErrorPresentationInput): ChatEr
   if (causes.some(value => ['attachment_capacity_unknown', 'attachment_capacity_unavailable'].includes(value))) {
     return presentation('modelUnavailable', 'open-model-settings')
   }
-  if (causes.some(value => [
-    'compaction_refused_empty_summary', 'context_unsalvageable', 'compaction_failed',
-    'compaction_not_smaller', 'compaction_exhausted', 'compaction_deadline_exceeded',
-  ].includes(value))) {
-    return presentation('contextUnavailable')
-  }
   if (causes.some(value => RUN_LIMITS.has(value))) return presentation('runLimit')
   if (causes.some(value => INCOMPLETE_RESPONSES.has(value))) return presentation('responseIncomplete')
   if (kind === 'budgetlimited') return presentation('runLimit')
@@ -135,6 +133,13 @@ export function chatErrorPresentation(input: ChatErrorPresentationInput): ChatEr
     const classified = PROVIDER_PRESENTATIONS.get(value)
       ?? (value.startsWith('provider_') ? PROVIDER_PRESENTATIONS.get(value.slice('provider_'.length)) : undefined)
     if (classified) return { ...classified }
+  }
+  // A generic recovery failure must not hide a known provider cause or its action.
+  if (causes.some(value => [
+    'compaction_refused_empty_summary', 'context_unsalvageable', 'compaction_failed',
+    'compaction_not_smaller', 'compaction_exhausted', 'compaction_deadline_exceeded',
+  ].includes(value))) {
+    return presentation('contextUnavailable')
   }
   return presentation('unknown')
 }

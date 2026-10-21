@@ -10,6 +10,17 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import type { DisplayAttachment } from '@/types/chat'
 import { isImageDisplayAttachment } from '@/utils/chat/attachments'
 
+/** A handoff from the current thumbnail owner, never a persisted/shared cache. */
+export interface AttachmentImagePreviewSource {
+  readonly key: string
+  readBlob(): Blob | null
+}
+
+export function attachmentImagePreviewKey(attachment: DisplayAttachment, sessionKey: string): string {
+  return JSON.stringify([sessionKey, attachment.renderKey, attachment.download_url,
+    attachment.sha256_ref, attachment.fileSnapshotRef, attachment.mime])
+}
+
 export type ImageLightboxItem =
   | { kind: 'artifact', artifact: ArtifactPayload }
   | { kind: 'attachment', attachment: DisplayAttachment }
@@ -18,13 +29,17 @@ export interface ArtifactImageLightboxRequest {
   image: ImageLightboxItem
   navigationImages: readonly ImageLightboxItem[]
   sessionKey: string
+  /** Visible conversation owner; side resource reads still use sessionKey. */
+  ownerSessionKey?: string
   invoker: HTMLElement | null
+  attachmentPreview?: AttachmentImagePreviewSource
 }
 
 export interface ArtifactImageLightboxOpenRequest {
   artifact: ArtifactPayload
   navigationArtifacts: readonly ArtifactPayload[]
   sessionKey: string
+  ownerSessionKey?: string
 }
 
 export interface ArtifactImageLightboxController {
@@ -33,7 +48,9 @@ export interface ArtifactImageLightboxController {
   openAttachments(request: {
     attachment: DisplayAttachment
     navigationAttachments: readonly DisplayAttachment[]
+    attachmentPreview?: AttachmentImagePreviewSource
     sessionKey: string
+    ownerSessionKey?: string
   }): void
   show(image: ImageLightboxItem): void
   updateNavigation(navigationArtifacts: readonly ArtifactPayload[], sessionKey: string): void
@@ -53,6 +70,7 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
         image: { kind: 'artifact', artifact: nextRequest.artifact },
         navigationImages: nextRequest.navigationArtifacts.map(artifact => ({ kind: 'artifact', artifact })),
         sessionKey: nextRequest.sessionKey,
+        ...(nextRequest.ownerSessionKey ? { ownerSessionKey: nextRequest.ownerSessionKey } : {}),
         invoker: document.activeElement instanceof HTMLElement
           ? document.activeElement
           : null,
@@ -62,10 +80,12 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
       if (!isImageDisplayAttachment(nextRequest.attachment)) return
       request.value = {
         image: { kind: 'attachment', attachment: nextRequest.attachment },
+        attachmentPreview: nextRequest.attachmentPreview,
         navigationImages: nextRequest.navigationAttachments
           .filter(isImageDisplayAttachment)
           .map(attachment => ({ kind: 'attachment', attachment })),
         sessionKey: nextRequest.sessionKey,
+        ...(nextRequest.ownerSessionKey ? { ownerSessionKey: nextRequest.ownerSessionKey } : {}),
         invoker: document.activeElement instanceof HTMLElement ? document.activeElement : null,
       }
     },
@@ -93,10 +113,24 @@ export function provideArtifactImageLightbox(): ArtifactImageLightboxController 
   return controller
 }
 
+export function closeImageLightboxOutsideSession(
+  controller: ArtifactImageLightboxController, sessionKey: string, chatRouteActive: boolean,
+) {
+  const request = controller.request.value
+  if (request && (!chatRouteActive || (request.ownerSessionKey || request.sessionKey) !== sessionKey)) {
+    controller.close()
+  }
+}
+
 export function useArtifactImageLightbox(): ArtifactImageLightboxController {
   const controller = inject(artifactImageLightboxKey, null)
   if (!controller) {
     throw new Error('Artifact image lightbox controller is not provided')
   }
   return controller
+}
+
+/** Optional embedding variant for Workbench panels mounted outside ChatView. */
+export function useOptionalArtifactImageLightbox(): ArtifactImageLightboxController | null {
+  return inject(artifactImageLightboxKey, null)
 }

@@ -298,12 +298,8 @@ def test_all_application_device_counts_deduplicate_profiles_without_legacy_fallb
     }
     assert metrics["clientUsage"]["entrypoints"] == [{"entrypoint": "chat", "users": 2}]
     assert [stage["deduplicatedCount"] for stage in metrics["activation"]["stages"]] == [2] * 4
-    for feature in ("metaskillUsage", "codingModeUsage"):
-        assert metrics[feature]["totalUses"] == 6
-        assert metrics[feature]["uniqueDevices"] == 2
-        assert metrics[feature]["dailyTrend"] == [
-            {"period": "2026-09-01", "uses": 6, "uniqueDevices": 2}
-        ]
+    assert "metaskillUsage" not in metrics
+    assert "codingModeUsage" not in metrics
     assert metrics["deviceIdentity"] == {
         "deduplicationUnit": "device", "uniqueDevices": 2,
         "eventsWithoutDeviceId": 16, "legacyProfileFallback": False,
@@ -478,8 +474,8 @@ def test_legacy_collector_schema_aggregates_both_scopes_without_migration(tmp_pa
     assert [transition["dropoffRate"] for transition in activation["transitions"]] == [None] * 3
     totals = result["growth"]["clientUsage"]["totals"]
     assert (totals["tuiUsers"], totals["cliUsers"]) == (0, 0)
-    assert result["growth"]["metaskillUsage"]["totalUses"] == 0
-    assert result["growth"]["codingModeUsage"]["totalUses"] == 0
+    assert "metaskillUsage" not in result["growth"]
+    assert "codingModeUsage" not in result["growth"]
     for path in (reliability, growth):
         with sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True) as connection:
             assert connection.execute("SELECT protocol_fingerprint FROM meta").fetchone() == (
@@ -1210,117 +1206,4 @@ def test_client_usage_counts_distinct_users_and_terminal_overlap(tmp_path: Path)
         {"entrypoint": "gateway_run", "users": 1},
     ]
     assert "不代表全部实际" in result["observablePopulationNote"]
-    _assert_no_sensitive_output(result)
-
-
-def test_metaskill_usage_counts_runs_and_zero_fills_daily_trend(tmp_path: Path) -> None:
-    queries, _, growth = _queries(tmp_path)
-    _insert(
-        growth,
-        sequence=301,
-        event_name="metaskill_usage",
-        occurred_at="2026-09-01T01:00:00.000Z",
-        source="runtime",
-        analytics_user_id="analytics-a",
-        notice_version="growth-v2",
-    )
-    _insert(
-        growth,
-        sequence=302,
-        event_name="metaskill_usage",
-        occurred_at="2026-09-01T02:00:00.000Z",
-        source="runtime",
-        analytics_user_id="analytics-a",
-        notice_version="growth-v2",
-    )
-    _insert(
-        growth,
-        sequence=303,
-        event_name="metaskill_usage",
-        occurred_at="2026-09-03T02:00:00.000Z",
-        source="runtime",
-        analytics_user_id="analytics-b",
-        notice_version="growth-v2",
-    )
-    # Malformed/other-source rows are not part of the v1 usage contract.
-    _insert(
-        growth,
-        sequence=304,
-        event_name="metaskill_usage",
-        occurred_at="2026-09-03T03:00:00.000Z",
-        source="gateway",
-        analytics_user_id="analytics-b",
-        notice_version="growth-v2",
-    )
-    # Feature-use events require the notice that disclosed ongoing usage counts.
-    _insert(
-        growth,
-        sequence=305,
-        event_name="metaskill_usage",
-        occurred_at="2026-09-03T04:00:00.000Z",
-        source="runtime",
-        analytics_user_id="analytics-b",
-        notice_version="growth-v1",
-    )
-
-    result = queries.growth(_window())["metaskillUsage"]
-
-    assert result["totalUses"] == 3
-    assert result["uniqueDevices"] == 2
-    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 2, "uniqueDevices": 1}
-    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0, "uniqueDevices": 0}
-    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1, "uniqueDevices": 1}
-    _assert_no_sensitive_output(result)
-
-
-def test_coding_mode_usage_counts_started_runs_and_zero_fills_daily_trend(
-    tmp_path: Path,
-) -> None:
-    queries, _, growth = _queries(tmp_path)
-    _insert(
-        growth,
-        sequence=311,
-        event_name="coding_mode_usage",
-        occurred_at="2026-09-01T01:00:00.000Z",
-        source="runtime",
-        analytics_user_id="analytics-a",
-        notice_version="growth-v2",
-    )
-    _insert(
-        growth,
-        sequence=312,
-        event_name="coding_mode_usage",
-        occurred_at="2026-09-03T02:00:00.000Z",
-        source="runtime",
-        analytics_user_id="analytics-b",
-        notice_version="growth-v2",
-    )
-    # Other sources do not satisfy the runtime event contract.
-    _insert(
-        growth,
-        sequence=313,
-        event_name="coding_mode_usage",
-        occurred_at="2026-09-03T03:00:00.000Z",
-        source="gateway",
-        analytics_user_id="analytics-b",
-        notice_version="growth-v2",
-    )
-    _insert(
-        growth,
-        sequence=314,
-        event_name="coding_mode_usage",
-        occurred_at="2026-09-03T04:00:00.000Z",
-        source="runtime",
-        analytics_user_id="analytics-b",
-        notice_version="growth-v1",
-    )
-
-    result = queries.growth(_window())["codingModeUsage"]
-
-    assert result["totalUses"] == 2
-    assert result["uniqueDevices"] == 2
-    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 1, "uniqueDevices": 1}
-    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0, "uniqueDevices": 0}
-    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1, "uniqueDevices": 1}
-    assert "仅开启模式不计数" in result["note"]
     _assert_no_sensitive_output(result)

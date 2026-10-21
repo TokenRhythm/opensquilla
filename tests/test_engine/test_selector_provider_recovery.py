@@ -190,6 +190,12 @@ async def clock(monkeypatch):
         await real_sleep(0)
 
     monkeypatch.setattr(loop, "time", lambda: now[0])
+    from opensquilla.provider import retry_after
+
+    monkeypatch.setattr(
+        retry_after, "_provider_retry_after_cooldowns",
+        retry_after.ProviderRetryAfterCooldowns(clock=loop.time),
+    )
     monkeypatch.setattr("opensquilla.engine.fallback.asyncio.sleep", sleep)
     return now, delays
 
@@ -479,11 +485,16 @@ async def test_connection_wait_is_cancelled_with_current_stream(monkeypatch):
     assert calls == ["primary"]
 
 
-async def test_normal_task_deadline_closes_connection_retry_wait(monkeypatch):
+async def test_normal_task_deadline_closes_connection_retry_wait(monkeypatch, clock):
     provider, _, calls = _wrapper(monkeypatch, {"primary": [[_connection()]]})
-    events = [event async for event in _agent(provider, timeout=0.05).run_turn("run")]
+    events = [event async for event in _agent(provider, timeout=4).run_turn("run")]
     assert calls == ["primary"]
-    assert any(event.kind == "error" and event.code == "agent_runtime_timeout" for event in events)
+    failures = [event for event in events if event.kind == "error"]
+    assert len(failures) == 1
+    assert failures[0].failure_kind == "transport_transient"
+    assert failures[0].http_status is None
+    assert not any(event.kind == "provider_activity" and event.phase == "retry_wait"
+                   for event in events)
 
 
 @pytest.mark.parametrize("timeout", [7, 8])

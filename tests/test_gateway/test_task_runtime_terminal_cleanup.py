@@ -27,7 +27,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.gateway import task_runtime
+from opensquilla.gateway import session_streams, task_runtime
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import (
@@ -70,9 +70,9 @@ def _make_envelope(session_key: str = "agent-1::sess-1") -> RouteEnvelope:
     )
 
 
-def _make_storage() -> Any:
+def _make_storage(*, mock_optional_methods: bool = True) -> Any:
     """Minimal storage mock."""
-    storage = MagicMock()
+    storage = MagicMock() if mock_optional_methods else SimpleNamespace()
     task_db: dict[str, AgentTaskRecord] = {}
 
     async def create(record: AgentTaskRecord) -> None:
@@ -123,6 +123,7 @@ def _make_runtime(
     turn_handler: Callable[..., Awaitable[Any]] | None = None,
     max_concurrency: int = 4,
     max_pending_per_session: int | None = 64,
+    max_resident_tasks: int | None = 256,
 ) -> TaskRuntime:
     async def _default_handler(_run: Any) -> None:
         pass
@@ -132,6 +133,7 @@ def _make_runtime(
         turn_handler=turn_handler or _default_handler,
         max_concurrency=max_concurrency,
         max_pending_per_session=max_pending_per_session,
+        max_resident_tasks=max_resident_tasks,
     )
 
 
@@ -148,8 +150,14 @@ async def test_terminal_clears_all_dicts() -> None:
     """
     rt = _make_runtime()
     env = _make_envelope("agent-1::sess-a")
-    handle = await rt.enqueue(env, "hello")
-    await rt.wait(handle.task_id, timeout=2.0)
+    # A no-op turn has no snapshot. Keep the warning contract in this short
+    # cleanup case instead of generating 10 000 warnings in the growth soak.
+    with capture_logs() as logs:
+        handle = await rt.enqueue(env, "hello")
+        record = await rt.wait(handle.task_id, timeout=2.0)
+    assert record.status is AgentTaskStatus.SUCCEEDED
+    assert "activity_snapshot" not in record.details
+    assert sum(entry["event"] == "task_runtime.activity_snapshot_missing" for entry in logs) == 1
 
     sk = env.session_key
     assert handle.task_id not in rt._tasks
@@ -195,6 +203,49 @@ async def test_terminal_lifecycle_settles_before_session_lane_cleanup() -> None:
     assert await rt.has_session_work(env.session_key) is False
     assert env.session_key not in rt._running_by_session
     assert handle.task_id not in rt._tasks
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_projects_terminal_claim_before_durable_settlement() -> None:
+    """Hydration must not resurrect SQLite RUNNING during terminal persistence."""
+
+    storage = _make_storage()
+    terminal_persist_started = asyncio.Event()
+    release_terminal_persist = asyncio.Event()
+    update_agent_task = storage.update_agent_task
+
+    async def delayed_update(task_id: str, **kwargs: Any) -> None:
+        if kwargs.get("status") in {
+            AgentTaskStatus.SUCCEEDED,
+            AgentTaskStatus.FAILED,
+            AgentTaskStatus.CANCELLED,
+            AgentTaskStatus.TIMEOUT,
+            AgentTaskStatus.ABANDONED,
+        }:
+            terminal_persist_started.set()
+            await release_terminal_persist.wait()
+        await update_agent_task(task_id, **kwargs)
+
+    storage.update_agent_task = delayed_update
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=lambda _run: asyncio.sleep(0),
+        max_concurrency=1,
+    )
+    envelope = _make_envelope("agent-1::sess-terminal-hydrate")
+    handle = await rt.enqueue(envelope, "hello")
+
+    await asyncio.wait_for(terminal_persist_started.wait(), timeout=2.0)
+    snapshot = await rt.session_task_snapshot(envelope.session_key)
+
+    assert snapshot.running_task_id is None
+    assert snapshot.queued_task_ids == ()
+    assert [record.task_id for record in snapshot.terminal_tasks] == [handle.task_id]
+    assert snapshot.terminal_tasks[0].status is AgentTaskStatus.SUCCEEDED
+
+    release_terminal_persist.set()
+    settled = await rt.wait(handle.task_id, timeout=2.0)
+    assert settled.status is AgentTaskStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -2766,89 +2817,166 @@ async def test_exception_path_clears_dicts() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.ci_serial
+@pytest.mark.stress
 async def test_no_leak_under_load(monkeypatch: pytest.MonkeyPatch) -> None:
-    """10 000 tasks, each <=50 ms; dict sizes after GC must be within ±2 of baseline."""
+    """Keep the 10 000-task reclamation/memory soak outside the default suite.
+
+    The short success, exception, and queued-handoff tests above own the
+    per-turn cleanup contracts; this test owns cumulative growth under load.
+    """
     num_tasks = 10_000
     session_count = 50  # rotate sessions to mimic real load
     monkeypatch.setattr(task_runtime, "_emit_metric", lambda *_args, **_kwargs: None)
+    from opensquilla.application import approval_queue
 
-    async def _instant_handler(_run: Any) -> None:
-        pass  # returns immediately — well under 50 ms
+    # Replay-history sizing has its own tests. Retain this synthetic turn's
+    # phase and done event without rescanning an ever-growing history per task.
+    streams = session_streams.SessionStreamRegistry(max_events_per_session=2)
+    monkeypatch.setattr(session_streams, "_session_streams", streams)
 
-    rt = _make_runtime(
+    # This workload has no approvals or activation permits. Keep the async
+    # cleanup boundary without a global SQLite worker or dynamic optional
+    # storage methods and their retained mock-call history.
+    approval_cleanups: dict[str, int] = {}
+
+    async def expire_pending_for_session_async(session_key: str) -> int:
+        approval_cleanups[session_key] = approval_cleanups.get(session_key, 0) + 1
+        return 0
+
+    empty_approval_queue = SimpleNamespace(
+        expire_pending_for_session_async=expire_pending_for_session_async,
+    )
+    monkeypatch.setattr(
+        approval_queue,
+        "get_approval_queue",
+        lambda: empty_approval_queue,
+    )
+    storage = _make_storage(mock_optional_methods=False)
+    executed = 0
+
+    async def _instant_handler(run: Any) -> None:
+        nonlocal executed
+        executed += 1
+        # Model a minimal completed turn through the real snapshot owner. A bare
+        # no-op handler omits the stream contract and emits thousands of unrelated
+        # snapshot-missing warnings instead of exercising normal settlement.
+        common = {"task_id": run.task_id, "turn_id": run.task_id}
+        streams.record(
+            run.envelope.session_key,
+            "session.event.provider_activity",
+            {**common, "phase": "requesting"},
+        )
+        streams.record(
+            run.envelope.session_key,
+            "session.event.done",
+            common,
+        )
+
+    rt = TaskRuntime(
+        storage=storage,
         turn_handler=_instant_handler,
         max_concurrency=32,
         max_pending_per_session=None,
+        # This is a reclamation/leak soak, not an admission-capacity test.
+        # Disable the resident lease so a 500-item batch can be admitted and
+        # drained before the next batch; bounded-resident behavior has its own
+        # contention tests in test_task_runtime_storage_contention.py.
+        max_resident_tasks=None,
     )
 
     # --- baseline snapshot (before any tasks) ---
     gc.collect()
     tracemalloc.start()
-    snap_before = tracemalloc.take_snapshot()
+    try:
+        snap_before = tracemalloc.take_snapshot()
 
-    baseline_tasks = len(rt._tasks)
-    baseline_pending = len(rt._pending_by_session)
-    baseline_running = len(rt._running_by_session)
-    baseline_envelope = len(rt._last_envelope_by_session)
+        baseline_tasks = len(rt._tasks)
+        baseline_pending = len(rt._pending_by_session)
+        baseline_running = len(rt._running_by_session)
+        baseline_envelope = len(rt._last_envelope_by_session)
 
-    # --- run 10 000 tasks ---
-    # Keep the workload at 10 000 tasks, but drain it in bounded batches. A
-    # single gather of 10 000 ``runtime.wait`` calls creates another 10 000
-    # waiter tasks and timer bookkeeping on top of the runtime workload; that
-    # amplification is what made this quantitative check consume a minute on
-    # loaded Windows runners. The shared deadline still catches a stuck task.
-    batch_size = 500
-    deadline = asyncio.get_running_loop().time() + 60.0
-    for batch_start in range(0, num_tasks, batch_size):
-        handles = []
-        for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
-            sk = f"agent-1::sess-load-{i % session_count}"
-            env = _make_envelope(sk)
-            handles.append(await rt.enqueue(env, f"msg-{i}"))
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            raise TimeoutError("task runtime leak workload exceeded its shared deadline")
-        async with asyncio.timeout(remaining):
-            await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+        # --- run 10 000 tasks ---
+        # Keep the workload at 10 000 tasks, but drain it in bounded batches. A
+        # single gather of 10 000 ``runtime.wait`` calls creates another 10 000
+        # waiter tasks and timer bookkeeping on top of the runtime workload; that
+        # amplification is what made this quantitative check consume a minute on
+        # loaded Windows runners. The shared deadline still catches a stuck task.
+        batch_size = 500
+        deadline = asyncio.get_running_loop().time() + 60.0
+        completed_tasks = 0
+        for batch_start in range(0, num_tasks, batch_size):
+            handles = []
+            for i in range(batch_start, min(batch_start + batch_size, num_tasks)):
+                sk = f"agent-1::sess-load-{i % session_count}"
+                env = _make_envelope(sk)
+                handles.append(await rt.enqueue(env, f"msg-{i}"))
+            remaining = deadline - asyncio.get_running_loop().time()
+            timeout_message = (
+                "task runtime leak workload exceeded its shared deadline "
+                f"after {completed_tasks}/{num_tasks} tasks drained"
+            )
+            if remaining <= 0:
+                raise TimeoutError(timeout_message)
+            try:
+                async with asyncio.timeout(remaining):
+                    records = await asyncio.gather(*(rt.wait(h.task_id) for h in handles))
+            except TimeoutError as exc:
+                raise TimeoutError(timeout_message) from exc
+            assert all(record.status is AgentTaskStatus.SUCCEEDED for record in records)
+            assert all(
+                record.details["activity_snapshot"]["complete"] is True
+                for record in records
+            )
+            completed_tasks += len(records)
+        assert completed_tasks == num_tasks
+        records = await storage.list_agent_tasks()
+        assert len(records) == executed == num_tasks
+        assert all(record.status is AgentTaskStatus.SUCCEEDED for record in records)
+        assert approval_cleanups == {
+            f"agent-1::sess-load-{i}": num_tasks // session_count
+            for i in range(session_count)
+        }
 
-    # --- post-GC snapshot ---
-    gc.collect()
-    snap_after = tracemalloc.take_snapshot()
-    tracemalloc.stop()
+        # --- post-GC snapshot ---
+        gc.collect()
+        snap_after = tracemalloc.take_snapshot()
 
-    after_tasks = len(rt._tasks)
-    after_locks = len(rt._session_locks)
-    after_pending = len(rt._pending_by_session)
-    after_running = len(rt._running_by_session)
-    after_envelope = len(rt._last_envelope_by_session)
+        # Check before shutdown: teardown must not hide a terminal cleanup leak.
+        after_tasks = len(rt._tasks)
+        after_locks = len(rt._session_locks)
+        after_pending = len(rt._pending_by_session)
+        after_running = len(rt._running_by_session)
+        after_envelope = len(rt._last_envelope_by_session)
 
-    tolerance = 2
-    assert abs(after_tasks - baseline_tasks) <= tolerance, (
-        f"_tasks leaked: baseline={baseline_tasks}, after={after_tasks}"
-    )
-    # _session_locks is intentionally NOT cleaned at terminal to prevent
-    # split-brain on rapid re-enqueue.  The dict grows by # unique session_keys
-    # (capped at session_count=50 here), not by # tasks.  We verify it is bounded
-    # by session_count rather than by num_tasks.
-    assert after_locks <= session_count + tolerance, (
-        f"_session_locks grew beyond unique session count: {after_locks} > {session_count}"
-    )
-    assert abs(after_pending - baseline_pending) <= tolerance, (
-        f"_pending_by_session leaked: baseline={baseline_pending}, after={after_pending}"
-    )
-    assert abs(after_running - baseline_running) <= tolerance, (
-        f"_running_by_session leaked: baseline={baseline_running}, after={after_running}"
-    )
-    assert abs(after_envelope - baseline_envelope) <= tolerance, (
-        f"_last_envelope_by_session leaked: baseline={baseline_envelope}, after={after_envelope}"
-    )
+        tolerance = 2
+        assert abs(after_tasks - baseline_tasks) <= tolerance, (
+            f"_tasks leaked: baseline={baseline_tasks}, after={after_tasks}"
+        )
+        # _session_locks is intentionally NOT cleaned at terminal to prevent
+        # split-brain on rapid re-enqueue. The dict grows by unique session_keys,
+        # not by tasks, and must stay bounded by the 50 sessions in this soak.
+        assert after_locks <= session_count + tolerance, (
+            f"_session_locks grew beyond unique session count: {after_locks} > {session_count}"
+        )
+        assert abs(after_pending - baseline_pending) <= tolerance, (
+            f"_pending_by_session leaked: baseline={baseline_pending}, after={after_pending}"
+        )
+        assert abs(after_running - baseline_running) <= tolerance, (
+            f"_running_by_session leaked: baseline={baseline_running}, after={after_running}"
+        )
+        assert abs(after_envelope - baseline_envelope) <= tolerance, (
+            "_last_envelope_by_session leaked: "
+            f"baseline={baseline_envelope}, after={after_envelope}"
+        )
 
-    # Confirm memory allocation delta is reasonable (no catastrophic growth).
-    # Informational only — the dict-size assertions above are authoritative.
-    # 10 000 asyncio tasks create significant transient allocation for
-    # Task/Future/Event objects; allow up to 200 MB of incidental growth.
-    top_stats = snap_after.compare_to(snap_before, "lineno")
-    total_added = sum(s.size_diff for s in top_stats if s.size_diff > 0)
-    assert total_added < 200 * 1024 * 1024, (
-        f"Unexpected memory growth: {total_added / 1024:.1f} KB"
-    )
+        # This coarse memory guard complements the precise dict-size checks.
+        # The fake storage intentionally retains all durable task records, so
+        # allow up to 200 MB of growth rather than claiming zero retained memory.
+        top_stats = snap_after.compare_to(snap_before, "lineno")
+        total_added = sum(s.size_diff for s in top_stats if s.size_diff > 0)
+        assert total_added < 200 * 1024 * 1024, (
+            f"Unexpected memory growth: {total_added / 1024:.1f} KB"
+        )
+    finally:
+        tracemalloc.stop()
+        await rt.shutdown()

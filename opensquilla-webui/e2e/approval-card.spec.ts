@@ -1,4 +1,8 @@
 import { test, expect, type Page } from '@playwright/test'
+import type { ApprovalResolveResult } from '../src/contracts/generated/v4/approvalResolve'
+import { helloOkResponse } from './support/gateway-fixture'
+import { chatHistoryPayload, sessionMessagesHydratePayload, sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload } from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
@@ -60,14 +64,63 @@ function snapshot(pending: MockApproval[]) {
   return { pending, mode: 'prompt', allowPatterns: [], denyPatterns: [] }
 }
 
-async function mockApprovalsRoute(page: Page, getPending: () => MockApproval[]) {
+function resolvedApproval(id: string, approved: boolean): ApprovalResolveResult {
+  return { id, mode: 'prompt', resolved: true, approved,
+    resolution: approved ? 'approved' : 'denied', deadline: null, consumed: false, pending: false }
+}
+
+async function mockApprovalsRoute(page: Page, getPending: () => MockApproval[], activeExecution = false, holdSnapshot = false) {
+  // A mocked approval belongs to a mocked, existing conversation. Leaving the
+  // socket live makes this depend on an unrelated Gateway having this test key.
+  const rpcCalls: string[] = []
+  let emit: (event: string, payload: Record<string, unknown>) => void = () => { throw new Error('Gateway socket is not connected') }
+  let releaseSnapshot: () => void = () => { throw new Error('Live snapshot has not been requested') }
+  const activeTask = activeExecution
+    ? { task_id: 'approval-e2e-task', status: 'approval_pending', started_at: Date.now() / 1000 }
+    : null
+  const runtime = activeTask
+    ? { run_status: 'approval_pending', active_task: activeTask, tasks: [activeTask] }
+    : {}
+  const history = activeTask
+    ? [{ id: 'approval-e2e-user', message_id: 'approval-e2e-user', role: 'user', text: 'Run the command that requires approval.' }]
+    : []
+  await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  await page.route('**/api/**', route => route.fulfill({ json: {} }))
   await page.route('**/api/approvals', route =>
     route.fulfill({ json: snapshot(getPending()) }))
+  await page.routeWebSocket(/\/ws$/, ws => {
+    emit = (event, payload) => ws.send(JSON.stringify({ type: 'event', event, payload }))
+    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
+    ws.onMessage(message => {
+      const frame = JSON.parse(String(message)) as { type?: string; id?: string; method?: string }
+      if (frame.type !== 'req') return
+      const method = frame.method || ''
+      rpcCalls.push(method)
+      if (method === 'connect') { ws.send(helloOkResponse()); return }
+      const payloads: Record<string, unknown> = {
+        'chat.history': chatHistoryPayload(history),
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, runtime),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY, { task_id: activeTask?.task_id ?? null }),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, runtime),
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
+        'agents.list': { agents: [] }, 'commands.list_for_surface': { commands: [] },
+        'config.get': { squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} }, permissions: {}, skills: {} },
+        'onboarding.status': { audioConfigured: false },
+        'sandbox.run_mode.preference.get': { runMode: 'standard', source: 'config' },
+        'sandbox.capability.status': { available: false }, 'usage.status': { sessions: [] },
+      }
+      const reply = () => ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: payloads[method] ?? {} }))
+      if (holdSnapshot && method === 'sessions.messages.snapshot') releaseSnapshot = reply
+      else reply()
+    })
+  })
+  return { rpcCalls, emit: (event: string, payload: Record<string, unknown>) => emit(event, payload),
+    releaseSnapshot: () => releaseSnapshot() }
 }
 
 async function openMockedChat(page: Page) {
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await page.waitForSelector('.conn-pill', { timeout: 10000 })
+  await page.waitForSelector('.topbar[data-connection-state]', { timeout: 10000 })
 }
 
 test.describe('In-thread approval card (mocked snapshot)', () => {
@@ -98,6 +151,20 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
     await expect(card).not.toContainText('https://example.com/admin')
     // No command and not a sandbox request — the same-type shortcut never renders.
     await expect(card.getByRole('button', { name: 'Always allow this' })).toHaveCount(0)
+  })
+
+  test('keeps a pending approval when its hydration precedes the idle session snapshot', async ({ page }) => {
+    const gateway = await mockApprovalsRoute(page, () => [genericApproval], false, true)
+    await openMockedChat(page)
+    await expect.poll(() => gateway.rpcCalls.includes('sessions.messages.snapshot')).toBe(true)
+    const card = page.getByTestId('approval-card')
+    await expect(card).toBeVisible()
+    gateway.releaseSnapshot()
+    // The composer becoming ready proves the held snapshot was installed.
+    await expect(page.locator('.chat-run-mode-btn')).toBeEnabled()
+    await expect(card).toBeVisible()
+    await expect(card.getByRole('heading', { name: 'Sensitive operation' })).toBeVisible()
+    await expect(page.locator('.conversation-live-edge')).toHaveCount(0)
   })
 
   test('destructive approval shows the exact target and backup guarantee without internals', async ({ page }) => {
@@ -148,7 +215,7 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
 
   test('Allow once resolves and collapses into an approved outcome row', async ({ page }) => {
     let resolved = false
-    await mockApprovalsRoute(page, () => (resolved ? [] : [execApproval]))
+    await mockApprovalsRoute(page, () => (resolved ? [] : [execApproval]), true)
     await page.route('**/api/approvals/resolve', async route => {
       const body = route.request().postDataJSON() as Record<string, unknown>
       expect(body.id).toBe('ap-e2e-1')
@@ -157,7 +224,7 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
       expect(body.allowAlways).toBeUndefined()
       expect(body.rememberIntent).toBeUndefined()
       resolved = true
-      await route.fulfill({ json: { resolved: true, approved: true } })
+      await route.fulfill({ json: resolvedApproval('ap-e2e-1', true) })
     })
     await openMockedChat(page)
 
@@ -174,14 +241,14 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
   test('Deny sends approved=false exactly once and does not create another agent turn', async ({ page }) => {
     let resolved = false
     let resolveCalls = 0
-    await mockApprovalsRoute(page, () => (resolved ? [] : [execApproval]))
+    const gateway = await mockApprovalsRoute(page, () => (resolved ? [] : [execApproval]), true)
     await page.route('**/api/approvals/resolve', async route => {
       resolveCalls += 1
       const body = route.request().postDataJSON() as Record<string, unknown>
       expect(body.id).toBe('ap-e2e-1')
       expect(body.approved).toBe(false)
       resolved = true
-      await route.fulfill({ json: { resolved: true, approved: false } })
+      await route.fulfill({ json: resolvedApproval('ap-e2e-1', false) })
     })
     await openMockedChat(page)
 
@@ -191,20 +258,76 @@ test.describe('In-thread approval card (mocked snapshot)', () => {
 
     await expect(page.getByTestId('approval-outcome')).toContainText('Denied')
     expect(resolveCalls).toBe(1)
+    expect(gateway.rpcCalls.filter(method => method === 'chat.send')).toEqual([])
   })
 
   test('topbar pill deep-links to the blocked session chat, not the retired approvals destination', async ({ page }) => {
     await mockApprovalsRoute(page, () => [execApproval])
     await openMockedChat(page)
 
-    const pill = page.locator('.approval-inline')
+    const pill = page.getByRole('button', { name: 'Approval required: 1 · Open the blocked session', exact: true })
     await expect(pill).toBeVisible({ timeout: 10000 })
     await pill.click()
 
     await expect(page).toHaveURL(new RegExp('/chat\\?session='))
+    expect(new URL(page.url()).searchParams.get('session')).toBe(SESSION_KEY)
     expect(page.url()).not.toContain('/approvals')
     await expect(page.getByTestId('approval-card')).toBeVisible()
   })
+
+  for (const approved of [true, false]) {
+    test(`standalone idle approval ${approved ? 'Allow once' : 'Deny'} does not manufacture an execution`, async ({ page }) => {
+      let resolveCalls = 0
+      const gateway = await mockApprovalsRoute(page, () => resolveCalls ? [] : [execApproval])
+      await page.route('**/api/approvals/resolve', async route => {
+        expect(route.request().postDataJSON()).toMatchObject({ id: execApproval.id, approved })
+        resolveCalls += 1
+        await route.fulfill({ json: resolvedApproval(execApproval.id, approved) })
+      })
+      await openMockedChat(page)
+      const card = page.getByTestId('approval-card')
+      await expect(card).toBeVisible()
+      await expect(page.locator('.conversation-live-edge')).toHaveCount(0)
+      await expect(page.locator('.chat-run-mode-btn')).toBeEnabled()
+      await card.getByRole('button', { name: approved ? 'Allow once' : 'Deny', exact: true }).click()
+      await expect(card).toHaveCount(0)
+      await expect(page.getByTestId('approval-outcome')).toHaveCount(0)
+      await expect(page.locator('.conversation-live-edge')).toHaveCount(0)
+      await expect(page.locator('.chat-run-mode-btn')).toBeEnabled()
+      await expect(page.locator('.chat-textarea')).toBeEditable()
+      expect(resolveCalls).toBe(1)
+      expect(gateway.rpcCalls.filter(method => method === 'chat.send')).toEqual([])
+    })
+
+    test(`standalone pushed approval ${approved ? 'Allow once' : 'Deny'} keeps execution mode and send usable`, async ({ page }) => {
+      let pending: MockApproval[] = []
+      const gateway = await mockApprovalsRoute(page, () => pending)
+      await page.route('**/api/approvals/resolve', async route => {
+        expect(route.request().postDataJSON()).toMatchObject({ id: execApproval.id, approved })
+        pending = []
+        await route.fulfill({ json: resolvedApproval(execApproval.id, approved) })
+      })
+      await openMockedChat(page)
+      const mode = page.locator('.chat-run-mode-btn')
+      await expect(mode).toBeEnabled()
+      pending = [execApproval]
+      gateway.emit('exec.approval.requested', {
+        ...execApproval, approval_id: execApproval.id, session_key: SESSION_KEY,
+        tool_name: execApproval.toolName, warning: '',
+      })
+      const card = page.getByTestId('approval-card')
+      await expect(card).toBeVisible()
+      await expect(mode).toBeEnabled()
+      await expect(page.locator('.chat-stop-btn')).toHaveCount(0)
+      await card.getByRole('button', { name: approved ? 'Allow once' : 'Deny', exact: true }).click()
+      await expect(card).toHaveCount(0)
+      await expect(mode).toBeEnabled()
+      await expect(page.locator('.conversation-live-edge')).toHaveCount(0)
+      await page.locator('.chat-textarea').fill('Ready for the next message')
+      await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeEnabled()
+      expect(gateway.rpcCalls.filter(method => method === 'chat.send')).toEqual([])
+    })
+  }
 })
 
 test.describe('Approval flow (live gateway, Standard execution mode)', () => {
@@ -221,7 +344,7 @@ test.describe('Approval flow (live gateway, Standard execution mode)', () => {
   test('blocked shell command surfaces a card; Allow once resumes the run', async ({ page }) => {
     test.slow()
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill.connected', { timeout: 15000 })
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 15000 })
 
     const textarea = page.locator('.chat-textarea')
     // `rm` is on the shell warnlist, so this command blocks on approval; the
@@ -241,7 +364,7 @@ test.describe('Approval flow (live gateway, Standard execution mode)', () => {
   test('Deny terminates the command without scheduling another agent turn', async ({ page }) => {
     test.slow()
     await page.goto(CONTROL_URL + 'chat/new')
-    await page.waitForSelector('.conn-pill.connected', { timeout: 15000 })
+    await page.waitForSelector('.topbar[data-connection-state="connected"]', { timeout: 15000 })
 
     const textarea = page.locator('.chat-textarea')
     // Warnlisted command (see the Allow-once test): guaranteed to raise an approval.

@@ -80,9 +80,10 @@ export interface ArtifactDocumentProvider {
 export interface WorkbenchResourceProvider {
   available(): boolean
   canImportDocuments(): boolean
-  list(sessionKey: string, options?: { types?: WorkbenchResourceType[]; limit?: number; signal?: AbortSignal }): Promise<WorkbenchResourcesListResponse>
+  list(sessionKey: string, options?: { types?: WorkbenchResourceType[]; limit?: number; signal?: AbortSignal; singlePage?: boolean }): Promise<WorkbenchResourcesListResponse>
   get(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchResource | null>
   open?(sessionKey: string, resource: WorkbenchResourceRef, request: { intent: 'edit-current'; expectedSha256?: string; idempotencyKey: string }, signal?: AbortSignal): Promise<WorkbenchResourceOpenResponse | null>
+  prepareAnnotation?(sessionKey: string, request: import('@/types/workbenchResources').WorkbenchAnnotationRequest, signal?: AbortSignal): Promise<WorkbenchResourceOpenResponse | null>
   createPreview?(sessionKey: string, resource: WorkbenchResourceRef, signal?: AbortSignal): Promise<WorkbenchPreviewResponse | null>
   importDocument(request: { sessionKey: string; source: WorkbenchResourceRef; expectedSha256: string; idempotencyKey: string; name?: string }, signal?: AbortSignal): Promise<DocumentImportResponse>
   publishDocument(request: { sessionKey: string; documentId: string; revisionId: string; idempotencyKey: string; name?: string }, signal?: AbortSignal): Promise<DocumentPublishResponse>
@@ -94,6 +95,7 @@ export interface ArtifactDocumentChange {
 }
 
 export interface ArtifactCatalog {
+  get(sessionKey: string, artifactId: string, signal?: AbortSignal): Promise<ArtifactPayload | null>
   listSession(
     sessionKey: string,
     options?: { readonly limit?: number; readonly signal?: AbortSignal },
@@ -160,6 +162,12 @@ export interface AttachmentUploadReceipt {
   readonly ttlSeconds?: number
 }
 
+export interface AttachmentTextPreview {
+  readonly content: string
+  readonly truncated: boolean
+  readonly totalBytes: number
+}
+
 /** Authenticated artifact and attachment bytes without endpoint or header leakage. */
 export interface WorkingFileRequest {
   sessionKey: string
@@ -180,7 +188,27 @@ export interface WorkingFileMetadata {
   size: number
 }
 
+export type HtmlBundleExportTarget =
+  | { readonly type: 'artifact'; readonly artifactId: string }
+  | { readonly type: 'document'; readonly documentId: string; readonly revisionId: string }
+  | { readonly type: 'working'; readonly documentId: string; readonly pagePath?: string }
+
+export interface HtmlBundleExportRequest {
+  readonly target: HtmlBundleExportTarget
+  readonly sessionKey: string
+  readonly signal?: AbortSignal
+}
+
+export class HtmlBundleExportError extends Error {
+  readonly name = 'HtmlBundleExportError'
+  constructor(readonly code: 'unavailable' | 'incomplete' | 'too-large' | 'source-forbidden' | 'source-changed' | 'failed') {
+    super(`HTML bundle export ${code}`)
+  }
+}
+
 export interface ArtifactContentAccess {
+  fetchVisualize?(request: { sessionKey: string; documentId: string; revisionId: string; signal?: AbortSignal; maxBytes: number }): Promise<Blob>
+  exportHtmlBundle?(request: HtmlBundleExportRequest): Promise<{ blob: Blob; filename: string }>
   workingFileMetadata?(request: WorkingFileRequest): Promise<WorkingFileMetadata | null>
   fetchWorkingFile?(request: WorkingFileRequest): Promise<Blob>
   fetchArtifact(
@@ -200,6 +228,15 @@ export interface ArtifactContentAccess {
     attachment: DisplayAttachment,
     request?: ArtifactAccessRequest,
   ): Promise<AttachmentFetchResult>
+  /** Bounded text projection; never substitutes for a complete attachment download. */
+  readAttachmentPreview?(
+    attachment: DisplayAttachment,
+    request?: ArtifactAccessRequest,
+  ): Promise<AttachmentTextPreview>
+  downloadAttachment?(
+    attachment: DisplayAttachment,
+    request?: ArtifactAccessRequest,
+  ): Promise<'saved' | 'cancelled'>
   uploadAttachment(file: File, mime: string): Promise<AttachmentUploadReceipt>
 }
 
@@ -215,6 +252,8 @@ export type ArtifactPreviewOptions = {
   maxBytes?: number
   requireSameOrigin?: boolean
   acceptBlob?: (blob: Blob) => boolean
+  /** Retain validated bytes only for the lifetime of this preview owner. */
+  retainLoadedBlob?: boolean
 } & (
   | { artifact: () => ArtifactPayload; loadBlob?: never }
   | { artifact?: never; loadBlob: (signal: AbortSignal) => Promise<Blob> }
@@ -225,6 +264,8 @@ export interface ArtifactPreviewController {
   errorCode: Ref<ArtifactPreviewErrorCode>
   progress: Ref<number | null>
   objectUrl: ShallowRef<string>
+  /** Null unless explicitly retained, loaded, and not released/disposed. */
+  readLoadedBlob(): Blob | null
   load(): void
   retry(): void
   observe(el: Element | null): void
@@ -267,6 +308,8 @@ export interface NativeHtmlArtifactResource {
 
 export interface ArtifactPreviewResourceOptions {
   artifact: () => ArtifactPayload
+  /** Resolve only registered images in the current session, never arbitrary file paths. */
+  resolveMarkdownImage?: (source: string, signal: AbortSignal) => Promise<ArtifactPayload | null>
   createObjectUrl?: (blob: Blob) => string
   htmlCollectionStatus?: () => 'complete' | 'partial' | 'not_applicable'
   htmlLaunchUrl?: () => string
@@ -281,7 +324,10 @@ export interface ArtifactPreviewResourceController {
   errorCode: Ref<ArtifactPreviewResourceErrorCode | null>
   kind: Ref<ArtifactWorkbenchPreviewKind>
   markdownHtml: ShallowRef<string>
+  /** Ready image resources are patched into stable Markdown placeholders. */
+  markdownImages?: ShallowRef<ReadonlyMap<string, string>>
   objectUrl: ShallowRef<string>
+  binary?: ShallowRef<ArrayBuffer | null>
   progress: Ref<number | null>
   relativeResources: ShallowRef<string[]>
   state: Ref<ArtifactPreviewResourceState>
@@ -318,6 +364,8 @@ export interface ArtifactPreviewLease {
   idle_timeout_seconds: number
   source: ArtifactPreviewLeaseSource
   workingDocumentId?: string
+  /** True only when the lease serves immutable artifact bundle bytes. */
+  snapshot?: boolean
 }
 
 export interface ArtifactPreviewLeaseRenewal {
@@ -337,6 +385,7 @@ export interface ArtifactPreviewLeaseRequest {
   nativeBroker?: ArtifactPreviewNativeBroker
   sessionKey?: string
   pagePath?: string
+  snapshot?: boolean
 }
 
 export class ArtifactPreviewLeaseError extends Error {
@@ -344,6 +393,7 @@ export class ArtifactPreviewLeaseError extends Error {
     message: string,
     readonly status: number,
     readonly code = '',
+    readonly retryable = false,
   ) {
     super(message)
     this.name = 'ArtifactPreviewLeaseError'

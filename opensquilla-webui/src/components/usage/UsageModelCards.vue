@@ -42,11 +42,6 @@
             <dt>{{ t('usageLogs.metrics.cost') }}</dt>
             <dd class="usage-mono usage-cost">
               {{ fmtCost(m.costUsd, { source: m }) }}
-              <span
-                class="usage-source"
-                :class="costSourceClassesForModelCard(m)"
-                :title="costSourceTooltipForModelCard(m)"
-              >{{ costSourceLabelForModelCard(m) }}</span>
             </dd>
           </div>
         </dl>
@@ -68,8 +63,5 @@ defineProps<{
     cost: number | null | undefined,
     opts?: { decimals?: number; source?: object },
   ) => string
-  costSourceClassesForModelCard: (m: ModelCard) => Record<string, boolean>
-  costSourceLabelForModelCard: (m: ModelCard) => string
-  costSourceTooltipForModelCard: (m: ModelCard) => string
 }>()
 </script>

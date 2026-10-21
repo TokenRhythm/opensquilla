@@ -1309,11 +1309,20 @@ async def test_standalone_repl_uses_exact_slash_tokens(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_standalone_slash_compact_uses_selected_physical_deployment(monkeypatch) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.provider.protocol import provider_connection_config
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+
     services = _FakeServices()
-    services.provider_selector = _FakeProviderSelector()
-    services.config = SimpleNamespace(
+    services.provider_selector = ModelSelector(SelectorConfig(primary=ProviderConfig(
+        provider="openrouter", model="provider/model", api_key="cli-provider-key",
+        base_url="https://openrouter.ai/api/v1",
+    )))
+    services.config = GatewayConfig(
         context_budget_tokens=1234,
-        compaction=SimpleNamespace(enabled=True, model=None, timeout_seconds=12.5),
+        llm={"provider": "openrouter", "model": "provider/model",
+             "context_window_tokens": 200_000},
+        compaction={"enabled": True, "timeout_seconds": 12.5},
     )
     inputs = iter(["/compact", "/quit"])
 
@@ -1349,9 +1358,14 @@ async def test_standalone_slash_compact_uses_selected_physical_deployment(monkey
     assert config.budget.physical_context_window_tokens == 200_000
     assert context_window == config.budget.history_capacity_tokens
     assert 1234 < context_window < 200_000
-    assert config.api_key == "cli-provider-key"
-    assert config.model == "provider/model"
-    assert config.base_url == "https://openrouter.ai/api/v1"
+    assert config.llm_plan is not None
+    deployment = config.llm_plan.primary
+    assert deployment.provider_id == "openrouter"
+    assert deployment.model == "openrouter/test"
+    connection = provider_connection_config(deployment.provider)
+    assert connection.api_key == "cli-provider-key"
+    assert connection.base_url == "https://openrouter.ai/api/v1"
+    assert services.provider_selector.current_config.model == "provider/model"
     assert config.timeout_seconds == 12.5
 
 

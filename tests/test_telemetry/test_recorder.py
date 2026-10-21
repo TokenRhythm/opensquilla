@@ -108,6 +108,31 @@ async def test_records_only_through_current_granted_notice(tmp_path: Path) -> No
         await outbox.close()
 
 
+async def test_record_many_checks_notice_and_rejects_an_obsolete_policy_revision(
+    tmp_path: Path,
+) -> None:
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    config = _shared_config(lambda _scope: _state())
+    recorder = TelemetryRecorder(outbox, config=config)
+    coordinator = scope_consent_coordinator_for(config)
+    events = [(_event(), None), (_event(notice="reliability-older"), None)]
+    try:
+        async with coordinator.transition(TelemetryScope.RELIABILITY):
+            pass
+        blocked = await recorder.record_many(events, expected_consent_revision=0)
+        assert [result.status for result in blocked] == [
+            RecordStatus.CONSENT_BLOCKED, RecordStatus.NOTICE_MISMATCH,
+        ]
+        assert (await outbox.stats()).pending_events == 0
+        recorded = await recorder.record_many(events, expected_consent_revision=1)
+        assert [result.status for result in recorded] == [
+            RecordStatus.RECORDED, RecordStatus.NOTICE_MISMATCH,
+        ]
+        assert (await outbox.stats()).pending_events == 1
+    finally:
+        await outbox.close()
+
+
 async def test_declined_unset_forced_and_provider_failure_fail_closed(
     tmp_path: Path,
 ) -> None:

@@ -60,8 +60,7 @@ class AgentProfile:
     identity: AgentIdentity = field(default_factory=AgentIdentity)
     agents_doc: AgentsDocument | None = None
     workspace_files: dict[str, str] = field(default_factory=dict)
-    # Prompt assembly mode: "full" | "minimal" | "none" |
-    # "headless_source_edit" | "headless_repo_coding_scaffold"
+    # Prompt assembly mode: "full" | "minimal" | "none"
     prompt_mode: str = "full"
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     patch_evidence_protocol: bool = False

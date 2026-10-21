@@ -157,10 +157,10 @@ def test_tokenrhythm_curated_ladder() -> None:
         == "static_tokenrhythm_b5"
     )
     expected_models = {
-        "c0": "qwen3.7-flash",
-        "c1": "deepseek-flash",
-        "c2": "deepseek-v4-pro-0813",
-        "c3": "glm-5.3",
+        "c0": "qwen3.8-flash",
+        "c1": "deepseek-v4.1-flash-1017",
+        "c2": "glm-5.3",
+        "c3": "kimi-k3",
         "image_model": "kimi-k2.6",
     }
     tiers = preset.tier_defaults()

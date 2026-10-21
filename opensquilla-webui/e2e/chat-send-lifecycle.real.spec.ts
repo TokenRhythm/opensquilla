@@ -1,4 +1,5 @@
 import { expect, test } from './real-gateway.fixture'
+import { expectComposerValue } from './utils'
 
 test('real Gateway accepts the next chat turn without changing sessions', async ({
   page,
@@ -9,7 +10,7 @@ test('real Gateway accepts the next chat turn without changing sessions', async 
   page.on('pageerror', error => rendererErrors.push(error.message))
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 20_000 })
+  await expect(page.locator('.topbar[data-connection-state="connected"]')).toBeVisible({ timeout: 20_000 })
 
   const input = page.locator('.chat-textarea')
   const send = page.locator('.chat-send-btn[aria-label="Send"]')
@@ -29,7 +30,7 @@ test('real Gateway accepts the next chat turn without changing sessions', async 
   )
   await expect(stop).toHaveCount(0)
   await expect(send).toBeEnabled()
-  await expect(input).toHaveValue('Continue with a second synthetic chat turn.')
+  await expectComposerValue(input, 'Continue with a second synthetic chat turn.')
   const sessionUrl = page.url()
 
   await send.click()
@@ -50,41 +51,57 @@ test.describe('anonymous guest conversation', () => {
 
   test('subscribes and completes two turns in the same guest-owned session', async ({
     page, isolatedRealGateway,
-  }) => {
+  }, testInfo) => {
     test.setTimeout(90_000)
     const deniedSubscriptions: string[] = []
+    const readResponses: Array<{ method: string; ok: boolean; code?: string }> = []
     page.on('websocket', socket => {
-      const subscriptions = new Set<string>()
+      const subscriptions = new Map<string, string>()
       socket.on('framesent', ({ payload }) => {
         const frame = JSON.parse(String(payload))
-        if (frame.method === 'sessions.messages.subscribe') subscriptions.add(frame.id)
+        if (frame.method === 'sessions.messages.subscribe'
+          || /^sessions\.read\..*\.v2$/.test(frame.method ?? '')
+          || frame.method === 'sessions.history.page.v2') subscriptions.set(frame.id, frame.method)
       })
       socket.on('framereceived', ({ payload }) => {
         const frame = JSON.parse(String(payload))
-        if (subscriptions.has(frame.id) && frame.error) deniedSubscriptions.push(frame.error.code)
+        const method = subscriptions.get(frame.id)
+        if (method) {
+          readResponses.push({ method, ok: frame.ok, ...(frame.error ? { code: frame.error.code } : {}) })
+          if (frame.error) deniedSubscriptions.push(frame.error.code)
+        }
       })
     })
-    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
-    await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
-    const input = page.locator('.chat-textarea')
-    const send = page.locator('.chat-send-btn[aria-label="Send"]')
-    await input.fill('Complete the first synthetic guest turn.')
-    await expect(send).toBeEnabled({ timeout: 20_000 })
-    await send.click()
-    await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(1)
-    await isolatedRealGateway.releaseFirstTask()
-    await expect(page.locator('.msg-ai')).toContainText('Task one completed after the lifecycle checks.')
-    await expect(send).toBeEnabled()
-    const session = new URL(page.url()).searchParams.get('session')
-    expect(session).toMatch(/^agent:main:webchat:guest:[0-9a-f]{64}:[a-z0-9]+$/)
-    await input.fill('Complete the second synthetic guest turn.')
-    await send.click()
-    await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(2)
-    await isolatedRealGateway.releaseSecondTask()
-    await expect(page.locator('.msg-ai').filter({ hasText: 'Task two completed after Goal removal.' })).toBeVisible()
-    await expect(send).toBeEnabled()
-    expect(new URL(page.url()).searchParams.get('session')).toBe(session)
-    expect((await isolatedRealGateway.readProviderCalls())[1].firstReplyInAssistantHistory).toBe(true)
-    expect(deniedSubscriptions).toEqual([])
+    try {
+      await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+      await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
+      const input = page.locator('.chat-textarea')
+      const send = page.locator('.chat-send-btn[aria-label="Send"]')
+      await input.fill('Complete the first synthetic guest turn.')
+      await expect(send).toBeEnabled({ timeout: 20_000 })
+      await send.click()
+      await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(1)
+      await isolatedRealGateway.releaseFirstTask()
+      await expect(page.locator('.msg-ai')).toContainText('Task one completed after the lifecycle checks.')
+      await expect(send).toBeEnabled()
+      const session = new URL(page.url()).searchParams.get('session')
+      expect(session).toMatch(/^agent:main:webchat:guest:[0-9a-f]{64}:[a-z0-9]+$/)
+      await input.fill('Complete the second synthetic guest turn.')
+      await send.click()
+      await expect.poll(async () => (await isolatedRealGateway.readProviderCalls()).length).toBe(2)
+      await isolatedRealGateway.releaseSecondTask()
+      await expect(page.locator('.msg-ai').filter({ hasText: 'Task two completed after Goal removal.' })).toBeVisible()
+      await expect(send).toBeEnabled()
+      expect(new URL(page.url()).searchParams.get('session')).toBe(session)
+      expect((await isolatedRealGateway.readProviderCalls())[1].firstReplyInAssistantHistory).toBe(true)
+      expect(deniedSubscriptions).toEqual([])
+      for (const method of ['sessions.read.open.v2', 'sessions.read.install.v2', 'sessions.history.page.v2']) {
+        expect(readResponses.some(response => response.method === method && response.ok)).toBe(true)
+      }
+    } finally {
+      await testInfo.attach('guest-session-read-responses', {
+        body: JSON.stringify(readResponses, null, 2), contentType: 'application/json',
+      })
+    }
   })
 })

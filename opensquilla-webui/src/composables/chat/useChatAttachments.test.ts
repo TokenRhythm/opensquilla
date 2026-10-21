@@ -26,6 +26,12 @@ function stagedZip(name = 'paper.zip') {
   return new File([bytes], name, { type: 'application/zip' })
 }
 
+function sizedFile(size: number, name: string, type: string): File {
+  const file = new File([new Uint8Array([0])], name, { type })
+  Object.defineProperty(file, 'size', { configurable: true, value: size })
+  return file
+}
+
 function successfulUploadResponse(fileUuid = 'file-1') {
   return {
     ok: true,
@@ -242,13 +248,13 @@ describe('useChatAttachments', () => {
     vi.stubGlobal('fetch', fetchMock)
     const attachments = useTestChatAttachments()
 
-    const files = Array.from({ length: 11 }, (_, index) => stagedPdf(`paper-${index}.pdf`))
+    const files = Array.from({ length: 17 }, (_, index) => stagedPdf(`paper-${index}.pdf`))
     await attachments.addAttachments(files)
     await flushUpload()
 
-    expect(fetchMock).toHaveBeenCalledTimes(10)
-    expect(attachments.pendingAttachments.value).toHaveLength(10)
-    expect(pushToast).toHaveBeenCalledWith('Too many attachments: max 10', { tone: 'danger' })
+    expect(fetchMock).toHaveBeenCalledTimes(16)
+    expect(attachments.pendingAttachments.value).toHaveLength(16)
+    expect(pushToast).toHaveBeenCalledWith('Too many attachments: max 16', { tone: 'danger' })
   })
 
   it('emits a single count-cap toast for a batch far over the limit', async () => {
@@ -256,26 +262,36 @@ describe('useChatAttachments', () => {
     vi.stubGlobal('fetch', fetchMock)
     const attachments = useTestChatAttachments()
 
-    const files = Array.from({ length: 15 }, (_, index) => stagedPdf(`paper-${index}.pdf`))
+    const files = Array.from({ length: 20 }, (_, index) => stagedPdf(`paper-${index}.pdf`))
     await attachments.addAttachments(files)
     await flushUpload()
 
-    expect(attachments.pendingAttachments.value).toHaveLength(10)
+    expect(attachments.pendingAttachments.value).toHaveLength(16)
     expect(pushToast).toHaveBeenCalledTimes(1)
-    expect(pushToast).toHaveBeenCalledWith('Too many attachments: max 10', { tone: 'danger' })
+    expect(pushToast).toHaveBeenCalledWith('Too many attachments: max 16', { tone: 'danger' })
   })
 
-  it('names the per-type cap when rejecting an oversized file', async () => {
-    const fetchMock = vi.fn()
+  it.each([
+    ['PDF', 'boundary.pdf', 'application/pdf'],
+    ['Office', 'boundary.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+    ['staged text', 'boundary.txt', 'text/plain'],
+    ['opaque', 'boundary.bin', 'application/octet-stream'],
+  ])('accepts %s at 50 MiB and rejects 50 MiB + 1', async (_category, name, mime) => {
+    const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse(`file-${name}`))
     vi.stubGlobal('fetch', fetchMock)
-    const attachments = useTestChatAttachments()
-    const hugePdf = new File([new Uint8Array(30 * 1024 * 1024 + 1)], 'huge.pdf', { type: 'application/pdf' })
+    const accepted = useTestChatAttachments()
 
-    await attachments.addAttachments([hugePdf])
+    await accepted.addAttachment(sizedFile(50 * 1024 * 1024, name, mime))
+    await flushUpload()
+    expect(accepted.pendingAttachments.value).toMatchObject([{ kind: 'staged', name }])
+    expect(fetchMock).toHaveBeenCalledOnce()
 
-    expect(fetchMock).not.toHaveBeenCalled()
-    expect(attachments.pendingAttachments.value).toHaveLength(0)
-    expect(pushToast).toHaveBeenCalledWith('File too large: huge.pdf (max 30 MiB)', { tone: 'danger' })
+    pushToast.mockClear()
+    const rejected = useTestChatAttachments()
+    await rejected.addAttachment(sizedFile(50 * 1024 * 1024 + 1, `too-large-${name}`, mime))
+    expect(rejected.pendingAttachments.value).toHaveLength(0)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(pushToast).toHaveBeenCalledWith(`File too large: too-large-${name} (max 50 MiB)`, { tone: 'danger' })
   })
 
   it('never states a rounded-up cap the rejected file already satisfies', async () => {
@@ -334,6 +350,50 @@ describe('useChatAttachments', () => {
       'Attachments too large: overflow.pdf would exceed 60 MiB total',
       { tone: 'danger' },
     )
+  })
+
+  it('excludes classified workspace bytes while retaining the 60 MiB payload boundary', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-live-mix'))
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useTestChatAttachments()
+    attachments.pendingAttachments.value = [{
+      kind: 'workspace', local_id: 1, name: 'large-live.bin', mime: 'application/octet-stream', size: 50 * 1024 * 1024,
+      workspaceFile: { workspaceId: 'project-A', relativePath: 'large-live.bin', name: 'large-live.bin',
+        mime: 'application/octet-stream', size: 50 * 1024 * 1024 },
+    }]
+
+    await attachments.addAttachments([
+      sizedFile(50 * 1024 * 1024, 'copy.pdf', 'application/pdf'),
+      sizedFile(10 * 1024 * 1024, 'copy.bin', 'application/octet-stream'),
+      sizedFile(1, 'overflow.pdf', 'application/pdf'),
+    ])
+    await flushUpload()
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(attachments.pendingAttachments.value).toHaveLength(3)
+    expect(pushToast).toHaveBeenCalledOnce()
+    expect(pushToast).toHaveBeenCalledWith(
+      'Attachments too large: overflow.pdf would exceed 60 MiB total',
+      { tone: 'danger' },
+    )
+  })
+
+  it('counts workspace references toward the sixteen-attachment limit', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useTestChatAttachments()
+    attachments.pendingAttachments.value = Array.from({ length: 16 }, (_, index) => ({
+      kind: 'workspace' as const, local_id: index + 1, name: `live-${index}.bin`,
+      mime: 'application/octet-stream', size: 50 * 1024 * 1024,
+      workspaceFile: { workspaceId: 'project-A', relativePath: `live-${index}.bin`, name: `live-${index}.bin`,
+        mime: 'application/octet-stream', size: 50 * 1024 * 1024 },
+    }))
+
+    await attachments.addAttachment(sizedFile(1, 'seventeenth.pdf', 'application/pdf'))
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(attachments.pendingAttachments.value).toHaveLength(16)
+    expect(pushToast).toHaveBeenCalledWith('Too many attachments: max 16', { tone: 'danger' })
   })
 
   it('adds the WebSocket token as a bearer header on staged uploads', async () => {

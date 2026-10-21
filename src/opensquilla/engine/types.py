@@ -7,11 +7,17 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from opensquilla.compaction_timing import (
+    DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS,
+    resolve_compaction_total_timeout,
+)
 from opensquilla.contracts.turn_execution import (
     AnswerGenerationResetEvent,
 )
 from opensquilla.execution_status import ExecutionStatus
+from opensquilla.provider.activity import safe_activity_model
 from opensquilla.provider.types import ExecutionIdentity
+from opensquilla.provider.types import ToolInputPreviewEvent as ToolInputPreviewEvent
 from opensquilla.tool_boundary import ToolCall as ToolCall
 from opensquilla.tool_boundary import ToolEffectOutcome as ToolEffectOutcome
 from opensquilla.tool_boundary import ToolResult as ToolResult
@@ -168,6 +174,15 @@ class ProviderActivityEvent:
     started_at: int = 0
     heartbeat: bool = False
     model: str = ""
+    http_status: int | None = None
+    # Actual failed leg, captured before selecting the fallback target.
+    from_model: str = ""
+
+    def __post_init__(self) -> None:
+        self.model = safe_activity_model(self.model) or ""
+        self.from_model = (
+            safe_activity_model(self.from_model) or "" if self.phase == "fallback" else ""
+        )
 
 
 @dataclass
@@ -225,6 +240,7 @@ class ToolResultEvent:
     generation_epoch: int = 0
     tool_presentation: dict[str, Any] | None = None
     execution_log_handle: str | None = None
+    file_snapshot: dict[str, Any] | None = None
 
 
 @dataclass
@@ -287,6 +303,7 @@ class ErrorEvent:
     no_prior_provider_dispatch: bool | None = None
     replay_safe: bool | None = None
     model_capacity: dict[str, Any] | None = None
+    http_status: int | None = None
 
 
 @dataclass
@@ -359,8 +376,8 @@ class DoneEvent:
     # cost has no estimated component, e.g. fully provider-billed turns).
     estimate_basis: str | None = None
     # V017 router-decision record id for this turn, when one was staged.
-    # Lets chat clients attribute feedback (router.feedback.submit) to the
-    # exact routing decision. None when the router is disabled, the turn
+    # Correlates chat diagnostics with the exact routing decision. None when
+    # the router is disabled, the turn
     # bypassed classification, or no decision writer is registered.
     decision_id: str | None = None
     # Explicit presence distinguishes an authoritative empty final answer from
@@ -409,6 +426,12 @@ def public_agent_event_payload(event: Any) -> dict[str, Any]:
     if isinstance(event, DoneEvent):
         payload = asdict(replace(event, assistant_replay=None))
         payload.pop("assistant_replay", None)
+        return payload
+    if isinstance(event, ToolResultEvent) and event.is_error:
+        # A failed mutation must never advertise a successful file snapshot,
+        # including callers that construct events outside the tool dispatcher.
+        payload = asdict(replace(event, file_snapshot=None))
+        payload.pop("file_snapshot", None)
         return payload
     return asdict(event)
 
@@ -487,80 +510,12 @@ class EnsembleProgressEvent:
     generation_epoch: int = 0
 
 
-@dataclass
-class MetaPreflightEvent:
-    """Emitted before a MetaSkill run begins when the plan declares a
-    ``request_template``. This is a non-blocking preview of the interpreted
-    request and declared assumptions; the scheduler continues after emitting it.
-    """
-
-    kind: Literal["meta_preflight"] = field(default="meta_preflight", init=False)
-    run_id: str = ""
-    meta_skill_name: str = ""
-    request_template: dict[str, Any] = field(default_factory=dict)
-    interpreted_request: str = ""
-    missing_fields: list[str] = field(default_factory=list)
-    assumptions: list[str] = field(default_factory=list)
-    can_skip: bool = True
-    requires_confirmation: bool = False
 
 
-@dataclass
-class MetaRunAnnouncedEvent:
-    """Emitted once when a MetaSkill run starts and its plan has been
-    compiled. WebUI uses this to seed the step ribbon with all declared
-    step ids, labels, kinds, and dependency edges. `parent_run_id` is
-    reserved for nested meta-skill rollouts (always None today).
-    """
-
-    kind: Literal["meta_run_announced"] = field(default="meta_run_announced", init=False)
-    run_id: str = ""
-    meta_skill_name: str = ""
-    language: str = ""
-    steps: list[dict[str, Any]] = field(default_factory=list)
-    total: int = 0
-    parent_run_id: str | None = None
 
 
-@dataclass
-class MetaStepStateEvent:
-    """One state transition for a single MetaSkill step within a run.
-
-    `state` is one of pending / running / succeeded / failed / skipped /
-    substituted. `status_text` is an optional short human-readable label
-    shown under the active chip; `error` carries the failure message when
-    `state == "failed"`; `substitute_for` is set on the substitute step
-    yielded after an `on_failure` branch fires.
-    """
-
-    kind: Literal["meta_step_state"] = field(default="meta_step_state", init=False)
-    run_id: str = ""
-    step_id: str = ""
-    state: Literal["pending", "running", "succeeded", "failed", "skipped", "substituted"] = (
-        "pending"
-    )
-    status_text: str | None = None
-    error: str | None = None
-    substitute_for: str | None = None
-    rescue: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class MetaRunCompletedEvent:
-    """Terminal event for a MetaSkill run. `outcome` is one of
-    ok / failed / cancelled. The three step-id lists let the WebUI freeze
-    the final ribbon state without scanning back through the stream.
-    `recovered_steps` keeps the audit trail for failed steps whose
-    on-failure substitute completed successfully.
-    """
-
-    kind: Literal["meta_run_completed"] = field(default="meta_run_completed", init=False)
-    run_id: str = ""
-    outcome: Literal["ok", "failed", "cancelled"] = "ok"
-    completed_steps: list[str] = field(default_factory=list)
-    failed_steps: list[str] = field(default_factory=list)
-    recovered_steps: list[str] = field(default_factory=list)
-    skipped_steps: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -594,6 +549,8 @@ class CompactionEvent:
     coverage_status: str = "unknown"
     missing_obligations: list[str] | None = None
     critical_carry_forward: list[str] | None = None
+    source_snapshot: Any | None = field(default=None, repr=False, compare=False)
+    persist_result: Any | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -619,6 +576,7 @@ class CompactionOutcome:
     # Request-scoped projection only. The canonical turn transcript remains
     # raw and no CompactionEvent may be persisted for this outcome.
     ephemeral_only: bool = False
+    source_snapshot: Any | None = field(default=None, repr=False, compare=False)
     # Runtime-only owner for a multi-stage overflow recovery. Durable and
     # request-scoped projections share its absolute deadline and physical LLM
     # call counter; it must never enter persistence, logs, or event reprs.
@@ -635,6 +593,7 @@ AgentEvent = (
     | ThinkingEndEvent
     | TextDeltaEvent
     | RunHeartbeatEvent
+    | ToolInputPreviewEvent
     | ProviderActivityEvent
     | SkillLoadEvent
     | ToolUseStartEvent
@@ -652,10 +611,6 @@ AgentEvent = (
     | WarningEvent
     | RouterDecisionEvent
     | EnsembleProgressEvent
-    | MetaPreflightEvent
-    | MetaRunAnnouncedEvent
-    | MetaStepStateEvent
-    | MetaRunCompletedEvent
 )
 
 
@@ -679,8 +634,7 @@ class AgentConfig:
     # bounded operator budgets for CI, benchmarks, and constrained runs.
     max_iterations: int = 0
     # Total turn wall-clock budget (seconds; 0 = disabled)
-    # Default outer turn budget (30 minutes) for
-    # meta-skill DAGs (paper-write / arxiv-deck run 5-7 min commonly).
+    # Default outer turn budget is 30 minutes.
     timeout: float = 1800.0
     # Deprecated, unused compatibility slot; preserve constructor position.
     iteration_timeout: float = 0.0
@@ -741,6 +695,8 @@ class AgentConfig:
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None
+    # Durable checkpoint contribution, kept separate from volatile context.
+    compaction_summary_context: str | None = None
     # Initial facts; physical request boundaries rebind this immutable snapshot.
     execution_identity: ExecutionIdentity | None = None
     # Per-turn user-role skill context injected after persisted history
@@ -748,9 +704,12 @@ class AgentConfig:
     # skill context in history so provider KV-cache prefixes stay stable.
     skills_context_prompt: str | None = None
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
+    compaction_enabled: bool = True
     compaction_trigger_ratio: float = 0.85
     compaction_protected_recent_messages: int = 0
-    compaction_total_timeout_seconds: float = 120.0
+    # Optional legacy semantic idle override; otherwise inherit request_timeout.
+    compaction_timeout_seconds: float | None = None
+    compaction_total_timeout_seconds: float = DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
     compaction_heartbeat_interval_seconds: float = 15.0
     # Frozen runtime-only single-deployment chain for auxiliary compaction.
     # Kept opaque here to avoid coupling engine types to session internals.
@@ -766,6 +725,12 @@ class AgentConfig:
         repr=False,
         compare=False,
     )
+    compaction_circuit_open: Callable[..., bool] | None = field(
+        default=None, repr=False, compare=False,
+    )
+    compaction_outcome_reporter: Callable[[bool], None] | None = field(
+        default=None, repr=False, compare=False,
+    )
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
     # Active-deployment tool capability provenance for diagnostics and routing.
     # Tool authorization remains owned by the projected registry surface and
@@ -776,8 +741,8 @@ class AgentConfig:
     model_vision_support: Literal["supported", "unsupported", "unknown"] = "unknown"
     # Tokenjuice projection: project eligible fresh tool results before the
     # next LLM turn. This is not user-selectable behavior.
-    # Legacy compression knobs remain as compatibility shims for meta_invoke
-    # tests and embedded callers; the runtime's default path uses Tokenjuice.
+    # Legacy compression knobs remain for embedded callers; the runtime's
+    # default path uses Tokenjuice.
     tool_result_compression_enabled: bool = True
     tool_result_compression_mode: Literal["off", "truncate", "summarize"] | None = None
     tool_result_compression_max_share: float = 0.25
@@ -919,8 +884,9 @@ class AgentConfig:
             0,
             int(self.compaction_protected_recent_messages or 0),
         )
-        if float(self.compaction_total_timeout_seconds or 0) <= 0:
-            self.compaction_total_timeout_seconds = 120.0
+        self.compaction_total_timeout_seconds = resolve_compaction_total_timeout(
+            self.compaction_total_timeout_seconds
+        )
         if float(self.compaction_heartbeat_interval_seconds or 0) <= 0:
             self.compaction_heartbeat_interval_seconds = 15.0
 
