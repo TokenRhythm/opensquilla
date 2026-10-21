@@ -679,8 +679,11 @@ def recovery_cleanup_apply(
             user_data=user_data,
             expected_fingerprint=expected_scope_fingerprint,
         )
-        # Chromium can finish an atomic Preferences write just after parent EOF.
-        # Reinspect briefly without deleting anything or expanding the approval.
+        # Parent EOF can precede Chromium's final Preferences/storage writes.
+        # Even an approved kind/path scope can still have a changing manifest.
+        # Require two consecutive matching inventories within the same bounded
+        # window; cleanup_apply still performs its locked CAS before deleting.
+        previous_approved_inventory: tuple[str, int] | None = None
         for attempt in range(5):
             if attempt:
                 time.sleep(0.1)
@@ -695,13 +698,22 @@ def recovery_cleanup_apply(
                 return
             refreshed_scope = frozenset(_cleanup_scope_pair(item) for item in refreshed.items)
             if refreshed_scope.issubset(approved_scope):
-                break
+                inventory = (refreshed.transaction_id, refreshed.revision)
+                if inventory == previous_approved_inventory:
+                    break
+                previous_approved_inventory = inventory
+            else:
+                previous_approved_inventory = None
         else:
             _cleanup_exit(
                 replace(
                     refreshed,
                     outcome="blocked",
-                    stable_code="cleanup_scope_changed",
+                    stable_code=(
+                        "cleanup_inventory_stale"
+                        if refreshed_scope.issubset(approved_scope)
+                        else "cleanup_scope_changed"
+                    ),
                 ),
                 json_output=json_output,
             )
