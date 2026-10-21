@@ -1101,6 +1101,7 @@ def test_direct_channel_batch_turn_emits_tool_events_to_webui() -> None:
             "generation_epoch": 4,
             "model_call_id": "3.0",
             "iteration": 3,
+            "provider_call_resettable": True,
         },
     ) in bridge.events
     assert channel.sent[-1].content == "ok"
@@ -2349,6 +2350,7 @@ def test_direct_streaming_path_emits_tool_events_to_webui() -> None:
             "generation_epoch": 3,
             "model_call_id": "2.1",
             "iteration": 2,
+            "provider_call_resettable": True,
         },
     ) in bridge.events
     assert channel.sent[-1].content == "finished"
