@@ -229,9 +229,128 @@ assert.deepEqual(limiter.accept(errorEntry, 3), [])
 const nextWindow = limiter.accept(errorEntry, 1000)
 assert.equal(nextWindow.length, 2)
 assert.equal(nextWindow[0].event, 'renderer_console_suppressed')
-assert.deepEqual(nextWindow[0].detail, { count: 2, window_ms: 1000 })
+assert.deepEqual(nextWindow[0].detail, { count: 2, window_ms: 1000, channel: 'renderer_console' })
 assert.equal(nextWindow[1], errorEntry)
 assert.deepEqual(limiter.flush(), [])
+
+const recoveryEntry = (scope, generation = 0) => ({
+  event: 'session_recovery',
+  detail: {
+    phase: 'failed', reason: 'metadata_hydration_failed',
+    session_key_sha256: scope, connection_generation: generation,
+  },
+})
+const scopeHash = index => index.toString(16).padStart(16, '0')
+
+// Different chats do not spend each other's allowance or the renderer-error
+// allowance. This is one long-lived main limiter, not a fresh one per document.
+const chatLimiter = new RendererConsoleLogLimiter()
+for (let chat = 0; chat < 20; chat++) {
+  const entry = recoveryEntry(scopeHash(chat))
+  assert.deepEqual(chatLimiter.accept(entry, chat), [entry])
+}
+for (let error = 0; error < 10; error++) {
+  assert.deepEqual(chatLimiter.accept(errorEntry, error), [errorEntry])
+}
+assert.deepEqual(chatLimiter.flush(), [])
+
+// Reloading the same chat cannot reset its main-process budget. Conversely,
+// saturating recovery diagnostics must not hide the next real renderer error.
+const reloadLimiter = new RendererConsoleLogLimiter()
+for (let document = 0; document < 1000; document++) {
+  const entry = recoveryEntry(scopeHash(1), document)
+  assert.equal(reloadLimiter.accept(entry, document).length, document < 8 ? 1 : 0)
+}
+assert.deepEqual(reloadLimiter.accept(errorEntry, 1000), [errorEntry])
+assert.deepEqual(reloadLimiter.flush(), [{
+  event: 'renderer_console_suppressed',
+  detail: { count: 992, window_ms: 60_000, channel: 'session_recovery' },
+}])
+assert.deepEqual(reloadLimiter.accept(recoveryEntry(scopeHash(1)), 1001), [])
+
+// Error flooding cannot consume recovery slots either. Lost error records keep
+// their original failure signal, and neither channel disguises it as success.
+const errorFloodLimiter = new RendererConsoleLogLimiter()
+for (let error = 0; error < 1000; error++) errorFloodLimiter.accept(errorEntry, error)
+const afterErrors = recoveryEntry(scopeHash(2))
+assert.deepEqual(errorFloodLimiter.accept(afterErrors, 1000), [afterErrors])
+assert.deepEqual(errorFloodLimiter.flush(), [{
+  event: 'renderer_console_suppressed',
+  detail: { count: 990, window_ms: 60_000, channel: 'renderer_console' },
+}])
+
+// Scope churn cannot evict a spent allowance: at most 64 * 8 recovery writes
+// fit in one fixed window, even when unbounded distinct identities are offered.
+const scopeLimiter = new RendererConsoleLogLimiter()
+let recoveryWrites = 0
+for (let scope = 0; scope < 1000; scope++) {
+  for (let record = 0; record < 8; record++) {
+    recoveryWrites += scopeLimiter.accept(recoveryEntry(scopeHash(scope), record), 0).length
+  }
+}
+assert.equal(recoveryWrites, 512)
+assert.deepEqual(scopeLimiter.accept(recoveryEntry(scopeHash(0), 9), 1), [])
+assert.deepEqual(scopeLimiter.flush(), [{
+  event: 'renderer_console_suppressed',
+  detail: { count: 7489, window_ms: 60_000, channel: 'session_recovery' },
+}])
+assert.equal(scopeLimiter.accept(recoveryEntry(scopeHash(999)), 60_000).length, 1)
+
+// Only a validated hash can create a scope; malformed or missing IDs cannot
+// bypass the global bucket, even if a caller bypasses the console parser.
+const invalidScopeLimiter = new RendererConsoleLogLimiter()
+for (let index = 0; index < 20; index++) {
+  const hash = index % 2 === 0 ? undefined : `untrusted-${index}`
+  assert.equal(invalidScopeLimiter.accept(recoveryEntry(hash), index).length, index < 8 ? 1 : 0)
+}
+assert.deepEqual(invalidScopeLimiter.flush(), [{
+  event: 'renderer_console_suppressed',
+  detail: { count: 12, window_ms: 60_000, channel: 'session_recovery' },
+}])
+
+// Exercise the production listener with successive document frame identities,
+// retaining the same window-owned limiter just as Electron does on navigation.
+let documentFrame = {}
+const navigationRecords = []
+const navigationWindow = {
+  isDestroyed: () => false,
+  webContents: { isDestroyed: () => false, get mainFrame() { return documentFrame } },
+}
+const navigationListener = createMainWindowConsoleListener(navigationWindow, navigationRecords)
+const recoveryConsoleMessage = scope => ({
+  ...recoveryMessage, frame: documentFrame,
+  message: '[opensquilla-recovery] ' + JSON.stringify(recoveryEntry(scope).detail),
+})
+for (let chat = 0; chat < 20; chat++) {
+  documentFrame = {}
+  navigationListener(recoveryConsoleMessage(scopeHash(chat)))
+}
+assert.equal(navigationRecords.filter(record => record.event === 'session_recovery').length, 20)
+for (let reload = 0; reload < 20; reload++) {
+  documentFrame = {}
+  navigationListener(recoveryConsoleMessage(scopeHash(0)))
+}
+assert.equal(navigationRecords.filter(record => record.event === 'session_recovery').length, 27)
+for (let error = 0; error < 10; error++) {
+  navigationListener({ ...consoleMessage, frame: documentFrame })
+}
+assert.equal(navigationRecords.filter(record => record.event === 'renderer_console').length, 10)
+
+const largestRecovery = buildRendererConsoleLogEntry({
+  ...recoveryMessage,
+  message: '[opensquilla-recovery] ' + JSON.stringify({
+    phase: 'recovered', reason: 'metadata_hydration_failed',
+    session_key_sha256: 'f'.repeat(16), delivery_epoch: 'ep/'.repeat(53) + 'e',
+    ...Object.fromEntries(['connection_generation', 'delivery_id', 'stream_seq', 'expected_seq',
+      'actual_seq', 'key_count', 'suppressed_count'].map(key => [key, Number.MAX_SAFE_INTEGER])),
+    global: false, retryable: false, error_code: 'HISTORY_CURSOR_INVALIDATED',
+    error_kind: 'budget-exhausted',
+  }),
+})
+assert.notEqual(largestRecovery, null)
+const recoveryFixtureBytes = Buffer.byteLength(JSON.stringify(largestRecovery), 'utf8')
+assert.ok(recoveryFixtureBytes <= 1024, 'The maximal schema fixture must remain content-free and bounded.')
+console.log(`renderer recovery maximal schema fixture: ${recoveryFixtureBytes} bytes; 512 records/window maximum.`)
 
 const goneEntry = buildRendererGoneLogEntry({ reason: 'crashed', exitCode: 133 })
 assert.equal(goneEntry.event, 'renderer_process_gone')

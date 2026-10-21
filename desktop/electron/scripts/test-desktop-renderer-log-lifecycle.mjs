@@ -66,6 +66,35 @@ if (!process.versions.electron) {
       assert.equal(deliveries, 2)
       assert.equal(records.length, 1, 'Child frames must remain excluded.')
 
+      // Full document navigation must neither reset the main-owned recovery
+      // budget nor let distinct chats consume the genuine error allowance.
+      for (let chat = 0; chat < 20; chat++) {
+        await window.loadURL(`data:text/html,<title>Chat document ${chat}</title>`)
+        contents.emit('console-message', {
+          ...message, frame: contents.mainFrame, level: 'warning',
+          message: '[opensquilla-recovery] ' + JSON.stringify({
+            phase: 'failed', reason: 'metadata_hydration_failed',
+            session_key_sha256: chat.toString(16).padStart(16, '0'), error_kind: 'busy',
+          }),
+        })
+      }
+      assert.equal(records.filter(record => record.event === 'session_recovery').length, 20)
+      for (let reload = 0; reload < 10; reload++) {
+        await window.loadURL(`data:text/html,<title>Same chat reload ${reload}</title>`)
+        contents.emit('console-message', {
+          ...message, frame: contents.mainFrame, level: 'warning',
+          message: '[opensquilla-recovery] ' + JSON.stringify({
+            phase: 'failed', reason: 'metadata_hydration_failed',
+            session_key_sha256: '0000000000000000', error_kind: 'busy',
+          }),
+        })
+      }
+      assert.equal(records.filter(record => record.event === 'session_recovery').length, 27)
+      contents.emit('console-message', { ...message, frame: contents.mainFrame })
+      assert.equal(records.filter(record => record.event === 'renderer_console').length, 2)
+      const recordsBeforeDestroy = records.length
+      const deliveriesBeforeDestroy = deliveries
+
       await new Promise(resolveDestroyed => {
         contents.once('destroyed', resolveDestroyed)
         window.destroy()
@@ -76,8 +105,8 @@ if (!process.versions.electron) {
       // Electron may remove event listeners during destruction. Invoke the
       // saved production callback to exercise an already queued late delivery.
       assert.doesNotThrow(() => deliver(message))
-      assert.equal(deliveries, 3)
-      assert.equal(records.length, 1, 'A late error must not log after destruction.')
+      assert.equal(deliveries, deliveriesBeforeDestroy + 1)
+      assert.equal(records.length, recordsBeforeDestroy, 'A late error must not log after destruction.')
       console.log('desktop renderer log lifecycle: real Electron teardown passed.')
       app.exit(0)
     } catch (error) {
