@@ -4803,7 +4803,10 @@ async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext
     # storage coordination inside the same bounded-read contract as history so
     # metadata cannot pin the connection's serialized dispatcher indefinitely.
     with bounded_interactive_storage_reads():
-        return await _hydrate_sessions_messages_metadata(ctx, key)
+        # Registration metadata comes from storage only. Transport recovery
+        # does not invalidate a previously checked physical directory; execution
+        # and workspace operations still validate it at their own boundaries.
+        return await _hydrate_sessions_messages_metadata(ctx, key, include_project_workspace=True)
 
 
 async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:

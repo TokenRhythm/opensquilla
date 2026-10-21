@@ -2103,6 +2103,8 @@ class SessionStorage:
         self._conn: Any | None = None
         self._connection_generation = 0
         self._transcript_reader: Any | None = None
+        self._committed_reader: Any | None = None
+        self._committed_reader_lock = asyncio.Lock()
         self._recovery_read_pool: RecoveryReadPool | None = None
         self._pending_reader_operations: set[asyncio.Task[Any]] = set()
         self._operation_lock = asyncio.Lock()
@@ -2189,6 +2191,7 @@ class SessionStorage:
         if (
             self._conn is not None
             or self._transcript_reader is not None
+            or self._committed_reader is not None
         ):
             await self.close()
         self._poisoned = False
@@ -2249,19 +2252,24 @@ class SessionStorage:
         if self._recovery_read_pool is not None:
             await self._recovery_read_pool.close()
         async with self._operation_lock:
-            async with self._transcript_reader_lock:
+            async with self._committed_reader_lock, self._transcript_reader_lock:
                 reader, self._transcript_reader = self._transcript_reader, None
                 conn, self._conn = self._conn, None
                 try:
-                    if self._pending_reader_operations:
-                        await self._finish_sqlite_call(asyncio.gather(
-                            *self._pending_reader_operations, return_exceptions=True,
-                        ))
-                    if reader is not None:
-                        await reader.close()
+                    try:
+                        if self._pending_reader_operations:
+                            await self._finish_sqlite_call(asyncio.gather(
+                                *self._pending_reader_operations, return_exceptions=True,
+                            ))
+                    finally:
+                        try:
+                            await self._close_committed_reader()
+                        finally:
+                            if reader is not None:
+                                await self._finish_sqlite_call(reader.close())
                 finally:
                     if conn is not None:
-                        await conn.close()
+                        await self._finish_sqlite_call(conn.close())
 
     def _warn_transcript_reader_fallback_once(
         self,
@@ -2368,6 +2376,29 @@ class SessionStorage:
         register_connection(self._db_path, "recovery_reader", reader)
         return reader
 
+    async def _open_committed_reader(self) -> None:
+        """Open under the snapshot gate; its owner shields all initialization."""
+
+        reader = await aiosqlite.connect(self._db_path, isolation_level=None)
+        try:
+            register_connection(self._db_path, "committed_reader", reader)
+            await self._initialize_recovery_reader(reader)
+            async with reader.execute("PRAGMA query_only") as cursor:
+                row = await cursor.fetchone()
+            if row is None or int(row[0]) != 1:
+                raise RuntimeError("Committed reader query-only mode unavailable")
+        except BaseException:
+            await self._finish_sqlite_call(reader.close())
+            raise
+        self._committed_reader = reader
+
+    async def _close_committed_reader(self) -> None:
+        """Retire only the snapshot reader, while holding its exclusive gate."""
+
+        reader, self._committed_reader = self._committed_reader, None
+        if reader is not None:
+            await self._finish_sqlite_call(reader.close())
+
     async def _initialize_recovery_reader(self, reader: Any) -> None:
         """Configure an already-owned reader; the pool handles every failure."""
 
@@ -2444,6 +2475,7 @@ class SessionStorage:
     @contextlib.contextmanager
     def _transaction_diagnostics(
         self, operation: str, role: str,
+        *, connection: Callable[[], Any] | None = None,
     ) -> Iterator[_TransactionTiming | None]:
         # Local opt-in only. Bound volume even if the switch is left enabled.
         if not self._diagnostics_enabled or self._diagnostic_count >= 256:
@@ -2467,6 +2499,7 @@ class SessionStorage:
         finally:
             phase = timing.phase
             timing.advance("finished")
+            observed_connection = connection() if connection is not None else self._conn
             # The caller has released its gate; no SQL, handlers or awaits are
             # added inside the transaction. These are await spans, not SQL CPU.
             log.info("session_storage.transaction_timing", extra={
@@ -2478,12 +2511,13 @@ class SessionStorage:
                     "duration_ms": max(0.0, (timing.phase_started - started) * 1000),
                     "timings": timing.timings,
                     "exception_type": type(failure).__name__ if failure else None,
-                    "backend": connection_backend(self._conn),
+                    "backend": connection_backend(observed_connection),
                     **sqlite_failure(failure),
-                    **(connection_snapshot(self._db_path, current_connection=self._conn)
+                    **(connection_snapshot(self._db_path, current_connection=observed_connection)
                        if failure else {}),
                     "connection_in_transaction": (
-                        bool(self._conn.in_transaction) if self._conn is not None else None
+                        bool(observed_connection.in_transaction)
+                        if observed_connection is not None else None
                     ),
                     "poisoned": self._poisoned,
                     "capture_limit_reached": sequence == 256,
@@ -2491,14 +2525,18 @@ class SessionStorage:
             })
 
     @contextlib.contextmanager
-    def _observe_operation(self, operation: str) -> Iterator[None]:
+    def _observe_operation(
+        self, operation: str, *, track_writer: bool = True,
+    ) -> Iterator[None]:
         started = self._monotonic()
-        self._operation_holder = (operation, started)
+        if track_writer:
+            self._operation_holder = (operation, started)
         try:
             yield
         finally:
             hold_ms = max(0, int((self._monotonic() - started) * 1000))
-            self._operation_holder = None
+            if track_writer:
+                self._operation_holder = None
             if hold_ms >= 250:
                 log.warning(
                     "session_storage.slow_operation operation=%s hold_ms=%d",
@@ -2534,9 +2572,11 @@ class SessionStorage:
         self._poisoned = True
         if self._recovery_read_pool is not None:
             await self._recovery_read_pool.close()
-        async with self._transcript_reader_lock:
+        async with self._committed_reader_lock, self._transcript_reader_lock:
             reader, self._transcript_reader = self._transcript_reader, None
             conn, self._conn = self._conn, None
+            with contextlib.suppress(BaseException):
+                await self._close_committed_reader()
             if self._pending_reader_operations:
                 await self._finish_sqlite_call(asyncio.gather(
                     *self._pending_reader_operations, return_exceptions=True,
@@ -2765,6 +2805,66 @@ class SessionStorage:
                             if timing is not None:
                                 timing.advance("rollback_await_ms")
                             await self._rollback_transaction(conn, qualified_operation)
+
+    @asynccontextmanager
+    async def committed_read_transaction(self, operation: str) -> AsyncIterator[Any]:
+        """Read one committed WAL snapshot without occupying the writer gate.
+
+        The dedicated query-only connection is exclusive for the entire snapshot.
+        Ordinary transcript reads cannot join its transaction, and all mutations
+        still go through the canonical writer. Memory/non-WAL databases retain
+        the serialized connection path because independent snapshots are unsafe.
+        Bodies must use only read SQL on the yielded connection, without taking
+        the writer gate or closing storage while holding this reader's gate.
+        """
+
+        generation = self.connection_generation
+        if self._transcript_reader is None:
+            async with self.read_transaction(operation) as conn:
+                yield conn
+            return
+
+        qualified_operation = f"read.{operation}"
+        with self._transaction_diagnostics(
+            qualified_operation, "committed_read", connection=lambda: self._committed_reader,
+        ) as timing:
+            async with self._committed_reader_lock:
+                self._raise_if_poisoned()
+                if generation != self.connection_generation:
+                    raise RuntimeError("Storage connection changed while waiting for a snapshot")
+                if timing is not None:
+                    timing.advance("begin_await_ms")
+                if self._committed_reader is None:
+                    await self._finish_sqlite_call(self._open_committed_reader())
+                conn = self._committed_reader
+                assert conn is not None
+                with self._observe_operation(qualified_operation, track_writer=False):
+                    try:
+                        await self._finish_sqlite_call(conn.execute("BEGIN"))
+                        if timing is not None:
+                            timing.advance("body_ms")
+                        yield conn
+                    finally:
+                        if bool(conn.in_transaction):
+                            if timing is not None:
+                                timing.advance("rollback_await_ms")
+                            try:
+                                await self._finish_sqlite_call(conn.rollback())
+                            except BaseException as exc:
+                                # Cancellation propagates only after rollback
+                                # settles. A failed reader must never poison the
+                                # independent writer or be reused in a transaction.
+                                if (
+                                    not isinstance(exc, asyncio.CancelledError)
+                                    or conn.in_transaction
+                                ):
+                                    log.error(
+                                        "session_storage.committed_read_rollback_failed "
+                                        "operation=%s",
+                                        qualified_operation,
+                                    )
+                                    await self._close_committed_reader()
+                                raise
 
     async def _initialize_schema(
         self,

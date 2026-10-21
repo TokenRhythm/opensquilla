@@ -577,7 +577,8 @@ async def test_real_socket_flow_pause_and_snapshot_staging_crosses_ack_hole(gate
         await _receive_until(client, frames, type="pong", nonce="credit-paused")
         assert len([f for f in frames if f.get("event") == "session.event.text_delta"]) == 128
         assert len(conn._flow.deliveries) == 128
-        assert key in conn._flow.dirty
+        assert not conn._flow.dirty
+        assert sum(len(pending) for pending in conn._pending_flow.values()) == 2
 
         parts = []
         first = None

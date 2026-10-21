@@ -73,6 +73,8 @@ export class TransportFlowV4 {
     resolve: () => void; reject: (error: Error) => void
   }>()
   private timer: ReturnType<typeof setTimeout> | null = null
+  private timerDueAt = 0
+  private retryNotBefore = 0
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null
   private inFlight = false
   private preferDirty = false
@@ -171,6 +173,8 @@ export class TransportFlowV4 {
     if (this.timer !== null) clearTimeout(this.timer)
     if (this.recoveryTimer !== null) clearTimeout(this.recoveryTimer)
     this.timer = null
+    this.timerDueAt = 0
+    this.retryNotBefore = 0
     this.recoveryTimer = null
     this.inFlight = false
     this.preferDirty = false
@@ -495,10 +499,12 @@ export class TransportFlowV4 {
     this.suspendedRecoveries.set(key, { version: this.recoveryVersion(key), receipts: outstanding })
   }
 
-  async waitForConsumption(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void> {
+  async waitForConsumption(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number; replayAccepted?: boolean }): Promise<void> {
     const revision = this.revision
-    // The FIFO proof follows its tail events. Capture the consumers already
-    // dispatched at that point, never an unrelated session's pending consumer.
+    const deadline = performance.now() + 7_000
+    // Capture only this session's already dispatched consumers. A validated
+    // modern resume proof may arrive before its first replay frame when another
+    // lane still owns the shared window; the cursor wait below covers that gap.
     await Promise.all([...this.consumers.entries()]
       .filter(([id, item]) => item.key === key && !this.unowned.has(id))
       .map(([, item]) => item.work))
@@ -509,23 +515,35 @@ export class TransportFlowV4 {
       // waiting for the authoritative final waterline while the connection
       // remains current; the caller's outer budget bounds this loop.
       const knownCursor = this.consumedCursors.get(key)
-      if ((!knownCursor || knownCursor.generation !== cursor.streamGeneration)
+      if (!cursor.replayAccepted
+        && (!knownCursor || knownCursor.generation !== cursor.streamGeneration)
         && !this.resumes.has(key)
         && ![...this.consumers.values()].some(item => item.key === key)) {
         throw Object.assign(new Error('Snapshot replay tail was not consumed.'), { code: 'SNAPSHOT_STALE' })
       }
-      for (let attempt = 0; attempt < 140; attempt++) {
+      // Progress can wake this loop much faster than the fallback timer. Count
+      // elapsed time, not notifications, so a long healthy replay keeps its
+      // full existing budget without extending it after each consumed frame.
+      while (this.current(revision)) {
         const consumed = this.consumedCursors.get(key)
         if (consumed?.generation === cursor.streamGeneration && consumed.sequence >= cursor.toSeq) return
-        if (!this.current(revision)) throw Object.assign(new Error('Snapshot replay tail was not consumed.'), { code: 'SNAPSHOT_STALE' })
+        const remaining = deadline - performance.now()
+        if (remaining <= 0) break
         let notify!: () => void
+        let timer: ReturnType<typeof setTimeout> | undefined
         const notified = new Promise<void>(resolve => { notify = resolve })
         const waiters = this.consumedWaiters.get(key) ?? new Set<() => void>()
         waiters.add(notify)
         this.consumedWaiters.set(key, waiters)
-        await Promise.race([notified, new Promise<void>(resolve => setTimeout(resolve, 50))])
-        waiters.delete(notify)
-        if (!waiters.size) this.consumedWaiters.delete(key)
+        try {
+          await Promise.race([notified, new Promise<void>(resolve => {
+            timer = setTimeout(resolve, Math.min(50, remaining))
+          })])
+        } finally {
+          if (timer !== undefined) clearTimeout(timer)
+          waiters.delete(notify)
+          if (!waiters.size && this.consumedWaiters.get(key) === waiters) this.consumedWaiters.delete(key)
+        }
       }
       throw Object.assign(new Error('Snapshot replay tail was not consumed.'), { code: 'SNAPSHOT_STALE' })
     }
@@ -722,8 +740,32 @@ export class TransportFlowV4 {
   }
 
   private schedule(delay: number): void {
-    if (!this.enabled || this.timer !== null) return
-    this.timer = setTimeout(() => { this.timer = null; void this.flush() }, delay)
+    if (!this.enabled) return
+    const dueAt = Math.max(Date.now() + delay, this.retryNotBefore)
+    if (this.timer !== null) {
+      if (this.timerDueAt >= this.retryNotBefore && this.timerDueAt <= dueAt) return
+      clearTimeout(this.timer)
+    }
+    this.timerDueAt = dueAt
+    this.timer = setTimeout(() => {
+      this.timer = null
+      this.timerDueAt = 0
+      void this.flush()
+    }, Math.max(0, dueAt - Date.now()))
+  }
+
+  private scheduleRetry(): void {
+    // New consumption may advance an ordinary coalescing timer, but must not
+    // turn a failed control RPC into an event-rate retry loop.
+    this.retryNotBefore = Date.now() + 1000
+    this.schedule(0)
+  }
+
+  private hasPendingLaneCredit(): boolean {
+    return this.sessionFlowV2 && (
+      [...this.laneAck.entries()].some(([lane, id]) => id > (this.laneSentAck.get(lane) ?? 0))
+      || this.staged.size > 0 || this.pendingRetires.size > 0
+    )
   }
 
   private async flushSessionFlowV2(): Promise<void> {
@@ -775,13 +817,16 @@ export class TransportFlowV4 {
       )
       if (!this.current(revision) || !validateSessionFlowUpdateV2Result(result)
         || result.connection_epoch !== this.epoch) throw new Error('Invalid session flow v2 reply')
+      let progressed = false
       for (const item of consumed) {
         const acknowledged = result.consumed.find(
           value => value.subscription_epoch === item.subscription_epoch,
         )
-        if (acknowledged && acknowledged.through_delivery_id >= item.through_delivery_id
-          && !this.laneRetired.has(item.subscription_epoch)) {
-          this.laneSentAck.set(item.subscription_epoch, acknowledged.through_delivery_id)
+        if (acknowledged && acknowledged.through_delivery_id >= item.through_delivery_id) {
+          if (!this.laneRetired.has(item.subscription_epoch)) {
+            this.laneSentAck.set(item.subscription_epoch, acknowledged.through_delivery_id)
+          }
+          progressed = true
         }
       }
       for (const item of staged) {
@@ -791,6 +836,7 @@ export class TransportFlowV4 {
         if (acknowledged) {
           this.staged.get(item.delivery_id)?.resolve()
           this.staged.delete(item.delivery_id)
+          progressed = true
         }
       }
       for (const item of discarded) {
@@ -802,8 +848,12 @@ export class TransportFlowV4 {
           this.pendingRetires.get(item.subscription_epoch)?.resolve()
           this.pendingRetires.delete(item.subscription_epoch)
           this.forgetRetiredLane(item.subscription_epoch)
+          progressed = true
         }
       }
+      // A well-shaped reply without any matching receipt proves no progress.
+      // Retain responsibility, with the same backoff as an unsuccessful RPC.
+      if (!progressed) this.scheduleRetry()
     } catch (error) {
       if (this.current(revision)) {
         const failure = record(error)
@@ -832,13 +882,14 @@ export class TransportFlowV4 {
             this.pendingRetires.delete(item.subscription_epoch)
             this.forgetRetiredLane(item.subscription_epoch)
           }
-        } else this.schedule(1000)
+        } else this.scheduleRetry()
       }
     } finally {
       if (this.current(revision)) {
         this.inFlight = false
-        if ([...this.laneAck.entries()].some(([lane, id]) => id > (this.laneSentAck.get(lane) ?? 0))
-          || this.staged.size || this.pendingRetires.size) this.schedule(this.staged.size ? 0 : 50)
+        // Coalesce everything consumed during the previous RPC into the next
+        // immediate batch. Only one ACK remains in flight at a time.
+        if (this.hasPendingLaneCredit()) this.schedule(0)
         else {
           this.isolateSessionFlowUpdates = false
           if (this.dirty.size || this.resumes.size) this.schedule(0)
@@ -849,11 +900,11 @@ export class TransportFlowV4 {
 
   private async flush(): Promise<void> {
     if (!this.enabled || this.inFlight) return
-    const hasSessionLaneWork = this.sessionFlowV2 && (
-      [...this.laneAck.entries()].some(([lane, id]) => id > (this.laneSentAck.get(lane) ?? 0))
-      || this.staged.size > 0 || this.pendingRetires.size > 0
-    )
-    if (hasSessionLaneWork) {
+    if (Date.now() < this.retryNotBefore) {
+      this.schedule(0)
+      return
+    }
+    if (this.hasPendingLaneCredit()) {
       await this.flushSessionFlowV2()
       return
     }
@@ -930,12 +981,13 @@ export class TransportFlowV4 {
       }
       // Credit updates are idempotent; retry only this connection-local RPC.
       // Never replay a business mutation or recycle the shared socket here.
-      if (this.current(revision)) this.schedule(1000)
+      if (this.current(revision)) this.scheduleRetry()
     } finally {
       if (this.current(revision)) {
         this.inFlight = false
-        if (this.ack !== this.sentAck || this.dirty.size || this.resumes.size || this.staged.size) {
-          this.schedule(this.staged.size ? 0 : 50)
+        if (this.hasPendingLaneCredit() || this.ack !== this.sentAck
+          || this.dirty.size || this.resumes.size || this.staged.size) {
+          this.schedule(this.sessionFlowV2 || this.staged.size ? 0 : 50)
         }
       }
     }

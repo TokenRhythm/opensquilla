@@ -98,7 +98,7 @@ interface SessionReadV4Transport {
   recoveryVersion?(key: string): string
   snapshotInstalled?(key: string, version: string): void
   retireLane?(receipt: TransportLaneRetireReceipt): Promise<void> | void
-  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
+  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number; replayAccepted?: boolean }): Promise<void>
   failProtocol?(generation: number): void
 }
 

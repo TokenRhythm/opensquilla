@@ -8,7 +8,7 @@ import inspect
 import json
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -60,11 +60,8 @@ from opensquilla.gateway.telemetry_connections import (
 from opensquilla.gateway.transport_flow import (
     CONNECTION_BUFFER_BYTES,
     CONTROL_BUFFER_BYTES,
-    CONTROL_BUFFER_FRAMES,
     FLOW_CAPABILITY,
     FLOW_CAPABILITY_V2,
-    FLOW_LANE_WINDOW_BYTES,
-    FLOW_LANE_WINDOW_FRAMES,
     FLOW_V2_MAX_LANE_EPOCHS,
     FLOW_V2_MAX_LANES,
     FLOW_WINDOW_BYTES,
@@ -237,6 +234,9 @@ _DETACHED_READ_STOP_TIMEOUT_SECONDS = 2.0
 _DIRECT_SEND_TIMEOUT_SECONDS = 2.0
 _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 _WRITER_SEND_TIMEOUT_SECONDS = 60.0
+# Pending frames retain a Python envelope as well as their encoded wire size.
+# This allowance also covers delivery-id growth while they await admission.
+_PENDING_FRAME_OVERHEAD = 256
 _MAX_ORDINARY_REQUESTS = 8
 _ORDINARY_DRAIN_SECONDS = 0.25
 _CONTROL_RPC_METHODS = frozenset({"transport.flow.update", "transport.sessionFlow.update.v2"})
@@ -420,10 +420,13 @@ class _OutboundFrame:
     meta: dict[str, Any] | None = None
     raw_text: str | None = None
     encoded_text: str | None = None
+    encoded_body: str | None = None
     budget_bytes: int = 0
     delivery_id: int | None = None
     is_control: bool = False
+    priority: bool = False
     budget_kind: BudgetKind = None
+    pending_size: int = 0
     is_probe: bool = False
     enqueued_at: float = field(default_factory=time.monotonic, repr=False)
 
@@ -567,6 +570,13 @@ class WsConnection:
     _pending_replays: OrderedDict[str, _PendingReplay] = field(
         default_factory=OrderedDict, init=False, repr=False
     )
+    _pending_flow: OrderedDict[tuple[str | None, str | None], deque[_OutboundFrame]] = field(
+        default_factory=OrderedDict, init=False, repr=False,
+    )
+    _draining_flow: bool = field(default=False, init=False, repr=False)
+    _pending_large_owner: tuple[str | None, str | None] | None = field(
+        default=None, init=False, repr=False,
+    )
 
     @property
     def flow_enabled(self) -> bool:
@@ -644,6 +654,8 @@ class WsConnection:
             from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
 
             raise SnapshotTransferError("SNAPSHOT_BUSY")
+        # The snapshot/replay owner now covers this unsent stream suffix.
+        self._discard_pending_flow(key)
         pending = self._pending_replays.pop(key, None)
         if pending is not None:
             pending.transfer.close()
@@ -712,9 +724,7 @@ class WsConnection:
                 flow_unacked_bytes=(
                     sum(item.size for item in flow.deliveries.values()) if flow else 0
                 ),
-                lane_window_frames=(
-                    FLOW_LANE_WINDOW_FRAMES if self._flow_lane_enabled else FLOW_WINDOW_FRAMES
-                ),
+                lane_window_frames=FLOW_WINDOW_FRAMES,
                 queue_depth=self._outbox.qsize() if self._outbox else 0,
             )
         except Exception:
@@ -724,6 +734,7 @@ class WsConnection:
     def _mark_flow_dirty(self, payload: Any, *, reason_code: str = "stream_invalidated") -> None:
         assert self._flow is not None
         key = _payload_field(payload, "session_key") or _payload_field(payload, "key")
+        self._discard_pending_flow(key if isinstance(key, str) else None)
         generation = _payload_field(payload, "stream_generation")
         seq = _payload_field(payload, "stream_seq")
         was_global = self._flow.global_dirty
@@ -796,6 +807,7 @@ class WsConnection:
         return True
 
     def _retire_flow_subscription(self, key: str) -> dict[str, Any] | None:
+        self._discard_pending_flow(key)
         self._resume_proofs.pop(key, None)
         pending = self._pending_replays.pop(key, None)
         if pending is not None:
@@ -995,14 +1007,12 @@ class WsConnection:
                 )
             except _FlowAdmissionError as exc:
                 raise SnapshotTransferError("SNAPSHOT_STALE") from exc
-            if wire_size > MAX_PAYLOAD_BYTES or (
-                self._flow_lane_enabled
-                and size > FLOW_LANE_WINDOW_BYTES * FLOW_V2_MAX_LANES
-            ):
+            if wire_size > MAX_PAYLOAD_BYTES:
                 # This event cannot fit even with empty credit. A new snapshot
                 # must absorb it; retrying the same frozen base stays impossible.
                 raise SnapshotTransferError("SNAPSHOT_STALE")
             frame.encoded_text = encoded
+            frame.encoded_body = None
             prepared.append((offset, frame, size, wire_size))
         return prepared
 
@@ -1043,10 +1053,18 @@ class WsConnection:
                 raise SnapshotTransferError("SNAPSHOT_BUSY")
         while pending.batch_index < len(pending.batches):
             batch = pending.batches[pending.batch_index]
-            prepared = self._prepare_replay_suffix(pending, lane_epoch=lane_epoch)
             # Keep one queue slot for the resume/control reply. Admission and
             # publication below never yield, so another producer cannot take it.
             capacity = max(0, self._outbox.maxsize - self._outbox.qsize() - 1)
+            ordinary = [item for item in flow.deliveries.values() if not item.recovery]
+            if not capacity or len(ordinary) >= FLOW_WINDOW_FRAMES or (
+                ordinary and sum(item.size for item in ordinary) >= FLOW_WINDOW_BYTES
+            ):
+                # Writer completion also retries pending replay. Do not encode
+                # a potentially large suffix repeatedly while no credit can
+                # have returned; ACK/dequeue will retry the same owner.
+                return
+            prepared = self._prepare_replay_suffix(pending, lane_epoch=lane_epoch)
             frames: list[_OutboundFrame] = []
             delivery_ids: set[int] = set()
             delivery_lanes: dict[int, tuple[str | None, str | None]] = {}
@@ -1055,7 +1073,7 @@ class WsConnection:
                 if len(frames) >= capacity:
                     next_offset = offset
                     break
-                # Use real lane, aggregate and connection/global credit. A
+                # Use real shared connection/global credit. A
                 # refused suffix is backpressure, not a new dirty barrier.
                 delivery_id = flow.admit(
                     size, wire_size=wire_size,
@@ -1072,7 +1090,11 @@ class WsConnection:
                     flow.deliveries[delivery_id].lane, lane_epoch,
                 )
             if prepared and not frames:
-                raise SnapshotTransferError("SNAPSHOT_BUSY")
+                # Another lane or an earlier physical write still owns the
+                # shared credit. ACK/writer drain will retry this same suffix.
+                if capacity and flow.last_rejection_reason != "connection_window_exhausted":
+                    raise SnapshotTransferError("SNAPSHOT_BUSY")
+                return
             # Every admitted frame has its pending owner before the first
             # frame becomes visible to the writer. Never replay an ACKed prefix.
             pending.pending_delivery_ids = delivery_ids
@@ -1093,9 +1115,7 @@ class WsConnection:
                             or (item.lane == pending.key and item.lane_epoch == lane_epoch)
                         )
                         for item in flow.deliveries.values()
-                    ) < (
-                        FLOW_LANE_WINDOW_FRAMES if self._flow_lane_enabled else FLOW_WINDOW_FRAMES
-                    )
+                    ) < FLOW_WINDOW_FRAMES
                 ):
                     # All of the new suffix is reserved and queued, with at
                     # least one frame of headroom for the continuing live
@@ -1149,11 +1169,7 @@ class WsConnection:
                 and not isinstance(through, bool)
             ):
                 acknowledged.append((epoch, through))
-        if not acknowledged:
-            return
         for pending in tuple(self._pending_replays.values()):
-            if not pending.pending_delivery_ids:
-                continue
             remaining: set[int] = set()
             for delivery_id in pending.pending_delivery_ids:
                 _lane, lane_epoch = pending.pending_delivery_lanes.get(delivery_id, (None, None))
@@ -1218,6 +1234,7 @@ class WsConnection:
             self._flow.stage(params["delivery_epoch"], delivery_id)
         self._prune_delivery_timers()
         self._advance_pending_replays()
+        self._drain_pending_flow()
         for key in dirty_keys:
             if key in repeated:
                 # Retrying a successful install may repeat its original
@@ -1400,6 +1417,7 @@ class WsConnection:
         self._flow.prune_settled_lanes()
         self._prune_delivery_timers()
         self._advance_pending_replays_v2(consumed)
+        self._drain_pending_flow()
         return {
             "connection_epoch": self._flow.epoch,
             "consumed": list(consumed),
@@ -1509,6 +1527,10 @@ class WsConnection:
             ),
             "flow_enabled": flow is not None,
             "flow_unacked_frames": len(flow.deliveries) if flow is not None else 0,
+            "flow_pending_frames": sum(map(len, self._pending_flow.values())),
+            "flow_pending_bytes": sum(
+                frame.budget_bytes for queue in self._pending_flow.values() for frame in queue
+            ),
             "flow_unacked_bytes": (
                 sum(delivery.size for delivery in flow.deliveries.values()) if flow else 0
             ),
@@ -1521,6 +1543,7 @@ class WsConnection:
         }
 
     def _cleanup_transport(self) -> None:
+        self._discard_pending_flow()
         self._confirmed_flow_retires.clear()
         self._flow_lane_epochs.clear()
         for timer in self._delivery_timers.values():
@@ -1877,9 +1900,11 @@ class WsConnection:
         if (
             self._outbox is None
             or self._outbox.qsize() + 1 > self._outbox.maxsize
-            or self._flow_control_bytes + proof_bytes > CONTROL_BUFFER_BYTES
         ):
             raise SnapshotTransferError("SNAPSHOT_BUSY")
+        if not self.reserve_transport_bytes(proof_bytes, kind="control"):
+            raise SnapshotTransferError("SNAPSHOT_BUSY")
+        self.release_transport_bytes(proof_bytes, kind="control")
         pending = _PendingReplay(
             key=key, params=dict(params), transfer=transfer,
             dirty_revision=dirty_revision,
@@ -2135,7 +2160,9 @@ class WsConnection:
                 )
                 await self._send_direct_text(wire.model_dump_json())
 
-    async def send_res(self, frame: ResFrame, *, transport_control: bool = False) -> None:
+    async def send_res(
+        self, frame: ResFrame, *, transport_control: bool = False, transport_priority: bool = False,
+    ) -> None:
         if self._closing:
             return
         # RPC responses are always CONTROL: they carry state-bearing payloads
@@ -2151,6 +2178,7 @@ class WsConnection:
                 # Non-droppable response ordering is independent of memory
                 # class: history pages may exceed the small control reserve.
                 is_control=self._recovery_enabled and (transport_control or not frame.ok),
+                priority=transport_priority,
             )
             self._enqueue_frame(outbound)
             return
@@ -2181,6 +2209,7 @@ class WsConnection:
                     res_frame=None,
                     raw_text=text,
                     is_probe=probe,
+                    priority=True,
                 )
             )
             return
@@ -2469,8 +2498,8 @@ class WsConnection:
             ),
             "control_reserved_frames": self._flow_control_frames,
             "control_reserved_bytes": self._flow_control_bytes,
-            "control_limit_frames": CONTROL_BUFFER_FRAMES,
-            "control_limit_bytes": CONTROL_BUFFER_BYTES,
+            "control_limit_frames": self._writer_queue_maxsize,
+            "control_limit_bytes": CONNECTION_BUFFER_BYTES,
             "wire_limit_bytes": MAX_PAYLOAD_BYTES,
             "connection_closing": self._closing,
         }
@@ -2522,6 +2551,25 @@ class WsConnection:
         """Encode and measure an event without mutating credit or queue state."""
         assert self._flow is not None and self._outbox is not None
         assert frame.event_name is not None
+        if frame.encoded_body is None:
+            estimated_payload_size = _bounded_json_size(frame.payload, MAX_PAYLOAD_BYTES)
+            if estimated_payload_size > MAX_PAYLOAD_BYTES:
+                raise _FlowAdmissionError(
+                    "Outbound event exceeds the wire limit",
+                    reason_code="frame_wire_limit", wire_bytes=estimated_payload_size,
+                )
+            base = make_event(
+                frame.event_name,
+                encode_payload_for_protocol(frame.payload, protocol=self.protocol),
+                meta=frame.meta,
+            )
+            # Freeze at enqueue, as the original direct admission path did.
+            # Producers may reuse their dictionaries after send_event returns.
+            frame.encoded_body = base.model_dump_json(exclude={"seq", "meta"})
+            if frame.meta is not None:
+                frame.meta = json.loads(base.model_dump_json(include={"meta"}))["meta"]
+            if isinstance(frame.payload, dict):
+                frame.payload = dict(frame.payload)
         meta = dict(frame.meta or {})
         if delivery_id is not None:
             meta["flow"] = {
@@ -2532,17 +2580,8 @@ class WsConnection:
                     "connection_epoch": self._flow.epoch,
                     "subscription_epoch": lane_epoch, "delivery_id": delivery_id,
                 }
-        estimated_payload_size = _bounded_json_size(frame.payload, MAX_PAYLOAD_BYTES)
-        if estimated_payload_size > MAX_PAYLOAD_BYTES:
-            raise _FlowAdmissionError(
-                "Outbound event exceeds the wire limit",
-                reason_code="frame_wire_limit", wire_bytes=estimated_payload_size,
-            )
-        encoded = make_event(
-            frame.event_name,
-            encode_payload_for_protocol(frame.payload, protocol=self.protocol),
-            meta=meta or None,
-        ).model_dump_json(exclude={"seq"})
+        metadata = make_event(frame.event_name, meta=meta or None).model_dump_json(include={"meta"})
+        encoded = frame.encoded_body[:-1] + "," + metadata[1:]
         encoded_size = len(encoded.encode("utf-8"))
         pending_events = sum(
             isinstance(queued, _OutboundFrame) and queued.event_name is not None
@@ -2616,21 +2655,21 @@ class WsConnection:
                 # allowance; the writer bounds and accounts for any growth.
                 size = max(size, 256 * 1024)
             if is_stream:
-                delivery_id = self._flow.admit(
-                    size,
-                    wire_size=wire_size,
-                    lane=(key if self._flow_lane_enabled and isinstance(key, str) else None),
-                    lane_epoch=lane_epoch,
-                )
-                if delivery_id is None:
+                reservation = size + _PENDING_FRAME_OVERHEAD
+                if not self.reserve_transport_bytes(reservation):
                     self._mark_flow_dirty(
                         frame.payload,
-                        reason_code=self._flow.last_rejection_reason or "flow_admission_rejected",
+                        reason_code="transport_reservation_rejected",
                     )
                     return False
-                frame.delivery_id = delivery_id
-                frame.encoded_text = encoded
-                return True
+                frame.budget_bytes = reservation
+                frame.pending_size = size
+                owner = (key if isinstance(key, str) else None, lane_epoch)
+                self._pending_flow.setdefault(owner, deque()).append(frame)
+                # Pending frames own bytes but have no delivery/wire sequence.
+                # One lane cannot overtake its own queued suffix.
+                self._drain_pending_flow()
+                return False
         elif frame.res_frame is not None:
             estimated_payload_size = _bounded_json_size(
                 frame.res_frame.payload, MAX_PAYLOAD_BYTES,
@@ -2712,14 +2751,8 @@ class WsConnection:
                 "Outbound frame exceeds the wire limit",
                 reason_code="frame_wire_limit", wire_bytes=wire_size,
             )
-        if frame.is_control and (
-            self._flow_control_frames >= CONTROL_BUFFER_FRAMES
-            or self._flow_control_bytes + size > CONTROL_BUFFER_BYTES
-        ):
-            raise _FlowAdmissionError(
-                "Control buffer is full", reason_code="control_buffer_limit",
-                wire_bytes=wire_size, requested_bytes=size,
-            )
+        # The control reserve is guaranteed headroom, not a second tiny hard
+        # ceiling. Healthy concurrent ACK/RPC replies share the total budget.
         frame.budget_kind = "control" if frame.is_control else None
         if not self.reserve_transport_bytes(size, kind=frame.budget_kind):
             raise _FlowAdmissionError(
@@ -2731,7 +2764,132 @@ class WsConnection:
             self._flow_control_frames += 1
             self._flow_control_bytes += size
         frame.encoded_text = encoded
+        frame.encoded_body = None
         return True
+
+    def _discard_pending_flow(self, key: str | None = None) -> None:
+        """Release unsent frames when their subscription/recovery owner leaves."""
+        for owner in tuple(self._pending_flow):
+            if key is not None and owner[0] != key:
+                continue
+            for frame in self._pending_flow.pop(owner):
+                self._release_outbound_budget(frame)
+        if self._pending_large_owner not in self._pending_flow:
+            self._pending_large_owner = None
+
+    def _drain_pending_flow(self) -> None:
+        """Move FIFO lane heads into shared credit, round-robin without awaiting.
+
+        Only successful admission assigns delivery IDs. An ACK or writer
+        dequeue retries temporary backpressure; it is not a dirty stream.
+        """
+        flow, outbox = self._flow, self._outbox
+        if flow is None or outbox is None or self._closing or self._draining_flow:
+            return
+        self._draining_flow = True
+        blocked = 0
+        try:
+            # Reserve one writer slot for ACK/retire/probe responses.
+            capacity = max(1, outbox.maxsize - 1) if outbox.maxsize > 0 else FLOW_WINDOW_FRAMES
+            while self._pending_flow and outbox.qsize() < capacity:
+                owner = self._pending_large_owner or next(iter(self._pending_flow))
+                key, lane_epoch = owner
+                queue = self._pending_flow[owner]
+                frame = queue[0]
+                replayed = bool((frame.meta or {}).get("replayed"))
+                if (
+                    (not replayed and (
+                        key in flow.dirty or self._flow_key_needs_global_recovery(key)
+                        or key in self._pending_replays
+                    ))
+                    or (
+                        self._session_flow_v2_enabled and self._subscriptions is not None
+                        and self._subscriptions.get_message_subscription_epoch(self.conn_id, key)
+                        != lane_epoch
+                    )
+                ):
+                    for discarded in self._pending_flow.pop(owner):
+                        self._release_outbound_budget(discarded)
+                    if self._pending_large_owner == owner:
+                        self._pending_large_owner = None
+                    blocked = 0
+                    continue
+                try:
+                    ordinary = [item for item in flow.deliveries.values() if not item.recovery]
+                    if len(ordinary) >= FLOW_WINDOW_FRAMES or (
+                        ordinary and sum(item.size for item in ordinary) + frame.pending_size
+                        > FLOW_WINDOW_BYTES
+                    ):
+                        # Do not repeatedly encode a blocked multi-megabyte
+                        # head every time another token joins its pending lane.
+                        if frame.pending_size > FLOW_WINDOW_BYTES:
+                            self._pending_large_owner = owner
+                            break
+                        self._pending_flow.move_to_end(owner)
+                        blocked += 1
+                        if blocked >= len(self._pending_flow):
+                            break
+                        continue
+                    encoded, size, wire_size = self._encode_flow_event(
+                        frame, delivery_id=flow.next_id, lane_epoch=lane_epoch,
+                    )
+                    frame.pending_size = size
+                    extra = max(0, size - frame.budget_bytes)
+                    if extra:
+                        if not self.reserve_transport_bytes(extra):
+                            self._mark_flow_dirty(
+                                frame.payload, reason_code="transport_reservation_rejected",
+                            )
+                            continue
+                        frame.budget_bytes += extra
+                    delivery_id = flow.admit(
+                        size, wire_size=wire_size,
+                        lane=key if self._flow_lane_enabled else None,
+                        lane_epoch=lane_epoch, pre_reserved=True,
+                    )
+                    if delivery_id is None:
+                        if flow.last_rejection_reason == "connection_window_exhausted":
+                            if size > FLOW_WINDOW_BYTES:
+                                # Stop refilling a nonempty window ahead of a
+                                # legal large frame; otherwise a steady small
+                                # stream can prevent its empty-window admission.
+                                self._pending_large_owner = owner
+                                break
+                            self._pending_flow.move_to_end(owner)
+                            blocked += 1
+                            if blocked >= len(self._pending_flow):
+                                break
+                            continue
+                        self._mark_flow_dirty(
+                            frame.payload,
+                            reason_code=flow.last_rejection_reason or "flow_admission_rejected",
+                        )
+                        continue
+                    # Transfer the existing reservation to the delivery ledger.
+                    # It survives physical send until the consumer ACKs it.
+                    self.release_transport_bytes(frame.budget_bytes - size)
+                    frame.budget_bytes = 0
+                    frame.delivery_id = delivery_id
+                    frame.encoded_text = encoded
+                    frame.encoded_body = None
+                    if self._pending_large_owner == owner:
+                        self._pending_large_owner = None
+                    queue.popleft()
+                    if queue:
+                        self._pending_flow.move_to_end(owner)
+                    else:
+                        del self._pending_flow[owner]
+                    outbox.put_nowait(frame)
+                    blocked = 0
+                except Exception:
+                    self._mark_flow_dirty(
+                        frame.payload, reason_code="event_encode_or_budget_failed",
+                    )
+                    log.warning(
+                        "gateway.ws_pending_flow_failed", conn_id=self.conn_id, exc_info=True,
+                    )
+        finally:
+            self._draining_flow = False
 
     async def _writer_loop(self) -> None:
         """Drain ``_outbox`` and serialize frames onto the wire.
@@ -2853,6 +3011,12 @@ class WsConnection:
                     self._release_outbound_budget(item)
                     if self._session_flow_v2_enabled and self._flow is not None:
                         self._flow.prune_settled_lanes()
+                    if not self._closing:
+                        if self._session_flow_v2_enabled:
+                            self._advance_pending_replays_v2([])
+                        else:
+                            self._advance_pending_replays()
+                        self._drain_pending_flow()
                     # The next queue wait may last for the connection's entire
                     # lifetime. Do not retain an uncharged completed frame.
                     del item, text
@@ -2992,6 +3156,17 @@ class WsConnection:
                 return
         try:
             self._outbox.put_nowait(frame)
+            if frame.priority:
+                # ACK/probe replies may bypass data. Recovery proofs remain
+                # behind their replay prefix even though they use control
+                # memory: the client relies on that ordering fence.
+                backing = self._outbox._queue  # type: ignore[attr-defined]
+                backing.pop()
+                position = next((
+                    index for index, queued in enumerate(backing)
+                    if not isinstance(queued, _OutboundFrame) or not queued.priority
+                ), len(backing))
+                backing.insert(position, frame)
             return
         except asyncio.QueueFull:
             pass
@@ -3827,6 +4002,9 @@ async def _dispatch_request(
         await conn.send_res(res, transport_control=(
             method in _CONTROL_RPC_METHODS or method in _RECOVERY_CONTROL_METHODS
             or method == "sessions.messages.resume"
+        ), transport_priority=(
+            method in _CONTROL_RPC_METHODS
+            and not (isinstance(params, dict) and params.get("resume"))
         ))
         settings_save_transport_stage(req_id, method, "response_submit_finished", conn.conn_id)
 

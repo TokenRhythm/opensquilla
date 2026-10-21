@@ -49,7 +49,7 @@ export interface WorkspacePathSelection {
 export interface WorkspaceCatalog {
   /** Defaults from the most recently read Gateway/profile catalog. */
   readonly creationDefaults?: WorkspaceCreationDefaults | null
-  list(options?: { signal?: AbortSignal }): Promise<readonly WorkspaceItem[]>
+  list(options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<readonly WorkspaceItem[]>
   create?(parentPath: string, name: string, options?: { signal?: AbortSignal }): Promise<WorkspaceItem | null>
   open(path: string, options?: { signal?: AbortSignal }): Promise<WorkspaceItem | null>
   rename(id: string, name: string, options?: { signal?: AbortSignal }): Promise<WorkspaceItem | null>

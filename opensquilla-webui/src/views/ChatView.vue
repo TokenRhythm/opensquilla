@@ -606,7 +606,7 @@
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
       :project-workspace="activeWorkspace"
-      :project-workspace-status="activeWorkspaceStatus"
+      :project-workspace-status="activeWorkspacePresentationStatus"
       :project-binding-busy="projectBindingBusy || workbenchSessionPreparing || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
@@ -1359,6 +1359,7 @@ const {
   boundWorkspaceId,
   activeWorkspace,
   status: activeWorkspaceStatus,
+  presentationStatus: activeWorkspacePresentationStatus,
   sendBlockedReason: activeWorkspaceSendBlockedReason,
 } = activeProjectWorkspace
 const projectPickerOpen = ref(false)
@@ -3002,6 +3003,9 @@ const chatSessionSubscription = useChatSessionSubscription({
     }
     const connectionEpoch = gatewayAccess.subscriptionEpoch
     const sessionEpoch = metadata.epoch ?? currentEpoch.value
+    const sameSessionIncarnation = !activeProjectWorkspace.refreshing.value || workbenchMetadataScope === JSON.stringify([
+      key, gatewayAccess.deliveryIdentity, connectionEpoch, sessionEpoch,
+    ])
     const identityRevision = workbenchIdentityRevision
     const isCurrent = () => !chatViewDisposed && key === sessionKey.value
       && connectionEpoch === gatewayAccess.subscriptionEpoch && sessionEpoch === currentEpoch.value
@@ -3018,6 +3022,7 @@ const chatSessionSubscription = useChatSessionSubscription({
         projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
       },
       cachedWorkspace: cached ? activeSnapshot(cached) : null,
+      sameSessionIncarnation,
       loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
         .map(workspace => activeSnapshot(workspace)),
       isCurrent,
@@ -5178,8 +5183,8 @@ const modelImageSendBlockedMessage = computed(() => {
     : ''
 })
 
-const activeProjectStatusMessage = computed(() => {
-  switch (activeWorkspaceStatus.value) {
+function projectStatusMessage(status: string): string {
+  switch (status) {
     case 'resolving':
       return t('workspaces.activeProjectResolving')
     case 'unavailable':
@@ -5192,14 +5197,18 @@ const activeProjectStatusMessage = computed(() => {
     default:
       return ''
   }
-})
+}
+
+const activeProjectStatusMessage = computed(() => projectStatusMessage(activeWorkspacePresentationStatus.value))
 
 const activeProjectComposerBlockMessage = computed(() => {
   switch (activeWorkspaceStatus.value) {
     case 'resolving':
     case 'unavailable':
     case 'removed':
-      return activeProjectStatusMessage.value
+      // The stable presentation can be ready while session metadata is being
+      // checked. Admission must use operation status, never its visible copy.
+      return projectStatusMessage(activeWorkspaceStatus.value)
     default:
       return ''
   }
@@ -7549,8 +7558,10 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     const workspaces = await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
+      fresh: true,
     })
-    if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
+    if (controller.signal.aborted || activeProjectValidationController !== controller
+      || sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
     }
     const workspace = workspaces.find(item => item.id === workspaceId) || null
@@ -7565,6 +7576,9 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     ) {
       activeProjectWorkspace.failWorkspaceRefresh()
     }
+    // A cancelled/superseded read must not turn a retained ready presentation
+    // into a successful preflight result for the departed operation.
+    return controller.signal.aborted ? 'resolving' : 'error'
   } finally {
     if (activeProjectValidationController === controller) {
       activeProjectValidationController = null

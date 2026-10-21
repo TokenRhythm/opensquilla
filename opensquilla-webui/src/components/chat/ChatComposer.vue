@@ -583,6 +583,7 @@ const props = withDefaults(defineProps<{
   voiceRecording: boolean
   voiceReady: boolean
   projectWorkspace?: { id: string; name: string; path: string } | null
+  /** Settled presentation; sendBlockedMessage independently gates operations. */
   projectWorkspaceStatus?: 'none' | 'resolving' | 'ready' | 'unavailable' | 'removed' | 'unknown' | 'error'
   projectBindingBusy?: boolean
   projectStatusMessage?: string

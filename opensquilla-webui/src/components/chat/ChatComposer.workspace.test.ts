@@ -1,8 +1,9 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick } from 'vue'
+import { createApp, h, nextTick } from 'vue'
 import i18n from '@/i18n'
 import ChatComposer from './ChatComposer.vue'
+import { applySessionProjectWorkspaceMetadata, useActiveProjectWorkspace } from '@/composables/useActiveProjectWorkspace'
 
 afterEach(() => {
   document.body.innerHTML = ''
@@ -114,6 +115,45 @@ describe('ChatComposer project draft', () => {
 
     expect(host.querySelector('.chat-project-chip')).toBeNull()
 
+    app.unmount()
+  })
+
+  it('keeps the durable toolbar stable through repeated metadata refreshes while gating sending', async () => {
+    const state = useActiveProjectWorkspace()
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, removed: false }
+    state.applySessionSnapshot('session', state.beginSessionResolution('session'), { workspaceId: 'a', projectWorkspace: workspace })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({ render: () => h(ChatComposer, composerProps({
+      isNewLanding: false, canCloseProject: false, hasSendContent: true, modelValue: 'hello',
+      projectWorkspace: state.activeWorkspace.value,
+      projectWorkspaceStatus: state.presentationStatus.value,
+      projectStatusMessage: state.presentationStatus.value === 'ready' ? '' : 'Project unavailable',
+      sendBlockedMessage: state.sendBlockedReason.value ? 'Project check pending' : '',
+    }) as never) })
+    app.use(i18n)
+    app.mount(host)
+    const loadWorkspaces = vi.fn()
+    for (let index = 0; index < 3; index++) {
+      const generation = state.beginSessionRefresh('session')
+      await nextTick()
+      expect(host.querySelector('.chat-project-chip')).toBeNull()
+      expect(host.querySelector<HTMLButtonElement>('.chat-send-btn')?.disabled).toBe(true)
+      await applySessionProjectWorkspaceMetadata({ state, sessionKey: 'session', generation,
+        metadata: { workspaceId: 'a', projectWorkspace: workspace }, loadWorkspaces, isCurrent: () => true })
+      await nextTick()
+      expect(host.querySelector('.chat-project-chip')).toBeNull()
+      expect(host.querySelector<HTMLButtonElement>('.chat-send-btn')?.disabled).toBe(false)
+    }
+    state.applyWorkspaceRefresh({ ...workspace, available: false })
+    await nextTick()
+    expect(host.querySelector('.chat-project-chip')?.getAttribute('data-status')).toBe('unavailable')
+    const chip = host.querySelector('.chat-project-chip')
+    state.beginSessionRefresh('session')
+    await nextTick()
+    expect(host.querySelector('.chat-project-chip')).toBe(chip)
+    expect(host.querySelector<HTMLButtonElement>('.chat-send-btn')?.disabled).toBe(true)
+    expect(loadWorkspaces).not.toHaveBeenCalled()
     app.unmount()
   })
 

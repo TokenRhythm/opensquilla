@@ -463,7 +463,7 @@ describe('read-v2 consumption covered by an installed snapshot', () => {
       // The caller applies the returned snapshot before confirming its install.
       await live.confirmInstalled!()
       expect(h.waitForConsumption.mock.calls).toEqual([
-        ['alpha', { streamGeneration: 'stream-1', fromSeq: 10, toSeq: 10 }],
+        ['alpha', { streamGeneration: 'stream-1', fromSeq: 10, toSeq: 10, replayAccepted: true }],
       ])
       expect(h.calls.filter(call => call.method === READ_INSTALL_V2).slice(-1)[0]?.params)
         .toMatchObject({ consumed_through_seq: 10, ack_through_seq: 10 })

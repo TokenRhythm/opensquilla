@@ -6,6 +6,8 @@ type ProjectWorkspaceItem = WorkspaceItem
 interface WorkspaceCatalogReadOptions {
   readonly signal?: AbortSignal
   readonly timeoutMs?: number
+  /** Operation preflight must not reuse a read begun before the operation. */
+  readonly fresh?: boolean
 }
 export type { WorkspaceItem as ProjectWorkspaceItem } from '@/modules/workspaceCatalog'
 
@@ -15,6 +17,27 @@ const error = ref<string | null>(null)
 const hasLoaded = ref(false)
 const creationDefaults = ref<WorkspaceCreationDefaults | null>(null)
 let loadSequence = 0
+
+interface CatalogFlight {
+  sequence: number
+  controller: AbortController
+  promise: Promise<ProjectWorkspaceItem[]>
+  waiters: number
+  settled: boolean
+}
+interface CatalogReads {
+  scope: string | null
+  mutationGeneration: number
+  flight: CatalogFlight | null
+}
+const catalogReads = new WeakMap<WorkspaceCatalog, CatalogReads>()
+const REPLACED_READ = Symbol('Workspace catalog read replaced by fresh preflight')
+
+function cancelledRead(message = 'Workspace catalog read was superseded'): Error {
+  const error = new Error(message)
+  error.name = 'AbortError'
+  return error
+}
 
 export function useProjectWorkspaces(
   catalogOverride?: WorkspaceCatalog,
@@ -33,6 +56,12 @@ export function useProjectWorkspaces(
   }
   const gatewayAccess = access
   const workspaceCatalog: WorkspaceCatalog = catalog
+  let reads = catalogReads.get(workspaceCatalog)
+  if (!reads) {
+    reads = { scope: null, mutationGeneration: 0, flight: null }
+    catalogReads.set(workspaceCatalog, reads)
+  }
+  const sharedReads = reads
 
   function catalogScope() {
     return JSON.stringify([
@@ -42,6 +71,8 @@ export function useProjectWorkspaces(
   }
 
   function resetWorkspaces() {
+    invalidateReads()
+    sharedReads.scope = catalogScope()
     loadSequence += 1
     workspaces.value = []
     isLoading.value = false
@@ -50,39 +81,126 @@ export function useProjectWorkspaces(
     creationDefaults.value = null
   }
 
+  function invalidateReads(replaced = false) {
+    sharedReads.mutationGeneration += 1
+    const prior = sharedReads.flight
+    sharedReads.flight = null
+    prior?.controller.abort(replaced ? REPLACED_READ : undefined)
+  }
+
   function requireOwner() {
     if (!gatewayAccess.isLocalOwner) {
       throw new Error('Project workspaces require a local owner.')
     }
   }
 
-  async function loadWorkspaces(
+  function loadWorkspaces(
     requestOptions?: WorkspaceCatalogReadOptions,
   ): Promise<ProjectWorkspaceItem[]> {
     if (!gatewayAccess.canManageProjectWorkspaces) {
       resetWorkspaces()
-      return []
+      return Promise.resolve([])
     }
-    const requestSequence = ++loadSequence
+    if (requestOptions?.signal?.aborted) return Promise.reject(cancelledRead('Workspace catalog read was cancelled'))
     const scope = catalogScope()
-    isLoading.value = true
-    error.value = null
-    try {
-      const loadedWorkspaces = [...await workspaceCatalog.list(requestOptions)]
-      if (requestSequence === loadSequence && scope === catalogScope()) {
-        workspaces.value = loadedWorkspaces
-        creationDefaults.value = workspaceCatalog.creationDefaults ?? null
-        hasLoaded.value = true
-      }
-      return loadedWorkspaces
-    } catch (cause) {
-      if (requestSequence === loadSequence) {
-        error.value = cause instanceof Error ? cause.message : String(cause)
-      }
-      throw cause
-    } finally {
-      if (requestSequence === loadSequence) isLoading.value = false
+    if (sharedReads.scope !== scope) {
+      resetWorkspaces()
     }
+    if (requestOptions?.fresh) invalidateReads(true)
+    let flight = sharedReads.flight
+    if (!flight || flight.controller.signal.aborted) {
+      const requestSequence = ++loadSequence
+      const mutationGeneration = sharedReads.mutationGeneration
+      const controller = new AbortController()
+      isLoading.value = true
+      // Keep an existing error visible while its retry is in progress.
+      const current = () => !controller.signal.aborted
+        && sharedReads.scope === scope && scope === catalogScope()
+        && mutationGeneration === sharedReads.mutationGeneration
+        && gatewayAccess.canManageProjectWorkspaces
+      const created: CatalogFlight = { sequence: requestSequence, controller, waiters: 0, settled: false, promise: Promise.resolve([]) }
+      sharedReads.flight = created
+      // Each waiter owns its deadline. The shared transport is cancelled only
+      // when all waiters leave, or its scope/mutation generation is retired.
+      created.promise = Promise.resolve().then(() => {
+        if (!current()) throw cancelledRead()
+        return workspaceCatalog.list({ signal: controller.signal, timeoutMs: 0 })
+      }).then(result => {
+        if (!current()) throw cancelledRead()
+        const loadedWorkspaces = [...result]
+        if (requestSequence === loadSequence) {
+          workspaces.value = loadedWorkspaces
+          creationDefaults.value = workspaceCatalog.creationDefaults ?? null
+          hasLoaded.value = true
+          error.value = null
+        }
+        return loadedWorkspaces
+      }).catch(cause => {
+        if (current() && requestSequence === loadSequence) {
+          error.value = cause instanceof Error ? cause.message : String(cause)
+        }
+        throw cause
+      }).finally(() => {
+        created.settled = true
+        if (sharedReads.flight === created) sharedReads.flight = null
+        if (requestSequence === loadSequence) isLoading.value = false
+      })
+      flight = created
+    }
+    const joined = flight
+    joined.waiters += 1
+    return new Promise((resolve, reject) => {
+      let done = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeoutMs = requestOptions?.timeoutMs ?? 30_000
+      const deadline = timeoutMs > 0 && Number.isFinite(timeoutMs) ? Date.now() + timeoutMs : null
+      const finish = (cause?: unknown, result?: ProjectWorkspaceItem[] | Promise<ProjectWorkspaceItem[]>) => {
+        if (done) return
+        done = true
+        if (timer !== undefined) clearTimeout(timer)
+        requestOptions?.signal?.removeEventListener('abort', cancel)
+        joined.controller.signal.removeEventListener('abort', superseded)
+        joined.waiters -= 1
+        if (!joined.waiters && !joined.settled) {
+          if (sharedReads.flight === joined) sharedReads.flight = null
+          joined.controller.abort()
+          if (joined.sequence === loadSequence) {
+            isLoading.value = false
+            if (cause instanceof Error && cause.name === 'TimeoutError') error.value = cause.message
+          }
+        }
+        if (cause !== undefined) reject(cause)
+        else resolve(result!)
+      }
+      const cancel = () => finish(cancelledRead('Workspace catalog read was cancelled'))
+      const superseded = () => {
+        if (joined.controller.signal.reason !== REPLACED_READ) {
+          finish(cancelledRead())
+          return
+        }
+        // A fresh preflight raises the freshness bar for existing readers too.
+        // Follow its successor rather than turning harmless replacement into
+        // a metadata error; never return the retired transport's response.
+        finish(undefined, Promise.resolve().then(() => {
+          if (scope !== catalogScope() || sharedReads.scope !== scope) throw cancelledRead()
+          const remaining = deadline === null ? timeoutMs : deadline - Date.now()
+          if (deadline !== null && remaining <= 0) {
+            const cause = new Error('Workspace catalog read timed out')
+            cause.name = 'TimeoutError'
+            throw cause
+          }
+          return loadWorkspaces({ signal: requestOptions?.signal, timeoutMs: remaining })
+        }))
+      }
+      requestOptions?.signal?.addEventListener('abort', cancel, { once: true })
+      joined.controller.signal.addEventListener('abort', superseded, { once: true })
+      if (timeoutMs > 0 && Number.isFinite(timeoutMs)) timer = setTimeout(() => {
+        const cause = new Error('Workspace catalog read timed out')
+        cause.name = 'TimeoutError'
+        finish(cause)
+      }, timeoutMs)
+      joined.promise.then(result => finish(undefined, result), cause => finish(cause))
+    })
   }
 
   async function refreshAfterMutation(): Promise<void> {
@@ -97,7 +215,13 @@ export function useProjectWorkspaces(
 
   async function openWorkspace(path: string): Promise<ProjectWorkspaceItem | null> {
     requireOwner()
-    const workspace = await workspaceCatalog.open(path)
+    const scope = catalogScope()
+    invalidateReads()
+    let workspace: ProjectWorkspaceItem | null
+    try { workspace = await workspaceCatalog.open(path) } finally {
+      if (scope === catalogScope()) invalidateReads()
+    }
+    if (scope !== catalogScope()) throw cancelledRead()
     await loadWorkspaces()
     return workspace
   }
@@ -108,8 +232,11 @@ export function useProjectWorkspaces(
       throw new Error('This Gateway does not support creating project directories.')
     }
     const scope = catalogScope()
+    invalidateReads()
     try {
       const workspace = await workspaceCatalog.create(parentPath, name)
+      if (scope === catalogScope()) invalidateReads()
+      if (scope !== catalogScope()) throw cancelledRead()
       if (scope === catalogScope()) {
         // A returned registration is authoritative even if refreshing fails.
         if (workspace) workspaces.value = [
@@ -117,8 +244,10 @@ export function useProjectWorkspaces(
         ]
         try { await loadWorkspaces() } catch { /* The known creation result remains valid. */ }
       }
+      if (scope !== catalogScope()) throw cancelledRead()
       return workspace
     } catch (cause) {
+      if (scope === catalogScope()) invalidateReads()
       if (scope === catalogScope()) {
         // A lost reply may follow registration. Refresh for review, but never
         // adopt a directory or replay creation based on path/name equality.
@@ -132,9 +261,13 @@ export function useProjectWorkspaces(
     workspaceId: string,
   ): Promise<WorkspaceHistoryDeletion> {
     requireOwner()
+    const scope = catalogScope()
     error.value = null
+    invalidateReads()
     try {
       const response = await workspaceCatalog.deleteHistory(workspaceId)
+      if (scope !== catalogScope()) return response
+      invalidateReads()
       try {
         await loadWorkspaces()
       } catch {
@@ -142,18 +275,28 @@ export function useProjectWorkspaces(
       }
       return response
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause)
+      if (scope === catalogScope()) {
+        invalidateReads()
+        error.value = cause instanceof Error ? cause.message : String(cause)
+      }
       throw cause
     }
   }
 
   async function removeWorkspace(workspaceId: string): Promise<void> {
     requireOwner()
+    const scope = catalogScope()
     error.value = null
+    invalidateReads()
     try {
       await workspaceCatalog.remove(workspaceId)
+      if (scope !== catalogScope()) return
+      invalidateReads()
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause)
+      if (scope === catalogScope()) {
+        invalidateReads()
+        error.value = cause instanceof Error ? cause.message : String(cause)
+      }
       throw cause
     }
     // Removal is authoritative once the destructive RPC succeeds. Publish it
@@ -165,12 +308,14 @@ export function useProjectWorkspaces(
     } catch {
       // loadWorkspaces records its own error for retry/status UI.
     }
-    workspaces.value = workspaces.value.filter(item => item.id !== workspaceId)
+    if (scope === catalogScope()) workspaces.value = workspaces.value.filter(item => item.id !== workspaceId)
   }
 
   const byId = computed(() => new Map(workspaces.value.map(item => [item.id, item])))
 
-  watch(catalogScope, resetWorkspaces)
+  watch(catalogScope, () => {
+    if (sharedReads.scope !== catalogScope()) resetWorkspaces()
+  }, { flush: 'sync' })
 
   watch(
     () => gatewayAccess.canManageProjectWorkspaces,
@@ -193,12 +338,22 @@ export function useProjectWorkspaces(
     createWorkspace,
     renameWorkspace: async (workspaceId: string, name: string) => {
       requireOwner()
-      await workspaceCatalog.rename(workspaceId, name)
+      const scope = catalogScope()
+      invalidateReads()
+      try { await workspaceCatalog.rename(workspaceId, name) } finally {
+        if (scope === catalogScope()) invalidateReads()
+      }
+      if (scope !== catalogScope()) throw cancelledRead()
       await refreshAfterMutation()
     },
     setPinned: async (workspaceId: string, pinned: boolean) => {
       requireOwner()
-      await workspaceCatalog.setPinned(workspaceId, pinned)
+      const scope = catalogScope()
+      invalidateReads()
+      try { await workspaceCatalog.setPinned(workspaceId, pinned) } finally {
+        if (scope === catalogScope()) invalidateReads()
+      }
+      if (scope !== catalogScope()) throw cancelledRead()
       await refreshAfterMutation()
     },
     removeWorkspace,

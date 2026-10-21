@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   createDraftProjectHydrationGuard,
   applySessionProjectWorkspaceMetadata,
@@ -35,6 +35,7 @@ describe('useActiveProjectWorkspace', () => {
     expect(state.boundWorkspaceId.value).toBe(hasProject ? 'p1' : null)
     expect(state.activeWorkspace.value).toBe(previousWorkspace)
     expect(state.status.value).toBe('resolving')
+    expect(state.presentationStatus.value).toBe(hasProject ? 'ready' : 'none')
     expect(state.sendBlockedReason.value).toBe('resolving')
     expect(state.applySessionSnapshot('session-a', first, {})).toBe(false)
     expect(state.failSessionResolution('session-a', first)).toBe(false)
@@ -203,7 +204,7 @@ describe('useActiveProjectWorkspace', () => {
       cachedWorkspace: project('p1', true),
       loadWorkspaces: () => new Promise(resolve => { finish = resolve }), isCurrent: () => true,
     })
-    expect(state.status.value).toBe('ready')
+    expect(state.status.value).toBe('resolving')
     expect(state.activeWorkspace.value?.id).toBe('p1')
     finish([project('p1', false)])
     await pending
@@ -252,7 +253,69 @@ describe('useActiveProjectWorkspace', () => {
     current = false
     fail(new Error('old connection closed'))
     await pending
-    expect(state.status.value).toBe('ready')
+    expect(state.status.value).toBe('resolving')
+  })
+
+  it.each(['ready', 'unavailable', 'error'] as const)('reuses same-owner registration without healing physical %s', async status => {
+    const state = useActiveProjectWorkspace()
+    const initial = state.beginSessionResolution('session-a')
+    state.applySessionSnapshot('session-a', initial, {
+      workspaceId: 'p1', projectWorkspace: project('p1', status !== 'unavailable'),
+    })
+    if (status === 'error') state.failWorkspaceRefresh()
+    const loadWorkspaces = vi.fn()
+    for (let index = 0; index < 3; index++) {
+      const generation = state.beginSessionRefresh('session-a')
+      expect(state.presentationStatus.value).toBe(status)
+      expect(state.sendBlockedReason.value).toBe('resolving')
+      await applySessionProjectWorkspaceMetadata({
+        state, sessionKey: 'session-a', generation,
+        metadata: { workspaceId: 'p1', projectWorkspace: { ...project('p1', true), name: 'Renamed' } },
+        loadWorkspaces, isCurrent: () => true,
+      })
+      expect(state.status.value).toBe(status)
+      expect(state.presentationStatus.value).toBe(status)
+      expect(state.sendBlockedReason.value).toBe(status === 'ready' ? null : status)
+    }
+    expect(state.activeWorkspace.value?.name).toBe('Renamed')
+    expect(loadWorkspaces).not.toHaveBeenCalled()
+  })
+
+  it.each(['initial', 'binding', 'path', 'incarnation'] as const)('validates registration after %s changes', async change => {
+    const state = useActiveProjectWorkspace()
+    const initial = state.beginSessionResolution('session-a')
+    if (change !== 'initial') state.applySessionSnapshot('session-a', initial, {
+      workspaceId: 'p1', projectWorkspace: project('p1', true),
+    })
+    const generation = change === 'initial' ? initial : state.beginSessionRefresh('session-a')
+    const registered = { ...project(change === 'binding' ? 'p2' : 'p1', true),
+      ...(change === 'path' ? { path: '/new/p1' } : {}) }
+    const loadWorkspaces = vi.fn(async () => [{ ...registered, available: false }])
+    await applySessionProjectWorkspaceMetadata({
+      state, sessionKey: 'session-a', generation,
+      metadata: { workspaceId: registered.id, projectWorkspace: registered },
+      sameSessionIncarnation: change !== 'incarnation', loadWorkspaces, isCurrent: () => true,
+    })
+    expect(loadWorkspaces).toHaveBeenCalledOnce()
+    expect(state.sendBlockedReason.value).toBe('unavailable')
+  })
+
+  it('keeps a metadata failure visible through retry while independently gating sending', async () => {
+    const state = useActiveProjectWorkspace()
+    const initial = state.beginSessionResolution('session-a')
+    state.applySessionSnapshot('session-a', initial, { workspaceId: 'p1', projectWorkspace: project('p1', true) })
+    state.failSessionResolution('session-a', state.beginSessionRefresh('session-a'))
+    const generation = state.beginSessionRefresh('session-a')
+    state.applyWorkspaceRefresh(project('p1', true))
+    expect(state.presentationStatus.value).toBe('error')
+    expect(state.sendBlockedReason.value).toBe('resolving')
+    await applySessionProjectWorkspaceMetadata({
+      state, sessionKey: 'session-a', generation,
+      metadata: { workspaceId: 'p1', projectWorkspace: project('p1', true) },
+      loadWorkspaces: vi.fn(), isCurrent: () => true,
+    })
+    expect(state.presentationStatus.value).toBe('ready')
+    expect(state.sendBlockedReason.value).toBeNull()
   })
 
   it('keeps same-key draft workspace identity while durable metadata refreshes', () => {

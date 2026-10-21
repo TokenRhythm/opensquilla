@@ -39,7 +39,7 @@ export interface RpcTransport {
   retireLane?(receipt: TransportLaneRetireReceipt): Promise<void> | void
   recoveryVersion?(key: string): string
   snapshotInstalled?(key: string, version: string): void
-  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
+  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number; replayAccepted?: boolean }): Promise<void>
   failProtocol?(generation: number): void
   readonly generation: number
 }

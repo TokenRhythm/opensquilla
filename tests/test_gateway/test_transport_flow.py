@@ -527,7 +527,7 @@ async def test_task_switch_discards_queued_old_epoch_without_closing_peer_lane(
 @pytest.mark.parametrize("reason_code", [
     "response_wire_limit", "snapshot_epoch_mismatch", "snapshot_delivery_id_invalid",
     "snapshot_delivery_missing", "snapshot_delivery_kind_invalid",
-    "snapshot_reservation_rejected", "frame_wire_limit", "control_buffer_limit",
+    "snapshot_reservation_rejected", "frame_wire_limit",
     "transport_reservation_rejected",
 ])
 def test_flow_admission_preserves_fixed_reason_and_existing_failure_type(monkeypatch, reason_code):
@@ -567,8 +567,6 @@ def test_flow_admission_preserves_fixed_reason_and_existing_failure_type(monkeyp
             )
         if reason_code.endswith("wire_limit"):
             monkeypatch.setattr(websocket_module, "MAX_PAYLOAD_BYTES", 1)
-        elif reason_code == "control_buffer_limit":
-            conn._flow_control_frames = websocket_module.CONTROL_BUFFER_FRAMES
         elif reason_code == "transport_reservation_rejected":
             # A closing connection is not necessarily out of memory.
             conn._closing = True
@@ -751,7 +749,8 @@ async def test_fast_socket_does_not_bypass_renderer_credit_and_other_peer_remain
         assert len(data) == FLOW_WINDOW_FRAMES
         assert slow_socket.closed == []
         assert len(slow._flow.deliveries) == FLOW_WINDOW_FRAMES
-        assert slow._flow.dirty["session"] == ("g", 10_000)
+        assert not slow._flow.dirty
+        assert sum(map(len, slow._pending_flow.values())) == 10_000 - FLOW_WINDOW_FRAMES
         assert (
             len(
                 [
@@ -760,7 +759,7 @@ async def test_fast_socket_does_not_bypass_renderer_credit_and_other_peer_remain
                     if frame.get("event") == "transport.flow.dirty"
                 ]
             )
-            == 1
+            == 0
         )
         for sequence in range(1, 401):
             await fast.send_event(
@@ -952,9 +951,10 @@ async def test_long_dirty_keys_keep_encoded_control_bytes_accounted_and_pong_ava
             conn._mark_flow_dirty({"session_key": f"{index:03}" + character * 4093})
         await conn.send_raw_text('{"type":"pong"}')
         await asyncio.sleep(0)
-        assert ws.frames[0]["payload"]["global_dirty"] is global_notice
-        assert len(ws.frames[0]["payload"]["dirty_keys"]) == (0 if global_notice else count)
-        assert ws.frames[-1] == {"type": "pong"}
+        assert ws.frames[0] == {"type": "pong"}
+        notice = next(frame for frame in ws.frames if frame.get("event") == "transport.flow.dirty")
+        assert notice["payload"]["global_dirty"] is global_notice
+        assert len(notice["payload"]["dirty_keys"]) == (0 if global_notice else count)
         assert len(conn._flow.dirty) == count
         assert not conn._flow.global_dirty  # Compact notice is not a permanent barrier.
         assert conn._flow_control_bytes == 0

@@ -305,6 +305,41 @@ async def ack_replay(conn, ids):
     assert update.ok, update.error
 
 
+async def test_replay_waits_for_another_lanes_credit_without_restarting_snapshot(v2_connection):
+    from opensquilla.gateway.transport_flow import FLOW_WINDOW_FRAMES
+
+    conn = v2_connection
+    active, recovering = "agent:main:active-window", "agent:main:waiting-replay"
+    subscribe(conn, active)
+    subscribe(conn, recovering)
+    payload = await snapshot(conn, recovering)
+    await stage(conn, payload)
+    streams = get_session_streams()
+    for index in range(FLOW_WINDOW_FRAMES):
+        event = streams.record(active, "session.event.text_delta", {"text": str(index)})
+        await conn.send_event("session.event.text_delta", event)
+    streams.record(recovering, "session.event.text_delta", {"text": "replay tail"})
+    installed = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert installed.ok, installed.error
+    assert installed.payload["replay_to_seq"] == 1
+    pending = conn._pending_replays[recovering]
+    assert not pending.pending_delivery_ids
+    assert not conn._flow.dirty
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+
+    # A successful resume identifies the accepted replay target, even if the
+    # first delivery is still waiting for another lane's shared credit.
+    await conn.send_res(installed, transport_control=True)
+    await ack_replay(conn, set(conn._flow.deliveries))
+    assert conn._pending_replays[recovering] is pending
+    assert len(pending.pending_delivery_ids) == 1
+    await ack_replay(conn, pending.pending_delivery_ids)
+    assert conn.installed_snapshot_proof(receipt(payload)) == installed.payload
+    replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
+    assert [frame["payload"]["text"] for frame in replayed] == ["replay tail"]
+    assert not conn._flow.dirty
+
+
 async def test_v2_replay_splits_large_frames_without_changing_logical_batch(v2_connection):
     conn = v2_connection
     key = "agent:main:byte-segments"
@@ -312,7 +347,7 @@ async def test_v2_replay_splits_large_frames_without_changing_logical_batch(v2_c
     payload = await snapshot(conn, key)
     await stage(conn, payload)
     for text in ("a", "b"):
-        get_session_streams().record(key, "session.event.text_delta", {"text": text * 150_000})
+        get_session_streams().record(key, "session.event.text_delta", {"text": text * 2_200_000})
     revision = conn._flow.dirty_revision(key)
     first = await request(conn, "sessions.messages.resume", receipt(payload))
     assert first.ok, first.error
@@ -502,8 +537,8 @@ async def test_replay_prevalidates_suffix_before_first_reservation(
     assert not any(frame.get("meta", {}).get("replayed") for frame in conn.ws.frames)
 
 
-@pytest.mark.parametrize("size, accepted", [(300_000, True), (1_048_576, False)])
-async def test_v2_replay_singleton_respects_aggregate_not_lane_byte_limit(
+@pytest.mark.parametrize("size, accepted", [(300_000, True), (1_048_576, True), (5_000_000, True)])
+async def test_v2_replay_singleton_uses_connection_window_with_large_frame_exception(
     v2_connection, size, accepted,
 ):
     conn = v2_connection
@@ -692,6 +727,14 @@ async def test_recovery_logs_first_admission_reason_once_without_content(
     monkeypatch.setattr(websocket, "log", logger)
     key = "agent:main:PRIVATE_SESSION_KEY"
     subscribe(conn, key)
+    reserve = conn.reserve_transport_bytes
+
+    def fail_bulk_after_eight(size, *, kind=None):
+        if kind is None and len(conn._flow.deliveries) >= 8:
+            return False
+        return reserve(size, kind=kind)
+
+    monkeypatch.setattr(conn, "reserve_transport_bytes", fail_bulk_after_eight)
     for _ in range(100):
         event = streams.record(key, "session.event.text_delta", {"text": "PRIVATE_OUTPUT"})
         await conn.send_event("session.event.text_delta", event)
@@ -700,11 +743,12 @@ async def test_recovery_logs_first_admission_reason_once_without_content(
         if call.args == ("gateway.session_recovery",) and call.kwargs["phase"] == "required"
     ]
     assert len(required) == 1
-    assert required[0]["reason_code"] == "lane_frames_exhausted"
+    assert required[0]["reason_code"] == "transport_reservation_rejected"
     assert required[0]["flow_unacked_frames"] == 8
     assert required[0]["stream_seq"] == 9
     assert required[0]["session_key_sha256"] == hashlib.sha256(key.encode()).hexdigest()[:16]
     assert "PRIVATE" not in json.dumps(required)
+    monkeypatch.setattr(conn, "reserve_transport_bytes", reserve)
     # A later admission success cannot reuse the earlier refusal diagnostic.
     await ack_replay(conn, set(conn._flow.deliveries))
     payload = await snapshot(conn, key)
@@ -1143,7 +1187,7 @@ async def test_legacy_batch_mutation_blocks_only_affected_modern_reads(connectio
         get_registry().unregister(legacy.conn_id)
 
 
-async def test_resume_does_not_clear_barrier_without_control_proof_capacity(connection):
+async def test_resume_control_proof_can_borrow_unused_shared_capacity(connection):
     from opensquilla.gateway.transport_flow import CONTROL_BUFFER_BYTES
 
     key = "agent:main:capacity"
@@ -1157,9 +1201,9 @@ async def test_resume_does_not_clear_barrier_without_control_proof_capacity(conn
     connection._flow_control_bytes = reserved
     try:
         result = await request(connection, "sessions.messages.resume", receipt(payload))
-        assert not result.ok and result.error.code == "SNAPSHOT_BUSY"
-        assert key in connection._flow.dirty
-        assert key not in connection._resume_proofs
+        assert result.ok, result.error
+        assert key not in connection._flow.dirty
+        assert key in connection._resume_proofs
     finally:
         connection._flow_control_bytes = 0
         connection.release_transport_bytes(reserved, kind="control")
