@@ -1,4 +1,5 @@
-import { app, clipboard, Menu, type ContextMenuParams, type MenuItemConstructorOptions, type WebContents } from 'electron'
+import { app, clipboard, type ContextMenuParams, type MenuItemConstructorOptions, type WebContents } from 'electron'
+import { popupTextContextMenu } from './text-context-menu.js'
 
 export interface BrowserContextMenuActions {
   canOpen(url: string): boolean
@@ -23,16 +24,16 @@ export function browserContextMenuTemplate(
   }
   if (items.length) items.push({ type: 'separator' })
   if (params.isEditable) {
-    items.push({ role: 'undo', enabled: params.editFlags.canUndo, click: () => contents.undo() },
-      { role: 'redo', enabled: params.editFlags.canRedo, click: () => contents.redo() },
+    items.push({ role: 'undo', enabled: params.editFlags.canUndo },
+      { role: 'redo', enabled: params.editFlags.canRedo },
       { type: 'separator' },
-      { role: 'cut', enabled: params.editFlags.canCut, click: () => contents.cut() },
-      { role: 'copy', enabled: params.editFlags.canCopy, click: () => contents.copy() },
-      { role: 'paste', enabled: params.editFlags.canPaste, click: () => contents.paste() })
+      { role: 'cut', enabled: params.editFlags.canCut },
+      { role: 'copy', enabled: params.editFlags.canCopy },
+      { role: 'paste', enabled: params.editFlags.canPaste })
   } else if (params.selectionText) {
-    items.push({ role: 'copy', enabled: params.editFlags.canCopy, click: () => contents.copy() })
+    items.push({ role: 'copy', enabled: params.editFlags.canCopy })
   }
-  items.push({ role: 'selectAll', click: () => contents.selectAll() }, { type: 'separator' },
+  items.push({ role: 'selectAll' }, { type: 'separator' },
     { label: label('Back', '后退'), enabled: contents.navigationHistory.canGoBack(), click: () => actions.navigate('back') },
     { label: label('Forward', '前进'), enabled: contents.navigationHistory.canGoForward(), click: () => actions.navigate('forward') },
     { label: label('Reload', '刷新'), click: () => actions.navigate('reload') },
@@ -43,6 +44,6 @@ export function browserContextMenuTemplate(
 export function showBrowserContextMenu(
   contents: WebContents, params: ContextMenuParams, actions: BrowserContextMenuActions,
 ): void {
-  Menu.buildFromTemplate(browserContextMenuTemplate(contents, params, actions,
-    app.getLocale().toLowerCase().startsWith('zh'))).popup({ ...(params.frame ? { frame: params.frame } : {}) })
+  popupTextContextMenu(contents, params, browserContextMenuTemplate(contents, params, actions,
+    app.getLocale().toLowerCase().startsWith('zh')))
 }
