@@ -2231,19 +2231,40 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentGenerationPayload(payloadObj, isCurrentTaskPayload(payloadObj))) return
     const terminalStatus = eventTaskTerminalStatus(eventKind)
     const noticeTurnId = payloadObj.terminalOutcome?.turnId || payloadTurnId(payloadObj)
+    const failureTerminal = eventKind === 'turn-failed' || eventKind === 'task-failed'
+      || eventKind === 'task-timed-out' || eventKind === 'task-abandoned'
+    // A done receipt flushes partial output before the runtime can publish a
+    // provider failure. Keep the finished stream tombstone (late content must
+    // not reopen it), but accept the final failure for that exact settled turn.
+    // Once another turn owns the composer, its run state remains isolated.
+    const latestTurnId = failureTerminal
+      ? [...messages.value].reverse().find(message => message.turnId)?.turnId
+      : undefined
+    const finishesRenderedTurn = Boolean(
+      noticeTurnId
+      && noticeTurnId === payloadTurnId(payloadObj)
+      && activeStreamTaskId.value === FINISHED_STREAM_TASK_ID
+      && !stream.isStreaming.value
+      && settledTaskIds.has(noticeTurnId)
+      && latestTurnId === noticeTurnId
+      && !options.taskOwnership?.hasAuthoritativeWork.value,
+    )
     if (
-      (eventKind === 'turn-failed' || eventKind === 'task-failed' || eventKind === 'task-timed-out' || eventKind === 'task-abandoned')
+      failureTerminal
       && noticeTurnId
       // History may restore a notice before the live owner receives its
       // terminal. That owner must still pass through normal stream settlement.
       && !(isCurrentTaskPayload(payloadObj) && stream.isStreaming.value)
-      && messages.value.some(message => message.role === 'error'
-        && message.terminalNotice && message.turnId === noticeTurnId)
+      && (finishesRenderedTurn || messages.value.some(message => message.role === 'error'
+        && message.terminalNotice && message.turnId === noticeTurnId))
     ) {
       if (!acceptStreamSeq(payloadObj)) return
+      clearAwaitingTurnCommit(noticeTurnId)
+      taskSucceededSyncedIds.delete(noticeTurnId)
       messages.value = dedupeTerminalErrorNotices([...messages.value, {
         role: 'error', text: eventSessionErrorMessage(payloadObj),
         errorCode: payloadObj.error_class ?? payloadObj.code,
+        modelCapacity: payloadObj.modelCapacity,
         turnId: noticeTurnId, turnOutcome: payloadObj.terminalOutcome,
         terminalNotice: true, ts: new Date().toISOString(),
       }])
@@ -2256,16 +2277,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       }
       // A late receipt may enrich an old notice, never another active turn's
       // run state. The finished tombstone may still receive its own lifecycle.
-      const latestTurnId = [...messages.value].reverse().find(message => message.turnId)?.turnId
       const ownsRunState = isCurrentTaskPayload(payloadObj)
         || (activeStreamTaskId.value === FINISHED_STREAM_TASK_ID
           && latestTurnId === noticeTurnId
           && !options.taskOwnership?.hasAuthoritativeWork.value)
-      if (terminalStatus && ownsRunState) {
+      const failureStatus = mergedOutcome?.status || terminalStatus || 'failed'
+      if (ownsRunState) {
         options.applySessionRunState(activeTaskGroups.value.size > 0
           ? activeTaskGroupRunState(payloadObj)
-          : { run_status: terminalStatus === 'abandoned' ? 'interrupted' : terminalStatus,
-              last_task: { ...payloadObj, status: terminalStatus } })
+          : { run_status: failureStatus === 'abandoned' ? 'interrupted' : failureStatus,
+              last_task: { ...payloadObj, status: failureStatus } })
       }
       options.scheduleHistorySync()
       return
@@ -2310,8 +2331,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       terminalEvent &&
       bufferPendingTerminalEvent({ kind: 'event', event: eventKind, payload: payloadObj })
     ) return
+    // A second receipt for an already settled task says nothing about a new
+    // hydration's ownership snapshot. Do not resolve that barrier with it.
     const terminalOwnership = terminalTaskId
-      ? options.taskOwnership?.noteTerminal(terminalTaskId)
+      ? options.taskOwnership?.noteTerminal(terminalTaskId, !settledTaskIds.has(terminalTaskId))
       : undefined
     if (
       terminalOwnership?.wasQueued

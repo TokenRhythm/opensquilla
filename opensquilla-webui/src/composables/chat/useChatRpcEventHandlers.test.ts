@@ -250,6 +250,56 @@ function createHarness(options: {
   }
 }
 
+describe('partial done followed by provider failure with real stream ownership', () => {
+  it.each(['settled', 'queued-successor', 'unresolved-hydration'] as const)(
+    'preserves the failure and next-owner boundary when %s',
+    (boundary) => {
+      const owner = useChatTaskOwnership()
+      owner.noteRunning('task-partial')
+      const h = createHarness({
+        withCompactionRuntime: true, taskOwnership: owner, supportsTurnCommitted: true,
+      })
+      h.activeStreamTaskId.value = 'task-partial'
+      try {
+        h.stream.startStreaming()
+        h.stream.appendDelta('Partial work before provider failure')
+        if (boundary === 'queued-successor') owner.noteQueued('task-next')
+        h.api.handlers.onWireEventFixture('session.event.done', {
+          key: h.sessionKey.value, task_id: 'task-partial', turn_id: 'task-partial',
+          epoch: 0, stream_seq: 1, text: 'Partial work before provider failure',
+        })
+        expect(h.messages.value).toEqual([expect.objectContaining({
+          role: 'assistant', text: 'Partial work before provider failure', turnId: 'task-partial',
+        })])
+        expect(owner.runningTaskId.value).toBe('')
+        if (boundary === 'unresolved-hydration') owner.beginHydration()
+        expect(owner.hasAuthoritativeWork.value).toBe(boundary !== 'settled')
+        h.applySessionRunState.mockClear()
+        h.api.handlers.onWireEventFixture('session.event.error', {
+          key: h.sessionKey.value, task_id: 'task-partial', turn_id: 'task-partial',
+          epoch: 0, stream_seq: 2, error_class: '402', http_status: 402,
+          turn_outcome: { kind: 'failed', failure_kind: 'insufficient_credits', http_status: 402 },
+        })
+        if (boundary === 'settled') {
+          expect(h.messages.value[0]?.turnOutcome).toMatchObject({
+            status: 'failed', failureKind: 'insufficient_credits', httpStatus: 402,
+          })
+          expect(h.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+          expect(h.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({ run_status: 'failed' }))
+          expect(h.api.awaitingCommitTaskIds.value.size).toBe(0)
+          expect(h.stream.isStreaming.value).toBe(false)
+        } else {
+          expect(h.messages.value.some(message => message.role === 'error')).toBe(false)
+          expect(h.applySessionRunState).not.toHaveBeenCalled()
+          expect(owner.hasAuthoritativeWork.value).toBe(true)
+          if (boundary === 'queued-successor') expect(owner.isQueued('task-next')).toBe(true)
+          else expect(owner.hydrationResolved.value).toBe(false)
+        }
+      } finally { h.stop() }
+    },
+  )
+})
+
 describe.each(['write_file', 'execute_code'] as const)('live %s input preview delivery', toolName => {
   const path = toolName === 'write_file' ? 'page.html' : ''
   const draft = (patch: Record<string, unknown> = {}) => ({
