@@ -1974,6 +1974,14 @@ button.attachment-chip__primary:focus-visible {
 .chat-send-control {
   position: relative;
   display: inline-flex;
+  /* Reserve the Stop target while a chat's task ownership is still loading.
+     Send remains visually smaller, but swapping controls cannot resize the
+     footer and push the textarea up. Keep both buttons on the same right edge. */
+  flex: 0 0 44px;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: flex-end;
   border-radius: var(--radius-full);
 }
 
