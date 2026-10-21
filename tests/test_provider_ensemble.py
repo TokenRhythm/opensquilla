@@ -8204,21 +8204,35 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
     quorum_grace_seconds: float,
 ) -> None:
     slow_gate = asyncio.Event()
+    started = {model: asyncio.Event() for model in ("p1", "p2", "p3", "p4")}
+    p1_closed = asyncio.Event()
+    p2_closed = asyncio.Event()
     p3_closed = asyncio.Event()
     p4_closed = asyncio.Event()
     fallback_started = asyncio.Event()
+    closed_at_fallback: list[tuple[bool, bool]] = []
     registry = _FakeRegistry(
         {
-            "p1": _FakePlan([ErrorEvent(message="p1 failed", code="upstream")]),
-            "p2": _FakePlan([ErrorEvent(message="p2 failed", code="upstream")]),
+            "p1": _FakePlan(
+                [ErrorEvent(message="p1 failed", code="upstream")],
+                started=started["p1"],
+                closed=p1_closed,
+            ),
+            "p2": _FakePlan(
+                [ErrorEvent(message="p2 failed", code="upstream")],
+                started=started["p2"],
+                closed=p2_closed,
+            ),
             "p3": _FakePlan(
                 [TextDeltaEvent(text="d3"), DoneEvent(model="p3")],
                 gate=slow_gate,
+                started=started["p3"],
                 closed=p3_closed,
             ),
             "p4": _FakePlan(
                 [TextDeltaEvent(text="d4"), DoneEvent(model="p4")],
                 gate=slow_gate,
+                started=started["p4"],
                 closed=p4_closed,
             ),
             "agg": _FakePlan([TextDeltaEvent(text="unused"), DoneEvent(model="agg")]),
@@ -8236,6 +8250,7 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
             config: ChatConfig | None = None,
         ) -> AsyncIterator[StreamEvent]:
             async def _stream() -> AsyncIterator[StreamEvent]:
+                closed_at_fallback.append((p3_closed.is_set(), p4_closed.is_set()))
                 fallback_started.set()
                 yield TextDeltaEvent(text="single")
                 yield DoneEvent(model="single")
@@ -8257,12 +8272,96 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
         shuffle_candidates=False,
     )
 
+    coordinator_waiting_for_successes = asyncio.Event()
+    candidate_tasks: dict[str, asyncio.Task[Any]] = {}
+    collect_candidate = provider._collect_candidate
+    real_wait = asyncio.wait
+
+    async def observe_candidate(**kwargs: Any) -> Any:
+        task = asyncio.current_task()
+        assert task is not None
+        candidate_tasks[kwargs["member"].provider_config.model] = task
+        return await collect_candidate(**kwargs)
+
+    async def observe_wait(tasks: Any, **kwargs: Any) -> Any:
+        waiting = set(tasks)
+        if (
+            set(candidate_tasks) == {"p1", "p2", "p3", "p4"}
+            and waiting == {candidate_tasks["p3"], candidate_tasks["p4"]}
+            and candidate_tasks["p1"].done()
+            and candidate_tasks["p2"].done()
+        ):
+            # _run_proposers has consumed both failures and entered its next
+            # wait with exactly the two successful-but-still-gated candidates.
+            coordinator_waiting_for_successes.set()
+        return await real_wait(waiting, **kwargs)
+
+    monkeypatch.setattr(provider, "_collect_candidate", observe_candidate)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.asyncio",
+        SimpleNamespace(**dict(vars(asyncio), wait=observe_wait)),
+    )
     consume_task = asyncio.create_task(_collect(provider))
-    await asyncio.sleep(0.05)
-    assert "agg" not in [call["model"] for call in registry.calls]
-    assert fallback_started.is_set() is False
-    slow_gate.set()
-    events = await asyncio.wait_for(consume_task, timeout=1.0)
+    coordinator_barrier = asyncio.create_task(coordinator_waiting_for_successes.wait())
+    primary_failure: BaseException | None = None
+    phase = "proposer startup and failed-proposer completion"
+    try:
+        # Event barriers prove the pending-proposer state. This is an ordering
+        # contract, not a one-second end-to-end scheduling benchmark on CI.
+        async with asyncio.timeout(10.0):
+            await asyncio.gather(
+                *(event.wait() for event in started.values()),
+                p1_closed.wait(),
+                p2_closed.wait(),
+            )
+            phase = "coordinator processing failures and retaining pending successes"
+            observed, _ = await asyncio.wait(
+                {coordinator_barrier, consume_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert coordinator_barrier in observed, (
+                "Ensemble completed before retaining the two pending successful proposers"
+            )
+            assert slow_gate.is_set() is False
+            assert p3_closed.is_set() is False
+            assert p4_closed.is_set() is False
+            assert "agg" not in [call["model"] for call in registry.calls]
+            assert fallback_started.is_set() is False
+
+            phase = "successful-proposer completion and fallback startup"
+            slow_gate.set()
+            await asyncio.gather(
+                p3_closed.wait(), p4_closed.wait(), fallback_started.wait()
+            )
+            assert closed_at_fallback == [(True, True)]
+            phase = "fallback stream completion"
+            events = await consume_task
+    except TimeoutError as exc:
+        primary_failure = AssertionError(
+            f"Ensemble fixture stalled during {phase}; "
+            f"started={[(model, event.is_set()) for model, event in started.items()]}; "
+            f"closed={[event.is_set() for event in (p1_closed, p2_closed, p3_closed, p4_closed)]}; "
+            f"fallback_started={fallback_started.is_set()}; "
+            f"calls={[call['model'] for call in registry.calls]}; "
+            f"consumer_done={consume_task.done()}"
+        )
+        raise primary_failure from exc
+    except BaseException as exc:
+        primary_failure = exc
+        raise
+    finally:
+        slow_gate.set()
+        for task in (coordinator_barrier, consume_task):
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(coordinator_barrier, consume_task, return_exceptions=True),
+                timeout=10.0,
+            )
+        except TimeoutError as exc:
+            if primary_failure is None:
+                raise AssertionError("Ensemble fixture cleanup timed out") from exc
+            primary_failure.add_note("Ensemble fixture cleanup also exceeded its 10s hangguard")
 
     assert slow_gate.is_set() is True
     assert p3_closed.is_set() is True

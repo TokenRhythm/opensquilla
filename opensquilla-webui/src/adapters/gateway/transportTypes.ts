@@ -18,6 +18,13 @@ export interface TransportLaneRetireReceipt {
   final_published_id: number
 }
 
+/** Local subscription ownership; only a validated remote fence can release credit. */
+export interface TransportLaneOwner {
+  beginRetirement(): void
+  completeRetirement(receipt: TransportLaneRetireReceipt | null): Promise<void>
+  failRetirement(): void
+}
+
 export interface TransportInstalledReceipt {
   key: string
   snapshot_id: string

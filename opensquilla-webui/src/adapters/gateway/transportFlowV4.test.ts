@@ -977,6 +977,79 @@ it('requires the exact visible replay watermark after its consumers finish', asy
   })).rejects.toMatchObject({ code: 'SNAPSHOT_STALE' })
 })
 
+it('waits for the first replay frame when its validated proof precedes shared credit', async () => {
+  const h = harness(true)
+  h.hello()
+  let completed = false
+  const pending = h.controller.waitForConsumption('alpha', {
+    streamGeneration: 'stream-1', fromSeq: 0, toSeq: 1, replayAccepted: true,
+  }).then(() => { completed = true })
+  await vi.advanceTimersByTimeAsync(100)
+  expect(completed).toBe(false)
+  h.emit('*', 'session.event.text_delta', {
+    key: 'alpha', stream_generation: 'stream-1', stream_seq: 1, text: 'first replay',
+  }, { flow: h.receipt(1) })
+  await pending
+  expect(completed).toBe(true)
+})
+
+it('consumes a long replay without counting progress notifications as elapsed budget', async () => {
+  const h = harness(true)
+  h.hello()
+  let outcome = 'pending'
+  const pending = h.controller.waitForConsumption('alpha', {
+    streamGeneration: 'stream-1', fromSeq: 0, toSeq: 256, replayAccepted: true,
+  }).then(() => { outcome = 'fulfilled' }, () => { outcome = 'rejected' })
+  for (let id = 1; id <= 256; id++) {
+    await vi.advanceTimersByTimeAsync(1)
+    if (id === 151) expect(outcome).toBe('pending')
+    h.emit('*', 'session.event.text_delta', {
+      key: 'alpha', stream_generation: 'stream-1', stream_seq: id, text: 'chunk',
+    }, { flow: h.receipt(id) })
+  }
+  await pending
+  expect(outcome).toBe('fulfilled')
+  h.controller.close()
+  expect(vi.getTimerCount()).toBe(0)
+})
+
+it('keeps the original monotonic replay deadline despite progress and wall-clock changes', async () => {
+  const h = harness(true)
+  h.hello()
+  let outcome = 'pending'
+  const pending = h.controller.waitForConsumption('alpha', {
+    streamGeneration: 'stream-1', fromSeq: 0, toSeq: 100, replayAccepted: true,
+  }).then(() => { outcome = 'fulfilled' }, error => { outcome = error.code })
+  for (let id = 1; id <= 6; id++) {
+    await vi.advanceTimersByTimeAsync(1_000)
+    h.emit('*', 'session.event.text_delta', {
+      key: 'alpha', stream_generation: 'stream-1', stream_seq: id, text: 'chunk',
+    }, { flow: h.receipt(id) })
+  }
+  vi.setSystemTime(Date.now() - 60_000)
+  await vi.advanceTimersByTimeAsync(999)
+  expect(outcome).toBe('pending')
+  await vi.advanceTimersByTimeAsync(1)
+  await pending
+  expect(outcome).toBe('SNAPSHOT_STALE')
+  h.controller.close()
+  expect(vi.getTimerCount()).toBe(0)
+})
+
+it.each(['reset', 'budget'])('keeps a proof-owned first-frame wait fenced by %s', async ending => {
+  const h = harness(true)
+  h.hello()
+  const pending = h.controller.waitForConsumption('alpha', {
+    streamGeneration: 'stream-1', fromSeq: 0, toSeq: 1, replayAccepted: true,
+  }).catch(error => error)
+  await vi.advanceTimersByTimeAsync(50)
+  if (ending === 'reset') h.controller.reset()
+  await vi.advanceTimersByTimeAsync(ending === 'reset' ? 50 : 6_950)
+  await expect(pending).resolves.toMatchObject({ code: 'SNAPSHOT_STALE' })
+  h.controller.close()
+  expect(vi.getTimerCount()).toBe(0)
+})
+
 describe('session-flow v2 lane ledger', () => {
   function laneFrame(h: ReturnType<typeof harness>, id: number, subscriptionEpoch: string, key = 'alpha') {
     h.emit('*', 'session.event.text_delta', { session_key: key, text_delta: 'x' }, {
@@ -986,6 +1059,310 @@ describe('session-flow v2 lane ledger', () => {
       },
     })
   }
+
+  it.each(['rejected', 'dirty', 'timeout'] as const)(
+    'keeps a departing owner credit for retirement instead of recovering its %s consumer', async outcome => {
+      const h = harness(true)
+      const consumer = deferred<'applied' | 'dirty'>()
+      h.consume.mockReturnValueOnce(consumer.promise)
+      h.helloV2()
+      const owner = h.controller.claimLaneOwner('alpha', 7)!
+      laneFrame(h, 1, 'old-alpha')
+      owner.beginRetirement()
+      if (outcome === 'rejected') consumer.reject(new Error('View detached'))
+      if (outcome === 'dirty') consumer.resolve('dirty')
+      laneFrame(h, 2, 'old-alpha')
+      h.dirty()
+      await vi.advanceTimersByTimeAsync(150)
+      expect(h.consume).toHaveBeenCalledTimes(1)
+      expect(h.recover).not.toHaveBeenCalled()
+      expect(h.request).not.toHaveBeenCalled()
+      expect(h.controller.diagnostics.pendingFrames).toBe(2)
+      const retired = owner.completeRetirement({ connection_epoch: EPOCH,
+        subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 2 })
+      await vi.advanceTimersByTimeAsync(0)
+      await retired
+      expect(h.controller.diagnostics.pendingFrames).toBe(0)
+      expect(h.request).toHaveBeenCalledExactlyOnceWith(V2_METHOD, {
+        connection_epoch: EPOCH,
+        discarded_lanes: [{ subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 2 }],
+      }, expect.anything())
+      consumer.resolve('applied')
+      await vi.advanceTimersByTimeAsync(1200)
+      expect(h.recover).not.toHaveBeenCalled()
+    },
+  )
+
+  it('separates old and replacement epochs when the first frame arrives during unsubscribe', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    old.beginRetirement()
+    const replacement = h.controller.claimLaneOwner('alpha', 7)!
+    laneFrame(h, 1, 'old-alpha')
+    laneFrame(h, 2, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(h.consume).not.toHaveBeenCalled()
+    expect(h.recover).not.toHaveBeenCalled()
+    expect(h.request).not.toHaveBeenCalled()
+    const retired = old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 1 })
+    await vi.advanceTimersByTimeAsync(0)
+    await retired
+    expect(h.consume).toHaveBeenCalledExactlyOnceWith('session.event.text_delta', expect.anything(),
+      expect.objectContaining({ session_flow_v2: expect.objectContaining({ subscription_epoch: 'new-alpha' }) }))
+    expect(h.request.mock.calls.some(([, params]) => JSON.stringify(params?.consumed ?? []).includes('old-alpha'))).toBe(false)
+    expect(h.controller.diagnostics.pendingFrames).toBe(0)
+    replacement.beginRetirement()
+    laneFrame(h, 3, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(h.consume).toHaveBeenCalledTimes(1)
+  })
+
+  it('holds an unsent ordinary ACK while draining and restores it if unsubscribe fails', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const owner = h.controller.claimLaneOwner('alpha', 7)!
+    laneFrame(h, 1, 'old-alpha')
+    await Promise.resolve()
+    owner.beginRetirement()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(h.request).not.toHaveBeenCalled()
+    owner.failRetirement()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.request).toHaveBeenCalledExactlyOnceWith(V2_METHOD, {
+      connection_epoch: EPOCH,
+      consumed: [{ subscription_epoch: 'old-alpha', through_delivery_id: 1 }],
+    }, expect.anything())
+    expect(h.recover).not.toHaveBeenCalled()
+  })
+
+  it('keeps a replacement owner active when an obsolete close arrives', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    h.controller.claimLaneOwner('alpha', 7)
+    old.beginRetirement()
+    h.consume.mockRejectedValueOnce(new Error('Active consumer failed'))
+    laneFrame(h, 1, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.consume).toHaveBeenCalledTimes(1)
+    expect(h.recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ keys: ['alpha'] }))
+  })
+
+  it('lets the new owner retire an adopted idempotent subscription, never the superseded owner', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    laneFrame(h, 1, 'same-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    const replacement = h.controller.claimLaneOwner('alpha', 7)!
+    old.beginRetirement()
+    await old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'same-alpha', retire_token: 'obsolete', final_published_id: 1 })
+    expect(h.request.mock.calls.every(([, params]) => !params?.discarded_lanes)).toBe(true)
+    replacement.beginRetirement()
+    laneFrame(h, 2, 'same-alpha')
+    const retired = replacement.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'same-alpha', retire_token: 'current', final_published_id: 2 })
+    await vi.advanceTimersByTimeAsync(0)
+    await retired
+    expect(h.consume).toHaveBeenCalledTimes(1)
+    expect(h.recover).not.toHaveBeenCalled()
+    expect(h.controller.diagnostics.pendingFrames).toBe(0)
+  })
+
+  it('does not let an old recovery retry or retire completion cancel replacement recovery', async () => {
+    const h = harness(true)
+    const recovery = deferred<boolean>()
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    h.consume.mockRejectedValue(new Error('Consumer unavailable'))
+    h.recover.mockReturnValueOnce(recovery.promise)
+    laneFrame(h, 1, 'old-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.recover).toHaveBeenCalledTimes(1)
+    old.beginRetirement()
+    h.controller.claimLaneOwner('alpha', 7)
+    laneFrame(h, 2, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    const retired = old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 1 })
+    recovery.resolve(false)
+    await vi.advanceTimersByTimeAsync(1200)
+    await retired
+    expect(h.recover).toHaveBeenCalledTimes(2)
+    expect(h.controller.diagnostics.pendingFrames).toBe(0)
+    expect(h.request.mock.calls.some(([, params]) => JSON.stringify(params?.consumed ?? []).includes('old-alpha'))).toBe(false)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'new-alpha', through_delivery_id: 2 }],
+    }), expect.anything())
+  })
+
+  it.each(['failed', 'missing-fence', 'wrong-epoch'] as const)(
+    'restores recovery without acknowledging an unproven %s retirement', async outcome => {
+      const h = harness(true)
+      const consumer = deferred<'applied'>()
+      h.helloV2()
+      const owner = h.controller.claimLaneOwner('alpha', 7)!
+      h.consume.mockReturnValueOnce(consumer.promise)
+      h.recover.mockReturnValue(new Promise(() => {}))
+      laneFrame(h, 1, 'old-alpha')
+      owner.beginRetirement()
+      consumer.reject(new Error('Detached'))
+      await vi.advanceTimersByTimeAsync(0)
+      if (outcome === 'failed') owner.failRetirement()
+      else await expect(owner.completeRetirement(outcome === 'missing-fence' ? null : {
+        connection_epoch: EPOCH, subscription_epoch: 'wrong-alpha', retire_token: 'wrong', final_published_id: 1,
+      })).rejects.toThrow('did not prove retirement')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ keys: ['alpha'] }))
+      expect(h.request).not.toHaveBeenCalled()
+      expect(h.controller.diagnostics.pendingFrames).toBe(1)
+    },
+  )
+
+  it('invalidates old local owner handles across connection replacement', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    old.beginRetirement()
+    h.replaceGeneration()
+    h.helloV2()
+    expect(h.controller.claimLaneOwner('alpha', 7)).toBeUndefined()
+    h.controller.claimLaneOwner('alpha', 8)
+    await old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 1 })
+    h.consume.mockRejectedValueOnce(new Error('Current owner failed'))
+    laneFrame(h, 1, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ keys: ['alpha'] }))
+    expect(h.request.mock.calls.every(([, params]) => !params?.discarded_lanes)).toBe(true)
+  })
+
+  it('immediately coalesces consumption during an in-flight ACK without overlapping requests', async () => {
+    const h = harness()
+    const first = deferred<unknown>()
+    const second = deferred<unknown>()
+    h.request.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    h.helloV2()
+    laneFrame(h, 1, 'sub-a')
+    await vi.advanceTimersByTimeAsync(1)
+    for (let id = 2; id <= 100; id++) laneFrame(h, id, 'sub-a')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).toHaveBeenCalledOnce()
+
+    first.resolve({ connection_epoch: EPOCH,
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 1 }],
+      staged_recovery: [], discarded_lanes: [] })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.request).toHaveBeenCalledTimes(2)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 100 }],
+    }), expect.anything())
+
+    laneFrame(h, 101, 'sub-a')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).toHaveBeenCalledTimes(2)
+    second.resolve({ connection_epoch: EPOCH,
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 100 }],
+      staged_recovery: [], discarded_lanes: [] })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.request).toHaveBeenCalledTimes(3)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 101 }],
+    }), expect.anything())
+  })
+
+  it('advances an ordinary coalescing timer when accumulated credit needs an immediate ACK', async () => {
+    const h = harness()
+    h.hello()
+    h.deliver(1)
+    await vi.advanceTimersByTimeAsync(10)
+    expect(h.request).not.toHaveBeenCalled()
+    for (let id = 2; id <= 32; id++) h.deliver(id)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.request).toHaveBeenCalledExactlyOnceWith(METHOD, {
+      delivery_epoch: EPOCH, ack_delivery_id: 32,
+    }, expect.anything())
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.request).toHaveBeenCalledOnce()
+  })
+
+  it.each(['rejected', 'unconfirmed'])('keeps ACK retry backoff under new consumption and staging after a %s reply', async outcome => {
+    const h = harness()
+    const first = deferred<unknown>()
+    h.request.mockReturnValueOnce(first.promise)
+    h.helloV2()
+    laneFrame(h, 1, 'sub-a')
+    await vi.advanceTimersByTimeAsync(1)
+    laneFrame(h, 2, 'sub-a')
+    if (outcome === 'rejected') first.reject(new Error('Temporary control failure'))
+    else first.resolve({ connection_epoch: EPOCH, consumed: [], staged_recovery: [], discarded_lanes: [] })
+    await vi.advanceTimersByTimeAsync(0)
+    const failedAt = Date.now()
+    await vi.advanceTimersByTimeAsync(10)
+    laneFrame(h, 3, 'sub-a')
+    const staged = h.controller.acknowledgeDelivery(h.receipt(4))
+    await vi.advanceTimersByTimeAsync(989)
+    expect(Date.now() - failedAt).toBe(999)
+    expect(h.request).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(1)
+    await staged
+    expect(h.request).toHaveBeenCalledTimes(2)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-a', through_delivery_id: 3 }],
+      staged_recovery: [h.receipt(4)],
+    }), expect.anything())
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(h.request).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears a failed ACK deadline on connection reset', async () => {
+    const h = harness()
+    h.request.mockRejectedValueOnce(new Error('Temporary control failure'))
+    h.helloV2()
+    laneFrame(h, 1, 'sub-old')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.request).toHaveBeenCalledOnce()
+    h.emit('_state', 'disconnected')
+    h.replaceGeneration()
+    h.helloV2()
+    laneFrame(h, 1, 'sub-new')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.request).toHaveBeenCalledTimes(2)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-new', through_delivery_id: 1 }],
+    }), expect.anything())
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(h.request).toHaveBeenCalledTimes(2)
+  })
+
+  it('immediately settles retirement and replacement consumption after the old ACK returns', async () => {
+    const h = harness()
+    const first = deferred<unknown>()
+    h.request.mockReturnValueOnce(first.promise)
+    h.helloV2()
+    laneFrame(h, 1, 'sub-old')
+    await vi.advanceTimersByTimeAsync(1)
+    const receipt = { connection_epoch: EPOCH, subscription_epoch: 'sub-old',
+      retire_token: 'old-token', final_published_id: 1 }
+    const retired = h.controller.retireLane(receipt)
+    laneFrame(h, 2, 'sub-new')
+    await vi.advanceTimersByTimeAsync(1)
+    expect(h.request).toHaveBeenCalledOnce()
+    first.resolve({ connection_epoch: EPOCH,
+      consumed: [{ subscription_epoch: 'sub-old', through_delivery_id: 1 }],
+      staged_recovery: [], discarded_lanes: [] })
+    await vi.advanceTimersByTimeAsync(1)
+    await retired
+    expect(h.request).toHaveBeenCalledTimes(2)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'sub-new', through_delivery_id: 2 }],
+      discarded_lanes: [{ subscription_epoch: 'sub-old', retire_token: 'old-token', final_published_id: 1 }],
+    }), expect.anything())
+    expect(h.recover).not.toHaveBeenCalled()
+  })
 
   it('waits for the completed prefix of one lane without blocking another lane', async () => {
     const h = harness()

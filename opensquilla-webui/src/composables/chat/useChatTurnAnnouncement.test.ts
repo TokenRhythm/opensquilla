@@ -102,6 +102,45 @@ describe('confirmed live turn announcements', () => {
     expect(api.announcement.value).toBe('chat.activity.lifecycle.interrupted')
   })
 
+  it('corrects partial done when the same task later reports provider failure', async () => {
+    const api = setup()
+    await api.start('turn-a')
+    // The rich done handler's provisional succeeded projection has no task id.
+    await api.settle('idle', 'succeeded')
+    expect(api.announcement.value).toBe('chat.activity.lifecycle.settled')
+    await api.settle('failed', 'failed', 'turn-a')
+    expect(api.announcement.value).toBe('chat.activity.lifecycle.failed')
+    await api.settle('idle', 'succeeded', 'turn-a')
+    expect(api.announcement.value).toBe('chat.activity.lifecycle.failed')
+  })
+
+  it('does not correct a settled announcement from an unrelated or unidentified task', async () => {
+    const api = setup()
+    await api.start('turn-a')
+    await api.settle('idle', 'succeeded')
+    await api.settle('failed', 'failed', 'turn-old')
+    expect(api.announcement.value).toBe('chat.activity.lifecycle.settled')
+    await api.settle('failed', 'failed')
+    expect(api.announcement.value).toBe('chat.activity.lifecycle.settled')
+    await api.start('turn-b')
+    await api.settle('failed', 'failed', 'turn-a')
+    expect(api.announcement.value).toBe('')
+    await api.settle('idle', 'succeeded', 'turn-b')
+    expect(api.announcement.value).toBe('chat.activity.lifecycle.settled')
+  })
+
+  it('does not inherit a settled owner when the next live turn starts before its task id arrives', async () => {
+    const api = setup()
+    await api.start('turn-a')
+    await api.settle('idle', 'succeeded', 'turn-a')
+    api.runStatus.value = { status: 'running', label: '', task: null }
+    api.isStreaming.value = true
+    await nextTick()
+    expect(api.announcement.value).toBe('')
+    await api.settle('failed', 'failed', 'turn-b')
+    expect(api.announcement.value).toBe('chat.activity.lifecycle.failed')
+  })
+
   it('is wired to the existing hidden polite region without another notification', () => {
     expect(chatViewSource).toContain('useChatTurnAnnouncement({ sessionKey, isStreaming, runStatus, t })')
     expect(chatViewSource).toContain('class="chat-turn-settled-announcer" role="status" aria-live="polite"')

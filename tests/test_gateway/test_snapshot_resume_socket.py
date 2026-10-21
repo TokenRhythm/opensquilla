@@ -15,7 +15,11 @@ from opensquilla.gateway import rpc_sessions, rpc_transport, session_streams, we
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
 from opensquilla.gateway.protocol import MAX_PAYLOAD_BYTES
 from opensquilla.gateway.rpc import get_dispatcher
-from opensquilla.gateway.transport_flow import SESSION_FLOW_V2_CAPABILITY, get_transport_budget
+from opensquilla.gateway.transport_flow import (
+    FLOW_WINDOW_BYTES,
+    SESSION_FLOW_V2_CAPABILITY,
+    get_transport_budget,
+)
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
 
@@ -99,7 +103,9 @@ async def test_two_session_pending_resume_retries_over_real_socket(
                 "params": {"minProtocol": 4, "maxProtocol": 4, "caps": [
                     "transport.flow.v1", "transport.recovery.v1", SESSION_FLOW_V2_CAPABILITY,
                 ]}}))
-            await receive(type="hello-ok")
+            hello = await receive(type="hello-ok")
+            conn = registry.get(hello["server"]["conn_id"])
+            assert conn is not None
             receipts = {}
             for key in keys:
                 await rpc("sessions.messages.subscribe", {"key": key, "fast_ack": True})
@@ -120,24 +126,40 @@ async def test_two_session_pending_resume_retries_over_real_socket(
                     })
 
             proofs = {key: await rpc("sessions.messages.resume", receipts[key]) for key in keys}
-            segment_counts = (8, 16, 17) if text_bytes == 1 else range(1, 18)
-            for expected_count in segment_counts:
-                for key in keys:
-                    current = replay_frames(key)
-                    assert len(current) == expected_count
-                    # The first reply may be lost to an observer even though
-                    # the socket delivered its first replay batch. Do not ACK
-                    # until the exact resume has been repeated successfully.
-                    repeated = await rpc("sessions.messages.resume", receipts[key])
-                    assert repeated == proofs[key]
-                    assert len(replay_frames(key)) == expected_count
-                    lane = current[-1]["meta"]["session_flow_v2"]
-                    await rpc("transport.sessionFlow.update.v2", {
-                        "connection_epoch": lane["connection_epoch"],
-                        "consumed": [{"subscription_epoch": lane["subscription_epoch"],
-                                      "through_delivery_id": lane["delivery_id"]}],
-                        "staged_recovery": [], "discarded_lanes": [],
-                    })
+            # Logical eight-frame batches pipeline. Both small replays fit;
+            # large A owns 17 frames and B fills the remaining shared 4 MiB
+            # with 10, instead of inventing a one-frame per-lane byte window.
+            initial_counts = [17, 17 if text_bytes == 1 else 10]
+            assert [len(replay_frames(key)) for key in keys] == initial_counts
+            reserved = sum(item.size for item in conn._flow.deliveries.values())
+            assert reserved <= FLOW_WINDOW_BYTES
+            if text_bytes > 1:
+                assert FLOW_WINDOW_BYTES - reserved < text_bytes
+            for key, expected_count in zip(keys, initial_counts, strict=True):
+                repeated = await rpc("sessions.messages.resume", receipts[key])
+                assert repeated == proofs[key]
+                assert len(replay_frames(key)) == expected_count
+            for index, key in enumerate(keys):
+                current = replay_frames(key)
+                assert len(current) == 17
+                lane = current[-1]["meta"]["session_flow_v2"]
+                await rpc("transport.sessionFlow.update.v2", {
+                    "connection_epoch": lane["connection_epoch"],
+                    "consumed": [{"subscription_epoch": lane["subscription_epoch"],
+                                  "through_delivery_id": lane["delivery_id"]}],
+                    "staged_recovery": [], "discarded_lanes": [],
+                })
+                if index == 0:
+                    # A's ACK refills B before any B ACK, preserving B's
+                    # original receipts and exact retry proof without duplicates.
+                    assert len(conn._pending_replays[keys[1]].pending_delivery_ids) == 17
+                    # ACK replies are priority control frames, not a physical
+                    # writer fence. Wait for B's newly admitted frames themselves.
+                    while len(replay_frames(keys[1])) < 17:
+                        await receive()
+                    assert len(replay_frames(keys[1])) == 17
+                    repeated = await rpc("sessions.messages.resume", receipts[keys[1]])
+                    assert repeated == proofs[keys[1]]
             for key in keys:
                 assert len(replay_frames(key)) == 17
                 assert len({frame["payload"]["stream_seq"] for frame in replay_frames(key)}) == 17

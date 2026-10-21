@@ -209,7 +209,7 @@ for (const { width, locale } of [
 }
 
 for (const theme of ['dark', 'light', 'miami']) {
-  test(`split chat keeps short model and Send/Stop on one row in ${theme}`, async ({ page }, testInfo) => {
+  test(`split chat keeps input and Send/Stop geometry stable in ${theme}`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width: 1800, height: 1083 })
     const fixture = await openSplitComposer(page, theme)
     const panel = page.locator('.chat-input-panel')
@@ -224,6 +224,8 @@ for (const theme of ['dark', 'light', 'miami']) {
     const centers = before.map(box => (box.top + box.bottom) / 2)
     expect(Math.max(...centers) - Math.min(...centers)).toBeLessThanOrEqual(5)
     const footerHeight = (await page.locator('.chat-input-footer').boundingBox())!.height
+    const inputBefore = (await page.locator('.chat-textarea').boundingBox())!
+    const slotBefore = (await page.locator('.chat-send-control').boundingBox())!
     await page.screenshot({ path: testInfo.outputPath(`split-${theme}-send.png`) })
     await page.locator('.chat-send-btn').click()
     await expect.poll(fixture.sends).toBe(1)
@@ -231,12 +233,24 @@ for (const theme of ['dark', 'light', 'miami']) {
     const active = await toolbarGeometry(page, [...selectors, '.chat-stop-btn'])
     const activeCenters = active.map(box => (box.top + box.bottom) / 2)
     expect(Math.max(...activeCenters) - Math.min(...activeCenters)).toBeLessThanOrEqual(5)
-    // Stop is intentionally 8px taller than Send; neither state adds a row.
-    expect(Math.abs((await page.locator('.chat-input-footer').boundingBox())!.height - footerHeight)).toBeLessThanOrEqual(10)
+    const inputActive = (await page.locator('.chat-textarea').boundingBox())!
+    const slotActive = (await page.locator('.chat-send-control').boundingBox())!
     await testInfo.attach('toolbar-geometry', {
-      body: JSON.stringify({ panel: panelBox, idle: before, running: active }, null, 2),
+      body: JSON.stringify({ panel: panelBox, idle: before, running: active,
+        inputBefore, inputActive, slotBefore, slotActive }, null, 2),
       contentType: 'application/json',
     })
+    // A recovered running chat changes Send into Stop after metadata arrives.
+    // Its larger hit target must not move the surrounding input or controls.
+    expect(Math.abs((await page.locator('.chat-input-footer').boundingBox())!.height - footerHeight)).toBeLessThanOrEqual(0.5)
+    expect(Math.abs(inputActive.y - inputBefore.y)).toBeLessThanOrEqual(0.5)
+    expect(Math.abs(inputActive.height - inputBefore.height)).toBeLessThanOrEqual(0.5)
+    for (const dimension of ['x', 'y', 'width', 'height'] as const) {
+      expect(Math.abs(slotActive[dimension] - slotBefore[dimension]), `Send/Stop slot ${dimension}`).toBeLessThanOrEqual(0.5)
+    }
+    const stopBox = (await page.locator('.chat-stop-btn').boundingBox())!
+    expect(stopBox.width).toBeGreaterThanOrEqual(44)
+    expect(stopBox.height).toBeGreaterThanOrEqual(44)
     await page.screenshot({ path: testInfo.outputPath(`split-${theme}-stop.png`) })
     await page.locator('.chat-stop-btn').click()
     await expect.poll(fixture.aborts).toBe(1)

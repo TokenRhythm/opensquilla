@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections import defaultdict
@@ -212,7 +213,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple sliding-window rate limiter per client IP."""
+    """Opt-in sliding-window request-count policy per client IP."""
 
     def __init__(self, app: ASGIApp, config: GatewayConfig) -> None:
         super().__init__(app)
@@ -262,7 +263,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     {"error": "Too Many Requests", "code": "CONTENT_RATE_LIMITED"},
                     status_code=429,
-                    headers={"Retry-After": str(max(1, int(content_window)))}
+                    headers={"Retry-After": self._retry_after(
+                        self._content_windows[client_ip], content_window, now,
+                    )},
                 )
             self._content_windows[client_ip].append(now)
             return await call_next(request)  # type: ignore[no-any-return]
@@ -275,11 +278,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if len(self._windows[client_ip]) >= max_req:
             return JSONResponse(
-                {"error": "Too Many Requests", "code": "RATE_LIMITED"}, status_code=429
+                {"error": "Too Many Requests", "code": "RATE_LIMITED"},
+                status_code=429,
+                headers={"Retry-After": self._retry_after(
+                    self._windows[client_ip], window, now,
+                )},
             )
 
         self._windows[client_ip].append(now)
         return await call_next(request)  # type: ignore[no-any-return]
+
+    @staticmethod
+    def _retry_after(timestamps: list[float], window: int, now: float) -> str:
+        # A slot becomes available when the oldest accepted request expires.
+        # Zero-request configurations reject without an existing timestamp.
+        remaining = timestamps[0] + window - now if timestamps else window
+        return str(max(1, math.ceil(remaining)))
 
     def _get_client_ip(self, request: Request) -> str:
         forwarded = request.headers.get("x-forwarded-for")

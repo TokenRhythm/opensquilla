@@ -332,6 +332,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private annotationEditingOriginal: { annotationId: string; body: string } | null = null
   private annotationAtomicCloseRearm = false
   private annotationPickerArmed = false
+  private annotationPickerEpoch = -1
+  private annotationSuspended = false
   private annotationModeOperation = 0
   private annotationSelectionAttempt = 0
   private annotationSelectionPending = false
@@ -409,6 +411,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       previewDefaultMode: this.defaultMode,
       previewLeaseError: '',
       previewLaunchUrl: preparedPreview?.launchUrl || '',
+      previewWorkingDocumentId: '',
       previewMode: this.mode,
       ...(preparedPreview
         ? {
@@ -1116,6 +1119,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
     }
     if (operation !== this.annotationModeOperation) return false
+    if (result.ok && 'pickerEpoch' in result && typeof result.pickerEpoch === 'number') {
+      this.annotationPickerEpoch = Math.max(this.annotationPickerEpoch, result.pickerEpoch)
+    }
     if (!result.ok) {
       // Fail closed in the renderer so a late native selection cannot create
       // a draft. A rejected stop remains visibly pressed because Desktop has
@@ -1203,10 +1209,64 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     if (this.annotationOverlayId) return false
     if (
       !this.createdSurface
+      || this.annotationSuspended
+      || this.rect?.visible === false
+      || this.context.isItemActive?.() === false
       || this.context.getRenderState().annotationAvailable !== true
     ) return false
     this.annotationModeRestorePending = false
     return await this.setAnnotationMode(true)
+  }
+
+  private pauseAnnotationPicker() {
+    const renderedMode = runtimeContextStateValue(
+      this.context.getRenderState(), 'annotationMode', this.annotationMode,
+    )
+    const stopping = runtimeContextStateValue(
+      this.context.getRenderState(), 'annotationModeStopping', false,
+    )
+    this.annotationModeRestorePending ||= this.annotationMode || (renderedMode && !stopping)
+    this.annotationModeOperation += 1
+    this.invalidateAnnotationSelectionAttempt()
+    this.annotationMode = false
+    this.annotationPickerArmed = false
+    this.context.updateRenderState({
+      annotationAvailable: false,
+      annotationMode: false,
+      annotationModeStopping: false,
+    })
+  }
+
+  private async handleAnnotationPickerState(detail: NativeWorkbenchSurfaceEvent['detail']) {
+    if (!detail || detail.surfaceInstanceId !== this.nativeSurfaceInstanceId
+      || typeof detail.pickerEpoch !== 'number'
+      || detail.pickerEpoch <= this.annotationPickerEpoch) return
+    this.annotationPickerEpoch = detail.pickerEpoch
+    // Enabling is acknowledged by the operation that requested it. An event
+    // must never resurrect a picker after a newer local Stop.
+    if (detail.enabled !== false) return
+    this.annotationPickerArmed = false
+    if (detail.reason === 'picker-cancelled' || detail.reason === 'surface-closed') return
+    // The editor cancellation path owns its retained draft and rearm.
+    if (this.annotationOverlayId) return
+    if (!this.annotationMode && !this.annotationModeRestorePending) return
+    this.pauseAnnotationPicker()
+    if (!this.annotationModeRestorePending || this.annotationSuspended
+      || this.rect?.visible === false || this.context.isItemActive?.() === false) return
+    if (detail.reason === 'debugger-detached') {
+      if (this.reserveNativeCapabilityRecovery(
+        { retryable: true, code: 'ANNOTATION_UNAVAILABLE' }, ['ANNOTATION_UNAVAILABLE'],
+      )) await this.recoverNativeCapabilitySurface(this.generation)
+      return
+    }
+    // Hidden cancellation can arrive after the latest visible rect. Restore
+    // its retained intent here as well as after in-page navigation; a hidden
+    // tab or a document still loading must wait for visibility/readiness.
+    if ((detail.reason === 'surface-navigation' || detail.reason === 'surface-hidden')
+      && this.context.getRenderState().nativeSurfaceState === 'ready') {
+      await this.refreshAnnotationCapability(this.generation)
+      await this.restoreAnnotationModeAfterSurfaceRefresh()
+    }
   }
 
   async handleSurfaceRect(rect: NativeSurfaceRect, item: WorkbenchItem) {
@@ -1221,30 +1281,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       // panel owns the slot. Fence the picker and hide its capability until a
       // visible rect arrives; otherwise the toolbar can stay pressed while
       // Desktop quite correctly keeps the WebContents detached.
-      const renderedMode = runtimeContextStateValue(
-        this.context.getRenderState(),
-        'annotationMode',
-        this.annotationMode,
-      )
-      const stopping = runtimeContextStateValue(
-        this.context.getRenderState(),
-        'annotationModeStopping',
-        false,
-      )
-      this.annotationModeRestorePending = this.annotationModeRestorePending
-        || this.annotationMode
-        || (renderedMode && !stopping)
-      this.annotationModeOperation += 1
-      this.annotationSelectionAttempt += 1
-      this.annotationSelectionPending = false
-      this.annotationMode = false
-      this.annotationPickerArmed = false
-      this.context.updateRenderState({
-        annotationAvailable: false,
-        annotationMode: false,
-        annotationModeStopping: false,
-        nativeSurfaceState: 'loading',
-      })
+      this.pauseAnnotationPicker()
+      // Visibility does not reload a retained document. Preserve its actual
+      // readiness: showing it again emits no new native ready event.
       await this.syncSurfaceRect()
       return
     }
@@ -1263,7 +1302,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.item = item
 
     if (!this.createdSurface) return
-    if (event.type === 'annotation-selected') {
+    if (event.type === 'annotation-picker-state') {
+      await this.handleAnnotationPickerState(event.detail)
+    } else if (event.type === 'annotation-selected') {
       await this.handleAnnotationSelected(event.detail?.selection)
     } else if (event.type === 'annotation-draft-change') {
       this.handleAnnotationDraftChange(
@@ -1323,8 +1364,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
           ? 'ready-with-warnings'
           : 'ready',
       })
-      if (this.lease?.workingDocumentId
-        && this.lease.workingDocumentId === this.currentDocument()?.document.documentId
+      if ((this.annotationModeRestorePending || (this.lease?.workingDocumentId
+        && this.lease.workingDocumentId === this.currentDocument()?.document.documentId))
         && !this.annotationOverlayId) {
         // Native reload does not remount the Vue preview. Restore the picker
         // only after this page is ready; an interrupted editor keeps its draft
@@ -1746,6 +1787,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         annotationId: fence.annotationId,
         ...(rearm && this.annotationAtomicCloseRearm ? { rearm: true as const } : {}),
       })
+      if (result.ok && typeof result.pickerEpoch === 'number'
+        && fence.generation === this.generation && fence.surfaceId === this.item.id) {
+        this.annotationPickerEpoch = Math.max(this.annotationPickerEpoch, result.pickerEpoch)
+      }
       if (
         !result.ok
         && result.retryable === true
@@ -1874,6 +1919,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       } finally {
         if (this.annotationOverlayOperation === operation) {
           this.annotationOverlayOperation = null
+          this.updateAnnotationEditorState(false, String(this.context.getRenderState().annotationError || ''))
         }
       }
       return
@@ -2051,12 +2097,19 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 
   async suspend() {
+    this.annotationSuspended = true
+    if (this.nativeProtocolVersion === 3 || this.nativeProtocolVersion === 4) {
+      // Lifecycle suspension must preserve intent itself; a rapid tab/chat
+      // switch can coalesce the Host's intermediate hidden layout event.
+      this.pauseAnnotationPicker()
+    }
     if (!await this.finishOfficeEditor()) return
     if (!this.rect) return
     await this.setSurfaceRect({ ...this.rect, visible: false })
   }
 
   async resume() {
+    this.annotationSuspended = false
     const generation = this.generation
     if (!await this.syncSurfaceRect()) return
     if (generation !== this.generation || !this.createdSurface) return
@@ -2130,6 +2183,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.generation = generation
     this.createdSurface = true
     this.nativeSurfaceInstanceId = ''
+    this.annotationPickerEpoch = -1
     this.context.updateRenderState({
       missingResources: resource.hasRelativeResources,
       nativeSurfaceState: 'loading',
@@ -2605,6 +2659,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       previewCollectionStatus: lease.source.collection_status,
       previewLeaseError: '',
       previewLaunchUrl: lease.launch_url,
+      previewWorkingDocumentId: lease.workingDocumentId || '',
       workingFileDocumentId: lease.workingDocumentId || this.currentDocument()?.document.documentId || '',
       workingFilePageUnknown: false,
       workingFileEntrypoint: lease.entrypoint,
@@ -2636,6 +2691,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const generation = ++this.generation
     this.createdSurface = true
     this.nativeSurfaceInstanceId = ''
+    this.annotationPickerEpoch = -1
     this.context.updateRenderState({
       nativeSurfaceState: 'loading',
     })
@@ -2828,6 +2884,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const lease = this.lease
     this.lease = null
     this.leaseArtifactId = ''
+    this.context.updateRenderState({ previewWorkingDocumentId: '' })
     if (!lease) return
     if (this.options.platform.id !== 'desktop' && lease.preview_origin) {
       await this.options.artifactContent.clearPreviewStorage(lease.preview_origin)
@@ -3053,6 +3110,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const surfaceInstanceId = this.nativeSurfaceInstanceId
     this.createdSurface = false
     this.nativeSurfaceInstanceId = ''
+    this.annotationPickerEpoch = -1
     const overlayId = this.annotationOverlayId
     const preserveModeIntent = this.annotationModeRestorePending || this.annotationMode
     let preserveAnnotationFallback = false

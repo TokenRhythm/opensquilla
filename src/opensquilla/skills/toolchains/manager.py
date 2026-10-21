@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping
@@ -37,9 +39,13 @@ from opensquilla.paths import state_dir
 from opensquilla.skills.toolchains import registry
 from opensquilla.skills.toolchains.registry import ToolchainDescriptor
 
+log = logging.getLogger(__name__)
+
 _LAYOUT_VERSION = "v1"
 _MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 _COPY_CHUNK_SIZE = 1024 * 1024
+_DOWNLOAD_HTTP_RETRY_DELAYS_SECONDS = (2.0, 5.0)
+_TRANSIENT_DOWNLOAD_HTTP_STATUSES = frozenset({502, 503, 504, 521, 522, 523, 524})
 _PROBE_TIMEOUT_SECONDS = 30.0
 _CODESIGN_PATH = Path("/usr/bin/codesign")
 _POST_INSTALL_TIMEOUT_SECONDS = 600.0
@@ -186,6 +192,41 @@ def _download(
     )
 
 
+def _open_download_response(url: str) -> Any:
+    """Retry temporary HTTP responses only before receiving an artifact body."""
+    retry = 0
+    while True:
+        # urllib records redirect history on Request objects. Each attempt needs
+        # its own request so a failed response cannot exhaust the next one's hops.
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "OpenSquilla-managed-toolchain/1"},
+        )
+        try:
+            return urllib.request.urlopen(request, timeout=60)  # noqa: S310 - fixed catalog URL
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if (
+                exc.code not in _TRANSIENT_DOWNLOAD_HTTP_STATUSES
+                or retry >= len(_DOWNLOAD_HTTP_RETRY_DELAYS_SECONDS)
+            ):
+                raise
+            # The synchronous install worker already outlives a cancelled caller.
+            # Keep the existing per-request timeout and bound only these retries;
+            # response reads, verification and local writes must never be retried.
+            delay = _DOWNLOAD_HTTP_RETRY_DELAYS_SECONDS[retry]
+            log.warning(
+                "Retrying managed artifact HTTP response: status=%d attempt=%d "
+                "max_attempts=%d backoff_seconds=%g",
+                exc.code,
+                retry + 2,
+                len(_DOWNLOAD_HTTP_RETRY_DELAYS_SECONDS) + 1,
+                delay,
+            )
+            time.sleep(delay)
+            retry += 1
+
+
 def _download_pinned(
     url: str,
     sha256: str,
@@ -202,14 +243,10 @@ def _download_pinned(
         raise DownloadVerificationError("Pinned artifact size exceeds the download safety limit")
     total = progress_total if progress_total is not None else size
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "OpenSquilla-managed-toolchain/1"},
-    )
     digest = hashlib.sha256()
     downloaded = 0
     _notify(progress_cb, progress_offset, total)
-    with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 - fixed catalog URL
+    with _open_download_response(url) as response:
         final_url = response.geturl()
         if not final_url.startswith("https://"):
             raise DownloadVerificationError("Artifact redirect left HTTPS")

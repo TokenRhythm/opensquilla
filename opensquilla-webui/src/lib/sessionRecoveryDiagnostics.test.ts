@@ -49,17 +49,66 @@ describe('session recovery diagnostics', () => {
     expect(write).toHaveBeenCalledTimes(3)
   })
 
-  it('bounds distinct scopes as well as repeats, and emits a suppression summary next minute', () => {
+  it('keeps separate allowances for 20 chats within one document', () => {
+    const write = vi.fn()
+    const logger = new SessionRecoveryDiagnostics(write, () => 0)
+    for (let id = 0; id < 20; id++) {
+      logger.log({ phase: 'failed', reason: 'metadata_hydration_failed', sessionKey: `chat-${id}` })
+      logger.log({ phase: 'recovered', reason: 'recovery_completed', sessionKey: `chat-${id}` })
+    }
+    expect(records(write)).toHaveLength(40)
+    expect(new Set(records(write).map(record => record.session_key_sha256)).size).toBe(20)
+    expect(records(write).every(record => record.suppressed_count === 0)).toBe(true)
+  })
+
+  it('bounds one chat even when its diagnostic signatures keep changing', () => {
+    const write = vi.fn()
+    const logger = new SessionRecoveryDiagnostics(write, () => 0)
+    for (let generation = 0; generation < 1000; generation++) logger.log({
+      phase: 'failed', reason: 'metadata_hydration_failed', sessionKey: 'chat',
+      connectionGeneration: generation,
+    })
+    expect(records(write)).toHaveLength(8)
+    logger.log({ phase: 'failed', reason: 'metadata_hydration_failed', sessionKey: 'other' })
+    const messages = records(write)
+    expect(messages[messages.length - 1]).toMatchObject({ suppressed_count: 992 })
+  })
+
+  it('bounds scopes without eviction resets and reports suppression next minute', () => {
     const write = vi.fn()
     let now = 0
     const logger = new SessionRecoveryDiagnostics(write, () => now)
     for (let id = 0; id < 1000; id++) logger.log({
       phase: 'trigger', reason: 'consumer_timeout', sessionKey: `session-${id}`,
     })
-    expect(write).toHaveBeenCalledTimes(8)
+    expect(write).toHaveBeenCalledTimes(64)
+    // Existing scopes retain their unused allowance when the scope table is full.
+    for (let generation = 1; generation < 8; generation++) {
+      for (let id = 0; id < 64; id++) logger.log({
+        phase: 'trigger', reason: 'consumer_timeout', sessionKey: `session-${id}`,
+        connectionGeneration: generation,
+      })
+    }
+    expect(write).toHaveBeenCalledTimes(512)
+    logger.log({ phase: 'failed', reason: 'consumer_timeout', sessionKey: 'session-0' })
+    logger.log({ phase: 'failed', reason: 'consumer_timeout', sessionKey: 'session-1000' })
+    expect(write).toHaveBeenCalledTimes(512)
     now = 60_000
     logger.log({ phase: 'trigger', reason: 'consumer_timeout', sessionKey: 'next' })
-    expect(records(write)[write.mock.calls.length - 1]).toMatchObject({ suppressed_count: 992 })
+    const messages = records(write)
+    expect(messages[messages.length - 1]).toMatchObject({ suppressed_count: 2 })
+    expect(records(write).reduce((sum, record) => sum + record.suppressed_count, 0)).toBe(938)
+  })
+
+  it('shares the global scope for missing or unhashable identities', () => {
+    const write = vi.fn()
+    const logger = new SessionRecoveryDiagnostics(write, () => 0)
+    for (let generation = 0; generation < 20; generation++) logger.log({
+      phase: 'trigger', reason: 'server_dirty', connectionGeneration: generation,
+      sessionKey: generation % 2 === 0 ? undefined : 'x'.repeat(4097),
+    })
+    expect(records(write)).toHaveLength(8)
+    expect(records(write).every(record => record.session_key_sha256 === undefined)).toBe(true)
   })
 
   it('does not serialize arbitrary errors or allow a logging failure to affect recovery', () => {

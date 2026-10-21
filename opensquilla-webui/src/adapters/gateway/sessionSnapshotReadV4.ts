@@ -36,7 +36,7 @@ interface SnapshotReader {
   resumeFlow?(receipt: SnapshotInstalledReceipt): Promise<void> | void
   recoveryVersion?(key: string): string
   snapshotInstalled?(key: string, version: string): void
-  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
+  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number; replayAccepted?: boolean }): Promise<void>
   failProtocol?(generation: number): void
 }
 
@@ -292,6 +292,9 @@ export function createV4SessionSnapshotTransfer(
           try {
             await bounded(rpc.waitForConsumption?.(key, {
               streamGeneration: receipt.stream_generation, fromSeq: receipt.stream_seq, toSeq: replayToSeq,
+              // Only the validated modern proof confirms ownership before any
+              // replay frame can obtain shared connection credit.
+              ...(modern ? { replayAccepted: true } : {}),
             }))
           } catch (error) {
             if ((error as { code?: string })?.code === 'SNAPSHOT_STALE') {

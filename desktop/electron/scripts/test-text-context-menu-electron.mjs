@@ -55,15 +55,28 @@ async function invokeWindowsCopyMenu(processId) {
       [System.Windows.Automation.ControlType]::MenuItem)
     $condition = [System.Windows.Automation.AndCondition]::new($processCondition, $typeCondition)
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    Write-Output 'synthetic-native-copy-uia-ready'
+    $reportedRoots = $false
     do {
-      $items = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants, $condition)
-      foreach ($item in $items) {
-        if ($item.Current.Name -match 'Copy|复制') {
-          $pattern = $item.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-          $pattern.Invoke()
-          Write-Output 'synthetic-native-copy-invoked'
-          exit 0
+      # A process condition does not prune a desktop-wide descendants scan.
+      # Select owned top-level roots first so unrelated UIA providers cannot
+      # consume the native menu's deadline. Popups can be separate root children.
+      $ownedRoots = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+        [System.Windows.Automation.TreeScope]::Children, $processCondition)
+      if (!$reportedRoots) {
+        Write-Output ('synthetic-native-copy-owned-roots:' + $ownedRoots.Count)
+        $reportedRoots = $true
+      }
+      foreach ($ownedRoot in $ownedRoots) {
+        $items = $ownedRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        foreach ($item in $items) {
+          if ($item.Current.Name -match 'Copy|复制') {
+            $pattern = $item.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            Write-Output 'synthetic-native-copy-invoke-start'
+            $pattern.Invoke()
+            Write-Output 'synthetic-native-copy-invoked'
+            exit 0
+          }
         }
       }
       Start-Sleep -Milliseconds 50

@@ -778,7 +778,7 @@ test.describe('Project workspaces', () => {
     expect(state.workspaceUpdateRequests).toEqual([])
   })
 
-  test('project names only disclose tasks while the plus opens a project draft', async ({ page }) => {
+  test('project names only disclose tasks while the new-task action opens a project draft', async ({ page }) => {
     const state = await installProjectLifecycleRpc(page)
     state.projectPresent = true
     state.sent = true
@@ -787,10 +787,10 @@ test.describe('Project workspaces', () => {
 
     const disclosure = project.getByTestId('project-workspace-disclosure')
     const info = project.getByTestId('project-workspace-info')
-    const plus = project.getByTestId('project-workspace-new-task')
+    const createTask = project.getByTestId('project-workspace-new-task')
 
     await expect(info).toBeVisible()
-    await expect(plus).toHaveCSS('opacity', '0')
+    await expect(createTask).toHaveCSS('opacity', '0')
     await expect(disclosure).toHaveAttribute('aria-expanded', /true|false/)
     const startedExpanded = await disclosure.getAttribute('aria-expanded') === 'true'
     await disclosure.click()
@@ -798,8 +798,8 @@ test.describe('Project workspaces', () => {
     await expect(page).not.toHaveURL(/\/chat\?session=/)
 
     await project.hover()
-    await expect(plus).toHaveCSS('opacity', '1')
-    await plus.click()
+    await expect(createTask).toHaveCSS('opacity', '1')
+    await createTask.click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=main&project=[^&]+$/)
     await expect(page.locator('.chat-project-chip')).toBeVisible()
     await expect(disclosure).toHaveAttribute('aria-expanded', 'true')

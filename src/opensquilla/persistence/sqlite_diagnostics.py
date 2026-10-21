@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 _ROLES = frozenset({
-    "session_writer", "transcript_reader", "recovery_reader",
+    "session_writer", "transcript_reader", "recovery_reader", "committed_reader",
     "usage_index_writer", "content_length_writer", "router_writer", "error_writer",
 })
 _MAX_CONNECTIONS = 16

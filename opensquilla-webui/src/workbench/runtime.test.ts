@@ -3,7 +3,7 @@ import {
   WorkbenchPanelRegistry,
   WorkbenchRuntimeManager,
 } from './runtime'
-import type { NativeWorkbenchApi } from '@/platform/types'
+import type { NativeWorkbenchApi, NativeWorkbenchSurfaceEvent } from '@/platform/types'
 import type {
   WorkbenchItem,
   WorkbenchPanelRuntime,
@@ -23,6 +23,11 @@ function item(
     retention,
     payload: {},
   }
+}
+
+function pickerState(surfaceId: string): NativeWorkbenchSurfaceEvent {
+  return { version: 3, surfaceId, type: 'annotation-picker-state',
+    detail: { enabled: false, reason: 'surface-hidden', pickerEpoch: 2, surfaceInstanceId: 'current' } }
 }
 
 describe('workbench runtime registry', () => {
@@ -457,6 +462,178 @@ describe('workbench runtime registry', () => {
     expect(handleSurfaceRect).toHaveBeenCalledWith(rect, descriptor)
   })
 
+  it('delivers the latest queued layout after a retained item metadata refresh', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    let finishAction!: () => void
+    const pendingAction = new Promise<void>(resolve => { finishAction = resolve })
+    const performAction = vi.fn(() => pendingAction)
+    const handleSurfaceRect = vi.fn()
+    const resumeVisibility: boolean[] = []
+    let providerVisible = false
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: () => ({
+        performAction,
+        handleSurfaceRect: (rect, descriptor) => {
+          handleSurfaceRect(rect, descriptor)
+          providerVisible = rect.visible
+        },
+        resume: () => { resumeVisibility.push(providerVisible) },
+      }),
+    })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const original: WorkbenchItem = { ...item('retained-layout'), hostKind: 'native-webcontents' }
+    const hidden = { itemId: original.id, x: 0, y: 0, width: 640, height: 480, visible: false }
+    manager.handle({ type: 'open', item: original })
+    manager.handle({ type: 'resume', item: original })
+    manager.handleSurfaceRect(hidden)
+    await manager.flush()
+    handleSurfaceRect.mockClear()
+    resumeVisibility.length = 0
+
+    manager.performAction(original, 'pending-native-operation')
+    await vi.waitFor(() => expect(performAction).toHaveBeenCalledOnce())
+    const visible = { ...hidden, visible: true }
+    const updated = { ...original, payload: { ...original.payload } }
+    manager.handleSurfaceRect({ ...hidden })
+    manager.handleSurfaceRect(visible)
+    manager.handle({ type: 'update', item: updated })
+    manager.handle({ type: 'resume', item: updated })
+    finishAction()
+    await manager.flush()
+
+    expect(manager.isNativeSurfaceVisible(updated.id)).toBe(true)
+    expect(handleSurfaceRect).toHaveBeenCalledExactlyOnceWith(visible, updated)
+    expect(providerVisible).toBe(true)
+    expect(resumeVisibility).toEqual([true])
+  })
+
+  it('delivers picker state across a metadata refresh after hidden layout is coalesced', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    let finishAction!: () => void
+    const pendingAction = new Promise<void>(resolve => { finishAction = resolve })
+    const performAction = vi.fn(() => pendingAction)
+    const handleSurfaceRect = vi.fn()
+    const handleNativeSurfaceEvent = vi.fn()
+    registry.register({ kind: 'artifact-preview', createRuntime: () => ({
+      performAction, handleSurfaceRect, handleNativeSurfaceEvent,
+    }) })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const original: WorkbenchItem = { ...item('retained-picker'), hostKind: 'native-webcontents',
+      payload: { resourceIdentity: 'document:one', artifact: { id: 'revision-one' } } }
+    manager.handle({ type: 'open', item: original })
+    manager.handle({ type: 'resume', item: original })
+    await manager.flush()
+    manager.performAction(original, 'pending-native-operation')
+    await vi.waitFor(() => expect(performAction).toHaveBeenCalledOnce())
+    const hidden = { itemId: original.id, x: 0, y: 0, width: 640, height: 480, visible: false }
+    const visible = { ...hidden, visible: true }
+    const state = pickerState(original.id)
+    manager.handleSurfaceRect(hidden)
+    manager.handleSurfaceRect(visible)
+    manager.handleNativeSurfaceEvent(state)
+    manager.handleNativeSurfaceEvent({ version: 3, surfaceId: original.id, type: 'ready' })
+    const updated = { ...original, title: 'Refreshed title', payload: { ...original.payload } }
+    manager.handle({ type: 'update', item: updated })
+    finishAction()
+    await manager.flush()
+
+    expect(handleSurfaceRect).toHaveBeenCalledExactlyOnceWith(visible, updated)
+    expect(handleNativeSurfaceEvent).toHaveBeenCalledExactlyOnceWith(state, updated)
+  })
+
+  it.each(['artifact', 'resourceIdentity', 'initialSectionRequestId', 'preparedPreview', 'scope'] as const)(
+    'rejects queued picker state when the same-id %s ownership changes', async field => {
+      const registry = new WorkbenchPanelRegistry()
+      let finishAction!: () => void
+      const pendingAction = new Promise<void>(resolve => { finishAction = resolve })
+      const performAction = vi.fn(() => pendingAction)
+      const handleNativeSurfaceEvent = vi.fn()
+      registry.register({ kind: 'artifact-preview', createRuntime: () => ({ performAction, handleNativeSurfaceEvent }) })
+      const manager = new WorkbenchRuntimeManager(registry)
+      const original: WorkbenchItem = { ...item('changed-picker'), hostKind: 'native-webcontents',
+        payload: { resourceIdentity: 'document:one', artifact: { id: 'revision-one' },
+          initialSectionRequestId: 1, preparedPreview: null } }
+      manager.handle({ type: 'open', item: original })
+      await manager.flush()
+      manager.performAction(original, 'pending-native-operation')
+      await vi.waitFor(() => expect(performAction).toHaveBeenCalledOnce())
+      manager.handleNativeSurfaceEvent(pickerState(original.id))
+      const updated = field === 'scope'
+        ? { ...original, scope: { type: 'session' as const, id: 'another-session' } }
+        : { ...original, payload: { ...original.payload, [field]: field === 'artifact' ? { id: 'revision-two' }
+          : field === 'initialSectionRequestId' ? 2 : field === 'preparedPreview' ? { launchUrl: 'another' } : 'document:two' } }
+      manager.handle({ type: 'update', item: updated })
+      finishAction()
+      await manager.flush()
+      expect(handleNativeSurfaceEvent).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([false, true])('fences picker state queued during runtime creation (suspended=%s)', async suspended => {
+    const registry = new WorkbenchPanelRegistry()
+    const handleNativeSurfaceEvent = vi.fn()
+    registry.register({ kind: 'artifact-preview', createRuntime: () => ({ handleNativeSurfaceEvent }) })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const original = item('creating-picker')
+    manager.handle({ type: 'open', item: original })
+    const state = pickerState(original.id)
+    manager.handleNativeSurfaceEvent(state)
+    if (suspended) manager.handle({ type: 'suspend', item: original })
+    const updated = { ...original, payload: { ...original.payload } }
+    manager.handle({ type: 'update', item: updated })
+    await manager.flush()
+    if (suspended) expect(handleNativeSurfaceEvent).not.toHaveBeenCalled()
+    else expect(handleNativeSurfaceEvent).toHaveBeenCalledExactlyOnceWith(state, updated)
+  })
+
+  it.each(['reopen', 'recreate'] as const)('does not deliver queued geometry or picker state to a retired runtime on %s', async replacement => {
+    const registry = new WorkbenchPanelRegistry()
+    let finishAction!: () => void
+    const pendingAction = new Promise<void>(resolve => { finishAction = resolve })
+    const performAction = vi.fn(() => pendingAction)
+    const layoutHandlers: Array<ReturnType<typeof vi.fn>> = []
+    const pickerHandlers: Array<ReturnType<typeof vi.fn>> = []
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: () => {
+        const handleSurfaceRect = vi.fn()
+        const handleNativeSurfaceEvent = vi.fn()
+        layoutHandlers.push(handleSurfaceRect)
+        pickerHandlers.push(handleNativeSurfaceEvent)
+        return { performAction, handleSurfaceRect, handleNativeSurfaceEvent }
+      },
+    })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const original = item('replaced-layout', 'dispose-on-suspend')
+    manager.handle({ type: 'open', item: original })
+    manager.handle({ type: 'resume', item: original })
+    await manager.flush()
+    manager.performAction(original, 'pending-native-operation')
+    await vi.waitFor(() => expect(performAction).toHaveBeenCalledOnce())
+    const rect = { itemId: original.id, x: 1, y: 2, width: 640, height: 480, visible: true }
+    const current = replacement === 'reopen' ? { ...original, payload: {} } : original
+    if (replacement === 'reopen') {
+      manager.handleSurfaceRect(rect)
+      manager.handleNativeSurfaceEvent(pickerState(original.id))
+      manager.handle({ type: 'dispose', item: original, reason: 'closed' })
+      manager.handle({ type: 'open', item: current })
+    } else {
+      manager.handle({ type: 'suspend', item: original })
+      manager.handleSurfaceRect(rect)
+      manager.handleNativeSurfaceEvent(pickerState(original.id))
+    }
+    manager.handle({ type: 'resume', item: current })
+    finishAction()
+    await manager.flush()
+
+    expect(layoutHandlers).toHaveLength(2)
+    expect(layoutHandlers[0]).not.toHaveBeenCalled()
+    expect(layoutHandlers[1]).toHaveBeenCalledExactlyOnceWith(rect, current)
+    expect(pickerHandlers[0]).not.toHaveBeenCalled()
+    expect(pickerHandlers[1]).not.toHaveBeenCalled()
+  })
+
   it('keeps a reopened descriptor with the same id reachable after close', async () => {
     const registry = new WorkbenchPanelRegistry()
     const runtimes: Array<Required<Pick<
@@ -647,6 +824,57 @@ describe('workbench runtime registry', () => {
     )
     expect(activateSurface).not.toHaveBeenCalled()
     expect(manager.hasRuntime(descriptor.id)).toBe(false)
+  })
+
+  it('reports native visibility before queued provider state catches up', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    let finishAction!: () => void
+    const pendingAction = new Promise<void>(resolve => { finishAction = resolve })
+    const performAction = vi.fn(() => pendingAction)
+    const handleSurfaceRect = vi.fn()
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: (_item, context) => ({
+        performAction,
+        handleSurfaceRect: rect => {
+          handleSurfaceRect(rect)
+          context.updateRenderState({ nativeVisible: rect.visible })
+        },
+      }),
+    })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor: WorkbenchItem = { ...item('preparing-annotation'), hostKind: 'native-webcontents' }
+    const rect = { itemId: descriptor.id, x: 0, y: 0, width: 640, height: 480, visible: true }
+    expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(false)
+    manager.handle({ type: 'open', item: descriptor })
+    manager.handleSurfaceRect(rect)
+    expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(false)
+    manager.handle({ type: 'resume', item: descriptor })
+    await manager.flush()
+    expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(true)
+
+    manager.performAction(descriptor, 'prepare-annotation')
+    await vi.waitFor(() => expect(performAction).toHaveBeenCalledOnce())
+    try {
+      manager.handleSurfaceRect({ ...rect, visible: false })
+      expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(false)
+      expect(manager.getRenderState(descriptor.id).nativeVisible).toBe(true)
+      expect(handleSurfaceRect).toHaveBeenCalledOnce()
+    } finally {
+      finishAction()
+      await manager.flush()
+    }
+    expect(manager.getRenderState(descriptor.id).nativeVisible).toBe(false)
+
+    manager.handleSurfaceRect(rect)
+    expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(true)
+    manager.handle({ type: 'suspend', item: descriptor })
+    expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(false)
+    manager.handle({ type: 'resume', item: descriptor })
+    expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(true)
+    manager.handle({ type: 'dispose', item: descriptor, reason: 'closed' })
+    expect(manager.isNativeSurfaceVisible(descriptor.id)).toBe(false)
+    await manager.flush()
   })
 
   it('revokes a pending native surface before disposeAll waits for its queue', async () => {

@@ -14,6 +14,8 @@ import { artifactFromWorkbenchItem, artifactWorkbenchItemId, createArtifactPrevi
 import { artifactPayloadFromRevision, createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
 import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
+import * as platformApi from '@/platform'
+import { createWebPlatform } from '@/platform/web'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { createWorkbenchResourceRef, type WorkbenchResource, type WorkbenchResourceOpenResponse } from '@/types/workbenchResources'
 import AppWorkbench from './AppWorkbench.vue'
@@ -88,15 +90,16 @@ function opened(artifact = target): WorkbenchResourceOpenResponse {
 }
 async function flush() { for (let i = 0; i < 8; i += 1) { await Promise.resolve(); await nextTick() } }
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason?: unknown) => void; const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail }); return { promise, resolve, reject } }
-async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPayload; resourcesEnabled?: boolean; resourceSessionKey?: string } = {}) {
+async function mount(options: { canonicalCurrent?: boolean; currentArtifact?: ArtifactPayload; nativeHtml?: boolean; target?: ArtifactPayload; resourcesEnabled?: boolean; resourceSessionKey?: string } = {}) {
+  const currentArtifact = options.currentArtifact || current
   const nextArtifact = options.target || target
   const resourceSessionKey = options.resourceSessionKey || 'session-a'
   const pinia = createPinia()
   const store = useWorkbenchStore(pinia)
   store.setSessionScope('session-a')
-  const item = { ...createArtifactPreviewWorkbenchItem({ artifact: current, nativeHtml: false, sessionKey: resourceSessionKey,
-    navigationArtifacts: [current, nextArtifact], resourceIdentity: options.canonicalCurrent
-      ? 'document:current-doc' : 'deliverable:current-html' }),
+  const item = { ...createArtifactPreviewWorkbenchItem({ artifact: currentArtifact, nativeHtml: options.nativeHtml === true, sessionKey: resourceSessionKey,
+    navigationArtifacts: [currentArtifact, nextArtifact], resourceIdentity: options.canonicalCurrent
+      ? `document:${currentArtifact.documentId || 'current-doc'}` : `deliverable:${currentArtifact.id}` }),
     scope: { type: 'session', id: 'session-a' } as const }
   store.openItem(item)
   const resources = useWorkbenchResourcesStore(pinia)
@@ -107,6 +110,7 @@ async function mount(options: { canonicalCurrent?: boolean; target?: ArtifactPay
   const host = document.createElement('div'); document.body.append(host)
   const fetchArtifact = vi.fn().mockResolvedValue({ ok: true, blob: new Blob(['download']) })
   const app = createApp(AppWorkbench, { sessionId: 'session-a', routeActive: true,
+    promptAnnotationsEnabled: options.nativeHtml === true,
     officePromptAnnotationsEnabled: true, workbenchResourcesEnabled: options.resourcesEnabled ?? true })
   app.use(pinia)
   app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
@@ -149,6 +153,52 @@ function installPreparedWorkspace(
     return workspace
   })
   return workspace
+}
+
+async function mountReadyAnnotationPreview(options: {
+  fixed?: boolean
+  artifact?: Partial<ArtifactPayload>
+  state?: Record<string, unknown>
+  prepared?: Partial<Extract<WorkbenchResourceOpenResponse, { disposition: 'document' }>>
+} = {}) {
+  const prepared = opened(current)
+  if (prepared.disposition !== 'document') throw new Error('Expected HTML document fixture')
+  prepared.revision.artifactSha256 = 'a'.repeat(64)
+  Object.assign(prepared, options.prepared)
+  const artifact = { ...artifactPayloadFromRevision(prepared.revision),
+    documentId: prepared.document.documentId, ...options.artifact }
+  const webPlatform = createWebPlatform()
+  vi.spyOn(platformApi, 'usePlatform').mockReturnValue({
+    ...webPlatform, id: 'desktop',
+    capabilities: { ...webPlatform.capabilities, hasNativeWorkbenchSurfaces: true },
+    workbench: { ...webPlatform.workbench, native: {
+      onSurfaceEvent: () => () => {},
+      createSurface: vi.fn(async () => ({ ok: true })),
+      activateSurface: vi.fn(async () => ({ ok: true })),
+      setSurfaceRect: vi.fn(async () => ({ ok: true })),
+      destroySurface: vi.fn(async () => ({ ok: true })),
+    } },
+  })
+  const state = {
+    annotationMode: false, annotationAvailable: true, nativeSurfaceState: 'ready',
+    previewWorkingDocumentId: prepared.document.documentId,
+    workingFileDocumentId: prepared.document.documentId,
+    workingFileEntrypoint: 'index.html', workingFileInitialPage: 'index.html',
+    previewLaunchUrl: 'http://preview.test/lease/index.html',
+    currentUrl: 'http://preview.test/lease/index.html',
+    ...options.state,
+  }
+  const getRenderState = vi.spyOn(WorkbenchRuntimeManager.prototype, 'getRenderState').mockReturnValue(state)
+  previewHarness.runtime = true
+  const h = await mount({ canonicalCurrent: !options.fixed, currentArtifact: artifact, nativeHtml: true })
+  h.prepareAnnotation.mockResolvedValue(prepared)
+  installPreparedWorkspace(h, prepared)
+  const runtime = getRenderState.mock.contexts[getRenderState.mock.contexts.length - 1] as WorkbenchRuntimeManager
+  runtime.handleSurfaceRect({ itemId: h.item.id, x: 0, y: 0, width: 640, height: 480, visible: true })
+  await runtime.flush(h.item.id)
+  const openItem = vi.spyOn(h.store, 'openItem')
+  const performAction = vi.spyOn(WorkbenchRuntimeManager.prototype, 'performAction')
+  return { ...h, prepared, state, runtime, openItem, performAction }
 }
 afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
@@ -508,6 +558,120 @@ describe('AppWorkbench artifact navigation', () => {
     ready.resolve()
     await flush()
     expect(performAction.mock.calls.some(([, action]) => action === 'begin-prepared-annotation')).toBe(false)
+  })
+
+  it.each([
+    { name: 'entrypoint', pagePath: undefined, currentUrl: 'http://preview.test/lease/index.html#kept' },
+    { name: 'authorized child page', pagePath: 'pages/detail.html', currentUrl: 'http://preview.test/lease/pages/detail.html' },
+  ])('keeps the ready $name preview while authorizing each annotation enable', async ({ pagePath, currentUrl }) => {
+    const h = await mountReadyAnnotationPreview({
+      artifact: { previewPagePath: pagePath },
+      state: { currentUrl },
+      prepared: { pageContext: pagePath ? { pagePath } : undefined },
+    })
+    const original = h.store.activeItem!
+    const originalRequest = original.payload.initialSectionRequestId
+
+    await h.continueEditing()
+    await vi.waitFor(() => expect(h.performAction).toHaveBeenCalledWith(original, 'begin-prepared-annotation'))
+    await h.continueEditing()
+    await vi.waitFor(() => expect(h.performAction.mock.calls
+      .filter(([, action]) => action === 'begin-prepared-annotation')).toHaveLength(2))
+
+    expect(h.prepareAnnotation).toHaveBeenCalledTimes(2)
+    expect(h.prepareAnnotation).toHaveBeenNthCalledWith(2, 'session-a', {
+      resourceRef: createWorkbenchResourceRef('document', h.prepared.document.documentId),
+    })
+    expect(h.documents.load).toHaveBeenCalledTimes(2)
+    expect(h.documents.load).toHaveBeenLastCalledWith(expect.objectContaining({
+      revisionId: h.prepared.revision.revisionId, sha256: h.prepared.revision.artifactSha256,
+    }), 'session-a', { force: true })
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.store.activeItem).toBe(original)
+    expect(h.store.activeItem?.payload.initialSectionRequestId).toBe(originalRequest)
+    expect(h.performAction.mock.calls.filter(([, action]) => action === 'begin-prepared-annotation')).toHaveLength(2)
+  })
+
+  it.each([
+    { name: 'fixed snapshot', options: { fixed: true } },
+    { name: 'Source section', options: { state: { nativeSurfaceState: 'loading', annotationAvailable: false } } },
+    { name: 'different page', options: { state: { currentUrl: 'http://preview.test/lease/pages/other.html' } } },
+    { name: 'unknown page', options: { state: { workingFilePageUnknown: true } } },
+    { name: 'outside the lease', options: { state: { currentUrl: 'http://other.test/index.html' } } },
+    { name: 'missing working lease binding', options: { state: { previewWorkingDocumentId: '' } } },
+    { name: 'different working lease', options: { state: { previewWorkingDocumentId: 'other-doc' } } },
+    { name: 'changed head', options: { artifact: { revisionId: 'revision-previous' } } },
+    { name: 'changed bytes', options: { artifact: { sha256: 'b'.repeat(64) } } },
+    { name: 'updated baseline', options: { prepared: { baselineUpdated: true } } },
+  ])('opens the prepared preview for $name', async ({ options }) => {
+    const h = await mountReadyAnnotationPreview(options)
+    const originalId = h.store.activeItemId
+    const originalRequest = Number(h.store.activeItem?.payload.initialSectionRequestId || 0)
+
+    await h.continueEditing()
+
+    await vi.waitFor(() => expect(h.openItem).toHaveBeenCalledOnce())
+    expect(h.prepareAnnotation).toHaveBeenCalledOnce()
+    expect(h.store.activeItem?.payload.resourceIdentity).toBe('document:canonical-doc')
+    expect(h.store.activeItem?.payload.initialSection).toBe('preview')
+    expect(h.store.activeItem?.payload.initialSectionRequestId)
+      .toBe(h.store.activeItemId === originalId ? originalRequest + 1 : 1)
+  })
+
+  it('requests Preview if Source hides the surface while annotation authorization is pending', async () => {
+    const h = await mountReadyAnnotationPreview()
+    const originalRequest = Number(h.store.activeItem?.payload.initialSectionRequestId || 0)
+    const pending = deferred<WorkbenchResourceOpenResponse | null>()
+    h.prepareAnnotation.mockReturnValueOnce(pending.promise)
+    await h.continueEditing()
+    await vi.waitFor(() => expect(h.prepareAnnotation).toHaveBeenCalledOnce())
+
+    // The runtime queue is still awaiting prepareAnnotation. A Source switch
+    // hides native content synchronously before the provider can update ready.
+    h.runtime.handleSurfaceRect({ itemId: h.item.id, x: 0, y: 0, width: 640, height: 480, visible: false })
+    expect(h.state.nativeSurfaceState).toBe('ready')
+    expect(h.state.annotationAvailable).toBe(true)
+    pending.resolve(h.prepared)
+
+    await vi.waitFor(() => expect(h.openItem).toHaveBeenCalledOnce())
+    expect(h.store.activeItem?.payload.initialSection).toBe('preview')
+    expect(h.store.activeItem?.payload.initialSectionRequestId).toBe(originalRequest + 1)
+  })
+
+  it('keeps reselection as an explicit navigation to the annotation page', async () => {
+    const h = await mountReadyAnnotationPreview()
+    await h.documents.load(artifactFromWorkbenchItem(h.item)!, 'session-a', { force: true })
+    await h.annotations.create({
+      annotationId: 'reselect-existing', sessionKey: 'session-a',
+      documentId: h.prepared.document.documentId, documentName: current.name,
+      revisionId: h.prepared.revision.revisionId, sha256: h.prepared.revision.artifactSha256,
+      body: 'Keep this target', pagePath: 'index.html',
+      selection: { selectionId: 'selected', targetRef: 'target', tagName: 'p', elementPath: 'p' },
+    })
+
+    h.runtime.handleComponentEvent(h.store.activeItem!, {
+      type: 'artifact-annotation-summary', payload: { type: 'reselect', annotationId: 'reselect-existing' },
+    })
+
+    await vi.waitFor(() => expect(h.openItem).toHaveBeenCalledOnce())
+    expect(h.prepareAnnotation).toHaveBeenCalledOnce()
+    expect(artifactFromWorkbenchItem(h.store.activeItem)?.previewPagePath).toBe('index.html')
+    expect(h.store.activeItem?.payload.initialSectionRequestId).toBe(1)
+  })
+
+  it('does not reuse a ready preview when fresh annotation authorization is denied', async () => {
+    const h = await mountReadyAnnotationPreview()
+    const original = h.store.activeItem
+    h.prepareAnnotation.mockRejectedValueOnce(artifactProductClientError('PERMISSION_DENIED'))
+
+    await h.continueEditing()
+
+    await vi.waitFor(() => expect(pushToast).toHaveBeenCalledWith(en.workbench.artifactErrors.permissionDenied,
+      expect.objectContaining({ tone: 'danger' })))
+    expect(h.store.activeItem).toBe(original)
+    expect(h.openItem).not.toHaveBeenCalled()
+    expect(h.documents.load).not.toHaveBeenCalled()
+    expect(h.performAction.mock.calls.some(([, action]) => action === 'begin-prepared-annotation')).toBe(false)
   })
 
   it.each([

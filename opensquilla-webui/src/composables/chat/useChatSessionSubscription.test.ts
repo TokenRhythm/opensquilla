@@ -174,6 +174,7 @@ interface HarnessOptions {
   resetStreamLiveTurnState?: UseChatSessionSubscriptionOptions['resetStreamLiveTurnState']
   onStreamGenerationReset?: UseChatSessionSubscriptionOptions['onStreamGenerationReset']
   onLiveSnapshot?: UseChatSessionSubscriptionOptions['onLiveSnapshot']
+  onSnapshotInstalled?: UseChatSessionSubscriptionOptions['onSnapshotInstalled']
   onAuthoritativeIdle?: UseChatSessionSubscriptionOptions['onAuthoritativeIdle']
   onRunModeLock?: UseChatSessionSubscriptionOptions['onRunModeLock']
   beginSessionMetadataResolution?: UseChatSessionSubscriptionOptions['beginSessionMetadataResolution']
@@ -229,6 +230,7 @@ function harness(
     resetStreamLiveTurnState,
     onStreamGenerationReset: options.onStreamGenerationReset,
     onLiveSnapshot: options.onLiveSnapshot,
+    onSnapshotInstalled: options.onSnapshotInstalled,
     onAuthoritativeIdle,
     onRunModeLock: options.onRunModeLock,
     beginSessionMetadataResolution: options.beginSessionMetadataResolution,
@@ -255,6 +257,38 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it('unfences the installed projection before waiting for the replay consumption proof', async () => {
+    const order: string[] = []
+    const proof = deferred<void>()
+    const confirmInstalled = vi.fn(() => { order.push('confirm'); return proof.promise })
+    const fixture = leaseFixture({ live: live({ confirmInstalled }) })
+    const subject = harness(fixture.lease, {
+      onSnapshotInstalled: () => { order.push('projection') },
+    })
+    try {
+      let settled = false
+      const result = subject.api.reconcileSession().then(value => { settled = true; return value })
+      await vi.waitFor(() => expect(confirmInstalled).toHaveBeenCalledOnce())
+      expect(order).toEqual(['projection', 'confirm'])
+      expect(settled).toBe(false)
+      proof.resolve()
+      await expect(result).resolves.toMatchObject({ authoritative: true })
+    } finally { subject.api.cancelActiveSubscription() }
+  })
+
+  it('does not confirm a projection that rejected its buffered events', async () => {
+    const confirmInstalled = vi.fn(async () => {})
+    const fixture = leaseFixture({ live: live({ confirmInstalled }) })
+    const subject = harness(fixture.lease, {
+      onSnapshotInstalled: () => { throw new SessionReadFailure('busy', 'Invalid buffered events', true) },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: false })
+      expect(confirmInstalled).not.toHaveBeenCalled()
+    } finally { warn.mockRestore(); subject.api.cancelActiveSubscription() }
+  })
+
   it.each([false, true])('preserves reader follow=%s when metadata restores an active task without a live bubble', async follow => {
     const autoScroll = ref(follow)
     const stream = useChatStream({
@@ -1020,6 +1054,23 @@ describe('useChatSessionSubscription domain lease', () => {
     expect(onSessionMetadata).toHaveBeenCalledWith(KEY, 12, recovered)
   })
 
+  it('shares metadata recovery so an automatic retry cannot cancel the sending caller', async () => {
+    const pending = deferred<SessionReadMetadata>()
+    const fixture = leaseFixture({ retryMetadata: () => pending.promise })
+    const beginSessionMetadataResolution = vi.fn(() => 12)
+    const onSessionMetadata = vi.fn()
+    const subject = harness(fixture.lease, { beginSessionMetadataResolution, onSessionMetadata })
+    const sending = subject.api.retrySessionMetadata()
+    const automatic = subject.api.retrySessionMetadata()
+
+    pending.resolve(metadata())
+
+    await expect(Promise.all([sending, automatic])).resolves.toEqual([true, true])
+    expect(fixture.retryMetadata).toHaveBeenCalledOnce()
+    expect(beginSessionMetadataResolution).toHaveBeenCalledOnce()
+    expect(onSessionMetadata).toHaveBeenCalledOnce()
+  })
+
   it('exposes deferred storage failure for recovery and clears stale working after terminal hydration', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const pendingMetadata = deferred<SessionReadMetadata>()
@@ -1053,16 +1104,18 @@ describe('useChatSessionSubscription domain lease', () => {
     }
   })
 
-  it('cancels and bounds metadata retry locally', async () => {
+  it('keeps the shared read alive when one caller cancels or times out', async () => {
     vi.useFakeTimers()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
       const pendingRetry = deferred<SessionReadMetadata>()
       const fixture = leaseFixture({ retryMetadata: () => pendingRetry.promise })
       const onSessionMetadataError = vi.fn()
+      const onSessionMetadata = vi.fn()
       const subject = harness(fixture.lease, {
         beginSessionMetadataResolution: () => 3,
         onSessionMetadataError,
+        onSessionMetadata,
       })
       const controller = new AbortController()
       const cancelled = subject.api.retrySessionMetadata({
@@ -1074,13 +1127,130 @@ describe('useChatSessionSubscription domain lease', () => {
       expect(onSessionMetadataError).not.toHaveBeenCalled()
 
       const timedOut = subject.api.retrySessionMetadata({ timeoutMs: 50 })
+      const automatic = subject.api.retrySessionMetadata()
       await vi.advanceTimersByTimeAsync(50)
       await expect(timedOut).resolves.toBe(false)
-      expect(onSessionMetadataError).toHaveBeenCalledWith(KEY, 3)
+      expect(onSessionMetadataError).not.toHaveBeenCalled()
+      expect(fixture.retryMetadata).toHaveBeenCalledOnce()
+      pendingRetry.resolve(metadata())
+      await expect(automatic).resolves.toBe(true)
+      expect(onSessionMetadata).toHaveBeenCalledOnce()
     } finally {
       warn.mockRestore()
       vi.useRealTimers()
     }
+  })
+
+  it('does not start a read for an already cancelled metadata caller', async () => {
+    const fixture = leaseFixture()
+    const beginSessionMetadataResolution = vi.fn(() => 1)
+    const subject = harness(fixture.lease, { beginSessionMetadataResolution })
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(subject.api.retrySessionMetadata({ signal: controller.signal })).resolves.toBe(false)
+    expect(fixture.retryMetadata).not.toHaveBeenCalled()
+    expect(beginSessionMetadataResolution).not.toHaveBeenCalled()
+  })
+
+  it('starts a fresh metadata read after a shared physical failure', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pending = deferred<SessionReadMetadata>()
+      const fixture = leaseFixture({ retryMetadata: () => pending.promise })
+      const onSessionMetadataError = vi.fn()
+      const subject = harness(fixture.lease, {
+        beginSessionMetadataResolution: () => 1, onSessionMetadataError,
+      })
+      const sending = subject.api.retrySessionMetadata()
+      const automatic = subject.api.retrySessionMetadata()
+      pending.reject(new SessionReadFailure('busy', 'storage busy', true))
+      await expect(Promise.all([sending, automatic])).resolves.toEqual([false, false])
+      expect(onSessionMetadataError).toHaveBeenCalledOnce()
+      expect(subject.api.metadataRecoveryError.value).toMatchObject({ kind: 'busy' })
+
+      fixture.retryMetadata.mockResolvedValueOnce(metadata())
+      await expect(subject.api.retrySessionMetadata()).resolves.toBe(true)
+      expect(fixture.retryMetadata).toHaveBeenCalledTimes(2)
+      expect(subject.api.metadataRecoveryError.value).toBeNull()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('does not relabel a pending physical read after Stop changes ownership', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pending = deferred<SessionReadMetadata>()
+      const taskOwnership = useChatTaskOwnership()
+      taskOwnership.noteRunning('task-C')
+      const fixture = leaseFixture({ retryMetadata: () => pending.promise })
+      const onSessionMetadata = vi.fn()
+      const subject = harness(fixture.lease, {
+        taskOwnership, beginSessionMetadataResolution: () => 1, onSessionMetadata,
+      })
+      const controller = new AbortController()
+      const previousCaller = subject.api.retrySessionMetadata({ signal: controller.signal })
+      controller.abort()
+      await expect(previousCaller).resolves.toBe(false)
+      taskOwnership.beginStop()
+      await expect(subject.api.retrySessionMetadata()).resolves.toBe(false)
+      expect(fixture.retryMetadata).toHaveBeenCalledOnce()
+
+      pending.resolve(metadata())
+      await vi.waitFor(() => expect(subject.api.metadataRecoveryError.value).toMatchObject({ kind: 'busy' }))
+      expect(onSessionMetadata).not.toHaveBeenCalled()
+      expect(taskOwnership.stopRequestedTaskId.value).toBe('task-C')
+
+      fixture.retryMetadata.mockResolvedValueOnce(metadata())
+      await expect(subject.api.retrySessionMetadata()).resolves.toBe(true)
+      expect(fixture.retryMetadata).toHaveBeenCalledTimes(2)
+      expect(taskOwnership.stopRequestedTaskId.value).toBe('')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it.each(['cancel', 'new subscription'])(
+    'keeps a pending read fenced after %s changes the metadata sequence', async change => {
+      const pending = deferred<SessionReadMetadata>()
+      const fixture = leaseFixture({ retryMetadata: () => pending.promise })
+      const onSessionMetadata = vi.fn()
+      const subject = harness(fixture.lease, {
+        beginSessionMetadataResolution: () => 1, onSessionMetadata,
+      })
+      const previous = subject.api.retrySessionMetadata()
+      if (change === 'cancel') subject.api.cancelActiveSubscription()
+      else await subject.api.subscribeSession()
+      onSessionMetadata.mockClear()
+
+      await expect(subject.api.retrySessionMetadata()).resolves.toBe(false)
+      expect(fixture.retryMetadata).toHaveBeenCalledOnce()
+      pending.resolve(metadata({ workspaceId: 'obsolete-project' }))
+      await expect(previous).resolves.toBe(false)
+      await Promise.resolve()
+      expect(onSessionMetadata).not.toHaveBeenCalled()
+
+      fixture.retryMetadata.mockResolvedValueOnce(metadata())
+      await expect(subject.api.retrySessionMetadata()).resolves.toBe(true)
+      expect(fixture.retryMetadata).toHaveBeenCalledTimes(2)
+    },
+  )
+
+  it('lets a new lease recover independently while the previous physical read settles', async () => {
+    const pending = deferred<SessionReadMetadata>()
+    const previousFixture = leaseFixture({ retryMetadata: () => pending.promise })
+    const onSessionMetadata = vi.fn()
+    const subject = harness(previousFixture.lease, {
+      beginSessionMetadataResolution: () => 1, onSessionMetadata,
+    })
+    const previous = subject.api.retrySessionMetadata()
+    subject.setLease(leaseFixture().lease)
+    await expect(subject.api.retrySessionMetadata()).resolves.toBe(true)
+    pending.resolve(metadata({ workspaceId: 'obsolete-project' }))
+    await expect(previous).resolves.toBe(false)
+    expect(onSessionMetadata).toHaveBeenCalledOnce()
+    expect(onSessionMetadata).toHaveBeenCalledWith(KEY, 1, expect.objectContaining({ workspaceId: null }))
   })
 
   it('reloads history and resets local live state only for generation change', async () => {

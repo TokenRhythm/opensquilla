@@ -339,6 +339,7 @@ import {
   fileActionArtifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
+  preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
   requestInitialSectionForWorkbenchItem,
   sessionKeyFromWorkbenchItem,
@@ -358,6 +359,7 @@ import {
   savePreviewPreferences,
 } from '@/utils/workbench/previewPreferences'
 import { artifactWorkbenchPreviewKind, isOfficePreviewFormat } from '@/utils/workbench/artifactPreview'
+import { previewPagePathFromUrl } from '@/utils/workbench/previewPagePath'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -473,16 +475,11 @@ const { pushToast } = useToasts()
 const platform = usePlatform()
 const nativeApi = platform.workbench.native
 const store = useWorkbenchStore()
-// Every producer uses the same admission boundary, including automatic agent
-// artifacts and main/side file links that do not pass through this component.
+// Browser producers share the same admission boundary even when they do not
+// open the tab through this component.
 const stopAdmissionNotifications = store.onAdmissionRejected(rejection => {
-  if (rejection.reason === 'native-preview-capacity') {
-    pushToast(t('workbench.nativePreview.capacityReached', { limit: rejection.limit }),
-      { tone: 'warn', duration: 9000 })
-  } else if (rejection.reason === 'browser-capacity') {
-    pushToast(t('workbench.browser.capacityReached', { limit: rejection.limit }),
-      { tone: 'warn', duration: 9000 })
-  }
+  pushToast(t('workbench.browser.capacityReached', { limit: rejection.limit }),
+    { tone: 'warn', duration: 9000 })
 })
 const sideChatLauncher = useSideChatLauncher()
 const sideChatHandles = new Map<string, SideChatLaunchHandle>()
@@ -1507,7 +1504,37 @@ async function prepareWorkbenchAnnotation(
     || String(workspace.headArtifact.sha256 || '') !== String(artifact.sha256 || '')) {
     throw artifactProductClientError('DOCUMENT_CHANGED')
   }
-  const opened = openResourceArtifact(prepared.resource, artifact, sessionKey, undefined, 'preview', item)
+  const currentItem = store.items.find(candidate => candidate.id === item.id)
+  const currentArtifact = artifactFromWorkbenchItem(currentItem || null)
+  const state = runtimeManager.getRenderState(item.id)
+  const entrypoint = String(state.workingFileEntrypoint || '')
+  const currentPage = previewPagePathFromUrl(String(state.currentUrl || ''), {
+    launch_url: String(state.previewLaunchUrl || ''),
+    entrypoint,
+    page_path: String(state.workingFileInitialPage || ''),
+  })
+  // Preparation still authorizes the operation and validates the current head.
+  // Re-entering selection on that same live page is not a Preview navigation:
+  // a new section request would replace its surface and discard in-page state.
+  const reuseCurrentPreview = !reselectAnnotationId
+    && currentItem?.hostKind === 'native-webcontents'
+    && !isFixedArtifactPreview(currentItem) && !preparedPreviewFromWorkbenchItem(currentItem)
+    && currentItem.payload.resourceIdentity === workbenchResourceKey(prepared.resource.resource)
+    && resourceSessionKey(currentItem) === sessionKey
+    && artifactWorkbenchPreviewKind(artifact) === 'html'
+    && currentArtifact?.documentId === artifact.documentId
+    && currentArtifact?.id === artifact.id
+    && currentArtifact?.revisionId === artifact.revisionId
+    && !!artifact.sha256 && currentArtifact?.sha256 === artifact.sha256
+    && !prepared.baselineUpdated && !prepared.materialized && prepared.resolution.status === 'current'
+    && state.previewWorkingDocumentId === artifact.documentId
+    && runtimeManager.isNativeSurfaceVisible(item.id)
+    && state.nativeSurfaceState === 'ready' && state.annotationAvailable === true
+    && state.workingFilePageUnknown !== true
+    && !!currentPage && currentPage === (artifact.previewPagePath || entrypoint)
+  const opened = reuseCurrentPreview
+    ? currentItem
+    : openResourceArtifact(prepared.resource, artifact, sessionKey, undefined, 'preview', item)
   if (!opened) return
   if (opened.id !== item.id && item.payload.historical !== true
     && (item.kind === 'file' || isFixedArtifactPreview(item))) store.closeItem(item.id)

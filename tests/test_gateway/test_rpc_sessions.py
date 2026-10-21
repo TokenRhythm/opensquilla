@@ -9565,6 +9565,10 @@ class TestSessionsMessagesSubscribe:
             epoch=7,
         )
         manager = FakeSessionManager([session])
+        manager._storage.get_project_workspace = AsyncMock(return_value=SimpleNamespace(
+            workspace_id="workspace-authoritative", display_name="Authoritative",
+            path="/registered/project", trusted_at=1, removed_at=None,
+        ))
         manager._storage._agent_tasks[key] = [
             SimpleNamespace(
                 task_id="task-hydrate",
@@ -9613,8 +9617,8 @@ class TestSessionsMessagesSubscribe:
         assert response.ok is True
         assert response.payload["key"] == key
         assert response.payload["workspaceId"] == "workspace-authoritative"
-        assert response.payload["projectWorkspace"] is None
-        assert response.payload["projectWorkspaceDeferred"] is True
+        assert response.payload["projectWorkspace"]["path"] == "/registered/project"
+        assert response.payload["projectWorkspaceDeferred"] is False
         assert response.payload["active_task"]["task_id"] == "task-hydrate"
         assert response.payload["active_task"]["cancel_requested"] is True
         assert (
@@ -9627,7 +9631,7 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["pendingUserInputs"] == pending
         assert response.payload["epoch"] == 7
         assert response.payload["hydration_complete"] is True
-        assert response.payload["deferred_fields"] == ["projectWorkspace"]
+        assert response.payload["deferred_fields"] == []
         assert subscriptions.get_message_subscribers(key) == set()
 
     @pytest.mark.asyncio

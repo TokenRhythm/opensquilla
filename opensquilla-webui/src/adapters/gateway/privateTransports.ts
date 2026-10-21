@@ -6,6 +6,7 @@ import type {
   TransportDeliveryReceipt,
   TransportInstalledReceipt,
   TransportLaneRetireReceipt,
+  TransportLaneOwner,
   TransportGapHandler,
   TransportRecoveryResult,
 } from './transportTypes'
@@ -37,9 +38,10 @@ export interface RpcTransport {
   acknowledgeDelivery?(receipt: TransportDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: TransportInstalledReceipt): Promise<void> | void
   retireLane?(receipt: TransportLaneRetireReceipt): Promise<void> | void
+  claimLaneOwner?(key: string, generation: number): TransportLaneOwner | undefined
   recoveryVersion?(key: string): string
   snapshotInstalled?(key: string, version: string): void
-  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
+  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number; replayAccepted?: boolean }): Promise<void>
   failProtocol?(generation: number): void
   readonly generation: number
 }
@@ -157,6 +159,7 @@ export function createPrivateGatewayTransports(
       acknowledgeDelivery: deliveryOwner.acknowledgeDelivery?.bind(deliveryOwner),
       resumeFlow: deliveryOwner.resumeFlow?.bind(deliveryOwner),
       retireLane: deliveryOwner.retireLane?.bind(deliveryOwner),
+      claimLaneOwner: (key, generation) => flow?.claimLaneOwner(key, generation),
       request(method, params, options) {
         return source.call(method, params, options)
       },

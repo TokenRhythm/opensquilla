@@ -64,9 +64,12 @@ function failureFields(error: unknown): Record<string, unknown> {
 
 export class SessionRecoveryDiagnostics {
   private windowStart = 0
-  private emitted = 0
   private suppressed = 0
-  private readonly signatures = new Set<string>()
+  // A chat owns its diagnostic allowance; visiting other chats must not consume
+  // it. A fixed window admits at most 64 scopes, each with 8 distinct records:
+  // at most 512 writes/signatures per fixed window, even if session IDs keep changing.
+  // Do not evict scopes within the window: eviction would reset their allowance.
+  private readonly scopes = new Map<string, Set<string>>()
 
   constructor(
     private readonly write: (message: string) => void = message => console.warn(message),
@@ -85,8 +88,7 @@ export class SessionRecoveryDiagnostics {
     const now = this.now()
     if (now - this.windowStart >= 60_000 || now < this.windowStart) {
       this.windowStart = now
-      this.emitted = 0
-      this.signatures.clear()
+      this.scopes.clear()
     }
     const detail: Record<string, unknown> = {
       phase: input.phase,
@@ -107,13 +109,25 @@ export class SessionRecoveryDiagnostics {
       detail.phase, detail.reason, detail.session_key_sha256, detail.connection_generation,
       detail.delivery_epoch, detail.global, detail.error_code, detail.error_kind,
     ])
-    // Bound both output and retained deduplication state during a hot loop.
-    if (this.emitted >= 8 || this.signatures.has(signature)) {
+    const scope = typeof detail.session_key_sha256 === 'string'
+      && /^[a-f0-9]{16}$/.test(detail.session_key_sha256)
+      ? detail.session_key_sha256 : 'global'
+    let signatures = this.scopes.get(scope)
+    if (!signatures) {
+      if (this.scopes.size >= 64) {
+        this.suppressed++
+        return
+      }
+      signatures = new Set<string>()
+      this.scopes.set(scope, signatures)
+    }
+    // Deduplication belongs to the hashed chat. suppressed_count remains the
+    // document-wide aggregate carried by the next successfully written record.
+    if (signatures.size >= 8 || signatures.has(signature)) {
       this.suppressed++
       return
     }
-    this.signatures.add(signature)
-    this.emitted++
+    signatures.add(signature)
     const suppressed = this.suppressed
     this.suppressed = 0
     this.write(SESSION_RECOVERY_LOG_PREFIX + JSON.stringify({

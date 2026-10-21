@@ -5,7 +5,7 @@ import { useRpcStore } from '@/stores/rpc'
 import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import type { GatewayAccess } from '@/modules/gatewayAccess'
 import { useProjectWorkspaces } from './useProjectWorkspaces'
-import { useActiveProjectWorkspace } from './useActiveProjectWorkspace'
+import { applySessionProjectWorkspaceMetadata, useActiveProjectWorkspace } from './useActiveProjectWorkspace'
 import chatViewSource from '@/views/ChatView.vue?raw'
 
 const PROJECT_METHODS = [
@@ -114,6 +114,254 @@ describe('useProjectWorkspaces', () => {
     expect(useRpcStore().state).toBe('disconnected')
   })
 
+  it('reuses only a checked exact directory in the current scope and invalidates it before fresh reads', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: false, taskCount: 1, pinned: false }
+    let finish!: (items: typeof workspace[]) => void
+    const list = vi.fn().mockResolvedValueOnce([workspace])
+      .mockImplementationOnce(() => new Promise<typeof workspace[]>(resolve => { finish = resolve }))
+    const access = { ...accessFromRpc(rpc), deliveryIdentity: 'owner-a' }
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, access)
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+    await projects.loadWorkspaces()
+    expect(projects.getValidatedWorkspace('a', '/a')?.workspace?.available).toBe(false)
+    expect(projects.getValidatedWorkspace('a', '/relocated')).toBeUndefined()
+    expect(projects.getValidatedWorkspace('removed', '/removed')).toEqual({ workspace: null })
+    const before = projects.validationGeneration.value
+    const pending = projects.loadWorkspaces({ fresh: true })
+    expect(projects.validationGeneration.value).toBeGreaterThan(before)
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+    await Promise.resolve()
+    finish([{ ...workspace, available: true }])
+    await pending
+    expect(projects.getValidatedWorkspace('a', '/a')?.workspace?.available).toBe(true)
+    access.deliveryIdentity = 'owner-b'
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+    expect(list).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not reuse a formerly healthy directory after a catalog error', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, taskCount: 1, pinned: false }
+    const list = vi.fn().mockResolvedValueOnce([workspace]).mockRejectedValueOnce(new Error('offline'))
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    await projects.loadWorkspaces()
+    await expect(projects.loadWorkspaces()).rejects.toThrow('offline')
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+  })
+
+  it('checks one physical workspace once across repeated visits to three chats, but checks again for a send', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, taskCount: 3, pinned: false }
+    const list = vi.fn().mockResolvedValue([workspace])
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    const active = useActiveProjectWorkspace()
+    active.setPresentationScope('gateway/connection')
+    const scope = effectScope()
+    scope.run(() => watch(projects.validationGeneration, () => active.invalidatePhysicalSnapshots(), { flush: 'sync' }))
+    const visit = async (key: string) => {
+      const generation = active.beginSessionVisit(key)
+      expect(active.sendBlockedReason.value).toBe('resolving')
+      const validated = projects.getValidatedWorkspace(workspace.id, workspace.path)
+      await applySessionProjectWorkspaceMetadata({ state: active, sessionKey: key, generation,
+        metadata: { epoch: 2, workspaceId: workspace.id, projectWorkspace: { ...workspace, removed: false } },
+        validatedWorkspace: validated ? validated.workspace ? { ...validated.workspace, removed: false } : null : undefined,
+        loadWorkspaces: async () => (await projects.loadWorkspaces()).map(item => ({ ...item, removed: false })),
+        isCurrent: () => true })
+      expect(active.status.value).toBe('ready')
+    }
+    for (let index = 0; index < 18; index++) await visit(`chat-${index % 3}`)
+    expect(list).toHaveBeenCalledOnce()
+    await projects.loadWorkspaces({ fresh: true })
+    await visit('chat-0')
+    expect(list).toHaveBeenCalledTimes(2)
+    scope.stop()
+  })
+
+  it.each(['removed', 'unavailable', 'relocated'] as const)('applies a background catalog %s discovered while a different project is active', async change => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, taskCount: 1, pinned: false }
+    const other = { ...workspace, id: 'b', name: 'B', path: '/b' }
+    const updated = change === 'removed' ? [other] : [other, { ...workspace,
+      available: change !== 'unavailable', path: change === 'relocated' ? '/new-a' : '/a' }]
+    const list = vi.fn().mockResolvedValueOnce([workspace, other]).mockResolvedValue(updated)
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    const active = useActiveProjectWorkspace()
+    active.setPresentationScope('gateway/connection')
+    const scope = effectScope()
+    scope.run(() => watch(projects.validationGeneration, () => active.invalidatePhysicalSnapshots(), { flush: 'sync' }))
+    await projects.loadWorkspaces()
+    for (const item of [workspace, other]) active.applySessionSnapshot(item.id, active.beginSessionVisit(item.id), {
+      workspaceId: item.id, projectWorkspace: { ...item, removed: false },
+    })
+    await projects.loadWorkspaces() // No fresh flag: a normal sidebar refresh.
+    const generation = active.beginSessionVisit('a')
+    const validated = projects.getValidatedWorkspace('a', '/a')
+    await applySessionProjectWorkspaceMetadata({ state: active, sessionKey: 'a', generation,
+      metadata: { workspaceId: 'a', projectWorkspace: { ...workspace, removed: false } },
+      validatedWorkspace: validated ? validated.workspace ? { ...validated.workspace, removed: false } : null : undefined,
+      loadWorkspaces: async () => (await projects.loadWorkspaces()).map(item => ({ ...item, removed: false })),
+      isCurrent: () => true })
+    expect(active.status.value).toBe(change === 'removed' ? 'removed' : change === 'unavailable' ? 'unavailable' : 'ready')
+    expect(active.activeWorkspace.value?.path).toBe(change === 'relocated' ? '/new-a' : '/a')
+    expect(list).toHaveBeenCalledTimes(change === 'relocated' ? 3 : 2)
+    scope.stop()
+  })
+
+  it('shares an in-flight read across consumers of the same catalog and scope', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    let finish!: (items: []) => void
+    const list = vi.fn(() => new Promise<[]>(resolve => { finish = resolve }))
+    const catalog = { ...catalogFromRpc(rpc), list }
+    const access = accessFromRpc(rpc)
+    const first = useProjectWorkspaces(catalog, access)
+    const second = useProjectWorkspaces(catalog, access)
+    const a = first.loadWorkspaces()
+    const b = second.loadWorkspaces()
+    await Promise.resolve()
+    expect(list).toHaveBeenCalledOnce()
+    finish([])
+    await expect(Promise.all([a, b])).resolves.toEqual([[], []])
+    await second.loadWorkspaces({ timeoutMs: 1 }).catch(() => {})
+    expect(list).toHaveBeenCalledTimes(2)
+  })
+
+  it('gives shared readers independent cancellation and aborts transport when all leave', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    let signal!: AbortSignal
+    const list = vi.fn((options?: { signal?: AbortSignal }) => {
+      signal = options!.signal!
+      return new Promise<[]>(() => {})
+    })
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    const a = new AbortController()
+    const b = new AbortController()
+    const first = projects.loadWorkspaces({ signal: a.signal }).catch(cause => cause)
+    const second = projects.loadWorkspaces({ signal: b.signal }).catch(cause => cause)
+    await Promise.resolve()
+    a.abort()
+    expect((await first).name).toBe('AbortError')
+    expect(signal.aborted).toBe(false)
+    expect(projects.isLoading.value).toBe(true)
+    b.abort()
+    expect((await second).name).toBe('AbortError')
+    expect(signal.aborted).toBe(true)
+    expect(projects.isLoading.value).toBe(false)
+  })
+
+  it('does not apply a short waiter deadline to another reader', async () => {
+    vi.useFakeTimers()
+    try {
+      const rpc = useRpcStore()
+      connectOwner(rpc)
+      let finish!: (items: []) => void
+      const list = vi.fn(() => new Promise<[]>(resolve => { finish = resolve }))
+      const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+      const short = projects.loadWorkspaces({ timeoutMs: 10 }).catch(cause => cause)
+      const long = projects.loadWorkspaces({ timeoutMs: 100 })
+      await vi.advanceTimersByTimeAsync(10)
+      expect((await short).name).toBe('TimeoutError')
+      expect(list).toHaveBeenCalledWith({ signal: expect.any(AbortSignal), timeoutMs: 0 })
+      expect(projects.isLoading.value).toBe(true)
+      finish([])
+      await expect(long).resolves.toEqual([])
+      expect(projects.error.value).toBeNull()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('preserves the original deadline when a waiter follows fresh preflight', async () => {
+    vi.useFakeTimers()
+    try {
+      const rpc = useRpcStore()
+      connectOwner(rpc)
+      const completions: Array<(items: []) => void> = []
+      const signals: AbortSignal[] = []
+      const list = vi.fn((options?: { signal?: AbortSignal }) => {
+        signals.push(options!.signal!)
+        return new Promise<[]>(resolve => { completions.push(resolve) })
+      })
+      const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+      const old = projects.loadWorkspaces({ timeoutMs: 10 }).catch(cause => cause)
+      await vi.advanceTimersByTimeAsync(5)
+      const fresh = projects.loadWorkspaces({ timeoutMs: 100, fresh: true })
+      await vi.advanceTimersByTimeAsync(5)
+      expect((await old).name).toBe('TimeoutError')
+      expect(signals[0]!.aborted).toBe(true)
+      expect(signals[1]!.aborted).toBe(false)
+      completions[1]!([])
+      await expect(fresh).resolves.toEqual([])
+    } finally { vi.useRealTimers() }
+  })
+
+  it('rejects departed-scope results even when transport ignores abort', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const epoch = ref(1)
+    const access = { ...accessFromRpc(rpc), get subscriptionEpoch() { return epoch.value } }
+    let finish!: (items: []) => void
+    const list = vi.fn(() => new Promise<[]>(resolve => { finish = resolve }))
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, access)
+    const pending = projects.loadWorkspaces().catch(cause => cause)
+    await Promise.resolve()
+    epoch.value += 1
+    finish([])
+    expect((await pending).name).toBe('AbortError')
+    expect(projects.hasLoaded.value).toBe(false)
+  })
+
+  it('retires reads from before a catalog mutation instead of resurrecting removed workspaces', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    let finish!: (items: never[]) => void
+    const list = vi.fn().mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+      .mockResolvedValue([])
+    const catalog = { ...catalogFromRpc(rpc), list, remove: vi.fn(async () => {}) }
+    const projects = useProjectWorkspaces(catalog, accessFromRpc(rpc))
+    const old = projects.loadWorkspaces().catch(cause => cause)
+    await Promise.resolve()
+    await projects.removeWorkspace('a')
+    finish([{ id: 'a', name: 'A', path: '/a', available: true } as never])
+    expect((await old).name).toBe('AbortError')
+    expect(projects.workspaces.value).toEqual([])
+    expect(list).toHaveBeenCalledTimes(2)
+  })
+
+  it('lets a metadata waiter follow a fresh preflight without flashing an error', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, removed: false, taskCount: 0, pinned: false }
+    let rejectOld!: (cause: Error) => void
+    let finishFresh!: (value: typeof workspace[]) => void
+    const list = vi.fn().mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOld = reject }))
+      .mockImplementationOnce(() => new Promise(resolve => { finishFresh = resolve }))
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    const active = useActiveProjectWorkspace()
+    active.applySessionSnapshot('session', active.beginSessionResolution('session'), { workspaceId: 'a', projectWorkspace: workspace })
+    const pending = applySessionProjectWorkspaceMetadata({
+      state: active, sessionKey: 'session', generation: active.beginSessionRefresh('session'),
+      metadata: { workspaceId: 'a', projectWorkspaceDeferred: true },
+      loadWorkspaces: async () => (await projects.loadWorkspaces()).map(item => ({ ...item, removed: false })),
+      isCurrent: () => true,
+    })
+    await Promise.resolve()
+    const preflight = projects.loadWorkspaces({ fresh: true })
+    rejectOld(new Error('retired read'))
+    await Promise.resolve()
+    expect(active.presentationStatus.value).toBe('ready')
+    expect(active.sendBlockedReason.value).toBe('resolving')
+    finishFresh([workspace])
+    await Promise.all([pending, preflight])
+    expect(active.status.value).toBe('ready')
+    expect(projects.error.value).toBeNull()
+    expect(list).toHaveBeenCalledTimes(2)
+  })
+
   it('retains an authoritative creation result when the following refresh fails', async () => {
     const rpc = useRpcStore()
     connectOwner(rpc)
@@ -160,7 +408,7 @@ describe('useProjectWorkspaces', () => {
     endpoint.value = 'ws://second.example/ws'
     await nextTick()
     finish({ workspace: { id: 'first', name: 'Demo', path: '/repo/Demo' } })
-    await pending
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
     expect(projects.workspaces.value).toEqual([])
     expect(projects.creationDefaults.value).toBeNull()
     expect(call).toHaveBeenCalledOnce()
@@ -321,8 +569,9 @@ describe('useProjectWorkspaces', () => {
     rpc.client = { call } as never
     const projects = useProjectWorkspaces(catalogFromRpc(rpc), accessFromRpc(rpc))
 
-    const first = projects.loadWorkspaces()
-    const second = projects.loadWorkspaces()
+    const first = projects.loadWorkspaces().catch((cause: unknown) => cause)
+    await Promise.resolve()
+    const second = projects.loadWorkspaces({ fresh: true })
     resolveSecond({
       workspaces: [{
         id: 'workspace-b',
@@ -344,9 +593,7 @@ describe('useProjectWorkspaces', () => {
         available: true,
       }],
     })
-    await expect(first).resolves.toEqual([
-      expect.objectContaining({ id: 'workspace-a' }),
-    ])
+    await expect(first).resolves.toEqual([expect.objectContaining({ id: 'workspace-b' })])
 
     expect(projects.workspaces.value.map(item => item.id)).toEqual(['workspace-b'])
     expect(projects.error.value).toBeNull()
@@ -367,9 +614,10 @@ describe('useProjectWorkspaces', () => {
     const projects = useProjectWorkspaces(catalogFromRpc(rpc), accessFromRpc(rpc))
 
     const first = projects.loadWorkspaces().catch((cause: unknown) => cause)
-    const second = projects.loadWorkspaces()
+    await Promise.resolve()
+    const second = projects.loadWorkspaces({ fresh: true })
     rejectFirst(new Error('A navigation was aborted'))
-    await expect(first).resolves.toBeInstanceOf(Error)
+    await Promise.resolve()
 
     expect(projects.isLoading.value).toBe(true)
     expect(projects.error.value).toBeNull()
@@ -384,6 +632,7 @@ describe('useProjectWorkspaces', () => {
       }],
     })
     await second
+    await expect(first).resolves.toEqual([expect.objectContaining({ id: 'workspace-b' })])
     expect(projects.workspaces.value.map(item => item.id)).toEqual(['workspace-b'])
     expect(projects.error.value).toBeNull()
     expect(projects.isLoading.value).toBe(false)
@@ -499,6 +748,46 @@ describe('useProjectWorkspaces', () => {
 
     expect(call).not.toHaveBeenCalled()
     expect(projects.hasLoaded.value).toBe(false)
+  })
+
+  it('rejects a created workspace if the owner changes during its follow-up read', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const endpoint = ref('ws://first.example/ws')
+    const access = { ...accessFromRpc(rpc), loadConnectionEndpoint: () => endpoint.value }
+    const workspace = { id: 'shared-id', name: 'First owner', path: '/first', available: true, taskCount: 0 }
+    let finish!: (value: unknown) => void
+    const call = vi.fn().mockResolvedValueOnce({ workspace })
+      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    rpc.client = { call } as never
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc), access)
+    const pending = projects.createWorkspace('/first', 'First owner')
+    const outcome = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    endpoint.value = 'ws://second.example/ws'
+    finish({ workspaces: [workspace] })
+    await outcome
+    expect(projects.workspaces.value).toEqual([])
+  })
+
+  it('does not remove a same-id workspace from a new owner after its old follow-up read', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const endpoint = ref('ws://first.example/ws')
+    const access = { ...accessFromRpc(rpc), loadConnectionEndpoint: () => endpoint.value }
+    let finish!: (value: unknown) => void
+    const call = vi.fn().mockResolvedValueOnce({ workspaceId: 'shared-id' })
+      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    rpc.client = { call } as never
+    const projects = useProjectWorkspaces(catalogFromRpc(rpc), access)
+    const pending = projects.removeWorkspace('shared-id')
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    endpoint.value = 'ws://second.example/ws'
+    const current = { id: 'shared-id', name: 'Second owner', path: '/second', available: true, taskCount: 0, pinned: false }
+    projects.workspaces.value = [current]
+    finish({ workspaces: [] })
+    await pending
+    expect(projects.workspaces.value).toEqual([current])
   })
 
   it('clears owner workspace state when the principal loses owner capability', async () => {

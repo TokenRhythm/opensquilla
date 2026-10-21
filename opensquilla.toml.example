@@ -57,6 +57,17 @@
 # debug = false
 # diagnostics_enabled = false
 
+# Optional per-IP HTTP request-count policy. Off by default so Desktop and
+# browser tabs sharing an IP do not exhaust one another's normal UI requests.
+# Authentication failure throttling and endpoint resource limits are separate.
+# Existing enabled=true settings remain effective after upgrade.
+[rate_limit]
+enabled = false
+# max_requests = 100
+# window_seconds = 60
+# content_max_requests = 1200
+# content_window_seconds = 60
+
 [control_ui]
 # Vue is the only Control UI. The optional frontend key is retained temporarily
 # for config compatibility; historical "legacy" values are deprecated and are

@@ -606,7 +606,7 @@
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
       :project-workspace="activeWorkspace"
-      :project-workspace-status="activeWorkspaceStatus"
+      :project-workspace-status="activeWorkspacePresentationStatus"
       :project-binding-busy="projectBindingBusy || workbenchSessionPreparing || sessionHasActiveWork || goalBusy || planModeBusy || modelRoutingSettingsBusy"
       :project-status-message="activeProjectStatusMessage"
       :prompt-annotations="activePromptAnnotations"
@@ -1351,6 +1351,11 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const activeProjectWorkspace = useActiveProjectWorkspace()
+watch(() => gatewayAccess.deliveryIdentity && gatewayAccess.canManageProjectWorkspaces ? JSON.stringify([
+  gatewayAccess.deliveryIdentity, gatewayAccess.loadConnectionEndpoint(), gatewayAccess.subscriptionEpoch,
+]) : null, scope => activeProjectWorkspace.setPresentationScope(scope), { immediate: true, flush: 'sync' })
+watch(projectWorkspaces.validationGeneration,
+  () => activeProjectWorkspace.invalidatePhysicalSnapshots(), { flush: 'sync' })
 let workbenchMetadataScope: string | null = null
 let workbenchIdentityRevision = 0
 const draftProjectHydration = createDraftProjectHydrationGuard()
@@ -1359,6 +1364,7 @@ const {
   boundWorkspaceId,
   activeWorkspace,
   status: activeWorkspaceStatus,
+  presentationStatus: activeWorkspacePresentationStatus,
   sendBlockedReason: activeWorkspaceSendBlockedReason,
 } = activeProjectWorkspace
 const projectPickerOpen = ref(false)
@@ -2959,7 +2965,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSnapshotInstalled: () => {
     if (!rpcEventHandlers.finishRecovery()) {
-      throw new SessionReadFailure('busy', 'Session recovery buffer overflow; retrying the latest snapshot.', true)
+      throw new SessionReadFailure('busy', 'Session projection could not consume the buffered events; retrying the latest snapshot.', true)
     }
   },
   onAuthoritativeIdle: () => {
@@ -2993,7 +2999,8 @@ const chatSessionSubscription = useChatSessionSubscription({
     const preserveCurrent = workbenchMaterializedSessionKey === key
     workbenchMaterializedSessionKey = ''
     if (refresh && !preserveCurrent) return activeProjectWorkspace.beginSessionRefresh(key)
-    return activeProjectWorkspace.beginSessionResolution(key, preserveCurrent)
+    return preserveCurrent ? activeProjectWorkspace.beginSessionResolution(key, true)
+      : activeProjectWorkspace.beginSessionVisit(key)
   },
   onSessionMetadata: (key, generation, metadata) => {
     if (generation < 0) return
@@ -3010,18 +3017,24 @@ const chatSessionSubscription = useChatSessionSubscription({
     // Subscription installs this metadata's epoch in onSnapshot immediately
     // after this callback. Validate/project after that installation so a cold
     // session with a nonzero epoch cannot invalidate its own workspace read.
-    void Promise.resolve().then(() => applySessionProjectWorkspaceMetadata({
-      state: activeProjectWorkspace, sessionKey: key, generation,
-      metadata: {
-        workspaceId: metadata.workspaceId ?? undefined,
-        projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
-        projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
-      },
-      cachedWorkspace: cached ? activeSnapshot(cached) : null,
-      loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
-        .map(workspace => activeSnapshot(workspace)),
-      isCurrent,
-    })).then(() => {
+    void Promise.resolve().then(() => {
+      const registered = projectWorkspaceFromSessionRead(metadata.projectWorkspace)
+      const validated = registered ? projectWorkspaces.getValidatedWorkspace(registered.id, registered.path) : undefined
+      return applySessionProjectWorkspaceMetadata({
+        state: activeProjectWorkspace, sessionKey: key, generation,
+        metadata: {
+          workspaceId: metadata.workspaceId ?? undefined,
+          projectWorkspace: registered,
+          projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
+          epoch: sessionEpoch,
+        },
+        cachedWorkspace: cached ? activeSnapshot(cached) : null,
+        validatedWorkspace: validated ? validated.workspace ? activeSnapshot(validated.workspace) : null : undefined,
+        loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
+          .map(workspace => activeSnapshot(workspace)),
+        isCurrent,
+      })
+    }).then(() => {
       // The first snapshot establishes the session epoch after the read began.
       // Remember the installed context, not the pre-bootstrap unknown epoch.
       if (isCurrent() && activeWorkspaceStatus.value !== 'resolving' && activeWorkspaceStatus.value !== 'error') {
@@ -3449,7 +3462,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   usageModel,
   createSessionKey,
   persistSession,
-  beginSessionResolution: activeProjectWorkspace.beginSessionResolution,
+  beginSessionResolution: activeProjectWorkspace.beginSessionVisit,
   cancelSessionBootstrap: (unsubscribe = true) => {
     // Retire draft-project work on the old socket before the next session's
     // coordinator can start, so its abort/reconnect cannot tear down B.
@@ -5178,8 +5191,8 @@ const modelImageSendBlockedMessage = computed(() => {
     : ''
 })
 
-const activeProjectStatusMessage = computed(() => {
-  switch (activeWorkspaceStatus.value) {
+function projectStatusMessage(status: string): string {
+  switch (status) {
     case 'resolving':
       return t('workspaces.activeProjectResolving')
     case 'unavailable':
@@ -5192,14 +5205,18 @@ const activeProjectStatusMessage = computed(() => {
     default:
       return ''
   }
-})
+}
+
+const activeProjectStatusMessage = computed(() => projectStatusMessage(activeWorkspacePresentationStatus.value))
 
 const activeProjectComposerBlockMessage = computed(() => {
   switch (activeWorkspaceStatus.value) {
     case 'resolving':
     case 'unavailable':
     case 'removed':
-      return activeProjectStatusMessage.value
+      // The stable presentation can be ready while session metadata is being
+      // checked. Admission must use operation status, never its visible copy.
+      return projectStatusMessage(activeWorkspaceStatus.value)
     default:
       return ''
   }
@@ -7549,8 +7566,10 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     const workspaces = await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
+      fresh: true,
     })
-    if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
+    if (controller.signal.aborted || activeProjectValidationController !== controller
+      || sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
     }
     const workspace = workspaces.find(item => item.id === workspaceId) || null
@@ -7565,6 +7584,9 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     ) {
       activeProjectWorkspace.failWorkspaceRefresh()
     }
+    // A cancelled/superseded read must not turn a retained ready presentation
+    // into a successful preflight result for the departed operation.
+    return controller.signal.aborted ? 'resolving' : 'error'
   } finally {
     if (activeProjectValidationController === controller) {
       activeProjectValidationController = null

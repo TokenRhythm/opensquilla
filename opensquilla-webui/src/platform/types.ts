@@ -416,6 +416,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  pickerEpoch?: number
   navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
@@ -438,6 +439,7 @@ export type NativeWorkbenchSurfaceEventType =
   | 'browser-opened'
   | 'browser-closed'
   | 'annotation-selected'
+  | 'annotation-picker-state'
   | 'annotation-draft-change'
   | 'annotation-submit'
   | 'annotation-record-current'
@@ -473,6 +475,8 @@ export interface NativeWorkbenchSurfaceEvent {
     action?: string
     code?: string
     surfaceInstanceId?: string
+    enabled?: boolean
+    pickerEpoch?: number
     message?: string
     path?: string
     reason?: string

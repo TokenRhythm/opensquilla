@@ -2,7 +2,7 @@ import { RpcClient, RpcTimeoutError } from '@/lib/rpc'
 import { createConversationEventHub } from '@/modules/conversationEventHub'
 import { createConversationEventTransport } from './conversationEventTransport'
 import { TransportFlowV4 } from './transportFlowV4'
-import type { TransportEventHandler, TransportLaneRetireReceipt } from './transportTypes'
+import type { TransportEventHandler, TransportLaneOwner, TransportLaneRetireReceipt } from './transportTypes'
 import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
@@ -463,7 +463,7 @@ describe('read-v2 consumption covered by an installed snapshot', () => {
       // The caller applies the returned snapshot before confirming its install.
       await live.confirmInstalled!()
       expect(h.waitForConsumption.mock.calls).toEqual([
-        ['alpha', { streamGeneration: 'stream-1', fromSeq: 10, toSeq: 10 }],
+        ['alpha', { streamGeneration: 'stream-1', fromSeq: 10, toSeq: 10, replayAccepted: true }],
       ])
       expect(h.calls.filter(call => call.method === READ_INSTALL_V2).slice(-1)[0]?.params)
         .toMatchObject({ consumed_through_seq: 10, ack_through_seq: 10 })
@@ -1982,6 +1982,106 @@ describe('v4 SessionReadPort Adapter', () => {
       retire_token: 'retire-token',
       final_published_id: 7,
     })
+  })
+
+  it('claims at physical subscribe and drains before sending unsubscribe, keeping the old fence owner', async () => {
+    const h = makeHarness()
+    const sequence: string[] = []
+    const firstOwner: TransportLaneOwner = {
+      beginRetirement: vi.fn(() => { sequence.push('begin') }),
+      completeRetirement: vi.fn(async () => {}),
+      failRetirement: vi.fn(),
+    }
+    const nextOwner: TransportLaneOwner = {
+      beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn(),
+    }
+    const claimLaneOwner = vi.fn().mockReturnValueOnce(firstOwner).mockReturnValue(nextOwner)
+    const original = h.requestMock.getMockImplementation()!
+    h.requestMock.mockImplementation((method, params, options) => {
+      if (method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD) sequence.push('unsubscribe')
+      return original(method, params, options)
+    })
+    const port = createV4SessionReadPort({ ...h.rpc, claimLaneOwner })
+    const prior = port.open(openRequest())
+    await prior.live
+    expect(claimLaneOwner).toHaveBeenCalledExactlyOnceWith('alpha', 7)
+    const oldReply = deferred<unknown>()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, oldReply.promise)
+    await prior.close()
+    expect(sequence).toEqual(['begin', 'unsubscribe'])
+    expect(firstOwner.completeRetirement).not.toHaveBeenCalled()
+    const successor = port.open(openRequest())
+    await successor.live
+    const receipt = { connection_epoch: 'connection', subscription_epoch: 'old-alpha',
+      retire_token: 'old-token', final_published_id: 3 }
+    oldReply.resolve({ lane_retire: receipt })
+    await flushAsyncWork()
+    expect(firstOwner.completeRetirement).toHaveBeenCalledExactlyOnceWith(receipt)
+    expect(nextOwner.beginRetirement).not.toHaveBeenCalled()
+    expect(nextOwner.completeRetirement).not.toHaveBeenCalled()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, null)
+    await successor.close()
+  })
+
+  it('never begins retirement from a superseded local read owner', async () => {
+    const h = makeHarness()
+    const firstOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const nextOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const claimLaneOwner = vi.fn().mockReturnValueOnce(firstOwner).mockReturnValue(nextOwner)
+    const port = createV4SessionReadPort({ ...h.rpc, claimLaneOwner })
+    const prior = port.open(openRequest())
+    await prior.live
+    const successor = port.open(openRequest())
+    await successor.live
+    await prior.close()
+    expect(firstOwner.beginRetirement).not.toHaveBeenCalled()
+    expect(nextOwner.beginRetirement).not.toHaveBeenCalled()
+    expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    await successor.close()
+    expect(nextOwner.beginRetirement).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels the local drain when a delayed unsubscribe fails after send admission', async () => {
+    const h = makeHarness()
+    const laneOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const port = createV4SessionReadPort({ ...h.rpc, claimLaneOwner: () => laneOwner })
+    const lease = port.open(openRequest())
+    await lease.live
+    const reply = deferred<unknown>()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, reply.promise)
+    await lease.close()
+    expect(laneOwner.beginRetirement).toHaveBeenCalledTimes(1)
+    expect(laneOwner.failRetirement).not.toHaveBeenCalled()
+    reply.reject(new Error('Unsubscribe failed'))
+    await flushAsyncWork()
+    expect(laneOwner.failRetirement).toHaveBeenCalledTimes(1)
+    expect(laneOwner.completeRetirement).not.toHaveBeenCalled()
+  })
+
+  it('retains one owner for same-generation admission retries and replaces it after reconnect', async () => {
+    const h = makeHarness()
+    const firstOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const nextOwner = { beginRetirement: vi.fn(), completeRetirement: vi.fn(async () => {}), failRetirement: vi.fn() }
+    const claimLaneOwner = vi.fn().mockReturnValueOnce(firstOwner).mockReturnValue(nextOwner)
+    const port = createV4SessionReadPort({ ...h.rpc, get generation() { return h.rpc.generation }, claimLaneOwner })
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, new Error('Subscribe reply lost'))
+    const prior = port.open(openRequest())
+    await Promise.all([
+      expect(prior.live).rejects.toThrow('Subscribe reply lost'),
+      expect(prior.metadata).rejects.toThrow('Subscribe reply lost'),
+    ])
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult())
+    await prior.reconcile()
+    expect(claimLaneOwner).toHaveBeenCalledExactlyOnceWith('alpha', 7)
+    h.setGeneration(8)
+    await expect(prior.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
+    const successor = port.open(openRequest())
+    await successor.live
+    expect(claimLaneOwner.mock.calls).toEqual([['alpha', 7], ['alpha', 8]])
+    await prior.close()
+    expect(firstOwner.beginRetirement).not.toHaveBeenCalled()
+    await successor.close()
+    expect(nextOwner.beginRetirement).toHaveBeenCalledTimes(1)
   })
 
   it('keeps a late malformed unsubscribe reply local after its successor has subscribed', async () => {

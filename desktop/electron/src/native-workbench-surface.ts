@@ -647,6 +647,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  pickerEpoch?: number
   navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
@@ -1626,7 +1627,8 @@ export class NativeWorkbenchSurfaceManager {
         }
       }
       this.auditAnnotationPicker(record, 'armed', 'succeeded', 'completed', startedAt)
-      return { ok: true }
+      this.emitAnnotationPickerState(record, 'armed')
+      return { ok: true, pickerEpoch }
     } catch (error) {
       if (record.annotationPickerEpoch === pickerEpoch) {
         record.annotationPickerActive = false
@@ -1682,7 +1684,7 @@ export class NativeWorkbenchSurfaceManager {
           message: cleanupFailure,
         }
       }
-      return { ok: true }
+      return { ok: true, pickerEpoch: record.annotationPickerEpoch }
     }
     if (!record.cdpReady || !record.contents.debugger.isAttached()) {
       return {
@@ -1947,7 +1949,7 @@ export class NativeWorkbenchSurfaceManager {
       record.annotationFallbackActive = false
       this.clearAnnotationCandidate(record)
       this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
-      return { ok: true }
+      return { ok: true, pickerEpoch }
     }
     if (overlay) this.closeAnnotationOverlayBinding(overlay, false)
     record.annotationFallbackActive = false
@@ -3245,7 +3247,8 @@ export class NativeWorkbenchSurfaceManager {
       }
       const candidate = parseNativeWorkbenchAnnotationSelection(raw)
       if (
-        generation !== record.annotationDocumentGeneration
+        record.annotationPickerEpoch !== pickerEpoch
+        || generation !== record.annotationDocumentGeneration
         || !this.isActiveAnnotationRecord(record)
       ) throw new Error('The selected preview element changed during inspection.')
       const selection: NativeWorkbenchAnnotationSelection = {
@@ -3332,7 +3335,7 @@ export class NativeWorkbenchSurfaceManager {
     // intentionally do not wait for this async routine before tearing down the
     // child renderer, so a prior timer must not outlive the surface generation.
     const startedAt = Date.now()
-    record.annotationPickerEpoch += 1
+    const pickerEpoch = ++record.annotationPickerEpoch
     const inspectModeMayBeActive = record.annotationPickerActive
     if (record.annotationFocusTimer) clearTimeout(record.annotationFocusTimer)
     record.annotationFocusTimer = null
@@ -3356,11 +3359,18 @@ export class NativeWorkbenchSurfaceManager {
     )
     if (
       cleanupFailure
+      && record.annotationPickerEpoch === pickerEpoch
       && !record.disposed
       && !record.crashed
       && !record.contents.isDestroyed()
       && record.contents.debugger.isAttached()
     ) record.annotationPickerActive = true
+    // Cancellation is picker state even when no node/editor has been selected.
+    // Publish only the still-current transition: a delayed hide/navigation
+    // cleanup must never disable a picker which the user has since rearmed.
+    if (record.annotationPickerEpoch === pickerEpoch) {
+      this.emitAnnotationPickerState(record, cleanupFailure ? 'reset-failed' : reason)
+    }
     this.auditAnnotationPicker(
       record,
       cleanupFailure ? 'failed' : 'cancelled',
@@ -3369,6 +3379,17 @@ export class NativeWorkbenchSurfaceManager {
       startedAt,
     )
     return cleanupFailure
+  }
+
+  private emitAnnotationPickerState(record: NativeWorkbenchSurfaceRecord, reason: string): void {
+    if (record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+      && record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4) return
+    this.emit(record, 'annotation-picker-state', {
+      enabled: record.annotationPickerActive,
+      reason,
+      pickerEpoch: record.annotationPickerEpoch,
+      surfaceInstanceId: record.surfaceInstanceId,
+    })
   }
 
   private async clearAnnotationInspectState(

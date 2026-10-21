@@ -661,14 +661,18 @@ def test_delete_all_helper_refuses_a_new_unconfirmed_scope_after_parent_exit(
 @pytest.mark.parametrize(
     ("scenario", "inspections", "waits", "stable_code"),
     [
-        ("already_ready", 1, 0, "cleanup_complete"),
-        ("settles", 2, 1, "cleanup_complete"),
+        ("already_ready", 2, 1, "cleanup_complete"),
+        ("settles", 3, 2, "cleanup_complete"),
+        ("approved_content_settles", 3, 2, "cleanup_complete"),
+        ("approved_content_settles_on_fourth_sample", 5, 4, "cleanup_complete"),
+        ("approved_content_settles_on_fifth_sample", 5, 4, "cleanup_inventory_stale"),
+        ("approved_content_keeps_changing", 5, 4, "cleanup_inventory_stale"),
         ("persistent", 5, 4, "cleanup_scope_changed"),
         ("becomes_unsafe", 2, 1, "cleanup_user_data_unsafe"),
-        ("changes_before_apply", 2, 1, "cleanup_inventory_stale"),
+        ("changes_before_apply", 3, 2, "cleanup_inventory_stale"),
     ],
 )
-def test_post_exit_cleanup_waits_only_for_unapproved_scope_to_disappear(
+def test_post_exit_cleanup_requires_stable_approved_inventory(
     tmp_path: Path,
     monkeypatch,
     scenario: str,
@@ -687,7 +691,10 @@ def test_post_exit_cleanup_waits_only_for_unapproved_scope_to_disappear(
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "lock-state"))
     approved = cleanup_inspect(user_data, mode="delete-all-user-data", profile_kind="primary")
     unapproved = user_data / "fa0587d5-7949-4b2f-9745-941635ecbe04.tmp"
-    if scenario != "already_ready":
+    initially_unapproved = scenario in {
+        "settles", "persistent", "becomes_unsafe", "changes_before_apply",
+    }
+    if initially_unapproved:
         unapproved.write_text("new preferences\n", encoding="utf-8")
 
     reports = []
@@ -705,8 +712,18 @@ def test_post_exit_cleanup_waits_only_for_unapproved_scope_to_disappear(
     def settle(delay):
         delays.append(delay)
         assert home.is_dir() and credential.is_file(), "waiting cannot delete approved data"
-        if scenario in {"settles", "changes_before_apply"}:
+        if scenario in {"settles", "changes_before_apply"} and unapproved.exists():
             unapproved.replace(preferences)
+        if (
+            scenario == "approved_content_settles" and len(delays) == 1
+        ) or (
+            scenario == "approved_content_settles_on_fourth_sample" and len(delays) <= 3
+        ) or scenario in {
+            "approved_content_settles_on_fifth_sample", "approved_content_keeps_changing",
+        }:
+            # Normal shutdown can update a previously approved file without
+            # adding any scope. Each size change must invalidate the inventory.
+            preferences.write_text("final preferences\n" * len(delays), encoding="utf-8")
 
     def apply(*args, **kwargs):
         apply_calls.append(kwargs)
@@ -734,15 +751,31 @@ def test_post_exit_cleanup_waits_only_for_unapproved_scope_to_disappear(
     assert json.loads(result.stdout)["stable_code"] == stable_code
     assert len(reports) == inspections
     assert delays == [0.1] * waits
-    should_apply = scenario in {"already_ready", "settles", "changes_before_apply"}
+    should_apply = scenario in {
+        "already_ready", "settles", "approved_content_settles", "changes_before_apply",
+        "approved_content_settles_on_fourth_sample",
+    }
     assert len(apply_calls) == int(should_apply)
     if should_apply:
         assert apply_calls[0]["transaction_id"] == reports[-1].transaction_id
         assert apply_calls[0]["expected_revision"] == reports[-1].revision
-    if scenario == "settles":
+    if scenario in {
+        "settles", "approved_content_settles", "approved_content_settles_on_fourth_sample",
+    }:
         assert reports[-1].revision != approved.revision
+        assert reports[-1].revision == reports[-2].revision
+    if scenario == "approved_content_settles_on_fourth_sample":
+        assert len({report.revision for report in reports[:-1]}) == 4
+    if scenario == "approved_content_settles_on_fifth_sample":
+        assert reports[-1].revision != reports[-2].revision
+        assert len({report.revision for report in reports}) == 5
+    if scenario.startswith("approved_content_"):
+        assert all(report.scope_fingerprint == approved.scope_fingerprint for report in reports)
+    if scenario == "approved_content_keeps_changing":
+        assert len({report.revision for report in reports}) == len(reports)
     if succeeded:
         assert not home.exists() and not credential.exists() and not preferences.exists()
     else:
         assert home.is_dir() and credential.is_file() and preferences.is_file()
-        assert unapproved.is_file(), "an unapproved file must never be deleted"
+        if initially_unapproved:
+            assert unapproved.is_file(), "an unapproved file must never be deleted"

@@ -2421,16 +2421,19 @@ async def test_atomic_direct_send_enters_registry_admission_before_accept_turn(
         registry = get_agent_task_registry()
         admission_attempted = asyncio.Event()
         accept_called = asyncio.Event()
+        phases: list[str] = []
         original_admission = registry.admission
         original_accept = stack.storage.accept_turn
 
         @asynccontextmanager
         async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            phases.append("admission")
             admission_attempted.set()
             async with original_admission(session_key):
                 yield
 
         async def observed_accept(*args: Any, **kwargs: Any) -> Any:
+            phases.append("accept")
             accept_called.set()
             return await original_accept(*args, **kwargs)
 
@@ -2441,38 +2444,53 @@ async def test_atomic_direct_send_enters_registry_admission_before_accept_turn(
             asyncio.Lock(),
         )
 
-        async with admission_lock:
-            sending = asyncio.create_task(
-                get_dispatcher().dispatch(
-                    "rpc-direct-admission",
-                    "sessions.send",
-                    {
-                        "key": SESSION_KEY,
-                        "message": "direct accepted turn",
-                        "clientRequestId": "direct-admission-request",
-                    },
-                    stack.context,
+        requests: list[asyncio.Task[Any]] = []
+        try:
+            async with admission_lock:
+                sending = asyncio.create_task(
+                    get_dispatcher().dispatch(
+                        "rpc-direct-admission",
+                        "sessions.send",
+                        {
+                            "key": SESSION_KEY,
+                            "message": "direct accepted turn",
+                            "clientRequestId": "direct-admission-request",
+                        },
+                        stack.context,
+                    )
                 )
-            )
-            admission_wait = asyncio.create_task(admission_attempted.wait())
-            accept_wait = asyncio.create_task(accept_called.wait())
-            done, _pending = await asyncio.wait(
-                {admission_wait, accept_wait},
-                timeout=2.0,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            assert admission_wait in done
-            assert accept_wait not in done
-            assert sending.done() is False
+                admission_wait = asyncio.create_task(admission_attempted.wait())
+                accept_wait = asyncio.create_task(accept_called.wait())
+                requests.extend((sending, admission_wait, accept_wait))
+                done, _pending = await asyncio.wait(
+                    {admission_wait, accept_wait, sending},
+                    timeout=_DURABLE_PHASE_GUARD_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Bootstrap I/O may take time; acceptance must still remain
+                # behind the held admission fence regardless of that latency.
+                assert admission_wait in done
+                assert accept_wait not in done
+                assert not accept_called.is_set()
+                assert sending.done() is False
 
-        response = await asyncio.wait_for(sending, timeout=2.0)
-        task = registry.get(SESSION_KEY)
-        if task is not None:
-            await task
-        admission_wait.cancel()
-        accept_wait.cancel()
+            response = await asyncio.wait_for(sending, timeout=_DURABLE_PHASE_GUARD_SECONDS)
+            task = registry.get(SESSION_KEY)
+            if task is not None:
+                await asyncio.wait_for(task, timeout=_DURABLE_PHASE_GUARD_SECONDS)
+        finally:
+            for request in requests:
+                if not request.done():
+                    request.cancel()
+            await asyncio.gather(*requests, return_exceptions=True)
+            task = registry.get(SESSION_KEY)
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
         assert response.ok is True
+        assert phases == ["admission", "accept"]
 
 
 @pytest.mark.asyncio

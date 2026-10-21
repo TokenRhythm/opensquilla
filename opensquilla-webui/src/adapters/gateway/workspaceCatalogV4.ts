@@ -143,6 +143,10 @@ export function createV4WorkspaceCatalog(transport: WorkspaceTransport): Workspa
         {},
         options?.signal,
         validateWorkspacesListResult,
+        options?.timeoutMs === undefined ? optionsFor(options?.signal) : {
+          ...optionsFor(options?.signal), timeoutMs: options.timeoutMs,
+          timeoutAction: 'reject', abortAction: 'reject',
+        },
       )
       const defaults = result.creationDefaults
       creationDefaults = defaults ? {

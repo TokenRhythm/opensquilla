@@ -274,6 +274,7 @@ export class RendererConsoleLogLimiter {
   private windowStartedAt: number | null = null
   private emitted = 0
   private suppressed = 0
+  private readonly recovery = new RendererRecoveryLogLimiter()
 
   constructor(options: RendererConsoleLogLimiterOptions = {}) {
     this.maxEntries = Math.max(1, options.maxEntries ?? 10)
@@ -281,9 +282,10 @@ export class RendererConsoleLogLimiter {
   }
 
   accept(entry: RendererLogEntry, now = Date.now()): RendererLogEntry[] {
+    if (entry.event === 'session_recovery') return this.recovery.accept(entry, now)
     const output: RendererLogEntry[] = []
     if (this.windowStartedAt === null || now - this.windowStartedAt >= this.windowMs) {
-      output.push(...this.flush())
+      output.push(...this.flushConsole())
       this.windowStartedAt = now
       this.emitted = 0
     }
@@ -297,12 +299,60 @@ export class RendererConsoleLogLimiter {
   }
 
   flush(): RendererLogEntry[] {
+    return [...this.flushConsole(), ...this.recovery.flush()]
+  }
+
+  private flushConsole(): RendererLogEntry[] {
     if (this.suppressed === 0) return []
     const count = this.suppressed
     this.suppressed = 0
     return [{
       event: 'renderer_console_suppressed',
-      detail: { count, window_ms: this.windowMs },
+      detail: { count, window_ms: this.windowMs, channel: 'renderer_console' },
+    }]
+  }
+}
+
+/** Recovery warnings must never spend the renderer-error write allowance. */
+class RendererRecoveryLogLimiter {
+  private windowStartedAt: number | null = null
+  private readonly scopes = new Map<string, number>()
+  private suppressed = 0
+
+  accept(entry: RendererLogEntry, now: number): RendererLogEntry[] {
+    const output: RendererLogEntry[] = []
+    if (this.windowStartedAt === null || now - this.windowStartedAt >= 60_000
+      || now < this.windowStartedAt) {
+      output.push(...this.flush())
+      this.windowStartedAt = now
+      this.scopes.clear()
+    }
+    // Only the validated, content-free identity owns a scope. Missing or
+    // malformed identities share one global allowance rather than creating keys.
+    const hash = entry.detail.session_key_sha256
+    const scope = typeof hash === 'string' && /^[a-f0-9]{16}$/.test(hash) ? hash : 'global'
+    const emitted = this.scopes.get(scope)
+    // Match the frontend's 8 records per chat and 64 scopes per fixed window.
+    // This bounds retained state and writes to 512 records/minute, independent
+    // of document reloads. Never evict a scope to admit another in that window.
+    if ((emitted === undefined && this.scopes.size >= 64) || (emitted ?? 0) >= 8) {
+      this.suppressed++
+      return output
+    }
+    this.scopes.set(scope, (emitted ?? 0) + 1)
+    output.push(entry)
+    return output
+  }
+
+  flush(): RendererLogEntry[] {
+    if (this.suppressed === 0) return []
+    const count = this.suppressed
+    this.suppressed = 0
+    // Keep the existing failure signal: losing a recovery record is still loss
+    // of evidence, not a renderer error and not a successful acceptance run.
+    return [{
+      event: 'renderer_console_suppressed',
+      detail: { count, window_ms: 60_000, channel: 'session_recovery' },
     }]
   }
 }

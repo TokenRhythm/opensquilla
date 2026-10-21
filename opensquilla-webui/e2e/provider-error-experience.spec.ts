@@ -12,7 +12,7 @@ const errorId = 'abcdef01'
 const privateMessage = 'PRIVATE_PROVIDER_BODY HTTP 403/404 upstream traceback (ref: abcdef01)'
 const partialAnswer = 'Partial answer'
 type Locale = 'en' | 'zh-Hans'
-type Delivery = 'live' | 'task-only' | 'history' | 'timeout-first' | 'timeout-last' | 'conflict'
+type Delivery = 'live' | 'task-only' | 'history' | 'timeout-first' | 'timeout-last' | 'conflict' | 'done-before-error'
 type Outcome = Record<string, unknown>
 
 // Literal expectations deliberately do not import the product's dictionaries:
@@ -168,8 +168,11 @@ async function prepareGateway(page: Page, options: {
       })
     },
     fail() {
-      durable = true
+      // The done-before-error case must first prove live failure rendering;
+      // history cannot repair a dropped terminal until the test releases it.
+      durable = delivery !== 'done-before-error'
       if (partial) emit!('session.event.text_delta', { text: partialAnswer })
+      if (delivery === 'done-before-error') emit!('session.event.done', { final_text: partialAnswer })
       const failure = {
         code: outcome.error_class, message: privateMessage, terminal_message: privateMessage,
         turn_outcome: outcome, ...(outcome.error_id ? { error_id: outcome.error_id } : {}),
@@ -184,6 +187,7 @@ async function prepareGateway(page: Page, options: {
         })
       }
     },
+    persistFailure() { durable = true },
     succeed() {
       durable = true
       succeeded = true
@@ -238,6 +242,40 @@ async function capturePresentation(page: Page, name: string) {
   await page.screenshot({ path, fullPage: true })
   await test.info().attach(name, { path, contentType: 'image/png' })
 }
+
+test('done-before-error 402 keeps partial work and one credits notice through reconnect and reload', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 })
+  const gateway = await prepareGateway(page, {
+    locale: 'en', delivery: 'done-before-error',
+    outcome: { kind: 'failed', reason: '402', error_class: '402',
+      failure_kind: 'insufficient_credits', http_status: 402, retryable: false, error_id: errorId },
+  })
+  const expectFailure = async () => {
+    const notice = page.locator('.msg-error')
+    await expect(notice).toHaveCount(1)
+    await expect(notice.locator('.msg-error__text')).toHaveText('The model service account has insufficient credits.')
+    await expect(notice.locator('.msg-error__http')).toHaveText('(HTTP 402)')
+    await expect(notice.getByRole('link', { name: 'Open provider settings', exact: true }))
+      .toHaveAttribute('href', '/control/settings/provider')
+    await expect(notice.locator('button, a')).toHaveCount(1)
+    await expect(notice.locator('.msg-error__note')).toHaveText(copy.en.partial)
+    await expect(notice).not.toContainText(/PRIVATE_PROVIDER_BODY|traceback|abcdef01|HTTP 403|HTTP 404/)
+    await expect(page.locator('.msg-ai')).toContainText(partialAnswer)
+    await expect(page.getByRole('status').filter({ hasText: /^Completed$/ })).toHaveCount(0)
+  }
+  await gateway.start()
+  gateway.fail()
+  await expectFailure()
+  await expect(page.locator('.chat-turn-settled-announcer')).toHaveText('Failed')
+  await capturePresentation(page, 'live-done-before-error-402')
+  gateway.persistFailure()
+  await gateway.reconnect()
+  await expectFailure()
+  await page.reload()
+  await expectFailure()
+  expect(gateway.sends()).toBe(1)
+  expect(gateway.runtimeErrors).toEqual([])
+})
 
 for (const locale of ['en', 'zh-Hans'] as const) {
   for (const { delivery, width } of [

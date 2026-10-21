@@ -23,13 +23,18 @@ export function useChatTurnAnnouncement(options: {
       return
     }
     if (streaming) {
+      // A new turn can start rendering before its accepted task id arrives.
+      // Only an already-live turn may retain its previous identity.
+      ownerTask = chatTaskId(run.task) || (wasLive ? ownerTask : '')
       wasLive = true
-      ownerTask = chatTaskId(run.task) || ownerTask
       announcement.value = ''
       return
     }
-    if (!wasLive) return
     const terminalTask = chatTaskId(run.task)
+    // A partial-output done can precede the runtime's failure receipt. Keep
+    // that live turn's identity after its first announcement so the exact
+    // same turn can correct it, without announcing unrelated/history rows.
+    if (!wasLive && (!ownerTask || terminalTask !== ownerTask)) return
     if (ownerTask && terminalTask && ownerTask !== terminalTask) return
 
     // A stopped render alone does not prove success. Reconnects, navigation,
@@ -38,9 +43,10 @@ export function useChatTurnAnnouncement(options: {
     const lifecycle = ['succeeded', 'completed'].includes(status || '') ? 'settled'
       : ['cancelled', 'interrupted', 'abandoned'].includes(status || '') ? 'interrupted'
         : ['failed', 'timeout', 'timed_out'].includes(status || '') ? 'failed' : ''
-    if (lifecycle) {
+    // A late done must not turn an already announced failure back into success.
+    if (lifecycle && (wasLive || lifecycle !== 'settled')) {
       wasLive = false
-      ownerTask = ''
+      ownerTask ||= terminalTask
       announcement.value = options.t(`chat.activity.lifecycle.${lifecycle}`)
     }
   }, { flush: 'post' })

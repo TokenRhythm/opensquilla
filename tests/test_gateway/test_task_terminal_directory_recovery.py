@@ -223,6 +223,16 @@ async def test_failed_initial_directory_identity_read_uses_notification_only_ret
 
     runtime = TaskRuntime(storage=storage, turn_handler=no_cleanup, event_emitter=emit,
                           lifecycle_listener=lifecycle_listener, running_heartbeat_interval_s=None)
+    allow_retry = asyncio.Event()
+    retry_updates = runtime._retry_terminal_updates
+
+    async def gated_retry_updates():
+        # Observe settlement before the notification retry can remove its entry;
+        # the production 50 ms backoff is not a synchronization boundary.
+        await allow_retry.wait()
+        await retry_updates()
+
+    monkeypatch.setattr(runtime, "_retry_terminal_updates", gated_retry_updates)
     persist = runtime._persist_terminal_update
     committed_writes = 0
     async def counted_persist(*args, **kwargs):
@@ -236,11 +246,14 @@ async def test_failed_initial_directory_identity_read_uses_notification_only_ret
             session_key=node.session_key, session_id=node.session_id, session_epoch=node.epoch,
         ), "synthetic")
         driver = runtime._tasks[handle.task_id].asyncio_task
-        await asyncio.wait_for(asyncio.shield(driver), 2)
+        # These deadlines only catch a hung test. Real SQLite commits and the
+        # injected exception's traceback rendering are not a 2 s latency contract.
+        await asyncio.wait_for(asyncio.shield(driver), 10)
         assert runtime._terminal_pending_updates[handle.task_id].persisted
         assert runtime._resident_count == 0
         assert not runtime._terminal_resident_holds
-        await asyncio.wait_for(asyncio.shield(runtime._terminal_retry_task), 2)
+        allow_retry.set()
+        await asyncio.wait_for(asyncio.shield(runtime._terminal_retry_task), 10)
         notices = [
             payload for _, name, payload in events
             if name == "sessions.changed" and payload["reason"] == "updated"
@@ -252,5 +265,6 @@ async def test_failed_initial_directory_identity_read_uses_notification_only_ret
         assert not runtime._terminal_pending_updates
         assert (await storage.get_session(node.session_key)).status == SessionStatus.RUNNING
     finally:
+        allow_retry.set()
         await runtime.shutdown(timeout=2)
         await storage.close()

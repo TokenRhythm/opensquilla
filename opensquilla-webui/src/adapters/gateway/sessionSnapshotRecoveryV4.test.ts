@@ -63,6 +63,9 @@ describe('persistent recovery transfer', () => {
     h.installed.mockImplementation(() => { throw new Error('local bookkeeping failed') })
     const staged = await h.transfer.read()
     await expect(staged.confirmInstalled()).resolves.toBeUndefined()
+    expect(h.consume).toHaveBeenCalledWith('alpha', {
+      streamGeneration: 'stream-1', fromSeq: 10, toSeq: 12, replayAccepted: true,
+    })
     expect(h.transfer.installed).toBe(true)
     expect(h.installed).toHaveBeenCalledWith('alpha', '0')
     await staged.confirmInstalled()

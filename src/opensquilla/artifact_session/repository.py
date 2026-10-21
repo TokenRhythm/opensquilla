@@ -85,7 +85,7 @@ class _SessionStorageBinding(Protocol):
         budget_seconds: float | None = None,
     ) -> AbstractAsyncContextManager[Any]: ...
 
-    def read_transaction(
+    def committed_read_transaction(
         self,
         operation: str,
     ) -> AbstractAsyncContextManager[Any]: ...
@@ -310,7 +310,7 @@ class ArtifactSessionRepository:
             return storage._write_transaction(f"artifact_session.{operation}")
 
         def read_transaction(operation: str) -> AbstractAsyncContextManager[Any]:
-            return storage.read_transaction(f"artifact_session.{operation}")
+            return storage.committed_read_transaction(f"artifact_session.{operation}")
 
         repository = cls(
             transaction,

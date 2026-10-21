@@ -34,6 +34,23 @@ restoredA.release()
 independentPreview.release()
 replacementBrowser.release()
 assert.deepEqual(retentionBudget.snapshot(), [])
+
+// Preview reservations still track lifetime, but hidden documents in other
+// chats must not block new previews or consume browser admission slots.
+const defaultBudget = new WorkbenchResourceBudget()
+const previewReservations = Array.from({ length: 12 }, () => defaultBudget.acquire('preview'))
+assert.ok(previewReservations.every(Boolean))
+const previewReplacement = previewReservations[0].retain()
+previewReservations[0].release()
+assert.equal(defaultBudget.snapshot().filter(entry => entry.kind === 'preview').length, 12)
+const browserReservations = Array.from({ length: 8 }, () => defaultBudget.acquire('browser'))
+assert.ok(browserReservations.every(Boolean))
+assert.equal(defaultBudget.acquire('browser'), null)
+const extraPreview = defaultBudget.acquire('preview')
+assert.ok(extraPreview)
+for (const reservation of [...previewReservations, ...browserReservations, previewReplacement, extraPreview]) reservation.release()
+assert.deepEqual(defaultBudget.snapshot(), [])
+
 import {
   parseNativeWorkbenchAnnotationGeometry,
   parseNativeWorkbenchAnnotationModeRequest,

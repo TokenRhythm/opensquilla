@@ -628,22 +628,20 @@ describe('AppWorkbench new panel menu interaction', () => {
     expect(harness.trigger()).not.toBeNull()
   })
 
-  it.each([true, false])('reports native artifact admission from any producer without stealing focus (activate=%s)', async activate => {
+  it.each([true, false])('opens a fifth native preview without a capacity warning and honors focus intent (activate=%s)', async activate => {
     const harness = await mount()
     const native = (index: number) => ({ id: `native-preview-${index}`, kind: 'artifact-preview' as const,
       title: 'Interactive preview', scope: { type: 'session' as const, id: 'session-a' },
       hostKind: 'native-webcontents' as const, retention: 'keep-alive' as const, payload: {} })
     for (let index = 0; index < 4; index += 1) harness.store.openItem(native(index), { activate: false })
-    // Simulates both explicit main/side opens and background agent-produced
-    // previews: all enter the store, so none can bypass the shared notification.
-    expect(harness.store.openItem(native(4), { activate })).toBe(false)
+    // Explicit opens and background agent-produced previews share admission.
+    expect(harness.store.openItem(native(4), { activate })).toBe(true)
     await settle()
-    expect(harness.store.items).toHaveLength(5)
-    expect(harness.store.activeItemId).toBe('existing-panel')
-    expect(pushToast).toHaveBeenCalledExactlyOnceWith('workbench.nativePreview.capacityReached',
-      { tone: 'warn', duration: 9000 })
+    expect(harness.store.items).toHaveLength(6)
+    expect(harness.store.activeItemId).toBe(activate ? 'native-preview-4' : 'existing-panel')
+    expect(pushToast).not.toHaveBeenCalled()
     expect(harness.store.openItem({ ...native(0), title: 'Updated preview' })).toBe(true)
-    expect(pushToast).toHaveBeenCalledTimes(1)
+    expect(pushToast).not.toHaveBeenCalled()
   })
 
   it('explains terminal capacity without discarding retained sessions or opening a broken tab', async () => {

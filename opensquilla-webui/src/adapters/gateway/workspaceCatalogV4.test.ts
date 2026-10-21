@@ -45,6 +45,15 @@ function transport() {
 }
 
 describe('createV4WorkspaceCatalog', () => {
+  it('forwards list deadlines without reconnecting the transport', async () => {
+    const source = transport()
+    const catalog = createV4WorkspaceCatalog(source as never)
+    const signal = new AbortController().signal
+    await catalog.list({ signal, timeoutMs: 7000 })
+    expect(source.request).toHaveBeenCalledWith('workspaces.list', {}, {
+      signal, timeoutMs: 7000, abortAction: 'reject', timeoutAction: 'reject',
+    })
+  })
   it('accepts additional response fields and keeps path mutation cancellation options', async () => {
     const request = vi.fn()
       .mockResolvedValueOnce({ path: '/synthetic/new', name: 'new', kind: 'directory', extra: true })
