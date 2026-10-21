@@ -9067,12 +9067,33 @@ class Agent:
                                         if usage_call is not None
                                         else str(self.config.model_id or "")
                                     )
-                                    error_usage = normalize_provider_usage(
-                                        raw_ev,
-                                        default_provider=usage_default_provider,
-                                        default_model=usage_default_model,
-                                        completed_at_ms=time.time_ns() // 1_000_000,
-                                    )
+                                    # Price discovery may perform synchronous network I/O.
+                                    # Preserve the canonical estimate without blocking turns.
+                                    try:
+                                        error_usage = await asyncio.to_thread(
+                                            normalize_provider_usage,
+                                            raw_ev,
+                                            default_provider=usage_default_provider,
+                                            default_model=usage_default_model,
+                                            completed_at_ms=time.time_ns() // 1_000_000,
+                                        )
+                                    except asyncio.CancelledError:
+                                        if usage_call is not None and not usage_call_terminal:
+                                            # Cancellation must retain received receipts without
+                                            # waiting for optional network price discovery.
+                                            cancelled_usage = normalize_provider_usage(
+                                                raw_ev,
+                                                default_provider=usage_default_provider,
+                                                default_model=usage_default_model,
+                                                completed_at_ms=time.time_ns() // 1_000_000,
+                                                resolve_estimates=False,
+                                            )
+                                            usage_call_terminal = True
+                                            await self._usage_call_finalize(
+                                                usage_call, raw_ev,
+                                                normalized_result=cancelled_usage,
+                                            )
+                                        raise
                                 if (
                                     usage_call is not None
                                     and not usage_call_terminal
@@ -9545,6 +9566,15 @@ class Agent:
                         reasoning_tokens=iter_reasoning_tokens,
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
+                    if (
+                        stream_replay_request is not None
+                        and provider_error is None
+                        and attempt_classification.kind == _ProviderAttemptKind.LENGTH_CAPPED
+                    ):
+                        # A valid capped response follows the existing continuation budget.
+                        # Its next request must include the accepted partial and continuation,
+                        # rather than replaying the frozen input. Keep the one-recovery limit.
+                        stream_replay_request = None
                     if stream_replay_request is not None and (
                         provider_error is not None
                         or attempt_classification.kind != _ProviderAttemptKind.OK
@@ -10649,7 +10679,10 @@ class Agent:
                             and not self._execution_context.terminal
                             and not self._execution_context.closed
                             and (
-                                self._execution_context.surface.supports_generation_reset
+                                (
+                                    self._execution_context.surface.supports_generation_reset
+                                    and self._execution_context.surface.supports_provider_call_reset
+                                )
                                 or not self._execution_context.surface.supports_streaming
                             )
                             and getattr(self.provider, "retry_failed_call_safe", True) is not False

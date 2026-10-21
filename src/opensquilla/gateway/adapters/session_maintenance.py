@@ -712,6 +712,8 @@ class GatewaySessionMaintenancePorts(
             self._EVENT_NAME,
             normalized,
         )
+        if buffered is None:
+            return None
         return _GatewayBufferedCompactionEvent(event.session_key, buffered)
 
     async def broadcast(self, buffered: object) -> None:

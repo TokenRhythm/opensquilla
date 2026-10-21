@@ -34,7 +34,7 @@ class SessionEventBuffer(Protocol):
         session_key: str,
         event_name: str,
         payload: dict[str, Any] | None,
-    ) -> dict[str, Any]: ...
+    ) -> dict[str, Any] | None: ...
 
 
 def buffer_session_event(
@@ -43,8 +43,8 @@ def buffer_session_event(
     payload: dict[str, Any] | None,
     *,
     streams: object | None = None,
-) -> dict[str, Any]:
-    """Record replayable message events and pass session projections through."""
+) -> dict[str, Any] | None:
+    """Return a publishable payload, or None for a rejected replayable event."""
 
     if event_name.startswith("session.event."):
         registry = cast(
@@ -97,9 +97,12 @@ async def send_prepared_to_subscribers(
     ctx: object,
     session_key: str,
     event_name: str,
-    send_payload: dict[str, Any],
+    send_payload: dict[str, Any] | None,
 ) -> None:
-    """Broadcast an already-buffered event without mutating replay state."""
+    """Broadcast an accepted buffered event without mutating replay state."""
+
+    if send_payload is None:
+        return
 
     from opensquilla.gateway.websocket import get_registry
 

@@ -535,7 +535,9 @@ class SessionStreamRegistry:
         session_key: str,
         event_name: str,
         payload: dict[str, Any] | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
+        """Return the publishable payload, or None when a call reset is rejected."""
+
         stream_seq = self.current_seq(session_key) + 1
         self._seq_by_session[session_key] = stream_seq
 
@@ -572,7 +574,7 @@ class SessionStreamRegistry:
             and enriched.get("reset_scope") == "provider_call"
             and not self._valid_call_reset(session_key, event)
         ):
-            return enriched
+            return None
         events = self._events_by_session.setdefault(session_key, deque())
         events.append(event)
         if self._is_generation_reset(event_name):
@@ -707,13 +709,9 @@ class SessionStreamRegistry:
             return True
         checkpoint = self._live_attempt_prefix_by_session.get(session_key)
         if checkpoint is not None and checkpoint[0] != failed_call_id.strip():
-            if any(
-                self._model_call_id(item.payload) == failed_call_id.strip()
-                for item in self._live_events_by_session.get(session_key, ())
-            ):
-                # An earlier accepted call is not a rollback target, even if
-                # a delayed producer attaches a plausible current epoch.
-                return False
+            # Only the current provisional call can be rolled back. An earlier
+            # accepted call or an unknown call is never a valid target.
+            return False
         current_epoch = self._live_generation_epoch_by_session.get(session_key)
         return current_epoch is None or old_epoch == current_epoch
 

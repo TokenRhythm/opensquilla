@@ -222,6 +222,7 @@ async def test_emit_preserves_thinking_start_time() -> None:
                 "generation_epoch": 0,
                 "model_call_id": "2.0",
                 "iteration": 2,
+                "provider_call_resettable": True,
             },
         )
     ]

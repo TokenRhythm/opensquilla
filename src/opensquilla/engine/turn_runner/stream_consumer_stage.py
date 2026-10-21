@@ -948,8 +948,7 @@ class _DoneHandler:
 
         snapshot_present, terminal_text = done_text_snapshot(event)
         accumulated_text = "".join(state.final_text_parts)
-        buffer_call_content = not _supports_provider_call_reset(inp)
-        buffer_system_event_text = buffer_call_content or (
+        buffer_system_event_text = (
             inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
@@ -1958,7 +1957,6 @@ class StreamConsumerStage:
             ThinkingEndEvent,
             ThinkingEvent,
             ThinkingStartEvent,
-            ToolInputPreviewEvent,
             ToolResultEvent,
             ToolUseDeltaEvent,
             ToolUseEndEvent,
@@ -1971,8 +1969,7 @@ class StreamConsumerStage:
         )
 
         state = inp.state
-        buffer_call_content = not _supports_provider_call_reset(inp)
-        buffer_system_event_text = buffer_call_content or (
+        buffer_system_event_text = (
             inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
@@ -1988,6 +1985,7 @@ class StreamConsumerStage:
         released_suppressed_source_text: str | None = None
         realtime_generation = _supports_realtime_generation(inp)
         supports_generation_reset = _supports_generation_reset(inp)
+        supports_call_reset = _supports_provider_call_reset(inp)
         deferred_generation_events: list[AgentEvent] = []
         attempt_checkpoint: _ProviderAttemptCheckpoint | None = None
         deferred_attempt_start = 0
@@ -2025,6 +2023,11 @@ class StreamConsumerStage:
             semantic_message=inp.semantic_input,
             pending_input_provider=inp.pending_input_provider,
         ):
+            # Carry the producing turn's recovery policy through live and replay
+            # projection. A CLI observer of a WebUI turn must still be protected.
+            if isinstance(event, (TextDeltaEvent, ThinkingEvent, ThinkingStartEvent,
+                                  ThinkingEndEvent)):
+                event = replace(event, provider_call_resettable=supports_call_reset)
             transformed: AgentEvent | object
             extra_yields: list[AgentEvent] = []
             if isinstance(event, ProviderAttemptStartEvent):
@@ -2101,7 +2104,7 @@ class StreamConsumerStage:
                     )
                 if (
                     event.reset_scope == "provider_call"
-                    and buffer_call_content
+                    and not supports_call_reset
                     and not event.terminal
                 ):
                     transformed = _SUPPRESS
@@ -2132,7 +2135,7 @@ class StreamConsumerStage:
             elif isinstance(event, TextDeltaEvent):
                 transformed = self._text_delta_handler.handle(event, state)
                 if buffer_system_event_text:
-                    if event.text and not buffered_text_observed and not buffer_call_content:
+                    if event.text and not buffered_text_observed:
                         log.info(
                             "internal_turn_text_buffered_total",
                             metric="internal_turn_text_buffered_total",
@@ -2497,11 +2500,6 @@ class StreamConsumerStage:
             if realtime_generation:
                 for extra_event in extra_yields:
                     yield extra_event
-                if buffer_call_content and isinstance(
-                    transformed,
-                    (ThinkingEvent, ThinkingStartEvent, ThinkingEndEvent, ToolInputPreviewEvent),
-                ):
-                    continue
                 if transformed is not _SUPPRESS:
                     yield transformed  # type: ignore[misc]
                 continue

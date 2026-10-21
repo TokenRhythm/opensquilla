@@ -5037,15 +5037,17 @@ async def start_gateway_server(
             prompt_cache_keepalive_service.refresh_required(session_key)
         # Lifecycle claiming and replay append now happen in one synchronous
         # call stack. Network delivery remains asynchronous and at-least-once.
-        event_payload = get_session_streams().record(
+        recorded = get_session_streams().record(
             session_key,
             "session.event.compaction",
             event_payload,
         )
+        if recorded is None:
+            return
         emit_coro = runtime_event_bridge.emit(
             session_key,
             "session.event.compaction",
-            event_payload,
+            recorded,
             replay_recorded=True,
         )
         try:
@@ -5345,6 +5347,8 @@ async def start_gateway_server(
                 "session.event.cron_result",
                 payload,
             )
+            if stream_payload is None:
+                return
             for conn_id in _sub_mgr.get_message_subscribers(origin_session_key):
                 conn = _registry.get(conn_id)
                 if conn:
@@ -5387,6 +5391,8 @@ async def start_gateway_server(
                 if event_name.startswith("session.event.")
                 else payload
             )
+            if stream_payload is None:
+                return
             conn_ids = _sub_mgr.get_message_subscribers(session_key)
             if event_name.startswith("sessions."):
                 conn_ids |= _sub_mgr.get_session_subscribers()

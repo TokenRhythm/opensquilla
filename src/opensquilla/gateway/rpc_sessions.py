@@ -1563,7 +1563,7 @@ def _buffer_session_event(
     session_key: str,
     event_name: str,
     payload: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     return buffer_session_event(
         session_key,
         event_name,
@@ -3869,7 +3869,7 @@ async def _send_prepared_to_subscribers(
     ctx: RpcContext,
     session_key: str,
     event_name: str,
-    send_payload: dict,
+    send_payload: dict | None,
 ) -> None:
     await send_prepared_to_subscribers(ctx, session_key, event_name, send_payload)
 

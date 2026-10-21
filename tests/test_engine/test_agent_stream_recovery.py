@@ -645,3 +645,218 @@ async def test_recovered_done_preserves_zero_receipt_authority_from_durable_ledg
         assert not any(isinstance(event, ErrorEvent) for event in events)
     finally:
         await storage.close()
+
+
+async def test_cli_visible_failure_does_not_replay_an_unretractable_call() -> None:
+    from opensquilla.tools.types import (
+        CallerKind,
+        ToolContext,
+        surface_capabilities_for_tool_context,
+    )
+
+    context = TurnExecutionContext.create(
+        TurnIdentity("stream-turn", "stream-answer", "agent:main:stream-recovery"),
+        surface=surface_capabilities_for_tool_context(ToolContext(caller_kind=CallerKind.CLI)),
+    )
+    provider = _Provider([_partial(httpx.ReadTimeout("synthetic read")), _success()])
+    events = await _run(_agent(provider, context=context))
+
+    assert len(provider.calls) == 1
+    assert not _resets(events)
+    assert any(event.kind == "text_delta" for event in events)
+    assert any(event.kind == "thinking" for event in events)
+    assert any(isinstance(event, ErrorEvent) for event in events)
+
+
+async def test_error_usage_estimation_keeps_event_loop_responsive(monkeypatch: Any) -> None:
+    import threading
+
+    from opensquilla.engine import usage_accounting
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    released_by_loop: list[bool] = []
+    resolve_price = usage_accounting.resolve_model_price
+
+    def waiting_price(model: str, provider: str):
+        loop.call_soon_threadsafe(entered.set)
+        released_by_loop.append(release.wait(timeout=5))
+        return resolve_price(model, provider)
+
+    monkeypatch.setattr(usage_accounting, "resolve_model_price", waiting_price)
+    failure = ProviderError(
+        code="timeout", recovery_origin="read_timeout", usage_missing_count=1,
+        model_usage_breakdown=[{
+            "provider": "anthropic", "model": "claude-sonnet-4-6",
+            "input_tokens": 100, "output_tokens": 10, "token_usage_known": True,
+            "cost_source": "unavailable",
+        }],
+    )
+    provider = _Provider([_partial(failure), _success()])
+    agent = _agent(
+        provider, context=_context(), provider_id="anthropic", model_id="claude-sonnet-4-6",
+    )
+    task = asyncio.create_task(_run(agent))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+    finally:
+        release.set()
+    events = await asyncio.wait_for(task, timeout=10)
+
+    assert released_by_loop and all(released_by_loop), "price lookup blocked the event loop"
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.cost_usd > done.billed_cost
+    assert done.missing_cost_entries >= 1
+    assert len(provider.calls) == 2
+
+
+async def test_recovered_length_cap_uses_normal_continuation_without_repeating_tools() -> None:
+    provider = _Provider([
+        _tool_response(1),
+        _partial(httpx.ReadTimeout("synthetic read")),
+        [ProviderText(text="First half. "), ProviderDone(
+            stop_reason="length", model="synthetic-stream-model", input_tokens=10,
+            output_tokens=2, billed_cost=0.02, cost_source="provider_billed",
+        )],
+        _success("Second half."),
+    ])
+    executed: list[str] = []
+
+    async def handle(call: Any) -> ToolResult:
+        executed.append(call.tool_use_id)
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="recorded",
+        )
+
+    events = await _run(_agent(provider, context=_context(), tool_handler=handle, max_iterations=2))
+
+    assert executed == ["tool-1"]
+    assert len(provider.calls) == 4
+    assert provider.calls[1][0:2] == provider.calls[2][0:2]
+    continuation = provider.calls[3][0]
+    assert continuation != provider.calls[2][0]
+    assert any(message.role == "assistant" and isinstance(message.content, list)
+               and any(getattr(block, "text", "") == "First half. " for block in message.content)
+               for message in continuation)
+    assert len(_resets(events)) == 1
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.text == "Completed step 1. First half. Second half."
+
+
+async def test_length_continuation_does_not_grant_a_second_transport_replay() -> None:
+    provider = _Provider([
+        _partial(httpx.ReadTimeout("first interrupted call")),
+        [ProviderText(text="Accepted partial."), ProviderDone(
+            stop_reason="length", model="synthetic-stream-model",
+        )],
+        _partial(httpx.ReadTimeout("interrupted continuation")),
+        _success("Must not be reached."),
+    ])
+    events = await _run(_agent(provider, context=_context()))
+
+    assert len(provider.calls) == 3
+    assert len(_resets(events)) == 1
+    assert any(isinstance(event, ErrorEvent) for event in events)
+
+
+async def test_cancellation_during_error_price_lookup_preserves_received_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    from contextlib import suppress
+    from types import SimpleNamespace
+
+    from opensquilla.engine import usage_accounting
+    from opensquilla.engine.usage_accounting import (
+        UsageAccountingScope,
+        UsageExecutionContext,
+        bind_usage_accounting_scope,
+        usd_to_nanos,
+    )
+
+    class Sink:
+        def __init__(self) -> None:
+            self.started: list[Any] = []
+            self.finalized: list[tuple[Any, Any]] = []
+            self.unknown: list[tuple[Any, str]] = []
+
+        async def start(self, call: Any) -> None:
+            self.started.append(call)
+
+        async def finalize(self, call: Any, result: Any) -> None:
+            self.finalized.append((call, result))
+
+        async def mark_unknown(self, call: Any, reason: str) -> None:
+            self.unknown.append((call, reason))
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    finished = asyncio.Event()
+    release = threading.Event()
+
+    def waiting_price(model: str, provider: str) -> Any:
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            release.wait(timeout=10)
+            return SimpleNamespace(source="test", has_accounting_price=False)
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    monkeypatch.setattr(usage_accounting, "resolve_model_price", waiting_price)
+    failure = ProviderError(
+        code="timeout", recovery_origin="read_timeout", usage_missing_count=1,
+        model_usage_breakdown=[
+            {
+                "provider": "openai", "model": "synthetic-billed-model",
+                "input_tokens": 20, "output_tokens": 3,
+                "billed_cost": 0.03, "cost_source": "provider_billed",
+            },
+            {
+                "provider": "anthropic", "model": "synthetic-unpriced-model",
+                "input_tokens": 100, "output_tokens": 10,
+                "token_usage_known": True, "cost_source": "unavailable",
+            },
+        ],
+    )
+    provider = _Provider([_partial(failure), _success()])
+    sink = Sink()
+    with bind_usage_accounting_scope(UsageAccountingScope(
+        sink=sink,
+        context=UsageExecutionContext(execution_id="cancel-price", agent_run_id="cancel-price"),
+    )):
+        task = asyncio.create_task(_run(_agent(provider, context=_context())))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+            # Cancellation settles received evidence before optional pricing finishes.
+            assert not release.is_set()
+            assert not finished.is_set()
+            assert len(sink.finalized) == 1
+            assert sink.unknown == []
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            await asyncio.wait_for(finished.wait(), timeout=5)
+
+    assert len(sink.started) == len(sink.finalized) == 1
+    call, result = sink.finalized[0]
+    assert call == sink.started[0]
+    assert result.billed_cost_nanos == usd_to_nanos(0.03)
+    assert result.estimated_cost_nanos == 0
+    assert result.cost_source == "mixed"
+    assert (result.input_tokens, result.output_tokens) == (120, 13)
+    assert result.missing_usage_entries == 1
+    assert len(result.items) == 2
+    assert all(item.token_usage_known for item in result.items)
+    assert result.items[0].cost_source == "provider_billed"
+    assert result.items[1].cost_source == "unavailable"
+    assert sink.unknown == []
+    assert len(provider.calls) == 1
+    assert provider.opened[0].closed

@@ -8,7 +8,6 @@ from dataclasses import asdict
 from decimal import Decimal, localcontext
 from typing import Any
 
-from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.usage_ledger import UsageLedgerConflictError
 from opensquilla.usage_metering import (
     UsageItemMetering,
@@ -341,7 +340,6 @@ def _overlay_cost_totals(
             if not any(item["revision_payload"] for item in items):
                 continue
             sources = []
-            event_billed = Decimal(0)
             event_estimated = Decimal(0)
             old_unknown = new_unknown = 0
             for item in items:
@@ -363,22 +361,16 @@ def _overlay_cost_totals(
                     new_unknown += int(source in {"none", "unavailable"})
                 exact_billed += new_billed - old_billed
                 exact_estimated += new_estimated - old_estimated
-                event_billed += new_billed
                 event_estimated += new_estimated
                 sources.append(source)
             original = items[0]
             missing = max(0, original["event_missing_cost_entries"] - old_unknown) + new_unknown
             result["missing_cost_entries"] += missing - original["event_missing_cost_entries"]
-            source = rollup_cost_source(
-                billed_cost_usd=float(event_billed),
-                estimated_cost_component_usd=float(event_estimated),
-                missing_cost_entries=missing,
-                provider_billed_entries=sum(s in {"provider_billed", "mixed"} for s in sources),
-                estimated_cost_entries=sum(s in {"opensquilla_estimate", "mixed"} for s in sources),
-            )
-            result["provider_billed_entries"] += int(source in {"provider_billed", "mixed"}) - int(
-                original["event_cost_source"] in {"provider_billed", "mixed"}
-            )
+            # A mixed rollup may contain only an estimate plus missing usage.
+            # Count actual billed items so that subtotal is not shown as a $0 bill.
+            result["provider_billed_entries"] += int(
+                any(source in {"provider_billed", "mixed"} for source in sources)
+            ) - int(original["event_cost_source"] in {"provider_billed", "mixed"})
             result["estimated_cost_entries"] += int(event_estimated > 0) - int(
                 original["event_estimated_cost_nanos"] > 0
             )

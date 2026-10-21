@@ -56,7 +56,6 @@ from opensquilla.engine.types import (
     ThinkingEndEvent,
     ThinkingEvent,
     ThinkingStartEvent,
-    ToolInputPreviewEvent,
     ToolResultEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
@@ -3380,7 +3379,10 @@ def test_done_handler_stamps_decision_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_buffers_attempt_content_but_keeps_completed_tools_live() -> None:
+async def test_cli_streams_text_reasoning_and_tools_before_done() -> None:
+    from opensquilla.engine.types import public_agent_event_payload
+    from opensquilla.gateway.protocol import project_session_event_for_client
+
     tool_context = ToolContext(caller_kind=CallerKind.CLI)
     surface = surface_capabilities_for_tool_context(tool_context)
     assert surface.supports_streaming
@@ -3389,47 +3391,64 @@ async def test_cli_buffers_attempt_content_but_keeps_completed_tools_live() -> N
     context = TurnExecutionContext.create(
         TurnIdentity("turn-cli", "assistant-cli", "agent:main:cli"), surface=surface,
     )
-    state = _make_state()
-    stage, _ = _make_stage(agent_run=_RecordingAgentRun(events=[
-        ProviderAttemptStartEvent(model_call_id="1.0", iteration=1),
-        TextDeltaEvent(text="accepted prefix ", model_call_id="1.0"),
-        ThinkingStartEvent(block_id="reasoning-one", model_call_id="1.0"),
-        ThinkingEvent(text="accepted reasoning", model_call_id="1.0"),
-        ThinkingEndEvent(block_id="reasoning-one", model_call_id="1.0"),
-        ProviderAttemptCommittedEvent(model_call_id="1.0", iteration=1),
-        ToolUseStartEvent(tool_use_id="completed-tool", tool_name="record"),
-        ToolResultEvent(tool_use_id="completed-tool", tool_name="record", result="completed"),
-        ProviderAttemptStartEvent(model_call_id="2.0", iteration=2),
-        ToolInputPreviewEvent(preview_id="failed-draft", content="uncommitted content"),
-        TextDeltaEvent(text="failed prefix", model_call_id="2.0"),
-        ThinkingEvent(text="failed reasoning", model_call_id="2.0"),
-        AnswerGenerationResetEvent(
-            reset_scope="provider_call", rollback_model_call_id="2.0",
-            old_generation_epoch=0, new_generation_epoch=1,
-        ),
-        ProviderAttemptStartEvent(model_call_id="2.1", iteration=2, generation_epoch=1),
-        TextDeltaEvent(text="accepted suffix", model_call_id="2.1", generation_epoch=1),
-        ProviderAttemptCommittedEvent(model_call_id="2.1", iteration=2, generation_epoch=1),
-        DoneEvent(text="accepted prefix accepted suffix", generation_epoch=1),
-    ]))
+    finish = asyncio.Event()
+    done_produced = False
 
-    events = await _drain(stage, _make_input(
+    class PausedAgentRun:
+        async def run_turn(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+            nonlocal done_produced
+            yield ProviderAttemptStartEvent(model_call_id="1.0", iteration=1)
+            yield TextDeltaEvent(text="accepted prefix ", model_call_id="1.0")
+            yield ThinkingStartEvent(block_id="reasoning-one", model_call_id="1.0")
+            yield ThinkingEvent(text="accepted reasoning", model_call_id="1.0")
+            yield ThinkingEndEvent(block_id="reasoning-one", model_call_id="1.0")
+            yield ProviderAttemptCommittedEvent(model_call_id="1.0", iteration=1)
+            yield ToolUseStartEvent(tool_use_id="completed-tool", tool_name="record")
+            yield ToolResultEvent(
+                tool_use_id="completed-tool", tool_name="record", result="completed",
+            )
+            yield ProviderAttemptStartEvent(model_call_id="2.0", iteration=2)
+            yield TextDeltaEvent(text="accepted suffix", model_call_id="2.0")
+            await finish.wait()
+            done_produced = True
+            yield ProviderAttemptCommittedEvent(model_call_id="2.0", iteration=2)
+            yield DoneEvent(text="accepted prefix accepted suffix")
+
+    state = _make_state()
+    stage, _ = _make_stage(agent_run=PausedAgentRun())
+    stream = stage.run(_make_input(
         state=state, execution_context=context, tool_context=tool_context,
     ))
+    try:
+        events = [await asyncio.wait_for(anext(stream), timeout=1) for _ in range(7)]
+        assert not done_produced
+        assert [event.kind for event in events] == [
+            "text_delta", "thinking_start", "thinking", "thinking_end",
+            "tool_use_start", "tool_result", "text_delta",
+        ]
+        for event in events:
+            if isinstance(event, (TextDeltaEvent, ThinkingEvent, ThinkingStartEvent,
+                                  ThinkingEndEvent)):
+                assert event.provider_call_resettable is False
+                payload = public_agent_event_payload(event)
+                event_name = f"session.event.{event.kind}"
+                assert project_session_event_for_client(event_name, payload) == (
+                    event_name, payload,
+                )
+        finish.set()
+        events.extend([event async for event in stream])
+    finally:
+        await stream.aclose()
 
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
-        "accepted prefix accepted suffix",
+        "accepted prefix ", "accepted suffix",
     ]
-    assert not any(isinstance(event, (ThinkingEvent, ThinkingStartEvent, ThinkingEndEvent,
-                                      ToolInputPreviewEvent, AnswerGenerationResetEvent))
-                   for event in events)
-    kinds = [event.kind for event in events]
-    assert kinds.index("tool_result") < kinds.index("text_delta") < kinds.index("done")
+    assert done_produced
+    assert isinstance(events[-1], DoneEvent)
     assert state.reasoning == ["accepted reasoning"]
 
-
 @pytest.mark.asyncio
-async def test_cli_keeps_answer_reset_compatibility_with_terminal_text_buffering() -> None:
+async def test_cli_keeps_answer_reset_compatibility_with_live_text() -> None:
     context = TurnExecutionContext.create(
         TurnIdentity("turn-cli-answer", "assistant-cli-answer", "agent:main:cli-answer"),
         surface=surface_capabilities_for_tool_context(ToolContext(caller_kind=CallerKind.CLI)),
@@ -3445,5 +3464,5 @@ async def test_cli_keeps_answer_reset_compatibility_with_terminal_text_buffering
 
     assert any(isinstance(event, AnswerGenerationResetEvent) for event in events)
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
-        "accepted answer",
+        "superseded answer", "accepted answer",
     ]

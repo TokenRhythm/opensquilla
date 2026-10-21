@@ -74,6 +74,18 @@ afterEach(() => {
 describe('SystemMessage runtime errors', () => {
   it.each([
     {
+      // Anthropic message_start reports an observed subtotal, not final output usage.
+      usage: {
+        input_tokens: 100, output_tokens: 1,
+        cost_usd: 0.000315, billed_cost: 0, estimated_cost_component_usd: 0.000315,
+        has_billed_component: false, has_estimated_component: true,
+        cost_source: 'mixed', missing_cost_entries: 1,
+        coverage_status: 'usage_unknown', usage_unknown: true, unknown_usage_events: 0,
+      },
+      expected: ['Estimated $0.000315', 'known subtotal'],
+      absent: ['Actual'], allowZero: false,
+    },
+    {
       usage: {
         input_tokens: 30, output_tokens: 4, cost_usd: 0.03, billed_cost: 0.02,
         cost_source: 'mixed', estimated_cost_component_usd: 0.01,

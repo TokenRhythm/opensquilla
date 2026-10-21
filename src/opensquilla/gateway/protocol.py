@@ -245,8 +245,11 @@ def project_session_event_for_client(
         and isinstance(payload, Mapping)
         and isinstance(payload.get("model_call_id"), str)
         and bool(payload["model_call_id"].strip())
+        and payload.get("provider_call_resettable") is not False
     ):
-        # A legacy observer cannot retract a failed physical attempt. Keep its
+        # A legacy observer cannot retract a failed physical attempt. Turns
+        # without call rollback (including CLI-origin turns) can stream safely.
+        # For recoverable turns, keep their
         # content behind the terminal authoritative snapshot from the first
         # scoped delta, including when the observer joins through replay.
         return None

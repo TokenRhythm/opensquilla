@@ -80,6 +80,9 @@ class ThinkingStartEvent:
     generation_epoch: int = 0
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -97,6 +100,9 @@ class ThinkingEvent:
     # Additive defaults preserve legacy producers and positional construction.
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -109,6 +115,9 @@ class ThinkingEndEvent:
     generation_epoch: int = 0
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass
@@ -148,6 +157,9 @@ class TextDeltaEvent:
     # Additive defaults preserve legacy producers and positional construction.
     model_call_id: str = ""
     iteration: int = 0
+    # False only when this turn cannot roll back an exposed provider call.
+    # Gateway observers may then stream it without call-reset support.
+    provider_call_resettable: bool = True
 
 
 @dataclass

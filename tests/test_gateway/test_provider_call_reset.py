@@ -269,6 +269,26 @@ def test_legacy_projection_hides_scoped_attempt_content(kind: str, caps: tuple[s
     ) == (f"session.event.{kind}", payload)
 
 
+@pytest.mark.parametrize("kind", ["text_delta", "thinking", "thinking_start", "thinking_end"])
+@pytest.mark.parametrize("caps", [(), (ANSWER_GENERATION_RESET_CAPABILITY,)])
+def test_projection_streams_calls_that_cannot_be_rolled_back(
+    kind: str, caps: tuple[str, ...],
+) -> None:
+    payload = {
+        **_IDENTITY, "model_call_id": "2.0", "text": "live CLI content",
+        "provider_call_resettable": False,
+    }
+    event_name = f"session.event.{kind}"
+    assert project_session_event_for_client(event_name, payload, client_caps=caps) == (
+        event_name, payload,
+    )
+    # This describes the producing turn, not the observing client's version.
+    # CLI observers of a recoverable WebUI turn must still withhold drafts.
+    assert project_session_event_for_client(
+        event_name, {**payload, "provider_call_resettable": True}, client_caps=caps,
+    ) is None
+
+
 def test_projection_keeps_legacy_producers_and_canonical_terminals() -> None:
     text = {"text": "unscoped legacy content"}
     assert project_session_event_for_client("session.event.text_delta", text) == (

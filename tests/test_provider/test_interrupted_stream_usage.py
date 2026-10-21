@@ -111,6 +111,93 @@ async def test_anthropic_retains_known_input_without_inventing_output_or_final_c
     assert streams[0].closed
 
 
+async def test_anthropic_start_usage_remains_an_incomplete_subtotal_in_the_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.usage_accounting import (
+        UsageAccountingScope,
+        UsageExecutionContext,
+        account_provider_stream,
+        bind_usage_accounting_scope,
+    )
+    from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
+    from opensquilla.provider.types import TextDeltaEvent
+    from opensquilla.session.models import SessionNode
+    from opensquilla.session.storage import SessionStorage
+
+    partial_text = "More generated content without a final usage update. " * 64
+    streams = _mock_stream(monkeypatch, [
+        {"type": "message_start", "message": {
+            "id": "synthetic-message", "usage": {"input_tokens": 100, "output_tokens": 1},
+        }},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": partial_text}},
+    ], httpx.ReadTimeout)
+    provider = AnthropicProvider(api_key="synthetic-key", model="claude-sonnet-4-6")
+    storage = await SessionStorage.open(":memory:")
+    try:
+        await storage.upsert_session(SessionNode(
+            session_key="agent:main:anthropic-subtotal", session_id="subtotal-session",
+        ))
+        await storage.initialize_usage_ledger(1)
+        with bind_usage_accounting_scope(UsageAccountingScope(
+            sink=SessionUsageEventSink(storage),
+            context=UsageExecutionContext(
+                execution_id="subtotal-execution", agent_run_id="subtotal-run",
+                session_id="subtotal-session", turn_id="subtotal-turn",
+            ),
+        )):
+            events = [event async for event in account_provider_stream(
+                lambda: provider.chat(
+                    [Message(role="user", content="synthetic request")],
+                    config=ChatConfig(physical_attempt_limit=1),
+                ),
+                provider="anthropic", model="claude-sonnet-4-6",
+            )]
+
+        assert "".join(event.text for event in events if isinstance(event, TextDeltaEvent)) == (
+            partial_text
+        )
+        assert not any(isinstance(event, DoneEvent) for event in events)
+        error = next(event for event in events if isinstance(event, ErrorEvent))
+        assert error.recovery_origin == "read_timeout"
+        assert error.usage_missing_count > 0
+        result = normalize_provider_usage(
+            error, default_provider="anthropic", default_model="claude-sonnet-4-6",
+            completed_at_ms=1,
+        )
+        assert (result.input_tokens, result.output_tokens) == (100, 1)
+        assert result.billed_cost_nanos == 0
+        assert result.estimated_cost_nanos > 0
+        assert result.items[0].settlement is not None
+        assert result.items[0].settlement.authority == "local_estimate"
+
+        projection = await storage.get_turn_usage_projection(
+            session_id="subtotal-session", session_epoch=0, turn_id="subtotal-turn",
+        )
+        assert projection is not None
+        assert (projection["input_tokens"], projection["output_tokens"]) == (100, 1)
+        assert projection["billed_cost"] == 0
+        assert projection["has_billed_component"] is False
+        assert projection["has_estimated_component"] is True
+        assert projection["cost_usd"] == pytest.approx(
+            result.estimated_cost_nanos / 1_000_000_000,
+        )
+        assert projection["coverage_status"] == "usage_unknown"
+        assert projection["usage_unknown"] is True
+        assert projection["missing_cost_entries"] > 0
+        assert projection["cost_source"] == "mixed"
+        projections = await storage.get_turn_usage_projections(
+            session_id="subtotal-session", session_epoch=0, turn_ids=["subtotal-turn"],
+        )
+        assert projections["subtotal-turn"] == projection
+        assert streams[0].closed
+    finally:
+        await storage.close()
+
+
 @pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.ReadError, None])
 @pytest.mark.parametrize("usage", [{}, {"prompt_tokens": 15}, {
     "prompt_tokens": 15, "completion_tokens": 4,
