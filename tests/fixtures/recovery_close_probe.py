@@ -108,6 +108,12 @@ async def scenario(directory: Path, fallback: bool, delay: float, fault: str) ->
         legacy_reader.close = observed_legacy_close
         close = asyncio.create_task(storage.close())
         await closing_started.wait()
+        if fault == "skip-drain":
+            # Close may shield native operations in child tasks. Wait for the
+            # observed physical close boundary rather than assuming that the
+            # parent close task has finished in this scheduler turn.
+            await close
+            raise AssertionError("skipping native drain was not detected")
         if close.done():
             await close  # Surface a deliberate ordering violation immediately.
         assert pool._closed and not close.done()

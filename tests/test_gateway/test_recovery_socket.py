@@ -21,7 +21,7 @@ from opensquilla.gateway import rpc_sessions, rpc_transport, session_streams, we
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
 from opensquilla.gateway.protocol import MAX_PAYLOAD_BYTES
 from opensquilla.gateway.rpc import get_dispatcher
-from opensquilla.gateway.transport_flow import get_transport_budget
+from opensquilla.gateway.transport_flow import FLOW_WINDOW_FRAMES, get_transport_budget
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
 
@@ -309,13 +309,20 @@ async def test_v2_recovery_hands_off_continuing_output_without_loss_over_real_so
                     }],
                 })
 
-            # Withhold ACKs: the ninth event exceeds the real negotiated lane.
+            # Ordinary short bursts no longer exhaust an eight-frame lane.
             for index in range(9):
                 await emit(f"burst-{index}|")
-            notice = await receive(event="transport.flow.dirty")
-            assert key_a in notice["payload"]["dirty_keys"]
-            assert len(stream_frames(key_a)) == 8
+            while len(stream_frames(key_a)) < 9:
+                await receive()
+            assert len(stream_frames(key_a)) == 9
+            assert not conn._flow.dirty
             await ack("ack-burst", key_a, stream_frames(key_a)[-1]["meta"]["flow"]["delivery_id"])
+            # Model a consumer asking for an authoritative base explicitly;
+            # a healthy nine-frame burst must not manufacture a dirty event.
+            await request("consumer-dirty", "transport.flow.update", {
+                "delivery_epoch": conn._flow.epoch, "ack_delivery_id": 0,
+                "dirty_keys": [key_a],
+            })
 
             part = await request("snapshot-a", "sessions.messages.snapshot.read", {
                 "key": key_a, "sync_revision": "one-continuing-recovery",
@@ -331,8 +338,10 @@ async def test_v2_recovery_hands_off_continuing_output_without_loss_over_real_so
                 "connection_epoch": part["delivery"]["delivery_epoch"],
                 "staged_recovery": [part["delivery"]],
             })
-            # Freeze a multi-batch original replay target, then keep advancing it.
-            for index in range(9):
+            # Freeze more than two real windows, then keep producing beyond
+            # the 500-event raw cache while the finite proof is consumed.
+            replay_count = FLOW_WINDOW_FRAMES * 2 + 17
+            for index in range(replay_count):
                 await emit(f"replay-{index}|")
             receipt = {
                 **{name: part[name] for name in (
@@ -341,8 +350,11 @@ async def test_v2_recovery_hands_off_continuing_output_without_loss_over_real_so
                 "stream_seq": part["current_stream_seq"],
             }
             proof = await request("resume-a", "sessions.messages.resume", receipt)
-            assert proof["replay_to_seq"] == 18
-            for index in range(8):
+            assert proof["replay_to_seq"] == 9 + replay_count
+            for index in range(601):
+                await emit(f"owned-tail-{index}|")
+            assert sum(len(queue) for queue in conn._pending_flow.values()) == 601
+            for index in range(3):
                 pending = conn._pending_replays.get(key_a)
                 if pending is None:
                     break
@@ -356,6 +368,16 @@ async def test_v2_recovery_hands_off_continuing_output_without_loss_over_real_so
             assert conn.installed_snapshot_proof(receipt) == proof
             assert conn._flow.deliveries, "the handoff tail is owned, not falsely ACKed"
             await emit("after-handoff|")
+            # Real ACKs, not an idle producer, release successive FIFO windows.
+            for index in range(8):
+                lane_ids = [
+                    delivery_id for delivery_id, delivery in conn._flow.deliveries.items()
+                    if delivery.lane == key_a
+                ]
+                if not lane_ids:
+                    break
+                await ack(f"ack-tail-{index}", key_a, max(lane_ids))
+            assert not conn._pending_flow
             await client.send(json.dumps({"type": "ping", "nonce": "tail-sent"}))
             await receive(type="pong", nonce="tail-sent")
             assert key_a not in conn._flow.dirty
@@ -374,12 +396,10 @@ async def test_v2_recovery_hands_off_continuing_output_without_loss_over_real_so
             assert streams.live_snapshot(key_a).task_id == "active-continuing"
             assert calls.count("sessions.messages.snapshot.read") == 1
             assert calls.count("sessions.messages.resume") == 1
-            for label, key in (("a", key_a), ("b", key_b)):
-                await ack(
-                    f"ack-final-{label}",
-                    key,
-                    stream_frames(key)[-1]["meta"]["flow"]["delivery_id"],
-                )
+            await ack(
+                "ack-final-b", key_b,
+                stream_frames(key_b)[-1]["meta"]["flow"]["delivery_id"],
+            )
             assert not conn._flow.deliveries
     finally:
         server.should_exit = True

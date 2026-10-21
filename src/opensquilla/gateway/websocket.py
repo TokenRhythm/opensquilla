@@ -185,9 +185,9 @@ _InstalledFlowReceipt = tuple[Any, Any, Any, Any, Any, _SnapshotIdentity]
 class _PendingReplay:
     """Connection-owned replay cursor for one snapshot installation.
 
-    A snapshot is not authoritative until every bounded replay batch has been
-    consumed and acknowledged by the client.  Keeping one cursor per key is
-    what prevents a large A replay from occupying the only control turn for B.
+    The frozen replay ends at replay_to_seq. Its logical batches may be in
+    flight together under the shared flow credit. Later live output belongs
+    to the charged lane FIFO, which cannot publish until this proof is ACKed.
     """
 
     key: str
@@ -199,8 +199,6 @@ class _PendingReplay:
     # Raw cursor includes capability-filtered events; the frozen public proof
     # contains only the original visible consumption target.
     replay_to_seq: int
-    catching_up: bool = False
-    catchup_logged: bool = False
     batch_index: int = 0
     batch_offset: int = 0
     pending_delivery_ids: set[int] = field(default_factory=set)
@@ -609,6 +607,27 @@ class WsConnection:
             self.add_transport_cleanup(self._snapshot_registry.close)
         return self._snapshot_registry
 
+    def admit_snapshot(
+        self, key: str, revision: str, lease_token: object | None,
+        *, is_current: Callable[[], bool],
+    ) -> SnapshotTransfer:
+        previous = self._pending_replays.get(key)
+        try:
+            transfer = self.snapshot_registry().admit(
+                key, revision, lease_token, is_current=is_current,
+            )
+        except Exception:
+            # Admission may retire the old transfer before discovering that
+            # all retained slots are occupied. Its already-closed replay must
+            # not survive to turn the next ACK into an unsolicited failure.
+            if previous is not None and previous.transfer.closed:
+                self._cancel_pending_replay(previous, "snapshot_replaced")
+            raise
+        pending = self._pending_replays.get(key)
+        if pending is not None and pending.transfer is not transfer:
+            self._cancel_pending_replay(pending, "snapshot_replaced")
+        return transfer
+
     def _snapshot_piece_staged(self, delivery: Any) -> None:
         if delivery.owner is not None and delivery.publication == "original":
             delivery.owner.stage_piece(delivery.segment_index)
@@ -893,15 +912,8 @@ class WsConnection:
             raise ValueError("Snapshot installation is not current")
         return transfer.identity
 
-    def _finish_pending_replay(self, pending: _PendingReplay, *, handoff: bool = False) -> None:
-        """Install the consumed base and atomically hand off its ordered tail.
-
-        New output is not a new loss. After the original target is consumed,
-        catch up from the raw cursor without reopening the snapshot. The final
-        bounded suffix may enter the ordinary delivery ledger before its ACK:
-        it is FIFO-owned output after the frozen proof, never claimed consumed.
-        """
-        from opensquilla.gateway.replay_batches import plan_replay_batches
+    def _finish_pending_replay(self, pending: _PendingReplay) -> None:
+        """Install the consumed finite proof and unblock its owned live FIFO."""
         from opensquilla.gateway.session_streams import get_session_streams
         from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
 
@@ -912,46 +924,22 @@ class WsConnection:
         if (
             flow.dirty_revision(key) != pending.dirty_revision
             or pending.transfer.closed
+            or get_session_streams().stream_generation != pending.params["stream_generation"]
             or self._subscriptions is None
             or pending.transfer.lease_token != self._subscriptions.get_message_subscription_token(
                 self.conn_id, key,
             )
         ):
             raise SnapshotTransferError("SNAPSHOT_STALE")
-        replay = get_session_streams().replay(
-            key, pending.replay_to_seq, pending.params["stream_generation"],
-        )
-        if not replay.replay_complete:
-            raise SnapshotTransferError("SNAPSHOT_STALE")
-        try:
-            batches = plan_replay_batches(
-                replay.events, start_seq=pending.replay_to_seq,
-                current_seq=replay.current_stream_seq,
-            )
-        except (TypeError, ValueError) as exc:
-            raise SnapshotTransferError("SNAPSHOT_STALE") from exc
-        if batches:
-            # A multi-batch catch-up may have accumulated another suffix
-            # while earlier batches were consumed. Keep the just-queued last
-            # batch owned until its ACK, then plan that newer contiguous tail.
-            if handoff:
-                return
-            pending.batches = batches
-            pending.batch_index = pending.batch_offset = 0
-            pending.replay_to_seq = replay.current_stream_seq
-            pending.catching_up = True
-            if not pending.catchup_logged:
-                pending.catchup_logged = True
-                self._log_session_recovery("catching_up", key, "output_advanced", pending=pending)
-            self._queue_pending_replay_batch(pending)
+        if pending.pending_delivery_ids or pending.batch_index < len(pending.batches):
             return
         watermark = flow.dirty.get(key)
         if watermark is not None and (
             watermark[0] not in (None, pending.params["stream_generation"])
             or watermark[1] > pending.replay_to_seq
         ):
-            # A dirty cursor not represented by this contiguous stream cannot
-            # be covered by the suffix handoff.
+            # Only the frozen proof is claimed consumed. A later invalidation
+            # cannot be repaired by merely owning unsent live output.
             raise SnapshotTransferError("SNAPSHOT_STALE")
         flow.dirty.pop(key, None)
         if self._subscriptions is not None:
@@ -968,12 +956,14 @@ class WsConnection:
         self._resume_proofs.move_to_end(key)
         while len(self._resume_proofs) > FLOW_WINDOW_FRAMES:
             self._resume_proofs.popitem(last=False)
+        has_tail = any(owner[0] == key and queue for owner, queue in self._pending_flow.items())
         self._pending_replays.pop(key, None)
         pending.transfer.close()
         self._clear_covered_global_flow()
         self._log_session_recovery(
-            "installed", key, "tail_handoff" if handoff else "replay_consumed", pending=pending,
+            "installed", key, "tail_handoff" if has_tail else "replay_consumed", pending=pending,
         )
+        self._drain_pending_flow()
 
     def _prepare_replay_suffix(
         self, pending: _PendingReplay, *, lane_epoch: str | None,
@@ -1017,7 +1007,7 @@ class WsConnection:
         return prepared
 
     def _queue_pending_replay_batch(self, pending: _PendingReplay) -> None:
-        """Publish one owned byte segment, then wait for all of its ACKs."""
+        """Pipeline the finite replay under real shared credit, not batch ACKs."""
         from opensquilla.gateway.session_streams import get_session_streams
         from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
 
@@ -1035,8 +1025,6 @@ class WsConnection:
             or get_session_streams().stream_generation != pending.params["stream_generation"]
         ):
             raise SnapshotTransferError("SNAPSHOT_STALE")
-        if pending.pending_delivery_ids:
-            return
         if self._outbox is None:
             raise SnapshotTransferError("SNAPSHOT_BUSY")
         lane_epoch = (
@@ -1092,50 +1080,48 @@ class WsConnection:
             if prepared and not frames:
                 # Another lane or an earlier physical write still owns the
                 # shared credit. ACK/writer drain will retry this same suffix.
-                if capacity and flow.last_rejection_reason != "connection_window_exhausted":
+                if (
+                    capacity and flow.last_rejection_reason != "connection_window_exhausted"
+                    and not (
+                        flow.last_rejection_reason == "transport_reservation_rejected"
+                        and flow.deliveries
+                    )
+                ):
                     raise SnapshotTransferError("SNAPSHOT_BUSY")
                 return
             # Every admitted frame has its pending owner before the first
             # frame becomes visible to the writer. Never replay an ACKed prefix.
-            pending.pending_delivery_ids = delivery_ids
-            pending.pending_delivery_lanes = delivery_lanes
+            pending.pending_delivery_ids.update(delivery_ids)
+            pending.pending_delivery_lanes.update(delivery_lanes)
             pending.batch_offset = next_offset
             if next_offset == len(batch):
                 pending.batch_index += 1
                 pending.batch_offset = 0
             for frame in frames:
                 self._enqueue_frame(frame)
-            if delivery_ids:
-                if (
-                    pending.catching_up
-                    and pending.batch_index == len(pending.batches)
-                    and sum(
-                        not item.recovery and (
-                            not self._flow_lane_enabled
-                            or (item.lane == pending.key and item.lane_epoch == lane_epoch)
-                        )
-                        for item in flow.deliveries.values()
-                    ) < FLOW_WINDOW_FRAMES
-                ):
-                    # All of the new suffix is reserved and queued, with at
-                    # least one frame of headroom for the continuing live
-                    # stream. Keep these frames in normal ACK accounting.
-                    self._finish_pending_replay(pending, handoff=True)
+            if next_offset < len(batch):
+                # The physical byte/queue budget, rather than the logical
+                # batch boundary, determines when publication has to wait.
                 return
-            # A projection-empty batch has no client consumption to await.
+            # Continue across logical batches while shared credit is available.
         self._finish_pending_replay(pending)
 
     def _advance_pending_replays(self) -> None:
-        """Advance every key whose current batch has crossed the ACK watermark."""
+        """Retire consumed receipts and refill each finite replay's credit."""
         flow = self._flow
         if flow is None:
             return
         for pending in tuple(self._pending_replays.values()):
             # Cumulative ACKs retire deliveries from the ledger, so the only
             # stable test after acknowledge() is the scalar watermark.
-            if pending.pending_delivery_ids and max(pending.pending_delivery_ids) > flow.ack_id:
-                continue
-            pending.pending_delivery_ids.clear()
+            pending.pending_delivery_ids = {
+                delivery_id for delivery_id in pending.pending_delivery_ids
+                if delivery_id > flow.ack_id
+            }
+            pending.pending_delivery_lanes = {
+                delivery_id: lane for delivery_id, lane in pending.pending_delivery_lanes.items()
+                if delivery_id in pending.pending_delivery_ids
+            }
             try:
                 self._queue_pending_replay_batch(pending)
             except Exception as exc:
@@ -1184,8 +1170,6 @@ class WsConnection:
                 for delivery_id in remaining
                 if delivery_id in pending.pending_delivery_lanes
             }
-            if remaining:
-                continue
             try:
                 self._queue_pending_replay_batch(pending)
             except Exception as exc:
@@ -1731,7 +1715,7 @@ class WsConnection:
                         raise SnapshotTransferError("SNAPSHOT_EXPIRED")
                 else:
                     existing_transfer = registry.get(key, params["sync_revision"])
-                    operation.transfer = registry.admit(
+                    operation.transfer = self.admit_snapshot(
                         key, params["sync_revision"], operation.subscription_token,
                         is_current=current,
                     )
@@ -1816,16 +1800,38 @@ class WsConnection:
             return False
         return True
 
+    def _cancel_pending_replay(self, pending: _PendingReplay, reason: str) -> None:
+        """Retire an explicit read owner without manufacturing a replay failure."""
+        key = pending.key
+        if self._pending_replays.get(key) is not pending:
+            return
+        self._pending_replays.pop(key, None)
+        self._discard_pending_flow(key)
+        if self._flow is not None:
+            # A cancelled proof cannot authorize later live deltas. Its caller
+            # is already closing/replacing the read, so retain the barrier
+            # without issuing another unsolicited recovery request.
+            self._flow.mark_dirty(key)
+        pending.transfer.close()
+        self._log_session_recovery("cancelled", key, reason, pending=pending)
+
     def retire_snapshot(self, key: str, revision: str, snapshot_id: str | None = None) -> None:
         proof = self._resume_proofs.get(key)
         if proof is not None and proof["sync_revision"] == revision and (
             snapshot_id is None or proof["snapshot_id"] == snapshot_id
         ):
             self._resume_proofs.pop(key, None)
+        pending = self._pending_replays.get(key)
+        retiring_transfer = None
+        if pending is not None and pending.params["sync_revision"] == revision and (
+            snapshot_id is None or pending.params["snapshot_id"] == snapshot_id
+        ):
+            retiring_transfer = pending.transfer
+            self._cancel_pending_replay(pending, "snapshot_released")
         registry = self._snapshot_registry
         if registry is None:
             return
-        transfer = registry.get(key, revision, snapshot_id)
+        transfer = retiring_transfer or registry.get(key, revision, snapshot_id)
         if transfer is not None:
             registry.release(key, revision, snapshot_id)
             for operation in tuple(self._recovery_operations.values()):
@@ -1837,10 +1843,10 @@ class WsConnection:
     ) -> dict[str, Any]:
         """Start a bounded replay installation.
 
-        The snapshot body is already staged by the caller. Replay is queued
-        in batches of at most eight; only the final batch ACK publishes the
-        flow/CAS proof. Repeated resume calls during the same installation
-        return the same proof without duplicating frames.
+        The snapshot body is already staged by the caller. Logical batches
+        pipeline under shared credit; consuming the finite target publishes
+        the flow/CAS proof and releases the owned live FIFO. Repeated resume
+        calls return the same proof without duplicating frames.
         """
         from opensquilla.gateway.replay_batches import plan_replay_batches
         from opensquilla.gateway.session_streams import get_session_streams
@@ -1910,14 +1916,22 @@ class WsConnection:
             dirty_revision=dirty_revision,
             batches=replay_batches, proof=proof, replay_to_seq=replay.current_stream_seq,
         )
-        # Keep the barrier installed while the client consumes replay. The
-        # replay metadata is the sole path that may pass this barrier.
+        # Queued output through this raw cursor is represented by the frozen
+        # replay. Later live frames receive a new, charged FIFO owner below.
+        replaced_queued_output = any(
+            owner[0] == key and queue for owner, queue in self._pending_flow.items()
+        )
+        self._discard_pending_flow(key)
+        # Keep the barrier until the finite proof is consumed. Live frames
+        # beyond its cursor are retained, never replayed from a mutable cache.
         self._pending_replays[key] = pending
         self._log_session_recovery("started", key, "snapshot_resume", pending=pending)
         try:
             self._queue_pending_replay_batch(pending)
         except Exception:
             self._pending_replays.pop(key, None)
+            if pending.pending_delivery_ids or replaced_queued_output:
+                self._mark_flow_dirty({"session_key": key}, reason_code="replay_publication_failed")
             raise
         return dict(proof)
 
@@ -2602,13 +2616,27 @@ class WsConnection:
                 frame.payload, "key"
             )
             replay_frame = bool((frame.meta or {}).get("replayed"))
-            if is_stream and not replay_frame and (
+            pending_replay = self._pending_replays.get(key) if isinstance(key, str) else None
+            if is_stream and not replay_frame and pending_replay is not None:
+                sequence = _payload_field(frame.payload, "stream_seq")
+                generation = _payload_field(frame.payload, "stream_generation")
+                if (
+                    generation != pending_replay.params["stream_generation"]
+                    or not isinstance(sequence, int) or isinstance(sequence, bool)
+                ):
+                    self._mark_flow_dirty(frame.payload, reason_code="replay_tail_identity_changed")
+                    return False
+                if sequence <= pending_replay.replay_to_seq:
+                    # This ordinary publication was already captured by the
+                    # finite proof and must not be repeated after handoff.
+                    return False
+                # New output is owned by the ordinary charged FIFO. Its lane
+                # is blocked below until the proof ACK releases the barrier.
+            elif is_stream and not replay_frame and (
                 key in self._flow.dirty or self._flow_key_needs_global_recovery(key)
-                or key in self._pending_replays
             ):
                 # The existing barrier already owns these intentionally
-                # suppressed deltas. An in-progress clean snapshot also owns
-                # this tail: normal publication must not overtake its replay.
+                # suppressed deltas until a snapshot accepts a finite proof.
                 prior = self._flow.dirty.get(key)
                 sequence = _payload_field(frame.payload, "stream_seq")
                 generation = _payload_field(frame.payload, "stream_generation")
@@ -2799,8 +2827,9 @@ class WsConnection:
                 replayed = bool((frame.meta or {}).get("replayed"))
                 if (
                     (not replayed and (
-                        key in flow.dirty or self._flow_key_needs_global_recovery(key)
-                        or key in self._pending_replays
+                        key not in self._pending_replays and (
+                            key in flow.dirty or self._flow_key_needs_global_recovery(key)
+                        )
                     ))
                     or (
                         self._session_flow_v2_enabled and self._subscriptions is not None
@@ -2813,6 +2842,16 @@ class WsConnection:
                     if self._pending_large_owner == owner:
                         self._pending_large_owner = None
                     blocked = 0
+                    continue
+                if not replayed and key in self._pending_replays:
+                    # The finite replay owns this lane until its proof ACK.
+                    # Keep its new tail charged and let other lanes progress.
+                    if self._pending_large_owner == owner:
+                        self._pending_large_owner = None
+                    self._pending_flow.move_to_end(owner)
+                    blocked += 1
+                    if blocked >= len(self._pending_flow):
+                        break
                     continue
                 try:
                     ordinary = [item for item in flow.deliveries.values() if not item.recovery]
@@ -3038,8 +3077,6 @@ class WsConnection:
         if self._outbox is None:
             return
         if self._flow is not None:
-            if frame.classification == "lossy" and self._outbox.full():
-                return
             try:
                 if not self._prepare_flow_frame(frame):
                     return

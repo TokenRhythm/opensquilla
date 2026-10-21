@@ -158,10 +158,10 @@ async def test_snapshot_recovery_converges_when_nine_events_arrive_before_instal
 
 @pytest.mark.parametrize("event_count, expected_batches", [(8, 1), (9, 2), (17, 3), (33, 5)])
 @pytest.mark.parametrize("first_delivery_id", [1, 1_000_000_000])
-async def test_replay_batches_advance_only_after_cumulative_ack(
+async def test_replay_logical_batches_pipeline_before_cumulative_ack(
     connection, event_count, expected_batches, first_delivery_id,
 ):
-    """Each bounded replay batch must be ACKed before the next is published."""
+    """Logical batches share the physical window instead of waiting on each ACK."""
     connection._flow.next_id = first_delivery_id
     connection._flow.ack_id = first_delivery_id - 1
     key = f"agent:main:batch-ack-{event_count}"
@@ -178,6 +178,7 @@ async def test_replay_batches_advance_only_after_cumulative_ack(
 
     pending = connection._pending_replays[key]
     assert len(pending.batches) == expected_batches
+    assert len(pending.pending_delivery_ids) == event_count
     observed = 1
     while key in connection._pending_replays:
         pending = connection._pending_replays[key]
@@ -195,7 +196,7 @@ async def test_replay_batches_advance_only_after_cumulative_ack(
         if key in connection._pending_replays:
             observed += 1
             assert observed <= expected_batches
-    assert observed == expected_batches
+    assert observed == 1
     assert key not in connection._flow.dirty
     assert connection.installed_snapshot_proof(receipt(payload)) is not None
 
@@ -282,7 +283,7 @@ async def test_pending_resume_retry_preserves_replay_owner_and_batch_progress(
         assert update.ok, update.error
         batch_count += 1
         assert batch_count <= 3
-    assert batch_count == 3
+    assert batch_count == 1
     assert conn.installed_snapshot_proof(receipt(payload)) == first.payload
     replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
     assert len(replayed) == 17
@@ -388,14 +389,15 @@ async def test_replay_queue_capacity_segments_before_publication(resumable_conne
     response = await request(conn, "sessions.messages.resume", receipt(payload))
     assert response.ok, response.error
     pending = conn._pending_replays[key]
-    for index in range(3):
-        assert len(pending.pending_delivery_ids) == 1
-        assert set(conn._flow.deliveries) == pending.pending_delivery_ids
-        assert conn.installed_snapshot_proof(receipt(payload)) is None
-        assert (pending.batch_index, pending.batch_offset) == (
-            (0, index + 1) if index < 2 else (1, 0)
-        )
-        await ack_replay(conn, pending.pending_delivery_ids)
+    assert len(pending.pending_delivery_ids) == 1
+    assert (pending.batch_index, pending.batch_offset) == (0, 1)
+    # Dequeue restores physical queue capacity even before an ACK. It must
+    # publish the remaining finite proof under the available flow credit.
+    await asyncio.sleep(0.05)
+    assert len(pending.pending_delivery_ids) == 3
+    assert set(conn._flow.deliveries) == pending.pending_delivery_ids
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+    await ack_replay(conn, set(pending.pending_delivery_ids))
     assert key not in conn._pending_replays
     assert conn.installed_snapshot_proof(receipt(payload)) == response.payload
     replayed = [frame for frame in conn.ws.frames if frame.get("meta", {}).get("replayed")]
@@ -537,6 +539,36 @@ async def test_replay_prevalidates_suffix_before_first_reservation(
     assert not any(frame.get("meta", {}).get("replayed") for frame in conn.ws.frames)
 
 
+async def test_failed_first_replay_publication_fences_replaced_queued_output(
+    resumable_connection, monkeypatch,
+):
+    from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
+
+    conn = resumable_connection
+    key = "agent:main:failed-replay-ownership-transfer"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    # Hold ordinary drain as if the writer window were occupied. The queued
+    # frame is the only charged owner until snapshot installation replaces it.
+    monkeypatch.setattr(conn, "_drain_pending_flow", Mock())
+    live = get_session_streams().record(key, "session.event.text_delta", {"text": "queued"})
+    await conn.send_event("session.event.text_delta", live)
+    assert conn._pending_flow and not conn._flow.dirty
+    monkeypatch.setattr(conn, "_prepare_replay_suffix", Mock(
+        side_effect=SnapshotTransferError("SNAPSHOT_BUSY"),
+    ))
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert not result.ok and result.error.code == "SNAPSHOT_BUSY"
+    assert not conn._pending_flow and not conn._pending_replays
+    assert not conn._flow.deliveries and key in conn._flow.dirty
+    live = get_session_streams().record(key, "session.event.text_delta", {"text": "after-failure"})
+    await conn.send_event("session.event.text_delta", live)
+    await asyncio.sleep(0.01)
+    assert not any(frame.get("event") == "session.event.text_delta" for frame in conn.ws.frames)
+    assert conn._transport_bytes == 0
+
+
 @pytest.mark.parametrize("size, accepted", [(300_000, True), (1_048_576, True), (5_000_000, True)])
 async def test_v2_replay_singleton_uses_connection_window_with_large_frame_exception(
     v2_connection, size, accepted,
@@ -576,7 +608,7 @@ async def test_pending_resume_retry_does_not_bypass_new_dirty_barrier(resumable_
 
 @pytest.mark.parametrize("suffix_count", [1, 8, 17])
 @pytest.mark.parametrize("initially_dirty", [False, True])
-async def test_replay_catches_up_and_hands_off_while_output_continues(
+async def test_replay_hands_off_owned_fifo_while_output_continues(
     resumable_connection, monkeypatch, suffix_count, initially_dirty,
 ):
     from opensquilla.gateway import session_streams
@@ -609,8 +641,7 @@ async def test_replay_catches_up_and_hands_off_while_output_continues(
         retry = await request(connection, "sessions.messages.resume", receipt(payload))
         assert retry.ok and retry.payload == frozen_proof
         await ack_replay(connection, set(pending.pending_delivery_ids))
-        window = 8 if connection._session_flow_v2_enabled else 128
-        assert len(connection._flow.deliveries) <= window
+        assert len(connection._flow.deliveries) <= 128
     assert key not in connection._pending_replays
     assert key not in connection._flow.dirty
     assert connection.installed_snapshot_proof(receipt(payload)) == frozen_proof
@@ -632,7 +663,248 @@ async def test_replay_catches_up_and_hands_off_while_output_continues(
     assert repeated.ok and repeated.payload == frozen_proof
 
 
-@pytest.mark.parametrize("failure", ["dirty", "generation", "subscription", "deadline", "gap"])
+async def test_replay_refills_partial_credit_and_owns_tail_past_raw_cache_eviction(
+    resumable_connection, monkeypatch,
+):
+    from opensquilla.gateway import session_streams
+    from opensquilla.gateway.transport_flow import FLOW_WINDOW_FRAMES
+
+    conn = resumable_connection
+    streams = session_streams.SessionStreamRegistry(stream_generation="owned-long-tail")
+    monkeypatch.setattr(session_streams, "_session_streams", streams)
+    key = "agent:main:owned-long-tail"
+    subscribe(conn, key)
+    conn._mark_flow_dirty({"session_key": key})
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    target = FLOW_WINDOW_FRAMES * 2 + 17
+    for index in range(target):
+        streams.record(key, "session.event.text_delta", {"text": f"proof-{index}"})
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok, result.error
+    assert result.payload["replay_to_seq"] == target
+    pending = conn._pending_replays[key]
+    original_ids = sorted(pending.pending_delivery_ids)
+    assert len(original_ids) == FLOW_WINDOW_FRAMES
+
+    # Returning half the real window must immediately refill it, even though
+    # the other half of the original replay remains unconsumed.
+    await ack_replay(conn, set(original_ids[:FLOW_WINDOW_FRAMES // 2]))
+    assert len(pending.pending_delivery_ids) == FLOW_WINDOW_FRAMES
+    assert set(original_ids[FLOW_WINDOW_FRAMES // 2:]) <= pending.pending_delivery_ids
+    assert max(pending.pending_delivery_ids) > original_ids[-1]
+
+    async def emit(text):
+        event = streams.record(key, "session.event.text_delta", {"text": text})
+        await conn.send_event("session.event.text_delta", event)
+
+    # The default raw replay cache only retains 500 lossy events. None of
+    # these later frames may be forgotten while the finite proof is consumed.
+    for index in range(601):
+        await emit(f"owned-{index}")
+    assert sum(len(queue) for queue in conn._pending_flow.values()) == 601
+    assert conn._transport_bytes > sum(item.size for item in conn._flow.deliveries.values())
+    replay = Mock(side_effect=AssertionError("handoff must not chase mutable raw history"))
+    monkeypatch.setattr(streams, "replay", replay)
+    await asyncio.sleep(0.01)
+    assert all(
+        frame["payload"]["stream_seq"] <= target for frame in conn.ws.frames
+        if frame.get("event") == "session.event.text_delta"
+    )
+    rounds = 0
+    while key in conn._pending_replays:
+        rounds += 1
+        assert rounds <= 2
+        await emit(f"continuous-proof-{rounds}")
+        await ack_replay(conn, set(pending.pending_delivery_ids))
+    assert conn.installed_snapshot_proof(receipt(payload)) == result.payload
+    assert key not in conn._flow.dirty
+    assert conn._pending_flow and conn._flow.deliveries
+    await emit("after-handoff")
+    for _ in range(8):
+        if not conn._flow.deliveries:
+            break
+        await ack_replay(conn, set(conn._flow.deliveries))
+    assert not conn._pending_flow and not conn._flow.deliveries
+    assert conn._transport_bytes == 0
+    delivered = [
+        frame["payload"]["stream_seq"] for frame in conn.ws.frames
+        if frame.get("event") == "session.event.text_delta"
+    ]
+    assert delivered == list(range(1, streams.current_seq(key) + 1))
+    replay.assert_not_called()
+
+
+async def test_replay_barrier_preserves_full_outbox_tail_and_other_lane_progress(v2_connection):
+    conn = v2_connection
+    key, other = "agent:main:barrier", "agent:main:other-live"
+    subscribe(conn, key)
+    subscribe(conn, other)
+    streams = get_session_streams()
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    for index in range(9):
+        streams.record(key, "session.event.text_delta", {"text": str(index)})
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok
+    pending = conn._pending_replays[key]
+    # All nine proof frames are synchronously enqueued. A full physical
+    # outbox must not drop the next lossy frame before the charged FIFO owns it.
+    original_maxsize = conn._outbox._maxsize
+    conn._outbox._maxsize = conn._outbox.qsize()
+    assert conn._outbox.full()
+    try:
+        live = streams.record(key, "session.event.text_delta", {"text": "held"})
+        await conn.send_event("session.event.text_delta", live)
+        assert sum(len(queue) for queue in conn._pending_flow.values()) == 1
+    finally:
+        conn._outbox._maxsize = original_maxsize
+    live = streams.record(other, "session.event.text_delta", {"text": "other-progress"})
+    await conn.send_event("session.event.text_delta", live)
+    await asyncio.sleep(0.01)
+    assert any(frame.get("payload", {}).get("text") == "other-progress" for frame in conn.ws.frames)
+    assert not any(frame.get("payload", {}).get("text") == "held" for frame in conn.ws.frames)
+    await ack_replay(conn, set(pending.pending_delivery_ids))
+    await asyncio.sleep(0.01)
+    assert any(frame.get("payload", {}).get("text") == "held" for frame in conn.ws.frames)
+    for lane_key in (key, other):
+        ids = {delivery_id for delivery_id, item in conn._flow.deliveries.items()
+               if item.lane == lane_key}
+        await ack_replay(conn, ids)
+    assert not conn._flow.deliveries and not conn._pending_flow
+    assert conn._transport_bytes == 0
+
+
+@pytest.mark.parametrize("retire", ["release", "expired_release", "replacement"])
+async def test_explicit_replay_retirement_discards_tail_without_false_failure(
+    resumable_connection, monkeypatch, retire,
+):
+    from opensquilla.gateway import websocket
+
+    conn = resumable_connection
+    logger = Mock()
+    monkeypatch.setattr(websocket, "log", logger)
+    key = f"agent:main:retire-{retire}"
+    subscribe(conn, key)
+    streams = get_session_streams()
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    streams.record(key, "session.event.text_delta", {"text": "proof"})
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok
+    pending = conn._pending_replays[key]
+    release_params = {name: payload[name] for name in ("key", "sync_revision", "snapshot_id")}
+    live = streams.record(key, "session.event.text_delta", {"text": "owned-tail"})
+    await conn.send_event("session.event.text_delta", live)
+    assert conn._pending_flow
+    bytes_before = conn._transport_bytes
+    replacement = None
+    if retire == "replacement":
+        replacement = await snapshot(conn, key, "successor")
+        await stage(conn, replacement)
+    else:
+        if retire == "expired_release":
+            pending.transfer.deadline = 0
+        released = await request(conn, "sessions.messages.snapshot.release", release_params)
+        assert released.ok, released.error
+    assert key not in conn._pending_replays
+    assert not conn._pending_flow
+    if retire != "replacement":
+        assert conn._transport_bytes < bytes_before
+    # Already published receipts remain owned until a real ACK; closing a
+    # snapshot must not counterfeit consumption or resurrect it on that ACK.
+    assert pending.pending_delivery_ids <= conn._flow.deliveries.keys()
+    await ack_replay(conn, set(pending.pending_delivery_ids))
+    assert key in conn._flow.dirty
+    assert conn.installed_snapshot_proof(receipt(payload)) is None
+    phases = [
+        call.kwargs["phase"] for call in logger.info.call_args_list
+        if call.args == ("gateway.session_recovery",)
+    ]
+    assert phases == ["started", "cancelled"]
+
+    replacement = replacement or await snapshot(conn, key, "successor")
+    if retire != "replacement":
+        await stage(conn, replacement)
+    streams.record(key, "session.event.text_delta", {"text": "new-proof"})
+    next_result = await request(conn, "sessions.messages.resume", receipt(replacement))
+    assert next_result.ok
+    successor = conn._pending_replays[key]
+    released = await request(conn, "sessions.messages.snapshot.release", release_params)
+    assert released.ok and conn._pending_replays[key] is successor
+    await ack_replay(conn, set(successor.pending_delivery_ids))
+    assert key not in conn._flow.dirty
+    assert conn.installed_snapshot_proof(receipt(replacement)) == next_result.payload
+
+
+async def test_busy_replacement_retires_expired_pending_without_false_replay_failure(
+    resumable_connection, monkeypatch,
+):
+    from opensquilla.gateway import websocket
+
+    conn = resumable_connection
+    logger = Mock()
+    monkeypatch.setattr(websocket, "log", logger)
+    key = "agent:main:busy-replacement"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    streams = get_session_streams()
+    streams.record(key, "session.event.text_delta", {"text": "proof"})
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok
+    pending = conn._pending_replays[key]
+    live = streams.record(key, "session.event.text_delta", {"text": "owned-tail"})
+    await conn.send_event("session.event.text_delta", live)
+    assert conn._pending_flow
+    # Expiry frees a retained slot, which other reads may occupy before this
+    # pending installation tries to replace its snapshot. No limits change.
+    registry = conn.snapshot_registry()
+    pending.transfer.deadline = 0
+    retained = [
+        registry.admit(f"agent:main:retained-{index}", "retained", object())
+        for index in range(registry._max_retained)
+    ]
+    failed = await request(conn, "sessions.messages.snapshot.read", {
+        "key": key, "sync_revision": "replacement",
+    })
+    assert not failed.ok and failed.error.code == "SNAPSHOT_BUSY"
+    assert key not in conn._pending_replays and not conn._pending_flow
+    assert key in conn._flow.dirty
+    assert all(not transfer.closed for transfer in retained)
+    assert pending.pending_delivery_ids <= conn._flow.deliveries.keys()
+    await ack_replay(conn, set(pending.pending_delivery_ids))
+    phases = [
+        call.kwargs["phase"] for call in logger.info.call_args_list
+        if call.args == ("gateway.session_recovery",)
+    ]
+    assert phases == ["started", "cancelled"]
+    assert not conn._flow.deliveries and conn._transport_bytes == 0
+
+
+async def test_failed_snapshot_admission_preserves_still_current_replay(resumable_connection):
+    from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
+
+    conn = resumable_connection
+    key = "agent:main:rejected-replacement"
+    subscribe(conn, key)
+    payload = await snapshot(conn, key)
+    await stage(conn, payload)
+    get_session_streams().record(key, "session.event.text_delta", {"text": "proof"})
+    result = await request(conn, "sessions.messages.resume", receipt(payload))
+    assert result.ok
+    pending = conn._pending_replays[key]
+    # A stale caller rejected before retirement has no authority over the
+    # still-live owner, even though it names the same session and revision.
+    with pytest.raises(SnapshotTransferError, match="SNAPSHOT_STALE"):
+        conn.admit_snapshot(key, payload["sync_revision"], object(), is_current=lambda: True)
+    assert conn._pending_replays[key] is pending and not pending.transfer.closed
+    assert key not in conn._flow.dirty
+    await ack_replay(conn, set(pending.pending_delivery_ids))
+    assert conn.installed_snapshot_proof(receipt(payload)) == result.payload
+
+
+@pytest.mark.parametrize("failure", ["dirty", "generation", "subscription", "deadline"])
 async def test_replay_catchup_preserves_recovery_fences(
     resumable_connection, monkeypatch, failure,
 ):
@@ -666,11 +938,6 @@ async def test_replay_catchup_preserves_recovery_fences(
         return
     elif failure == "deadline":
         pending.transfer.deadline = 0
-    else:
-        streams.record(key, "session.event.text_delta", {"text": "missing"})
-        monkeypatch.setattr(streams, "replay", lambda *_: session_streams.ReplayResult(
-            streams.stream_generation, 2, False, [], "synthetic_gap",
-        ))
     await ack_replay(conn, set(pending.pending_delivery_ids))
     assert key in conn._flow.dirty
     assert key not in conn._pending_replays

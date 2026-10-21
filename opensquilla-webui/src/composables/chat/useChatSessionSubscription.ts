@@ -58,6 +58,7 @@ export interface UseChatSessionSubscriptionOptions {
   onStreamGenerationReset?: () => void
   onLiveSnapshot?: (snapshot: SessionReadSnapshot) => void
   onReadStarted?: () => void
+  /** Local projection is ready for events; runs before transport confirmation. */
   onSnapshotInstalled?: () => void
   onReconciliationInstalled?: () => Promise<void>
   onAuthoritativeIdle?: () => void
@@ -406,9 +407,14 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       }
       assertOwnershipSnapshotCurrent(ownershipRevision)
       async function finishInstallation() {
+        // The base/history/metadata are now installed. Release the local event
+        // fence before requesting replay, so each tail frame is rendered and
+        // consumed as it arrives instead of buffering the entire replay proof.
+        options.onSnapshotInstalled?.()
+        live.assertInstalledCurrent?.()
+        if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
         await live.confirmInstalled?.()
         if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
-        options.onSnapshotInstalled?.()
         // Projection/tail application can itself detect loss. Recheck the
         // adapter's exact invalidation fence after that final consumer step.
         live.assertInstalledCurrent?.()

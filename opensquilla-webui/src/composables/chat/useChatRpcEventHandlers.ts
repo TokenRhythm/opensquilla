@@ -237,8 +237,12 @@ type BufferedPendingReplayEntry =
       order: number
     }
 
-const MAX_PENDING_TASK_BUCKETS = 8
-const MAX_PENDING_STREAM_EVENTS_PER_TASK = 64
+// Pending task admission and snapshot installation both own early events.
+// Share one memory budget aligned with the connection's encoded-byte budget;
+// ordinary fast streams must not fail because they contain many tiny deltas.
+const MAX_BUFFERED_EVENT_BYTES = 50 * 1024 * 1024
+const bufferEncoder = new TextEncoder()
+const encodedEventBytes = (value: unknown) => bufferEncoder.encode(JSON.stringify(value)).byteLength
 const MAX_TRACKED_COMMITTED_TURNS = 64
 const TURN_COMMIT_TIMEOUT_MS = 5_000
 const SERVER_CLOCK_TOLERANCE_MS = 5_000
@@ -376,14 +380,39 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const turnActivityLog: TurnActivityRecord[] = []
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
-  let recoveryDirty = false
-  let recoveryFenced = false
-  let recoveryOverflow = false
-  let recoveryRevision = 0
-  const recoveryEvents: ConversationEvent[] = []
-  function markRecoveryDirty() {
+  const pendingTerminalBytes = new Map<string, number>()
+  const pendingStreamBytes = new Map<string, number>()
+  let pendingBytes = 0
+  function clearPendingEvents() {
     pendingTerminalEvents.clear()
     pendingStreamEvents.clear()
+    pendingTerminalBytes.clear()
+    pendingStreamBytes.clear()
+    pendingBytes = 0
+  }
+  function dropPendingTask(taskId: string) {
+    pendingBytes -= (pendingTerminalBytes.get(taskId) ?? 0) + (pendingStreamBytes.get(taskId) ?? 0)
+    pendingTerminalEvents.delete(taskId)
+    pendingStreamEvents.delete(taskId)
+    pendingTerminalBytes.delete(taskId)
+    pendingStreamBytes.delete(taskId)
+  }
+  let recoveryDirty = false
+  let recoveryFenced = false
+  let recoveryFailed = false
+  let recoveryRevision = 0
+  const recoveryEvents: ConversationEvent[] = []
+  let recoveryBytes = 0
+  function clearRecoveryEvents() {
+    recoveryEvents.length = 0
+    recoveryBytes = 0
+  }
+  function markRecoveryDirty() {
+    clearPendingEvents()
+    if (recoveryFenced) {
+      recoveryFailed = true
+      clearRecoveryEvents()
+    }
     if (recoveryDirty) return
     recoveryDirty = true
     options.onRecoveryRequired?.()
@@ -392,16 +421,20 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function beginRecovery() {
     recoveryRevision++
     recoveryFenced = true
-    recoveryOverflow = false
-    recoveryEvents.length = 0
+    recoveryFailed = false
+    clearRecoveryEvents()
   }
 
   function finishRecovery(): boolean {
-    if (recoveryOverflow) return false
+    if (recoveryFailed) return false
     recoveryFenced = false
     recoveryDirty = false
     const buffered = recoveryEvents.splice(0)
-    for (const event of buffered) handleConversationEvent(event)
+    recoveryBytes = 0
+    for (const event of buffered) {
+      handleConversationEvent(event)
+      if (recoveryDirty) return false
+    }
     return !recoveryDirty
   }
 
@@ -411,14 +444,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return 'dirty'
     }
     if (recoveryFenced) {
-      if (!recoveryOverflow && recoveryEvents.length < MAX_PENDING_STREAM_EVENTS_PER_TASK) {
+      if (recoveryFailed) return 'dirty'
+      const bytes = encodedEventBytes(message)
+      if (recoveryBytes + pendingBytes + bytes <= MAX_BUFFERED_EVENT_BYTES) {
         recoveryEvents.push(message)
-        // This bounded buffer owns the event until the snapshot and its tail
-        // are installed. Ordinary progress must not invalidate that snapshot.
+        recoveryBytes += bytes
+        // This buffer owns early events only until the local base is ready.
+        // Subsequent replay is applied directly, before its delivery is ACKed.
         return 'applied'
       } else {
-        recoveryEvents.length = 0
-        recoveryOverflow = true
         markRecoveryDirty()
       }
       return 'dirty'
@@ -668,15 +702,19 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const priority = entry.priority ?? (entry.kind === 'event' ? terminalEventPriority(entry.event) : 1)
     const existing = pendingTerminalEvents.get(taskId)
     if (!existing || priority >= existing.priority) {
-      if (!existing && pendingTerminalEvents.size >= MAX_PENDING_TASK_BUCKETS) {
+      const bufferedEntry = {
+        ...entry, priority,
+        ...(buffersSuccessor ? { replayWithoutSeq: true } : {}),
+      }
+      const bytes = encodedEventBytes(bufferedEntry)
+      const replacedBytes = pendingTerminalBytes.get(taskId) ?? 0
+      if (pendingBytes + recoveryBytes + bytes - replacedBytes > MAX_BUFFERED_EVENT_BYTES) {
         markRecoveryDirty()
         return true
       }
-      pendingTerminalEvents.set(taskId, {
-        ...entry,
-        priority,
-        ...(buffersSuccessor ? { replayWithoutSeq: true } : {}),
-      })
+      pendingBytes += bytes - replacedBytes
+      pendingTerminalBytes.set(taskId, bytes)
+      pendingTerminalEvents.set(taskId, bufferedEntry)
     }
     return true
   }
@@ -687,8 +725,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (taskId) {
       settledTaskIds.add(taskId)
       options.onTaskSettled?.(taskId, payload.epoch)
-      pendingTerminalEvents.delete(taskId)
-      pendingStreamEvents.delete(taskId)
+      dropPendingTask(taskId)
     }
   }
 
@@ -718,20 +755,20 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!buffersPendingAcceptance && !buffersSuccessor) return false
     if (buffersSuccessor && !acceptStreamSeq(payload)) return true
 
-    let buffered = pendingStreamEvents.get(taskId)
-    if (!buffered) {
-      if (pendingStreamEvents.size >= MAX_PENDING_TASK_BUCKETS) {
-        markRecoveryDirty()
-        return true
-      }
-      buffered = []
-      pendingStreamEvents.set(taskId, buffered)
-    }
-    if (buffered.length >= MAX_PENDING_STREAM_EVENTS_PER_TASK) {
+    const entry = { event, payload, replayed, ...(buffersSuccessor ? { replayWithoutSeq: true } : {}) }
+    const bytes = encodedEventBytes(entry)
+    if (pendingBytes + recoveryBytes + bytes > MAX_BUFFERED_EVENT_BYTES) {
       markRecoveryDirty()
       return true
     }
-    buffered.push({ event, payload, replayed, ...(buffersSuccessor ? { replayWithoutSeq: true } : {}) })
+    let buffered = pendingStreamEvents.get(taskId)
+    if (!buffered) {
+      buffered = []
+      pendingStreamEvents.set(taskId, buffered)
+    }
+    buffered.push(entry)
+    pendingBytes += bytes
+    pendingStreamBytes.set(taskId, (pendingStreamBytes.get(taskId) ?? 0) + bytes)
     return true
   }
 
@@ -907,8 +944,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.resetLiveTurnState?.({ preservePendingInterrupts: true })
     clearLiveThinking()
     clearGenerationTracking()
-    pendingTerminalEvents.clear()
-    pendingStreamEvents.clear()
+    clearPendingEvents()
     settledTaskIds.clear()
     pendingSuccessorRenderTaskId = ''
     options.clearPendingRouterDecision()
@@ -988,8 +1024,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // One chat.send response resolves one PENDING window. Drop every other
     // task's early frames so a late prior task can never be consumed by a
     // future send that happens to reuse this session.
-    pendingTerminalEvents.clear()
-    pendingStreamEvents.clear()
+    clearPendingEvents()
     if (settledTaskIds.has(taskId)) {
       activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
       return
@@ -1243,14 +1278,13 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     recoveryRevision++
     recoveryDirty = false
     recoveryFenced = false
-    recoveryOverflow = false
-    recoveryEvents.length = 0
+    recoveryFailed = false
+    clearRecoveryEvents()
     streamThinking.value = null
     clearGenerationTracking()
     turnReasoningLog.length = 0
     turnActivityLog.length = 0
-    pendingTerminalEvents.clear()
-    pendingStreamEvents.clear()
+    clearPendingEvents()
     settledTaskIds.clear()
     clearTurnCommitTracking()
     pendingSuccessorRenderTaskId = ''
@@ -1261,13 +1295,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   watch(activeStreamTaskId, (taskId, previousTaskId) => {
     if (taskId === PENDING_STREAM_TASK_ID) {
       clearGenerationTracking()
-      pendingTerminalEvents.clear()
-      pendingStreamEvents.clear()
+      clearPendingEvents()
       settledTaskIds.clear()
       pendingSuccessorRenderTaskId = ''
     } else if (!taskId || taskId === FINISHED_STREAM_TASK_ID || taskId === STOPPED_STREAM_TASK_ID) {
-      pendingTerminalEvents.clear()
-      pendingStreamEvents.clear()
+      clearPendingEvents()
     } else if (taskId !== previousTaskId) {
       // A concrete task transition starts a fresh generation ledger. The
       // PENDING branch above already clears it before normal chat.send replay;

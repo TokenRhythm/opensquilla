@@ -174,6 +174,7 @@ interface HarnessOptions {
   resetStreamLiveTurnState?: UseChatSessionSubscriptionOptions['resetStreamLiveTurnState']
   onStreamGenerationReset?: UseChatSessionSubscriptionOptions['onStreamGenerationReset']
   onLiveSnapshot?: UseChatSessionSubscriptionOptions['onLiveSnapshot']
+  onSnapshotInstalled?: UseChatSessionSubscriptionOptions['onSnapshotInstalled']
   onAuthoritativeIdle?: UseChatSessionSubscriptionOptions['onAuthoritativeIdle']
   onRunModeLock?: UseChatSessionSubscriptionOptions['onRunModeLock']
   beginSessionMetadataResolution?: UseChatSessionSubscriptionOptions['beginSessionMetadataResolution']
@@ -229,6 +230,7 @@ function harness(
     resetStreamLiveTurnState,
     onStreamGenerationReset: options.onStreamGenerationReset,
     onLiveSnapshot: options.onLiveSnapshot,
+    onSnapshotInstalled: options.onSnapshotInstalled,
     onAuthoritativeIdle,
     onRunModeLock: options.onRunModeLock,
     beginSessionMetadataResolution: options.beginSessionMetadataResolution,
@@ -255,6 +257,38 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it('unfences the installed projection before waiting for the replay consumption proof', async () => {
+    const order: string[] = []
+    const proof = deferred<void>()
+    const confirmInstalled = vi.fn(() => { order.push('confirm'); return proof.promise })
+    const fixture = leaseFixture({ live: live({ confirmInstalled }) })
+    const subject = harness(fixture.lease, {
+      onSnapshotInstalled: () => { order.push('projection') },
+    })
+    try {
+      let settled = false
+      const result = subject.api.reconcileSession().then(value => { settled = true; return value })
+      await vi.waitFor(() => expect(confirmInstalled).toHaveBeenCalledOnce())
+      expect(order).toEqual(['projection', 'confirm'])
+      expect(settled).toBe(false)
+      proof.resolve()
+      await expect(result).resolves.toMatchObject({ authoritative: true })
+    } finally { subject.api.cancelActiveSubscription() }
+  })
+
+  it('does not confirm a projection that rejected its buffered events', async () => {
+    const confirmInstalled = vi.fn(async () => {})
+    const fixture = leaseFixture({ live: live({ confirmInstalled }) })
+    const subject = harness(fixture.lease, {
+      onSnapshotInstalled: () => { throw new SessionReadFailure('busy', 'Invalid buffered events', true) },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: false })
+      expect(confirmInstalled).not.toHaveBeenCalled()
+    } finally { warn.mockRestore(); subject.api.cancelActiveSubscription() }
+  })
+
   it.each([false, true])('preserves reader follow=%s when metadata restores an active task without a live bubble', async follow => {
     const autoScroll = ref(follow)
     const stream = useChatStream({

@@ -2960,7 +2960,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSnapshotInstalled: () => {
     if (!rpcEventHandlers.finishRecovery()) {
-      throw new SessionReadFailure('busy', 'Session recovery buffer overflow; retrying the latest snapshot.', true)
+      throw new SessionReadFailure('busy', 'Session projection could not consume the buffered events; retrying the latest snapshot.', true)
     }
   },
   onAuthoritativeIdle: () => {

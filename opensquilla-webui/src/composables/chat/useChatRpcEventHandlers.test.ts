@@ -3784,18 +3784,53 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 })
 
 describe('useChatRpcEventHandlers ensemble activity', () => {
-  it('marks a 65-event pending-acceptance overflow dirty instead of replaying a truncated tail', () => {
+  it('preserves fast output that arrives before the task acceptance response', () => {
     const onRecoveryRequired = vi.fn()
     const { api, activeStreamTaskId, stream, stop } = createHarness({ onRecoveryRequired })
     try {
       activeStreamTaskId.value = PENDING_STREAM_TASK_ID
-      for (let seq = 1; seq <= 65; seq++) api.handlers.onTextDelta({
-        key: 'agent:main:test', task_id: 'task-overflow', stream_seq: seq, text: String(seq),
+      for (let seq = 1; seq <= 1000; seq++) api.handlers.onTextDelta({
+        key: 'agent:main:test', task_id: 'task-fast', stream_seq: seq, text: String(seq),
       })
-      expect(onRecoveryRequired).toHaveBeenCalledOnce()
-      api.bindActiveStreamTask('task-overflow')
-      expect(stream.appendDelta).not.toHaveBeenCalled()
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+      api.bindActiveStreamTask('task-fast')
+      expect(stream.appendDelta).toHaveBeenCalledTimes(1000)
+      expect(vi.mocked(stream.appendDelta).mock.calls.map(call => call[0]))
+        .toEqual(Array.from({ length: 1000 }, (_, i) => String(i + 1)))
     } finally { stop() }
+  })
+
+  it('selects only the accepted task from many early task identities without a count-based recovery', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      for (let task = 1; task <= 20; task++) h.api.handlers.onTextDelta({
+        key: h.sessionKey.value, task_id: `early-${task}`, stream_seq: task, text: `task ${task}`,
+      })
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+      h.api.bindActiveStreamTask('early-20')
+      expect(h.stream.appendDelta).toHaveBeenCalledExactlyOnceWith('task 20')
+    } finally { h.stop() }
+  })
+
+  it('shares the byte budget between pending admission and recovery instead of silently truncating either', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      const text = 'x'.repeat(2 * 1024 * 1024)
+      for (let sequence = 1; sequence <= 24; sequence++) h.api.handlers.onTextDelta({
+        key: h.sessionKey.value, task_id: 'early', stream_seq: sequence, text,
+      })
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+      h.api.beginRecovery()
+      expect(h.api.consumeConversationEvent({ kind: 'sessions-changed', payload: { key: h.sessionKey.value, text } })).toBe('dirty')
+      expect(h.api.finishRecovery()).toBe(false)
+      expect(onRecoveryRequired).toHaveBeenCalledOnce()
+      h.api.bindActiveStreamTask('early')
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
+    } finally { h.stop() }
   })
 
   it('does not inject a transcript row for an automatically recovered connection', () => {
@@ -4550,15 +4585,58 @@ describe('recovery buffer consumption ownership', () => {
       expect(h.lastStreamSeq.value).toBe(0)
     } finally { h.stop() }
   })
-  it('declares actual overflow dirty and cannot complete installation', () => {
+  it('preserves thousands of small deltas and applies later replay immediately after the base', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.activeStreamTaskId.value = 'task-1'
+      h.api.beginRecovery()
+      for (let sequence = 1; sequence <= 5000; sequence++) {
+        const event = token(sequence)
+        event.event.payload.text = `${sequence},`
+        expect(h.api.consumeConversationEvent(event)).toBe('applied')
+      }
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
+      expect(h.api.finishRecovery()).toBe(true)
+      expect(h.stream.appendDelta).toHaveBeenCalledTimes(5000)
+      expect(vi.mocked(h.stream.appendDelta).mock.calls.map(call => call[0]).join(''))
+        .toBe(Array.from({ length: 5000 }, (_, i) => `${i + 1},`).join(''))
+      expect(h.api.consumeConversationEvent(token(5001))).toBe('applied')
+      expect(h.lastStreamSeq.value).toBe(5001)
+      expect(h.stream.appendDelta).toHaveBeenCalledTimes(5001)
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('bounds retained bytes rather than token count and releases the budget for the next base', () => {
     const onRecoveryRequired = vi.fn()
     const h = createHarness({ onRecoveryRequired })
     try {
       h.api.beginRecovery()
-      for (let sequence = 1; sequence <= 64; sequence++) h.api.consumeConversationEvent(token(sequence))
-      expect(h.api.consumeConversationEvent(token(65))).toBe('dirty')
+      const event = token(1)
+      event.event.payload.text = 'x'.repeat(2 * 1024 * 1024)
+      for (let sequence = 1; sequence <= 24; sequence++) {
+        expect(h.api.consumeConversationEvent(event)).toBe('applied')
+      }
+      expect(h.api.consumeConversationEvent(event)).toBe('dirty')
       expect(onRecoveryRequired).toHaveBeenCalledOnce()
       expect(h.api.finishRecovery()).toBe(false)
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
+      h.api.beginRecovery()
+      expect(h.api.consumeConversationEvent(token(1))).toBe('applied')
+      expect(h.api.finishRecovery()).toBe(true)
+      expect(h.stream.appendDelta).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('does not install a buffer invalidated by a malformed event', () => {
+    const h = createHarness()
+    try {
+      h.api.beginRecovery()
+      h.api.consumeConversationEvent(token(1))
+      expect(h.api.consumeConversationEvent({ kind: 'invalid', error: new Error('invalid frame') })).toBe('dirty')
+      expect(h.api.finishRecovery()).toBe(false)
+      expect(h.stream.appendDelta).not.toHaveBeenCalled()
     } finally { h.stop() }
   })
 })

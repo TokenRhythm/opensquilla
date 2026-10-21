@@ -1060,6 +1060,186 @@ describe('session-flow v2 lane ledger', () => {
     })
   }
 
+  it.each(['rejected', 'dirty', 'timeout'] as const)(
+    'keeps a departing owner credit for retirement instead of recovering its %s consumer', async outcome => {
+      const h = harness(true)
+      const consumer = deferred<'applied' | 'dirty'>()
+      h.consume.mockReturnValueOnce(consumer.promise)
+      h.helloV2()
+      const owner = h.controller.claimLaneOwner('alpha', 7)!
+      laneFrame(h, 1, 'old-alpha')
+      owner.beginRetirement()
+      if (outcome === 'rejected') consumer.reject(new Error('View detached'))
+      if (outcome === 'dirty') consumer.resolve('dirty')
+      laneFrame(h, 2, 'old-alpha')
+      h.dirty()
+      await vi.advanceTimersByTimeAsync(150)
+      expect(h.consume).toHaveBeenCalledTimes(1)
+      expect(h.recover).not.toHaveBeenCalled()
+      expect(h.request).not.toHaveBeenCalled()
+      expect(h.controller.diagnostics.pendingFrames).toBe(2)
+      const retired = owner.completeRetirement({ connection_epoch: EPOCH,
+        subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 2 })
+      await vi.advanceTimersByTimeAsync(0)
+      await retired
+      expect(h.controller.diagnostics.pendingFrames).toBe(0)
+      expect(h.request).toHaveBeenCalledExactlyOnceWith(V2_METHOD, {
+        connection_epoch: EPOCH,
+        discarded_lanes: [{ subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 2 }],
+      }, expect.anything())
+      consumer.resolve('applied')
+      await vi.advanceTimersByTimeAsync(1200)
+      expect(h.recover).not.toHaveBeenCalled()
+    },
+  )
+
+  it('separates old and replacement epochs when the first frame arrives during unsubscribe', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    old.beginRetirement()
+    const replacement = h.controller.claimLaneOwner('alpha', 7)!
+    laneFrame(h, 1, 'old-alpha')
+    laneFrame(h, 2, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(h.consume).not.toHaveBeenCalled()
+    expect(h.recover).not.toHaveBeenCalled()
+    expect(h.request).not.toHaveBeenCalled()
+    const retired = old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 1 })
+    await vi.advanceTimersByTimeAsync(0)
+    await retired
+    expect(h.consume).toHaveBeenCalledExactlyOnceWith('session.event.text_delta', expect.anything(),
+      expect.objectContaining({ session_flow_v2: expect.objectContaining({ subscription_epoch: 'new-alpha' }) }))
+    expect(h.request.mock.calls.some(([, params]) => JSON.stringify(params?.consumed ?? []).includes('old-alpha'))).toBe(false)
+    expect(h.controller.diagnostics.pendingFrames).toBe(0)
+    replacement.beginRetirement()
+    laneFrame(h, 3, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(h.consume).toHaveBeenCalledTimes(1)
+  })
+
+  it('holds an unsent ordinary ACK while draining and restores it if unsubscribe fails', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const owner = h.controller.claimLaneOwner('alpha', 7)!
+    laneFrame(h, 1, 'old-alpha')
+    await Promise.resolve()
+    owner.beginRetirement()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(h.request).not.toHaveBeenCalled()
+    owner.failRetirement()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.request).toHaveBeenCalledExactlyOnceWith(V2_METHOD, {
+      connection_epoch: EPOCH,
+      consumed: [{ subscription_epoch: 'old-alpha', through_delivery_id: 1 }],
+    }, expect.anything())
+    expect(h.recover).not.toHaveBeenCalled()
+  })
+
+  it('keeps a replacement owner active when an obsolete close arrives', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    h.controller.claimLaneOwner('alpha', 7)
+    old.beginRetirement()
+    h.consume.mockRejectedValueOnce(new Error('Active consumer failed'))
+    laneFrame(h, 1, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.consume).toHaveBeenCalledTimes(1)
+    expect(h.recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ keys: ['alpha'] }))
+  })
+
+  it('lets the new owner retire an adopted idempotent subscription, never the superseded owner', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    laneFrame(h, 1, 'same-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    const replacement = h.controller.claimLaneOwner('alpha', 7)!
+    old.beginRetirement()
+    await old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'same-alpha', retire_token: 'obsolete', final_published_id: 1 })
+    expect(h.request.mock.calls.every(([, params]) => !params?.discarded_lanes)).toBe(true)
+    replacement.beginRetirement()
+    laneFrame(h, 2, 'same-alpha')
+    const retired = replacement.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'same-alpha', retire_token: 'current', final_published_id: 2 })
+    await vi.advanceTimersByTimeAsync(0)
+    await retired
+    expect(h.consume).toHaveBeenCalledTimes(1)
+    expect(h.recover).not.toHaveBeenCalled()
+    expect(h.controller.diagnostics.pendingFrames).toBe(0)
+  })
+
+  it('does not let an old recovery retry or retire completion cancel replacement recovery', async () => {
+    const h = harness(true)
+    const recovery = deferred<boolean>()
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    h.consume.mockRejectedValue(new Error('Consumer unavailable'))
+    h.recover.mockReturnValueOnce(recovery.promise)
+    laneFrame(h, 1, 'old-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.recover).toHaveBeenCalledTimes(1)
+    old.beginRetirement()
+    h.controller.claimLaneOwner('alpha', 7)
+    laneFrame(h, 2, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    const retired = old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 1 })
+    recovery.resolve(false)
+    await vi.advanceTimersByTimeAsync(1200)
+    await retired
+    expect(h.recover).toHaveBeenCalledTimes(2)
+    expect(h.controller.diagnostics.pendingFrames).toBe(0)
+    expect(h.request.mock.calls.some(([, params]) => JSON.stringify(params?.consumed ?? []).includes('old-alpha'))).toBe(false)
+    expect(h.request).toHaveBeenLastCalledWith(V2_METHOD, expect.objectContaining({
+      consumed: [{ subscription_epoch: 'new-alpha', through_delivery_id: 2 }],
+    }), expect.anything())
+  })
+
+  it.each(['failed', 'missing-fence', 'wrong-epoch'] as const)(
+    'restores recovery without acknowledging an unproven %s retirement', async outcome => {
+      const h = harness(true)
+      const consumer = deferred<'applied'>()
+      h.helloV2()
+      const owner = h.controller.claimLaneOwner('alpha', 7)!
+      h.consume.mockReturnValueOnce(consumer.promise)
+      h.recover.mockReturnValue(new Promise(() => {}))
+      laneFrame(h, 1, 'old-alpha')
+      owner.beginRetirement()
+      consumer.reject(new Error('Detached'))
+      await vi.advanceTimersByTimeAsync(0)
+      if (outcome === 'failed') owner.failRetirement()
+      else await expect(owner.completeRetirement(outcome === 'missing-fence' ? null : {
+        connection_epoch: EPOCH, subscription_epoch: 'wrong-alpha', retire_token: 'wrong', final_published_id: 1,
+      })).rejects.toThrow('did not prove retirement')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ keys: ['alpha'] }))
+      expect(h.request).not.toHaveBeenCalled()
+      expect(h.controller.diagnostics.pendingFrames).toBe(1)
+    },
+  )
+
+  it('invalidates old local owner handles across connection replacement', async () => {
+    const h = harness(true)
+    h.helloV2()
+    const old = h.controller.claimLaneOwner('alpha', 7)!
+    old.beginRetirement()
+    h.replaceGeneration()
+    h.helloV2()
+    expect(h.controller.claimLaneOwner('alpha', 7)).toBeUndefined()
+    h.controller.claimLaneOwner('alpha', 8)
+    await old.completeRetirement({ connection_epoch: EPOCH,
+      subscription_epoch: 'old-alpha', retire_token: 'old-token', final_published_id: 1 })
+    h.consume.mockRejectedValueOnce(new Error('Current owner failed'))
+    laneFrame(h, 1, 'new-alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ keys: ['alpha'] }))
+    expect(h.request.mock.calls.every(([, params]) => !params?.discarded_lanes)).toBe(true)
+  })
+
   it('immediately coalesces consumption during an in-flight ACK without overlapping requests', async () => {
     const h = harness()
     const first = deferred<unknown>()

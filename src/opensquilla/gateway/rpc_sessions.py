@@ -5478,7 +5478,7 @@ async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcC
                 snapshots = connection.snapshot_registry()
                 transfer = snapshots.get(key, sync_revision, params["snapshot_id"]) if (
                     params.get("snapshot_id") is not None
-                ) else snapshots.admit(key, sync_revision, lease, is_current=current)
+                ) else connection.admit_snapshot(key, sync_revision, lease, is_current=current)
             if transfer is None or transfer.closed:
                 raise SnapshotTransferError("SNAPSHOT_EXPIRED")
         else:
