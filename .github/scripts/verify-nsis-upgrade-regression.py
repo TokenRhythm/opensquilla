@@ -1640,7 +1640,17 @@ class Audit:
         uninstalled = self.run('uninstall-candidate', uninstallers[0], ['/S'], self.short_temp)
         require(uninstalled['exitCode'] == 0, f'Final uninstall failed: {uninstalled["exitCode"]}')
         deadline = time.monotonic() + 60
-        while (self.install / 'OpenSquilla.exe').exists() or installed_registry():
+        while True:
+            try:
+                pending = (self.install / 'OpenSquilla.exe').exists() or installed_registry()
+            except OSError as exc:
+                if getattr(exc, 'winerror', None) != 1018:
+                    raise
+                # NSIS may delete a key while it is being read. Require a fresh,
+                # successful scan before accepting that registration is absent.
+                pending = True
+            if not pending:
+                break
             require(time.monotonic() < deadline, 'Uninstall did not remove executable and registration within 60 seconds')
             time.sleep(0.5)
         self.check_profiles('afterUninstall')
