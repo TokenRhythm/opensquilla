@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tarfile
 import threading
+import urllib.error
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -693,11 +694,144 @@ def test_streaming_download_verifies_size_digest_https_and_reports_progress(
     assert progress[-1] == (len(data), len(data))
 
 
-@pytest.mark.parametrize("failure", ["too-large", "wrong-digest", "http-redirect"])
+@pytest.mark.parametrize("status", [502, 503, 504, 521, 522, 523, 524])
+def test_download_retries_temporary_http_response_before_writing(
+    tmp_path: Path,
+    monkeypatch: Any,
+    caplog: Any,
+    status: int,
+) -> None:
+    data = b"verified artifact"
+    descriptor = _descriptor(size=len(data), sha256=hashlib.sha256(data).hexdigest())
+    destination = tmp_path / "artifact"
+    error_body = io.BytesIO(b"unavailable")
+    calls: list[tuple[str, int]] = []
+    requests: list[Any] = []
+    delays: list[float] = []
+
+    def open_response(request: Any, *, timeout: int) -> _Response:
+        assert not destination.exists()
+        calls.append((request.full_url, timeout))
+        requests.append(request)
+        assert request.get_header("User-agent") == "OpenSquilla-managed-toolchain/1"
+        if len(calls) == 1:
+            request.redirect_dict = {"https://objects.example.invalid/artifact": 4}
+            raise urllib.error.HTTPError(request.full_url, status, "unavailable", None, error_body)
+        assert not hasattr(request, "redirect_dict")
+        assert error_body.closed
+        return _Response(data, content_length=len(data))
+
+    monkeypatch.setattr(manager.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(manager.time, "sleep", delays.append)
+    manager._download(descriptor, destination, None)
+
+    assert calls == [(descriptor.url, 60)] * 2
+    assert requests[0] is not requests[1]
+    assert delays == [2.0]
+    assert destination.read_bytes() == data
+    assert f"status={status} attempt=2 max_attempts=3 backoff_seconds=2" in caplog.text
+    assert descriptor.url not in caplog.text
+
+
+def test_download_http_retries_are_bounded_and_raise_the_last_error(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    descriptor = _descriptor()
+    errors = [
+        urllib.error.HTTPError(descriptor.url, status, "unavailable", None, io.BytesIO())
+        for status in (521, 503, 524)
+    ]
+    calls = 0
+    delays: list[float] = []
+
+    def open_response(*_args: Any, **_kwargs: Any) -> _Response:
+        nonlocal calls
+        calls += 1
+        raise errors[calls - 1]
+
+    monkeypatch.setattr(manager.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(manager.time, "sleep", delays.append)
+    destination = tmp_path / "artifact"
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        manager._download(descriptor, destination, None)
+
+    assert caught.value is errors[-1]
+    assert calls == 3
+    assert delays == [2.0, 5.0]
+    assert all(error.closed for error in errors)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("status", [403, 404, 500])
+def test_download_does_not_retry_other_http_responses(
+    tmp_path: Path,
+    monkeypatch: Any,
+    status: int,
+) -> None:
+    descriptor = _descriptor()
+    error = urllib.error.HTTPError(descriptor.url, status, "rejected", None, io.BytesIO())
+    calls = 0
+
+    def open_response(*_args: Any, **_kwargs: Any) -> _Response:
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr(manager.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(manager.time, "sleep", lambda _delay: pytest.fail("unexpected retry"))
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        manager._download(descriptor, tmp_path / "artifact", None)
+    assert caught.value is error
+    assert error.closed
+    assert calls == 1
+
+
+@pytest.mark.parametrize("failure", ["socket-timeout", "url-error", "stream", "existing-file"])
+def test_download_does_not_retry_transport_stream_or_local_errors(
+    tmp_path: Path,
+    monkeypatch: Any,
+    failure: str,
+) -> None:
+    descriptor = _descriptor()
+    destination = tmp_path / "artifact"
+    calls = 0
+    if failure == "existing-file":
+        destination.write_bytes(b"original")
+    error = urllib.error.URLError("connection failed") if failure == "url-error" else TimeoutError()
+
+    class BrokenStream(_Response):
+        def read(self, _size: int = -1) -> bytes:
+            raise error
+
+    def open_response(*_args: Any, **_kwargs: Any) -> _Response:
+        nonlocal calls
+        calls += 1
+        if failure in {"socket-timeout", "url-error"}:
+            raise error
+        if failure == "stream":
+            return BrokenStream(b"")
+        return _Response(b"x")
+
+    monkeypatch.setattr(manager.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(manager.time, "sleep", lambda _delay: pytest.fail("unexpected retry"))
+    expected_error = FileExistsError if failure == "existing-file" else type(error)
+    with pytest.raises(expected_error):
+        manager._download(descriptor, destination, None)
+    assert calls == 1
+    if failure == "existing-file":
+        assert destination.read_bytes() == b"original"
+
+
+@pytest.mark.parametrize("transient_first", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["too-large", "wrong-digest", "http-redirect", "content-length"]
+)
 def test_streaming_download_fails_closed(
     tmp_path: Path,
     monkeypatch: Any,
     failure: str,
+    transient_first: bool,
 ) -> None:
     data = b"artifact"
     descriptor = _descriptor(size=len(data), sha256=hashlib.sha256(data).hexdigest())
@@ -706,15 +840,28 @@ def test_streaming_download_fails_closed(
         descriptor = replace(descriptor, size=len(data) - 1)
     elif failure == "wrong-digest":
         descriptor = replace(descriptor, sha256="f" * 64)
-    else:
+    elif failure == "http-redirect":
         final_url = "http://objects.example.invalid/artifact"
-    monkeypatch.setattr(
-        manager.urllib.request,
-        "urlopen",
-        lambda *_args, **_kwargs: _Response(data, final_url=final_url),
-    )
+    calls = 0
+    delays: list[float] = []
+
+    def open_response(*_args: Any, **_kwargs: Any) -> _Response:
+        nonlocal calls
+        calls += 1
+        if transient_first and calls == 1:
+            raise urllib.error.HTTPError(descriptor.url, 521, "unavailable", None, io.BytesIO())
+        return _Response(
+            data,
+            final_url=final_url,
+            content_length=len(data) + 1 if failure == "content-length" else None,
+        )
+
+    monkeypatch.setattr(manager.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(manager.time, "sleep", delays.append)
     with pytest.raises(DownloadVerificationError):
         manager._download(descriptor, tmp_path / failure, None)
+    assert calls == (2 if transient_first else 1)
+    assert delays == ([2.0] if transient_first else [])
 
 
 def test_archive_payload_manifest_covers_runtime_tree_and_excludes_own_marker(
@@ -1682,9 +1829,11 @@ def test_auxiliary_assets_are_pinned_receipted_and_runtime_resolvable(
     assert license_path.read_bytes() == license_data
 
 
+@pytest.mark.parametrize("transient_auxiliary_failure", [False, True])
 def test_auxiliary_archive_is_source_verified_manifested_and_reused(
     tmp_path: Path,
     monkeypatch: Any,
+    transient_auxiliary_failure: bool,
 ) -> None:
     from opensquilla.skills.toolchains.registry import AuxiliaryAssetDescriptor
 
@@ -1714,39 +1863,40 @@ def test_auxiliary_archive_is_source_verified_manifested_and_reused(
         archive_member="ffprobe",
     )
     descriptor = replace(
-        _descriptor(size=primary.stat().st_size),
+        _descriptor(
+            size=primary.stat().st_size,
+            sha256=hashlib.sha256(primary.read_bytes()).hexdigest(),
+        ),
         auxiliary_assets=(asset,),
     )
     monkeypatch.setattr(manager.registry, "describe_component", lambda _component: descriptor)
     primary_downloads = 0
     auxiliary_downloads = 0
+    delays: list[float] = []
+    real_sleep = manager.time.sleep
 
-    def fake_primary_download(
-        _descriptor: ToolchainDescriptor,
-        destination: Path,
-        _progress: object,
-        **_kwargs: object,
-    ) -> None:
+    def wait_retry(delay: float) -> None:
+        if delay in (2.0, 5.0):
+            delays.append(delay)
+        else:
+            # Preserve the existing Windows payload-promotion retry delays.
+            real_sleep(delay)
+
+    def open_response(request: Any, *, timeout: int) -> _Response:
         nonlocal primary_downloads
-        primary_downloads += 1
-        shutil.copyfile(primary, destination)
-
-    def fake_pinned_download(
-        _url: str,
-        sha256: str,
-        size: int,
-        destination: Path,
-        _progress: object,
-        **_kwargs: object,
-    ) -> None:
         nonlocal auxiliary_downloads
+        assert timeout == 60
+        if request.full_url == descriptor.url:
+            primary_downloads += 1
+            return _Response(primary.read_bytes(), content_length=descriptor.size)
+        assert request.full_url == asset.url
         auxiliary_downloads += 1
-        assert size == len(auxiliary_archive)
-        assert sha256 == hashlib.sha256(auxiliary_archive).hexdigest()
-        destination.write_bytes(auxiliary_archive)
+        if transient_auxiliary_failure and auxiliary_downloads == 1:
+            raise urllib.error.HTTPError(asset.url, 521, "unavailable", None, io.BytesIO())
+        return _Response(auxiliary_archive, content_length=asset.size)
 
-    monkeypatch.setattr(manager, "_download", fake_primary_download)
-    monkeypatch.setattr(manager, "_download_pinned", fake_pinned_download)
+    monkeypatch.setattr(manager.urllib.request, "urlopen", open_response)
+    monkeypatch.setattr(manager.time, "sleep", wait_retry)
     state_root = tmp_path / "state"
     first = manager.install_component("paper-tex", root=state_root)
     assert first.package_relpath is not None
@@ -1766,7 +1916,8 @@ def test_auxiliary_archive_is_source_verified_manifested_and_reused(
     second = manager.install_component("paper-tex", root=state_root)
     assert second == first
     assert primary_downloads == 1
-    assert auxiliary_downloads == 1
+    assert auxiliary_downloads == (2 if transient_auxiliary_failure else 1)
+    assert delays == ([2.0] if transient_auxiliary_failure else [])
     assert (
         resolve_managed_resource(asset.asset_id, component_id="paper-tex", root=state_root)
         == installed
@@ -1775,7 +1926,7 @@ def test_auxiliary_archive_is_source_verified_manifested_and_reused(
     installed.write_bytes(b"tampered")
     manager.install_component("paper-tex", root=state_root)
     assert primary_downloads == 2
-    assert auxiliary_downloads == 2
+    assert auxiliary_downloads == (3 if transient_auxiliary_failure else 2)
     assert installed.read_bytes() == b"extracted executable"
 
 
