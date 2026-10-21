@@ -18,9 +18,9 @@ from opensquilla.search.types import (
 
 CredentialSource = Literal["configured", "configured_env", "spec_env", "none"]
 
-_GENERAL_TIE_BREAKER = ("bocha", "tavily", "iqs", "brave", "exa", "duckduckgo")
-_TECHNICAL_TIE_BREAKER = ("exa", "bocha", "brave", "tavily", "iqs", "duckduckgo")
-_FRESHNESS_TIE_BREAKER = ("bocha", "tavily", "iqs", "brave", "exa")
+_GENERAL_TIE_BREAKER = ("bocha", "tavily", "iqs", "brave", "exa", "keenable", "duckduckgo")
+_TECHNICAL_TIE_BREAKER = ("exa", "bocha", "brave", "tavily", "iqs", "keenable", "duckduckgo")
+_FRESHNESS_TIE_BREAKER = ("bocha", "tavily", "iqs", "brave", "exa", "keenable")
 
 
 @dataclass(frozen=True)
@@ -53,14 +53,25 @@ class SearchProviderRuntimeConfig:
     use_env_proxy: bool = False
     diagnostics: bool = False
     fallback_policy: str = "off"
+    opt_in: bool = False
 
     @property
     def credential_configured(self) -> bool:
         return bool(self.api_key)
 
     @property
+    def selected(self) -> bool:
+        """Whether an opt-in provider was chosen explicitly or given a key."""
+
+        if not self.opt_in:
+            return True
+        return self.active_provider == self.provider_id or self.credential_configured
+
+    @property
     def available(self) -> bool:
         if not self.runtime_supported:
+            return False
+        if not self.selected:
             return False
         return (not self.requires_api_key) or self.credential_configured
 
@@ -68,6 +79,8 @@ class SearchProviderRuntimeConfig:
     def skipped_reason(self) -> str:
         if not self.runtime_supported:
             return "runtime_unsupported"
+        if not self.selected:
+            return "not_selected"
         if self.requires_api_key and not self.credential_configured:
             return "missing_api_key"
         return ""
@@ -78,7 +91,7 @@ class SearchProviderRuntimeConfig:
             "use_env_proxy": self.use_env_proxy,
             "diagnostics": self.diagnostics,
         }
-        if self.requires_api_key and self.api_key:
+        if self.api_key and (self.requires_api_key or self.env_key):
             kwargs["api_key"] = self.api_key
         return kwargs
 
@@ -126,14 +139,19 @@ class ResolvedSearchRuntime:
         provider = self.provider_config(provider_id)
         if provider.available:
             return
+        if provider.skipped_reason == "not_selected":
+            message = (
+                "Search provider is opt-in; select it as the search provider "
+                "or set its API key to enable it."
+            )
+        elif provider.requires_api_key and not provider.credential_configured:
+            message = "Search API key is not configured."
+        else:
+            message = "Search provider is not supported by this runtime."
         raise SearchProviderError(
             provider=provider_id,
             kind="auth" if provider.requires_api_key else "unknown",
-            message=(
-                "Search API key is not configured."
-                if provider.requires_api_key and not provider.credential_configured
-                else "Search provider is not supported by this runtime."
-            ),
+            message=message,
             retryable=False,
         )
 
@@ -350,6 +368,7 @@ def resolve_search_runtime(
             use_env_proxy=cfg.use_env_proxy,
             diagnostics=cfg.diagnostics,
             fallback_policy=cfg.fallback_policy,
+            opt_in=spec.opt_in,
         )
     return ResolvedSearchRuntime(config=cfg, providers=providers)
 
@@ -365,6 +384,7 @@ def _ensure_builtin_search_providers() -> None:
         "opensquilla.search.providers.tavily",
         "opensquilla.search.providers.brave",
         "opensquilla.search.providers.exa",
+        "opensquilla.search.providers.keenable",
         "opensquilla.search.providers.duckduckgo",
     ):
         importlib.import_module(module_name)
