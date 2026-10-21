@@ -493,9 +493,6 @@
       "exited": "Terminal exited",
       "state": { "starting": "Starting", "running": "Connected", "exited": "Exited", "error": "Unavailable" }
     },
-    "nativePreview": {
-      "capacityReached": "Es sind bereits vier interaktive Vorschauen geöffnet. Kehre zu einer vorhandenen Vorschau zurück oder schließe eine, bevor du eine weitere öffnest."
-    },
     "artifactAnnotation": {
       "start": "Änderung anfordern",
       "stop": "Annotieren beenden",

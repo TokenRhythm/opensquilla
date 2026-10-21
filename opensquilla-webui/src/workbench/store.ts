@@ -19,14 +19,10 @@ const CLOSED_BROWSER_HISTORY_LIMIT = 8
 // Matches the existing Gateway PTY admission limit. Keeping terminals across
 // navigation must not turn a bounded connection into unbounded mounted views.
 const TERMINAL_ITEM_LIMIT = 4
-// Native interactive artifact pages cannot be safely reconstructed yet. Bound
-// new protected preview owners instead of evicting existing user work. This is
-// an admission count, not a heap limit or a cap on adopted browser targets.
-const NATIVE_ARTIFACT_ITEM_LIMIT = 4
 const BROWSER_ITEM_LIMIT = 8
 
 interface WorkbenchAdmissionRejection {
-  reason: 'native-preview-capacity' | 'browser-capacity'
+  reason: 'browser-capacity'
   item: WorkbenchItem
   limit: number
 }
@@ -188,11 +184,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (!existing && item.kind === 'browser' && item.payload.adoptedNativeSurface !== true
       && items.value.filter(candidate => candidate.kind === 'browser').length >= BROWSER_ITEM_LIMIT) {
       return rejectAdmission({ reason: 'browser-capacity', item, limit: BROWSER_ITEM_LIMIT })
-    }
-    if (!existing && item.kind === 'artifact-preview' && item.hostKind === 'native-webcontents'
-      && items.value.filter(candidate => candidate.kind === 'artifact-preview'
-        && candidate.hostKind === 'native-webcontents').length >= NATIVE_ARTIFACT_ITEM_LIMIT) {
-      return rejectAdmission({ reason: 'native-preview-capacity', item, limit: NATIVE_ARTIFACT_ITEM_LIMIT })
     }
     if (item.kind === 'terminal' && !existing
       && items.value.filter(candidate => candidate.kind === 'terminal').length >= TERMINAL_ITEM_LIMIT) return false

@@ -211,6 +211,7 @@ async function createAnnotationDraftHarness(
   workingDocumentId?: string,
   navigatedPage?: string,
   overlayEditorV2 = false,
+  pickerOnly = false,
 ) {
   let currentHead = { ...artifact }
   const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
@@ -394,7 +395,7 @@ async function createAnnotationDraftHarness(
       detail: { url: `${lease.preview_origin}/${navigatedPage}` },
     }, item)
   }
-  await runtime.handleNativeSurfaceEvent?.({
+  if (!pickerOnly) await runtime.handleNativeSurfaceEvent?.({
     version: 3,
     surfaceId: item.id,
     type: 'annotation-selected',
@@ -413,7 +414,7 @@ async function createAnnotationDraftHarness(
     },
   }, item)
   const annotationId = String(showOverlay.mock.calls[0]?.[0].annotationId || '')
-  expect(annotationId).not.toBe('')
+  if (!pickerOnly) expect(annotationId).not.toBe('')
 
   return {
     annotationId,
@@ -758,6 +759,37 @@ describe('artifact Workbench provider', () => {
     expect(harness.updateAnnotation).toHaveBeenCalledOnce()
   })
 
+  it('unlocks a recovered Web fallback after its interrupted draft has finished saving', async () => {
+    const h = await createAnnotationDraftHarness({ ok: true }, false, 'document-1', undefined, true)
+    const body = 'Unsubmitted draft survives leaving this preview.'
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-draft-change',
+      detail: { annotationId: h.annotationId, body },
+    }, h.item)
+    await h.runtime.suspend?.(h.item)
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-cancel',
+      detail: { annotationId: h.annotationId, reason: 'surface-hidden' },
+    }, h.item)
+    await h.runtime.resume?.(h.item)
+    await h.runtime.handleSurfaceRect?.({
+      itemId: h.item.id, x: 300, y: 40, width: 600, height: 500, visible: true,
+    }, h.item)
+    expect(h.renderState.annotationFallback).toMatchObject({ annotationId: h.annotationId, body })
+    expect(h.renderState.annotationBusy).toBe(false)
+    expect(h.renderState.annotationError).toBe('')
+
+    await h.runtime.handleComponentEvent?.({
+      type: 'artifact-annotation-fallback-submit', payload: { annotationId: h.annotationId, body },
+    }, h.item)
+    expect(h.renderState.annotationFallback).toBeNull()
+    expect(h.renderState.annotationBusy).toBe(false)
+    expect(h.completeOverlayEdit).toHaveBeenCalledExactlyOnceWith(h.annotationId)
+    expect(h.createAnnotation).toHaveBeenCalledOnce()
+    expect(h.discardAnnotation).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
   it('keeps the local body and fallback when lifecycle flush fails', async () => {
     vi.useFakeTimers()
     const harness = await createAnnotationDraftHarness({
@@ -792,6 +824,8 @@ describe('artifact Workbench provider', () => {
       'workbench.artifactAnnotation.updateFailed',
       { tone: 'danger' },
     )
+    expect(harness.renderState.annotationBusy).toBe(false)
+    expect(harness.renderState.annotationError).toBe('workbench.artifactAnnotation.updateFailed')
 
     await vi.advanceTimersByTimeAsync(1_000)
     expect(harness.updateAnnotation).toHaveBeenCalledOnce()
@@ -4696,6 +4730,174 @@ describe('working document preview refresh', () => {
       expect(h.destroySurface).not.toHaveBeenCalled()
       expect(h.createSurface).toHaveBeenCalledTimes(1)
     } finally { await h.runtime.dispose?.('closed') }
+  })
+})
+
+describe('native picker state synchronization', () => {
+  const visibleRect = { x: 300, y: 40, width: 600, height: 500, visible: true }
+  const selection = {
+    selectionId: 'after-resume', tagName: 'h1', elementPath: '[["","h1",1]]',
+    targetRef: 'target-focused', rect: { x: 1, y: 2, width: 100, height: 30 },
+  }
+  async function pickerHarness() {
+    return await createAnnotationDraftHarness({ ok: true }, false, undefined, undefined, false, true)
+  }
+  async function state(h: Awaited<ReturnType<typeof pickerHarness>>, reason: string, epoch: number,
+    instance = 'surface-instance-current', enabled = false) {
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-picker-state',
+      detail: { enabled, reason, pickerEpoch: epoch, surfaceInstanceId: instance },
+    }, h.item)
+  }
+
+  it('rearms after lifecycle suspension even when the hidden layout event was coalesced', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await h.runtime.suspend?.(h.item)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.setSurfaceRect).toHaveBeenLastCalledWith(expect.objectContaining({ visible: false }))
+    await h.runtime.resume?.(h.item)
+    await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id }, h.item)
+    expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-selected', detail: { selection },
+    }, h.item)
+    expect(h.createAnnotation).toHaveBeenCalledOnce()
+    expect(h.showOverlay).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('rearms a visible preview when native hidden cancellation arrives after the latest visible rect', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    try {
+      // Runtime hides native content immediately, but coalesces the queued
+      // Source/Preview rectangles to their latest visible geometry. Native
+      // cancellation can finish after that visible rect has been delivered.
+      await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id }, h.item)
+      expect(h.setAnnotationMode).not.toHaveBeenCalled()
+      await state(h, 'surface-hidden', 2)
+
+      expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+      expect(h.renderState.annotationMode).toBe(true)
+      await h.runtime.handleNativeSurfaceEvent?.({
+        version: 3, surfaceId: h.item.id, type: 'annotation-selected', detail: { selection },
+      }, h.item)
+      expect(h.createAnnotation).toHaveBeenCalledOnce()
+      expect(h.showOverlay).toHaveBeenCalledOnce()
+    } finally { await h.runtime.dispose?.('closed') }
+  })
+
+  it.each(['hidden', 'stopped', 'loading'] as const)(
+    'does not rearm a %s preview on late native hidden cancellation',
+    async condition => {
+      const h = await pickerHarness()
+      try {
+        if (condition === 'hidden') {
+          await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id, visible: false }, h.item)
+        } else if (condition === 'stopped') {
+          await h.runtime.performAction?.('toggle-annotation-mode', h.item)
+        } else {
+          await h.runtime.handleNativeSurfaceEvent?.({
+            version: 3, surfaceId: h.item.id, type: 'loading',
+          }, h.item)
+        }
+        h.setAnnotationMode.mockClear()
+        await state(h, 'surface-hidden', 2)
+        expect(h.setAnnotationMode).not.toHaveBeenCalled()
+        expect(h.renderState.annotationMode).toBe(false)
+      } finally { await h.runtime.dispose?.('closed') }
+    },
+  )
+
+  it('restores a ready page after native in-page navigation cancels an unconsumed picker', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await state(h, 'surface-navigation', 2)
+    expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+    expect(h.renderState.annotationMode).toBe(true)
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'annotation-selected', detail: { selection },
+    }, h.item)
+    expect(h.showOverlay).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it.each(['ready', 'loading'] as const)('preserves document readiness %s across a stopped preview round trip', async readiness => {
+    const h = await pickerHarness()
+    await h.runtime.performAction?.('toggle-annotation-mode', h.item)
+    if (readiness === 'loading') {
+      await h.runtime.handleNativeSurfaceEvent?.({
+        version: 3, surfaceId: h.item.id, type: 'loading',
+      }, h.item)
+    }
+    h.createSurface.mockClear()
+    await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id, visible: false }, h.item)
+    expect(h.renderState.annotationAvailable).toBe(false)
+    expect(h.renderState.annotationMode).toBe(false)
+    await h.runtime.suspend?.(h.item)
+    await h.runtime.resume?.(h.item)
+    await h.runtime.handleSurfaceRect?.({ ...visibleRect, itemId: h.item.id }, h.item)
+    expect(h.renderState.nativeSurfaceState).toBe(readiness)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.createSurface).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('waits for full navigation readiness before restoring an immutable lease picker', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'loading',
+    }, h.item)
+    await state(h, 'surface-navigation', 2)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: h.item.id, type: 'ready',
+    }, h.item)
+    expect(h.setAnnotationMode).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ enabled: true }))
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('does not rearm behind a hidden tab, or resurrect an explicitly stopped mode', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockClear()
+    await h.runtime.suspend?.(h.item)
+    await state(h, 'surface-hidden', 2)
+    await state(h, 'surface-navigation', 3)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.resume?.(h.item)
+    await h.runtime.performAction?.('toggle-annotation-mode', h.item)
+    h.setAnnotationMode.mockClear()
+    await state(h, 'picker-cancelled', 5)
+    await state(h, 'surface-navigation', 6)
+    expect(h.renderState.annotationMode).toBe(false)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('ignores old surface and already acknowledged picker epochs after rearming', async () => {
+    const h = await pickerHarness()
+    h.setAnnotationMode.mockResolvedValue({ ok: true, pickerEpoch: 10 })
+    await h.runtime.suspend?.(h.item)
+    await h.runtime.resume?.(h.item)
+    h.setAnnotationMode.mockClear()
+    await state(h, 'surface-hidden', 9)
+    await state(h, 'surface-navigation', 11, 'previous-surface')
+    expect(h.renderState.annotationMode).toBe(true)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    await h.runtime.dispose?.('closed')
+  })
+
+  it('keeps an open annotation editor in charge of its draft when the picker stops', async () => {
+    const h = await createAnnotationDraftHarness()
+    h.setAnnotationMode.mockClear()
+    await state(h, 'surface-navigation', 2)
+    expect(h.setAnnotationMode).not.toHaveBeenCalled()
+    expect(h.discardAnnotation).not.toHaveBeenCalled()
+    expect(h.showOverlay).toHaveBeenCalledOnce()
+    await h.runtime.dispose?.('closed')
   })
 })
 

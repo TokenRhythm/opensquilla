@@ -12,6 +12,36 @@ afterEach(() => {
 })
 
 describe('native Workbench platform bridge', () => {
+  it('validates picker state identity and epoch and preserves mode acknowledgements', async () => {
+    let emit: ((payload: unknown) => void) | undefined
+    setDesktopApi({
+      createWorkbenchSurface: vi.fn(), setWorkbenchSurfaceRect: vi.fn(),
+      activateWorkbenchSurface: vi.fn(), destroyWorkbenchSurface: vi.fn(),
+      onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => { emit = callback; return () => {} },
+      setArtifactAnnotationMode: async () => ({ ok: true, pickerEpoch: 12 }),
+      closeArtifactAnnotationOverlay: async () => ({ ok: true, pickerEpoch: 13 }),
+    })
+    const native = createDesktopPlatform().workbench.native!
+    const receive = vi.fn()
+    native.onSurfaceEvent(receive)
+    const event = { version: 4, surfaceId: 'artifact:fixture', type: 'annotation-picker-state',
+      detail: { enabled: false, reason: 'surface-navigation', pickerEpoch: 11, surfaceInstanceId: 'instance-1' } }
+    emit!(event)
+    emit!({ ...event, version: 2 })
+    for (const detail of [
+      { ...event.detail, enabled: 'false' }, { ...event.detail, pickerEpoch: -1 },
+      { ...event.detail, pickerEpoch: 1.5 }, { ...event.detail, pickerEpoch: undefined },
+      { ...event.detail, surfaceInstanceId: '' }, { ...event.detail, reason: '' },
+    ]) emit!({ ...event, detail })
+    expect(receive).toHaveBeenCalledExactlyOnceWith(event)
+    await expect(native.setArtifactAnnotationMode!({
+      version: 4, surfaceId: event.surfaceId, enabled: true,
+    })).resolves.toEqual({ ok: true, pickerEpoch: 12 })
+    await expect(native.closeArtifactAnnotationOverlay!({
+      version: 4, surfaceId: event.surfaceId, annotationId: 'annotation-1', rearm: true,
+    })).resolves.toEqual({ ok: true, pickerEpoch: 13 })
+  })
+
   it('negotiates editor v2 only with its state update bridge and separates record from batch submit', async () => {
     let emit: ((payload: unknown) => void) | undefined
     const base = {
