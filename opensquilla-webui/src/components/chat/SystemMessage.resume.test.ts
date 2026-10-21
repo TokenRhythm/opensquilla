@@ -81,6 +81,7 @@ describe('SystemMessage runtime errors', () => {
         usage_unknown: true, unknown_usage_events: 1,
       },
       expected: ['Actual $0.02', 'Estimated $0.01', 'known subtotal'],
+      absent: [], allowZero: false,
     },
     {
       usage: {
@@ -88,8 +89,59 @@ describe('SystemMessage runtime errors', () => {
         coverage_status: 'usage_unknown', usage_unknown: true, unknown_usage_events: 2,
       },
       expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
     },
-  ])('shows failed-turn accounting from error-only restored history without a false zero total', async ({ usage, expected }) => {
+    {
+      usage: {
+        cost_usd: 0.0045, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+      },
+      expected: ['Estimated $0.0045', 'known subtotal'],
+      absent: ['Actual'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0.02, billed_cost: 0.02, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+      },
+      expected: ['Actual $0.02', 'known subtotal'],
+      absent: ['Estimated'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+        model_usage_breakdown: [{ cost_source: 'mixed', billed_cost: 0, has_billed_component: true }],
+      },
+      expected: ['Actual $0', 'known subtotal'],
+      absent: ['Estimated'], allowZero: true,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+      },
+      expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+        model_usage_breakdown: [{ cost_source: 'provider_billed', billing_receipt: { status: 'pending' } }],
+      },
+      expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
+    },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown', has_billed_component: true,
+      },
+      expected: ['Actual $0', 'known subtotal'],
+      absent: ['Estimated'], allowZero: true,
+    },
+  ])('shows failed-turn accounting from error-only restored history without a false zero total', async ({ usage, expected, absent, allowZero }) => {
     const historyMessage = projectConversationHistoryMessage(projectHistoryMessage({
       id: 'failed-message', message_id: 'failed-message', role: 'system',
       text: 'Error: response incomplete', timestamp: 1,
@@ -110,7 +162,8 @@ describe('SystemMessage runtime errors', () => {
     try {
       const summary = el.querySelector('.msg-error__usage')?.textContent || ''
       for (const text of expected) expect(summary).toContain(text)
-      expect(summary).not.toMatch(/\$0(?:\s|$)/)
+      for (const text of absent) expect(summary).not.toContain(text)
+      if (!allowZero) expect(summary).not.toMatch(/\$0(?:\s|$)/)
       expect(el.querySelectorAll('button,a')).toHaveLength(0)
     } finally { app.unmount() }
   })

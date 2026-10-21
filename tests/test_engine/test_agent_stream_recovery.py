@@ -561,3 +561,24 @@ async def test_interrupted_counter_estimates_match_ledger_after_success(
     assert sum(row["cost_usd"] for row in done.model_usage_breakdown) == pytest.approx(
         done.cost_usd,
     )
+
+
+def test_model_rollup_retains_confirmed_zero_authority_with_unknown_sibling() -> None:
+    from opensquilla.engine.agent import _summarize_model_usage_breakdown
+
+    rows = _summarize_model_usage_breakdown([
+        {"model": "synthetic-model", "provider": "openai", "cost_source": "provider_billed",
+         "billed_cost": 0},
+        {"model": "synthetic-model", "provider": "openai", "cost_source": "unavailable",
+         "missing_cost_entries": 1},
+    ])
+    assert len(rows) == 1
+    assert rows[0]["cost_source"] == "mixed"
+    assert rows[0]["cost_usd"] == 0
+    assert rows[0]["has_billed_component"] is True
+    assert rows[0]["has_estimated_component"] is False
+    rerolled = _summarize_model_usage_breakdown([
+        {**rows[0], "_opensquilla_reported_cost": True},
+    ])
+    assert rerolled[0]["has_billed_component"] is True
+    assert rerolled[0]["has_estimated_component"] is False

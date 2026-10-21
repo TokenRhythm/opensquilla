@@ -980,6 +980,27 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const cached = numeric(u.cached_tokens ?? u.cachedTokens)
     const reasoning = numeric(u.reasoning_tokens ?? u.reasoningTokens)
     const cost = numeric(u.cost_usd ?? u.costUsd)
+    const billed = numeric(u.billed_cost ?? u.billedCost)
+    const estimated = numeric(u.estimated_cost_component_usd ?? u.estimatedCostComponentUsd
+      ?? Math.max(0, cost - billed))
+    const costSource = String(u.cost_source ?? u.costSource)
+    const rawBreakdown = u.model_usage_breakdown ?? u.modelUsageBreakdown
+    const hasConfirmedBill = Array.isArray(rawBreakdown) && rawBreakdown.some(row => {
+      if (!row || typeof row !== 'object') return false
+      if ((row.has_billed_component ?? row.hasBilledComponent) === true) return true
+      const receipt = row.billing_receipt ?? row.billingReceipt
+      if (receipt && typeof receipt === 'object') return 'status' in receipt && receipt.status === 'confirmed'
+      return ['provider_billed', 'openrouter_usage'].includes(String(row.cost_source ?? row.costSource))
+    })
+    // Mixed also covers a known subtotal plus missing receipts. A zero amount
+    // alone cannot prove that a billed or estimated component exists.
+    const hasBilledComponent = billed > 0 || hasConfirmedBill
+      || (u.has_billed_component ?? u.hasBilledComponent) === true
+      || ['provider_billed', 'openrouter_usage'].includes(costSource)
+    const hasEstimatedComponent = estimated > 0 || costSource === 'opensquilla_estimate'
+      || (u.has_estimated_component ?? u.hasEstimatedComponent) === true
+      || (Array.isArray(rawBreakdown) && rawBreakdown.some(row => row && typeof row === 'object'
+        && (row.has_estimated_component ?? row.hasEstimatedComponent) === true))
     const hasTier = !!(u.routed_tier && u.routing_source && u.routing_source !== 'none')
     const turnSavedPct = typeof u.total_savings_pct === 'number' && u.total_savings_pct > 0 ? u.total_savings_pct : 0
     const hasSaved = hasTier && turnSavedPct > 0 && !u.__savings_ui_suppressed
@@ -1005,7 +1026,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       numeric(u.cache_write_tokens ?? u.cacheWriteTokens ?? u.cache_write),
       numeric(u.billed_cost ?? u.billedCost),
       numeric(u.estimated_cost_component_usd ?? u.estimatedCostComponentUsd),
-    ].some(value => value > 0) || Boolean(ensemble && (
+    ].some(value => value > 0) || hasBilledComponent || hasEstimatedComponent || Boolean(ensemble && (
       ensemble.costUsd > 0
       || ensemble.models.some(member =>
         member.input > 0 || member.output > 0 || member.costUsd > 0,
@@ -1020,10 +1041,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       cachedTokens: cached,
       reasoningTokens: reasoning,
       costUsd: cost,
-      ...(['provider_billed', 'mixed'].includes(String(u.cost_source ?? u.costSource))
-        ? { billedCostUsd: numeric(u.billed_cost ?? u.billedCost) } : {}),
-      ...(['opensquilla_estimate', 'mixed'].includes(String(u.cost_source ?? u.costSource))
-        ? { estimatedCostUsd: Math.max(0, cost - numeric(u.billed_cost ?? u.billedCost)) } : {}),
+      ...(hasBilledComponent ? { billedCostUsd: billed } : {}),
+      ...(hasEstimatedComponent ? { estimatedCostUsd: estimated } : {}),
       ...(numeric(u.missing_cost_entries ?? u.missingCostEntries) > 0
         ? { missingCostEntries: Math.floor(numeric(u.missing_cost_entries ?? u.missingCostEntries)) } : {}),
       hasSaved,

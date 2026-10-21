@@ -804,22 +804,25 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         row_missing_cost_entries = _usage_int(row.get("missing_cost_entries") or 0)
         target["missing_cost_entries"] += row_missing_cost_entries
         target["request_count"] += max(1, _usage_int(row.get("request_count") or 1))
-        components_by_key[key].append(
-            _cost_component_flags(
-                cost_source=str(row.get("cost_source") or row.get("costSource") or "none"),
-                cost_usd=_usage_float(row.get("cost_usd") or row.get("costUsd")),
-                billed_cost=_usage_float(
-                    row.get("billed_cost")
-                    or row.get("billedCost")
-                    or row.get("billed_cost_usd")
-                    or row.get("billedCostUsd")
-                ),
-                missing_cost_entries=row_missing_cost_entries,
-                estimate_basis=(
-                    str(row.get("estimate_basis") or row.get("estimateBasis") or "") or None
-                ),
-            )
+        components = _cost_component_flags(
+            cost_source=str(row.get("cost_source") or row.get("costSource") or "none"),
+            cost_usd=_usage_float(row.get("cost_usd") or row.get("costUsd")),
+            billed_cost=_usage_float(
+                row.get("billed_cost")
+                or row.get("billedCost")
+                or row.get("billed_cost_usd")
+                or row.get("billedCostUsd")
+            ),
+            missing_cost_entries=row_missing_cost_entries,
+            estimate_basis=(
+                str(row.get("estimate_basis") or row.get("estimateBasis") or "") or None
+            ),
         )
+        components_by_key[key].append((
+            components[0] or row.get("has_billed_component") is True,
+            components[1] or row.get("has_estimated_component") is True,
+            components[2],
+        ))
 
     summarized: list[dict[str, Any]] = []
     for key, row in aggregated.items():
@@ -834,6 +837,8 @@ def _summarize_model_usage_breakdown(rows: list[dict[str, Any]]) -> list[dict[st
         row["billedCostUsd"] = row["billed_cost_usd"]
         row["estimatedCostUsd"] = row["estimated_cost_usd"]
         row["costSource"] = row["cost_source"]
+        row["has_billed_component"] = any(part[0] for part in components_by_key[key])
+        row["has_estimated_component"] = any(part[1] for part in components_by_key[key])
         summarized.append(row)
     return summarized
 

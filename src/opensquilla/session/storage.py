@@ -4929,6 +4929,8 @@ class SessionStorage:
             "cost_usd": float(row["cost_usd_exact"]),
             "billed_cost": billed_cost,
             "estimated_cost_component_usd": estimated_cost,
+            "has_billed_component": int(row["provider_billed_entries"] or 0) > 0,
+            "has_estimated_component": int(row["estimated_cost_entries"] or 0) > 0,
             "cost_source": cost_source,
             "missing_cost_entries": missing_entries,
             "coverage_status": coverage_status,
@@ -5049,6 +5051,8 @@ class SessionStorage:
                 "cost_usd": float(totals["cost_usd_exact"]),
                 "billed_cost": billed_cost,
                 "estimated_cost_component_usd": estimated_cost,
+                "has_billed_component": totals["provider_billed_entries"] > 0,
+                "has_estimated_component": totals["estimated_cost_entries"] > 0,
                 "cost_source": rollup_cost_source(
                     billed_cost_usd=billed_cost,
                     estimated_cost_component_usd=estimated_cost,

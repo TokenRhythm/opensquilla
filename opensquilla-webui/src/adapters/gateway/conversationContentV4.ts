@@ -136,7 +136,7 @@ function terminalUsage(source: Record<string, unknown>): ConversationUsage {
     const value = alias(raw, key)
     if (value != null && Number.isFinite(Number(value))) result[key] = Number(value)
   }
-  for (const key of ['usage_unknown', '__savings_ui_suppressed']) {
+  for (const key of ['usage_unknown', '__savings_ui_suppressed', 'has_billed_component', 'has_estimated_component']) {
     const value = alias(raw, key)
     if (value != null) result[key] = Boolean(value)
   }

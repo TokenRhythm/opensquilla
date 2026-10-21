@@ -812,8 +812,9 @@ async def test_live_start_resolves_session_attribution_and_boot_recovers_started
         await storage.close()
 
 
+@pytest.mark.parametrize("confirmed_zero", [False, True])
 async def test_cancelled_turn_projection_keeps_finalized_usage_and_unknown_coverage(
-    tmp_path: Path,
+    tmp_path: Path, confirmed_zero: bool,
 ) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
     try:
@@ -825,7 +826,16 @@ async def test_cancelled_turn_projection_keeps_finalized_usage_and_unknown_cover
         )
         await storage.initialize_usage_ledger(1)
         await storage.start_usage_event(_start())
-        await storage.finalize_usage_event("event-1", _completion(), items=(_item(),))
+        completion = _completion()
+        item = _item()
+        if confirmed_zero:
+            completion = replace(
+                completion, cost_nanos=0, estimated_cost_nanos=0, cost_source="provider_billed",
+            )
+            item = replace(
+                item, cost_nanos=0, estimated_cost_nanos=0, cost_source="provider_billed",
+            )
+        await storage.finalize_usage_event("event-1", completion, items=(item,))
         await storage.start_usage_event(
             _start(
                 event_id="event-2",
@@ -854,6 +864,8 @@ async def test_cancelled_turn_projection_keeps_finalized_usage_and_unknown_cover
         assert projection["usage_unknown"] is True
         assert projection["unknown_usage_events"] == 1
         assert projection["missing_cost_entries"] == 1
+        assert projection["has_billed_component"] is confirmed_zero
+        assert projection["has_estimated_component"] is not confirmed_zero
         batch = await storage.get_turn_usage_projections(
             session_id="session-1",
             session_epoch=0,
