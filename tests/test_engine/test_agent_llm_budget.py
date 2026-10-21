@@ -1694,7 +1694,9 @@ async def test_agent_turn_cost_budget_stops_retry_after_ensemble_error_receipt(
     assert "$0.300000" in error.message
     assert "estimated cost basis" in error.message
     assert len(provider.calls) == 1
-    assert calls == [("m1", "p1")]
+    # Ledger settlement and the conservative budget owner both price the
+    # member deployment. Neither may substitute the outer ensemble model.
+    assert set(calls) == {("m1", "p1")}
 
 
 def test_with_model_usage_cost_fields_prices_unbilled_cache_reads_cache_aware() -> None:
