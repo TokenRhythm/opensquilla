@@ -980,16 +980,22 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const cached = numeric(u.cached_tokens ?? u.cachedTokens)
     const reasoning = numeric(u.reasoning_tokens ?? u.reasoningTokens)
     const cost = numeric(u.cost_usd ?? u.costUsd)
-    const billed = numeric(u.billed_cost ?? u.billedCost)
+    const costSource = String(u.cost_source ?? u.costSource)
+    const billed = numeric(u.billed_cost ?? u.billedCost
+      ?? (['provider_billed', 'openrouter_usage'].includes(costSource) ? cost : 0))
     const estimated = numeric(u.estimated_cost_component_usd ?? u.estimatedCostComponentUsd
       ?? Math.max(0, cost - billed))
-    const costSource = String(u.cost_source ?? u.costSource)
     const rawBreakdown = u.model_usage_breakdown ?? u.modelUsageBreakdown
     const hasConfirmedBill = Array.isArray(rawBreakdown) && rawBreakdown.some(row => {
       if (!row || typeof row !== 'object') return false
       if ((row.has_billed_component ?? row.hasBilledComponent) === true) return true
       const receipt = row.billing_receipt ?? row.billingReceipt
-      if (receipt && typeof receipt === 'object') return 'status' in receipt && receipt.status === 'confirmed'
+      if (receipt && typeof receipt === 'object') {
+        const native = receipt as Record<string, unknown>
+        const usdNanos = native.usd_equivalent_nanos ?? native.usdEquivalentNanos
+          ?? (native.currency === 'USD' ? native.amount_nanos ?? native.amountNanos : undefined)
+        return native.status === 'confirmed' && usdNanos === 0
+      }
       return ['provider_billed', 'openrouter_usage'].includes(String(row.cost_source ?? row.costSource))
     })
     // Mixed also covers a known subtotal plus missing receipts. A zero amount

@@ -141,6 +141,18 @@ describe('SystemMessage runtime errors', () => {
       expected: ['Actual $0', 'known subtotal'],
       absent: ['Estimated'], allowZero: true,
     },
+    {
+      usage: {
+        cost_usd: 0, billed_cost: 0, cost_source: 'mixed', missing_cost_entries: 1,
+        usage_unknown: true, coverage_status: 'usage_unknown',
+        model_usage_breakdown: [{ cost_source: 'unavailable', billing_receipt: {
+          status: 'confirmed', currency: 'CNY', amount_nanos: 100_000_000,
+          usd_equivalent_nanos: null,
+        } }],
+      },
+      expected: ['exact usage total unavailable'],
+      absent: ['Actual', 'Estimated'], allowZero: false,
+    },
   ])('shows failed-turn accounting from error-only restored history without a false zero total', async ({ usage, expected, absent, allowZero }) => {
     const historyMessage = projectConversationHistoryMessage(projectHistoryMessage({
       id: 'failed-message', message_id: 'failed-message', role: 'system',
