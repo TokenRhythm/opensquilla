@@ -1,9 +1,70 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { join } from 'node:path'
 
 // Preserve the production Gateway's shutdown request, 80s exit observation,
 // and 6s + 5s hard-kill backstops without changing any interaction budget.
 const ELECTRON_CLEANUP_TIMEOUT_MS = 100_000
 const PROVIDER_CLEANUP_TIMEOUT_MS = 15_000
+
+/** A terminal renderer receipt can precede the Gateway's driver/auxiliary settlement. */
+export async function waitForFirstSendGatewayIdle({
+  page, userDataDir, deadline, onSample = () => {},
+  now = Date.now, sleep = delay,
+  loadOwnership, readActivity,
+}) {
+  const started = now()
+  const fail = reason => {
+    const error = new Error(`First-send Gateway idle verification failed: ${reason}`)
+    error.code = 'FIRST_SEND_GATEWAY_NOT_IDLE'
+    error.reason = reason
+    throw error
+  }
+  if (!Number.isFinite(deadline) || now() >= deadline) fail('completion_deadline')
+  const connection = await captureFirstSendDiagnostic(() => page.evaluate(async () => {
+    const descriptor = await window.opensquillaDesktop.getGatewayConnection()
+    const address = new URL(descriptor.httpUrl)
+    return { status: descriptor.status, profileFingerprint: descriptor.profileFingerprint,
+      protocol: address.protocol, hostname: address.hostname, port: Number(address.port) }
+  }), Math.max(1, deadline - now()))
+  if (connection?.diagnosticError || connection?.status !== 'ready'
+    || !/^[0-9a-f]{64}$/.test(connection.profileFingerprint)
+    || connection.protocol !== 'http:'
+    || !['127.0.0.1', 'localhost', '[::1]'].includes(connection.hostname)
+    || !Number.isSafeInteger(connection.port) || connection.port < 1) fail('invalid_connection')
+  // This read-only endpoint authenticates the exact owned instance. Never use
+  // renderer run-status or an unauthenticated health response as idle proof.
+  const ownership = loadOwnership && readActivity ? null
+    : await import('../dist/desktop-gateway-ownership.js')
+  const loaded = (loadOwnership ?? ownership.loadDesktopGatewayOwnershipRecord)(
+    join(userDataDir, 'gateway-ownership', connection.profileFingerprint),
+  )
+  if (loaded.status !== 'valid' || loaded.record.profile_fingerprint !== connection.profileFingerprint
+    || loaded.record.port !== connection.port) fail('ownership_mismatch')
+  const read = readActivity ?? ownership.readVerifiedDesktopGatewayActivity
+  let polls = 0
+  const countKeys = ['running', 'queued', 'waiting', 'reservations', 'auxiliary']
+  while (now() < deadline) {
+    const result = await read(loaded.record, { timeoutMs: Math.max(1, Math.min(1_000, deadline - now())) })
+    polls += 1
+    if (!result || !['ok', 'unreachable', 'rejected', 'unsupported'].includes(result.kind)) fail('invalid_activity')
+    let activity
+    if (result.kind === 'ok') {
+      if (!result.activity || countKeys.some(key => !Number.isSafeInteger(result.activity[key])
+        || result.activity[key] < 0)
+        || result.activeCount !== countKeys.reduce((sum, key) => sum + result.activity[key], 0)) {
+        fail('invalid_activity')
+      }
+      activity = Object.fromEntries(countKeys.map(key => [key, result.activity[key]]))
+    }
+    const sample = { polls, waitElapsedMs: Math.max(0, now() - started), kind: result.kind,
+      ...(activity ? { activeCount: result.activeCount, activity } : {}) }
+    onSample(sample)
+    if (result.kind === 'rejected' || result.kind === 'unsupported') fail(result.kind)
+    if (now() < deadline && result.kind === 'ok' && result.activeCount === 0) return sample
+    await sleep(Math.max(0, Math.min(200, deadline - now())))
+  }
+  fail('completion_deadline')
+}
 
 export function expectedShutdownCancellationIndices(records) {
   const positions = ['before_quit', 'quit_gateway_shutdown_requested', 'quit_gateway_exit']

@@ -19,6 +19,7 @@ import {
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
+  waitForFirstSendGatewayIdle,
 } from './packaged-first-send-cleanup.mjs'
 import {
   FIRST_SEND_REPORT_VERSION,
@@ -203,6 +204,8 @@ let targetPageId = null
 let targetWebContentsId = null
 let mainObservationInstalled = false
 let cleanupSucceeded = false
+let finalSendDeadline = null
+let gatewayIdle = { status: 'not_checked', samples: [] }
 const observationErrors = []
 const outboundNetwork = []
 const rpcSendCounts = new Map()
@@ -551,6 +554,7 @@ try {
     const followupMessage = `Synthetic follow-up ${String(iteration).padStart(2, '0')}`
     await composer.fill(followupMessage)
     assert.equal(await composerValue(composer), followupMessage, 'follow-up must reach the composer before clicking send')
+    if (iteration === iterations) finalSendDeadline = Date.now() + SEND_TIMEOUT_MS
     await page.locator('.chat-send-btn.btn--primary').click()
     await waitFor(
       () => observedChatSendCount(page, followupMessage).then(count => count === 1),
@@ -591,6 +595,32 @@ try {
     iterations,
     'each new-task iteration must materialize one distinct session',
   )
+  // The final visible receipt can arrive while a driver or auxiliary completion
+  // still owns Gateway work. Wait within this send's original completion budget
+  // before requesting normal Quit, whose active-work confirmation stays intact.
+  reportPhase('gateway-idle-start')
+  gatewayIdle.status = 'waiting'
+  try {
+    const settled = await waitForFirstSendGatewayIdle({
+      page, userDataDir, deadline: finalSendDeadline,
+      onSample: sample => {
+        gatewayIdle.lastSample = sample
+        const previous = gatewayIdle.samples.at(-1)
+        if (!previous || previous.kind !== sample.kind
+          || JSON.stringify(previous.activity) !== JSON.stringify(sample.activity)) {
+          gatewayIdle.samples.push(sample)
+          reportPhase('gateway-idle-sample', sample)
+        }
+      },
+    })
+    gatewayIdle.status = 'idle'
+    reportPhase('gateway-idle-complete', settled)
+  } catch (error) {
+    gatewayIdle.status = 'failed'
+    gatewayIdle.reason = error.reason ?? 'activity_read_failed'
+    reportPhase('gateway-idle-failed', { reason: gatewayIdle.reason, lastSample: gatewayIdle.lastSample })
+    throw error
+  }
   reportPhase('renderer-checks-complete', { completedChatSends: rpcSendCounts.size })
 } catch (error) {
   runError = error
@@ -633,6 +663,7 @@ try {
         processes: electronProcessSnapshot(electronProcessIdentity),
         desktopLog: await readDesktopLogEvidence(userDataDir),
         rendererBeforeCleanup: failureRendererSnapshot,
+        gatewayIdle,
       }),
       onPhase: reportPhase,
     })
@@ -681,6 +712,7 @@ console.log(JSON.stringify({
   viewports: { wide: Math.ceil(iterations / 2), tight: Math.floor(iterations / 2) },
   rpc: { chatSend: rpcSendCounts.size, uniqueSessions: new Set(rpcSessions.values()).size },
   provider: provider?.counts(),
+  gatewayIdle,
   renderer,
   externalRendererRequests: outboundNetwork.length,
   desktopLog: desktopLogSummary,
