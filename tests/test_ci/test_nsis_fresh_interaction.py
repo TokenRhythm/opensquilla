@@ -430,6 +430,83 @@ def test_deferred_candidate_waits_until_old_installation_is_verified(
     assert len(audit.sentinels) == 3
 
 
+@pytest.fixture
+def uninstall_audit(nsis, tmp_path, monkeypatch):
+    audit, _ = _preparation_audit(nsis, tmp_path, monkeypatch)
+    audit.install.mkdir()
+    (audit.install / "Uninstall OpenSquilla.exe").write_bytes(b"fixture")
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+    monkeypatch.setattr(nsis.time, "monotonic", lambda: clock.now)
+
+    def sleep(seconds):
+        clock.sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(nsis.time, "sleep", sleep)
+    return audit, clock
+
+
+def test_uninstall_rechecks_deleted_registry_key_until_registration_is_absent(
+    nsis, uninstall_audit, monkeypatch,
+):
+    audit, clock = uninstall_audit
+    deleted = OSError("Registry key marked for deletion")
+    deleted.winerror = 1018
+    observations = iter([deleted, [{"key": "OpenSquilla"}], [], []])
+
+    def registry():
+        value = next(observations)
+        if isinstance(value, OSError):
+            raise value
+        return value
+
+    monkeypatch.setattr(nsis, "installed_registry", registry)
+    audit.uninstall_candidate(retained_profile=True)
+    assert clock.sleeps == [0.5, 0.5]
+    assert audit.report["finalRegistry"] == []
+    assert audit.report["proofs"]["finalUninstall"] is True
+
+
+@pytest.mark.parametrize("deleting", [False, True])
+def test_uninstall_registry_wait_retains_deadline(
+    nsis, uninstall_audit, monkeypatch, deleting,
+):
+    audit, clock = uninstall_audit
+
+    def registry():
+        if deleting:
+            error = OSError("Registry key marked for deletion")
+            error.winerror = 1018
+            raise error
+        return [{"key": "OpenSquilla"}]
+
+    monkeypatch.setattr(nsis, "installed_registry", registry)
+    with pytest.raises(RuntimeError, match="within 60 seconds"):
+        audit.uninstall_candidate(retained_profile=True)
+    assert clock.now == 60
+    assert "finalUninstall" not in audit.report["proofs"]
+
+
+@pytest.mark.parametrize("winerror", [None, 5])
+def test_uninstall_does_not_retry_other_registry_errors(
+    nsis, uninstall_audit, monkeypatch, winerror,
+):
+    audit, clock = uninstall_audit
+    error = OSError("Registry read failed")
+    if winerror is not None:
+        error.winerror = winerror
+
+    def registry():
+        raise error
+
+    monkeypatch.setattr(nsis, "installed_registry", registry)
+    with pytest.raises(OSError) as raised:
+        audit.uninstall_candidate(retained_profile=True)
+    assert raised.value is error
+    assert not clock.sleeps
+    assert "finalUninstall" not in audit.report["proofs"]
+
+
 def _downloaded_candidate(tmp_path):
     installer = tmp_path / "candidate.exe"
     installer.write_bytes(b"candidate fixture")

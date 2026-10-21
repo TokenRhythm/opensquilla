@@ -2441,8 +2441,8 @@ def test_windows_profile_split_keeps_shared_setup_and_original_browser_router_ch
         "profile-consolidation-flow", "primary-repair-accessibility", "profile-import-flow",
         "desktop-cleanup-flow", "gateway-ownership", "gateway-orphan-recovery-flow",
         "window-background-flow", "desktop-quit-interaction", "theme-flow",
-        "native-workbench-surface", "desktop-zoom-shortcuts", "native-workbench-v2",
-        "desktop-browser",
+        "native-workbench-surface", "text-context-menu", "desktop-zoom-shortcuts",
+        "native-workbench-v2", "desktop-browser",
         "desktop-browser-electron", "live-html-business", "unsafe-legacy-recovery-no-write",
     )),
 ])
@@ -2480,6 +2480,7 @@ def test_profile_dispatcher_selects_independent_cases_without_duplicate_legacy_r
         "desktop-quit-interaction": "desktop-quit-native-acceptance",
         "theme-flow": "desktop-theme-flow",
         "native-workbench-surface": "native-workbench-surface-electron",
+        "text-context-menu": "text-context-menu-electron",
         "native-workbench-v2": "native-workbench-v2-electron",
     }
     assert result.stdout.splitlines() == [

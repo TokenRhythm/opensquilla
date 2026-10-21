@@ -61,7 +61,7 @@ export default defineConfig({
           : {}),
       },
       // Live-turn and OS clipboard proofs have isolated projects/configs.
-      testIgnore: /(?:fold-live-turn|image-copy|user-message-copy)\.spec\.ts/,
+      testIgnore: /(?:fold-live-turn|image-copy|user-message-copy|text-context-menu\.desktop)\.spec\.ts/,
     },
     {
       // Drive the real live-stream path through the sole turn projection.

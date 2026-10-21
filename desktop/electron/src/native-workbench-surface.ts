@@ -63,6 +63,7 @@ import { BrowserPlaywrightDriver } from './browser-playwright.js'
 import { BrowserPointerController } from './browser-pointer-controller.js'
 import { BrowserManagedDownloads } from './browser-managed-downloads.js'
 import { showBrowserContextMenu } from './browser-context-menu.js'
+import { installTextContextMenu } from './text-context-menu.js'
 import { NativeWorkbenchPdfResourcePolicy } from './native-workbench-pdf-policy.js'
 import { BROWSER_PROMPT_PRELOAD, BrowserPromptController } from './browser-prompt.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
@@ -4987,6 +4988,7 @@ export class NativeWorkbenchSurfaceManager {
 
   private configureWebContents(record: NativeWorkbenchSurfaceRecord): void {
     const contents = record.contents
+    if (record.kind !== 'url-preview') installTextContextMenu(contents)
     if (record.kind === 'url-preview') {
       contents.on('will-frame-navigate', event => {
         if (!event.isMainFrame || record.disposed || contents.isDestroyed()

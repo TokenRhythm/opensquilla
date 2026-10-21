@@ -32,6 +32,7 @@
     "test:e2e": "playwright test",
     "test:e2e:image-copy": "playwright test --config playwright.image-copy.config.ts",
     "test:e2e:message-copy": "playwright test --config playwright.message-copy.config.ts",
+    "test:e2e:text-context-menu": "npm --prefix ../desktop/electron run build && playwright test --config playwright.text-context-menu.config.ts",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:debug": "playwright test --debug"
   },
