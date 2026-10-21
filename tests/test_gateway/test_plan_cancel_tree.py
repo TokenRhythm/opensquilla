@@ -12,6 +12,10 @@ from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc_sessions import _handle_plans_cancel_run, _handle_plans_implement
 from opensquilla.session.models import AgentTaskStatus
 
+# Starting a real SQLite-backed turn is a setup precondition, not the
+# cancellation latency contract checked by the separate two-second waits below.
+_HANDLER_START_TIMEOUT_S = 10.0
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("child_running", [False, True])
@@ -43,7 +47,8 @@ async def test_plan_stop_cancels_exact_descendants_and_completion_without_stoppi
                 "clientRequestId": "synthetic-plan-parent",
             }, stack.context)
             await asyncio.wait_for(
-                started.setdefault(SOURCE_KEY, asyncio.Event()).wait(), timeout=2,
+                started.setdefault(SOURCE_KEY, asyncio.Event()).wait(),
+                timeout=_HANDLER_START_TIMEOUT_S,
             )
             parent_id = parent["task_id"]
 
@@ -61,12 +66,14 @@ async def test_plan_stop_cancels_exact_descendants_and_completion_without_stoppi
 
             sibling_key, sibling = await enqueue_child("unrelated", "different-parent-task")
             await asyncio.wait_for(
-                started.setdefault(sibling_key, asyncio.Event()).wait(), timeout=2,
+                started.setdefault(sibling_key, asyncio.Event()).wait(),
+                timeout=_HANDLER_START_TIMEOUT_S,
             )
             child_key, child = await enqueue_child("owned", parent_id)
             if child_running:
                 await asyncio.wait_for(
-                    started.setdefault(child_key, asyncio.Event()).wait(), timeout=2,
+                    started.setdefault(child_key, asyncio.Event()).wait(),
+                    timeout=_HANDLER_START_TIMEOUT_S,
                 )
             else:
                 assert (await stack.storage.get_agent_task(child.task_id)).status == "queued"
