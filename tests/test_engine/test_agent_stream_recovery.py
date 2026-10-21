@@ -582,3 +582,66 @@ def test_model_rollup_retains_confirmed_zero_authority_with_unknown_sibling() ->
     ])
     assert rerolled[0]["has_billed_component"] is True
     assert rerolled[0]["has_estimated_component"] is False
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+@pytest.mark.parametrize("confirmed_zero", [False, True])
+async def test_recovered_done_preserves_zero_receipt_authority_from_durable_ledger(
+    tracked: bool, confirmed_zero: bool,
+) -> None:
+    from opensquilla.engine.usage_accounting import (
+        UsageAccountingScope,
+        UsageExecutionContext,
+        bind_usage_accounting_scope,
+    )
+    from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
+    from opensquilla.session.models import SessionNode
+    from opensquilla.session.storage import SessionStorage
+
+    storage = await SessionStorage.open(":memory:")
+    try:
+        await storage.upsert_session(SessionNode(
+            session_key="agent:main:stream-recovery", session_id="zero-receipt-session",
+        ))
+        await storage.initialize_usage_ledger(1)
+        failed = ProviderError(
+            code="timeout", recovery_origin="read_timeout", usage_missing_count=1,
+            model_usage_breakdown=[{
+                "provider": "openai", "model": "synthetic-stream-model",
+                "input_tokens": 10, "output_tokens": 2, "billed_cost": 0,
+                "token_usage_known": confirmed_zero,
+                "cost_source": "provider_billed" if confirmed_zero else "unavailable",
+            }],
+        )
+        provider = _Provider([_partial(failed), [
+            ProviderText(text="Recovered."),
+            ProviderDone(model="synthetic-stream-model", usage_missing_count=1),
+        ]])
+        agent = _agent(provider, context=_context())
+        if not tracked:
+            agent._usage_tracker = None
+        with bind_usage_accounting_scope(UsageAccountingScope(
+            sink=SessionUsageEventSink(storage),
+            context=UsageExecutionContext(
+                execution_id="zero-receipt-execution", agent_run_id="zero-receipt-run",
+                session_id="zero-receipt-session", turn_id="stream-turn",
+            ),
+        )):
+            events = await _run(agent)
+
+        done = next(event for event in events if isinstance(event, DoneEvent))
+        projection = await storage.get_turn_usage_projection(
+            session_id="zero-receipt-session", session_epoch=0, turn_id="stream-turn",
+        )
+        assert projection is not None
+        assert projection["has_billed_component"] is confirmed_zero
+        assert projection["has_estimated_component"] is False
+        assert done.cost_source == projection["cost_source"] == (
+            "mixed" if confirmed_zero else "unavailable"
+        )
+        assert done.cost_usd == projection["cost_usd"] == 0
+        assert done.missing_cost_entries == projection["missing_cost_entries"] > 0
+        assert len(provider.calls) == 2
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+    finally:
+        await storage.close()

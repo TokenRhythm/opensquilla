@@ -13596,6 +13596,8 @@ class Agent:
             estimate_basis=estimate_basis,
             infer_missing=parent_has_usage,
         )
+        # A confirmed zero receipt remains authoritative alongside missing usage.
+        has_billed_component |= total_provider_billed_entries > 0
         estimate_bases = (
             [estimate_basis]
             if has_estimated_component and estimate_basis not in {None, "free"}
