@@ -81,8 +81,6 @@ const props = withDefaults(defineProps<{
   hasMore?: boolean
   currentKey: string
   contractDebugEnabled: boolean
-  /** Command-palette chord, shown in the search button's tooltip. */
-  searchHint: string
   sessionOrder?: string[]
   canManageProjects?: boolean
   canCreateProjects?: boolean
@@ -112,7 +110,6 @@ const emit = defineEmits<{
   (e: 'project-edit', workspaceId: string): void
   (e: 'project-delete-history', workspaceId: string): void
   (e: 'project-remove', workspaceId: string): void
-  (e: 'search'): void
 }>()
 
 const { confirm } = useConfirm()
@@ -1342,20 +1339,6 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
       >
         <Icon name="plus" :size="13" />
       </button>
-      <!-- Conversation search lives on the recents header, beside the selection
-           and refresh controls, because the palette's hits are these rows.
-           Hidden while selecting: that mode owns the header's spare width. -->
-      <button
-        v-if="!selectionMode"
-        type="button"
-        class="sidebar-cmd-btn"
-        :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
-        :title="`${t('chrome.searchChats')} (${props.searchHint})`"
-        aria-haspopup="dialog"
-        @click="emit('search')"
-      >
-        <Icon name="search" :size="13" />
-      </button>
       <button
         v-if="selectionMode"
         type="button"
@@ -1480,17 +1463,6 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
             <Icon name="plus" :size="13" />
           </button>
           <button
-            v-if="block.zone === controlsZone && !selectionMode"
-            type="button"
-            class="sidebar-cmd-btn"
-            :aria-label="`${t('chrome.searchChats')} (${props.searchHint})`"
-            :title="`${t('chrome.searchChats')} (${props.searchHint})`"
-            aria-haspopup="dialog"
-            @click="emit('search')"
-          >
-            <Icon name="search" :size="13" />
-          </button>
-          <button
             v-if="block.zone === controlsZone && totalRows > 0 && !selectionMode"
             type="button"
             class="sidebar-bulk-mode-btn"
@@ -1600,6 +1572,18 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                   >
                     <button
                       type="button"
+                      class="sidebar-project-action sidebar-row-menu-btn"
+                      data-testid="project-workspace-more"
+                      aria-haspopup="menu"
+                      :aria-expanded="openMenuKey === row.key"
+                      :aria-label="t('workspaces.moreActions')"
+                      :title="t('workspaces.moreActions')"
+                      @click.stop="toggleMenu(row.key, $event)"
+                    >
+                      <Icon name="moreHorizontal" :size="16" />
+                    </button>
+                    <button
+                      type="button"
                       class="sidebar-project-action sidebar-project-action--new-task"
                       data-testid="project-workspace-new-task"
                       :aria-label="row.workspaceAvailable === false
@@ -1611,19 +1595,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                       :disabled="row.workspaceAvailable === false"
                       @click.stop="startProjectTask(row)"
                     >
-                      <Icon name="plus" :size="13" />
-                    </button>
-                    <button
-                      type="button"
-                      class="sidebar-project-action sidebar-row-menu-btn"
-                      data-testid="project-workspace-more"
-                      aria-haspopup="menu"
-                      :aria-expanded="openMenuKey === row.key"
-                      :aria-label="t('workspaces.moreActions')"
-                      :title="t('workspaces.moreActions')"
-                      @click.stop="toggleMenu(row.key, $event)"
-                    >
-                      <Icon name="moreHorizontal" :size="14" />
+                      <Icon name="chat-plus" :size="16" />
                     </button>
                   </div>
                 </div>

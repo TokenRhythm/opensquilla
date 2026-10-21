@@ -136,7 +136,6 @@ async function mountSidebar(
     loading: false,
     currentKey: '',
     contractDebugEnabled: false,
-    searchHint: 'Ctrl+K',
     canManageProjects,
     canCreateProjects,
     onSelect: events.select,
@@ -166,7 +165,7 @@ afterEach(() => {
 })
 
 describe('SidebarConversations project workspaces', () => {
-  it('creates projects from the section header while project-row plus actions remain task scoped', async () => {
+  it('creates projects from the section header while project-row creation actions remain task scoped', async () => {
     const { host, events } = await mountSidebar([projectRow(), taskRow()])
     const createProject = host.querySelector<HTMLButtonElement>('[data-testid="sidebar-create-project"]')
     const createTask = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
@@ -677,19 +676,19 @@ describe('SidebarConversations project workspaces', () => {
     expect(events.select).not.toHaveBeenCalled()
   })
 
-  it('creates a project task and expands its project from the persistent plus action', async () => {
+  it('creates a project task and expands its project from the new-task action', async () => {
     const { host, events } = await mountSidebar([projectRow(), taskRow()])
-    const plus = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+    const createTask = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
     const disclosure = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-disclosure"]')
 
-    expect(plus).toBeTruthy()
-    expect(plus?.classList.contains('sidebar-project-action--new-task')).toBe(true)
-    expect(plus?.querySelector('svg')).not.toBeNull()
+    expect(createTask).toBeTruthy()
+    expect(createTask?.classList.contains('sidebar-project-action--new-task')).toBe(true)
+    expect(createTask?.querySelector('svg')).not.toBeNull()
     disclosure?.click()
     await nextTick()
     expect(disclosure?.getAttribute('aria-expanded')).toBe('false')
 
-    plus?.click()
+    createTask?.click()
     await nextTick()
 
     expect(events.newProjectTask).toHaveBeenCalledWith('project-a')
@@ -720,11 +719,11 @@ describe('SidebarConversations project workspaces', () => {
       projectRow({ workspaceAvailable: false }),
       taskRow(),
     ])
-    const plus = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
+    const createTask = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-new-task"]')
 
-    expect(plus?.disabled).toBe(true)
-    expect(plus?.getAttribute('title')).toBe('This project directory is unavailable')
-    plus?.click()
+    expect(createTask?.disabled).toBe(true)
+    expect(createTask?.getAttribute('title')).toBe('This project directory is unavailable')
+    createTask?.click()
     await nextTick()
 
     expect(events.newProjectTask).not.toHaveBeenCalled()

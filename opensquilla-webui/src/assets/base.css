@@ -308,7 +308,8 @@ pre {
   gap: var(--sp-2);
 }
 
-.sidebar-dock-toggle {
+.sidebar-dock-toggle,
+.sidebar-search-button {
   position: relative;
   width: 28px;
   height: 28px;
@@ -323,7 +324,8 @@ pre {
   transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
   flex-shrink: 0;
 }
-.sidebar-dock-toggle:hover {
+.sidebar-dock-toggle:hover,
+.sidebar-search-button:hover {
   background: var(--sidebar-item-hover);
   color: var(--sidebar-text-strong);
   border-color: transparent;
@@ -409,6 +411,18 @@ pre {
   padding: 6px 12px 8px;
 }
 
+.sidebar-brand-actions {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: var(--sp-1);
+}
+
+.sidebar-brand-actions > button {
+  width: 32px;
+  height: 32px;
+}
+
 .sidebar-brand-lockup {
   display: flex;
   align-items: center;
@@ -433,10 +447,14 @@ pre {
   font-size: 1rem;
   color: var(--sidebar-text-strong);
   letter-spacing: var(--track-display);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Leads the nav index. Shares .sidebar-fn-item's row geometry so the sidebar
-   reads as one list; the weight and the plus glyph carry the emphasis instead
+   reads as one list; the weight and the chat-plus glyph carry the emphasis instead
    of a border, and the row keeps its own class for the New-task selectors. */
 .sidebar-new-session {
   display: flex;
@@ -1314,6 +1332,12 @@ pre {
   display: flex;
   flex-shrink: 0;
   align-items: center;
+  gap: 2px;
+}
+
+.sidebar-project-actions > .sidebar-project-action {
+  width: 28px;
+  height: 28px;
 }
 
 .sidebar-project-action {
@@ -1707,6 +1731,7 @@ pre {
 /* Drawer affordances retain the mobile touch contract even when a coarse-only
    device enters drawer mode above the phone breakpoint. */
 .sidebar--drawer .sidebar-dock-toggle,
+.sidebar--drawer .sidebar-search-button,
 .sidebar--drawer .sidebar-core .sidebar-fn-item,
 .sidebar--drawer .sidebar-foot .sidebar-fn-item,
 .sidebar--drawer .sidebar-new-session,
@@ -1714,7 +1739,8 @@ pre {
   min-height: 44px;
 }
 
-.sidebar--drawer .sidebar-dock-toggle {
+.sidebar--drawer .sidebar-dock-toggle,
+.sidebar--drawer .sidebar-search-button {
   width: 44px;
   height: 44px;
 }

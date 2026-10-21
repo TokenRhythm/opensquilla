@@ -18,27 +18,41 @@
         <img class="sidebar-brand-mark" :src="brandMarkUrl" alt="" aria-hidden="true" />
         <span class="sidebar-brand-text">OpenSquilla</span>
       </div>
-      <button
-        ref="sidebarDockToggleRef"
-        class="sidebar-dock-toggle"
-        :aria-label="t('chrome.collapseSidebar')"
-        aria-controls="sidebar-nav"
-        :aria-expanded="effectiveSidebarOpen"
-        :aria-keyshortcuts="sidebarToggleAriaShortcut"
-        aria-describedby="sidebar-toggle-tip-expanded"
-        data-testid="sidebar-toggle-expanded"
-        @click="toggleDock('sidebar-button')"
-      >
-        <Icon name="sidebar-visible" :size="18" />
-        <span
-          id="sidebar-toggle-tip-expanded"
-          class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
-          role="tooltip"
+      <div class="sidebar-brand-actions">
+        <button
+          type="button"
+          class="sidebar-search-button"
+          data-testid="sidebar-search"
+          :aria-label="t('chrome.searchChats')"
+          :title="commandPaletteHint ? `${t('chrome.searchChats')} (${commandPaletteHint})` : t('chrome.searchChats')"
+          aria-haspopup="dialog"
+          :aria-expanded="commandPaletteOpen"
+          @click="openCommandPalette"
         >
-          <span>{{ t('chrome.toggleSidebar') }}</span>
-          <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
-        </span>
-      </button>
+          <Icon name="search" :size="18" />
+        </button>
+        <button
+          ref="sidebarDockToggleRef"
+          class="sidebar-dock-toggle"
+          :aria-label="t('chrome.collapseSidebar')"
+          aria-controls="sidebar-nav"
+          :aria-expanded="effectiveSidebarOpen"
+          :aria-keyshortcuts="sidebarToggleAriaShortcut"
+          aria-describedby="sidebar-toggle-tip-expanded"
+          data-testid="sidebar-toggle-expanded"
+          @click="toggleDock('sidebar-button')"
+        >
+          <Icon name="sidebar-visible" :size="18" />
+          <span
+            id="sidebar-toggle-tip-expanded"
+            class="sidebar-toggle-tip sidebar-toggle-tip--sidebar"
+            role="tooltip"
+          >
+            <span>{{ t('chrome.toggleSidebar') }}</span>
+            <kbd v-if="sidebarToggleHint">{{ sidebarToggleHint }}</kbd>
+          </span>
+        </button>
+      </div>
     </div>
 
     <!-- Always-visible flat nav index. Bounded and self-scrolling under a
@@ -53,7 +67,7 @@
         :title="newChatHint ? `${t('chrome.newTaskTitle')} (${newChatHint})` : t('chrome.newTaskTitle')"
         @click="startNewChatInstant"
       >
-        <Icon name="plus" :size="17" />
+        <Icon name="chat-plus" :size="18" />
         <span class="sidebar-new-session__label">{{ t('chrome.newTask') }}</span>
         <!-- Badge tracks the configured binding and hides when the shortcut is
              disabled (Settings → Keyboard), so it never advertises a dead key. -->
@@ -87,7 +101,6 @@
       :has-more="hasMore"
       :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
-      :search-hint="commandPaletteHint"
       :can-manage-projects="gatewayAccess.canManageProjectWorkspaces"
       :can-create-projects="gatewayAccess.canChooseProject"
       @select="switchToSession"
@@ -106,7 +119,6 @@
       @project-edit="openProjectEditor"
       @project-delete-history="onProjectDeleteHistory"
       @project-remove="onProjectRemove"
-      @search="openCommandPalette"
     />
 
     <!-- Fixed footer: settings and the desktop update entry -->
@@ -1649,7 +1661,7 @@ async function onProjectRemove(workspaceId: string) {
   }
 }
 
-// Command palette: ⌘K / Ctrl+K and the rail "Search / Go to…" row both open it.
+// Command palette: ⌘K / Ctrl+K and the sidebar header search both open it.
 // Its action commands route back through the existing handlers so behaviour stays
 // single-sourced (new chat opens a draft, Settings reuses the footer path).
 function openCommandPalette() {
