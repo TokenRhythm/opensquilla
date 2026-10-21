@@ -414,7 +414,14 @@ def test_manual_consumer_admission_uses_exact_adapter_projection() -> None:
     assert len(fingerprint) == 64
 
 
-def test_manual_consumer_admission_reserves_the_next_authoritative_envelope() -> None:
+def test_manual_consumer_admission_reserves_the_next_authoritative_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Test the envelope reserve independently of optional tokenizer availability.
+    monkeypatch.setattr(
+        "opensquilla.token_estimation.estimate_tokens_with_source",
+        lambda text: (max(1, len(text) // 4), "test"),
+    )
     config = GatewayConfig(
         llm={
             "provider": "openai",
