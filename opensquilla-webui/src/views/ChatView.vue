@@ -1351,6 +1351,11 @@ const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
 const activeProjectWorkspace = useActiveProjectWorkspace()
+watch(() => gatewayAccess.deliveryIdentity && gatewayAccess.canManageProjectWorkspaces ? JSON.stringify([
+  gatewayAccess.deliveryIdentity, gatewayAccess.loadConnectionEndpoint(), gatewayAccess.subscriptionEpoch,
+]) : null, scope => activeProjectWorkspace.setPresentationScope(scope), { immediate: true, flush: 'sync' })
+watch(projectWorkspaces.validationGeneration,
+  () => activeProjectWorkspace.invalidatePhysicalSnapshots(), { flush: 'sync' })
 let workbenchMetadataScope: string | null = null
 let workbenchIdentityRevision = 0
 const draftProjectHydration = createDraftProjectHydrationGuard()
@@ -2994,7 +2999,8 @@ const chatSessionSubscription = useChatSessionSubscription({
     const preserveCurrent = workbenchMaterializedSessionKey === key
     workbenchMaterializedSessionKey = ''
     if (refresh && !preserveCurrent) return activeProjectWorkspace.beginSessionRefresh(key)
-    return activeProjectWorkspace.beginSessionResolution(key, preserveCurrent)
+    return preserveCurrent ? activeProjectWorkspace.beginSessionResolution(key, true)
+      : activeProjectWorkspace.beginSessionVisit(key)
   },
   onSessionMetadata: (key, generation, metadata) => {
     if (generation < 0) return
@@ -3003,9 +3009,6 @@ const chatSessionSubscription = useChatSessionSubscription({
     }
     const connectionEpoch = gatewayAccess.subscriptionEpoch
     const sessionEpoch = metadata.epoch ?? currentEpoch.value
-    const sameSessionIncarnation = !activeProjectWorkspace.refreshing.value || workbenchMetadataScope === JSON.stringify([
-      key, gatewayAccess.deliveryIdentity, connectionEpoch, sessionEpoch,
-    ])
     const identityRevision = workbenchIdentityRevision
     const isCurrent = () => !chatViewDisposed && key === sessionKey.value
       && connectionEpoch === gatewayAccess.subscriptionEpoch && sessionEpoch === currentEpoch.value
@@ -3014,19 +3017,24 @@ const chatSessionSubscription = useChatSessionSubscription({
     // Subscription installs this metadata's epoch in onSnapshot immediately
     // after this callback. Validate/project after that installation so a cold
     // session with a nonzero epoch cannot invalidate its own workspace read.
-    void Promise.resolve().then(() => applySessionProjectWorkspaceMetadata({
-      state: activeProjectWorkspace, sessionKey: key, generation,
-      metadata: {
-        workspaceId: metadata.workspaceId ?? undefined,
-        projectWorkspace: projectWorkspaceFromSessionRead(metadata.projectWorkspace),
-        projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
-      },
-      cachedWorkspace: cached ? activeSnapshot(cached) : null,
-      sameSessionIncarnation,
-      loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
-        .map(workspace => activeSnapshot(workspace)),
-      isCurrent,
-    })).then(() => {
+    void Promise.resolve().then(() => {
+      const registered = projectWorkspaceFromSessionRead(metadata.projectWorkspace)
+      const validated = registered ? projectWorkspaces.getValidatedWorkspace(registered.id, registered.path) : undefined
+      return applySessionProjectWorkspaceMetadata({
+        state: activeProjectWorkspace, sessionKey: key, generation,
+        metadata: {
+          workspaceId: metadata.workspaceId ?? undefined,
+          projectWorkspace: registered,
+          projectWorkspaceDeferred: metadata.projectWorkspaceDeferred,
+          epoch: sessionEpoch,
+        },
+        cachedWorkspace: cached ? activeSnapshot(cached) : null,
+        validatedWorkspace: validated ? validated.workspace ? activeSnapshot(validated.workspace) : null : undefined,
+        loadWorkspaces: async () => (await projectWorkspaces.loadWorkspaces({ timeoutMs: 7_000 }))
+          .map(workspace => activeSnapshot(workspace)),
+        isCurrent,
+      })
+    }).then(() => {
       // The first snapshot establishes the session epoch after the read began.
       // Remember the installed context, not the pre-bootstrap unknown epoch.
       if (isCurrent() && activeWorkspaceStatus.value !== 'resolving' && activeWorkspaceStatus.value !== 'error') {
@@ -3454,7 +3462,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   usageModel,
   createSessionKey,
   persistSession,
-  beginSessionResolution: activeProjectWorkspace.beginSessionResolution,
+  beginSessionResolution: activeProjectWorkspace.beginSessionVisit,
   cancelSessionBootstrap: (unsubscribe = true) => {
     // Retire draft-project work on the old socket before the next session's
     // coordinator can start, so its abort/reconnect cannot tear down B.

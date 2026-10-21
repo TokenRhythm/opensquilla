@@ -157,6 +157,42 @@ describe('ChatComposer project draft', () => {
     app.unmount()
   })
 
+  it('keeps known chat visits settled and places visible workspace problems after the safety control', async () => {
+    const state = useActiveProjectWorkspace()
+    state.setPresentationScope('gateway/connection')
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, removed: false }
+    for (const key of ['a', 'b']) state.applySessionSnapshot(key, state.beginSessionVisit(key), {
+      workspaceId: 'a', projectWorkspace: workspace,
+    })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({ render: () => h(ChatComposer, composerProps({
+      isNewLanding: false, canCloseProject: false, hasSendContent: true, modelValue: 'hello',
+      projectWorkspace: state.activeWorkspace.value, projectWorkspaceStatus: state.presentationStatus.value,
+      projectStatusMessage: state.presentationStatus.value === 'ready' ? '' : 'Project unavailable',
+      sendBlockedMessage: state.sendBlockedReason.value ? 'Project check pending' : '',
+    }) as never) })
+    app.use(i18n)
+    app.mount(host)
+    const safety = host.querySelector('.chat-run-mode-anchor')!
+    for (const key of ['a', 'b', 'a']) {
+      const generation = state.beginSessionVisit(key)
+      await nextTick()
+      expect(host.querySelector('.chat-project-chip')).toBeNull()
+      expect(host.querySelector('.chat-run-mode-anchor')).toBe(safety)
+      expect(host.querySelector<HTMLButtonElement>('.chat-send-btn')?.disabled).toBe(true)
+      await applySessionProjectWorkspaceMetadata({ state, sessionKey: key, generation,
+        metadata: { workspaceId: 'a', projectWorkspace: workspace }, loadWorkspaces: vi.fn(), isCurrent: () => true })
+    }
+    state.applyWorkspaceRefresh({ ...workspace, available: false })
+    await nextTick()
+    const chip = host.querySelector('.chat-project-chip')!
+    expect(chip.textContent).toContain('Project unavailable')
+    expect(safety.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+    expect(host.querySelector<HTMLButtonElement>('.chat-send-btn')?.disabled).toBe(true)
+    app.unmount()
+  })
+
   it.each([false, true])('disables project changes during a pending binding (selected=%s)', async selected => {
     const chooseProject = vi.fn()
     const closeProject = vi.fn()

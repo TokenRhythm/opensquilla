@@ -774,7 +774,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(stream.appendToolCall).toHaveBeenCalledWith(earlyTool)
   })
 
-  it('marks overflow dirty and installs the complete authoritative text instead of a truncated tail', () => {
+  it('retains early deltas beyond the former frame cap until the response binds their task', () => {
     const { api, stream, options, scope } = makeHarness(PENDING_STREAM_TASK_ID)
 
     for (let index = 0; index < 70; index++) {
@@ -788,60 +788,36 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     api.bindActiveStreamTask('task-B')
 
-    expect(options.onRecoveryRequired).toHaveBeenCalledOnce()
-    expect(stream.appendDelta).not.toHaveBeenCalled()
+    expect(options.onRecoveryRequired).not.toHaveBeenCalled()
     const completeText = Array.from({ length: 70 }, (_, index) => `delta-${index}`).join('')
-    api.beginRecovery()
-    api.restoreLiveTurnSnapshot({
-      sessionKey: SESSION, taskId: 'task-B', currentStreamSeq: 70, streamGeneration: 'stream-1',
-      events: [{ semanticKind: 'text-delta', payload: { key: SESSION, task_id: 'task-B', text: completeText } }],
-    })
-    expect(api.finishRecovery()).toBe(true)
-    expect(stream.appendDelta).toHaveBeenCalledOnce()
-    expect(vi.mocked(stream.appendDelta).mock.calls[0]?.[0]).toBe(completeText)
+    expect(stream.appendDelta).toHaveBeenCalledTimes(70)
+    expect(vi.mocked(stream.appendDelta).mock.calls.map(([text]) => text).join('')).toBe(completeText)
     expect(options.lastStreamSeq.value).toBe(70)
     scope.stop()
   })
 
-  it('marks terminal bucket overflow dirty and recovers only the authoritative task terminal', () => {
-    const oldest = makeHarness(PENDING_STREAM_TASK_ID)
+  it.each([0, 8])('retains terminal candidates beyond the former task cap and consumes only task-%i', (boundIndex) => {
+    const { api, stream, options, messages, activeTaskId, scope } = makeHarness(PENDING_STREAM_TASK_ID)
     for (let index = 0; index < 9; index++) {
-      oldest.api.handlers.onWireEventFixture('task.failed', {
+      api.handlers.onWireEventFixture('task.failed', {
         task_id: `task-${index}`,
         session_key: SESSION,
         terminal_message: `Task ${index} failed.`,
       })
     }
 
-    oldest.api.bindActiveStreamTask('task-0')
-    expect(oldest.stream.endStreaming).not.toHaveBeenCalled()
-    expect(oldest.options.onRecoveryRequired).toHaveBeenCalledOnce()
-
-    const newest = makeHarness(PENDING_STREAM_TASK_ID)
-    for (let index = 0; index < 9; index++) {
-      newest.api.handlers.onWireEventFixture('task.failed', {
-        task_id: `task-${index}`,
-        session_key: SESSION,
-        terminal_message: `Task ${index} failed.`,
-      })
-    }
-
-    newest.api.bindActiveStreamTask('task-8')
-    expect(newest.options.onRecoveryRequired).toHaveBeenCalledOnce()
-    expect(newest.stream.endStreaming).not.toHaveBeenCalled()
-    newest.api.beginRecovery()
-    newest.api.restoreLiveTurnSnapshot({
-      sessionKey: SESSION, taskId: 'task-8', currentStreamSeq: 9,
-      events: [{ semanticKind: 'turn-failed', payload: {
-        key: SESSION, task_id: 'task-8', terminal_message: 'Task 8 failed.',
-      } }],
-    })
-    expect(newest.api.finishRecovery()).toBe(true)
-    expect(newest.stream.endStreaming).toHaveBeenCalledTimes(1)
-    expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('This request did not finish.')
-    expect(newest.options.lastStreamSeq.value).toBe(9)
-    oldest.scope.stop()
-    newest.scope.stop()
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+    expect(messages.value).toEqual([])
+    api.bindActiveStreamTask(`task-${boundIndex}`)
+    expect(options.onRecoveryRequired).not.toHaveBeenCalled()
+    expect(stream.endStreaming).toHaveBeenCalledOnce()
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]?.text).toBe('This request did not finish.')
+    expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+    expect(options.applySessionRunState).toHaveBeenLastCalledWith(expect.objectContaining({
+      last_task: expect.objectContaining({ task_id: `task-${boundIndex}` }),
+    }))
+    scope.stop()
   })
 
   it("accepts the exact Stop target's cancelled terminal without poisoning the render id", () => {

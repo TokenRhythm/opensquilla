@@ -21,6 +21,7 @@ export interface ActiveProjectWorkspaceSnapshot {
 export interface SessionProjectWorkspaceMetadata {
   workspaceId?: string
   projectWorkspace?: ActiveProjectWorkspaceSnapshot | null
+  epoch?: number
 }
 
 /** Session metadata describes registration, not current filesystem availability. */
@@ -30,25 +31,42 @@ export async function applySessionProjectWorkspaceMetadata(options: {
   generation: number
   metadata: SessionProjectWorkspaceMetadata & { projectWorkspaceDeferred?: boolean }
   cachedWorkspace?: ActiveProjectWorkspaceSnapshot | null
+  /** A physical catalog result fenced by the current Gateway and mutation generation. */
+  validatedWorkspace?: ActiveProjectWorkspaceSnapshot | null
   sameSessionIncarnation?: boolean
   loadWorkspaces: () => Promise<readonly ActiveProjectWorkspaceSnapshot[]>
   isCurrent: () => boolean
 }): Promise<void> {
   if (!options.isCurrent()) return
   const { state, sessionKey, generation, metadata } = options
-  if (options.sameSessionIncarnation === false
+  const sameIncarnation = state.observeSessionIncarnation(sessionKey, generation, metadata.epoch)
+  if ((options.sameSessionIncarnation === false || !sameIncarnation)
     && !state.invalidateSessionIncarnation(sessionKey, generation)) return
   const workspaceId = metadata.workspaceId || metadata.projectWorkspace?.id
   const known = state.activeWorkspace.value?.id === workspaceId
     ? state.activeWorkspace.value : options.cachedWorkspace?.id === workspaceId
       ? options.cachedWorkspace : null
-  // Only a same-owner refresh can reuse a physical check. The caller fences
-  // Gateway identity and session incarnation before beginning that refresh.
-  if (state.reuseSessionRegistration(sessionKey, generation, metadata)) return
   if (!workspaceId || metadata.projectWorkspace?.removed) {
     state.applySessionSnapshot(sessionKey, generation, metadata)
     return
   }
+  // Prefer a current catalog result over an older session's physical result.
+  // This also reflects removals discovered while another project was active.
+  if (sameIncarnation && options.sameSessionIncarnation !== false
+    && options.validatedWorkspace !== undefined) {
+    const checked = options.validatedWorkspace
+    const registration = metadata.projectWorkspace
+    if (registration?.id === workspaceId
+      && (!checked || (checked.id === workspaceId && checked.path === registration.path))) {
+      state.applySessionSnapshot(sessionKey, generation, {
+        ...metadata, workspaceId,
+        projectWorkspace: checked ? { ...checked, name: registration.name }
+          : { ...registration, available: false, removed: true, availabilityReason: 'removed' },
+      })
+      return
+    }
+  }
+  if (state.reuseSessionRegistration(sessionKey, generation, metadata)) return
   if (!state.applySessionSnapshot(sessionKey, generation, {
     ...metadata,
     workspaceId,
@@ -117,6 +135,67 @@ export function useActiveProjectWorkspace() {
   // Unlike the visible in-flight flag, this remains set after refresh failure:
   // a project-catalog result cannot revalidate the session's retained binding.
   let sessionRefreshUnresolved = false
+  let presentationScope: string | null = null
+  let currentSessionScope: string | null = null
+  let sessionIncarnation: number | undefined
+  let physicalValidated = false
+  // View-lifetime presentation only. A return visit still waits for current
+  // session metadata, and every send performs its own physical preflight.
+  const sessionPresentations = new Map<string, {
+    workspaceId: string | null
+    workspace: ActiveProjectWorkspaceSnapshot | null
+    physicalStatus: ActiveProjectWorkspaceStatus
+    presentationStatus: ActiveProjectWorkspaceStatus
+    physicalValidated: boolean
+    epoch?: number
+  }>()
+
+  function rememberSessionPresentation() {
+    if (!presentationScope || currentSessionScope !== presentationScope
+      || !resolvingSessionKey || !hasResolvedSession || sessionRefreshUnresolved) return
+    sessionPresentations.set(resolvingSessionKey, {
+      workspaceId: boundWorkspaceId.value,
+      workspace: activeWorkspace.value ? { ...activeWorkspace.value } : null,
+      physicalStatus, presentationStatus: presentationStatus.value, physicalValidated, epoch: sessionIncarnation,
+    })
+  }
+
+  function setPresentationScope(scope: string | null) {
+    if (scope === presentationScope) return
+    presentationScope = scope
+    currentSessionScope = null
+    physicalValidated = false
+    sessionPresentations.clear()
+  }
+
+  function beginSessionVisit(sessionKey: string): number {
+    rememberSessionPresentation()
+    const remembered = presentationScope ? sessionPresentations.get(sessionKey) : undefined
+    const generation = beginSessionResolution(sessionKey)
+    if (!remembered) return generation
+    boundWorkspaceId.value = remembered.workspaceId
+    activeWorkspace.value = remembered.workspace ? { ...remembered.workspace } : null
+    physicalStatus = remembered.physicalStatus
+    physicalValidated = remembered.physicalValidated
+    presentationStatus.value = remembered.presentationStatus
+    sessionIncarnation = remembered.epoch
+    hasResolvedSession = true
+    sessionRefreshUnresolved = true
+    refreshing.value = true
+    return generation
+  }
+
+  function invalidatePhysicalSnapshots() {
+    physicalValidated = false
+    for (const remembered of sessionPresentations.values()) remembered.physicalValidated = false
+  }
+
+  function observeSessionIncarnation(sessionKey: string, generation: number, epoch?: number): boolean {
+    if (sessionKey !== resolvingSessionKey || generation !== sessionGeneration) return false
+    const same = sessionIncarnation === undefined || epoch === undefined || sessionIncarnation === epoch
+    if (epoch !== undefined) sessionIncarnation = epoch
+    return same
+  }
 
   function settleStatus(value: ActiveProjectWorkspaceStatus) {
     status.value = presentationStatus.value = physicalStatus = value
@@ -129,6 +208,7 @@ export function useActiveProjectWorkspace() {
   }
 
   function clearDraft() {
+    rememberSessionPresentation()
     sessionGeneration += 1
     resolvingSessionKey = null
     hasResolvedSession = false
@@ -139,6 +219,7 @@ export function useActiveProjectWorkspace() {
   }
 
   function beginProjectDraft(workspace: ActiveProjectWorkspaceSnapshot) {
+    rememberSessionPresentation()
     sessionGeneration += 1
     resolvingSessionKey = null
     hasResolvedSession = false
@@ -155,6 +236,7 @@ export function useActiveProjectWorkspace() {
   }
 
   function beginUnknownProjectDraft(workspaceId: string) {
+    rememberSessionPresentation()
     sessionGeneration += 1
     resolvingSessionKey = null
     hasResolvedSession = false
@@ -173,6 +255,9 @@ export function useActiveProjectWorkspace() {
   function beginSessionResolution(sessionKey: string, preserveCurrent = false): number {
     sessionGeneration += 1
     resolvingSessionKey = sessionKey
+    currentSessionScope = presentationScope
+    sessionIncarnation = undefined
+    physicalValidated = false
     hasResolvedSession = false
     sessionRefreshUnresolved = false
     refreshing.value = false
@@ -203,6 +288,8 @@ export function useActiveProjectWorkspace() {
   function invalidateSessionIncarnation(sessionKey: string, generation: number): boolean {
     if (sessionKey !== resolvingSessionKey || generation !== sessionGeneration) return false
     hasResolvedSession = false
+    physicalValidated = false
+    sessionPresentations.delete(sessionKey)
     sessionRefreshUnresolved = false
     refreshing.value = false
     boundWorkspaceId.value = null
@@ -240,8 +327,10 @@ export function useActiveProjectWorkspace() {
     else if (metadata.workspaceId) settleStatus('unknown')
     else settleStatus('none')
     hasResolvedSession = true
+    physicalValidated = true
     sessionRefreshUnresolved = false
     refreshing.value = false
+    rememberSessionPresentation()
     return true
   }
 
@@ -251,7 +340,7 @@ export function useActiveProjectWorkspace() {
     metadata: SessionProjectWorkspaceMetadata,
   ): boolean {
     if (sessionKey !== resolvingSessionKey || generation !== sessionGeneration
-      || !hasResolvedSession || !sessionRefreshUnresolved) return false
+      || !hasResolvedSession || !sessionRefreshUnresolved || !physicalValidated) return false
     const registered = metadata.projectWorkspace
     const id = metadata.workspaceId || registered?.id || null
     const known = activeWorkspace.value
@@ -264,6 +353,7 @@ export function useActiveProjectWorkspace() {
     status.value = presentationStatus.value = physicalStatus
     sessionRefreshUnresolved = false
     refreshing.value = false
+    rememberSessionPresentation()
     return true
   }
 
@@ -272,6 +362,8 @@ export function useActiveProjectWorkspace() {
       return false
     }
     status.value = presentationStatus.value = 'error'
+    const remembered = sessionPresentations.get(sessionKey)
+    if (remembered) remembered.presentationStatus = 'error'
     refreshing.value = false
     return true
   }
@@ -279,7 +371,22 @@ export function useActiveProjectWorkspace() {
   function applyWorkspaceRefresh(
     workspace: ActiveProjectWorkspaceSnapshot | null,
   ): void {
+    // A completed physical check also updates inactive visits to this project.
+    // Otherwise switching back could briefly resurrect a removed directory.
+    for (const [key, remembered] of sessionPresentations) {
+      if (!remembered.workspaceId || remembered.workspaceId !== boundWorkspaceId.value) continue
+      if (workspace && remembered.workspace?.path !== workspace.path) {
+        sessionPresentations.delete(key)
+        continue
+      }
+      remembered.workspace = workspace ? { ...workspace } : remembered.workspace
+        ? { ...remembered.workspace, available: false, removed: true, availabilityReason: 'removed' } : null
+      remembered.physicalStatus = remembered.presentationStatus = !workspace || workspace.removed ? 'removed'
+        : workspace.available ? 'ready' : 'unavailable'
+      remembered.physicalValidated = true
+    }
     if (!boundWorkspaceId.value) return
+    physicalValidated = true
     if (!workspace) {
       if (activeWorkspace.value) {
         activeWorkspace.value = {
@@ -292,6 +399,7 @@ export function useActiveProjectWorkspace() {
       physicalStatus = 'removed'
       if (!sessionRefreshUnresolved || presentationStatus.value !== 'error') presentationStatus.value = physicalStatus
       if (!sessionRefreshUnresolved) status.value = physicalStatus
+      rememberSessionPresentation()
       return
     }
     boundWorkspaceId.value = workspace.id
@@ -303,11 +411,19 @@ export function useActiveProjectWorkspace() {
         : 'unavailable'
     if (!sessionRefreshUnresolved || presentationStatus.value !== 'error') presentationStatus.value = physicalStatus
     if (!sessionRefreshUnresolved) status.value = physicalStatus
+    rememberSessionPresentation()
   }
 
   function failWorkspaceRefresh(): void {
     if (!boundWorkspaceId.value || sessionRefreshUnresolved) return
     settleStatus('error')
+    physicalValidated = true
+    for (const remembered of sessionPresentations.values()) {
+      if (remembered.workspaceId !== boundWorkspaceId.value) continue
+      remembered.physicalStatus = remembered.presentationStatus = 'error'
+      remembered.physicalValidated = true
+    }
+    rememberSessionPresentation()
   }
 
   const sendBlockedReason = computed(() =>
@@ -328,6 +444,10 @@ export function useActiveProjectWorkspace() {
     beginUnknownProjectDraft,
     acceptPendingBinding,
     beginSessionResolution,
+    beginSessionVisit,
+    setPresentationScope,
+    invalidatePhysicalSnapshots,
+    observeSessionIncarnation,
     beginSessionRefresh,
     invalidateSessionIncarnation,
     applySessionSnapshot,

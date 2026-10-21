@@ -20,6 +20,83 @@ function project(
 }
 
 describe('useActiveProjectWorkspace', () => {
+  it.each(['ready', 'unavailable', 'error'] as const)('restores a known visit without flashing checking and still authenticates its binding (%s)', async physical => {
+    const state = useActiveProjectWorkspace()
+    state.setPresentationScope('gateway-a/connection-1')
+    const loadWorkspaces = vi.fn(async () => [project('p1', physical !== 'unavailable')])
+    for (const key of ['a', 'b']) {
+      const generation = state.beginSessionVisit(key)
+      expect(state.activeWorkspace.value).toBeNull()
+      await applySessionProjectWorkspaceMetadata({ state, sessionKey: key, generation,
+        metadata: { epoch: 4, workspaceId: 'p1', projectWorkspace: project('p1', true) },
+        validatedWorkspace: project('p1', physical !== 'unavailable'), loadWorkspaces, isCurrent: () => true })
+      if (physical === 'error') state.failWorkspaceRefresh()
+    }
+    const generation = state.beginSessionVisit('a')
+    expect(state.presentationStatus.value).toBe(physical)
+    expect(state.activeWorkspace.value?.id).toBe('p1')
+    expect(state.sendBlockedReason.value).toBe('resolving')
+    await applySessionProjectWorkspaceMetadata({ state, sessionKey: 'a', generation,
+      metadata: { epoch: 4, workspaceId: 'p1', projectWorkspace: project('p1', true) },
+      loadWorkspaces, isCurrent: () => true })
+    expect(state.status.value).toBe(physical)
+    expect(loadWorkspaces).not.toHaveBeenCalled()
+  })
+
+  it.each(['owner', 'incarnation', 'path', 'physical-invalidation'] as const)('does not authorize a remembered visit after %s changes', async change => {
+    const state = useActiveProjectWorkspace()
+    state.setPresentationScope('gateway-a/connection-1')
+    const metadata = { epoch: 4, workspaceId: 'p1', projectWorkspace: project('p1', true) }
+    await applySessionProjectWorkspaceMetadata({ state, sessionKey: 'a', generation: state.beginSessionVisit('a'),
+      metadata, validatedWorkspace: project('p1', true), loadWorkspaces: vi.fn(), isCurrent: () => true })
+    state.beginSessionVisit('b')
+    if (change === 'owner') state.setPresentationScope('gateway-b/connection-2')
+    if (change === 'physical-invalidation') state.invalidatePhysicalSnapshots()
+    const generation = state.beginSessionVisit('a')
+    if (change === 'owner') expect(state.activeWorkspace.value).toBeNull()
+    expect(state.sendBlockedReason.value).toBe('resolving')
+    const registration = { ...metadata, epoch: change === 'incarnation' ? 5 : 4,
+      projectWorkspace: { ...metadata.projectWorkspace, path: change === 'path' ? '/relocated' : '/repos/p1' } }
+    const loadWorkspaces = vi.fn(async () => [{ ...registration.projectWorkspace, available: false }])
+    await applySessionProjectWorkspaceMetadata({ state, sessionKey: 'a', generation,
+      metadata: registration, loadWorkspaces, isCurrent: () => true })
+    expect(loadWorkspaces).toHaveBeenCalledOnce()
+    expect(state.status.value).toBe('unavailable')
+  })
+
+  it('uses the same checked directory for a new session without trusting the previous session binding', async () => {
+    const state = useActiveProjectWorkspace()
+    state.setPresentationScope('gateway-a/connection-1')
+    const a = state.beginSessionVisit('a')
+    state.applySessionSnapshot('a', a, { workspaceId: 'p1', projectWorkspace: project('p1', true) })
+    const b = state.beginSessionVisit('b')
+    expect(state.activeWorkspace.value).toBeNull()
+    expect(state.sendBlockedReason.value).toBe('resolving')
+    const loadWorkspaces = vi.fn()
+    await applySessionProjectWorkspaceMetadata({ state, sessionKey: 'b', generation: b,
+      metadata: { workspaceId: 'p1', projectWorkspace: project('p1', true) },
+      validatedWorkspace: project('p1', false), loadWorkspaces, isCurrent: () => true })
+    expect(loadWorkspaces).not.toHaveBeenCalled()
+    expect(state.status.value).toBe('unavailable')
+  })
+
+  it('does not resurrect a removed project when returning to an inactive session', async () => {
+    const state = useActiveProjectWorkspace()
+    state.setPresentationScope('gateway-a/connection-1')
+    for (const key of ['a', 'b']) state.applySessionSnapshot(key, state.beginSessionVisit(key), {
+      workspaceId: 'p1', projectWorkspace: project('p1', true),
+    })
+    state.invalidatePhysicalSnapshots()
+    state.applyWorkspaceRefresh(null)
+    const generation = state.beginSessionVisit('a')
+    expect(state.presentationStatus.value).toBe('removed')
+    await applySessionProjectWorkspaceMetadata({ state, sessionKey: 'a', generation,
+      metadata: { workspaceId: 'p1', projectWorkspace: project('p1', true) },
+      validatedWorkspace: null, loadWorkspaces: vi.fn(), isCurrent: () => true })
+    expect(state.status.value).toBe('removed')
+    expect(state.sendBlockedReason.value).toBe('removed')
+  })
+
   it.each([true, false])('preserves settled same-session presentation while blocking refresh operations (project=%s)', hasProject => {
     const state = useActiveProjectWorkspace()
     const initial = state.beginSessionResolution('session-a')

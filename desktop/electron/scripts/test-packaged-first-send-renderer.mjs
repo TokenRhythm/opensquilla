@@ -197,6 +197,7 @@ let runError
 let rendererPage
 let electronProcessIdentity
 let failureRendererSnapshot
+let failureInteractionTimeline
 let rendererObservation = { pages: new Map(), subframePageIds: new Set(), pageErrorDetails: [], consoleErrorDetails: [], sessionStreamWarnings: [] }
 let targetPageId = null
 let targetWebContentsId = null
@@ -233,12 +234,35 @@ async function browserRpcSnapshot(page) {
     return {
       methods: probe?.methods || {},
       sends: probe?.sends || [],
+      interactionTimeline: probe?.interactionTimeline || [],
     }
   })
 }
 
 function installBrowserRpcProbe() {
-  const probe = { methods: {}, sends: [] }
+  const probe = { methods: {}, sends: [], interactionTimeline: [] }
+  const note = (entry) => {
+    probe.interactionTimeline.push({ at: Date.now(), ...entry })
+    if (probe.interactionTimeline.length > 100) probe.interactionTimeline.shift()
+  }
+  const composerState = () => {
+    const composer = document.querySelector('.chat-textarea')
+    const button = document.querySelector('.chat-send-btn.btn--primary')
+    return {
+      composerLength: (composer?.value ?? composer?.textContent ?? '').length,
+      buttonPresent: Boolean(button),
+      buttonDisabled: button?.disabled ?? null,
+      buttonBusy: button?.getAttribute('aria-busy') === 'true',
+      recoveryNoticePresent: Boolean(document.querySelector('.chat-recovery-notice')),
+    }
+  }
+  document.addEventListener('click', event => {
+    if (!(event.target instanceof Element) || !event.target.closest('.chat-send-btn.btn--primary')) return
+    note({ kind: 'send-click-capture', trusted: event.isTrusted, ...composerState() })
+    queueMicrotask(() => note({ kind: 'send-click-microtask', ...composerState() }))
+  }, { capture: true })
+  const observedSockets = new WeakSet()
+  const pendingMethods = new Map()
   Object.defineProperty(globalThis, '__opensquillaP15RpcProbe', {
     configurable: false,
     enumerable: false,
@@ -247,11 +271,28 @@ function installBrowserRpcProbe() {
   })
   const originalSend = WebSocket.prototype.send
   WebSocket.prototype.send = function opensquillaP15ObservedSend(data) {
+    if (!observedSockets.has(this)) {
+      observedSockets.add(this)
+      this.addEventListener('message', event => {
+        try {
+          const response = JSON.parse(event.data)
+          const method = response.type === 'res' && pendingMethods.get(response.id)
+          if (method) {
+            pendingMethods.delete(response.id)
+            note({ kind: 'rpc-response', method, ok: response.ok, code: response.error?.code })
+          }
+        } catch { /* Observation never alters the frame. */ }
+      })
+    }
     try {
       if (typeof data === 'string') {
         const frame = JSON.parse(data)
         if (frame?.type === 'req' && typeof frame.method === 'string') {
           probe.methods[frame.method] = (probe.methods[frame.method] || 0) + 1
+          if (!['transport.flow.ack', 'transport.flow.probe'].includes(frame.method)) {
+            pendingMethods.set(frame.id, frame.method)
+            note({ kind: 'rpc-request', method: frame.method })
+          }
           if (frame.method === 'chat.send') {
             probe.sends.push({
               message: typeof frame.params?.message === 'string' ? frame.params.message : '',
@@ -561,10 +602,13 @@ try {
     error: error?.stack || error?.message || String(error),
   }))
   failureRendererSnapshot = await captureRendererFailure(rendererPage)
+  failureInteractionTimeline = await captureFirstSendDiagnostic(async () =>
+    (await browserRpcSnapshot(rendererPage)).interactionTimeline)
   console.error(JSON.stringify({
     event: 'packaged_first_send_failure_diagnostics',
     processes: electronProcessSnapshot(electronProcessIdentity),
     renderer: failureRendererSnapshot,
+    interactionTimeline: failureInteractionTimeline,
     sessionStreamWarnings: rendererObservation.sessionStreamWarnings,
   }))
 } finally {
@@ -642,6 +686,7 @@ console.log(JSON.stringify({
   desktopLog: desktopLogSummary,
   observation,
   acceptance,
-  ...(runError ? { error: runError?.stack || String(runError), failureSnapshot: failureRendererSnapshot } : {}),
+  ...(runError ? { error: runError?.stack || String(runError), failureSnapshot: failureRendererSnapshot,
+    interactionTimeline: failureInteractionTimeline } : {}),
 }, null, 2))
 if (runError) process.exitCode = 1

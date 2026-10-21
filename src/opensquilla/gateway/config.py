@@ -244,16 +244,20 @@ class AttachmentsConfig(BaseSettings):
 class RateLimitConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_RATE_")
 
-    enabled: bool = True
+    # Optional deployment policy, not a measure of gateway resource pressure.
+    # Desktop and browser tabs share an IP, and ordinary file/preview activity
+    # can exhaust a fixed request bucket even when the gateway is healthy.
+    # Authentication failure throttling and endpoint resource limits are
+    # independent of this switch and remain enforced.
+    enabled: bool = False
     max_requests: int = 100
     window_seconds: int = 60
     # Content reads are a separate, bounded capability.  A transcript is
     # deliberately read in 1 MiB ranges, so charging those requests to the
     # small control/API bucket makes a normal history or export compete with
-    # startup traffic.  Keep an independent request budget instead of
-    # disabling abuse protection altogether.  The content endpoint enforces
-    # the per-range byte limit; this budget therefore caps the aggregate
-    # amount a client can read in one window as well.
+    # startup traffic. When enabled, keep an independent request budget.
+    # The content endpoint enforces its per-range byte limit regardless of
+    # this optional request-count policy.
     content_max_requests: int = 1200
     content_window_seconds: int = 60
 

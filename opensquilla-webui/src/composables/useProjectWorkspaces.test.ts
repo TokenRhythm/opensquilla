@@ -114,6 +114,104 @@ describe('useProjectWorkspaces', () => {
     expect(useRpcStore().state).toBe('disconnected')
   })
 
+  it('reuses only a checked exact directory in the current scope and invalidates it before fresh reads', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: false, taskCount: 1, pinned: false }
+    let finish!: (items: typeof workspace[]) => void
+    const list = vi.fn().mockResolvedValueOnce([workspace])
+      .mockImplementationOnce(() => new Promise<typeof workspace[]>(resolve => { finish = resolve }))
+    const access = { ...accessFromRpc(rpc), deliveryIdentity: 'owner-a' }
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, access)
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+    await projects.loadWorkspaces()
+    expect(projects.getValidatedWorkspace('a', '/a')?.workspace?.available).toBe(false)
+    expect(projects.getValidatedWorkspace('a', '/relocated')).toBeUndefined()
+    expect(projects.getValidatedWorkspace('removed', '/removed')).toEqual({ workspace: null })
+    const before = projects.validationGeneration.value
+    const pending = projects.loadWorkspaces({ fresh: true })
+    expect(projects.validationGeneration.value).toBeGreaterThan(before)
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+    await Promise.resolve()
+    finish([{ ...workspace, available: true }])
+    await pending
+    expect(projects.getValidatedWorkspace('a', '/a')?.workspace?.available).toBe(true)
+    access.deliveryIdentity = 'owner-b'
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+    expect(list).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not reuse a formerly healthy directory after a catalog error', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, taskCount: 1, pinned: false }
+    const list = vi.fn().mockResolvedValueOnce([workspace]).mockRejectedValueOnce(new Error('offline'))
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    await projects.loadWorkspaces()
+    await expect(projects.loadWorkspaces()).rejects.toThrow('offline')
+    expect(projects.getValidatedWorkspace('a', '/a')).toBeUndefined()
+  })
+
+  it('checks one physical workspace once across repeated visits to three chats, but checks again for a send', async () => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, taskCount: 3, pinned: false }
+    const list = vi.fn().mockResolvedValue([workspace])
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    const active = useActiveProjectWorkspace()
+    active.setPresentationScope('gateway/connection')
+    const scope = effectScope()
+    scope.run(() => watch(projects.validationGeneration, () => active.invalidatePhysicalSnapshots(), { flush: 'sync' }))
+    const visit = async (key: string) => {
+      const generation = active.beginSessionVisit(key)
+      expect(active.sendBlockedReason.value).toBe('resolving')
+      const validated = projects.getValidatedWorkspace(workspace.id, workspace.path)
+      await applySessionProjectWorkspaceMetadata({ state: active, sessionKey: key, generation,
+        metadata: { epoch: 2, workspaceId: workspace.id, projectWorkspace: { ...workspace, removed: false } },
+        validatedWorkspace: validated ? validated.workspace ? { ...validated.workspace, removed: false } : null : undefined,
+        loadWorkspaces: async () => (await projects.loadWorkspaces()).map(item => ({ ...item, removed: false })),
+        isCurrent: () => true })
+      expect(active.status.value).toBe('ready')
+    }
+    for (let index = 0; index < 18; index++) await visit(`chat-${index % 3}`)
+    expect(list).toHaveBeenCalledOnce()
+    await projects.loadWorkspaces({ fresh: true })
+    await visit('chat-0')
+    expect(list).toHaveBeenCalledTimes(2)
+    scope.stop()
+  })
+
+  it.each(['removed', 'unavailable', 'relocated'] as const)('applies a background catalog %s discovered while a different project is active', async change => {
+    const rpc = useRpcStore()
+    connectOwner(rpc)
+    const workspace = { id: 'a', name: 'A', path: '/a', available: true, taskCount: 1, pinned: false }
+    const other = { ...workspace, id: 'b', name: 'B', path: '/b' }
+    const updated = change === 'removed' ? [other] : [other, { ...workspace,
+      available: change !== 'unavailable', path: change === 'relocated' ? '/new-a' : '/a' }]
+    const list = vi.fn().mockResolvedValueOnce([workspace, other]).mockResolvedValue(updated)
+    const projects = useProjectWorkspaces({ ...catalogFromRpc(rpc), list }, accessFromRpc(rpc))
+    const active = useActiveProjectWorkspace()
+    active.setPresentationScope('gateway/connection')
+    const scope = effectScope()
+    scope.run(() => watch(projects.validationGeneration, () => active.invalidatePhysicalSnapshots(), { flush: 'sync' }))
+    await projects.loadWorkspaces()
+    for (const item of [workspace, other]) active.applySessionSnapshot(item.id, active.beginSessionVisit(item.id), {
+      workspaceId: item.id, projectWorkspace: { ...item, removed: false },
+    })
+    await projects.loadWorkspaces() // No fresh flag: a normal sidebar refresh.
+    const generation = active.beginSessionVisit('a')
+    const validated = projects.getValidatedWorkspace('a', '/a')
+    await applySessionProjectWorkspaceMetadata({ state: active, sessionKey: 'a', generation,
+      metadata: { workspaceId: 'a', projectWorkspace: { ...workspace, removed: false } },
+      validatedWorkspace: validated ? validated.workspace ? { ...validated.workspace, removed: false } : null : undefined,
+      loadWorkspaces: async () => (await projects.loadWorkspaces()).map(item => ({ ...item, removed: false })),
+      isCurrent: () => true })
+    expect(active.status.value).toBe(change === 'removed' ? 'removed' : change === 'unavailable' ? 'unavailable' : 'ready')
+    expect(active.activeWorkspace.value?.path).toBe(change === 'relocated' ? '/new-a' : '/a')
+    expect(list).toHaveBeenCalledTimes(change === 'relocated' ? 3 : 2)
+    scope.stop()
+  })
+
   it('shares an in-flight read across consumers of the same catalog and scope', async () => {
     const rpc = useRpcStore()
     connectOwner(rpc)

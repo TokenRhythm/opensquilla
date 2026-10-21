@@ -249,6 +249,40 @@
                 @close="closeAddMenu"
               />
             </div>
+            <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
+              <button
+                class="btn btn--ghost chat-run-mode-btn"
+                :class="[`chat-run-mode-btn--${runMode}`, {
+                  'is-active': runModeOpen,
+                  'is-locked': runModeLocked,
+                }]"
+                :title="runModeLocked ? undefined : runModeLabel"
+                :aria-label="`${t('chat.composer.runMode')}: ${runModeLabel}`"
+                aria-haspopup="dialog"
+                :aria-expanded="runModeOpen ? 'true' : 'false'"
+                :aria-disabled="runModeLocked ? 'true' : 'false'"
+                :aria-describedby="runModeLocked ? runModeLockTooltipId : undefined"
+                :disabled="runModeLocked"
+                @click="toggleRunMode"
+              >
+                <Icon name="shield" :size="16" aria-hidden="true" />
+                <span class="chat-run-mode-btn__label">{{ runModeLabel }}</span>
+              </button>
+              <span
+                v-if="runModeLocked"
+                :id="runModeLockTooltipId"
+                class="chat-run-mode-lock-tip"
+                role="tooltip"
+              >{{ runModeLockMessage }}</span>
+              <ChatComposerRunMode
+                v-if="runModeOpen"
+                :run-mode="runMode"
+                :allowed-run-modes="allowedRunModes"
+                :safe-setup-available="safeSetupAvailable"
+                @close="runModeOpen = false"
+                @set-run-mode="emit('setRunMode', $event)"
+              />
+            </div>
             <div
               v-if="showProjectContext && projectWorkspace"
               class="chat-project-chip"
@@ -290,40 +324,6 @@
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
 
-            <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
-              <button
-                class="btn btn--ghost chat-run-mode-btn"
-                :class="[`chat-run-mode-btn--${runMode}`, {
-                  'is-active': runModeOpen,
-                  'is-locked': runModeLocked,
-                }]"
-                :title="runModeLocked ? undefined : runModeLabel"
-                :aria-label="`${t('chat.composer.runMode')}: ${runModeLabel}`"
-                aria-haspopup="dialog"
-                :aria-expanded="runModeOpen ? 'true' : 'false'"
-                :aria-disabled="runModeLocked ? 'true' : 'false'"
-                :aria-describedby="runModeLocked ? runModeLockTooltipId : undefined"
-                :disabled="runModeLocked"
-                @click="toggleRunMode"
-              >
-                <Icon name="shield" :size="16" aria-hidden="true" />
-                <span class="chat-run-mode-btn__label">{{ runModeLabel }}</span>
-              </button>
-              <span
-                v-if="runModeLocked"
-                :id="runModeLockTooltipId"
-                class="chat-run-mode-lock-tip"
-                role="tooltip"
-              >{{ runModeLockMessage }}</span>
-              <ChatComposerRunMode
-                v-if="runModeOpen"
-                :run-mode="runMode"
-                :allowed-run-modes="allowedRunModes"
-                :safe-setup-available="safeSetupAvailable"
-                @close="runModeOpen = false"
-                @set-run-mode="emit('setRunMode', $event)"
-              />
-            </div>
             <ChatComposerGoalMode
               v-if="policy.goal"
               :active="goalDraftArmed"

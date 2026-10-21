@@ -1,4 +1,4 @@
-import { computed, hasInjectionContext, inject, ref, watch } from 'vue'
+import { computed, hasInjectionContext, inject, ref, watch, type Ref } from 'vue'
 import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog, type WorkspaceCreationDefaults, type WorkspaceHistoryDeletion, type WorkspaceItem } from '@/modules/workspaceCatalog'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 
@@ -29,6 +29,8 @@ interface CatalogReads {
   scope: string | null
   mutationGeneration: number
   flight: CatalogFlight | null
+  validated: readonly ProjectWorkspaceItem[] | null
+  validationGeneration: Ref<number>
 }
 const catalogReads = new WeakMap<WorkspaceCatalog, CatalogReads>()
 const REPLACED_READ = Symbol('Workspace catalog read replaced by fresh preflight')
@@ -58,7 +60,7 @@ export function useProjectWorkspaces(
   const workspaceCatalog: WorkspaceCatalog = catalog
   let reads = catalogReads.get(workspaceCatalog)
   if (!reads) {
-    reads = { scope: null, mutationGeneration: 0, flight: null }
+    reads = { scope: null, mutationGeneration: 0, flight: null, validated: null, validationGeneration: ref(0) }
     catalogReads.set(workspaceCatalog, reads)
   }
   const sharedReads = reads
@@ -83,6 +85,8 @@ export function useProjectWorkspaces(
 
   function invalidateReads(replaced = false) {
     sharedReads.mutationGeneration += 1
+    sharedReads.validated = null
+    sharedReads.validationGeneration.value += 1
     const prior = sharedReads.flight
     sharedReads.flight = null
     prior?.controller.abort(replaced ? REPLACED_READ : undefined)
@@ -128,6 +132,10 @@ export function useProjectWorkspaces(
       }).then(result => {
         if (!current()) throw cancelledRead()
         const loadedWorkspaces = [...result]
+        sharedReads.validated = loadedWorkspaces
+        // A background list can discover relocation/removal too. Retire old
+        // per-session physical snapshots before publishing the new catalog.
+        sharedReads.validationGeneration.value += 1
         if (requestSequence === loadSequence) {
           workspaces.value = loadedWorkspaces
           creationDefaults.value = workspaceCatalog.creationDefaults ?? null
@@ -137,6 +145,8 @@ export function useProjectWorkspaces(
         return loadedWorkspaces
       }).catch(cause => {
         if (current() && requestSequence === loadSequence) {
+          sharedReads.validated = null
+          sharedReads.validationGeneration.value += 1
           error.value = cause instanceof Error ? cause.message : String(cause)
         }
         throw cause
@@ -166,7 +176,11 @@ export function useProjectWorkspaces(
           joined.controller.abort()
           if (joined.sequence === loadSequence) {
             isLoading.value = false
-            if (cause instanceof Error && cause.name === 'TimeoutError') error.value = cause.message
+            if (cause instanceof Error && cause.name === 'TimeoutError') {
+              sharedReads.validated = null
+              sharedReads.validationGeneration.value += 1
+              error.value = cause.message
+            }
           }
         }
         if (cause !== undefined) reject(cause)
@@ -313,6 +327,15 @@ export function useProjectWorkspaces(
 
   const byId = computed(() => new Map(workspaces.value.map(item => [item.id, item])))
 
+  function getValidatedWorkspace(id: string, path: string): { workspace: ProjectWorkspaceItem | null } | undefined {
+    if (!gatewayAccess.canManageProjectWorkspaces || sharedReads.scope !== catalogScope()
+      || !sharedReads.validated) return undefined
+    const workspace = sharedReads.validated.find(item => item.id === id)
+    // An ID alone cannot vouch for a relocated directory.
+    if (workspace && workspace.path !== path) return undefined
+    return { workspace: workspace ?? null }
+  }
+
   watch(catalogScope, () => {
     if (sharedReads.scope !== catalogScope()) resetWorkspaces()
   }, { flush: 'sync' })
@@ -333,6 +356,8 @@ export function useProjectWorkspaces(
     hasLoaded,
     creationDefaults,
     resetWorkspaces,
+    getValidatedWorkspace,
+    validationGeneration: sharedReads.validationGeneration,
     loadWorkspaces,
     openWorkspace,
     createWorkspace,
