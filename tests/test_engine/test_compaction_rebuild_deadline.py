@@ -214,12 +214,25 @@ async def test_pending_cooldown_recovers_original_canonical_then_obeys_same_hint
     assert terminal[0]["durability"] == "request_scoped"
     assert len(case.sink.starts) == case.usage_before_wait + 1
     # A later deliberate turn must not inherit the abandoned candidate/source.
-    # Give that independent request its larger actual model capacity.
+    # Give that independent request its larger actual model capacity, including
+    # removing the fixture's independent character cap from both consumers.
+    projections_before_next = len(case.provider.projections)
     case.agent.config.context_window_tokens = 128_000
-    case.agent._durable_consumer_window_tokens = 128_000
+    case.agent.config.provider_request_proof_max_chars = 0
+    case.agent.config.provider_request_proof_max_chars_explicit = False
+    case.agent.bind_durable_consumer(
+        provider=case.agent.provider, model_id=case.agent.config.model_id,
+        context_window_tokens=128_000, max_output_tokens=case.agent.config.max_tokens,
+        provider_request_proof_max_chars=0,
+    )
     next_events = [e async for e in case.agent.run_turn("Continue the next turn")]
     assert any(e.kind == "done" for e in next_events)
     assert not any(isinstance(e, ErrorEvent) for e in next_events)
+    assert len(case.provider.projections) == projections_before_next + 1
+    assert case.provider.projections[-1].fits
+    assert len(case.physical) == 2
+    assert len(case.summaries) == 1
+    assert CANDIDATE not in json.dumps(case.physical[-1])
     assert len(observed) == 1
     assert case.agent._pending_durable_compaction_source is None
 
