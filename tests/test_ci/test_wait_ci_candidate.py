@@ -45,14 +45,23 @@ def test_api_retries_only_transient_http_errors_with_pagination(helper, monkeypa
     assert sleeps == [1, 2]
 
 
-@pytest.mark.parametrize("stderr,attempts", [
-    ("gh: Server Error (HTTP 502)", 3),
-    ("gh: Bad credentials (HTTP 401)", 1),
-    ("gh: Forbidden (HTTP 403)", 1),
-    ("gh: Not Found (HTTP 404)", 1),
-    ("unknown failure", 1),
+@pytest.mark.parametrize("stderr,attempts,reason", [
+    ("gh: Server Error (HTTP 502)", 3, "http-502"),
+    ("gh: Bad credentials (HTTP 401); TLS handshake timeout", 1, "http-401"),
+    ("gh: Forbidden (HTTP 403); connection reset", 1, "http-403"),
+    ("gh: Not Found (HTTP 404); i/o timeout", 1, "http-404"),
+    ("gh: rate limit (HTTP 429)", 1, "http-429"),
+    ("net/http: TLS handshake timeout", 3, "tls-handshake-timeout"),
+    ("read tcp: connection reset by peer", 3, "connection-reset"),
+    ("wsarecv: An existing connection was forcibly closed by the remote host.",
+     3, "connection-reset"),
+    ("dial tcp: i/o timeout", 3, "network-timeout"),
+    ("net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+     3, "network-timeout"),
+    ("x509: certificate signed by unknown authority", 1, "unknown-cli-failure"),
+    ("unknown failure", 1, "unknown-cli-failure"),
 ])
-def test_api_preserves_failure_and_bounds_retries(helper, monkeypatch, stderr, attempts):
+def test_api_preserves_failure_and_bounds_retries(helper, monkeypatch, stderr, attempts, reason):
     calls, sleeps = [], []
     failure = subprocess.CalledProcessError(1, ["gh"], stderr=stderr)
 
@@ -62,11 +71,165 @@ def test_api_preserves_failure_and_bounds_retries(helper, monkeypatch, stderr, a
 
     monkeypatch.setattr(helper.subprocess, "run", run)
     monkeypatch.setattr(helper.time, "sleep", sleeps.append)
-    with pytest.raises(subprocess.CalledProcessError) as caught:
+    with pytest.raises(helper.MetadataApiError, match=reason) as caught:
         helper.api("repos/owner/repo/actions/runs/123")
-    assert caught.value is failure
+    assert caught.value.__cause__ is failure
+    assert f"attempts={attempts}" in str(caught.value)
     assert len(calls) == attempts
     assert sleeps == ([1, 2] if attempts == 3 else [])
+
+
+def test_api_retries_explicit_command_timeout_without_exposing_captured_content(
+    helper, monkeypatch,
+):
+    calls, sleeps = [], []
+    failure = subprocess.TimeoutExpired(
+        ["gh", "api", "repos/owner/repo/actions/jobs/1"], 60,
+        output="sensitive-response-body", stderr="Authorization: Bearer sensitive-token",
+    )
+
+    def run(*args, **kwargs):
+        calls.append(kwargs)
+        raise failure
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    with pytest.raises(helper.MetadataApiError, match="command-timeout") as caught:
+        helper.api("repos/owner/repo/actions/jobs/1")
+    assert caught.value.__cause__ is failure
+    assert "sensitive" not in str(caught.value)
+    assert len(calls) == 3
+    assert sleeps == [1, 2]
+
+
+def test_api_unknown_failure_summary_does_not_echo_stderr(helper, monkeypatch):
+    failure = subprocess.CalledProcessError(1, ["gh"], stderr="sensitive-token sensitive-body")
+
+    def run(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    with pytest.raises(helper.MetadataApiError, match="unknown-cli-failure") as caught:
+        helper.api("repos/owner/repo/actions/jobs/1")
+    assert caught.value.__cause__ is failure
+    assert "sensitive" not in str(caught.value)
+
+
+def test_api_transport_failure_can_recover_on_the_second_read(helper, monkeypatch):
+    calls, sleeps = [], []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(
+                1, command, stderr="net/http: TLS handshake timeout",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout='{"status":"completed"}')
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    assert helper.api("repos/owner/repo/actions/jobs/1") == {"status": "completed"}
+    assert len(calls) == 2
+    assert sleeps == [1]
+
+
+def test_api_does_not_retry_malformed_json(helper, monkeypatch):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="not JSON")
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    with pytest.raises(json.JSONDecodeError):
+        helper.api("repos/owner/repo/actions/jobs/1")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), SystemExit(1)])
+def test_api_does_not_intercept_cancellation(helper, monkeypatch, error):
+    calls = []
+
+    def run(*args, **kwargs):
+        calls.append(args)
+        raise error
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    with pytest.raises(type(error)) as caught:
+        helper.api("repos/owner/repo/actions/jobs/1")
+    assert caught.value is error
+    assert len(calls) == 1
+
+
+def test_api_expired_wait_budget_never_starts_another_request(helper, monkeypatch):
+    monkeypatch.setattr(helper.time, "monotonic", lambda: 10)
+    calls = []
+    monkeypatch.setattr(helper.subprocess, "run", lambda *a, **k: calls.append(a))
+    with pytest.raises(TimeoutError, match="60 minutes"):
+        helper.api("repos/owner/repo/actions/jobs/1", deadline=10)
+    assert not calls
+
+
+def test_api_does_not_sleep_past_the_shared_wait_budget(helper, monkeypatch):
+    clock, calls, sleeps = [0.0], [], []
+    failure = subprocess.CalledProcessError(1, ["gh"], stderr="connection reset by peer")
+
+    def run(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock[0] = 0.5
+        raise failure
+
+    monkeypatch.setattr(helper.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    with pytest.raises(TimeoutError, match="60 minutes") as caught:
+        helper.api("repos/owner/repo/actions/jobs/1", deadline=1)
+    assert caught.value.__cause__ is failure
+    assert "connection-reset" in str(caught.value)
+    assert calls == [1]
+    assert not sleeps
+
+
+def test_api_retry_timeout_is_clamped_to_remaining_wait_budget(helper, monkeypatch):
+    clock, calls, sleeps = [0.0], [], []
+
+    def run(command, **kwargs):
+        calls.append(kwargs["timeout"])
+        if len(calls) == 1:
+            clock[0] += 2
+            raise subprocess.CalledProcessError(1, command, stderr="connection reset by peer")
+        return subprocess.CompletedProcess(command, 0, stdout="{}")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(helper.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleep)
+    assert helper.api("repos/owner/repo/actions/jobs/1", deadline=5) == {}
+    assert calls == [5, 2]
+    assert sleeps == [1]
+
+
+def test_api_command_timeout_exhausts_wait_budget_without_an_extra_attempt(helper, monkeypatch):
+    clock, calls, sleeps = [0.0], [], []
+    failure = subprocess.TimeoutExpired(["gh"], 1)
+
+    def run(*args, **kwargs):
+        calls.append(kwargs["timeout"])
+        clock[0] = 1
+        raise failure
+
+    monkeypatch.setattr(helper.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.time, "sleep", sleeps.append)
+    with pytest.raises(TimeoutError, match="60 minutes") as caught:
+        helper.api("repos/owner/repo/actions/jobs/1", deadline=1)
+    assert caught.value.__cause__ is failure
+    assert "command-timeout" in str(caught.value)
+    assert calls == [1]
+    assert not sleeps
 
 
 def manifest_fixture(destination):
@@ -163,7 +326,8 @@ def configure_wait(helper, monkeypatch):
 
 def test_wait_uses_current_attempt_and_pins_producer_before_download(helper, monkeypatch, tmp_path):
     configure_wait(helper, monkeypatch)
-    endpoints = []
+    endpoints, deadlines = [], []
+    monkeypatch.setattr(helper.time, "monotonic", lambda: 0)
     # PR API head_sha can differ from the merge SHA actually checked out.
     run = {"id": 123, "run_attempt": 2, "head_sha": "e" * 40}
     job = {"id": 456, "name": "Windows NSIS acceptance / build", "status": "in_progress",
@@ -175,6 +339,7 @@ def test_wait_uses_current_attempt_and_pins_producer_before_download(helper, mon
 
     def fake_api(endpoint, **kwargs):
         endpoints.append(endpoint)
+        deadlines.append(kwargs["deadline"])
         return responses.pop(0)
 
     monkeypatch.setattr(helper, "api", fake_api)
@@ -188,6 +353,7 @@ def test_wait_uses_current_attempt_and_pins_producer_before_download(helper, mon
     assert endpoints[1].endswith("/attempts/2/jobs?per_page=20")
     assert endpoints[2].endswith("/jobs/456")
     assert downloads == [["gh", "api", "repos/owner/repo/actions/artifacts/789/zip"]]
+    assert deadlines == [helper.WAIT_SECONDS] * 5
     assert not responses
 
 
@@ -233,3 +399,30 @@ def test_wait_has_bounded_deadline(helper, monkeypatch, tmp_path):
     monkeypatch.setattr(helper, "api", lambda *a, **k: {"id": 123, "run_attempt": 2})
     with pytest.raises(TimeoutError, match="60 minutes"):
         helper.wait_for_candidate("candidate", tmp_path / "download", SOURCE)
+
+
+def test_wait_poll_sleep_stays_inside_original_budget(helper, monkeypatch, tmp_path):
+    configure_wait(helper, monkeypatch)
+    clock, sleeps, calls = [0.0], [], []
+
+    def api(endpoint, **kwargs):
+        calls.append(endpoint)
+        if len(calls) == 1:
+            clock[0] = helper.WAIT_SECONDS - 1
+            return {"id": 123, "run_attempt": 2}
+        return [{"jobs": [{"id": 456, "name": "build", "status": "in_progress",
+                            "run_id": 123, "run_attempt": 2}]}]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(helper.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(helper.time, "sleep", sleep)
+    monkeypatch.setattr(helper, "api", api)
+    with pytest.raises(TimeoutError, match="60 minutes"):
+        helper.wait_for_candidate("candidate", tmp_path / "download", SOURCE)
+    assert sleeps == [1]
+    assert len(calls) == 2
+    assert clock[0] == helper.WAIT_SECONDS
+    assert not (tmp_path / "download").exists()
