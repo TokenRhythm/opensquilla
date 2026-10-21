@@ -73,7 +73,7 @@ try {
       await owner.webContents.executeJavaScript('void document.querySelector("#video").requestFullscreen()', true)
       await waitFor(() => htmlEvents.entered === entered, 'Electron HTML fullscreen entry')
       await waitFor(() => owner.isVisible(), 'visible fullscreen owner')
-      require(await owner.webContents.executeJavaScript('document.fullscreenElement?.id === "video"'), 'the actual video must enter HTML fullscreen')
+      await waitFor(() => owner.webContents.executeJavaScript('document.fullscreenElement?.id === "video"'), 'the actual video fullscreen element')
       return wasNativeFullscreen
     }
     async function exitVideo(wasNativeFullscreen, escape = false) {
