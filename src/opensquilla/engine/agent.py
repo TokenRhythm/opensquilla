@@ -96,6 +96,8 @@ from opensquilla.engine.session_sanitize import (
     sanitize_session_messages,
     session_payload_chars,
 )
+from opensquilla.engine.stream_close import StreamCloseEvidence, stream_close_evidence
+from opensquilla.engine.stream_recovery import StreamRecoveryRequest
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
 from opensquilla.engine.tool_argument_recovery import (
@@ -206,6 +208,7 @@ from opensquilla.provider.protocol import (
     validate_provider_chat_admission,
 )
 from opensquilla.provider.recovery import recovery_delay_seconds
+from opensquilla.provider.recovery_origin import RecoveryOrigin, transport_recovery_origin
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
     effective_proof_token_budget,
@@ -343,6 +346,8 @@ from .types import (
     EnsembleProgressEvent,
     ErrorEvent,
     ProviderActivityEvent,
+    ProviderAttemptCommittedEvent,
+    ProviderAttemptStartEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
@@ -575,6 +580,7 @@ def _normalized_usage_breakdown_rows(
                 "billedCostUsd": billed_cost,
                 "cost_source": item.cost_source,
                 "costSource": item.cost_source,
+                "token_usage_known": item.token_usage_known,
             }
         )
         rows.append(row)
@@ -718,6 +724,10 @@ def _with_model_usage_cost_fields(rows: list[dict[str, Any]]) -> list[dict[str, 
                     # input while still labeling the estimate "cache_aware".
                     cache_read_tokens=_usage_int(cache_read or 0),
                     cache_write_tokens=_usage_int(item.get("cache_write_tokens") or 0),
+                    unbilled_input_tokens=(0 if item.get("token_usage_known") is False else None),
+                    unbilled_output_tokens=0,
+                    unbilled_cache_read_tokens=0,
+                    unbilled_cache_write_tokens=0,
                     has_billed_receipt=(
                         True
                         if str(item.get("cost_source") or item.get("costSource") or "")
@@ -1955,10 +1965,14 @@ def _provider_retry_delay_seconds(
 class _RaisedProviderBoundaryError(RuntimeError):
     """Content-free marker for an exception raised by provider call/iteration."""
 
-    def __init__(self, *, timeout: bool, connection_failed: bool = False) -> None:
+    def __init__(
+        self, *, timeout: bool, connection_failed: bool = False,
+        recovery_origin: RecoveryOrigin = "unknown",
+    ) -> None:
         super().__init__("provider boundary failed")
         self.timeout = timeout
         self.connection_failed = connection_failed
+        self.recovery_origin = recovery_origin
 
 
 _STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
@@ -7032,6 +7046,8 @@ class Agent:
                 provider_error: ProviderErrorEvent | None = None
 
                 _retry_attempt = 0
+                stream_replay_request: StreamRecoveryRequest | None = None
+                stream_recovery_used = False
                 _connection_wait_attempt = 0
                 _call_attempt = 0
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
@@ -7100,492 +7116,377 @@ class Agent:
                             status=status,
                             ended_at=time.time_ns() // 1_000_000,
                             generation_epoch=generation_epoch,
+                            model_call_id=call_id,
+                            iteration=iterations,
                         )
                         reasoning_block_id = ""
                         return event
 
                     call_started_at = time.monotonic()
                     ignored_post_delivery_tool_use = False
-                    if message_count_request_view is not None:
-                        base_request_turn_messages = message_count_request_view.materialize(
-                            turn_messages
-                        )
-                        active_request_context_insert_index = (
-                            message_count_request_view.request_context_insert_index
-                        )
-                        active_runtime_context_insert_index = (
-                            message_count_request_view.runtime_context_insert_index
-                        )
-                        active_protected_turn_start_index = (
-                            message_count_request_view.protected_turn_start_index
-                        )
-                    else:
-                        base_request_turn_messages = turn_messages
-                        active_request_context_insert_index = request_context_insert_index
-                        active_runtime_context_insert_index = runtime_context_insert_index
-                        active_protected_turn_start_index = current_turn_start_index
+                    if stream_replay_request is None:
+                        if message_count_request_view is not None:
+                            base_request_turn_messages = message_count_request_view.materialize(
+                                turn_messages
+                            )
+                            active_request_context_insert_index = (
+                                message_count_request_view.request_context_insert_index
+                            )
+                            active_runtime_context_insert_index = (
+                                message_count_request_view.runtime_context_insert_index
+                            )
+                            active_protected_turn_start_index = (
+                                message_count_request_view.protected_turn_start_index
+                            )
+                        else:
+                            base_request_turn_messages = turn_messages
+                            active_request_context_insert_index = request_context_insert_index
+                            active_runtime_context_insert_index = runtime_context_insert_index
+                            active_protected_turn_start_index = current_turn_start_index
 
-                    request_suffix_messages: list[Message] = []
-                    reasoning_only_act_now_for_call: Message | None = None
-                    if tool_failure_finalization_pending:
-                        request_suffix_messages = [
-                            Message(role="user", content=FAILURE_RECOVERY_INSTRUCTION)
+                        request_suffix_messages: list[Message] = []
+                        reasoning_only_act_now_for_call: Message | None = None
+                        if tool_failure_finalization_pending:
+                            request_suffix_messages = [
+                                Message(role="user", content=FAILURE_RECOVERY_INSTRUCTION)
+                            ]
+                        elif (
+                            max_iterations_finalization_pending
+                            and max_iterations_finalization_message is not None
+                        ):
+                            request_suffix_messages = [max_iterations_finalization_message]
+                        elif reasoning_only_act_now_message is not None and (
+                            not turn_messages or turn_messages[-1].role != "assistant"
+                        ):
+                            # Answer the preceding reasoning-only failure. Preserve
+                            # an assistant tail when it carries a reasoning prefill.
+                            request_suffix_messages = [reasoning_only_act_now_message]
+                            reasoning_only_act_now_for_call = reasoning_only_act_now_message
+                        request_turn_messages = [
+                            *base_request_turn_messages,
+                            *request_suffix_messages,
                         ]
-                    elif (
-                        max_iterations_finalization_pending
-                        and max_iterations_finalization_message is not None
-                    ):
-                        request_suffix_messages = [max_iterations_finalization_message]
-                    elif reasoning_only_act_now_message is not None and (
-                        not turn_messages or turn_messages[-1].role != "assistant"
-                    ):
-                        # Answer the preceding reasoning-only failure. Preserve
-                        # an assistant tail when it carries a reasoning prefill.
-                        request_suffix_messages = [reasoning_only_act_now_message]
-                        reasoning_only_act_now_for_call = reasoning_only_act_now_message
-                    request_turn_messages = [
-                        *base_request_turn_messages,
-                        *request_suffix_messages,
-                    ]
-                    if tool_images_pending_admission:
-                        tool_images_pending_admission = False
-                        if (
-                            count_provider_image_blocks(request_turn_messages) > 0
-                            and self._active_model_vision_support_for_call(chat_cfg) != "supported"
-                        ):
-                            prepare_continuation = getattr(
-                                self.provider, "prepare_image_continuation", None
-                            )
-                            rebound_config = None
-                            if callable(prepare_continuation):
-                                rebound_config = prepare_continuation(
-                                    request_turn_messages, chat_cfg
-                                )
-                                if inspect.isawaitable(rebound_config):
-                                    rebound_config = await rebound_config
-                            if isinstance(rebound_config, ChatConfig):
-                                chat_cfg = rebound_config
-                                identity = provider_metadata(self.provider)
-                                self.config.model_id = identity.model or self.config.model_id
-                                self.config.provider_id = (
-                                    identity.provider_id or identity.provider_name
-                                )
-                                self.config.model_capabilities = chat_cfg.model_capabilities
-                                tools_supported = (
-                                    getattr(chat_cfg.model_capabilities, "supports_tools", None)
-                                    is not False
-                                )
-                                provider_tool_definitions = (
-                                    (self.tool_definitions or None) if tools_supported else None
-                                )
-                                self.config.model_vision_support = chat_cfg.model_vision_support
-                                self.config.context_window_known = (
-                                    chat_cfg.provider_context_window_tokens > 0
-                                )
-                                self.config.max_tokens = chat_cfg.max_tokens
-                                self.config.provider_request_proof_max_chars = (
-                                    chat_cfg.provider_request_max_chars
-                                )
-                                active_window = getattr(
-                                    self.provider, "active_context_window_tokens", None
-                                )
-                                if callable(active_window):
-                                    context_window = active_window()
-                                    if isinstance(context_window, int) and context_window > 0:
-                                        self.config.context_window_tokens = context_window
-                                image_projection_forced = False
-                                image_projection_forced_deployment = None
-                                image_projection_marker_state = ImageMarkerState.NOT_ANALYZED
-                                for key in (
-                                    "image_input_forced_rejection_reason",
-                                    "image_input_rejection_reason",
-                                    "image_input_projection_required",
-                                    "image_input_reason",
-                                ):
-                                    self.config.metadata.pop(key, None)
-                                self._write_turn_call_log(
-                                    "image_continuation_route",
-                                    action="rebind",
-                                    model=self.config.model_id,
-                                    provider=self.config.provider_id,
-                                    image_count=count_provider_image_blocks(request_turn_messages),
-                                    iteration=iterations,
-                                )
-                    provider_tools_for_call = (
-                        None
-                        if max_iterations_finalization_pending
-                        or tool_failure_finalization_pending
-                        else provider_tool_definitions
-                    )
-                    tools_supported_for_call = (
-                        tools_supported
-                        and not max_iterations_finalization_pending
-                        and not tool_failure_finalization_pending
-                    )
-                    base_recovery_available = self._tool_result_recovery_available()
-                    call_retrieval_available = bool(
-                        self._provider_schema_has_tool_result_retrieval(provider_tools_for_call)
-                        and base_recovery_available
-                    )
-                    call_recovery_downgraded = False
-                    if not call_retrieval_available:
-                        # Restore before provider-view assembly.  The physical
-                        # call's admission/sanitization must see the true byte
-                        # pressure; restoring after those passes can turn an
-                        # admitted bounded request into an unbounded one.
-                        restored_request_turn_messages = (
-                            self._restore_tool_results_without_retrieval_schema(
-                                request_turn_messages
-                            )
-                        )
-                        # A tool-less/finalization call may hide retrieval even
-                        # when history contains no projected Store references.
-                        # Only the actual raw restoration expands the request and
-                        # therefore needs the custom-provider admission gate.
-                        call_recovery_downgraded = (
-                            restored_request_turn_messages is not request_turn_messages
-                        )
-                        request_turn_messages = restored_request_turn_messages
-                    previous_call_retrieval = self._provider_call_tool_result_retrieval_available
-                    self._provider_call_tool_result_retrieval_available = call_retrieval_available
-                    try:
-                        (
-                            request_messages,
-                            request_sanitize_result,
-                        ) = await self._provider_request_messages_with_sanitize_async(
-                            request_turn_messages,
-                            request_context_message=request_context_message,
-                            request_context_insert_index=active_request_context_insert_index,
-                            runtime_context_message=runtime_context_message,
-                            runtime_context_insert_index=active_runtime_context_insert_index,
-                        )
-                    finally:
-                        self._provider_call_tool_result_retrieval_available = (
-                            previous_call_retrieval
-                        )
-                    # Project only this physical request. ``turn_messages`` and
-                    # ``request_turn_messages`` remain image-bearing canonical
-                    # views so a later vision-capable turn can recover the
-                    # original attachment. The projection runs after all
-                    # provider-view sanitizers because tool-result adapters may
-                    # introduce nested image blocks of their own.
-                    active_vision_support = (
-                        self._active_model_vision_support_for_call(chat_cfg)
-                    )
-                    barrier_requires_image_marker = bool(
-                        turn_image_retry_barrier_crossed
-                        and active_vision_support == "unknown"
-                        and count_projected_image_blocks(request_messages) > 0
-                    )
-                    if barrier_requires_image_marker:
-                        # Once a tool has executed (or output has escaped), an
-                        # unknown-capability native probe cannot be retried
-                        # safely. Shape this request as text up front so the
-                        # same configured model can still finish the turn.
-                        self.config.metadata["image_input_mode"] = (
-                            ImageProjectionMode.MARKER.value
-                        )
-                        self.config.metadata["image_input_reason"] = (
-                            "image_probe_unsafe_after_irreversible_effect"
-                        )
-                        self.config.metadata["image_input_stage"] = "primary"
-                    # Selector fallback must retain the image-bearing input;
-                    # this projected view is only for the active leg's local
-                    # admission, loop detection, and diagnostics.
-                    canonical_request_messages = request_messages
-                    force_current_image_marker = image_projection_forced and (
-                        not selector_projects_images
-                        or selector_image_provider.active_deployment_config()
-                        == image_projection_forced_deployment
-                    )
-                    if selector_projects_images:
-                        selector_image_provider.configure_image_request_projection(
-                            force_marker=force_current_image_marker,
-                            marker_state=image_projection_marker_state,
-                            forbid_unknown_probe=turn_image_retry_barrier_crossed,
-                            reason=(
-                                str(self.config.metadata.get("image_input_reason") or "")
-                                or None
-                            ),
-                        )
-                    request_messages, image_projection_result = (
-                        self._project_image_input_for_provider(
-                            request_messages,
-                            chat_config=chat_cfg,
-                            force_marker=(
-                                force_current_image_marker
-                                or barrier_requires_image_marker
-                            ),
-                            marker_state=image_projection_marker_state,
-                            stage="primary",
-                            reason_override=(
-                                "image_probe_unsafe_after_irreversible_effect"
-                                if barrier_requires_image_marker
-                                else None
-                            ),
-                        )
-                    )
-                    validation_error = validate_provider_chat_admission(
-                        self.provider,
-                        request_messages,
-                        chat_cfg,
-                    )
-                    if validation_error is not None:
-                        validation_image_failure = classify_image_failure(
-                            validation_error,
-                            provider_name=getattr(
-                                self.provider,
-                                "provider_name",
-                                "",
-                            ),
-                        )
-                        if (
-                            validation_image_failure.is_unsupported
-                            and (
-                                not _image_marker_retry_done
-                                or selector_projects_images
-                                and selector_image_provider.active_deployment_config()
-                                not in image_marker_retry_deployments
-                            )
-                            and not turn_image_retry_barrier_crossed
-                        ):
-                            image_fallback = getattr(
-                                self.provider,
-                                "fallback_after_image_rejection",
-                                None,
-                            )
-                            if callable(image_fallback) and image_fallback(
-                                "provider preflight rejected image input"
+                        if tool_images_pending_admission:
+                            tool_images_pending_admission = False
+                            if (
+                                count_provider_image_blocks(request_turn_messages) > 0
+                                and self._active_model_vision_support_for_call(
+                                    chat_cfg,
+                                ) != "supported"
                             ):
-                                # Router owns an explicit c0-c3 probe chain.
-                                # Keep the canonical request image-bearing for
-                                # the next configured leg; the wrapper rebinds
-                                # capability and request budgets per call.
-                                image_projection_forced = False
-                                image_projection_marker_state = (
-                                    ImageMarkerState.NOT_ANALYZED
+                                prepare_continuation = getattr(
+                                    self.provider, "prepare_image_continuation", None
                                 )
-                                _call_attempt += 1
-                                continue
-                            # A provider-side preflight can know more than the
-                            # catalog (for example an unlisted deployment).
-                            # Retry once with a truthful marker before any
-                            # visible output or side effect is emitted.
-                            _image_marker_retry_done = True
-                            image_projection_forced = True
-                            if selector_projects_images:
-                                image_projection_forced_deployment = (
-                                    selector_image_provider.active_deployment_config()
+                                rebound_config = None
+                                if callable(prepare_continuation):
+                                    rebound_config = prepare_continuation(
+                                        request_turn_messages, chat_cfg
+                                    )
+                                    if inspect.isawaitable(rebound_config):
+                                        rebound_config = await rebound_config
+                                if isinstance(rebound_config, ChatConfig):
+                                    chat_cfg = rebound_config
+                                    identity = provider_metadata(self.provider)
+                                    self.config.model_id = identity.model or self.config.model_id
+                                    self.config.provider_id = (
+                                        identity.provider_id or identity.provider_name
+                                    )
+                                    self.config.model_capabilities = chat_cfg.model_capabilities
+                                    tools_supported = (
+                                        getattr(chat_cfg.model_capabilities, "supports_tools", None)
+                                        is not False
+                                    )
+                                    provider_tool_definitions = (
+                                        (self.tool_definitions or None) if tools_supported else None
+                                    )
+                                    self.config.model_vision_support = chat_cfg.model_vision_support
+                                    self.config.context_window_known = (
+                                        chat_cfg.provider_context_window_tokens > 0
+                                    )
+                                    self.config.max_tokens = chat_cfg.max_tokens
+                                    self.config.provider_request_proof_max_chars = (
+                                        chat_cfg.provider_request_max_chars
+                                    )
+                                    active_window = getattr(
+                                        self.provider, "active_context_window_tokens", None
+                                    )
+                                    if callable(active_window):
+                                        context_window = active_window()
+                                        if isinstance(context_window, int) and context_window > 0:
+                                            self.config.context_window_tokens = context_window
+                                    image_projection_forced = False
+                                    image_projection_forced_deployment = None
+                                    image_projection_marker_state = ImageMarkerState.NOT_ANALYZED
+                                    for key in (
+                                        "image_input_forced_rejection_reason",
+                                        "image_input_rejection_reason",
+                                        "image_input_projection_required",
+                                        "image_input_reason",
+                                    ):
+                                        self.config.metadata.pop(key, None)
+                                    self._write_turn_call_log(
+                                        "image_continuation_route",
+                                        action="rebind",
+                                        model=self.config.model_id,
+                                        provider=self.config.provider_id,
+                                        image_count=count_provider_image_blocks(request_turn_messages),
+                                        iteration=iterations,
+                                    )
+                        provider_tools_for_call = (
+                            None
+                            if max_iterations_finalization_pending
+                            or tool_failure_finalization_pending
+                            else provider_tool_definitions
+                        )
+                        tools_supported_for_call = (
+                            tools_supported
+                            and not max_iterations_finalization_pending
+                            and not tool_failure_finalization_pending
+                        )
+                        base_recovery_available = self._tool_result_recovery_available()
+                        call_retrieval_available = bool(
+                            self._provider_schema_has_tool_result_retrieval(provider_tools_for_call)
+                            and base_recovery_available
+                        )
+                        call_recovery_downgraded = False
+                        if not call_retrieval_available:
+                            # Restore before provider-view assembly.  The physical
+                            # call's admission/sanitization must see the true byte
+                            # pressure; restoring after those passes can turn an
+                            # admitted bounded request into an unbounded one.
+                            restored_request_turn_messages = (
+                                self._restore_tool_results_without_retrieval_schema(
+                                    request_turn_messages
                                 )
-                                image_marker_retry_deployments.append(
-                                    image_projection_forced_deployment
-                                )
+                            )
+                            # A tool-less/finalization call may hide retrieval even
+                            # when history contains no projected Store references.
+                            # Only the actual raw restoration expands the request and
+                            # therefore needs the custom-provider admission gate.
+                            call_recovery_downgraded = (
+                                restored_request_turn_messages is not request_turn_messages
+                            )
+                            request_turn_messages = restored_request_turn_messages
+                        previous_call_retrieval = (
+                            self._provider_call_tool_result_retrieval_available
+                        )
+                        self._provider_call_tool_result_retrieval_available = (
+                            call_retrieval_available
+                        )
+                        try:
+                            (
+                                request_messages,
+                                request_sanitize_result,
+                            ) = await self._provider_request_messages_with_sanitize_async(
+                                request_turn_messages,
+                                request_context_message=request_context_message,
+                                request_context_insert_index=active_request_context_insert_index,
+                                runtime_context_message=runtime_context_message,
+                                runtime_context_insert_index=active_runtime_context_insert_index,
+                            )
+                        finally:
+                            self._provider_call_tool_result_retrieval_available = (
+                                previous_call_retrieval
+                            )
+                        # Project only this physical request. ``turn_messages`` and
+                        # ``request_turn_messages`` remain image-bearing canonical
+                        # views so a later vision-capable turn can recover the
+                        # original attachment. The projection runs after all
+                        # provider-view sanitizers because tool-result adapters may
+                        # introduce nested image blocks of their own.
+                        active_vision_support = (
+                            self._active_model_vision_support_for_call(chat_cfg)
+                        )
+                        barrier_requires_image_marker = bool(
+                            turn_image_retry_barrier_crossed
+                            and active_vision_support == "unknown"
+                            and count_projected_image_blocks(request_messages) > 0
+                        )
+                        if barrier_requires_image_marker:
+                            # Once a tool has executed (or output has escaped), an
+                            # unknown-capability native probe cannot be retried
+                            # safely. Shape this request as text up front so the
+                            # same configured model can still finish the turn.
                             self.config.metadata["image_input_mode"] = (
                                 ImageProjectionMode.MARKER.value
                             )
                             self.config.metadata["image_input_reason"] = (
-                                "image_capability_probe_failed"
+                                "image_probe_unsafe_after_irreversible_effect"
                             )
-                            self.config.metadata["image_input_stage"] = "preflight"
-                            self._write_turn_call_log(
-                                "image_input_projection",
-                                action="retry_marker",
-                                reason="provider_preflight_rejected_image",
-                                stage="preflight",
-                                image_count=count_projected_image_blocks(
-                                    request_messages
+                            self.config.metadata["image_input_stage"] = "primary"
+                        # Selector fallback must retain the image-bearing input;
+                        # this projected view is only for the active leg's local
+                        # admission, loop detection, and diagnostics.
+                        canonical_request_messages = request_messages
+                        force_current_image_marker = image_projection_forced and (
+                            not selector_projects_images
+                            or selector_image_provider.active_deployment_config()
+                            == image_projection_forced_deployment
+                        )
+                        if selector_projects_images:
+                            selector_image_provider.configure_image_request_projection(
+                                force_marker=force_current_image_marker,
+                                marker_state=image_projection_marker_state,
+                                forbid_unknown_probe=turn_image_retry_barrier_crossed,
+                                reason=(
+                                    str(self.config.metadata.get("image_input_reason") or "")
+                                    or None
                                 ),
                             )
-                            _call_attempt += 1
-                            continue
-                        terminal_error = ErrorEvent(
-                            message=validation_error.message,
-                            code=validation_error.code,
-                        )
-                        if validation_image_failure.is_unsupported:
-                            exact_image_count = count_provider_image_blocks(
-                                request_messages
-                            )
-                            self.config.metadata["image_input_mode"] = "rejected"
-                            self.config.metadata.setdefault(
-                                "image_input_reason",
-                                "model_vision_unsupported",
-                            )
-                            self.config.metadata["image_input_count"] = exact_image_count
-                            self.config.metadata.setdefault(
-                                "image_input_stage",
-                                "primary",
-                            )
-                            self._write_turn_call_log(
-                                "image_input_preflight",
-                                action="reject",
-                                reason=str(
-                                    self.config.metadata.get("image_input_reason")
-                                    or "model_vision_unsupported"
+                        request_messages, image_projection_result = (
+                            self._project_image_input_for_provider(
+                                request_messages,
+                                chat_config=chat_cfg,
+                                force_marker=(
+                                    force_current_image_marker
+                                    or barrier_requires_image_marker
                                 ),
-                                stage=str(
-                                    self.config.metadata.get("image_input_stage") or "primary"
-                                ),
-                                image_count=int(
-                                    self.config.metadata.get("image_input_count") or 0
-                                ),
-                                iteration=iterations,
-                                attempt=_call_attempt,
-                            )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="stop",
-                            reason=terminal_error.message,
-                            code=terminal_error.code,
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield self._transition(AgentState.ERROR)
-                        yield terminal_error
-                        break
-                    self._write_context_stage(
-                        "stream:context",
-                        request_messages,
-                        call_id=call_id,
-                        iteration=iterations,
-                        attempt=_call_attempt,
-                        sanitize=request_sanitize_result,
-                    )
-
-                    next_call_budget_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
-                    terminal_error = next_call_budget_error
-                    if terminal_error is not None:
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action=("stop"),
-                            reason=terminal_error.message,
-                            code=terminal_error.code,
-                            sent_llm_calls=turn_llm_calls,
-                            attempted_llm_call=turn_llm_calls + 1,
-                            iteration=iterations,
-                            attempt=_call_attempt,
-                        )
-                        yield self._transition(AgentState.ERROR)
-                        yield terminal_error
-                        break
-
-                    call_chat_cfg = chat_cfg
-                    if tool_failure_finalization_pending:
-                        call_chat_cfg = call_chat_cfg.model_copy(
-                            update={"tool_choice": None, "physical_attempt_limit": 1}
-                        )
-                    if _total_deadline is not None:
-                        call_chat_cfg = call_chat_cfg.model_copy(
-                            update={
-                                "turn_deadline_at_monotonic": _total_deadline,
-                            }
-                        )
-                    if self._provider_request_correlation is not None:
-                        call_chat_cfg = call_chat_cfg.model_copy(
-                            update={
-                                "provider_request_correlation": (self._provider_request_correlation)
-                            }
-                        )
-                    requires_replay = getattr(
-                        self.provider, "requires_complete_reasoning_history", None
-                    )
-                    replay_compatible = getattr(self.provider, "can_replay_reasoning", None)
-                    if (
-                        callable(requires_replay)
-                        and callable(replay_compatible)
-                        and requires_replay(
-                            tools=provider_tools_for_call, thinking=call_chat_cfg.thinking
-                        ) is True
-                    ):
-                        request_messages, replay_rebased = rebase_incomplete_reasoning_history(
-                            request_messages, compatible=replay_compatible
-                        )
-                        # Preserve canonical replay for selector fallbacks: each physical
-                        # provider leg projects its own compatible request view.
-                        if replay_rebased and not replay_boundary_notified:
-                            replay_boundary_notified = True
-                            yield WarningEvent(
-                                code="reasoning_replay_context_rebuilt",
-                                message=(
-                                    "Historical reasoning is unavailable for this interface. "
-                                    "Continuing with recorded conversation and tool results "
-                                    "in a new model context."
+                                marker_state=image_projection_marker_state,
+                                stage="primary",
+                                reason_override=(
+                                    "image_probe_unsafe_after_irreversible_effect"
+                                    if barrier_requires_image_marker
+                                    else None
                                 ),
                             )
-                    active_user_message_index = _active_user_message_index_for_request(
-                        request_messages,
-                        current_user_text=self._current_turn_message or "",
-                    )
-                    if active_user_message_index is not None:
-                        call_chat_cfg = call_chat_cfg.model_copy(
-                            update={"active_user_message_index": (active_user_message_index)}
                         )
-
-                    active_identity = self._active_execution_identity()
-                    if active_identity is not None:
-                        call_chat_cfg = call_chat_cfg.model_copy(
-                            update={"execution_identity": active_identity}
-                        )
-                        request_messages = project_execution_identity(
-                            request_messages, call_chat_cfg,
-                        )
-
-                    if call_recovery_downgraded and not bool(
-                        getattr(
-                            self.provider,
-                            "final_request_admission_guaranteed",
-                            False,
-                        )
-                    ):
-                        # Built-in adapters perform exact admission before
-                        # network I/O. A custom/plugin provider may not. When
-                        # this physical call hid retrieval and therefore
-                        # restored raw tool results, require either its exact
-                        # projector or conservative local token+character
-                        # bounds before handing it the expanded envelope.
-                        exact_projection = project_provider_final_request(
+                        validation_error = validate_provider_chat_admission(
                             self.provider,
                             request_messages,
-                            provider_tools_for_call,
-                            call_chat_cfg,
+                            chat_cfg,
                         )
-                        if exact_projection is not None:
-                            restored_request_fits = exact_projection.fits
-                            admission_source = "provider_exact_projection"
-                        else:
-                            estimated_tokens = self._estimate_live_request_tokens(
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
-                            )
-                            estimated_chars = self._estimate_live_request_chars(
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
-                            )
-                            budget = self._context_budget_governor().snapshot()
-                            token_limit, _ = effective_proof_token_budget(
-                                budget.usable_tokens,
-                            )
-                            char_limit = budget.provider_request_max_chars
-                            restored_request_fits = bool(
-                                estimated_tokens <= token_limit and estimated_chars <= char_limit
-                            )
-                            admission_source = "conservative_local_projection"
-                        if not restored_request_fits:
-                            terminal_error = ErrorEvent(
-                                message=(
-                                    "The provider request cannot safely include raw "
-                                    "tool results while retrieval is unavailable."
+                        if validation_error is not None:
+                            validation_image_failure = classify_image_failure(
+                                validation_error,
+                                provider_name=getattr(
+                                    self.provider,
+                                    "provider_name",
+                                    "",
                                 ),
-                                code="provider_request_budget_exhausted",
                             )
+                            if (
+                                validation_image_failure.is_unsupported
+                                and (
+                                    not _image_marker_retry_done
+                                    or selector_projects_images
+                                    and selector_image_provider.active_deployment_config()
+                                    not in image_marker_retry_deployments
+                                )
+                                and not turn_image_retry_barrier_crossed
+                            ):
+                                image_fallback = getattr(
+                                    self.provider,
+                                    "fallback_after_image_rejection",
+                                    None,
+                                )
+                                if callable(image_fallback) and image_fallback(
+                                    "provider preflight rejected image input"
+                                ):
+                                    # Router owns an explicit c0-c3 probe chain.
+                                    # Keep the canonical request image-bearing for
+                                    # the next configured leg; the wrapper rebinds
+                                    # capability and request budgets per call.
+                                    image_projection_forced = False
+                                    image_projection_marker_state = (
+                                        ImageMarkerState.NOT_ANALYZED
+                                    )
+                                    _call_attempt += 1
+                                    continue
+                                # A provider-side preflight can know more than the
+                                # catalog (for example an unlisted deployment).
+                                # Retry once with a truthful marker before any
+                                # visible output or side effect is emitted.
+                                _image_marker_retry_done = True
+                                image_projection_forced = True
+                                if selector_projects_images:
+                                    image_projection_forced_deployment = (
+                                        selector_image_provider.active_deployment_config()
+                                    )
+                                    image_marker_retry_deployments.append(
+                                        image_projection_forced_deployment
+                                    )
+                                self.config.metadata["image_input_mode"] = (
+                                    ImageProjectionMode.MARKER.value
+                                )
+                                self.config.metadata["image_input_reason"] = (
+                                    "image_capability_probe_failed"
+                                )
+                                self.config.metadata["image_input_stage"] = "preflight"
+                                self._write_turn_call_log(
+                                    "image_input_projection",
+                                    action="retry_marker",
+                                    reason="provider_preflight_rejected_image",
+                                    stage="preflight",
+                                    image_count=count_projected_image_blocks(
+                                        request_messages
+                                    ),
+                                )
+                                _call_attempt += 1
+                                continue
+                            terminal_error = ErrorEvent(
+                                message=validation_error.message,
+                                code=validation_error.code,
+                            )
+                            if validation_image_failure.is_unsupported:
+                                exact_image_count = count_provider_image_blocks(
+                                    request_messages
+                                )
+                                self.config.metadata["image_input_mode"] = "rejected"
+                                self.config.metadata.setdefault(
+                                    "image_input_reason",
+                                    "model_vision_unsupported",
+                                )
+                                self.config.metadata["image_input_count"] = exact_image_count
+                                self.config.metadata.setdefault(
+                                    "image_input_stage",
+                                    "primary",
+                                )
+                                self._write_turn_call_log(
+                                    "image_input_preflight",
+                                    action="reject",
+                                    reason=str(
+                                        self.config.metadata.get("image_input_reason")
+                                        or "model_vision_unsupported"
+                                    ),
+                                    stage=str(
+                                        self.config.metadata.get("image_input_stage") or "primary"
+                                    ),
+                                    image_count=int(
+                                        self.config.metadata.get("image_input_count") or 0
+                                    ),
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
                             self._write_turn_call_log(
                                 "turn_policy_decision",
                                 action="stop",
                                 reason=terminal_error.message,
                                 code=terminal_error.code,
-                                admission_source=admission_source,
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
+                        self._write_context_stage(
+                            "stream:context",
+                            request_messages,
+                            call_id=call_id,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            sanitize=request_sanitize_result,
+                        )
+
+                        next_call_budget_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                        terminal_error = next_call_budget_error
+                        if terminal_error is not None:
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action=("stop"),
+                                reason=terminal_error.message,
+                                code=terminal_error.code,
+                                sent_llm_calls=turn_llm_calls,
+                                attempted_llm_call=turn_llm_calls + 1,
                                 iteration=iterations,
                                 attempt=_call_attempt,
                             )
@@ -7593,245 +7494,395 @@ class Agent:
                             yield terminal_error
                             break
 
-                    self._compaction_request_context = CompactionRequestContext(
-                        chat_config=call_chat_cfg.model_copy(deep=True),
-                        recoverable_reference_resolver=self._verified_tool_result_references,
-                        tools=(
-                            tuple(
-                                tool.model_copy(deep=True) for tool in provider_tools_for_call
+                        call_chat_cfg = chat_cfg
+                        if tool_failure_finalization_pending:
+                            call_chat_cfg = call_chat_cfg.model_copy(
+                                update={"tool_choice": None, "physical_attempt_limit": 1}
                             )
-                            if provider_tools_for_call else None
-                        ),
-                    )
-                    self._write_turn_call_log(
-                        "llm_request",
-                        call_id=call_id,
-                        iteration=iterations,
-                        attempt=_call_attempt,
-                        messages=request_messages,
-                        tools=provider_tools_for_call,
-                        config=call_chat_cfg,
-                    )
-                    self._record_provider_tool_schema_event(
-                        tools=provider_tools_for_call,
-                        iteration=iterations,
-                        attempt=_call_attempt,
-                        call_id=call_id,
-                        tools_supported=tools_supported_for_call,
-                    )
-                    ensemble_request_count_baseline: int | None = None
-                    if ensemble_continuation_provider is self.provider:
-                        ensemble_request_count_baseline = ensemble_continuation_request_count
-                    ensemble_continuation_request_count = None
-                    ensemble_continuation_provider = None
-                    if (
-                        ensemble_request_count_baseline is None
-                        and self._execution_context is not None
-                        and getattr(self.provider, "execution_context_aware", False)
-                    ):
-                        continuation_snapshot = (
-                            self._execution_context.ensemble_continuation_snapshot
+                        if _total_deadline is not None:
+                            call_chat_cfg = call_chat_cfg.model_copy(
+                                update={
+                                    "turn_deadline_at_monotonic": _total_deadline,
+                                }
+                            )
+                        if self._provider_request_correlation is not None:
+                            call_chat_cfg = call_chat_cfg.model_copy(
+                                update={
+                                    "provider_request_correlation": (
+                                        self._provider_request_correlation
+                                    )
+                                }
+                            )
+                        requires_replay = getattr(
+                            self.provider, "requires_complete_reasoning_history", None
                         )
+                        replay_compatible = getattr(self.provider, "can_replay_reasoning", None)
                         if (
-                            continuation_snapshot is not None
-                            and continuation_snapshot.request_started
+                            callable(requires_replay)
+                            and callable(replay_compatible)
+                            and requires_replay(
+                                tools=provider_tools_for_call, thinking=call_chat_cfg.thinking
+                            ) is True
                         ):
-                            ensemble_request_count_baseline = (
-                                continuation_snapshot.physical_request_count
+                            request_messages, replay_rebased = rebase_incomplete_reasoning_history(
+                                request_messages, compatible=replay_compatible
                             )
-                    async def _recover_capacity_limited_output_window(
-                        *, reason: str = "reasoning_output_budget_exhausted",
-                    ) -> bool:
-                        """Use the existing retry slot to recover capacity-limited output."""
-                        nonlocal message_count_request_view
-                        before = project_provider_final_request(
-                            self.provider, request_messages, provider_tools_for_call, call_chat_cfg,
-                        )
-                        if before is None or not before.fits:
-                            return False
-                        desired = max(0, int(call_chat_cfg.max_tokens or 0))
-                        actual = projected_generation_budget(before.payload, desired)
-                        if desired <= 0 or actual >= desired:
-                            return False
-                        window = await self._recover_progressed_request_window(
-                            base_request_turn_messages,
-                            rejected_messages=request_messages,
-                            protected_turn_start_index=active_protected_turn_start_index,
-                            request_context_insert_index=active_request_context_insert_index,
-                            runtime_context_insert_index=active_runtime_context_insert_index,
-                            chat_config=call_chat_cfg, tools=provider_tools_for_call,
-                            request_context_message=request_context_message,
-                            runtime_context_message=runtime_context_message,
-                            request_suffix_messages=request_suffix_messages,
-                            reason=reason,
-                            force_shrink=True, increase_generation_budget=True,
-                        )
-                        if window is None:
-                            return False
-                        message_count_request_view = _MessageCountRequestView(
-                            messages=window.messages, canonical_tail_start=len(turn_messages),
-                            request_context_insert_index=(
-                                window.request_context_insert_index
-                                if window.request_context_insert_index is not None
-                                else active_request_context_insert_index
-                            ),
-                            runtime_context_insert_index=(
-                                window.runtime_context_insert_index
-                                if window.runtime_context_insert_index is not None
-                                else active_runtime_context_insert_index
-                            ),
-                            protected_turn_start_index=(
-                                window.protected_turn_start_index
-                                if window.protected_turn_start_index is not None
-                                else active_protected_turn_start_index
-                            ),
-                        )
-                        self._notify_admitted_request_window(
-                            window, source_count=len(base_request_turn_messages),
-                            reason=reason,
-                        )
-                        return True
-
-                    async def _recover_pending_cooling_window(reason: str) -> bool:
-                        nonlocal turn_messages, request_context_insert_index
-                        nonlocal runtime_context_insert_index, current_turn_start_index
-                        nonlocal message_count_request_view
-                        pending = self._pending_durable_compaction_event
-                        source = self._pending_durable_compaction_source
-                        if (pending is None or source is None or not source.compaction_id
-                                or source.compaction_id != pending.compaction_id):
-                            return False
-                        window = await self._recover_progressed_request_window(
-                            source.messages, rejected_messages=source.rejected_messages,
-                            protected_turn_start_index=source.protected_turn_start_index,
-                            request_context_insert_index=source.request_context_insert_index,
-                            runtime_context_insert_index=source.runtime_context_insert_index,
-                            chat_config=call_chat_cfg, tools=provider_tools_for_call,
-                            request_context_message=request_context_message,
-                            runtime_context_message=runtime_context_message,
-                            request_suffix_messages=request_suffix_messages,
-                            compaction_config=source.config,
-                            reason=reason,
-                        )
-                        if window is None:
-                            return False
-                        # Admission awaited local work. Recheck the operation owner
-                        # before replacing any view or emitting its sole terminal.
-                        if self._pending_durable_compaction_event is not pending:
-                            return False
-                        turn_messages = list(source.messages)
-                        request_context_insert_index = source.request_context_insert_index
-                        runtime_context_insert_index = source.runtime_context_insert_index
-                        current_turn_start_index = source.protected_turn_start_index
-                        message_count_request_view = _MessageCountRequestView(
-                            messages=window.messages, canonical_tail_start=len(turn_messages),
-                            request_context_insert_index=(
-                                window.request_context_insert_index
-                                if window.request_context_insert_index is not None
-                                else request_context_insert_index
-                            ),
-                            runtime_context_insert_index=(
-                                window.runtime_context_insert_index
-                                if window.runtime_context_insert_index is not None
-                                else runtime_context_insert_index
-                            ),
-                            protected_turn_start_index=(
-                                window.protected_turn_start_index
-                                if window.protected_turn_start_index is not None
-                                else current_turn_start_index
-                            ),
-                        )
-                        self._pending_durable_compaction_event = None
-                        self._pending_durable_compaction_source = None
-                        self._compaction_failed_this_turn = True
-                        self._last_compaction_refusal_reason = None
-                        self._notify_admitted_request_window(
-                            window, source_count=len(source.messages),
-                            reason=reason,
-                        )
-                        return True
-
-                    if not getattr(self.provider, "owns_retry_after_admission", False):
-                        cooling_deadline = _total_deadline
-                        pending_compaction = self._pending_durable_compaction_event
-                        if pending_compaction is not None:
-                            install_deadline = pending_compaction.compaction_deadline_at_monotonic
-                            if install_deadline is not None:
-                                cooling_deadline = (
-                                    min(cooling_deadline, install_deadline)
-                                    if cooling_deadline is not None else install_deadline
-                                )
-                        try:
-                            async for retry_delay in provider_retry_after_cooldowns().wait(
-                                self.provider,
-                                scope=provider_retry_after_scope(self.provider),
-                                deadline_at_monotonic=cooling_deadline,
-                                sleep=sleep_before_retry,
-                            ):
-                                yield ProviderActivityEvent(
-                                    activity_id=provider_activity_id,
-                                    model=self._provider_activity_model(),
-                                    phase="retry_wait",
-                                    reason=_normalize_provider_activity_reason(
-                                        provider_retry_after_cooldowns().reason(
-                                            self.provider,
-                                            scope=provider_retry_after_scope(self.provider),
-                                        )
+                            # Preserve canonical replay for selector fallbacks: each physical
+                            # provider leg projects its own compatible request view.
+                            if replay_rebased and not replay_boundary_notified:
+                                replay_boundary_notified = True
+                                yield WarningEvent(
+                                    code="reasoning_replay_context_rebuilt",
+                                    message=(
+                                        "Historical reasoning is unavailable for this interface. "
+                                        "Continuing with recorded conversation and tool results "
+                                        "in a new model context."
                                     ),
-                                    retry_attempt=_retry_attempt,
-                                    retry_limit=_fallback.max_retries,
-                                    retry_after_ms=math.ceil(retry_delay * 1000),
-                                    started_at=time.time_ns() // 1_000_000,
                                 )
-                        except RetryAfterDeferredError as exc:
-                            if (
-                                pending_compaction is not None
-                                and cooling_deadline != _total_deadline
-                                and (_total_deadline is None or _loop.time() < _total_deadline)
-                                and await _recover_pending_cooling_window(exc.code)
-                            ):
-                                _call_attempt += 1
-                                continue
-                            if self._switch_to_invalid_response_fallback(
-                                exc.code,
-                                requires_tools=bool(provider_tools_for_call),
-                                exclude_current_authority=True,
-                            ):
-                                continue
-                            self._terminalize_pending_durable_compaction(
-                                status="failed", reason=exc.code,
+                        active_user_message_index = _active_user_message_index_for_request(
+                            request_messages,
+                            current_user_text=self._current_turn_message or "",
+                        )
+                        if active_user_message_index is not None:
+                            call_chat_cfg = call_chat_cfg.model_copy(
+                                update={"active_user_message_index": (active_user_message_index)}
                             )
-                            yield self._transition(AgentState.ERROR)
-                            terminal_error = ErrorEvent(
-                                message=exc.message, code=exc.code,
-                                failure_kind=exc.failure_reason,
+
+                        active_identity = self._active_execution_identity()
+                        if active_identity is not None:
+                            call_chat_cfg = call_chat_cfg.model_copy(
+                                update={"execution_identity": active_identity}
                             )
-                            yield terminal_error
-                            break
-                        except RetryAfterWaitTimeoutError as exc:
+                            request_messages = project_execution_identity(
+                                request_messages, call_chat_cfg,
+                            )
+
+                        if call_recovery_downgraded and not bool(
+                            getattr(
+                                self.provider,
+                                "final_request_admission_guaranteed",
+                                False,
+                            )
+                        ):
+                            # Built-in adapters perform exact admission before
+                            # network I/O. A custom/plugin provider may not. When
+                            # this physical call hid retrieval and therefore
+                            # restored raw tool results, require either its exact
+                            # projector or conservative local token+character
+                            # bounds before handing it the expanded envelope.
+                            exact_projection = project_provider_final_request(
+                                self.provider,
+                                request_messages,
+                                provider_tools_for_call,
+                                call_chat_cfg,
+                            )
+                            if exact_projection is not None:
+                                restored_request_fits = exact_projection.fits
+                                admission_source = "provider_exact_projection"
+                            else:
+                                estimated_tokens = self._estimate_live_request_tokens(
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    config=call_chat_cfg,
+                                )
+                                estimated_chars = self._estimate_live_request_chars(
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    config=call_chat_cfg,
+                                )
+                                budget = self._context_budget_governor().snapshot()
+                                token_limit, _ = effective_proof_token_budget(
+                                    budget.usable_tokens,
+                                )
+                                char_limit = budget.provider_request_max_chars
+                                restored_request_fits = bool(
+                                    estimated_tokens <= token_limit
+                                    and estimated_chars <= char_limit
+                                )
+                                admission_source = "conservative_local_projection"
+                            if not restored_request_fits:
+                                terminal_error = ErrorEvent(
+                                    message=(
+                                        "The provider request cannot safely include raw "
+                                        "tool results while retrieval is unavailable."
+                                    ),
+                                    code="provider_request_budget_exhausted",
+                                )
+                                self._write_turn_call_log(
+                                    "turn_policy_decision",
+                                    action="stop",
+                                    reason=terminal_error.message,
+                                    code=terminal_error.code,
+                                    admission_source=admission_source,
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                yield terminal_error
+                                break
+
+                        self._compaction_request_context = CompactionRequestContext(
+                            chat_config=call_chat_cfg.model_copy(deep=True),
+                            recoverable_reference_resolver=self._verified_tool_result_references,
+                            tools=(
+                                tuple(
+                                    tool.model_copy(deep=True) for tool in provider_tools_for_call
+                                )
+                                if provider_tools_for_call else None
+                            ),
+                        )
+                        self._write_turn_call_log(
+                            "llm_request",
+                            call_id=call_id,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            messages=request_messages,
+                            tools=provider_tools_for_call,
+                            config=call_chat_cfg,
+                        )
+                        self._record_provider_tool_schema_event(
+                            tools=provider_tools_for_call,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            call_id=call_id,
+                            tools_supported=tools_supported_for_call,
+                        )
+                        ensemble_request_count_baseline: int | None = None
+                        if ensemble_continuation_provider is self.provider:
+                            ensemble_request_count_baseline = ensemble_continuation_request_count
+                        ensemble_continuation_request_count = None
+                        ensemble_continuation_provider = None
+                        if (
+                            ensemble_request_count_baseline is None
+                            and self._execution_context is not None
+                            and getattr(self.provider, "execution_context_aware", False)
+                        ):
+                            continuation_snapshot = (
+                                self._execution_context.ensemble_continuation_snapshot
+                            )
                             if (
-                                pending_compaction is not None
-                                and exc.deadline_at_monotonic
-                                == pending_compaction.compaction_deadline_at_monotonic
-                                and (_total_deadline is None or _loop.time() < _total_deadline)
+                                continuation_snapshot is not None
+                                and continuation_snapshot.request_started
                             ):
-                                if await _recover_pending_cooling_window(
-                                    "compaction_deadline_exceeded",
+                                ensemble_request_count_baseline = (
+                                    continuation_snapshot.physical_request_count
+                                )
+                        async def _recover_capacity_limited_output_window(
+                            *, reason: str = "reasoning_output_budget_exhausted",
+                        ) -> bool:
+                            """Use the existing retry slot to recover capacity-limited output."""
+                            nonlocal message_count_request_view
+                            before = project_provider_final_request(
+                                self.provider, request_messages,
+                                provider_tools_for_call, call_chat_cfg,
+                            )
+                            if before is None or not before.fits:
+                                return False
+                            desired = max(0, int(call_chat_cfg.max_tokens or 0))
+                            actual = projected_generation_budget(before.payload, desired)
+                            if desired <= 0 or actual >= desired:
+                                return False
+                            window = await self._recover_progressed_request_window(
+                                base_request_turn_messages,
+                                rejected_messages=request_messages,
+                                protected_turn_start_index=active_protected_turn_start_index,
+                                request_context_insert_index=active_request_context_insert_index,
+                                runtime_context_insert_index=active_runtime_context_insert_index,
+                                chat_config=call_chat_cfg, tools=provider_tools_for_call,
+                                request_context_message=request_context_message,
+                                runtime_context_message=runtime_context_message,
+                                request_suffix_messages=request_suffix_messages,
+                                reason=reason,
+                                force_shrink=True, increase_generation_budget=True,
+                            )
+                            if window is None:
+                                return False
+                            message_count_request_view = _MessageCountRequestView(
+                                messages=window.messages, canonical_tail_start=len(turn_messages),
+                                request_context_insert_index=(
+                                    window.request_context_insert_index
+                                    if window.request_context_insert_index is not None
+                                    else active_request_context_insert_index
+                                ),
+                                runtime_context_insert_index=(
+                                    window.runtime_context_insert_index
+                                    if window.runtime_context_insert_index is not None
+                                    else active_runtime_context_insert_index
+                                ),
+                                protected_turn_start_index=(
+                                    window.protected_turn_start_index
+                                    if window.protected_turn_start_index is not None
+                                    else active_protected_turn_start_index
+                                ),
+                            )
+                            self._notify_admitted_request_window(
+                                window, source_count=len(base_request_turn_messages),
+                                reason=reason,
+                            )
+                            return True
+
+                        async def _recover_pending_cooling_window(reason: str) -> bool:
+                            nonlocal turn_messages, request_context_insert_index
+                            nonlocal runtime_context_insert_index, current_turn_start_index
+                            nonlocal message_count_request_view
+                            pending = self._pending_durable_compaction_event
+                            source = self._pending_durable_compaction_source
+                            if (pending is None or source is None or not source.compaction_id
+                                    or source.compaction_id != pending.compaction_id):
+                                return False
+                            window = await self._recover_progressed_request_window(
+                                source.messages, rejected_messages=source.rejected_messages,
+                                protected_turn_start_index=source.protected_turn_start_index,
+                                request_context_insert_index=source.request_context_insert_index,
+                                runtime_context_insert_index=source.runtime_context_insert_index,
+                                chat_config=call_chat_cfg, tools=provider_tools_for_call,
+                                request_context_message=request_context_message,
+                                runtime_context_message=runtime_context_message,
+                                request_suffix_messages=request_suffix_messages,
+                                compaction_config=source.config,
+                                reason=reason,
+                            )
+                            if window is None:
+                                return False
+                            # Admission awaited local work. Recheck the operation owner
+                            # before replacing any view or emitting its sole terminal.
+                            if self._pending_durable_compaction_event is not pending:
+                                return False
+                            turn_messages = list(source.messages)
+                            request_context_insert_index = source.request_context_insert_index
+                            runtime_context_insert_index = source.runtime_context_insert_index
+                            current_turn_start_index = source.protected_turn_start_index
+                            message_count_request_view = _MessageCountRequestView(
+                                messages=window.messages, canonical_tail_start=len(turn_messages),
+                                request_context_insert_index=(
+                                    window.request_context_insert_index
+                                    if window.request_context_insert_index is not None
+                                    else request_context_insert_index
+                                ),
+                                runtime_context_insert_index=(
+                                    window.runtime_context_insert_index
+                                    if window.runtime_context_insert_index is not None
+                                    else runtime_context_insert_index
+                                ),
+                                protected_turn_start_index=(
+                                    window.protected_turn_start_index
+                                    if window.protected_turn_start_index is not None
+                                    else current_turn_start_index
+                                ),
+                            )
+                            self._pending_durable_compaction_event = None
+                            self._pending_durable_compaction_source = None
+                            self._compaction_failed_this_turn = True
+                            self._last_compaction_refusal_reason = None
+                            self._notify_admitted_request_window(
+                                window, source_count=len(source.messages),
+                                reason=reason,
+                            )
+                            return True
+
+                        if not getattr(self.provider, "owns_retry_after_admission", False):
+                            cooling_deadline = _total_deadline
+                            pending_compaction = self._pending_durable_compaction_event
+                            if pending_compaction is not None:
+                                install_deadline = (
+                                    pending_compaction.compaction_deadline_at_monotonic
+                                )
+                                if install_deadline is not None:
+                                    cooling_deadline = (
+                                        min(cooling_deadline, install_deadline)
+                                        if cooling_deadline is not None
+                                        else install_deadline
+                                    )
+                            try:
+                                async for retry_delay in provider_retry_after_cooldowns().wait(
+                                    self.provider,
+                                    scope=provider_retry_after_scope(self.provider),
+                                    deadline_at_monotonic=cooling_deadline,
+                                    sleep=sleep_before_retry,
+                                ):
+                                    yield ProviderActivityEvent(
+                                        activity_id=provider_activity_id,
+                                        model=self._provider_activity_model(),
+                                        phase="retry_wait",
+                                        reason=_normalize_provider_activity_reason(
+                                            provider_retry_after_cooldowns().reason(
+                                                self.provider,
+                                                scope=provider_retry_after_scope(self.provider),
+                                            )
+                                        ),
+                                        retry_attempt=_retry_attempt,
+                                        retry_limit=_fallback.max_retries,
+                                        retry_after_ms=math.ceil(retry_delay * 1000),
+                                        started_at=time.time_ns() // 1_000_000,
+                                    )
+                            except RetryAfterDeferredError as exc:
+                                if (
+                                    pending_compaction is not None
+                                    and cooling_deadline != _total_deadline
+                                    and (_total_deadline is None or _loop.time() < _total_deadline)
+                                    and await _recover_pending_cooling_window(exc.code)
                                 ):
                                     _call_attempt += 1
                                     continue
+                                if self._switch_to_invalid_response_fallback(
+                                    exc.code,
+                                    requires_tools=bool(provider_tools_for_call),
+                                    exclude_current_authority=True,
+                                ):
+                                    continue
                                 self._terminalize_pending_durable_compaction(
-                                    status="timed_out", reason="compaction_deadline_exceeded",
+                                    status="failed", reason=exc.code,
                                 )
                                 yield self._transition(AgentState.ERROR)
                                 terminal_error = ErrorEvent(
-                                    message=("Context compaction could not be installed "
-                                             "before its deadline."),
-                                    code="compaction_deadline_exceeded",
+                                    message=exc.message, code=exc.code,
+                                    failure_kind=exc.failure_reason,
                                 )
                                 yield terminal_error
                                 break
-                            raise
+                            except RetryAfterWaitTimeoutError as exc:
+                                if (
+                                    pending_compaction is not None
+                                    and exc.deadline_at_monotonic
+                                    == pending_compaction.compaction_deadline_at_monotonic
+                                    and (_total_deadline is None or _loop.time() < _total_deadline)
+                                ):
+                                    if await _recover_pending_cooling_window(
+                                        "compaction_deadline_exceeded",
+                                    ):
+                                        _call_attempt += 1
+                                        continue
+                                    self._terminalize_pending_durable_compaction(
+                                        status="timed_out", reason="compaction_deadline_exceeded",
+                                    )
+                                    yield self._transition(AgentState.ERROR)
+                                    terminal_error = ErrorEvent(
+                                        message=("Context compaction could not be installed "
+                                                 "before its deadline."),
+                                        code="compaction_deadline_exceeded",
+                                    )
+                                    yield terminal_error
+                                    break
+                                raise
+                    else:
+                        # A replay uses the admitted input, not another routing,
+                        # compaction, steering or request-preparation pass.
+                        request_messages = stream_replay_request.messages
+                        canonical_request_messages = request_messages
+                        provider_tools_for_call = stream_replay_request.tools
+                        call_chat_cfg = stream_replay_request.config.model_copy(deep=True)
+                        terminal_error = (
+                            _turn_llm_call_budget_error(turn_llm_calls + 1) or _turn_budget_error()
+                        )
+                        if terminal_error is not None:
+                            yield self._transition(AgentState.ERROR)
+                            yield terminal_error
+                            break
+                        self._write_turn_call_log(
+                            "llm_request", call_id=call_id, iteration=iterations,
+                            attempt=_call_attempt, messages=request_messages,
+                            tools=provider_tools_for_call, config=call_chat_cfg,
+                        )
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -7885,6 +7936,15 @@ class Agent:
                             raise
                         turn_irreversible_effect_started = True
 
+                    if self._execution_context is not None:
+                        self._execution_context.begin_provider_attempt(
+                            call_id, text_snapshot="".join(final_text_parts),
+                            reasoning_snapshot="".join(final_reasoning_parts),
+                        )
+                    yield ProviderAttemptStartEvent(
+                        model_call_id=call_id, iteration=iterations,
+                        generation_epoch=generation_epoch,
+                    )
                     yield ProviderActivityEvent(
                         activity_id=provider_activity_id,
                         model=self._provider_activity_model(),
@@ -7896,9 +7956,25 @@ class Agent:
                     )
 
                     dispatch_evidence = RetryAfterDispatchEvidence()
+                    attempt_request_snapshot: StreamRecoveryRequest | None = None
+                    provider_events_stream: AsyncIterator[Any] | None = None
+                    close_evidence = StreamCloseEvidence()
+                    close_token = stream_close_evidence.set(close_evidence)
+                    provider_stream_closed = False
                     try:
                         try:
-                            if self._failure_injector is None:
+                            if stream_replay_request is not None:
+                                raw_stream = stream_replay_request.open(self._execution_context)
+                            elif self._failure_injector is None:
+                                if not callable(
+                                    getattr(self.provider, "stream_recovery_request", None),
+                                ):
+                                    attempt_request_snapshot = StreamRecoveryRequest.capture(
+                                        self.provider,
+                                        canonical_request_messages
+                                        if selector_projects_images else request_messages,
+                                        provider_tools_for_call, call_chat_cfg,
+                                    )
                                 provider_chat: Any = getattr(self.provider, "chat")
                                 provider_chat_kwargs: dict[str, Any] = {
                                     "tools": provider_tools_for_call,
@@ -7941,6 +8017,7 @@ class Agent:
                             raise _RaisedProviderBoundaryError(
                                 timeout=isinstance(exc, TimeoutError),
                                 connection_failed=is_connection_failure(exc),
+                                recovery_origin=transport_recovery_origin(exc),
                             ) from None
                         raw_stream = observe_retry_after_dispatch(
                             guard_provider_text_stream(raw_stream), dispatch_evidence,
@@ -7962,12 +8039,13 @@ class Agent:
                             return pending_deadline
 
                         provider_stream_deadline = _total_deadline
-                        async for raw_ev in self._stream_provider_events_with_deadline(
+                        provider_events_stream = self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
                             total_deadline=provider_stream_deadline,
                             deadline_provider=_active_stream_deadline,
-                        ):
+                        )
+                        async for raw_ev in provider_events_stream:
                             if isinstance(raw_ev, ToolInputPreviewEvent):
                                 # Display drafts cannot enter content-commit,
                                 # tool execution, retry-safety or history paths.
@@ -8406,6 +8484,8 @@ class Agent:
                                         block_index=active_reasoning_block_index,
                                         started_at=reasoning_started_at_ms,
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
                                 # Bare providers reach Agent without the
                                 # selector's pre-text buffer. This thinking
@@ -9037,6 +9117,7 @@ class Agent:
                                                 ),
                                                 provider=usage_item.provider,
                                                 cost_source=usage_item.cost_source,
+                                                token_usage_known=usage_item.token_usage_known,
                                             )
                                     _accumulate_turn_cost(
                                         raw_ev,
@@ -9228,10 +9309,18 @@ class Agent:
                                 if exc.connection_failed
                                 else "request_error"
                             ),
+                            recovery_origin=exc.recovery_origin,
                         )
                         provider_error_for_log = provider_error
                         _got_error = True
                     finally:
+                        try:
+                            if provider_events_stream is not None:
+                                provider_stream_closed = await self._close_provider_stream(
+                                    provider_events_stream,
+                                )
+                        finally:
+                            stream_close_evidence.reset(close_token)
                         if usage_call is not None and not usage_call_terminal:
                             await self._usage_call_unknown(
                                 usage_call,
@@ -9247,6 +9336,13 @@ class Agent:
                             reasoning_only_act_now_message = None
 
                     if _got_error:
+                        if not cost_receipt_counted and (
+                            provider_error is None
+                            or provider_error.tool_argument_rejection is None
+                        ):
+                            total_missing_cost_entries += max(
+                                1, getattr(provider_error, "usage_missing_count", 0),
+                            )
                         for preview in discard_tool_previews():
                             yield preview
                     call_duration_ms = int((time.monotonic() - call_started_at) * 1000)
@@ -9445,6 +9541,45 @@ class Agent:
                         reasoning_tokens=iter_reasoning_tokens,
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
+                    if stream_replay_request is not None and (
+                        provider_error is not None
+                        or attempt_classification.kind != _ProviderAttemptKind.OK
+                    ):
+                        recovery_error_code = (
+                            provider_error.code if provider_error else "incomplete_stream"
+                        )
+                        recovery_failure_kind = (
+                            classify_provider_error(
+                                provider_name=getattr(self.provider, "provider_name", ""),
+                                status_code=provider_error.http_status or (
+                                    int(provider_error.code)
+                                    if provider_error.code.isdigit() else None
+                                ),
+                                raw_code=provider_error.provider_code or provider_error.code,
+                                message=provider_error.message,
+                            ) if provider_error is not None
+                            else ProviderFailureKind.MALFORMED_RESPONSE
+                        )
+                        if (
+                            provider_error is not None
+                            and provider_error.recovery_origin == "unknown"
+                            and provider_error.code in {"response_incomplete", "request_error"}
+                        ):
+                            recovery_failure_kind = ProviderFailureKind.UNKNOWN
+                        terminal_error = ErrorEvent(
+                            message=_safe_provider_terminal_message(
+                                recovery_failure_kind, recovery_error_code,
+                            ),
+                            code=safe_provider_failure_code(
+                                recovery_error_code, recovery_failure_kind.value,
+                            ),
+                            failure_kind=recovery_failure_kind.value,
+                            http_status=provider_error.http_status if provider_error else None,
+                            generation_epoch=generation_epoch,
+                        )
+                        yield self._transition(AgentState.ERROR)
+                        yield terminal_error
+                        break
                     if (
                         tool_failure_finalization_pending
                         and attempt_classification.kind != _ProviderAttemptKind.OK
@@ -10496,17 +10631,109 @@ class Agent:
                             )
                             yield terminal_error
                             break
+                        if (
+                            attempt_irreversible_output_emitted
+                            and not stream_recovery_used
+                            and not _got_done_event
+                            and not provider_error.recovery_exhausted
+                            and provider_error.tool_argument_rejection is None
+                            and provider_error.recovery_origin in {
+                                "read_timeout", "transport_disconnect",
+                            }
+                            and provider_stream_closed and not close_evidence.failed
+                            and self._execution_context is not None
+                            and not self._execution_context.terminal
+                            and not self._execution_context.closed
+                            and (
+                                self._execution_context.surface.supports_generation_reset
+                                or not self._execution_context.surface.supports_streaming
+                            )
+                            and getattr(self.provider, "retry_failed_call_safe", True) is not False
+                            and _retry_attempt < _fallback.max_retries
+                            and _turn_llm_call_budget_error(turn_llm_calls + 1) is None
+                            and self._execution_context.generation_epoch == generation_epoch
+                            and self._failure_injector is None
+                        ):
+                            capture = getattr(self.provider, "stream_recovery_request", None)
+                            recovered_request = (
+                                capture() if callable(capture) else attempt_request_snapshot
+                            )
+                            stream_retry_delay = recovery_delay_seconds(
+                                kind=failure_kind, attempt=_retry_attempt,
+                                provider_retry_after_s=provider_error.retry_after_s,
+                                base_ms=_fallback.base_backoff_ms,
+                                max_ms=_fallback.max_backoff_ms,
+                                deadline_at_monotonic=_total_deadline,
+                            )
+                            if (
+                                recovered_request is not None and stream_retry_delay is not None
+                                and (
+                                    _total_deadline is None
+                                    or _loop.time() + stream_retry_delay < _total_deadline
+                                )
+                            ):
+                                await asyncio.sleep(0)
+                                if (
+                                    self._execution_context.closed
+                                    or self._execution_context.terminal
+                                    or (_total_deadline is not None
+                                        and _loop.time() >= _total_deadline)
+                                ):
+                                    break
+                                reset_event = self._execution_context.begin_generation_reset(
+                                    self._execution_context.generation.owner,
+                                    self._execution_context.generation.owner,
+                                    "transport_transient",
+                                    reset_scope="provider_call",
+                                    rollback_model_call_id=call_id,
+                                )
+                                stream_recovery_used = True
+                                stream_replay_request = recovered_request
+                                _retry_attempt += 1
+                                self._write_turn_call_log(
+                                    "turn_policy_decision", action="stream_recovery",
+                                    reason_code=provider_error.recovery_origin,
+                                    iteration=iterations, old_attempt=_call_attempt,
+                                    new_attempt=_call_attempt + 1,
+                                )
+                                generation_epoch = reset_event.new_generation_epoch
+                                last_provider_sequence = reset_event.sequence
+                                if router_model_call_id == call_id:
+                                    router_model_call_id = ""
+                                    router_iteration = 0
+                                yield reset_event
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    model=self._provider_activity_model(), phase="retry_wait",
+                                    reason="transport_transient", retry_attempt=_retry_attempt,
+                                    retry_limit=_fallback.max_retries,
+                                    retry_after_ms=math.ceil(stream_retry_delay * 1000),
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
+                                async with asyncio.timeout_at(_total_deadline):
+                                    await sleep_before_retry(stream_retry_delay)
+                                if (
+                                    self._execution_context.closed
+                                    or self._execution_context.terminal
+                                ):
+                                    break
+                                if _total_deadline is not None and _loop.time() >= _total_deadline:
+                                    raise TimeoutError("Agent total timeout during stream recovery")
+                                for boundary in applied_model_call_boundaries:
+                                    if boundary["model_call_id"] == call_id:
+                                        boundary["model_call_id"] = (
+                                            f"{iterations}.{_call_attempt + 1}"
+                                        )
+                                _call_attempt += 1
+                                next_provider_activity_reason = "transport_transient"
+                                continue
                         if attempt_irreversible_output_emitted:
-                            # Text, reasoning, and tool lifecycle frames are
-                            # streamed to the client immediately and cannot be
-                            # rolled back. A retry or fallback after that commit
-                            # would replay or mix attempts, while the terminal
-                            # transcript would retain only the later attempt.
-                            # Selector-buffered failed-leg reasoning remains
-                            # retryable because it never reaches this boundary.
+                            # Without admitted call recovery, visible frames
+                            # remain committed. Ordinary retry or fallback
+                            # would mix attempts in the client's transcript.
                             _log.warning(
                                 "provider.retry_suppressed",
-                                reason="user_visible_output_committed",
+                                reason_code="user_visible_output_committed",
                                 kind=kind.value,
                                 provider=getattr(self.provider, "provider_name", ""),
                             )
@@ -11741,7 +11968,7 @@ class Agent:
                         if should_retry and not retry_failed_call_safe:
                             _log.warning(
                                 "provider.retry_suppressed",
-                                reason="composite_provider",
+                                reason_code="composite_provider",
                                 kind=kind.value,
                                 provider=getattr(self.provider, "provider_name", ""),
                             )
@@ -11916,6 +12143,12 @@ class Agent:
                 # was received and that every tool sequence was closed and
                 # validated. Only now can the buffered public events be
                 # committed; any retry/error path above discards them.
+                if self._execution_context is not None:
+                    self._execution_context.commit_provider_attempt(call_id)
+                yield ProviderAttemptCommittedEvent(
+                    model_call_id=call_id, iteration=iterations,
+                    generation_epoch=generation_epoch,
+                )
                 if self._execution_context is not None and provider_done_for_log is not None:
                     for tool_call in tool_calls:
                         await self._execution_context.commit_tool_round(
@@ -13515,7 +13748,7 @@ class Agent:
             or done_cache_write_tokens
             or done_cost
             or done_billed_cost
-            or missing_cost_entries
+            or (missing_cost_entries and terminal_error is None)
             or total_provider_billed_entries
         )
         replay_messages = _assistant_replay_tail(turn_messages, current_turn_start_index)
@@ -14076,6 +14309,7 @@ class Agent:
             raise _RaisedProviderBoundaryError(
                 timeout=isinstance(exc, TimeoutError),
                 connection_failed=is_connection_failure(exc),
+                recovery_origin=transport_recovery_origin(exc),
             ) from None
         close_state = {"deferred": False}
         try:
@@ -14180,12 +14414,13 @@ class Agent:
                 raise _RaisedProviderBoundaryError(
                     timeout=isinstance(exc, TimeoutError),
                     connection_failed=is_connection_failure(exc),
+                    recovery_origin=transport_recovery_origin(exc),
                 ) from None
             yield event
 
     @staticmethod
-    async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:
-        await close_async_iterator_bounded(
+    async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> bool:
+        return await close_async_iterator_bounded(
             stream_iter,
             timeout=0.25,
             event_prefix="provider_stream",

@@ -2718,7 +2718,9 @@ class SessionManager:
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content if role == "assistant" else None,
             assistant_replay=deepcopy(assistant_replay) if role == "assistant" else None,
-            turn_usage=turn_usage if role == "assistant" else None,
+            # Terminal provider errors use system transcript rows. Their
+            # explicit ledger projection must survive reload as well.
+            turn_usage=turn_usage if role in {"assistant", "system"} else None,
             turn_context=dict(turn_context) if turn_context is not None else None,
             token_count=token_count,
         )

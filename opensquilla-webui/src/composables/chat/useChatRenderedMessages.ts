@@ -1020,6 +1020,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       cachedTokens: cached,
       reasoningTokens: reasoning,
       costUsd: cost,
+      ...(['provider_billed', 'mixed'].includes(String(u.cost_source ?? u.costSource))
+        ? { billedCostUsd: numeric(u.billed_cost ?? u.billedCost) } : {}),
+      ...(['opensquilla_estimate', 'mixed'].includes(String(u.cost_source ?? u.costSource))
+        ? { estimatedCostUsd: Math.max(0, cost - numeric(u.billed_cost ?? u.billedCost)) } : {}),
+      ...(numeric(u.missing_cost_entries ?? u.missingCostEntries) > 0
+        ? { missingCostEntries: Math.floor(numeric(u.missing_cost_entries ?? u.missingCostEntries)) } : {}),
       hasSaved,
       turnSavedPct,
       savedLabel: turnSavedPct > 0 ? `Saved ~${Math.round(turnSavedPct)}%` : 'Cost optimized',

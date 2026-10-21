@@ -2076,6 +2076,7 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         provider: str | None = None,
         model: str | None = None,
         fallback_hops: int = 0,
+        turn_usage: dict[str, Any] | None = None,
     ) -> None:
         await self._runner._persist_turn_error(
             session_key,
@@ -2088,4 +2089,5 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
             provider=provider,
             model=model,
             fallback_hops=fallback_hops,
+            **({"turn_usage": turn_usage} if turn_usage is not None else {}),
         )

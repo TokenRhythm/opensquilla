@@ -827,6 +827,9 @@ export interface ChatMessageMeta {
   cachedTokens: number
   reasoningTokens: number
   costUsd: number
+  billedCostUsd?: number
+  estimatedCostUsd?: number
+  missingCostEntries?: number
   hasSaved: boolean
   savedLabel: string
   turnSavedPct?: number

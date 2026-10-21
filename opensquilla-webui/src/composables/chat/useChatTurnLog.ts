@@ -26,6 +26,8 @@ export interface UseChatTurnLogOptions {
 export function useChatTurnLog(options: UseChatTurnLogOptions) {
   const accumulator = new TurnAccumulator()
   let acceptedFrames: Frame[] = []
+  const providerCallPrefixes = new Map<string, { frames: Frame[]; nextSeq: number }>()
+  const invalidatedProviderCalls = new Set<string>()
   let appendIndex = 0
   let acceptedActivityOrder: number | undefined
   let snapshotDirty = false
@@ -76,10 +78,17 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   })
 
   function coalesceAcceptedFrame(frame: Frame): void {
-    // Generation reset always discards these frames. Retaining their bodies
-    // would only duplicate the accumulator's display projection.
-    if (frame.kind === 'text' || frame.kind === 'thinking' || frame.kind === 'final-text') return
     const previous = acceptedFrames[acceptedFrames.length - 1]
+    if (previous?.kind === 'text' && frame.kind === 'text'
+      && previous.presentation === frame.presentation) {
+      previous.text += frame.text
+      return
+    }
+    if (previous?.kind === 'thinking' && frame.kind === 'thinking'
+      && previous.blockId === frame.blockId && previous.blockIndex === frame.blockIndex) {
+      previous.text += frame.text
+      return
+    }
     if (previous?.kind === 'tool-delta' && frame.kind === 'tool-delta'
       && previous.toolId === frame.toolId) {
       previous.fragment += frame.fragment
@@ -123,6 +132,8 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
       : []
     accumulator.reset()
     acceptedFrames = []
+    providerCallPrefixes.clear()
+    invalidatedProviderCalls.clear()
     appendIndex = 0
     acceptedActivityOrder = undefined
     snapshotDirty = true
@@ -140,7 +151,11 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
 
   function checkpointText() {
     accumulator.checkpointText()
-    acceptedFrames = []
+    acceptedFrames = acceptedFrames.filter(frame => frame.kind !== 'text' && frame.kind !== 'final-text')
+    // A steer moved text into a different message. Recover its canonical
+    // server projection instead of guessing how to splice across that row.
+    for (const callId of providerCallPrefixes.keys()) invalidatedProviderCalls.add(callId)
+    providerCallPrefixes.clear()
     snapshotDirty = true
     publishPending = true
     publish()
@@ -155,6 +170,8 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     textSnapshot?: string
     preserveCompletedTools?: boolean
   } = {}) {
+    providerCallPrefixes.clear()
+    invalidatedProviderCalls.clear()
     const preserveCompletedTools = optionsArg.preserveCompletedTools !== false
     const completedToolIds = new Set(
       acceptedFrames
@@ -190,6 +207,40 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     }
 
     publish()
+  }
+
+  function beginProviderCall(modelCallId: string): void {
+    if (!modelCallId || providerCallPrefixes.has(modelCallId)
+      || invalidatedProviderCalls.has(modelCallId)) return
+    // Only the currently visible attempt may be rolled back. Keeping older
+    // complete prefixes would grow quadratically across a long tool loop.
+    providerCallPrefixes.clear()
+    providerCallPrefixes.set(modelCallId, {
+      frames: acceptedFrames.map(frame => ({ ...frame })),
+      nextSeq: appendIndex,
+    })
+  }
+
+  function rollbackProviderCall(modelCallId: string): boolean {
+    const prefix = providerCallPrefixes.get(modelCallId)
+    if (!prefix) return false
+    const completedTools = new Set(acceptedFrames
+      .filter((frame): frame is Extract<Frame, { kind: 'tool-result' }> => frame.kind === 'tool-result')
+      .map(frame => frame.toolId))
+    const retained = acceptedFrames.filter(frame => frame.seq >= prefix.nextSeq && (
+      frame.kind === 'artifact' || frame.kind === 'interrupt' || frame.kind === 'interrupt-resolved'
+      || frame.kind === 'status'
+      || ((frame.kind === 'tool-start' || frame.kind === 'tool-delta' || frame.kind === 'tool-result')
+        && completedTools.has(frame.toolId))
+    ))
+    acceptedFrames = [...prefix.frames, ...retained]
+    providerCallPrefixes.clear()
+    accumulator.reset()
+    for (const frame of acceptedFrames) accumulator.append(frame)
+    snapshotDirty = true
+    publishPending = true
+    publish()
+    return true
   }
 
   function peekRawText(): string {
@@ -241,6 +292,8 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     peekToolTiming,
     finalizeToolInputs,
     resetGeneration,
+    beginProviderCall,
+    rollbackProviderCall,
     foldedTurn,
   }
 }

@@ -198,6 +198,7 @@ describe('RpcClient', () => {
     const guestSessionKey = firstFrame.params.auth.guestSessionKey
     expect(firstFrame.params.caps).toEqual([
       'session.answer_generation_reset.v1',
+      'session.answer_generation_reset.v2',
       'session.turn_committed.v1',
       'transport.probe.v1',
     ])

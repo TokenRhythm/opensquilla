@@ -320,6 +320,40 @@ class _StreamState:
 
 
 @dataclass(frozen=True)
+class _ProviderAttemptCheckpoint:
+    model_call_id: str
+    current_text_parts: tuple[str, ...]
+    current_text_presentation: Literal["intermediate", "answer"]
+    final_text_parts: tuple[str, ...]
+    reasoning: tuple[str, ...]
+    reasoning_parts: tuple[str, ...]
+    turn_segments: tuple[dict[str, Any], ...]
+
+    @classmethod
+    def capture(cls, model_call_id: str, state: _StreamState) -> _ProviderAttemptCheckpoint:
+        return cls(
+            model_call_id=model_call_id,
+            current_text_parts=tuple(state.current_text_parts),
+            current_text_presentation=state.current_text_presentation,
+            final_text_parts=tuple(state.final_text_parts),
+            reasoning=tuple(state.reasoning),
+            reasoning_parts=tuple(state.reasoning_parts),
+            turn_segments=tuple(copy.deepcopy(state.turn_segments)),
+        )
+
+    def restore(self, state: _StreamState) -> None:
+        state.current_text_parts[:] = self.current_text_parts
+        state.current_text_presentation = self.current_text_presentation
+        state.final_text_parts[:] = self.final_text_parts
+        state.reasoning[:] = self.reasoning
+        state.reasoning_parts[:] = self.reasoning_parts
+        state.turn_segments[:] = copy.deepcopy(self.turn_segments)
+        state.error_message = None
+        state.pending_error_event = None
+        state.done_event = None
+
+
+@dataclass(frozen=True)
 class _SilentReplyStateProjection:
     """Copy-on-write silent-reply projection of the live segment timeline."""
 
@@ -416,6 +450,11 @@ def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
         # adopted explicit surface capability negotiation.
         return True
     return bool(context.surface.supports_generation_reset)
+
+
+def _supports_provider_call_reset(inp: StreamConsumerStageInput) -> bool:
+    context = inp.execution_context
+    return context is None or bool(getattr(context.surface, "supports_provider_call_reset", True))
 
 
 # ---------------------------------------------------------------------------
@@ -909,7 +948,8 @@ class _DoneHandler:
 
         snapshot_present, terminal_text = done_text_snapshot(event)
         accumulated_text = "".join(state.final_text_parts)
-        buffer_system_event_text = (
+        buffer_call_content = not _supports_provider_call_reset(inp)
+        buffer_system_event_text = buffer_call_content or (
             inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
@@ -1912,8 +1952,13 @@ class StreamConsumerStage:
             DoneEvent,
             EnsembleProgressEvent,
             ErrorEvent,
+            ProviderAttemptCommittedEvent,
+            ProviderAttemptStartEvent,
             TextDeltaEvent,
+            ThinkingEndEvent,
             ThinkingEvent,
+            ThinkingStartEvent,
+            ToolInputPreviewEvent,
             ToolResultEvent,
             ToolUseDeltaEvent,
             ToolUseEndEvent,
@@ -1926,7 +1971,8 @@ class StreamConsumerStage:
         )
 
         state = inp.state
-        buffer_system_event_text = (
+        buffer_call_content = not _supports_provider_call_reset(inp)
+        buffer_system_event_text = buffer_call_content or (
             inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
@@ -1943,6 +1989,9 @@ class StreamConsumerStage:
         realtime_generation = _supports_realtime_generation(inp)
         supports_generation_reset = _supports_generation_reset(inp)
         deferred_generation_events: list[AgentEvent] = []
+        attempt_checkpoint: _ProviderAttemptCheckpoint | None = None
+        deferred_attempt_start = 0
+        attempt_silent_reply_state: tuple[bool, str, bool] | None = None
 
         def _is_deferred_generation_event(candidate: object) -> bool:
             return isinstance(
@@ -1950,6 +1999,8 @@ class StreamConsumerStage:
                 (
                     TextDeltaEvent,
                     ThinkingEvent,
+                    ThinkingStartEvent,
+                    ThinkingEndEvent,
                     ToolUseStartEvent,
                     ToolUseDeltaEvent,
                     ToolUseEndEvent,
@@ -1958,11 +2009,13 @@ class StreamConsumerStage:
                 ),
             )
 
-        def _drop_speculative_text() -> None:
-            deferred_generation_events[:] = [
+        def _drop_speculative_text(*, since: int = 0) -> None:
+            deferred_generation_events[since:] = [
                 candidate
-                for candidate in deferred_generation_events
-                if not isinstance(candidate, (TextDeltaEvent, ThinkingEvent))
+                for candidate in deferred_generation_events[since:]
+                if not isinstance(
+                    candidate, (TextDeltaEvent, ThinkingEvent, ThinkingStartEvent, ThinkingEndEvent)
+                )
             ]
 
         async for event in self._agent_run.run_turn(
@@ -1974,10 +2027,46 @@ class StreamConsumerStage:
         ):
             transformed: AgentEvent | object
             extra_yields: list[AgentEvent] = []
+            if isinstance(event, ProviderAttemptStartEvent):
+                attempt_checkpoint = _ProviderAttemptCheckpoint.capture(event.model_call_id, state)
+                deferred_attempt_start = len(deferred_generation_events)
+                attempt_silent_reply_state = (
+                    human_silent_reply_prefix_open,
+                    held_human_silent_reply_text,
+                    human_prefix_crossed_public_boundary,
+                )
+                continue
+            if isinstance(event, ProviderAttemptCommittedEvent):
+                if attempt_checkpoint is not None:
+                    if attempt_checkpoint.model_call_id != event.model_call_id:
+                        raise RuntimeError("provider attempt commit does not match its checkpoint")
+                    attempt_checkpoint = None
+                continue
             if isinstance(event, AnswerGenerationResetEvent):
-                _reset_generation_stream_state(state)
-                if not realtime_generation:
-                    _drop_speculative_text()
+                if event.reset_scope == "provider_call":
+                    if (attempt_checkpoint is None
+                            or attempt_checkpoint.model_call_id != event.rollback_model_call_id):
+                        raise RuntimeError("provider call reset does not match its checkpoint")
+                    attempt_checkpoint.restore(state)
+                    if attempt_silent_reply_state is not None:
+                        (
+                            human_silent_reply_prefix_open,
+                            held_human_silent_reply_text,
+                            human_prefix_crossed_public_boundary,
+                        ) = attempt_silent_reply_state
+                    if not realtime_generation:
+                        _drop_speculative_text(since=deferred_attempt_start)
+                else:
+                    _reset_generation_stream_state(state)
+                    held_human_silent_reply_text = ""
+                    human_silent_reply_prefix_open = gate_human_silent_reply_prefix
+                    human_prefix_crossed_public_boundary = False
+                    if not realtime_generation:
+                        _drop_speculative_text()
+                attempt_checkpoint = None
+                released_system_event_text = None
+                released_system_event_source_text = None
+                released_suppressed_source_text = None
                 terminal_snapshot = ""
                 if event.terminal:
                     terminal_snapshot = str(
@@ -2010,7 +2099,13 @@ class StreamConsumerStage:
                         ),
                         state,
                     )
-                if supports_generation_reset:
+                if (
+                    event.reset_scope == "provider_call"
+                    and buffer_call_content
+                    and not event.terminal
+                ):
+                    transformed = _SUPPRESS
+                elif supports_generation_reset:
                     # Keep the typed failure taxonomy on the trusted
                     # in-process event until TaskRuntime has classified the
                     # durable outcome. Gateway serializers scrub these fields
@@ -2037,7 +2132,7 @@ class StreamConsumerStage:
             elif isinstance(event, TextDeltaEvent):
                 transformed = self._text_delta_handler.handle(event, state)
                 if buffer_system_event_text:
-                    if event.text and not buffered_text_observed:
+                    if event.text and not buffered_text_observed and not buffer_call_content:
                         log.info(
                             "internal_turn_text_buffered_total",
                             metric="internal_turn_text_buffered_total",
@@ -2402,6 +2497,11 @@ class StreamConsumerStage:
             if realtime_generation:
                 for extra_event in extra_yields:
                     yield extra_event
+                if buffer_call_content and isinstance(
+                    transformed,
+                    (ThinkingEvent, ThinkingStartEvent, ThinkingEndEvent, ToolInputPreviewEvent),
+                ):
+                    continue
                 if transformed is not _SUPPRESS:
                     yield transformed  # type: ignore[misc]
                 continue

@@ -102,6 +102,24 @@ def test_canonical_payload_marks_schema_version_and_preserves_extensions() -> No
     assert decoded.meta == {"replayed": True}
 
 
+def test_provider_call_reset_fields_fit_the_additive_payload_contract() -> None:
+    payload = {
+        "schema_version": 1,
+        "key": "agent:main:recovery",
+        "turn_id": "turn-recovery",
+        "assistant_message_id": "assistant-recovery",
+        "reset_scope": "provider_call",
+        "rollback_model_call_id": "4.0",
+        "old_generation_epoch": 0,
+        "new_generation_epoch": 1,
+    }
+    decoded = decode_conversation_event_frame({
+        "event": "session.event.answer_generation_reset", "payload": payload,
+    })
+    assert decoded.is_known
+    assert decoded.payload == payload
+
+
 def test_unknown_additive_event_is_safe_to_observe_but_not_known() -> None:
     decoded = decode_conversation_event(
         "session.event.future_checkpoint",

@@ -41,6 +41,7 @@ from .protocol import (
     ProviderMetadata,
     ProviderModelListingResponseError,
 )
+from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     RESPONSES_REQUEST_ENVELOPE,
     ProviderRequestBudgetExceededError,
@@ -462,7 +463,9 @@ class OpenAIResponsesProvider:
                 max_len=2000,
             )
             trace.record_error(code=code, message=message)
-            yield ErrorEvent(message=message, code=code)
+            yield ErrorEvent(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
             return
         except httpx.RequestError as exc:
             code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
@@ -472,7 +475,9 @@ class OpenAIResponsesProvider:
                 max_len=2000,
             )
             trace.record_error(code=code, message=message)
-            yield ErrorEvent(message=message, code=code)
+            yield ErrorEvent(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
             return
 
         if response.status_code != 200:

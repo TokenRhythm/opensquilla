@@ -919,6 +919,21 @@ async def test_append_message_with_turn_usage_does_not_double_count_output_token
     assert node.total_tokens == 0
 
 
+@pytest.mark.parametrize("role", ["system", "user", "tool"])
+async def test_failure_usage_projection_survives_only_model_and_system_history(manager, role):
+    key = "agent:main:usage-failure"
+    await manager.create(key)
+    usage = {
+        "cost_usd": 0.03, "billed_cost": 0.03, "cost_source": "mixed",
+        "estimated_cost_component_usd": 0.0, "missing_cost_entries": 1,
+        "coverage_status": "usage_unknown", "usage_unknown": True,
+    }
+    await manager.append_message(key, role, "Error: Synthetic provider failure", turn_usage=usage)
+    entry = (await manager.get_transcript(key))[0]
+    assert entry.role == role
+    assert entry.turn_usage == (usage if role == "system" else None)
+
+
 @pytest.mark.asyncio
 async def test_get_transcript(manager):
     await manager.create("agent:main:main")

@@ -50,8 +50,13 @@ from opensquilla.engine.types import (
     DoneEvent,
     EnsembleProgressEvent,
     ErrorEvent,
+    ProviderAttemptCommittedEvent,
+    ProviderAttemptStartEvent,
     TextDeltaEvent,
+    ThinkingEndEvent,
     ThinkingEvent,
+    ThinkingStartEvent,
+    ToolInputPreviewEvent,
     ToolResultEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
@@ -62,7 +67,11 @@ from opensquilla.silent_reply import (
     SILENT_REPLY_NOT_ALLOWED_CODE,
     SILENT_REPLY_NOT_ALLOWED_MESSAGE,
 )
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import (
+    CallerKind,
+    ToolContext,
+    surface_capabilities_for_tool_context,
+)
 
 # ---------------------------------------------------------------------------
 # Recording fakes
@@ -641,6 +650,88 @@ async def test_non_editable_surface_hides_replaced_text_until_fixed_done() -> No
     )
     assert not any(isinstance(event, AnswerGenerationResetEvent) for event in events)
     assert sum(isinstance(event, DoneEvent) for event in events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realtime", [False, True])
+async def test_call_reset_keeps_completed_prefix_and_tool_order(realtime: bool) -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-prefix", "assistant-prefix", "agent:main:prefix"),
+        surface=SurfaceCapabilities(
+            supports_streaming=realtime,
+            supports_edit=realtime,
+            supports_generation_reset=realtime,
+        ),
+    )
+    state = _make_state()
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(events=[
+            ProviderAttemptStartEvent(model_call_id="1.0", iteration=1),
+            TextDeltaEvent(text="Checked. ", presentation="intermediate", model_call_id="1.0"),
+            ThinkingEvent(text="Accepted reasoning", model_call_id="1.0"),
+            ProviderAttemptCommittedEvent(model_call_id="1.0", iteration=1),
+            ToolUseStartEvent(tool_use_id="tool-prefix", tool_name="record"),
+            ToolResultEvent(tool_use_id="tool-prefix", tool_name="record", result="completed"),
+            ProviderAttemptStartEvent(model_call_id="2.0", iteration=2),
+            ThinkingStartEvent(block_id="failed", model_call_id="2.0"),
+            ThinkingEvent(text="Discard reasoning", block_id="failed", model_call_id="2.0"),
+            TextDeltaEvent(text="Discard text", model_call_id="2.0"),
+            ThinkingEndEvent(block_id="failed", model_call_id="2.0", status="error"),
+            AnswerGenerationResetEvent(
+                old_generation_epoch=0,
+                new_generation_epoch=1,
+                reset_scope="provider_call",
+                rollback_model_call_id="2.0",
+                authoritative_text_snapshot="Checked. ",
+                authoritative_reasoning_snapshot="Accepted reasoning",
+            ),
+            ProviderAttemptStartEvent(model_call_id="2.1", iteration=2, generation_epoch=1),
+            TextDeltaEvent(text="Recovered.", model_call_id="2.1", generation_epoch=1),
+            ProviderAttemptCommittedEvent(model_call_id="2.1", iteration=2, generation_epoch=1),
+            DoneEvent(text="Checked. Recovered.", generation_epoch=1),
+        ])
+    )
+
+    events = await _drain(stage, _make_input(state=state, execution_context=context))
+
+    assert "".join(state.final_text_parts) == "Checked. Recovered."
+    assert "".join(state.reasoning_parts) == "Accepted reasoning"
+    assert [segment["type"] for segment in state.turn_segments] == [
+        "text", "tool_use", "tool_result",
+    ]
+    assert state.turn_segments[0]["text"] == "Checked. "
+    assert state.turn_segments[1]["tool_use_id"] == "tool-prefix"
+    assert not any(isinstance(event, (ProviderAttemptStartEvent, ProviderAttemptCommittedEvent))
+                   for event in events)
+    if not realtime:
+        assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+            "Checked. ", "Recovered.",
+        ]
+        assert not any(getattr(event, "model_call_id", "") == "2.0" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_call_reset_discards_withheld_silent_reply_prefix() -> None:
+    state = _make_state()
+    stage, _ = _make_stage(agent_run=_RecordingAgentRun(events=[
+        ProviderAttemptStartEvent(model_call_id="1.0"),
+        TextDeltaEvent(text="NO", model_call_id="1.0"),
+        AnswerGenerationResetEvent(
+            reset_scope="provider_call", rollback_model_call_id="1.0",
+            old_generation_epoch=0, new_generation_epoch=1,
+        ),
+        ProviderAttemptStartEvent(model_call_id="1.1", generation_epoch=1),
+        TextDeltaEvent(text="Recovered.", model_call_id="1.1", generation_epoch=1),
+        ProviderAttemptCommittedEvent(model_call_id="1.1", generation_epoch=1),
+        DoneEvent(text="Recovered.", generation_epoch=1),
+    ]))
+
+    events = await _drain(stage, _make_input(state=state))
+
+    assert "".join(event.text for event in events if isinstance(event, TextDeltaEvent)) == (
+        "Recovered."
+    )
+    assert "".join(state.final_text_parts) == "Recovered."
 
 
 # ---------------------------------------------------------------------------
@@ -3286,3 +3377,73 @@ def test_done_handler_stamps_decision_id() -> None:
         DoneEvent(text="r", input_tokens=1, output_tokens=1), inp2, _make_state()
     )
     assert transformed2.decision_id is None
+
+
+@pytest.mark.asyncio
+async def test_cli_buffers_attempt_content_but_keeps_completed_tools_live() -> None:
+    tool_context = ToolContext(caller_kind=CallerKind.CLI)
+    surface = surface_capabilities_for_tool_context(tool_context)
+    assert surface.supports_streaming
+    assert surface.supports_generation_reset
+    assert not surface.supports_provider_call_reset
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-cli", "assistant-cli", "agent:main:cli"), surface=surface,
+    )
+    state = _make_state()
+    stage, _ = _make_stage(agent_run=_RecordingAgentRun(events=[
+        ProviderAttemptStartEvent(model_call_id="1.0", iteration=1),
+        TextDeltaEvent(text="accepted prefix ", model_call_id="1.0"),
+        ThinkingStartEvent(block_id="reasoning-one", model_call_id="1.0"),
+        ThinkingEvent(text="accepted reasoning", model_call_id="1.0"),
+        ThinkingEndEvent(block_id="reasoning-one", model_call_id="1.0"),
+        ProviderAttemptCommittedEvent(model_call_id="1.0", iteration=1),
+        ToolUseStartEvent(tool_use_id="completed-tool", tool_name="record"),
+        ToolResultEvent(tool_use_id="completed-tool", tool_name="record", result="completed"),
+        ProviderAttemptStartEvent(model_call_id="2.0", iteration=2),
+        ToolInputPreviewEvent(preview_id="failed-draft", content="uncommitted content"),
+        TextDeltaEvent(text="failed prefix", model_call_id="2.0"),
+        ThinkingEvent(text="failed reasoning", model_call_id="2.0"),
+        AnswerGenerationResetEvent(
+            reset_scope="provider_call", rollback_model_call_id="2.0",
+            old_generation_epoch=0, new_generation_epoch=1,
+        ),
+        ProviderAttemptStartEvent(model_call_id="2.1", iteration=2, generation_epoch=1),
+        TextDeltaEvent(text="accepted suffix", model_call_id="2.1", generation_epoch=1),
+        ProviderAttemptCommittedEvent(model_call_id="2.1", iteration=2, generation_epoch=1),
+        DoneEvent(text="accepted prefix accepted suffix", generation_epoch=1),
+    ]))
+
+    events = await _drain(stage, _make_input(
+        state=state, execution_context=context, tool_context=tool_context,
+    ))
+
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "accepted prefix accepted suffix",
+    ]
+    assert not any(isinstance(event, (ThinkingEvent, ThinkingStartEvent, ThinkingEndEvent,
+                                      ToolInputPreviewEvent, AnswerGenerationResetEvent))
+                   for event in events)
+    kinds = [event.kind for event in events]
+    assert kinds.index("tool_result") < kinds.index("text_delta") < kinds.index("done")
+    assert state.reasoning == ["accepted reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_cli_keeps_answer_reset_compatibility_with_terminal_text_buffering() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-cli-answer", "assistant-cli-answer", "agent:main:cli-answer"),
+        surface=surface_capabilities_for_tool_context(ToolContext(caller_kind=CallerKind.CLI)),
+    )
+    stage, _ = _make_stage(agent_run=_RecordingAgentRun(events=[
+        TextDeltaEvent(text="superseded answer"),
+        AnswerGenerationResetEvent(old_generation_epoch=0, new_generation_epoch=1),
+        TextDeltaEvent(text="accepted answer", generation_epoch=1),
+        DoneEvent(text="accepted answer", generation_epoch=1),
+    ]))
+
+    events = await _drain(stage, _make_input(execution_context=context))
+
+    assert any(isinstance(event, AnswerGenerationResetEvent) for event in events)
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "accepted answer",
+    ]

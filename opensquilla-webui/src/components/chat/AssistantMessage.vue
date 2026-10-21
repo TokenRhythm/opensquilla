@@ -393,6 +393,14 @@
                 <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
                 <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.costUsd) }}</span>
               </div>
+              <div v-if="message.meta.billedCostUsd !== undefined && !message.meta.ensemble" class="msg-meta-popover__row">
+                <span class="msg-meta-popover__label">{{ t('usageLogs.costSource.actual.label') }}</span>
+                <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.billedCostUsd) }}</span>
+              </div>
+              <div v-if="message.meta.estimatedCostUsd !== undefined && !message.meta.ensemble" class="msg-meta-popover__row">
+                <span class="msg-meta-popover__label">{{ t('usageLogs.costSource.estimated.label') }}</span>
+                <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.estimatedCostUsd) }}</span>
+              </div>
               <div v-if="message.meta.hasTokens" class="msg-meta-popover__row">
                 <span class="msg-meta-popover__label">{{ t('chat.msgMeta.tokens') }}</span>
                 <span class="msg-meta-popover__value">&#8593;{{ fmtTok(message.meta.input) }} &#8595;{{ fmtTok(message.meta.output) }}</span>

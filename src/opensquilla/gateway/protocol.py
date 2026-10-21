@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 
 from opensquilla.contracts.gateway_transport import (
     ANSWER_GENERATION_RESET_CAPABILITY,
+    PROVIDER_CALL_RESET_CAPABILITY,
     TURN_COMMITTED_CAPABILITY,
     TURN_COMMITTED_EVENT,
 )
@@ -96,6 +97,8 @@ class AnswerGenerationResetWire(BaseModel):
     preserve_completed_tools: bool = True
     authoritative_text_snapshot: str = ""
     authoritative_reasoning_snapshot: str = ""
+    reset_scope: Literal["answer", "provider_call"] = "answer"
+    rollback_model_call_id: str = ""
     sequence: int = Field(default=0, ge=0)
     terminal: bool = False
     terminal_text_snapshot: str | None = None
@@ -229,6 +232,25 @@ def project_session_event_for_client(
             return None
         return event_name, public_payload
 
+    supports_call_reset = PROVIDER_CALL_RESET_CAPABILITY in (client_caps or ())
+    if (
+        not supports_call_reset
+        and event_name
+        in {
+            "session.event.text_delta",
+            "session.event.thinking",
+            "session.event.thinking_start",
+            "session.event.thinking_end",
+        }
+        and isinstance(payload, Mapping)
+        and isinstance(payload.get("model_call_id"), str)
+        and bool(payload["model_call_id"].strip())
+    ):
+        # A legacy observer cannot retract a failed physical attempt. Keep its
+        # content behind the terminal authoritative snapshot from the first
+        # scoped delta, including when the observer joins through replay.
+        return None
+
     if event_name != _ANSWER_GENERATION_RESET_EVENT or not isinstance(payload, Mapping):
         return event_name, payload
 
@@ -236,9 +258,23 @@ def project_session_event_for_client(
     for field_name in _INTERNAL_TERMINAL_RESET_FIELDS:
         public_payload.pop(field_name, None)
 
+    if public_payload.get("reset_scope") == "provider_call" and not supports_call_reset:
+        if public_payload.get("terminal") is not True:
+            # Legacy clients must advance their generation guard before the next
+            # tool or terminal frame. Their existing replacement handler can
+            # install the accepted prefix and retain completed tool rows. This
+            # also preserves the existing capability-less nonterminal contract.
+            public_payload["reset_scope"] = "answer"
+            public_payload.pop("rollback_model_call_id", None)
+            return event_name, public_payload
+        # The call-local contract is new even for v1 replacement clients.
+        # Their sole failed outcome must use the existing error projection.
+        client_caps = ()
+
     if (
         public_payload.get("terminal") is not True
         or ANSWER_GENERATION_RESET_CAPABILITY in (client_caps or ())
+        or supports_call_reset
     ):
         return event_name, public_payload
 

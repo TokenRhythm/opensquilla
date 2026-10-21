@@ -197,6 +197,7 @@ class SessionUsage:
         billed_cost: float = 0.0,
         provider: str = "",
         cost_source: str | None = None,
+        token_usage_known: bool = True,
     ) -> None:
         """Accumulate token counts, tracking per-model breakdown.
 
@@ -241,7 +242,7 @@ class SessionUsage:
                     mu.provider_billed_entries += 1
                 if not provider_billed or mixed_source:
                     mu.unbilled_entries += 1
-                if not provider_billed and not mixed_source:
+                if not provider_billed and not mixed_source and token_usage_known:
                     # Pure counters only — pricing stays lazy in the cost
                     # properties/serializers so add() never blocks the event loop.
                     mu.unbilled_input_tokens += input_tokens
@@ -610,6 +611,7 @@ class UsageTracker:
         billed_cost: float = 0.0,
         provider: str = "",
         cost_source: str | None = None,
+        token_usage_known: bool = True,
     ) -> None:
         """Record token usage for a session.
 
@@ -635,6 +637,7 @@ class UsageTracker:
             billed_cost=billed_cost,
             provider=provider,
             cost_source=cost_source,
+            token_usage_known=token_usage_known,
         )
         if model_id:
             usage.model_id = model_id
@@ -653,6 +656,7 @@ class UsageTracker:
                 provider=provider,
                 billed_cost=billed_cost,
                 cost_source=cost_source,
+                token_usage_known=token_usage_known,
             )
             if model_id:
                 scoped.model_id = model_id

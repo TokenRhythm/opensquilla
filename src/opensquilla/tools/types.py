@@ -396,6 +396,11 @@ def surface_capabilities_for_tool_context(
             supports_generation_reset=False,
         )
 
+    if caller_kind is CallerKind.CLI:
+        # Terminal renderers can reconcile a final answer, but cannot retract
+        # arbitrary reasoning/text already printed around completed tool rows.
+        return SurfaceCapabilities(supports_provider_call_reset=False)
+
     return SurfaceCapabilities()
 
 

@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 
 class TurnExecutionError(RuntimeError):
@@ -249,6 +249,7 @@ class SurfaceCapabilities:
     supports_streaming: bool = True
     supports_edit: bool = True
     supports_generation_reset: bool = True
+    supports_provider_call_reset: bool = True
 
 
 @dataclass(slots=True)
@@ -376,6 +377,7 @@ class TurnExecutionContext:
                         "supports_streaming",
                         "supports_edit",
                         "supports_generation_reset",
+                        "supports_provider_call_reset",
                     }
                 }
             )
@@ -418,6 +420,7 @@ class TurnExecutionContext:
         self._lease_finished: dict[str, Any] = {}
         self._tool_buffers: dict[str, PendingToolBuffer] = {}
         self._completed_tools: list[CompletedToolRecord] = []
+        self._provider_attempt_checkpoint: tuple[str, str, str] | None = None
         self._cleanup_tasks: dict[str, asyncio.Future[Any] | asyncio.Task[Any]] = {}
         self._cleanup_handles: dict[str, CleanupHandle] = {}
         self._proposer_logical_tasks_created = 0
@@ -913,6 +916,37 @@ class TurnExecutionContext:
         self._tool_buffers.clear()
         return len(buffers)
 
+    def begin_provider_attempt(
+        self,
+        model_call_id: str,
+        *,
+        text_snapshot: str | None = None,
+        reasoning_snapshot: str | None = None,
+    ) -> None:
+        """Remember the published prefix before a physical response starts."""
+
+        self._ensure_open()
+        if self._terminalized or self._generation_state.terminal:
+            raise TurnExecutionError("terminal generation cannot start a provider attempt")
+        if not isinstance(model_call_id, str) or not model_call_id.strip():
+            raise ValueError("model_call_id must be a non-empty string")
+        self._provider_attempt_checkpoint = (
+            model_call_id,
+            self._publication_ledger.text_snapshot if text_snapshot is None else text_snapshot,
+            (self._publication_ledger.reasoning_snapshot
+             if reasoning_snapshot is None else reasoning_snapshot),
+        )
+
+    def commit_provider_attempt(self, model_call_id: str) -> None:
+        """Make a validated response ineligible for a later call rollback."""
+
+        checkpoint = self._provider_attempt_checkpoint
+        if checkpoint is None:
+            return
+        if checkpoint[0] != model_call_id:
+            raise TurnExecutionError("provider attempt checkpoint does not match")
+        self._provider_attempt_checkpoint = None
+
     def begin_generation_reset(
         self,
         from_role: StickyExecutionRole | str,
@@ -925,6 +959,8 @@ class TurnExecutionContext:
         terminal_error_code: str = "",
         terminal_failure_kind: str = "",
         terminal_http_status: int | None = None,
+        reset_scope: Literal["answer", "provider_call"] = "answer",
+        rollback_model_call_id: str = "",
     ) -> AnswerGenerationResetEvent:
         """Advance the generation epoch while retaining the same message id."""
 
@@ -934,6 +970,16 @@ class TurnExecutionContext:
             raise TurnExecutionError("turn context is closed")
         if self._terminalized or self._generation_state.terminal:
             raise TurnExecutionError("terminal generation is already closed")
+        if reset_scope not in {"answer", "provider_call"}:
+            raise ValueError("invalid generation reset scope")
+        prefix_text = prefix_reasoning = ""
+        if reset_scope == "provider_call":
+            checkpoint = self._provider_attempt_checkpoint
+            if checkpoint is None or checkpoint[0] != rollback_model_call_id:
+                raise TurnExecutionError("provider call reset requires its attempt checkpoint")
+            if _role(from_role) != _role(to_role):
+                raise TurnExecutionError("provider call reset cannot change execution role")
+            _, prefix_text, prefix_reasoning = checkpoint
         old_epoch = self._generation_state.epoch
         new_epoch = old_epoch + 1
         sequence = self.next_sequence()
@@ -944,7 +990,10 @@ class TurnExecutionContext:
             owner=normalized_to_role,
             last_sequence=sequence,
             terminal=terminal,
+            text_snapshot=prefix_text,
+            reasoning_snapshot=prefix_reasoning,
         )
+        self._provider_attempt_checkpoint = None
         if terminal:
             self._terminalized = True
             self._suppress_selector_fallback = True
@@ -953,8 +1002,8 @@ class TurnExecutionContext:
         self._last_event_sequence = sequence
         self._publication_ledger.generation_epoch = new_epoch
         self._publication_ledger.last_sequence = sequence
-        self._publication_ledger.text_snapshot = ""
-        self._publication_ledger.reasoning_snapshot = ""
+        self._publication_ledger.text_snapshot = prefix_text
+        self._publication_ledger.reasoning_snapshot = prefix_reasoning
         self._publication_ledger.terminal = terminal
         if terminal and terminal_text_snapshot:
             self._publication_ledger.text_snapshot = terminal_text_snapshot
@@ -975,6 +1024,10 @@ class TurnExecutionContext:
             terminal_error_code=terminal_error_code,
             terminal_failure_kind=terminal_failure_kind,
             terminal_http_status=terminal_http_status,
+            reset_scope=reset_scope,
+            rollback_model_call_id=rollback_model_call_id,
+            authoritative_text_snapshot=prefix_text,
+            authoritative_reasoning_snapshot=prefix_reasoning,
         )
 
     def begin_control_terminal(self, reason: str) -> int | None:
@@ -1174,3 +1227,5 @@ class AnswerGenerationResetEvent:
     terminal_error_code: str = ""
     terminal_failure_kind: str = ""
     terminal_http_status: int | None = None
+    reset_scope: Literal["answer", "provider_call"] = "answer"
+    rollback_model_call_id: str = ""

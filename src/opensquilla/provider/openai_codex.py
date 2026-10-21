@@ -46,6 +46,7 @@ from .failures import (
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .openai_responses import _responses_input
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     RESPONSES_REQUEST_ENVELOPE,
     ProviderRequestBudgetExceededError,
@@ -427,6 +428,7 @@ class OpenAICodexProvider:
                     max_len=2000,
                 ),
                 code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout",
+                recovery_origin=transport_recovery_origin(exc),
             )
         except httpx.RequestError as exc:
             yield ErrorEvent(
@@ -436,6 +438,7 @@ class OpenAICodexProvider:
                     max_len=2000,
                 ),
                 code=CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error",
+                recovery_origin=transport_recovery_origin(exc),
             )
         except CandidateArtifactLimitError as exc:
             log.warning(

@@ -30,6 +30,7 @@ from .failures import (
     safe_http_status,
 )
 from .protocol import ProviderModelListingResponseError
+from .recovery_origin import transport_recovery_origin
 from .request_proof import (
     ProviderRequestBudgetExceededError,
     project_final_request_payload,
@@ -820,7 +821,9 @@ class OllamaProvider:
                 max_len=2000,
             )
             trace.record_error(code=code, message=message)
-            yield ErrorEvent(message=message, code=code)
+            yield ErrorEvent(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
         except httpx.RequestError as exc:
             code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
@@ -829,7 +832,9 @@ class OllamaProvider:
                 max_len=2000,
             )
             trace.record_error(code=code, message=message)
-            yield ErrorEvent(message=message, code=code)
+            yield ErrorEvent(
+                message=message, code=code, recovery_origin=transport_recovery_origin(exc),
+            )
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             message = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",

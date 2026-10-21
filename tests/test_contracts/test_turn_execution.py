@@ -14,6 +14,7 @@ from opensquilla.contracts.turn_execution import (
     RecoveryContext,
     StickyExecutionRole,
     TurnExecutionContext,
+    TurnExecutionError,
     TurnIdentity,
 )
 
@@ -138,6 +139,89 @@ async def test_generation_reset_preserves_completed_tools_and_drops_pending_tool
     assert [record.call_id for record in context.completed_tools] == ["completed-call"]
 
 
+def test_provider_call_reset_restores_only_its_published_prefix() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-call-reset", "assistant-call-reset", "agent:main:call-reset")
+    )
+    context.publish_visible(text="completed prefix", reasoning="completed reasoning")
+    context.begin_provider_attempt("2.0")
+    context.publish_visible(
+        text="completed prefix failed suffix",
+        reasoning="completed reasoning failed reasoning",
+    )
+    context.open_tool_buffer("uncommitted")
+
+    reset = context.begin_generation_reset(
+        StickyExecutionRole.PRIMARY_AGGREGATOR,
+        StickyExecutionRole.PRIMARY_AGGREGATOR,
+        "transport_transient",
+        reset_scope="provider_call",
+        rollback_model_call_id="2.0",
+    )
+
+    assert reset.reset_scope == "provider_call"
+    assert reset.rollback_model_call_id == "2.0"
+    assert reset.authoritative_text_snapshot == "completed prefix"
+    assert reset.authoritative_reasoning_snapshot == "completed reasoning"
+    assert context.publication_ledger.text_snapshot == "completed prefix"
+    assert context.publication_ledger.reasoning_snapshot == "completed reasoning"
+    assert context.pending_tool_buffers == {}
+    assert context.accept_event(0, reset.sequence + 1, True, "upstream") is False
+    assert context.publish_visible(text="completed prefix replacement", generation_epoch=1)
+
+
+def test_provider_call_reset_rejects_committed_or_unrelated_attempt() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-committed", "assistant-committed", "agent:main:committed")
+    )
+    context.begin_provider_attempt("1.0")
+    context.publish_visible(text="completed")
+    context.commit_provider_attempt("1.0")
+
+    with pytest.raises(TurnExecutionError, match="attempt checkpoint"):
+        context.begin_generation_reset(
+            StickyExecutionRole.PRIMARY_AGGREGATOR,
+            StickyExecutionRole.PRIMARY_AGGREGATOR,
+            "transport_transient",
+            reset_scope="provider_call",
+            rollback_model_call_id="1.0",
+        )
+    assert context.generation_epoch == 0
+    assert context.publication_ledger.text_snapshot == "completed"
+
+    context.begin_provider_attempt("2.0")
+    with pytest.raises(TurnExecutionError, match="cannot change execution role"):
+        context.begin_generation_reset(
+            StickyExecutionRole.PRIMARY_AGGREGATOR,
+            StickyExecutionRole.FIXED_DIRECT,
+            "transport_transient",
+            reset_scope="provider_call",
+            rollback_model_call_id="2.0",
+        )
+
+
+def test_provider_attempt_can_checkpoint_an_unpublished_committed_prefix() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-buffered", "assistant-buffered", "agent:main:buffered")
+    )
+    context.begin_provider_attempt(
+        "2.0", text_snapshot="completed prefix", reasoning_snapshot="completed reasoning",
+    )
+
+    assert context.publication_ledger.published is False
+    reset = context.begin_generation_reset(
+        StickyExecutionRole.PRIMARY_AGGREGATOR,
+        StickyExecutionRole.PRIMARY_AGGREGATOR,
+        "transport_transient",
+        reset_scope="provider_call",
+        rollback_model_call_id="2.0",
+    )
+
+    assert reset.authoritative_text_snapshot == "completed prefix"
+    assert reset.authoritative_reasoning_snapshot == "completed reasoning"
+    assert context.publication_ledger.published is False
+
+
 @pytest.mark.asyncio
 async def test_attempt_one_requires_finished_attempt_zero_and_request_start_is_single_use() -> None:
     context = TurnExecutionContext.create(
@@ -197,6 +281,8 @@ async def test_terminal_reset_rejects_late_events_calls_and_post_fixed_proposers
         terminal=True,
     )
     assert context.terminal is True
+    with pytest.raises(TurnExecutionError, match="terminal generation"):
+        context.begin_provider_attempt("late-attempt")
     assert (
         context.accept_event(
             reset.new_generation_epoch,

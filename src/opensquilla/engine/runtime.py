@@ -107,6 +107,8 @@ from opensquilla.engine.pricing import PriceEntry, lookup_price
 from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
 from opensquilla.engine.route_plan import record_execution_leg
 from opensquilla.engine.router_decision import build_router_decision_event
+from opensquilla.engine.stream_close import record_stream_close_failure
+from opensquilla.engine.stream_recovery import StreamRecoveryRequest
 from opensquilla.engine.turn_policy import resolve_turn_policy
 from opensquilla.engine.turn_runner import (
     AgentBootstrapStage,
@@ -2100,6 +2102,8 @@ def _selector_stream_exception_error(
 ) -> ProviderErrorEvent:
     """Stable, provider-prose-free projection for an exception-raised stream."""
 
+    from opensquilla.provider.recovery_origin import transport_recovery_origin
+
     return ProviderErrorEvent(
         message=(
             "The connection to the model provider ended before the response completed."
@@ -2113,6 +2117,7 @@ def _selector_stream_exception_error(
             if error is not None and is_connection_failure(error)
             else "request_error"
         ),
+        recovery_origin=transport_recovery_origin(error) if error is not None else "unknown",
     )
 
 
@@ -2165,7 +2170,9 @@ async def _selector_safe_stream(
                 # A close-path provider exception carries the same untrusted
                 # prose as an iteration exception, but there is no additional
                 # event to emit while this generator is itself closing.
-                pass
+                record_stream_close_failure()
+        elif stream is not None:
+            record_stream_close_failure()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2319,6 +2326,7 @@ class _SelectorFallbackProvider:
         self._image_marker_state = ImageMarkerState.NOT_ANALYZED
         self._image_marker_reason: str | None = None
         self._image_probe_forbidden = False
+        self._stream_recovery_request: StreamRecoveryRequest | None = None
         self.last_image_request_had_native_images = False
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
         self._fallback_deployment_limits: dict[_FallbackDeploymentIdentity, tuple[int, int]] = {}
@@ -2341,6 +2349,10 @@ class _SelectorFallbackProvider:
         if callable(resolve):
             return cast("tuple[Any, ProviderConfig | None, ChatConfig]", resolve(bound_config))
         return self._provider, None, bound_config
+
+    def stream_recovery_request(self) -> StreamRecoveryRequest | None:
+        """Return the actual dispatched leg, including its projected input."""
+        return self._stream_recovery_request
 
     def configure_retry_policy(self, policy: FallbackPolicy) -> None:
         self._retry_policy = policy
@@ -3792,6 +3804,7 @@ class _SelectorFallbackProvider:
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[Any]:
         self._last_request_had_tools = bool(tools)
+        self._stream_recovery_request = None
         emitted_user_visible_content = False
         pre_text_buffer = _SelectorPreTextBuffer()
         primary_activity_id = uuid.uuid4().hex
@@ -3859,6 +3872,12 @@ class _SelectorFallbackProvider:
         def primary_stream_factory() -> AsyncGenerator[Any, None]:
             nonlocal physical_attempts
             physical_attempts += 1
+            if isinstance(active_config, ChatConfig):
+                self._stream_recovery_request = StreamRecoveryRequest.capture(
+                    active_provider, physical_messages, tools, active_config,
+                    account_usage=not provider_accounts_physical_usage(active_provider),
+                    provider_id=active_provider_id, model=active_model,
+                )
             return _selector_safe_stream(
                 lambda: active_provider.chat(physical_messages, **primary_chat_kwargs),
                 content_started=lambda: emitted_user_visible_content,
@@ -4308,6 +4327,14 @@ class _SelectorFallbackProvider:
                     def fallback_stream_factory() -> AsyncGenerator[Any, None]:
                         nonlocal physical_attempts
                         physical_attempts += 1
+                        if isinstance(fallback_config, ChatConfig):
+                            self._stream_recovery_request = StreamRecoveryRequest.capture(
+                                fallback_provider, fallback_messages, tools, fallback_config,
+                                account_usage=(
+                                    not provider_accounts_physical_usage(fallback_provider)
+                                ),
+                                provider_id=fallback_provider_id, model=fallback_model,
+                            )
                         return _selector_safe_stream(
                             lambda: fallback_provider.chat(
                                 fallback_messages,
@@ -7889,6 +7916,44 @@ class TurnRunner:
             error_fallback_hops = turn.metadata.get("router_fallback_hops", 0)
             if not isinstance(error_fallback_hops, int) or isinstance(error_fallback_hops, bool):
                 error_fallback_hops = 0
+            failed_turn_usage: dict[str, Any] | None = None
+            if (
+                error_message and done_event is None
+                and self._session_manager is not None
+                and pipeline_usage_context is not None
+            ):
+                project_usage = getattr(
+                    getattr(self._session_manager, "storage", None),
+                    "get_turn_usage_projection", None,
+                )
+                if callable(project_usage):
+                    try:
+                        failed_turn_usage = await project_usage(
+                            session_id=pipeline_usage_context.session_id,
+                            session_epoch=pipeline_usage_context.session_epoch,
+                            turn_id=pipeline_usage_context.turn_id or turn_id,
+                        )
+                    except Exception:
+                        log.warning(
+                            "turn_runner.failed_usage_projection_failed",
+                            session_key=session_key, turn_id=turn_id,
+                        )
+                reconcile_usage = getattr(
+                    getattr(self._session_manager, "storage", None),
+                    "reconcile_session_usage_totals_from_ledger", None,
+                )
+                if callable(reconcile_usage):
+                    try:
+                        await reconcile_usage(
+                            session_key=session_key,
+                            expected_session_id=pipeline_usage_context.session_id,
+                            expected_epoch=pipeline_usage_context.session_epoch,
+                        )
+                    except Exception:
+                        log.warning(
+                            "turn_runner.failed_usage_rollup_failed",
+                            session_key=session_key, turn_id=turn_id,
+                        )
             fin_outcome = await self._turn_finalizer_stage.run(
                 TurnFinalizerStageInput(
                     final_text_parts=final_text_parts,
@@ -7916,6 +7981,7 @@ class TurnRunner:
                     error_provider=error_provider,
                     error_model=error_model,
                     error_fallback_hops=error_fallback_hops,
+                    failed_turn_usage=failed_turn_usage,
                 )
             )
             fin_out = fin_outcome.require_output()
@@ -8779,6 +8845,7 @@ class TurnRunner:
         provider: str | None = None,
         model: str | None = None,
         fallback_hops: int = 0,
+        turn_usage: dict[str, Any] | None = None,
     ) -> None:
         """Best-effort durable transcript record for terminal turn errors."""
         if event is None:
@@ -8859,6 +8926,8 @@ class TurnRunner:
                 append_kwargs["expected_session_id"] = expected_session_id
             if expected_session_epoch is not None:
                 append_kwargs["expected_session_epoch"] = expected_session_epoch
+            if turn_usage is not None:
+                append_kwargs["turn_usage"] = dict(turn_usage)
             await self._append_session_message(session_key, **append_kwargs)
             log.info(
                 "turn_runner.error_persisted",

@@ -250,6 +250,66 @@ function createHarness(options: {
   }
 }
 
+describe('provider call generation recovery', () => {
+  it('rolls back failed reasoning and text while retaining earlier complete output', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    h.activeStreamTaskId.value = 'task-live'
+    const identity = { key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live' }
+    try {
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 1, generation_epoch: 0,
+        model_call_id: 'complete', iteration: 1, text: 'kept prefix' })
+      h.api.handlers.onWireEventFixture('session.event.thinking_start', { ...identity,
+        stream_seq: 2, generation_epoch: 0, model_call_id: 'failed', iteration: 2, block_id: 'r2' })
+      h.api.handlers.onWireEventFixture('session.event.thinking', { ...identity,
+        stream_seq: 3, generation_epoch: 0, model_call_id: 'failed', iteration: 2, block_id: 'r2', text: 'discarded reasoning' })
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 4, generation_epoch: 0,
+        model_call_id: 'failed', iteration: 2, text: ' discarded answer' })
+      h.api.handlers.onAnswerGenerationReset({ ...identity, stream_seq: 5,
+        old_generation_epoch: 0, new_generation_epoch: 1, reset_scope: 'provider_call',
+        rollback_model_call_id: 'failed', authoritative_text_snapshot: 'must not append this scalar' })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('kept prefix')
+      expect(h.streamRuntime!.foldedTurn.value.thinkingText).not.toContain('discarded')
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 6, generation_epoch: 0,
+        model_call_id: 'failed', iteration: 2, text: 'late discarded' })
+      h.api.handlers.onTextDelta({ ...identity, stream_seq: 7, generation_epoch: 1,
+        model_call_id: 'replacement', iteration: 2, text: ' replacement' })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('kept prefix replacement')
+    } finally { h.stop() }
+  })
+
+  it('requires canonical recovery for a live reset without a matching checkpoint', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ withCompactionRuntime: true, onRecoveryRequired })
+    h.activeStreamTaskId.value = 'task-live'
+    try {
+      h.api.handlers.onAnswerGenerationReset({ key: h.sessionKey.value, task_id: 'task-live',
+        stream_seq: 1, old_generation_epoch: 0, new_generation_epoch: 1,
+        reset_scope: 'provider_call', rollback_model_call_id: 'unseen' })
+      expect(onRecoveryRequired).toHaveBeenCalledOnce()
+      expect(h.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('restores a canonical snapshot whose failed attempt has already been pruned', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ withCompactionRuntime: true, onRecoveryRequired })
+    const identity = { key: h.sessionKey.value, task_id: 'task-live', turn_id: 'task-live' }
+    try {
+      h.api.restoreLiveTurnSnapshot({ sessionKey: h.sessionKey.value, taskId: 'task-live', events: [
+        { semanticKind: 'text-delta', payload: { ...identity, stream_seq: 1, generation_epoch: 0,
+          model_call_id: 'complete', iteration: 1, text: 'kept prefix' } },
+        { semanticKind: 'answer-generation-reset', payload: { ...identity, stream_seq: 5,
+          old_generation_epoch: 0, new_generation_epoch: 1, reset_scope: 'provider_call',
+          rollback_model_call_id: 'pruned' } },
+        { semanticKind: 'text-delta', payload: { ...identity, stream_seq: 6, generation_epoch: 1,
+          model_call_id: 'replacement', iteration: 2, text: ' replacement' } },
+      ] })
+      expect(h.streamRuntime!.foldedTurn.value.rawText).toBe('kept prefix replacement')
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+})
+
 describe.each(['write_file', 'execute_code'] as const)('live %s input preview delivery', toolName => {
   const path = toolName === 'write_file' ? 'page.html' : ''
   const draft = (patch: Record<string, unknown> = {}) => ({
@@ -4560,5 +4620,42 @@ describe('recovery buffer consumption ownership', () => {
       expect(onRecoveryRequired).toHaveBeenCalledOnce()
       expect(h.api.finishRecovery()).toBe(false)
     } finally { h.stop() }
+  })
+})
+
+describe('legacy generation projection after provider recovery', () => {
+  it.each([
+    ['v1', 'done'], ['v1', 'error'], ['none', 'done'], ['none', 'error'],
+  ] as const)('accepts %s projected %s after an earlier committed step', (_caps, terminal) => {
+    const h = createHarness()
+    try {
+      h.activeStreamTaskId.value = 'task-live'
+      const identity = { key: h.sessionKey.value, task_id: 'task-live' }
+      h.api.handlers.onRunHeartbeat({
+        ...identity, generation_epoch: 0, stream_seq: 1, phase: 'tool',
+      })
+      {
+        // The gateway projects the call reset to the pre-existing v1 reset.
+        h.api.handlers.onAnswerGenerationReset({
+          ...identity, assistant_message_id: 'assistant-1', reset_scope: 'answer',
+          old_generation_epoch: 0, new_generation_epoch: 1, stream_seq: 3,
+          authoritative_text_snapshot: 'accepted prefix ', preserve_completed_tools: true,
+        })
+      }
+      h.api.handlers.onWireEventFixture(`session.event.${terminal}`, {
+        ...identity, generation_epoch: 1, stream_seq: 5,
+        text_snapshot: 'accepted prefix recovered', text: 'accepted prefix recovered',
+        ...(terminal === 'error' ? { code: 'timeout', message: 'synthetic provider failure' } : {}),
+      })
+      expect(h.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(h.lastStreamSeq.value).toBe(5)
+      if (terminal === 'done') {
+        expect(h.stream.reconcileFinalText).toHaveBeenCalledWith('accepted prefix recovered')
+      } else {
+        expect(h.messages.value.some(message => message.role === 'error')).toBe(true)
+      }
+    } finally {
+      h.stop()
+    }
   })
 })

@@ -117,6 +117,8 @@ export interface ChatRpcStreamApi {
     textSnapshot?: string
     preserveCompletedTools?: boolean
   }) => void
+  beginProviderCall?: (modelCallId: string) => void
+  resetProviderCallGeneration?: (modelCallId: string) => boolean
   setAssistantMessageId?: (messageId: string) => void
   resetStreamIdleTimer: (opts?: { progress?: boolean }) => void
   clearStreamIdleTimer: () => void
@@ -377,6 +379,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
   let recoveryDirty = false
+  let restoringLiveSnapshot = false
   let recoveryFenced = false
   let recoveryOverflow = false
   let recoveryRevision = 0
@@ -770,6 +773,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // reset more than once. Consume its cursor above, then leave the live
     // bubble untouched when the requested generation is already active.
     if (currentGenerationEpoch === newGenerationEpoch) return
+    const providerCallReset = payload.reset_scope === 'provider_call'
+    if (providerCallReset) {
+      const rolledBack = stream.resetProviderCallGeneration?.(payload.rollback_model_call_id || '')
+      if (!rolledBack && !restoringLiveSnapshot) {
+        markRecoveryDirty()
+        options.scheduleHistorySync()
+        return
+      }
+    }
     currentGenerationEpoch = newGenerationEpoch
     if (assistantMessageId) {
       activeAssistantMessageId = assistantMessageId
@@ -786,14 +798,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!stream.isStreaming.value && !stream.resetAnswerGeneration) {
       stream.startStreaming()
     }
-    stream.resetAnswerGeneration?.({
-      textSnapshot: authoritativeTextSnapshot,
-      preserveCompletedTools,
-    })
+    if (!providerCallReset) {
+      stream.resetAnswerGeneration?.({
+        textSnapshot: authoritativeTextSnapshot,
+        preserveCompletedTools,
+      })
+    }
 
     streamThinking.value = null
     stream.hideThinkingIndicator()
-    if (authoritativeReasoningSnapshot) {
+    if (!providerCallReset && authoritativeReasoningSnapshot) {
       const now = Date.now()
       streamThinking.value = {
         startedAt: now,
@@ -951,20 +965,25 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (hasTurnActivity && !stream.isStreaming.value) {
       stream.startStreaming(restoredStartedAt, false)
     }
-    for (const entry of replayEntries) {
-      if (entry.kind !== 'stream') continue
-      // Snapshot events retain their original sequence for diagnostics, but
-      // they form an authoritative base rather than fresh deltas. Replaying
-      // them through the normal render handlers without the old sequence
-      // rebuilds the bubble even when this client already had a newer cursor.
-      replayPendingStreamEvent({
-        event: entry.event,
-        payload: { ...entry.payload },
-        replayWithoutSeq: true,
-        // A coalesced authoritative live draft is a current base; ordinary
-        // reconnect replay still cannot create a generating draft.
-        replayed: entry.event !== 'tool-input-preview',
-      })
+    restoringLiveSnapshot = true
+    try {
+      for (const entry of replayEntries) {
+        if (entry.kind !== 'stream') continue
+        // Snapshot events retain their original sequence for diagnostics, but
+        // they form an authoritative base rather than fresh deltas. Replaying
+        // them through the normal render handlers without the old sequence
+        // rebuilds the bubble even when this client already had a newer cursor.
+        replayPendingStreamEvent({
+          event: entry.event,
+          payload: { ...entry.payload },
+          replayWithoutSeq: true,
+          // A coalesced authoritative live draft is a current base; ordinary
+          // reconnect replay still cannot create a generating draft.
+          replayed: entry.event !== 'tool-input-preview',
+        })
+      }
+    } finally {
+      restoringLiveSnapshot = false
     }
     if (snapshot.streamGeneration && options.streamGeneration) options.streamGeneration.value = snapshot.streamGeneration
     if (typeof snapshot.currentStreamSeq === 'number') lastStreamSeq.value = snapshot.currentStreamSeq
@@ -1063,6 +1082,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function appendThinkingDelta(text: string, payload: ConversationEventData) {
     if (!text) return
     if (!stream.isStreaming.value) stream.startStreaming()
+    stream.beginProviderCall?.(String(payload.model_call_id || ''))
     // Actual reasoning owns the current phase even when a compatibility
     // stream omits provider_activity, or resumes reasoning between its pulses.
     recordActivityPhase('Thinking deeply', 'provider:reasoning')
@@ -1100,6 +1120,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!stream.isStreaming.value) stream.startStreaming()
     const blockId = payload.block_id ?? ''
     if (!blockId) return
+    stream.beginProviderCall?.(String(payload.model_call_id || ''))
     const rawBlockIndex = payload.block_index
     const rawContentKind = payload.content_kind
     stream.appendFrame({

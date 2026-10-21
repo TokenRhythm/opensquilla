@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from opensquilla.contracts.turn_execution import StickyExecutionRole
 from opensquilla.execution_status import ExecutionStatus
 from opensquilla.provider.activity import safe_activity_model
+from opensquilla.provider.recovery_origin import RecoveryOrigin
 from opensquilla.redaction import redact_error_text
 
 if TYPE_CHECKING:
@@ -258,6 +259,9 @@ class ErrorEvent:
     recovery_exhausted: bool = False
     # Internal machine cause, independent of the HTTP transport status.
     provider_code: str = ""
+    # Trusted transport evidence, distinct from broad retry classifications.
+    # Unknown extensions and protocol/consumer failures cannot authorize replay.
+    recovery_origin: RecoveryOrigin = "unknown"
 
 
 @dataclass(frozen=True, slots=True)

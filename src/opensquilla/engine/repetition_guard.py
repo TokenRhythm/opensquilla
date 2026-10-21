@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from opensquilla.engine.stream_close import record_stream_close_failure
 from opensquilla.provider import TextDeltaEvent as ProviderTextDelta
 
 log = structlog.get_logger(__name__)
@@ -412,12 +413,13 @@ async def close_async_iterator_bounded(
     *,
     timeout: float,
     event_prefix: str = "provider_stream",
-) -> None:
+) -> bool:
     caller = asyncio.current_task()
     caller_cancelling_before = caller.cancelling() if caller is not None else 0
     aclose = getattr(stream_iter, "aclose", None)
     if not callable(aclose):
-        return
+        record_stream_close_failure()
+        return False
     try:
         close_task = asyncio.ensure_future(aclose())
     except Exception as exc:  # noqa: BLE001 - cleanup must not mask detection
@@ -425,7 +427,8 @@ async def close_async_iterator_bounded(
             f"{event_prefix}.close_failed",
             error_type=type(exc).__name__,
         )
-        return
+        record_stream_close_failure()
+        return False
     try:
         await asyncio.wait_for(
             asyncio.shield(close_task),
@@ -438,7 +441,8 @@ async def close_async_iterator_bounded(
             f"{event_prefix}.close_timeout",
             timeout_seconds=timeout,
         )
-        return
+        record_stream_close_failure()
+        return False
     except asyncio.CancelledError:
         caller_cancelling_now = caller.cancelling() if caller is not None else 0
         caller_is_cancelling = caller_cancelling_now > caller_cancelling_before or (
@@ -456,13 +460,17 @@ async def close_async_iterator_bounded(
             f"{event_prefix}.close_failed",
             error_type=asyncio.CancelledError.__name__,
         )
+        record_stream_close_failure()
     except Exception as exc:  # noqa: BLE001 - cleanup must not mask terminal outcome
         log.warning(
             f"{event_prefix}.close_failed",
             error_type=type(exc).__name__,
         )
+        record_stream_close_failure()
     else:
         _consume_close_result(close_task)
+        return True
+    return False
 
 
 class _IdempotentStreamCloser:
@@ -471,7 +479,7 @@ class _IdempotentStreamCloser:
     def __init__(self, stream_iter: AsyncIterator[Any], *, timeout: float) -> None:
         self._stream_iter = stream_iter
         self._timeout = timeout
-        self._close_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[bool] | None = None
 
     async def close(self) -> None:
         if self._close_task is None:
