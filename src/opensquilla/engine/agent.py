@@ -9067,7 +9067,6 @@ class Agent:
                                         default_provider=usage_default_provider,
                                         default_model=usage_default_model,
                                         completed_at_ms=time.time_ns() // 1_000_000,
-                                        resolve_estimates=False,
                                     )
                                 if (
                                     usage_call is not None

@@ -235,6 +235,10 @@ async def test_runtime_persists_usage_before_yielding_terminal_error() -> None:
         assert session.total_tokens == 42
         assert session.total_cost_usd == pytest.approx(0.004)
         assert session.billed_cost_usd == pytest.approx(0.004)
-        assert session.cost_source == "provider_billed"
+        # The reasoning receipt is billed, but the exhausted fixture's later
+        # requests fail without receipts. Their spend remains unconfirmed.
+        assert session.cost_source == "mixed"
+        assert session.missing_cost_entries > 0
+        assert session.estimated_cost_component_usd == 0.0
     finally:
         await storage.close()

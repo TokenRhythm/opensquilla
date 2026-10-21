@@ -557,8 +557,20 @@ async def test_real_gateway_suppresses_goal_sentinel_everywhere(
             if frame.get("event") == "session.event.done"
             and (frame.get("payload") or {}).get("task_id") == task_id
         )
-        assert len(text_delta_indexes) == 1
-        assert text_delta_indexes[0] < done_index
+        # This v1 observer receives scoped answers through the canonical Done
+        # snapshot. Internal continuations still release one unscoped terminal
+        # delta after silent-reply normalization, before their Done frame.
+        if payload.get("input_mode") in {"system_event", "goal_continuation"}:
+            assert len(text_delta_indexes) == 1
+        else:
+            assert text_delta_indexes == []
+        assert all(index < done_index for index in text_delta_indexes)
+        assert not any(
+            frame.get("event") == "session.event.text_delta"
+            and (frame.get("payload") or {}).get("task_id") == task_id
+            and (frame.get("payload") or {}).get("model_call_id")
+            for frame in frames
+        )
 
     suppressed = [
         payload

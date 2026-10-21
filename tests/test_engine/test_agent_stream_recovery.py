@@ -494,11 +494,15 @@ async def test_selector_raw_stream_requires_confirmed_close_before_replay(
 
 
 @pytest.mark.parametrize("tracked", [False, True])
-async def test_unknown_partial_counters_are_not_repriced_after_success(tracked: bool) -> None:
+@pytest.mark.parametrize("token_usage_known", [False, True])
+async def test_interrupted_counter_estimates_match_ledger_after_success(
+    tracked: bool, token_usage_known: bool,
+) -> None:
     from opensquilla.engine.usage_accounting import (
         UsageAccountingScope,
         UsageExecutionContext,
         bind_usage_accounting_scope,
+        normalize_provider_usage,
         usd_to_nanos,
     )
 
@@ -519,7 +523,8 @@ async def test_unknown_partial_counters_are_not_repriced_after_success(tracked: 
         code="timeout", recovery_origin="read_timeout", usage_missing_count=1,
         model_usage_breakdown=[{
             "provider": "anthropic", "model": "claude-sonnet-4-6",
-            "input_tokens": 15, "output_tokens": 0, "token_usage_known": False,
+            "input_tokens": 15_000, "output_tokens": 4_000 if token_usage_known else 0,
+            "token_usage_known": token_usage_known,
             "cost_source": "unavailable",
         }],
     )
@@ -540,12 +545,19 @@ async def test_unknown_partial_counters_are_not_repriced_after_success(tracked: 
     )):
         events = await _run(agent)
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.input_tokens == 25
-    assert done.cost_usd == pytest.approx(0.02)
+    failed_estimate = normalize_provider_usage(
+        failed, default_provider="anthropic", default_model="claude-sonnet-4-6",
+        completed_at_ms=1,
+    ).estimated_cost_nanos / 1_000_000_000
+    assert (failed_estimate > 0) is token_usage_known
+    assert done.input_tokens == 15_010
+    assert done.cost_usd == pytest.approx(0.02 + failed_estimate)
     assert done.billed_cost == pytest.approx(0.02)
     assert done.missing_cost_entries >= 1
     ledger_cost = sum(
         result.billed_cost_nanos + result.estimated_cost_nanos for result in sink.results
     )
     assert ledger_cost == usd_to_nanos(done.cost_usd)
-    assert sum(row["cost_usd"] for row in done.model_usage_breakdown) == pytest.approx(0.02)
+    assert sum(row["cost_usd"] for row in done.model_usage_breakdown) == pytest.approx(
+        done.cost_usd,
+    )
