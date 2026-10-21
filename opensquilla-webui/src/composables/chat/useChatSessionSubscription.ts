@@ -149,8 +149,17 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   const conversationRuntime = options.conversationRuntime
   let activeSubscriptionController: AbortController | null = null
   let subscriptionSequence = 0
-  let activeMetadataController: AbortController | null = null
   let metadataHydrationSequence = 0
+  // Keep the physical read's authority until it settles. A caller's deadline,
+  // Stop, or a new projection must not relabel that same in-flight lease read
+  // as a fresh snapshot captured after the change.
+  const metadataRetries = new Map<SessionReadLease, {
+    key: string
+    sequence: number
+    ownershipRevision: number | undefined
+    controller: AbortController
+    promise: Promise<boolean>
+  }>()
 
   function cursor() {
     return conversationRuntime.createCursor(options.sessionKey.value, {
@@ -540,66 +549,82 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   async function retrySessionMetadata(
     retryOptions: SessionMetadataRetryOptions = {},
   ): Promise<boolean> {
+    if (retryOptions.signal?.aborted) return false
     const key = options.sessionKey.value
     if (!key) return false
     const lease = options.sessionReadLeaseReader.current()
     if (!lease) return false
     const ownershipRevision = options.taskOwnership?.captureSnapshotRevision()
+    let owner = metadataRetries.get(lease)
+    if (owner && (
+      owner.key !== key || owner.sequence !== metadataHydrationSequence
+      || owner.ownershipRevision !== ownershipRevision || owner.controller.signal.aborted
+    )) return false
 
-    const metadataHydration = ++metadataHydrationSequence
-    const metadataGeneration = options.beginSessionMetadataResolution?.(key)
-    activeMetadataController?.abort()
-    const controller = new AbortController()
-    activeMetadataController = controller
-    const externalSignal = retryOptions.signal
-    const relayAbort = () => controller.abort()
-    if (externalSignal?.aborted) controller.abort()
-    else externalSignal?.addEventListener('abort', relayAbort, { once: true })
-
-    const timeoutMs = Math.max(
-      1,
-      retryOptions.timeoutMs ?? SESSION_PHASE_ATTEMPT_BUDGET_MS,
-    )
-    const isCurrent = () => (
-      metadataHydration === metadataHydrationSequence
-      && key === options.sessionKey.value
-      && options.sessionReadLeaseReader.current() === lease
-      && !controller.signal.aborted
-    )
-
-    try {
-      const hydration = await waitForMetadataRetry(
-        lease.retryMetadata(),
-        controller.signal,
-        timeoutMs,
+    if (!owner) {
+      const sequence = ++metadataHydrationSequence
+      const metadataGeneration = options.beginSessionMetadataResolution?.(key)
+      const controller = new AbortController()
+      owner = { key, sequence, ownershipRevision, controller, promise: Promise.resolve(false) }
+      metadataRetries.set(lease, owner)
+      const isCurrent = () => (
+        sequence === metadataHydrationSequence
+        && key === options.sessionKey.value
+        && options.sessionReadLeaseReader.current() === lease
+        && !controller.signal.aborted
       )
-      if (!isCurrent()) return false
-      if (!hydration.hydrationComplete) {
-        throw new Error('Session state hydration remained incomplete')
-      }
-      applyHydratedSubscriptionState(key, metadataGeneration, hydration, 'unknown', ownershipRevision)
-      return true
-    } catch (cause) {
-      if (isCurrent() && metadataGeneration !== undefined) {
-        options.onSessionMetadataError?.(key, metadataGeneration)
-      }
-      if (isCurrent()) {
-        metadataRecoveryError.value = cause
-        console.warn(
-          'Session metadata recovery failed:',
-          cause instanceof Error ? cause.message : cause,
-        )
-        sessionRecoveryDiagnostics.log({
-          phase: 'failed', reason: 'metadata_recovery_failed', sessionKey: key,
-          streamSeq: options.lastStreamSeq.value, error: cause,
-        })
-      }
+      // The lease owns the bounded physical read. Automatic recovery and Send
+      // join this one installation instead of aborting each other's wait.
+      owner.promise = (async () => {
+        try {
+          const hydration = await lease.retryMetadata()
+          if (!isCurrent()) return false
+          if (!hydration.hydrationComplete) {
+            throw new Error('Session state hydration remained incomplete')
+          }
+          applyHydratedSubscriptionState(key, metadataGeneration, hydration, 'unknown', ownershipRevision)
+          return true
+        } catch (cause) {
+          if (isCurrent() && metadataGeneration !== undefined) {
+            options.onSessionMetadataError?.(key, metadataGeneration)
+          }
+          if (isCurrent()) {
+            metadataRecoveryError.value = cause
+            console.warn(
+              'Session metadata recovery failed:',
+              cause instanceof Error ? cause.message : cause,
+            )
+            sessionRecoveryDiagnostics.log({
+              phase: 'failed', reason: 'metadata_recovery_failed', sessionKey: key,
+              streamSeq: options.lastStreamSeq.value, error: cause,
+            })
+          }
+          return false
+        } finally {
+          metadataRetries.delete(lease)
+        }
+      })()
+    }
+
+    // Each consumer may leave independently. Only the subscription lifecycle
+    // cancels the shared owner; caller timeouts are not failed metadata reads.
+    const caller = new AbortController()
+    const externalSignal = retryOptions.signal
+    const relayAbort = () => caller.abort()
+    if (externalSignal?.aborted || owner.controller.signal.aborted) caller.abort()
+    else externalSignal?.addEventListener('abort', relayAbort, { once: true })
+    owner.controller.signal.addEventListener('abort', relayAbort, { once: true })
+    try {
+      return await waitForMetadataRetry(
+        owner.promise,
+        caller.signal,
+        Math.max(1, retryOptions.timeoutMs ?? SESSION_PHASE_ATTEMPT_BUDGET_MS),
+      )
+    } catch {
       return false
     } finally {
       externalSignal?.removeEventListener('abort', relayAbort)
-      if (activeMetadataController === controller) {
-        activeMetadataController = null
-      }
+      owner.controller.signal.removeEventListener('abort', relayAbort)
     }
   }
 
@@ -608,8 +633,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     ++metadataHydrationSequence
     activeSubscriptionController?.abort()
     activeSubscriptionController = null
-    activeMetadataController?.abort()
-    activeMetadataController = null
+    for (const owner of metadataRetries.values()) owner.controller.abort()
     metadataRecoveryError.value = null
     isHydrating.value = false
   }
