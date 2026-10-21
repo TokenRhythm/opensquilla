@@ -81,7 +81,7 @@ try {
     <p><span id="main">${samples.main}</span></p>
     <p><span id="auxiliary">${samples.auxiliary}</span></p>
     <p><span id="markdown">Markdown <strong>预览</strong> selected Gamma 63</span></p>
-    <p><span id="multiline">${samples.multiline.replace('\n', '<br>')}</span></p>
+    <p><span id="multiline">${samples.multiline.replaceAll('\n', '<br>')}</span></p>
     <iframe src="frame.html"></iframe>
     <input id="input" value="${samples.input}">
     <div id="blank">Empty selection target</div>
