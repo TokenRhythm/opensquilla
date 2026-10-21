@@ -46,6 +46,7 @@
     "test:desktop-zoom": "npm run build && node scripts/test-desktop-zoom-shortcuts.mjs",
     "test:desktop-reload": "npm run build && node scripts/test-desktop-reload-shortcuts.mjs",
     "test:image-clipboard": "node scripts/test-image-clipboard-electron.mjs",
+    "test:text-context-menu": "npm run build && node scripts/test-text-context-menu-electron.mjs",
     "test:attachment-drafts": "npm run build && node scripts/test-attachment-drafts-electron.mjs",
     "test:native-attachments": "npm run build && node --test scripts/test-native-attachments.mjs && node scripts/test-native-attachments-electron.mjs",
     "test:project-workspace-picker": "npm run build && node scripts/test-project-workspace-picker.mjs",
