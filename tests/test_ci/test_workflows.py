@@ -2443,7 +2443,8 @@ def test_windows_profile_split_keeps_shared_setup_and_original_browser_router_ch
         "window-background-flow", "desktop-quit-interaction", "theme-flow",
         "native-workbench-surface", "text-context-menu", "desktop-zoom-shortcuts",
         "native-workbench-v2", "desktop-browser",
-        "desktop-browser-electron", "live-html-business", "unsafe-legacy-recovery-no-write",
+        "desktop-browser-electron", "browser-open-recovery", "live-html-business",
+        "unsafe-legacy-recovery-no-write",
     )),
 ])
 def test_profile_dispatcher_selects_independent_cases_without_duplicate_legacy_runs(
@@ -2482,6 +2483,7 @@ def test_profile_dispatcher_selects_independent_cases_without_duplicate_legacy_r
         "native-workbench-surface": "native-workbench-surface-electron",
         "text-context-menu": "text-context-menu-electron",
         "native-workbench-v2": "native-workbench-v2-electron",
+        "browser-open-recovery": "browser-open-recovery-electron",
     }
     assert result.stdout.splitlines() == [
         f"{case}:scripts/test-{specialized_scripts.get(case, case)}.mjs" for case in expected

@@ -270,6 +270,7 @@
         "desktop/electron/scripts/test-desktop-zoom*.mjs",
         "desktop/electron/scripts/test-native-workbench-v2-electron.mjs",
         "desktop/electron/scripts/test-unsafe-legacy-recovery-no-write.mjs",
+        "desktop/electron/scripts/test-browser-open-recovery-electron.mjs",
         "desktop/electron/scripts/test-desktop-browser*.mjs"
       ]
     }
