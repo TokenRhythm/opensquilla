@@ -2,6 +2,7 @@
 import asyncio
 import sqlite3
 import time
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -183,6 +184,7 @@ async def test_manual_commit_barrier_cancel_reaches_adapter_and_owner(
     from opensquilla.gateway.rpc.registry import RpcContext
     from opensquilla.provider.selector import ProviderConfig
     from opensquilla.session.compaction import CompactionResult
+    from opensquilla.session.compaction_state import build_coverage_obligations
 
     storage = SessionStorage(":memory:")
     await storage.connect()
@@ -191,10 +193,18 @@ async def test_manual_commit_barrier_cancel_reaches_adapter_and_owner(
         node, _, _ = await _seed(manager)
         before = await manager.get_summaries(node.session_key)
         candidates = []
+        original_payloads = []
 
         async def summarize(request):
+            payload = _payload("S1")
+            payload["source_coverage"]["exact_reference_manifest"] = (
+                build_coverage_obligations(
+                    request.entries[:2], session_id=node.session_id,
+                ).manifest
+            )
+            original_payloads.append((payload, deepcopy(payload)))
             result = CompactionResult(
-                summary="S1", summary_payload=_payload("S1"), summary_format="structured_v1",
+                summary="S1", summary_payload=payload, summary_format="structured_v1",
                 kept_entries=request.entries[2:], kept_start_index=2, removed_count=2,
                 chunks_processed=1, replaced_previous_summary=True,
             )
@@ -262,6 +272,13 @@ async def test_manual_commit_barrier_cancel_reaches_adapter_and_owner(
             assert result.applied is commit_applied and result.cancellation_reconciled
         assert candidates[0].cancellation_reconciled
         assert len(candidates) == 1
+        original_payload, before_binding = original_payloads[0]
+        assert original_payload == before_binding
+        assert candidates[0].summary_payload is not original_payload
+        bound = candidates[0].summary_payload["source_coverage"]["exact_reference_manifest"]
+        assert bound["session_id"] == node.session_id
+        assert bound["compaction_id"] == "review-cancellation"
+        assert bound["covered_through_id"] > 0
         assert len(await manager.get_summaries(node.session_key)) == len(before) + commit_applied
 
     finally:

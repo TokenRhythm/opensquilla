@@ -4106,10 +4106,12 @@ class SessionManager:
                 max((entry.id or 0) for entry in removed_entries) if removed_entries else 0,
             )
             if result.summary_payload is not None:
-                result = replace(result, summary_payload=bind_coverage_manifest(
+                # Preserve candidate identity for commit-barrier cancellation;
+                # binding leaves the input payload unchanged.
+                result.summary_payload = bind_coverage_manifest(
                     result.summary_payload, session_id=current_node.session_id,
                     compaction_id=persisted_compaction_id, covered_through_id=covered_through_id,
-                ))
+                )
             summary_record = SessionSummary(
                 session_id=current_node.session_id,
                 session_key=session_key,
