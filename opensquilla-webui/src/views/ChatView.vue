@@ -1171,7 +1171,7 @@ type Message = ChatMessage
 
 // Both route chat and a workbench child mount this exact implementation. Host
 // differences concern identity/lifetime only, never event folding or rendering.
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   embedded?: boolean
   surfaceVisible?: boolean
   sessionKeyOverride?: string
@@ -1186,7 +1186,7 @@ const props = defineProps<{
   draftIdentity?: string
   inheritedRunMode?: string | null
   expectedWorkspaceId?: string | null
-}>()
+}>(), { surfaceVisible: true })
 const conversationPolicy = computed(() => props.policy ?? MAIN_CONVERSATION_POLICY)
 const surfaceVisible = computed(() => props.surfaceVisible !== false)
 const workbenchOwnerKey = computed(() => props.workbenchOwnerSessionKey || sessionKey.value)
