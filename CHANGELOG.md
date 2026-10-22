@@ -25,8 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Available updates download in the background on supported Windows and macOS
   Desktop builds, with confirmation before installation.
-- Preserve custom routing model choices during upgrades.
-  Project instructions are read at the start of each turn.
+- Project instructions are read at the start of each turn.
 - Clearer usage accounting for media and delegated tasks, with smaller
   background telemetry batches and updated dependencies.
 
