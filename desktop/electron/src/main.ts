@@ -10039,6 +10039,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  // Observe fullscreen before a background task opens the first sidebar page.
+  nativeWorkbenchSurfaces.observeWindow(window)
   desktopStartupLog('window_created')
   installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)

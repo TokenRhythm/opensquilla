@@ -874,6 +874,7 @@ export class NativeWorkbenchSurfaceManager {
   private readonly annotationOverlays = new Map<BrowserWindow, NativeWorkbenchAnnotationOverlayRecord>()
   private readonly hookedWindows = new WeakSet<BrowserWindow>()
   private readonly unresponsiveWindows = new WeakSet<BrowserWindow>()
+  private readonly ownerHtmlFullscreenWindows = new WeakSet<BrowserWindow>()
   private activeSurfaceId: string | null = null
   private htmlFullscreen: { record: NativeWorkbenchSurfaceRecord; ownerWasFullscreen: boolean } | null = null
   private readonly browserAutomationStates = new Map<string, { taskId: string; active: boolean }>()
@@ -1137,7 +1138,7 @@ export class NativeWorkbenchSurfaceManager {
       || request.kind !== 'url-preview' || request.payload.scopeId !== source.scopeId || source.owner !== owner)) {
       throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser context is not owned by this session.', 404)
     }
-    this.hookWindow(owner)
+    this.observeWindow(owner)
     const record = this.allocateSurface(request, owner, source?.previewSession, undefined, reservation.retain())
     if (source) record.contextTargetRef = source.targetRef
     let interruptedNavigation: DesktopBrowserError | undefined
@@ -3575,6 +3576,7 @@ export class NativeWorkbenchSurfaceManager {
     preserveFocus: boolean,
   ): void {
     if (overlay.owner.isDestroyed() || overlay.view.webContents.isDestroyed()) return
+    visible = visible && this.ownerCanShowSurfaces(overlay.owner)
     const binding = overlay.binding
     const wasFocused = preserveFocus && visible && overlay.view.webContents.isFocused()
     const currentBounds = overlay.view.getBounds()
@@ -5738,7 +5740,9 @@ export class NativeWorkbenchSurfaceManager {
     }
     this.activeSurfaceId = record.id
     const bounds = this.resolveEffectiveSurfaceRect(record)
-    if (bounds) record.view.setBounds(bounds)
+    // Keep the retained page's viewport stable while the owner's video is
+    // fullscreen. Resizing even a hidden view can clamp its scroll position.
+    if (bounds && !this.ownerHtmlFullscreenWindows.has(record.owner)) record.view.setBounds(bounds)
     this.emitBrowserFindState(record)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
     const overlay = this.annotationOverlays.get(record.owner)
@@ -5781,7 +5785,7 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
     visible: boolean,
   ): void {
-    visible = visible && !record.browserNavigationError
+    visible = visible && this.ownerCanShowSurfaces(record.owner) && !record.browserNavigationError
     try {
       if (!record.contents.isDestroyed()) {
         record.contents.setAudioMuted(!visible)
@@ -5827,7 +5831,7 @@ export class NativeWorkbenchSurfaceManager {
       this.setPhysicalVisibility(record, false)
       return
     }
-    record.view.setBounds(bounds)
+    if (!this.ownerHtmlFullscreenWindows.has(owner)) record.view.setBounds(bounds)
     this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(owner))
     const overlay = this.annotationOverlays.get(owner)
     if (
@@ -5847,6 +5851,7 @@ export class NativeWorkbenchSurfaceManager {
   private ownerCanShowSurfaces(owner: BrowserWindow): boolean {
     return !owner.isDestroyed()
       && !this.unresponsiveWindows.has(owner)
+      && !this.ownerHtmlFullscreenWindows.has(owner)
       && owner.isVisible()
       && !owner.isMinimized()
   }
@@ -5889,7 +5894,7 @@ export class NativeWorkbenchSurfaceManager {
     return true
   }
 
-  private hookWindow(owner: BrowserWindow): void {
+  observeWindow(owner: BrowserWindow): void {
     if (this.hookedWindows.has(owner)) return
     this.hookedWindows.add(owner)
     owner.on('resize', () => this.reapplyActiveBounds(owner))
@@ -5897,6 +5902,21 @@ export class NativeWorkbenchSurfaceManager {
     owner.on('minimize', () => this.hideOwnedViews(owner))
     owner.on('show', () => this.reapplyActiveBounds(owner))
     owner.on('restore', () => this.reapplyActiveBounds(owner))
+    // Listen to the host document, not the window: a sidebar page can also
+    // enter HTML fullscreen and must remain visible in that case.
+    owner.webContents.on('enter-html-full-screen', () => {
+      this.ownerHtmlFullscreenWindows.add(owner)
+      this.hideOwnedViews(owner)
+    })
+    const restoreAfterHtmlFullscreen = () => {
+      if (!this.ownerHtmlFullscreenWindows.delete(owner)) return
+      this.reapplyActiveBounds(owner)
+    }
+    owner.webContents.on('leave-html-full-screen', restoreAfterHtmlFullscreen)
+    owner.webContents.on('did-navigate', () => {
+      this.ownerHtmlFullscreenWindows.delete(owner)
+      this.unresponsiveWindows.delete(owner)
+    })
     owner.webContents.on('zoom-changed', () => this.reapplyActiveBounds(owner))
     owner.webContents.on('unresponsive', () => {
       this.unresponsiveWindows.add(owner)
@@ -5914,10 +5934,12 @@ export class NativeWorkbenchSurfaceManager {
       }
     })
     owner.webContents.on('render-process-gone', () => {
+      this.ownerHtmlFullscreenWindows.delete(owner)
       this.unresponsiveWindows.add(owner)
       void this.destroyAll()
     })
     owner.once('closed', () => {
+      this.ownerHtmlFullscreenWindows.delete(owner)
       void this.destroyAll()
     })
   }

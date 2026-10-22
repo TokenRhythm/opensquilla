@@ -867,3 +867,5 @@ try {
   if (electronApp) await electronApp.close().catch(() => {})
   await rm(isolationRoot, { recursive: true, force: true })
 }
+
+await import('./test-native-workbench-fullscreen-electron.mjs')
