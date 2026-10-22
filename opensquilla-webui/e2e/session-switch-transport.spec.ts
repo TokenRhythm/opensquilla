@@ -988,6 +988,7 @@ for (const first of ['history', 'live'] as const) {
     await expect(reasoning).toHaveCount(1)
     await expect(draft.locator('.activity-motion--active')).toHaveCount(0)
     await expect(page.locator('.chat-message-surface')).toHaveAttribute('inert', '')
+    const historyReads = gateway.requests.filter(item => item.key === SESSION_A && item.method === 'chat.history').length
     gateway.release(first)
     // One side resolving is insufficient to replace the complete, read-only view.
     await expectWarmLiveFrames(page, true)
@@ -999,6 +1000,12 @@ for (const first of ['history', 'live'] as const) {
     await expect(draft.locator('code')).toHaveText('print("draft revision 2")')
     await expect(reasoning).toHaveCount(1)
     await expect(page.locator('.chat-message-surface')).not.toHaveAttribute('inert', '')
+    // The unchanged epoch keeps this read's installed history. Sample past the
+    // scheduled sync window to catch an unnecessary second history request.
+    await page.evaluate(async () => {
+      for (let frame = 0; frame < 8; frame++) await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+    })
+    expect(gateway.requests.filter(item => item.key === SESSION_A && item.method === 'chat.history')).toHaveLength(historyReads)
     expect(gateway.sockets).toHaveLength(1)
     expect(gateway.requests.filter(item => item.method === 'chat.send' || item.method === 'chat.abort')).toEqual([])
     expect(gateway.failures).toEqual([])
@@ -1045,9 +1052,10 @@ for (const ownerKnown of [false, true]) {
   })
 }
 
-for (const historyAfterAdvance of ['canonical', 'fallback', 'read-error'] as const) {
-  test(`changed epoch after history-first restoration handles ${historyAfterAdvance} history and releases the live view`, async ({ page }) => {
-    const gateway = await prepareWarmLiveRace(page, false, '', false, historyAfterAdvance)
+for (const [modern, historyAfterAdvance] of [false, true].flatMap(modern =>
+  (['canonical', 'fallback', 'read-error'] as const).map(history => [modern, history] as const))) {
+  test(`changed epoch after history-first restoration handles ${historyAfterAdvance} history and releases the live view (${modern ? 'modern' : 'legacy'} snapshot)`, async ({ page }) => {
+    const gateway = await prepareWarmLiveRace(page, modern, '', false, historyAfterAdvance)
     await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(SESSION_A)}`)
     await expect(page.getByTestId('tool-input-preview')).toBeVisible()
     await expect(page.getByText('Narration before draft revision 1', { exact: true })).toBeVisible()

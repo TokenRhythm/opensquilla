@@ -2962,7 +2962,13 @@ const chatSessionSubscription = useChatSessionSubscription({
     chatCompaction.handleGatewayRestart()
   },
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
-  onReadEpoch: sessionViewCache.observeEpoch,
+  onReadEpoch: (key, epoch) => {
+    const viewGeneration = sessionViewCache.generation.value
+    sessionViewCache.observeEpoch(key, epoch)
+    if (viewGeneration !== sessionViewCache.generation.value) {
+      scheduleHistorySync()
+    }
+  },
   onReadStarted: () => {
     sessionViewCache.beginLiveRead(sessionKey.value)
     presentationMetadataReady.value = false
