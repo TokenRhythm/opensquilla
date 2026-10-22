@@ -342,7 +342,7 @@ export class SessionReadContractError extends Error {
   }
 }
 
-export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large' | 'budget-exhausted' | 'rebase-required'
+export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large' | 'budget-exhausted' | 'rebase-required' | 'unresolved'
 
 /** Recoverable read failure projected by a transport Adapter. */
 export class SessionReadFailure extends Error {
@@ -729,7 +729,7 @@ export function createSessionReadLifecycle(
       if (error instanceof SessionReadSessionMissingError) await Promise.resolve()
       // A request-level read failure does not revoke a subscription that may
       // already be active on the healthy socket. Reconcile owns its recovery.
-      if (!(error instanceof SessionReadFailure && (error.retryable || error.kind === 'too-large' || error.kind === 'budget-exhausted')) && !state.closedReason) {
+      if (!(error instanceof SessionReadFailure && (error.retryable || error.kind === 'too-large' || error.kind === 'budget-exhausted' || error.kind === 'unresolved')) && !state.closedReason) {
         await closeState('closed').catch(() => {})
       }
     })

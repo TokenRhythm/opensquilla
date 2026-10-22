@@ -55,7 +55,7 @@ const props = defineProps<{
   transportState?: 'disconnected' | 'connecting' | 'connected'
   transportPhase?: 'healthy' | 'checking' | 'suspect' | 'reconnecting'
   resumeSource?: DesktopResumeSource | null
-  action?: 'retry-history' | 'retry-live'
+  action?: 'retry-history' | 'retry-live' | 'reload-page'
   busy?: boolean
 }>()
 
@@ -108,6 +108,7 @@ const description = computed(() => {
     case 'live-connecting':
       return ''
     case 'live-degraded':
+      if (props.action === 'reload-page') return t('chat.liveRecoveryReloadDescription')
       return t(
         props.transportState === 'connected'
           ? 'chat.liveUnavailableConnectedDescription'
@@ -117,9 +118,9 @@ const description = computed(() => {
       return ''
     }
   })
-const action = computed(() => props.action === 'retry-live'
-  ? t('chat.reconnectLive')
-  : t('chat.reloadSession'))
+const action = computed(() => props.action === 'reload-page'
+  ? t('errorBoundary.reload')
+  : props.action === 'retry-live' ? t('chat.reconnectLive') : t('chat.reloadSession'))
 
 function requestRetry() {
   emit('retry')

@@ -146,10 +146,10 @@
           :transport-state="gatewayConnectionState"
           :transport-phase="gatewayAccess.connectionPhase"
           :resume-source="gatewayAccess.resumeSource"
-          :action="recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
+          :action="recoveryNoticeState.startsWith('live-') ? (chatSessionBootstrap.liveRecoveryRequiresReload.value ? 'reload-page' : 'retry-live') : 'retry-history'"
           :busy="chatSessionBootstrap.retryBusy.value"
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
-          @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
+          @retry="retrySessionRecoveryNotice"
         />
         <div v-if="showTemporaryConversationEmpty" class="chat-temporary-empty" data-testid="temporary-conversation-empty">
           <Icon name="chat" :size="32" aria-hidden="true" />
@@ -3251,6 +3251,15 @@ function retryHistory() {
 
 function retryLive(explicit = true) {
   return retryLiveCoordinator(explicit)
+}
+
+async function retrySessionRecoveryNotice() {
+  if (!recoveryNoticeState.value?.startsWith('live-')) return retryHistory()
+  if (!chatSessionBootstrap.liveRecoveryRequiresReload.value) return retryLive()
+  // Flush the current draft watcher before the explicit page reload.
+  await nextTick()
+  await chatAttachments.flushAttachmentDraft()
+  window.location.reload()
 }
 
 function cancelSessionBootstrap(unsubscribe = true) {

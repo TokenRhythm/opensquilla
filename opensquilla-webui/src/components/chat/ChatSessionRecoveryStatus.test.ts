@@ -12,7 +12,7 @@ async function mountState(
   state: ChatSessionRecoveryState,
   onRetry = vi.fn(),
   transportState: 'disconnected' | 'connecting' | 'connected' = 'connected',
-  action?: 'retry-history' | 'retry-live',
+  action?: 'retry-history' | 'retry-live' | 'reload-page',
 ) {
   const host = document.createElement('div')
   host.className = 'chat-thread'
@@ -44,6 +44,23 @@ afterEach(() => {
 })
 
 describe('ChatSessionRecoveryStatus', () => {
+  it('offers an explicit page reload only for unresolved recovery', async () => {
+    const { host, onRetry } = await mountState('live-degraded', vi.fn(), 'connected', 'reload-page')
+    const retry = host.querySelector('[data-testid="chat-session-recovery-retry"]') as HTMLButtonElement
+    expect(host.textContent).toContain('Save any unsent input')
+    expect(retry.textContent).toContain('Reload page')
+    expect(onRetry).not.toHaveBeenCalled()
+    retry.click()
+    await nextTick()
+    expect(onRetry).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the ordinary live retry action unchanged', async () => {
+    const { host } = await mountState('live-degraded', vi.fn(), 'connected', 'retry-live')
+    expect(host.querySelector('[data-testid="chat-session-recovery-retry"]')?.textContent).toContain('Reconnect')
+    expect(host.textContent).not.toContain('Save any unsent input')
+  })
+
   it('renders compact localized history progress as a live status', async () => {
     i18n.global.locale.value = 'zh-Hans'
     const { host } = await mountState('history-loading')

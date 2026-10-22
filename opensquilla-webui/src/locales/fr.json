@@ -3972,6 +3972,7 @@
     "liveUnavailable": "Les mises à jour en direct sont temporairement indisponibles",
     "liveUnavailableDescription": "L’historique reste disponible. L’envoi reprendra une fois les mises à jour en direct rétablies.",
     "liveUnavailableConnectedDescription": "La Gateway est connectée. Les mises à jour en direct de cette session sont temporairement indisponibles.",
+    "liveRecoveryReloadDescription": "Les mises à jour en direct n’ont pas pu être rétablies. Enregistrez les messages non envoyés, puis rechargez cette page pour vous reconnecter.",
     "reconnectLive": "Se reconnecter",
     "liveSendBlockedConnecting": "Les mises à jour en direct se reconnectent. Votre brouillon est conservé.",
     "liveSendBlockedDegraded": "Les mises à jour en direct sont temporairement indisponibles. Votre brouillon est conservé.",

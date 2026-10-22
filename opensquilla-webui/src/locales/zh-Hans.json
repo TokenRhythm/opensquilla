@@ -4074,6 +4074,7 @@
     "liveUnavailable": "实时更新暂不可用",
     "liveUnavailableDescription": "历史消息仍可查看；实时更新恢复后即可发送。",
     "liveUnavailableConnectedDescription": "Gateway 已连接。当前会话的实时更新暂时不可用。",
+    "liveRecoveryReloadDescription": "实时更新未能恢复。请保存尚未发送的内容，然后重新加载此页以恢复连接。",
     "reconnectLive": "重新连接",
     "liveSendBlockedConnecting": "正在恢复实时更新，草稿已保留。",
     "liveSendBlockedDegraded": "实时更新暂时不可用，草稿已保留。",

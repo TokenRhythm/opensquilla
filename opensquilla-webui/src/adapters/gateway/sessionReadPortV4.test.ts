@@ -647,15 +647,17 @@ describe('read-v2 admission and retirement ownership', () => {
     const recovery = expect(lease.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
     await vi.waitFor(() => expect(h.calls.filter(call => call.method === READ_INSTALL_V2)).toHaveLength(2))
     let replacement: SessionReadPortLease | undefined
-    if (change === 'closed') await lease.close()
+    let closing: Promise<void> | undefined
+    if (change === 'closed') closing = lease.close()
     else if (change === 'generation') h.setGeneration(h.rpc.generation + 1)
     else {
       h.results.set(READ_INSTALL_V2, install)
       replacement = port.open(openRequest(undefined, false))
-      await replacement.live
     }
     delayed.reject(Object.assign(new Error('Old base expired'), { code: 'REBASE_REQUIRED' }))
     await recovery
+    await closing
+    await replacement?.live
     const closeCount = h.calls.filter(call => call.method === READ_CLOSE_V2).length
     await lease.close()
     expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(closeCount)
@@ -773,6 +775,39 @@ describe('read-v2 admission and retirement ownership', () => {
     },
   )
 
+  it.each([READ_INSTALL_V2, READ_STATE_V2])('rebases an active view after a lost %s result is reconciled', async method => {
+    vi.useFakeTimers()
+    const h = v2AdmissionHarness()
+    const original = h.results.get(method)
+    const delayed = deferred<unknown>()
+    const port = createV4SessionReadPort(h.rpc)
+    if (method === READ_INSTALL_V2) h.results.set(method, delayed.promise)
+    const lease = port.open(openRequest(undefined, false))
+    const metadata = lease.metadata.catch(error => error)
+    const admitted = lease.criticalRequestsQueued.catch(error => error)
+    let pending = lease.live
+    if (method === READ_STATE_V2) {
+      await lease.live
+      h.results.set(method, delayed.promise)
+      pending = lease.reconcile()
+    }
+    const failed = expect(pending).rejects.toMatchObject({ kind: 'timeout' })
+    await vi.advanceTimersByTimeAsync(7_000)
+    await failed
+    if (method === READ_INSTALL_V2) {
+      expect(await metadata).toMatchObject({ kind: 'timeout' })
+      expect(await admitted).toBeUndefined()
+    }
+    h.results.set(method, original)
+    await flushAsyncWork()
+    // The old local handle cannot silently retry a lease retired by the probe.
+    await expect(lease.reconcile()).rejects.toMatchObject({ kind: 'rebase-required', retryable: true })
+    await lease.close()
+    const replacement = port.open(openRequest(undefined, false))
+    await expect(replacement.live).resolves.toMatchObject({ sessionKey: 'alpha' })
+    await replacement.close()
+  })
+
   it('queues old A unsubscribe before a delayed read-close response can reach replacement A', async () => {
     vi.useFakeTimers()
     const h = v2AdmissionHarness()
@@ -792,6 +827,11 @@ describe('read-v2 admission and retirement ownership', () => {
     })
     const oldClose = old.close()
     const beta = port.open({ ...openRequest(), sessionKey: 'beta' })
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
+    setTimeout(() => delayed.resolve(h.results.get(READ_CLOSE_V2)), 200)
+    await vi.advanceTimersByTimeAsync(200)
+    await oldClose
     await beta.live
     await beta.close()
     const replacement = port.open(openRequest())
@@ -801,11 +841,7 @@ describe('read-v2 admission and retirement ownership', () => {
       const replacementSubscribe = h.calls.map(call => call.method).lastIndexOf(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
       expect(unsubscribe).toBeGreaterThan(-1)
       expect(unsubscribe).toBeLessThan(replacementSubscribe)
-      const countBeforeReply = h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD).length
-      setTimeout(() => delayed.resolve(h.results.get(READ_CLOSE_V2)), 200)
-      await vi.advanceTimersByTimeAsync(200)
-      await oldClose
-      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(countBeforeReply)
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(2)
       await expect(replacement.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
     } finally {
       await replacement.close()
@@ -846,9 +882,12 @@ describe('read-v2 admission and retirement ownership', () => {
     const metadata = expect(lease.metadata).rejects.toMatchObject({ kind: 'aborted' })
     for (let index = 0; index < 12; index++) await flushAsyncWork()
     expect(h.calls.some(call => call.method === READ_INSTALL_V2)).toBe(true)
-    await lease.close()
-    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+    const closing = lease.close()
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(0)
     delayed.resolve(installed)
+    await closing
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
     await Promise.all([live, metadata])
     await expect(lease.reconcile()).rejects.toMatchObject({ name: 'AbortError' })
     expect(h.calls.some(call => call.method === READ_STATE_V2)).toBe(false)
@@ -872,14 +911,17 @@ describe('read-v2 admission and retirement ownership', () => {
     else await old.close()
     h.results.set(READ_OPEN_V2, opened)
     const replacement = reason === 'replacement' ? port.open(openRequest()) : null
-    if (replacement) await replacement.live
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
     delayed.resolve(opened)
     await rejected
-    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(replacement ? 0 : 1)
+    await replacement?.live
+    await flushAsyncWork()
+    expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
     if (replacement) {
       await expect(replacement.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
       await replacement.close()
-      expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(1)
+      expect(h.calls.filter(call => call.method === READ_CLOSE_V2)).toHaveLength(2)
     }
     await old.close()
   })

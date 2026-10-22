@@ -86,6 +86,7 @@ function createBootstrap(overrides: {
   })
   return {
     api,
+    sessionKey,
     loadHistory,
     subscribeSession,
     cancelHistory,
@@ -101,6 +102,50 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('stops automatic retries when the remote read remains unresolved and clears the action on replacement', async () => {
+    vi.useFakeTimers()
+    let unresolved = true
+    const failure = new SessionReadFailure('unresolved', 'Remote completion is unknown', false)
+    const h = createBootstrap({
+      connectionState: ref('connected'),
+      subscribeSession: async () => unresolved ? { ...LIVE_READY, authoritative: false, error: failure } : LIVE_READY,
+    })
+    try {
+      const run = h.api.startSessionBootstrap()
+      await Promise.all([run.history, run.live])
+      expect(h.api.historyPhase.value).toBe('ready')
+      expect(h.api.livePhase.value).toBe('degraded')
+      expect(h.api.liveRecoveryRequiresReload.value).toBe(true)
+      await vi.advanceTimersByTimeAsync(180_000)
+      await expect(h.api.retryLive()).resolves.toMatchObject({ error: failure })
+      expect(h.subscribeSession).toHaveBeenCalledOnce()
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+      unresolved = false
+      h.sessionKey.value = 'agent:main:webchat:replacement'
+      const next = h.api.startSessionBootstrap()
+      expect(h.api.liveRecoveryRequiresReload.value).toBe(false)
+      await next.live
+      expect(h.api.livePhase.value).toBe('ready')
+      expect(h.api.liveRecoveryRequiresReload.value).toBe(false)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
+  it('does not expose an obsolete session failure as the current reload action', async () => {
+    let finish!: (result: SessionSubscriptionOutcome) => void
+    const h = createBootstrap({ subscribeSession: async context => context.key.endsWith('bootstrap-test')
+      ? new Promise(resolve => { finish = resolve }) : LIVE_READY })
+    try {
+      const old = h.api.startSessionBootstrap()
+      h.sessionKey.value = 'agent:main:webchat:replacement'
+      await h.api.startSessionBootstrap().live
+      finish({ ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('unresolved', 'Remote completion is unknown', false) })
+      await old.live
+      expect(h.api.livePhase.value).toBe('ready')
+      expect(h.api.liveRecoveryRequiresReload.value).toBe(false)
+    } finally { h.api.cancelSessionBootstrap() }
+  })
+
   it.each(['initial', 'reconcile'])('replaces an obsolete read base after %s failure while retaining history', async source => {
     vi.useFakeTimers()
     const rebase = { ...LIVE_READY, authoritative: false,

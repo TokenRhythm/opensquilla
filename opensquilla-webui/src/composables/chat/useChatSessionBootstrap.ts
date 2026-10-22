@@ -85,6 +85,7 @@ function liveRuntime(deadlineAt: number): PhaseRuntime<SessionSubscriptionOutcom
 export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions) {
   const historyPhase = ref<SessionHistoryPhase>('idle')
   const livePhase = ref<SessionLivePhase>('idle')
+  const liveRecoveryRequiresReload = ref(false)
   const liveAttemptCompletion = ref(0)
   const retryBusy = ref(false)
   const noticeDismissed = ref(false)
@@ -259,6 +260,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     phase.running = true
     phase.result = null
     if (isCurrent(run)) {
+      liveRecoveryRequiresReload.value = false
       const incident = incidentFor(run.key)
       noticeDismissed.value = incident.dismissed
       const remaining = incident.started + SESSION_BOOTSTRAP_BUDGET_MS - performance.now()
@@ -291,6 +293,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         return { ...result, authoritative: false, cancelled: true }
       }
       phase.result = result
+      liveRecoveryRequiresReload.value = !result.authoritative
+        && result.error instanceof SessionReadFailure && result.error.kind === 'unresolved'
       if (result.authoritative) {
         clearForegroundTimer()
         incidents.delete(incidentKey(run.key))
@@ -402,6 +406,11 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
 
   function retryLive(explicit = false): Promise<SessionSubscriptionOutcome> {
     const run = active
+    if (!explicit && run && isCurrent(run)
+      && run.live.result?.error instanceof SessionReadFailure
+      && run.live.result.error.kind === 'unresolved') {
+      return Promise.resolve(run.live.result)
+    }
     if (explicit && run && isCurrent(run)) {
       if (run.live.running) return run.live.promise
       delete incidentFor(run.key).readDeadlineAt
@@ -470,6 +479,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     options.cancelSubscription()
     historyPhase.value = 'idle'
     livePhase.value = 'idle'
+    liveRecoveryRequiresReload.value = false
     if (unsubscribe && cancelled) void cancelled.lease.close().catch(() => {})
   }
 
@@ -597,6 +607,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   return {
     historyPhase,
     livePhase,
+    liveRecoveryRequiresReload,
     startSessionBootstrap,
     cancelSessionBootstrap,
     retryHistory,

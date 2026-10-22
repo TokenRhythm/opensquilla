@@ -3972,6 +3972,7 @@
     "liveUnavailable": "Live-Aktualisierungen sind vorübergehend nicht verfügbar",
     "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Der Versand wird fortgesetzt, sobald die Live-Aktualisierungen wiederhergestellt sind.",
     "liveUnavailableConnectedDescription": "Das Gateway ist verbunden. Live-Aktualisierungen für diese Sitzung sind vorübergehend nicht verfügbar.",
+    "liveRecoveryReloadDescription": "Live-Aktualisierungen konnten nicht wiederhergestellt werden. Sichere ungesendete Eingaben und lade diese Seite neu, um die Verbindung wiederherzustellen.",
     "reconnectLive": "Erneut verbinden",
     "liveSendBlockedConnecting": "Live-Aktualisierungen werden wiederhergestellt. Ihr Entwurf bleibt erhalten.",
     "liveSendBlockedDegraded": "Live-Aktualisierungen sind vorübergehend nicht verfügbar. Ihr Entwurf bleibt erhalten.",

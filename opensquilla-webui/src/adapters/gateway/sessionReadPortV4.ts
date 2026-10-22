@@ -542,6 +542,9 @@ export function createV4SessionReadPort(
       let laneOwner: TransportLaneOwner | undefined
       let v2Lease: SessionReadV2Lease | null = null
       let v2BaseApplied = false
+      const v2Controller = new AbortController()
+      const abortV2 = () => v2Controller.abort()
+      request.signal.addEventListener('abort', abortV2, { once: true })
 
       async function createContext(): Promise<OpenContext> {
         const admissionDeadline = performance.now() + READ_TIMEOUT_MS
@@ -662,16 +665,13 @@ export function createV4SessionReadPort(
             }
             if (v2Enabled && !v2BaseApplied) {
               if (!v2Lease) {
-                const modern = await openV2SessionRead(rpc, request.sessionKey, expectedGeneration, request.signal)
+                const modern = await openV2SessionRead(rpc, request.sessionKey, expectedGeneration, v2Controller.signal)
                 try {
                   assertAdmissionCurrent()
                 } catch (error) {
-                  // Open is idempotent by connection/key. A replacement owner
-                  // may already have adopted this exact lease; do not close it.
-                  const currentOwner = owners.get(request.sessionKey)
-                  if (rpc.generation === expectedGeneration && (!currentOwner || currentOwner === owner)) {
-                    await modern.close()
-                  }
+                  // This releases only the obsolete consumer. A same-key view
+                  // may retain its own handle to the shared physical lease.
+                  await modern.close()
                   throw error
                 }
                 // Own the lease before base installation can fail or cancel.
@@ -957,6 +957,8 @@ export function createV4SessionReadPort(
       async function close(): Promise<void> {
         if (closed) return
         closed = true
+        v2Controller.abort()
+        request.signal.removeEventListener('abort', abortV2)
         transfer?.release()
         // No await before the ownership/send decision: a pending ready wait
         // cannot later send subscribe after this local close.

@@ -3972,6 +3972,7 @@
     "liveUnavailable": "リアルタイム更新を一時的に利用できません",
     "liveUnavailableDescription": "履歴は引き続き表示できます。リアルタイム更新の復旧後に送信を再開します。",
     "liveUnavailableConnectedDescription": "Gateway は接続されています。このセッションのリアルタイム更新は一時的に利用できません。",
+    "liveRecoveryReloadDescription": "リアルタイム更新を復元できませんでした。未送信の入力を保存してから、このページを再読み込みして再接続してください。",
     "reconnectLive": "再接続",
     "liveSendBlockedConnecting": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",
     "liveSendBlockedDegraded": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",

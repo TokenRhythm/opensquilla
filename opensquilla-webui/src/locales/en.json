@@ -4075,6 +4075,7 @@
     "liveUnavailable": "Live updates are temporarily unavailable",
     "liveUnavailableDescription": "History remains available. Sending resumes when live updates recover.",
     "liveUnavailableConnectedDescription": "The Gateway is connected. Live updates for this session are temporarily unavailable.",
+    "liveRecoveryReloadDescription": "Live updates could not be restored. Save any unsent input, then reload this page to reconnect.",
     "reconnectLive": "Reconnect",
     "liveSendBlockedConnecting": "Live updates are reconnecting. Your draft is saved.",
     "liveSendBlockedDegraded": "Live updates are temporarily unavailable. Your draft is saved.",
