@@ -2863,7 +2863,22 @@ class SessionStorage:
         the serialized connection path because independent snapshots are unsafe.
         Bodies must use only read SQL on the yielded connection, without taking
         the writer gate or closing storage while holding this reader's gate.
+        Inside an admitted history view, reuse its snapshot and leave transaction
+        cleanup to the outer recovery lease.
         """
+
+        if self.in_committed_history_view:
+            self._raise_if_poisoned()
+            selected = _READ_CONNECTION.get()
+            budget = current_read_budget()
+            if (
+                selected is None or selected[0] is not self
+                or selected[1] is self._conn or budget is None
+            ):
+                raise RuntimeError("Committed history view no longer owns its reader")
+            budget.check()
+            yield selected[1]
+            return
 
         generation = self.connection_generation
         if self._transcript_reader is None:

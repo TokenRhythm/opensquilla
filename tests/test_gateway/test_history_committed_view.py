@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.artifact_session import ArtifactSessionService
+from opensquilla.artifact_session import repository as artifact_repository
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway import rpc_sessions
 from opensquilla.gateway.adapters import session_history_projection
@@ -285,19 +286,27 @@ async def test_turn_outcomes_use_snapshot_reader_without_schema_writes(
     initialization_calls = []
     ledger_reads = []
     original = ArtifactSessionService.list_mutation_attempts_by_turn_ids
+    original_fetchall = artifact_repository._fetchall
 
     async def forbid_initialize(*args, **kwargs):
         initialization_calls.append(True)
         raise AssertionError("History must not initialize the artifact schema")
 
     async def read_ledger(self, **kwargs):
-        ledger_reads.append(case.storage.conn)
         assert case.storage.in_committed_history_view and case.storage.conn.in_transaction
         assert case.storage.conn is not case.storage._conn
         return await original(self, **kwargs)
 
+    async def read_attempts(reader, query, params=()):
+        if "FROM artifact_mutation_attempts" in query:
+            ledger_reads.append(reader)
+            assert reader is case.storage.conn
+            assert reader.in_transaction
+        return await original_fetchall(reader, query, params)
+
     monkeypatch.setattr(ArtifactSessionService, "from_session_storage", forbid_initialize)
     monkeypatch.setattr(ArtifactSessionService, "list_mutation_attempts_by_turn_ids", read_ledger)
+    monkeypatch.setattr(artifact_repository, "_fetchall", read_attempts)
     response = await admitted_history({"sessionKey": case.node.session_key}, case.context)
     assert [outcome["turn_id"] for outcome in response["turn_outcomes"]] == [turn_id]
     assert initialization_calls == []

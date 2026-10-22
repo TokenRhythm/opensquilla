@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from opensquilla.artifact_session import repository as repository_module
 from opensquilla.artifact_session.repository import ArtifactSessionRepository
 from opensquilla.session.models import SessionNode
+from opensquilla.session.recovery_reads import recovery_read_scope
 from opensquilla.session.storage import SessionStorage, StorageBusyError
 from opensquilla.session.usage_ledger import UsageEventStart
 
@@ -104,6 +106,56 @@ async def test_committed_reader_rejects_mutations_and_reuses_after_error(tmp_pat
             assert next_reader is reader
             assert await _value(next_reader) == 1
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_artifact_read_keeps_history_snapshot_and_outer_cleanup(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    snapshot_ready, write_done = asyncio.Event(), asyncio.Event()
+    writer = None
+    readers = []
+
+    async def update_after_snapshot():
+        await snapshot_ready.wait()
+        async with storage._write_transaction("parallel") as connection:
+            await connection.execute("UPDATE snapshot_probe SET value = 2")
+        write_done.set()
+
+    async def read_history():
+        outer_reader = storage.conn
+        readers.append(outer_reader)
+        assert await _value(outer_reader) == 1
+        snapshot_ready.set()
+        await asyncio.wait_for(write_done.wait(), 2)
+        with pytest.raises(RuntimeError, match="nested read failed"):
+            async with storage.committed_read_transaction("artifact_read") as reader:
+                assert reader is outer_reader
+                assert await _value(reader) == 1
+                raise RuntimeError("nested read failed")
+        assert outer_reader.in_transaction
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            async with storage.committed_read_transaction("invalid_mutation") as reader:
+                await reader.execute("UPDATE snapshot_probe SET value = 3")
+        assert outer_reader.in_transaction
+        assert await _value(outer_reader) == 1
+
+    try:
+        await _seed(storage)
+        # The writer must not inherit the query-only history lease.
+        writer = asyncio.create_task(update_after_snapshot())
+        with recovery_read_scope("history-view", deadline=time.monotonic() + 5) as budget:
+            await storage.read_committed_history_view("history", read_history)
+        await budget.drain()
+        assert readers and not readers[0].in_transaction
+        assert storage._committed_reader is None
+        async with storage.committed_read_transaction("following") as reader:
+            assert await _value(reader) == 2
+    finally:
+        snapshot_ready.set()
+        if writer is not None:
+            writer.cancel()
+            await asyncio.gather(writer, return_exceptions=True)
         await storage.close()
 
 

@@ -12,7 +12,6 @@ import copy
 import json
 import time
 from collections.abc import Mapping
-from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
 
@@ -334,21 +333,18 @@ async def _chat_history_turn_outcomes(
                 # Schema initialization is a write and must never run on a
                 # query-only history lease. An absent ledger has no attempts
                 # in this committed version; existing ledgers use this reader.
-                async with storage.conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' "
-                    "AND name='artifact_mutation_attempts'",
-                ) as cursor:
-                    ledger_exists = await cursor.fetchone() is not None
+                async with storage.committed_read_transaction("history.artifact_ledger") as reader:
+                    async with reader.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='artifact_mutation_attempts'",
+                    ) as cursor:
+                        ledger_exists = await cursor.fetchone() is not None
                 if ledger_exists:
-                    @asynccontextmanager
-                    async def history_transaction(_operation: str):
-                        yield storage.conn
-
                     def reject_write(_operation: str):
                         raise RuntimeError("History artifact projections are read-only")
 
                     artifact_service = ArtifactSessionService(ArtifactSessionRepository(
-                        reject_write, read_transaction_factory=history_transaction,
+                        reject_write, read_transaction_factory=storage.committed_read_transaction,
                     ))
             else:
                 artifact_service = await ArtifactSessionService.from_session_storage(storage)
