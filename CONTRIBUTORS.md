@@ -26,6 +26,21 @@ trailers.
 | [@ab2ence](https://github.com/ab2ence) | macOS Seatbelt backend execution, denial escalation, and release-candidate type-check cleanup. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`fb1e6225`](https://github.com/opensquilla/opensquilla/pull/46/commits/fb1e6225e4db9cb0801ea347a89c2066e3e0601b), [`f73ac3eb`](https://github.com/opensquilla/opensquilla/pull/46/commits/f73ac3eb0044c64c79cfd18f9ec03d1bba9128ff), [`cf3b046f`](https://github.com/opensquilla/opensquilla/pull/46/commits/cf3b046f42a42efc951320b0af80e9d066dcf7d2) |
 | [@kimjune01](https://github.com/kimjune01) | Provider stream timeout cleanup fix that prevents double-closing provider streams. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`06e3126d`](https://github.com/opensquilla/opensquilla/pull/46/commits/06e3126d8ebda4ad4cf349ca7be0d0804e0c008d) |
 
+## OpenSquilla 0.5.7
+
+Thanks to the maintainers and community contributors whose work is included
+since 0.5.6. Historical attribution below remains unchanged.
+
+| Contributor | 0.5.7 contribution | Evidence |
+| --- | --- | --- |
+| [@Kiuyor](https://github.com/Kiuyor) | Preserve user comments during configuration migration and expand the glossary. | [#1881](https://github.com/TokenRhythm/opensquilla/pull/1881), [#1879](https://github.com/TokenRhythm/opensquilla/pull/1879) |
+| [@LIES225](https://github.com/LIES225) | Reject reversed stepped Cron ranges. | [#1944](https://github.com/TokenRhythm/opensquilla/pull/1944) |
+| [@LiuXinchen1997](https://github.com/LiuXinchen1997) | Refresh routing presets and preserve upgraded model choices. | [#1963](https://github.com/TokenRhythm/opensquilla/pull/1963) |
+| [@lihongguang-0014](https://github.com/lihongguang-0014) | Video generation, embedded browser isolation, provider recovery, and Desktop reliability. | [#1893](https://github.com/TokenRhythm/opensquilla/pull/1893), [#1897](https://github.com/TokenRhythm/opensquilla/pull/1897), [#1972](https://github.com/TokenRhythm/opensquilla/pull/1972), [#1793](https://github.com/TokenRhythm/opensquilla/pull/1793) |
+| [@openvictory](https://github.com/openvictory) | Keep forked conversations in their parent project. | [#1898](https://github.com/TokenRhythm/opensquilla/pull/1898) |
+| [@pcbeingused333](https://github.com/pcbeingused333) | Improve composer history editing and update the default OpenAI image model. | [#1956](https://github.com/TokenRhythm/opensquilla/pull/1956), [#1943](https://github.com/TokenRhythm/opensquilla/pull/1943) |
+| [@xiaohuzai](https://github.com/xiaohuzai) | Rich Markdown rendering, Mermaid diagrams, and streaming highlighting. | [#1886](https://github.com/TokenRhythm/opensquilla/pull/1886) |
+
 ## OpenSquilla 0.5.6
 
 Thanks to the maintainers and community contributors whose work is included

@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.6"
-CURRENT_DESKTOP_VERSION = "0.5.6"
+CURRENT_VERSION = "0.5.7"
+CURRENT_DESKTOP_VERSION = "0.5.7"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -1549,8 +1549,8 @@ def test_current_release_notes_cover_upgrade_and_containers() -> None:
     assert "Supported database migrations run automatically" in normalized
     assert f"No Windows Portable assets are published for {CURRENT_VERSION}" in notes
     assert f"{CURRENT_VERSION} Portable zip" in notes
-    assert "## Upgrading from 0.5.5" in notes
-    assert "Upgrading from 0.5.4 or earlier" in notes
+    assert "## Upgrading from 0.5.6" in notes
+    assert "Upgrading from 0.5.5 or earlier" in notes
     assert "must not\n> uninstall that build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
     assert f"ghcr.io/tokenrhythm/opensquilla:{CURRENT_TAG}" in notes
@@ -1620,10 +1620,10 @@ def test_historical_contributor_ledger_retains_055_attribution() -> None:
     assert "Claude Code" not in section
 
 
-def test_current_release_records_browser_beta_and_contributors() -> None:
-    notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
+def test_historical_056_release_records_browser_beta_and_contributors() -> None:
+    notes = Path("docs/releases/0.5.6.md").read_text(encoding="utf-8")
     ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
-    section = ledger.split(f"## OpenSquilla {CURRENT_VERSION}", 1)[1].split(
+    section = ledger.split("## OpenSquilla 0.5.6", 1)[1].split(
         "## OpenSquilla 0.5.5",
         1,
     )[0]

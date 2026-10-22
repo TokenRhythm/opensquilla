@@ -3,12 +3,10 @@
 OpenSquilla is a Python agent runtime with MCP-native tools, durable sessions,
 local memory, multi-channel messaging, and a local web control UI.
 
-The package is published as part of an OpenSquilla release zip. Install from the
-release bundle rather than from a source checkout so the wheel, dependency
-wheelhouse, install scripts, and third-party notices stay together.
-The wheel already contains the built Web UI, so installing this release bundle
-does not require Node.js or npm. Those tools are needed only when building from
-a Git checkout.
+Public releases provide Desktop installers and a versioned Python wheel.
+Use the Desktop installer for the bundled app, or install the wheel for CLI and
+Gateway use. Both include the built Web UI and do not require Node.js or npm;
+those tools are needed only when building from a Git checkout.
 
 ## Requirements
 
@@ -32,5 +30,5 @@ opensquilla gateway run
 
 ## Project Links
 
-Repository, license, release, and third-party notice information are included in
-the release bundle and in the public OpenSquilla repository.
+Repository, license, release, and third-party notice information are available
+in the public OpenSquilla repository and the release artifacts.
