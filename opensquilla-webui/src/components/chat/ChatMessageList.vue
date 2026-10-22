@@ -100,6 +100,7 @@
         <CompactionEvent
           v-else-if="messages[entry.index].displayRole === 'maintenance' && messages[entry.index].maintenance?.kind === 'context_compaction'"
           :message="messages[entry.index]"
+          :preview="previewReadOnly"
         />
         <AssistantMessage
           v-else-if="messages[entry.index].displayRole === 'assistant'"

@@ -325,6 +325,65 @@ describe('history installation for warm session views', () => {
     'watch', 'historyState', 'historySessionKey', 'sessionKey', 'sessionViewCache', readinessWatch,
   )
 
+  it.each(['history', 'live'] as const)(
+    'keeps a warm user transcript when replacement history fails (%s first)', async first => {
+      const scope = effectScope()
+      const sessionKey = ref('A')
+      const originalMessages: SessionReadMessageFixture[] = [
+        { role: 'user', messageId: 'a-user', text: 'Keep this user query.' },
+        { role: 'assistant', messageId: 'a-answer', text: 'Existing answer.' },
+      ]
+      let installed: (key: string) => void = () => {}
+      const h = makeHistory(false, { sessionKey,
+        response: { canonicalAvailable: true, canonicalComplete: true, messages: originalMessages },
+        onHistoryInstalled: key => installed(key),
+      })
+      const cache = scope.run(() => useChatSessionViewCache({
+        sessionKey, deliveryIdentity: ref('gateway'), messages: h.messages, waitForLive: true,
+      }))!
+      installed = cache.historyInstalled
+      scope.run(() => installReadinessWatch(watch, h.api.historyState, h.api.historySessionKey, sessionKey, cache))
+      try {
+        cache.observeEpoch('A', 0)
+        await h.api.loadHistory()
+        cache.liveInstalled('A')
+        sessionKey.value = 'B'
+        h.messages.value = []
+        h.replaceReadLease()
+        h.historyFixture.mockResolvedValueOnce({ canonicalAvailable: true, messages: [{ role: 'user', messageId: 'b-user', text: 'B' }] })
+        await h.api.loadHistory()
+        cache.liveInstalled('B')
+        sessionKey.value = 'A'
+        h.messages.value = []
+        h.replaceReadLease()
+        expect(cache.showingPreview.value).toBe(true)
+        expect(cache.messages.value.map(message => message.messageId)).toEqual(['a-user', 'a-answer'])
+
+        let reject!: (error: Error) => void
+        h.historyFixture.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+        const pending = h.api.loadHistory()
+        if (first === 'live') cache.liveInstalled('A')
+        reject(new SessionReadFailure('busy', 'History lock is busy.', true))
+        expect(await pending).toMatchObject({ ok: false })
+        if (first === 'history') cache.liveInstalled('A')
+        expect(h.api.historyState.value).toMatchObject({ initialLoadStatus: 'error', recoveryError: true })
+        expect(cache.ready.value).toBe(false)
+        expect(cache.showingPreview.value).toBe(true)
+        expect(cache.messages.value.map(message => message.messageId)).toEqual(['a-user', 'a-answer'])
+        // Display-only history must not be installed as current canonical data.
+        expect(h.messages.value).toEqual([])
+
+        h.historyFixture.mockResolvedValueOnce({ canonicalAvailable: true, canonicalComplete: true,
+          messages: [...originalMessages, { role: 'assistant', messageId: 'a-new', text: 'New committed output.' }],
+        })
+        await h.api.loadHistory()
+        expect(cache.ready.value).toBe(true)
+        expect(cache.showingPreview.value).toBe(false)
+        expect(cache.messages.value.map(message => message.messageId)).toEqual(['a-user', 'a-answer', 'a-new'])
+      } finally { h.api.cleanup(); scope.stop() }
+    },
+  )
+
   it.each([
     ['fallback', 'fallback'], ['fallback', 'read-error'],
     ['canonical', 'fallback'], ['canonical', 'read-error'],

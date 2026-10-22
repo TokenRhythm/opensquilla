@@ -174,6 +174,7 @@ interface HarnessOptions {
   resetStreamLiveTurnState?: UseChatSessionSubscriptionOptions['resetStreamLiveTurnState']
   onStreamGenerationReset?: UseChatSessionSubscriptionOptions['onStreamGenerationReset']
   onLiveSnapshot?: UseChatSessionSubscriptionOptions['onLiveSnapshot']
+  onReadEpoch?: UseChatSessionSubscriptionOptions['onReadEpoch']
   onSnapshotInstalled?: UseChatSessionSubscriptionOptions['onSnapshotInstalled']
   onAuthoritativeIdle?: UseChatSessionSubscriptionOptions['onAuthoritativeIdle']
   onRunModeLock?: UseChatSessionSubscriptionOptions['onRunModeLock']
@@ -230,6 +231,7 @@ function harness(
     resetStreamLiveTurnState,
     onStreamGenerationReset: options.onStreamGenerationReset,
     onLiveSnapshot: options.onLiveSnapshot,
+    onReadEpoch: options.onReadEpoch,
     onSnapshotInstalled: options.onSnapshotInstalled,
     onAuthoritativeIdle,
     onRunModeLock: options.onRunModeLock,
@@ -855,6 +857,7 @@ describe('useChatSessionSubscription domain lease', () => {
 
   it('uses fast metadata immediately and hydrates complete metadata independently', async () => {
     const initialMetadata = metadata({
+      epoch: 7,
       hydrationComplete: false,
       deferredFields: ['workspaceId'],
       runStatus: 'running',
@@ -864,6 +867,7 @@ describe('useChatSessionSubscription domain lease', () => {
     const taskOwnership = useChatTaskOwnership()
     const onSessionMetadata = vi.fn()
     const onSnapshot = vi.fn()
+    const onReadEpoch = vi.fn()
     const subject = harness(leaseFixture({
       live: live({
         activity: 'foreground',
@@ -876,6 +880,7 @@ describe('useChatSessionSubscription domain lease', () => {
       beginSessionMetadataResolution: () => 7,
       onSessionMetadata,
       onSnapshot,
+      onReadEpoch,
     })
 
     await expect(subject.api.subscribeSession()).resolves.toEqual({
@@ -884,6 +889,7 @@ describe('useChatSessionSubscription domain lease', () => {
       backgroundOnly: false,
     })
     expect(taskOwnership.hydrationResolved.value).toBe(false)
+    expect(onReadEpoch).toHaveBeenCalledExactlyOnceWith(KEY, 7)
     expect(onSessionMetadata).not.toHaveBeenCalled()
 
     const hydrated = metadata({
@@ -980,6 +986,7 @@ describe('useChatSessionSubscription domain lease', () => {
     const oldLive = deferred<SessionReadLive>()
     const oldLease = leaseFixture({ live: oldLive.promise }).lease
     const newMetadata = metadata({
+      epoch: 9,
       runStatus: 'running',
       activeTask: { taskId: 'task-new', status: 'running' },
     })
@@ -987,7 +994,8 @@ describe('useChatSessionSubscription domain lease', () => {
       live: live({ activity: 'foreground', initialMetadata: newMetadata }),
       metadata: newMetadata,
     }).lease
-    const subject = harness(oldLease)
+    const onReadEpoch = vi.fn()
+    const subject = harness(oldLease, { onReadEpoch })
 
     const stale = subject.api.subscribeSession()
     await Promise.resolve()
@@ -1004,6 +1012,7 @@ describe('useChatSessionSubscription domain lease', () => {
       live: true,
     })
     expect(subject.runStatus.value.status).toBe('running')
+    expect(onReadEpoch).toHaveBeenCalledExactlyOnceWith(KEY, 9)
   })
 
   it('reports only the current live failure to metadata ownership', async () => {

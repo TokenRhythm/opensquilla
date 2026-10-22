@@ -434,8 +434,8 @@ function connectPlanCommands(
     selectedSkills: options.selectedSkills,
     sessionKey: options.sessionKey,
     autoResizeTextarea: options.autoResizeTextarea,
-    newSession: vi.fn(), resetCurrentSession: vi.fn(), setCompactInFlight: vi.fn(),
-    showCompactStatus: vi.fn(), showCompactionToast: vi.fn(), notify: vi.fn(),
+    newSession: vi.fn(), resetCurrentSession: vi.fn(),
+    beginManualCompactionRequest: vi.fn(() => ({ resolve: vi.fn(), reject: vi.fn(() => null), retire: vi.fn(() => null) })), notify: vi.fn(),
     planModeAvailable: () => true,
     activatePlanMode,
   })

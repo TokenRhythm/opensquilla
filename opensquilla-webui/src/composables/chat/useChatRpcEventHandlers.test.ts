@@ -2301,6 +2301,39 @@ describe('compaction wire events through the live stream and maintenance runtime
     } finally { h.stop() }
   })
 
+  it('restores an observed-only manual snapshot after returning to its session and settles it once', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    const payload = { key: h.sessionKey.value, source: 'manual', compaction_id: 'cmp-observed-return' }
+    const snapshot: SessionReadSnapshot = {
+      sessionKey: h.sessionKey.value, taskId: null, currentStreamSeq: 24,
+      events: [{ semanticKind: 'compaction-progress', payload: {
+        ...payload, status: 'observed', stage: 'summarizing', heartbeat: true, sequence: 4, stream_seq: 24,
+      } }],
+    }
+    try {
+      h.api.restoreLiveTurnSnapshot(snapshot)
+      expect(h.compaction!.compactStatus.value).toMatchObject({
+        compactionId: 'cmp-observed-return', source: 'manual', detail: 'summarizing', isBusy: true,
+      })
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(h.stream.isStreaming.value).toBe(false)
+      h.compaction!.setCompactInFlight(false)
+      h.compaction!.hideCompactStatus()
+      h.api.restoreLiveTurnSnapshot(snapshot)
+      expect(h.compaction!.compactStatus.value.compactionId).toBe('cmp-observed-return')
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+      const terminal = { ...payload, status: 'completed', durability: 'durable', sequence: 5, stream_seq: 25 }
+      h.api.handlers.onCompaction(terminal)
+      h.api.handlers.onCompaction(terminal)
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      expect(h.stream.isStreaming.value).toBe(false)
+      expect(h.messages.value.filter(message => message.role === 'assistant')).toEqual([])
+      h.api.restoreLiveTurnSnapshot(snapshot)
+      expect(h.compaction!.compactStatus.value.status).toBe('completed')
+    } finally { h.stop() }
+  })
+
   it.each(['manual', 'automatic'] as const)(
     'keeps manual maintenance independent when %s compaction starts first', firstSource => {
       const h = createHarness({ withCompactionRuntime: true })

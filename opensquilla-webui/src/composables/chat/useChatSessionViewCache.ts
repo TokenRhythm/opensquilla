@@ -1,5 +1,5 @@
 import { computed, onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue'
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMaintenanceEvent, ChatMessage } from '@/types/chat'
 import { createChatViewCaptureBudget } from './chatViewCaptureBudget'
 
 interface ViewSnapshot<Presentation, Viewport> {
@@ -7,6 +7,13 @@ interface ViewSnapshot<Presentation, Viewport> {
   presentation?: Presentation
   viewport?: Viewport
   bytes: number
+  epoch: number | null
+  identity: string
+}
+
+export interface CompactionPresentationProof {
+  identity: string | null
+  authority: unknown
   epoch: number | null
 }
 
@@ -36,6 +43,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
   const historyReady = ref(false)
   let historyConfirmed = false
   let historyAuthority: unknown = null
+  let historyCompactions: readonly ChatMaintenanceEvent[] = []
   const liveReady = ref(!options.waitForLive)
   let liveConfirmed = !options.waitForLive
   let liveAuthority: unknown = null
@@ -77,7 +85,9 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     if (!budget.include('viewport', viewport)) return
     const serialized = JSON.stringify({ messages: retainedMessages, presentation, viewport })
     const bytes = budget.bytes
-    const snapshot: ViewSnapshot<Presentation, Viewport> = { ...JSON.parse(serialized), bytes, epoch }
+    const snapshot: ViewSnapshot<Presentation, Viewport> = {
+      ...JSON.parse(serialized), bytes, epoch, identity: options.deliveryIdentity.value,
+    }
     if (!installed) return snapshot
     snapshots.set(key, snapshot)
     totalBytes += bytes
@@ -102,6 +112,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
       historyReady.value = false
       historyConfirmed = false
       historyAuthority = null
+      historyCompactions = []
       liveReady.value = !options.waitForLive
       liveConfirmed = !options.waitForLive
       liveAuthority = null
@@ -136,6 +147,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     historyReady.value = false
     historyConfirmed = false
     historyAuthority = null
+    historyCompactions = []
     liveReady.value = !options.waitForLive
     liveConfirmed = !options.waitForLive
     liveAuthority = null
@@ -151,12 +163,78 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     epoch = cached?.epoch ?? null
   }, { flush: 'sync' })
 
-  function historyInstalled(key: string, authoritative = true) {
+  function historyInstalled(key: string, authoritative = true, compactions: readonly ChatMaintenanceEvent[] = []) {
     if (key !== options.sessionKey.value) return
+    // A failed replacement read cannot supersede a readable preview. The
+    // same lease's earlier canonical installation also remains valid when a
+    // refresh failed without replacing its rows. Cold fallback still releases
+    // its display barrier, but cannot become a confirmed navigation snapshot.
+    if (!authoritative && (
+      preview.value
+      || (historyConfirmed && historyAuthority === currentAuthority())
+    )) return
     historyReady.value = true
     historyConfirmed = authoritative
     historyAuthority = currentAuthority()
+    // Only receipts in this canonical read are proof. Merged current messages
+    // may also retain old/local maintenance, which must not mint new authority.
+    const cachedIds = new Set(preview.value?.messages.flatMap(message => message.maintenance
+      ? [message.maintenance.compactionId] : []) ?? [])
+    historyCompactions = authoritative ? compactions.filter(receipt => cachedIds.has(receipt.compactionId)) : []
+    if (authoritative) reconcileHistoryCompactions()
     releasePreview()
+  }
+
+  /** Update presentation only; the cached lease never becomes read authority. */
+  function reconcileCompactionTerminal(key: string, receipt: ChatMaintenanceEvent, proof: CompactionPresentationProof): boolean {
+    const cached = preview.value
+    // Legacy semantic frames can omit epoch. A fast ACK from this exact
+    // current lease can supply it; the preview's old lease cannot.
+    const receiptEpoch = proof.epoch ?? (epochAuthority === proof.authority ? epoch : null)
+    if (key !== options.sessionKey.value || !cached || receipt.kind !== 'context_compaction'
+      || !receipt.compactionId || receipt.state === 'running'
+      || !proof.identity || cached.identity !== proof.identity || options.deliveryIdentity.value !== proof.identity
+      || proof.authority == null || proof.authority !== currentAuthority()
+      || receiptEpoch === null || cached.epoch !== receiptEpoch) return false
+    const index = cached.messages.findIndex(message => message.role === 'maintenance'
+      && message.maintenance?.kind === 'context_compaction'
+      && message.maintenance.compactionId === receipt.compactionId)
+    const previous = cached.messages[index]
+    if (!previous?.maintenance || (previous.maintenance.state !== 'running'
+      && previous.maintenance.state !== receipt.state)) return false
+    const messages = cached.messages.slice()
+    messages[index] = { ...previous, maintenance: {
+      ...previous.maintenance, ...receipt,
+      source: previous.maintenance.source,
+      durability: previous.maintenance.historyArchived ? previous.maintenance.durability
+        : receipt.durability || previous.maintenance.durability,
+      providerRecovery: undefined,
+    } }
+    const budget = createChatViewCaptureBudget(maxBytes)
+    if (!budget.include('messages', messages) || !budget.include('presentation', cached.presentation)
+      || !budget.include('viewport', cached.viewport)) return false
+    const updated = { ...cached, messages, bytes: budget.bytes }
+    // Keep the retained entry coherent across another A/B/A while a reread is
+    // pending. Neither this receipt nor this copy installs current messages.
+    if (snapshots.get(key) === cached) {
+      totalBytes += updated.bytes - cached.bytes
+      snapshots.set(key, updated)
+      while (totalBytes > maxBytes) remove(snapshots.keys().next().value!)
+    }
+    preview.value = updated
+    return true
+  }
+
+  function reconcileHistoryCompactions() {
+    const authority = currentAuthority()
+    if (!historyConfirmed || historyAuthority !== authority || epochAuthority !== authority) return
+    for (const receipt of historyCompactions) {
+      if (receipt.historyArchived && receipt.durability === 'durable') {
+        reconcileCompactionTerminal(options.sessionKey.value, receipt, {
+          identity: options.deliveryIdentity.value, authority, epoch,
+        })
+      }
+    }
   }
 
   function beginLiveRead(key: string) {
@@ -212,6 +290,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     if (previous != null && previous !== next) invalidate(key)
     epoch = next
     epochAuthority = currentAuthority()
+    reconcileHistoryCompactions()
   }
 
   onScopeDispose(() => {
@@ -231,6 +310,7 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     retirePreview,
     liveInstalled,
     observeEpoch,
+    reconcileCompactionTerminal,
     invalidate,
   }
 }

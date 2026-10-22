@@ -1,4 +1,5 @@
 import type { ProviderRecovery } from '@/types/parts'
+import type { ChatMaintenanceEvent } from '@/types/chat'
 import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import {
@@ -11,6 +12,14 @@ import {
 
 export type ChatCompactStatusTone = 'info' | 'ok' | 'warn' | 'err' | string
 export type ChatCompactionPlacement = 'activity' | 'standalone'
+export type ChatCompactionRequestNotice = 'unconfirmed' | 'rejected'
+
+/** A command receipt belongs to this request, not to a backend terminal event. */
+export interface ChatManualCompactionRequest {
+  resolve: (payload: Record<string, unknown>) => void
+  reject: (error: unknown) => ChatCompactionRequestNotice | null
+  retire: () => ChatCompactionRequestNotice | null
+}
 
 export interface ChatCompactStatus {
   providerRecovery?: ProviderRecovery
@@ -83,6 +92,8 @@ interface ChatCompactMeta {
   replayed?: unknown
   placement?: unknown
   authoritativeLive?: unknown
+  /** Presentation only; accepted or validated idempotent terminal, never a rejected event. */
+  onTerminal?: (receipt: ChatMaintenanceEvent) => void
 }
 
 interface TrackedCompactionPlacement {
@@ -135,8 +146,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
   const activeCompactionId = ref('')
   const compactStatus = ref<ChatCompactStatus>(createEmptyCompactStatus())
   const lastSequenceById = new Map<string, number>()
-  const terminalCompactionIds = new Set<string>()
+  const terminalCompactionIds = new Map<string, string>()
   const placementByCompactionId = new Map<string, TrackedCompactionPlacement>()
+  let manualRequest: { key: string; compactionId: string; previousCompactionId: string } | null = null
   let dismissTimer: ReturnType<typeof setTimeout> | null = null
 
   function clearDismissTimer() {
@@ -154,12 +166,65 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     compactInFlight.value = active
     compactInFlightKey.value = active ? String(key || options.sessionKey.value || '') : ''
     if (active && compactionId) activeCompactionId.value = compactionId
-    if (!active) activeCompactionId.value = ''
+    if (!active) {
+      activeCompactionId.value = ''
+      // Reset and terminal settlement retire the command's local receipt too.
+      // Its delayed callback cannot reopen the same session incarnation.
+      manualRequest = null
+    }
   }
 
   function hideCompactStatus() {
     clearDismissTimer()
     compactStatus.value = createEmptyCompactStatus()
+  }
+
+  function beginManualCompactionRequest(key = options.sessionKey.value): ChatManualCompactionRequest {
+    const previousCompactionId = activeCompactionId.value
+      || (compactStatus.value.source === 'manual' ? compactStatus.value.compactionId : '')
+    const request = { key, compactionId: '', previousCompactionId }
+    manualRequest = request
+    const activeId = isCompactInFlightForCurrentSession() ? activeCompactionId.value : ''
+    setCompactInFlight(true, key)
+    showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
+      source: 'manual', compactionId: activeId,
+    })
+
+    function finish(error: unknown, retiring = false): ChatCompactionRequestNotice | null {
+      if (manualRequest !== request) return null
+      manualRequest = null
+      if (request.key !== options.sessionKey.value) return null
+      const rejected = !retiring && !!error && typeof error === 'object'
+        && (error as { accepted?: unknown }).accepted === false
+      // Only a lifecycle observed during this request can confirm its result.
+      // An old terminal receipt must not hide a new command's rejection.
+      if (request.compactionId && terminalCompactionIds.has(request.compactionId)) {
+        return rejected ? 'rejected' : null
+      }
+      if (request.compactionId || (isCompactInFlightForCurrentSession() && activeCompactionId.value)) {
+        // Losing the command ACK cannot end an already accepted operation.
+        return retiring ? null : rejected ? 'rejected' : 'unconfirmed'
+      }
+      if (isCompactInFlightForCurrentSession()) {
+        setCompactInFlight(false)
+        options.popAllPendingIntoComposer()
+      }
+      showCompactStatus('failed', i18n.global.t(rejected ? 'chat.compact.requestRejected' : 'chat.compact.requestUnconfirmed'), {
+        source: 'manual', compactionId: '', tone: 'warn',
+        reason: rejected ? 'request_rejected' : 'request_unconfirmed',
+      })
+      return retiring ? 'unconfirmed' : null
+    }
+
+    return {
+      resolve(payload) {
+        if (manualRequest !== request || request.key !== options.sessionKey.value) return
+        manualRequest = null
+        showCompactionToast({ ...payload, key: request.key, source: 'manual' })
+      },
+      reject: error => finish(error),
+      retire: () => finish(undefined, true),
+    }
   }
 
   function showCompactStatus(status: string, message: string, statusOptions: ShowCompactStatusOptions = {}) {
@@ -232,10 +297,10 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     return String(payload.compaction_id ?? payload.compactionId ?? '').trim()
   }
 
-  function rememberTerminalCompactionId(compactionId: string) {
-    terminalCompactionIds.add(compactionId)
+  function rememberTerminalCompactionId(compactionId: string, status: string) {
+    terminalCompactionIds.set(compactionId, status)
     if (terminalCompactionIds.size <= 256) return
-    const oldest = terminalCompactionIds.values().next().value
+    const oldest = terminalCompactionIds.keys().next().value
     if (typeof oldest === 'string') {
       terminalCompactionIds.delete(oldest)
       lastSequenceById.delete(oldest)
@@ -266,9 +331,10 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
   function acceptCompactionEvent(
     payload: ChatCompactPayload,
     status: string,
-  ): boolean {
+    authoritativeLive: boolean,
+  ): 'accepted' | 'duplicate-terminal' | 'rejected' {
     const payloadKey = String(payload.key || '')
-    if (payloadKey && payloadKey !== options.sessionKey.value) return false
+    if (payloadKey && payloadKey !== options.sessionKey.value) return 'rejected'
     const incomingId = payloadCompactionId(payload)
     const terminal = isCompactionTerminalStatus(status)
     const source = String(payload.source || '').toLowerCase()
@@ -276,9 +342,14 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     // The wait:false RPC acknowledgement can race a very fast terminal event.
     // Once an operation is terminal, its delayed "started" acknowledgement
     // must not resurrect the busy indicator.
-    if (!terminal && incomingId && terminalCompactionIds.has(incomingId)) return false
+    if (!terminal && incomingId && terminalCompactionIds.has(incomingId)) return 'rejected'
+    // A terminal already known before this request is not its receipt. Legacy
+    // terminals can omit sequence, so sequence deduplication alone cannot
+    // protect a newer optimistic command from being retired by that replay.
+    if (manual && terminal && incomingId && terminalCompactionIds.has(incomingId)
+      && manualRequest && manualRequest.compactionId !== incomingId) return 'rejected'
     if (manual && terminal && incomingId && activeCompactionId.value && incomingId !== activeCompactionId.value) {
-      return false
+      return 'rejected'
     }
     // A reconnect terminal is authoritative even while an optimistic
     // wait:false /compact is still waiting for its acknowledgement and has no
@@ -286,17 +357,27 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     // terminal-id cache prevents the delayed started acknowledgement from
     // resurrecting the operation afterwards.
     const sequence = toFiniteNumber(payload.sequence)
+    const previous = incomingId ? lastSequenceById.get(incomingId) ?? 0 : 0
+    if (terminal && incomingId && terminalCompactionIds.has(incomingId)) {
+      // An exact known outcome can repair a detached presentation without
+      // settling controls again. Conflicting outcomes and stale seq cannot.
+      if (terminalCompactionIds.get(incomingId) !== status
+        || (sequence !== null && sequence < previous)) return 'rejected'
+      if (sequence !== null) lastSequenceById.set(incomingId, sequence)
+      return 'duplicate-terminal'
+    }
     if (incomingId && sequence !== null) {
-      const previous = lastSequenceById.get(incomingId) ?? 0
-      if (sequence <= previous) return false
+      const restoreSnapshot = sequence === previous && authoritativeLive && !terminal
+        && (!manual || !compactInFlight.value || activeCompactionId.value === incomingId)
+      if (sequence < previous || (sequence === previous && !restoreSnapshot)) return 'rejected'
       lastSequenceById.set(incomingId, sequence)
     }
     if (manual && status === 'started' && incomingId) activeCompactionId.value = incomingId
     if (terminal) {
-      if (incomingId) rememberTerminalCompactionId(incomingId)
+      if (incomingId) rememberTerminalCompactionId(incomingId, status)
       if (manual) activeCompactionId.value = ''
     }
-    return true
+    return 'accepted'
   }
 
   function showCompactionToast(
@@ -309,6 +390,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       status = payload.compacted ? 'completed' : 'skipped'
     }
     const compactionId = payloadCompactionId(payload)
+    const previouslyTerminal = terminalCompactionIds.has(compactionId)
     // Legacy terminal events may omit their source. Retain the source only
     // for the same operation; never borrow it from an unrelated receipt.
     const source = String(payload.source
@@ -346,11 +428,25 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     // progress event must never resurrect an already-finished busy indicator.
     // Legacy payloads without `status` remain supported via `compacted` above.
     if (meta.replayed === true && !terminal) return false
-    if (!acceptCompactionEvent(payload, status)) {
+    const acceptance = acceptCompactionEvent(payload, status, authoritativeLive)
+    if (terminal && compactionId && acceptance !== 'rejected') {
+      meta.onTerminal?.({
+        kind: 'context_compaction', compactionId, source: source || 'manual',
+        state: status === 'skipped' ? 'skipped' : status === 'stale' ? 'stale'
+          : status === 'cancelled' ? 'cancelled'
+          : ['failed', 'error', 'timed_out'].includes(status) ? 'failed' : 'completed',
+        durability: status === 'emergency_ephemeral' ? 'request_scoped' : String(payload.durability || ''),
+        reason: String(payload.reason || payload.skip_reason || payload.error_reason || ''),
+        ...(typeof payload.detail === 'string' ? { detail: payload.detail } : {}),
+        httpStatus: payload.compactionFailure?.httpStatus,
+        failureKind: payload.compactionFailure?.failureKind,
+      })
+    }
+    if (acceptance !== 'accepted') {
       // Snapshot ownership can arrive after the replayed terminal with the
       // same lifecycle sequence. Placement reconciliation is still new work
       // even though applying the terminal twice is not.
-      return terminal ? correctedPlacement ?? false : false
+      return terminal && acceptance === 'duplicate-terminal' ? correctedPlacement ?? false : false
     }
     const trackedAfterAcceptance = placementByCompactionId.get(placementKey)
     const canCloseTrackedHiddenFeedback = terminal
@@ -383,30 +479,38 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (tracked.provisional) return false
     const placement = tracked.placement
     const inActivity = placement === 'activity'
+    const identity = {
+      ...(source ? { source } : {}),
+      ...(compactionId ? { compactionId } : {}),
+    }
+    if (source === 'manual' && compactionId && !previouslyTerminal
+      && manualRequest?.key === options.sessionKey.value
+      && compactionId !== manualRequest.previousCompactionId
+      && (!manualRequest.compactionId || manualRequest.compactionId === compactionId)) {
+      manualRequest.compactionId = compactionId
+    }
+    if (!terminal && source === 'manual'
+      && (status === 'started' || status === 'observed' || payload.heartbeat === true)) {
+      setCompactInFlight(true, String(payload.key || options.sessionKey.value), compactionId)
+    }
 
     if (status === 'started') {
-      if (source === 'manual') {
-        setCompactInFlight(
-          true,
-          String(payload.key || options.sessionKey.value),
-          payloadCompactionId(payload),
-        )
-      }
       if (inActivity) return placement
       showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
         tone: 'info',
-        source,
-        compactionId,
+        ...identity,
         durability: String(payload.durability || ''),
       })
       return placement
     }
-    if (status === 'observed' || payload.heartbeat === true) {
+    if (!terminal && (status === 'observed' || payload.heartbeat === true)) {
       if (inActivity) return placement
       const stage = String(payload.stage || payload.phase || '').trim()
       showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
         tone: 'info',
         detail: stage,
+        ...identity,
+        durability: String(payload.durability || ''),
         providerRecovery: payload.compactionRecovery,
       })
       return placement
@@ -417,8 +521,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       const skipReason = payload.reason || payload.skip_reason || payload.error_reason || ''
       showCompactStatus('skipped', i18n.global.t(compactionSkippedLabelCode(skipReason)), {
         tone: compactionSkipIsInformational(skipReason) ? 'info' : 'warn',
-        source,
-        compactionId,
+        ...identity,
         reason: skipReason,
       })
       return placement
@@ -428,6 +531,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       if (inActivity) return placement
       showCompactStatus('stale', i18n.global.t('chat.compact.cancelled'), {
         tone: 'warn',
+        ...identity,
         detail: typeof payload.detail === 'string'
           ? payload.detail
           : typeof payload.reason === 'string' ? payload.reason : '',
@@ -449,8 +553,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
         httpStatus: payload.compactionFailure?.httpStatus,
         failureKind: payload.compactionFailure?.failureKind,
         detail: manualFailure ? i18n.global.t(failure.detail) : '',
-        source,
-        compactionId,
+        ...identity,
         reason,
       })
       return placement
@@ -466,8 +569,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       showCompactStatus('timed_out', i18n.global.t(manualFailure ? failure.title : 'chat.compact.incomplete'), {
         tone: manualFailure ? 'warn' : 'info',
         detail: manualFailure ? i18n.global.t(failure.detail) : '',
-        source,
-        compactionId,
+        ...identity,
         reason: 'compaction_deadline_exceeded',
       })
       return placement
@@ -477,8 +579,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       if (inActivity) return placement
       showCompactStatus('cancelled', i18n.global.t('chat.compact.cancelled'), {
         tone: 'warn',
-        source,
-        compactionId,
+        ...identity,
       })
       return placement
     }
@@ -487,8 +588,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       if (inActivity) return placement
       showCompactStatus('emergency_ephemeral', i18n.global.t('chat.compact.temporarilyReduced'), {
         tone: 'ok',
-        source,
-        compactionId,
+        ...identity,
         durability: 'request_scoped',
       })
       return placement
@@ -498,8 +598,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       if (inActivity) return placement
       showCompactStatus('completed', i18n.global.t(compactionCompletedLabelCode(payload.durability)), {
         tone: 'ok',
-        source,
-        compactionId,
+        ...identity,
         durability: String(payload.durability || ''),
       })
       return placement
@@ -527,6 +626,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
 
   function cleanup() {
     clearDismissTimer()
+    manualRequest = null
     activeCompactionId.value = ''
     lastSequenceById.clear()
     terminalCompactionIds.clear()
@@ -535,6 +635,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
 
   return {
     compactStatus,
+    beginManualCompactionRequest,
     getCompactionPlacement,
     isCompactInFlightForCurrentSession,
     setCompactInFlight,

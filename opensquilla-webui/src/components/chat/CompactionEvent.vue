@@ -2,12 +2,13 @@
   <div
     class="chat-compaction-event"
     :class="{
-      'chat-compaction-event--running': maintenance?.state === 'running' && maintenance.providerRecovery?.phase !== 'retry_wait',
+      'chat-compaction-event--running': !recovering && maintenance?.state === 'running' && maintenance.providerRecovery?.phase !== 'retry_wait',
       'chat-compaction-event--failed': isFailure,
     }"
     data-testid="compaction-event"
     :data-compaction-id="maintenance?.compactionId"
-    :data-status="maintenance?.state"
+    :data-status="recovering ? 'recovering' : maintenance?.state"
+    :data-freshness="recovering ? 'last-known' : undefined"
     :data-source="maintenance?.source"
     :data-durability="maintenance?.durability"
     data-placement="transcript"
@@ -44,18 +45,20 @@ import {
 
 const props = defineProps<{
   message: ChatRenderedMessage
+  preview?: boolean
 }>()
 
 const { t } = useI18n()
 const maintenance = computed(() => props.message.maintenance)
+const recovering = computed(() => props.preview && maintenance.value?.state === 'running')
 const temporaryRecovery = computed(() => maintenance.value?.state === 'completed' && maintenance.value.durability === 'request_scoped')
 // A failed automatic attempt may still be recovered by the owning turn.
 // Keep its receipt factual; the turn's SystemMessage owns the terminal error.
 const isFailure = computed(() => maintenance.value?.state === 'failed' && maintenance.value.source === 'manual')
-const now = useProviderRecoveryClock(() => !props.message.restoredFromHistory && maintenance.value?.state === 'running' && maintenance.value.providerRecovery?.phase === 'retry_wait')
+const now = useProviderRecoveryClock(() => !props.preview && !props.message.restoredFromHistory && maintenance.value?.state === 'running' && maintenance.value.providerRecovery?.phase === 'retry_wait')
 function recoveryText(announce = false): string {
   const value = maintenance.value
-  if (!value?.providerRecovery || value.state !== 'running') return ''
+  if (recovering.value || !value?.providerRecovery || value.state !== 'running') return ''
   const label = providerActivityLabel({ key: value.compactionId, at: 0, isCurrent: !props.message.restoredFromHistory, providerRecovery: value.providerRecovery, label: { code: 'chat.compact.compacting', params: {} } }, now.value, announce)
   return String(t(label.code, label.params))
 }
@@ -63,6 +66,7 @@ const recoveryLabel = computed(() => recoveryText())
 const recoveryAnnouncement = computed(() => maintenance.value?.providerRecovery?.phase === 'retry_wait' ? recoveryText(true) : '')
 const failure = computed(() => compactionFailurePresentation(maintenance.value?.reason))
 const labelCode = computed(() => {
+  if (recovering.value) return 'chat.compact.recovering'
   if (temporaryRecovery.value) return 'chat.compact.compacted'
   if (maintenance.value?.state === 'running') return 'chat.compact.compacting'
   if (maintenance.value?.state === 'failed') return isFailure.value ? failure.value.title : 'chat.compact.incomplete'
@@ -86,7 +90,7 @@ const detailLabelCode = computed(() => {
   return ''
 })
 const liveRole = computed(() => {
-  if (props.message.restoredFromHistory) return undefined
+  if (props.preview || props.message.restoredFromHistory) return undefined
   return isFailure.value ? 'alert' : 'status'
 })
 const liveMode = computed(() => {

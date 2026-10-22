@@ -12,6 +12,7 @@ import type {
   UsageReportingRequestOptions,
 } from '@/modules/usageReporting'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import type { ChatManualCompactionRequest, ChatCompactionRequestNotice } from './useChatCompaction'
 import {
   formatGoalDuration,
   type GoalSnapshot,
@@ -95,13 +96,7 @@ export interface UseChatSlashCommandsOptions {
   autoResizeTextarea: () => void
   newSession: () => void
   resetCurrentSession: () => void
-  setCompactInFlight: (active: boolean, key?: string) => void
-  showCompactStatus: (
-    status: string,
-    message: string,
-    options?: { tone?: string; detail?: string; dismissMs?: number; source?: string },
-  ) => void
-  showCompactionToast: (payload: Record<string, unknown>, meta?: Record<string, unknown>) => void
+  beginManualCompactionRequest: (key: string) => ChatManualCompactionRequest
   notify: (message: string) => void
   activatePlanMode?: () => boolean | Promise<boolean>
   planModeAvailable?: () => boolean
@@ -249,6 +244,20 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   let candidateEpoch = 0
   let catalogEpoch = 0
   let catalogLoad: Promise<void> | null = null
+  let compactRequest: ChatManualCompactionRequest | null = null
+  function showCompactRequestNotice(notice: ChatCompactionRequestNotice | null) {
+    if (notice) options.notify(i18n.global.t(notice === 'rejected'
+      ? 'chat.compact.requestRejected' : 'chat.compact.requestUnconfirmed'))
+  }
+  watch([options.sessionKey, () => options.catalogScope?.()], () => {
+    const previous = compactRequest
+    compactRequest = null
+    if (previous) showCompactRequestNotice(previous.retire())
+  }, { flush: 'sync' })
+  if (getCurrentScope()) onScopeDispose(() => {
+    compactRequest?.retire()
+    compactRequest = null
+  })
   watch(() => options.catalogScope?.(), () => {
     catalogEpoch += 1
     catalogLoad = null
@@ -625,24 +634,17 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       case 'sessions.contextCompact':
       case '/compact': {
         const compactKey = options.sessionKey.value
-        options.setCompactInFlight(true, compactKey)
-        options.showCompactStatus('started', i18n.global.t('chat.compact.compacting'), {
-          tone: 'info',
-          source: 'manual',
-        })
+        const request = options.beginManualCompactionRequest(compactKey)
+        compactRequest = request
         maintenance.compact({ key: compactKey, wait: false })
           .then((result) => {
-            if (compactKey !== options.sessionKey.value) return
-            options.showCompactionToast({ ...result, key: compactKey, source: 'manual' })
-          })
-          .catch((err: unknown) => {
-            if (compactKey !== options.sessionKey.value) return
-            options.showCompactionToast({
-              key: compactKey,
-              source: 'manual',
-              status: 'failed',
-              detail: err instanceof Error ? err.message : String(err),
-            })
+            if (compactRequest !== request || compactKey !== options.sessionKey.value) return
+            compactRequest = null
+            request.resolve({ ...result })
+          }, (err: unknown) => {
+            if (compactRequest !== request || compactKey !== options.sessionKey.value) return
+            compactRequest = null
+            showCompactRequestNotice(request.reject(err))
           })
         break
       }

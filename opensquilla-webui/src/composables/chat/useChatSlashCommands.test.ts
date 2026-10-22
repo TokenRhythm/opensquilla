@@ -1,5 +1,5 @@
 import i18n, { loadLocaleMessages } from '@/i18n'
-import { nextTick, ref, watch } from 'vue'
+import { effectScope, nextTick, ref, watch } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
@@ -8,7 +8,7 @@ import { useLocalPathDraft } from './useLocalPathDraft'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { RpcCallOptions } from '@/lib/rpc'
-import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import type { SessionCompactionResult, SessionMaintenance } from '@/modules/sessionMaintenance'
 import { usageReportingDouble } from '@/testing/usage.test-helper'
 import {
   commandCatalogFromTestRpc,
@@ -169,9 +169,7 @@ function harness(
     autoResizeTextarea: vi.fn(),
     newSession: vi.fn(),
     resetCurrentSession: vi.fn(),
-    setCompactInFlight: vi.fn(),
-    showCompactStatus: vi.fn(),
-    showCompactionToast: vi.fn(),
+    beginManualCompactionRequest: vi.fn(() => ({ resolve: vi.fn(), reject: vi.fn(() => null), retire: vi.fn(() => null) })),
     notify,
     activatePlanMode,
     planModeAvailable: () => planModeAvailable,
@@ -224,9 +222,7 @@ describe('useChatSlashCommands compaction lifecycle', () => {
       })
       const { api, sessionMaintenance } = harness(false, [], Promise.resolve(), undefined, {
         sessionKey,
-        setCompactInFlight: compaction.setCompactInFlight,
-        showCompactStatus: compaction.showCompactStatus,
-        showCompactionToast: compaction.showCompactionToast,
+        beginManualCompactionRequest: compaction.beginManualCompactionRequest,
       })
       api.selectSlashCmd({ name: '/compact', cmd: '/compact', label: 'Compact', desc: '', aliases: [] })
 
@@ -256,6 +252,103 @@ describe('useChatSlashCommands compaction lifecycle', () => {
       stop()
       compaction.cleanup()
     }
+  })
+
+  function commandDeferred() {
+    let resolve!: (result: SessionCompactionResult) => void
+    let reject!: (error: unknown) => void
+    const promise = new Promise<SessionCompactionResult>((accept, refuse) => { resolve = accept; reject = refuse })
+    return { promise, resolve, reject }
+  }
+
+  function integratedHarness() {
+    const scope = effectScope()
+    const sessionKey = ref('agent:main:webchat:A')
+    const catalogScope = ref('gateway-1')
+    const recover = vi.fn(() => true)
+    const compaction = scope.run(() => useChatCompaction({ sessionKey, popAllPendingIntoComposer: recover, schedulePendingDrainAfterTerminal: vi.fn() }))!
+    const h = scope.run(() => harness(false, [], Promise.resolve(), undefined, {
+      sessionKey, catalogScope: () => catalogScope.value,
+      beginManualCompactionRequest: compaction.beginManualCompactionRequest,
+    }))!
+    const start = () => h.api.selectSlashCmd({ name: '/compact', cmd: '/compact', label: 'Compact', desc: '', aliases: [] })
+    const progress = (id: string) => compaction.showCompactionToast({
+      key: sessionKey.value, source: 'manual', compaction_id: id, status: 'observed', sequence: 1,
+    })
+    const result = (id: string): SessionCompactionResult => ({
+      key: sessionKey.value, compactionId: id, status: 'started', compacted: false, applied: false, durability: 'none', userVisible: true,
+    })
+    return { ...h, scope, sessionKey, catalogScope, compaction, recover, start, progress, result }
+  }
+
+  it.each(['resolve', 'reject'] as const)('ignores an old %s after leaving and returning to the same session', async outcome => {
+    const h = integratedHarness()
+    const old = commandDeferred()
+    const current = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+    try {
+      h.start()
+      h.progress('cmp-old')
+      h.sessionKey.value = 'agent:main:webchat:B'
+      h.compaction.setCompactInFlight(false)
+      h.compaction.hideCompactStatus()
+      h.sessionKey.value = 'agent:main:webchat:A'
+      h.start()
+      h.progress('cmp-current')
+      if (outcome === 'resolve') old.resolve(h.result('cmp-old'))
+      else old.reject(new Error('old connection closed'))
+      await Promise.resolve()
+      expect(h.compaction.compactStatus.value).toMatchObject({ compactionId: 'cmp-current', isBusy: true })
+      expect(h.compaction.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(h.notify).not.toHaveBeenCalled()
+      current.resolve(h.result('cmp-current'))
+      await Promise.resolve()
+    } finally { h.scope.stop(); h.compaction.cleanup() }
+  })
+
+  it('retires an unacknowledged request when the Gateway scope changes, even if no snapshot arrives', async () => {
+    const h = integratedHarness()
+    const request = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(request.promise)
+    try {
+      h.start()
+      h.catalogScope.value = 'gateway-2'
+      expect(h.compaction.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.compaction.compactStatus.value).toMatchObject({ reason: 'request_unconfirmed', status: 'failed' })
+      expect(h.recover).toHaveBeenCalledOnce()
+      expect(h.notify).toHaveBeenCalledWith(i18n.global.t('chat.compact.requestUnconfirmed'))
+      request.resolve(h.result('cmp-old-generation'))
+      await Promise.resolve()
+      expect(h.compaction.compactStatus.value.compactionId).toBe('')
+    } finally { h.scope.stop(); h.compaction.cleanup() }
+  })
+
+  it('retires the optimistic request on disposal without reviving it from a late rejection', async () => {
+    const h = integratedHarness()
+    const request = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(request.promise)
+    h.start()
+    h.scope.stop()
+    expect(h.compaction.isCompactInFlightForCurrentSession()).toBe(false)
+    request.reject(new Error('old view connection closed'))
+    await Promise.resolve()
+    expect(h.notify).not.toHaveBeenCalled()
+    h.compaction.cleanup()
+  })
+
+  it('reports command uncertainty while preserving its already accepted operation', async () => {
+    const h = integratedHarness()
+    const request = commandDeferred()
+    vi.mocked(h.sessionMaintenance.compact).mockReturnValueOnce(request.promise)
+    try {
+      h.start()
+      h.progress('cmp-running')
+      request.reject(new Error('lost command acknowledgement'))
+      await Promise.resolve()
+      expect(h.compaction.compactStatus.value).toMatchObject({ compactionId: 'cmp-running', isBusy: true })
+      expect(h.notify).toHaveBeenCalledWith(i18n.global.t('chat.compact.requestUnconfirmed'))
+      expect(h.recover).not.toHaveBeenCalled()
+    } finally { h.scope.stop(); h.compaction.cleanup() }
   })
 })
 

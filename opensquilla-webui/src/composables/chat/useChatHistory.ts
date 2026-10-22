@@ -1,6 +1,7 @@
 import { projectConversationHistoryMessage, compactionSummaryMessages, summaryCompactionIds, isHistoryMaintenance, mergeHistoryMaintenance, turnOutcomeRecord, attachHistoryTurnOutcomes, preserveAcceptedEnsembleRouterRows } from '@/utils/chat/conversationHistory'
 import { nextTick, ref, watch, type Ref } from 'vue'
 import type {
+  ChatMaintenanceEvent,
   ChatMessage,
   ChatTurnOutcome,
 } from '@/types/chat'
@@ -51,7 +52,7 @@ export interface UseChatHistoryOptions {
   scrollToBottom: () => void
   onTerminalTask?: (outcome: ChatTurnOutcome) => void
   /** A current canonical page has been installed; display-only previews may retire. */
-  onHistoryInstalled?: (key: string) => void
+  onHistoryInstalled?: (key: string, compactions: readonly ChatMaintenanceEvent[]) => void
   /** Display-only window size; does not restore pagination or replay cursors. */
   initialWindowSize?: () => number
 }
@@ -545,6 +546,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         )
       ))
       const maintenanceMessages = compactionSummaryMessages(data)
+      const installedCompactions = () => maintenanceMessages.flatMap(message => message.maintenance ? [message.maintenance] : [])
       let historyData = data
       let bridgeContinuationNeeded = false
       const needsForwardBridge = canonicalAvailable !== false
@@ -717,7 +719,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           options.lastHeaderRole.value = ''
           options.lastHeaderDay.value = ''
         }
-        if (canonicalAvailable !== false || confirmedEmptyDraft) options.onHistoryInstalled?.(key)
+        if (canonicalAvailable !== false || confirmedEmptyDraft) options.onHistoryInstalled?.(key, installedCompactions())
         acknowledgePreservedLocalTail()
         flushPendingHistorySync()
         return { ok: true }
@@ -766,7 +768,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
-      if (!params.prepend && canonicalAvailable !== false) options.onHistoryInstalled?.(key)
+      if (!params.prepend && canonicalAvailable !== false) options.onHistoryInstalled?.(key, installedCompactions())
 
       // The list virtualizer owns prepend/reflow geometry. History only
       // preserves the user's live-edge intent across its async data commit.

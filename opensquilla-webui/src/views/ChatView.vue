@@ -940,6 +940,7 @@ import {
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import { useChatSessionViewCache } from '@/composables/chat/useChatSessionViewCache'
+import { projectInitialCompactionRows } from '@/utils/chat/compactionPresentation'
 import {
   useChatSessionSubscription,
 } from '@/composables/chat/useChatSessionSubscription'
@@ -2211,7 +2212,7 @@ const {
   getCompactionPlacement,
   setCompactInFlight,
   hideCompactStatus,
-  showCompactStatus,
+  beginManualCompactionRequest,
   showCompactionToast,
   handleStreamGenerationChange: handleCompactionStreamGenerationChange,
   cleanup: cleanupCompaction,
@@ -2600,7 +2601,15 @@ const findContextRendered = useChatRenderedMessages({
   isSubagentCompletionMessage, timeTranslator: t,
 })
 const findDisplayMessages = computed(() => findContextMessages.value
-  ? findContextRendered.renderedMessages.value : visibleRenderedMessages.value)
+  ? findContextRendered.renderedMessages.value
+  : projectInitialCompactionRows(visibleRenderedMessages.value, {
+    sessionKey: sessionKey.value,
+    historySessionKey: historySessionKey.value,
+    initialHistoryStatus: historyState.value.initialLoadStatus,
+    retrying: historyState.value.retrying,
+    showingPreview: sessionViewCache.showingPreview.value,
+    compactionId: compactStatus.value.compactionId,
+  }))
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
@@ -2634,7 +2643,7 @@ const chatHistory = useChatHistory({
   canApplyViewportCorrection: () => !historyNavigationScrollLock.locked,
   stripTimePrefix,
   scrollToBottom,
-  onHistoryInstalled: sessionViewCache.historyInstalled,
+  onHistoryInstalled: (key, compactions) => sessionViewCache.historyInstalled(key, true, compactions),
   initialWindowSize: () => sessionViewCache.showingPreview.value ? sessionViewCache.messages.value.length : 0,
   onTerminalTask: outcome => {
     const taskId = outcome.taskId || ''
@@ -2953,6 +2962,7 @@ const chatSessionSubscription = useChatSessionSubscription({
     chatCompaction.handleGatewayRestart()
   },
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
+  onReadEpoch: sessionViewCache.observeEpoch,
   onReadStarted: () => {
     sessionViewCache.beginLiveRead(sessionKey.value)
     presentationMetadataReady.value = false
@@ -3775,9 +3785,7 @@ const chatSlashCommands = useChatSlashCommands({
     scheduleHistorySync()
     void retryLive()
   },
-  setCompactInFlight,
-  showCompactStatus,
-  showCompactionToast,
+  beginManualCompactionRequest,
   notify: (message: string) => pushToast(message, { duration: 6000 }),
   activatePlanMode: activatePlanComposerMode,
   planModeAvailable: () => planUiAvailable.value,
@@ -4557,7 +4565,19 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   clearPendingRouterDecision,
   handleRouterControlReplay,
   resetRouterReplayCursor,
-  showCompactionToast,
+  showCompactionToast: (payload, meta) => {
+    // This callback runs only after the RPC consumer's cursor/owner fences.
+    // Bind the receipt to this read, never to the cached snapshot's old lease.
+    const key = sessionKey.value
+    const authority = sessionReadLifecycle.current()
+    const identity = deliveryIdentity.value
+    return showCompactionToast(payload, {
+      ...meta,
+      onTerminal: receipt => sessionViewCache.reconcileCompactionTerminal(key, receipt, {
+        identity, authority, epoch: typeof payload.epoch === 'number' ? payload.epoch : null,
+      }),
+    })
+  },
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
   supportsTurnCommitted: () => gatewayAccess.turnCommittedEvents,

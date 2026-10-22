@@ -57,6 +57,8 @@ export interface UseChatSessionSubscriptionOptions {
   /** Retire maintenance owned by a replaced process before replaying its successor. */
   onStreamGenerationReset?: () => void
   onLiveSnapshot?: (snapshot: SessionReadSnapshot) => void
+  /** Current lease's fast epoch proof, independent of deferred task metadata. */
+  onReadEpoch?: (key: string, epoch: number | null) => void
   onReadStarted?: () => void
   /** Local projection is ready for events; runs before transport confirmation. */
   onSnapshotInstalled?: () => void
@@ -415,6 +417,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
       assertOwnershipSnapshotCurrent(ownershipRevision)
+      options.onReadEpoch?.(key, live.initialMetadata.epoch)
       async function finishInstallation() {
         // The base/history/metadata are now installed. Release the local event
         // fence before requesting replay, so each tail frame is rendered and
