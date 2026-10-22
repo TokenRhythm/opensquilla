@@ -51,6 +51,19 @@ class HistoryPage:
     canonical_complete: bool
 
 
+@dataclass(frozen=True, slots=True)
+class SessionHistoryView[T]:
+    """A captured history result and the durable owner of its committed view."""
+
+    session_id: str | None
+    session_epoch: int | None
+    value: T
+
+
+class HistoryViewOwnerChangedError(RuntimeError):
+    """The captured view belongs to a session incarnation that was replaced."""
+
+
 class CanonicalHistoryReadError(RuntimeError):
     """Raised when canonical projection fails for a non-cursor reason."""
 
@@ -213,8 +226,10 @@ __all__ = [
     "CanonicalHistoryReader",
     "HistoryCursor",
     "HistoryPage",
+    "HistoryViewOwnerChangedError",
     "SessionHistoryApplication",
     "SessionHistoryQuery",
+    "SessionHistoryView",
     "cursor_for_entry",
     "paginate_transcript",
 ]

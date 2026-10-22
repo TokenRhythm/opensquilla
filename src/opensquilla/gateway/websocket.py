@@ -241,7 +241,11 @@ _CONTROL_RPC_METHODS = frozenset({"transport.flow.update", "transport.sessionFlo
 _MAX_CONTROL_REQUESTS = 64
 _CONTROL_DRAIN_SECONDS = 2.0
 _MAX_FLOW_LANE_EPOCHS = 16
-_RECOVERY_READ_METHODS = frozenset({
+# Canonical WAL history owns the same per-session SQLite permit as hydration.
+# Admission is a server rule even for SDK/older peers without recovery caps;
+# otherwise their history can race a modern peer's scheduled metadata read.
+_UNCONDITIONAL_RECOVERY_READ_METHODS = frozenset({"sessions.history.page.v2"})
+_RECOVERY_READ_METHODS = _UNCONDITIONAL_RECOVERY_READ_METHODS | frozenset({
     "chat.history", "sessions.messages.subscribe", "sessions.messages.snapshot",
     "sessions.messages.snapshot.read", "sessions.messages.hydrate", "sessions.messages.resume",
 })
@@ -1666,7 +1670,7 @@ class WsConnection:
         self._recovery_runtime = runtime
         scheduler = get_recovery_scheduler()
         predecessors: list[asyncio.Future[Any]] = []
-        tail = scheduler.mutation_tail(runtime, key)
+        tail = scheduler.read_barrier_tail(runtime, key)
         if tail is not None:
             predecessors.append(tail)
         intent = None
@@ -3839,7 +3843,7 @@ async def handle_ws_connection(
             sessions_routing_model_selection=True,
             concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
             cancellable_request_methods=sorted(
-                _CANCELLABLE_REQUEST_METHODS | (
+                _CANCELLABLE_REQUEST_METHODS | _UNCONDITIONAL_RECOVERY_READ_METHODS | (
                     _RECOVERY_READ_METHODS if conn._recovery_enabled else frozenset()
                 )
             ),
@@ -4104,7 +4108,9 @@ def _admit_session_mutation(
     tails = []
     scheduler = get_recovery_scheduler()
     for key in keys:
-        predecessor, tail = scheduler.admit_mutation(runtime, key)
+        predecessor, tail = scheduler.admit_mutation(
+            runtime, key, blocks_reads=method != "sessions.contextCompact",
+        )
         if predecessor is not None:
             predecessors.append(predecessor)
         tails.append(tail)
@@ -4352,9 +4358,12 @@ async def _message_loop(
                 method == "transport.flow.update" and isinstance(params, dict)
                 and params.get("resume")
             )
-            if (conn._recovery_enabled and method in (
-                _RECOVERY_READ_METHODS | _RECOVERY_CONTROL_METHODS
-            )) or legacy_resume:
+            if (
+                method in _UNCONDITIONAL_RECOVERY_READ_METHODS
+                or (conn._recovery_enabled and method in (
+                    _RECOVERY_READ_METHODS | _RECOVERY_CONTROL_METHODS
+                )) or legacy_resume
+            ):
                 try:
                     admitted_params = _authorized_admission_params(dispatcher, method, params, ctx)
                 except (ValueError, KeyError):

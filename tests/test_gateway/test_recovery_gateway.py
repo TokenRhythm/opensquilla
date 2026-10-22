@@ -1489,7 +1489,7 @@ async def test_rejected_recovery_admission_releases_new_transfer(connection, mon
         )
     else:
         class RejectingScheduler:
-            def mutation_tail(self, *_args):
+            def read_barrier_tail(self, *_args):
                 return None
 
             def submit(self, *_args, **_kwargs):

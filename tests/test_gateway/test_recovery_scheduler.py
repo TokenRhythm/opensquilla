@@ -249,3 +249,39 @@ async def test_dispatcher_response_claim_suppresses_late_stale():
     await asyncio.sleep(0)
     assert terminal == []
     assert scheduler.running == scheduler.waiting == 0
+
+
+async def test_owner_preserving_mutation_keeps_dispatch_order_without_blocking_reads():
+    scheduler = RecoveryScheduler()
+    runtime = object()
+    predecessor, reset = scheduler.admit_mutation(runtime, "A")
+    assert predecessor is None
+    predecessor, compact = scheduler.admit_mutation(runtime, "A", blocks_reads=False)
+    assert predecessor is reset
+    assert scheduler.mutation_tail(runtime, "A") is compact
+    assert scheduler.read_barrier_tail(runtime, "A") is reset
+    reset.set_result(None)
+    await asyncio.sleep(0)
+    assert scheduler.read_barrier_tail(runtime, "A") is None
+    assert scheduler.mutation_tail(runtime, "A") is compact
+    compact.set_result(None)
+    await asyncio.sleep(0)
+    assert scheduler.mutation_tail(runtime, "A") is None
+
+
+async def test_old_barrier_completion_cannot_clear_a_later_mutation_barrier():
+    scheduler = RecoveryScheduler()
+    runtime = object()
+    _, old = scheduler.admit_mutation(runtime, "A")
+    _, compact = scheduler.admit_mutation(runtime, "A", blocks_reads=False)
+    predecessor, replacement = scheduler.admit_mutation(runtime, "A")
+    assert predecessor is compact
+    old.set_result(None)
+    compact.set_result(None)
+    await asyncio.sleep(0)
+    assert scheduler.mutation_tail(runtime, "A") is replacement
+    assert scheduler.read_barrier_tail(runtime, "A") is replacement
+    assert scheduler.read_barrier_tail(object(), "A") is None
+    replacement.set_result(None)
+    await asyncio.sleep(0)
+    assert scheduler.read_barrier_tail(runtime, "A") is None

@@ -115,7 +115,10 @@ from opensquilla.gateway.adapters.plans_contract import (
 from opensquilla.gateway.adapters.session_control_contract import (
     register_session_control_contract,
 )
-from opensquilla.gateway.adapters.session_history_projection import read_chat_history_v4
+from opensquilla.gateway.adapters.session_history_projection import (
+    _project_fork_workspace_previews,
+    read_chat_history_v4,
+)
 from opensquilla.gateway.adapters.session_lifecycle import (
     GatewaySessionLifecycleAdapter,
 )
@@ -5254,13 +5257,87 @@ async def _handle_sessions_read_close_v2(params: dict | None, ctx: RpcContext) -
 
 
 async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.application.session_history import HistoryViewOwnerChangedError
+    from opensquilla.gateway.adapters.session_history import SessionHistoryStorageAdapter
+
+    manager = getattr(ctx, "session_manager", None)
+    adapter = SessionHistoryStorageAdapter(manager)
+    if not adapter.supports_committed_view:
+        return await _read_sessions_history_page_v2(params, ctx)
+    key = _require_key(params)
+    assert isinstance(params, dict)
+    view = await adapter.read_view(
+        key, lambda owner: _read_sessions_history_page_v2(params, ctx, pinned_owner=owner),
+    )
+    result = view.value
+    messages = [item["message"] for item in result["items"]]
+    projected = await _project_fork_workspace_previews(
+        messages, session_key=key, manager=manager,
+    )
+    for item, message in zip(result["items"], projected, strict=True):
+        item["message"] = message
+    _bound_projected_history_page(result, params, key=key)
+    try:
+        # This read is outside the captured transaction. Re-reading its owner
+        # inside that transaction would only prove the old snapshot's identity.
+        await adapter.require_current_owner(key, view)
+    except HistoryViewOwnerChangedError as exc:
+        raise RpcHandlerError(
+            "REBASE_REQUIRED", "Session identity changed before history publication",
+            accepted=False,
+        ) from exc
+    return result
+
+
+def _bound_projected_history_page(
+    result: dict[str, Any], params: dict, *, key: str,
+) -> None:
+    """Keep optional post-snapshot aliases inside the transport byte budget."""
+
+    target_bytes = min(1_048_576, max(1, int(params.get("target_bytes") or 1_048_576)))
+    direction = "before" if params.get("anchor_message_id") else params["direction"]
+    items = result["items"]
+    while (
+        len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > target_bytes
+    ):
+        if len(items) <= 1:
+            raise RpcHandlerError(
+                "RESPONSE_TOO_LARGE", "History metadata exceeds the requested page byte budget",
+                accepted=False,
+            )
+        items.pop(0 if direction == "before" else -1)
+        message = items[0 if direction == "before" else -1]["message"]
+        boundary = message.get(
+            "historyCursorBefore" if direction == "before" else "historyCursorAfter",
+        )
+        if not isinstance(boundary, str):
+            timestamp, transcript_id = message.get("timestamp"), message.get("transcript_id")
+            if timestamp is None or transcript_id is None:
+                raise RpcHandlerError(
+                    "RESPONSE_TOO_LARGE", "History item has no resumable boundary", accepted=False,
+                )
+            boundary = f"{int(timestamp)}|{int(transcript_id)}"
+        result[f"{direction}_cursor"] = _v2_cursor_encode(
+            key=key, session_id=result["session_id"], session_epoch=result["session_epoch"],
+            direction=direction, cursor=boundary,
+        )
+        result[f"has_more_{direction}"] = True
+        result["complete_for_requested_window"] = False
+
+
+async def _read_sessions_history_page_v2(
+    params: dict | None, ctx: RpcContext,
+    *, pinned_owner: tuple[str | None, int | None] | None = None,
+) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params required: key, direction")
     key = _require_key(params)
     direction = params.get("direction")
     if direction not in {"before", "after"}:
         raise ValueError("params.direction must be before or after")
-    session_id, session_epoch = await _snapshot_session_identity(ctx, key)
+    session_id, session_epoch = (
+        pinned_owner if pinned_owner is not None else await _snapshot_session_identity(ctx, key)
+    )
     if not isinstance(session_id, str) or session_epoch is None:
         raise RpcHandlerError("NOT_FOUND", "Session not found", accepted=False)
     if params.get("session_id") is not None and params["session_id"] != session_id:
@@ -5421,7 +5498,9 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
             raise RpcHandlerError(
                 'HISTORY_STALE', 'Search message changed during navigation', accepted=False,
             )
-        if await _snapshot_session_identity(ctx, key) != (session_id, session_epoch):
+        if pinned_owner is None and await _snapshot_session_identity(ctx, key) != (
+            session_id, session_epoch,
+        ):
             raise RpcHandlerError('REBASE_REQUIRED', 'Session identity changed', accepted=False)
     if (
         len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))

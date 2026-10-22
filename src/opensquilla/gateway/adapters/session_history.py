@@ -15,14 +15,18 @@ leaving the v4 wire shape and all legacy fallback/error semantics untouched.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Awaitable, Callable, Sequence
+from typing import cast
 
 import structlog
 
 from opensquilla.application.session_history import (
     CanonicalHistoryReadError,
     HistoryPage,
+    HistoryViewOwnerChangedError,
     SessionHistoryApplication,
+    SessionHistoryView,
     cursor_for_entry,
     paginate_transcript,
 )
@@ -30,16 +34,19 @@ from opensquilla.chat.flattened_tool_markers import (
     has_flattened_used_tool_line,
     is_flattened_tool_result_dump,
 )
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.history_cursor import (
     HISTORY_CURSOR_MAX_INTEGER,
     HistoryCursor,
     HistoryCursorInvalidatedError,
     HistoryCursorInvalidError,
 )
+from opensquilla.recovery_read_budget import current_read_budget, recovery_read_scope
 from opensquilla.session.storage import StorageBusyError
 
 log = structlog.get_logger(__name__)
 _MAX_HISTORY_CURSOR_INTEGER_TEXT = str(HISTORY_CURSOR_MAX_INTEGER)
+_HISTORY_VIEW_TIMEOUT_SECONDS = 5.0
 
 
 async def _read_page_bounded(
@@ -146,6 +153,70 @@ class SessionHistoryStorageAdapter:
 
     def __init__(self, manager: object) -> None:
         self._manager = manager
+        self._storage = get_session_storage(manager)
+
+    @property
+    def supports_committed_view(self) -> bool:
+        return getattr(self._storage, "supports_committed_history_view", False) is True
+
+    @property
+    def in_committed_view(self) -> bool:
+        return getattr(self._storage, "in_committed_history_view", False) is True
+
+    async def read_view[T](
+        self, session_key: str,
+        read: Callable[[tuple[str | None, int | None]], Awaitable[T]],
+    ) -> SessionHistoryView[T]:
+        """Capture identity and all callback reads on one committed transaction."""
+
+        storage = self._storage
+        if storage is None:
+            raise RuntimeError("Session history storage is unavailable")
+
+        async def capture() -> SessionHistoryView[T]:
+            node = await storage.get_session(session_key)
+            owner: tuple[str | None, int | None] = (
+                (node.session_id, int(node.epoch or 0)) if node is not None else (None, None)
+            )
+            return SessionHistoryView(owner[0], owner[1], await read(owner))
+
+        if current_read_budget() is not None:
+            return cast(
+                SessionHistoryView[T],
+                await storage.read_committed_history_view("history.view", capture),
+            )
+        with recovery_read_scope(
+            session_key, deadline=time.monotonic() + _HISTORY_VIEW_TIMEOUT_SECONDS,
+        ):
+            return cast(
+                SessionHistoryView[T],
+                await storage.read_committed_history_view("history.view", capture),
+            )
+
+    async def require_current_owner(self, session_key: str, view: SessionHistoryView) -> None:
+        """Check publication against a fresh view after the capture transaction exits."""
+
+        if self.in_committed_view:
+            raise RuntimeError("Fresh owner checks must run outside the history snapshot")
+        storage = self._storage
+        if storage is None:
+            raise RuntimeError("Session history storage is unavailable")
+
+        async def current_owner() -> tuple[str | None, int | None]:
+            node = await storage.get_session(session_key)
+            return (node.session_id, int(node.epoch or 0)) if node is not None else (None, None)
+
+        if current_read_budget() is not None:
+            owner = await current_owner()
+        else:
+            with recovery_read_scope(
+                session_key, deadline=time.monotonic() + _HISTORY_VIEW_TIMEOUT_SECONDS,
+            ):
+                owner = await current_owner()
+        if owner != (view.session_id, view.session_epoch):
+            raise HistoryViewOwnerChangedError(
+                "Session identity changed before history publication",
+            )
 
     async def read_canonical_page(
         self,
@@ -186,6 +257,8 @@ class SessionHistoryStorageAdapter:
             ):
                 raise
             except Exception as exc:  # noqa: BLE001 - preserve active fallback
+                if self.in_committed_view:
+                    raise
                 raise CanonicalHistoryReadError(
                     "canonical history projection failed"
                 ) from exc
@@ -213,6 +286,8 @@ class SessionHistoryStorageAdapter:
             ):
                 raise
             except Exception as exc:  # noqa: BLE001 - preserve active fallback
+                if self.in_committed_view:
+                    raise
                 raise CanonicalHistoryReadError(
                     "canonical history projection failed"
                 ) from exc
