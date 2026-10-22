@@ -952,7 +952,7 @@ export function createV4SessionReadPort(
 
       const historyRead = (historyRequest: SessionReadPortHistoryRequest) => acquireContext().then(
         context => context.readHistory(historyRequest),
-      )
+      ).catch(error => { throw mapSessionReadError(error) })
 
       async function close(): Promise<void> {
         if (closed) return

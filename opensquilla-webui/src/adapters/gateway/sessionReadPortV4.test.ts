@@ -3,7 +3,8 @@ import { createConversationEventHub } from '@/modules/conversationEventHub'
 import { createConversationEventTransport } from './conversationEventTransport'
 import { TransportFlowV4 } from './transportFlowV4'
 import type { TransportEventHandler, TransportLaneOwner, TransportLaneRetireReceipt } from './transportTypes'
-import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
+import { createSessionReadLifecycle, type SessionReadPortLease, type SessionReadLease } from '@/modules/sessionReadLifecycle'
+import { useChatSessionBootstrap } from '@/composables/chat/useChatSessionBootstrap'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -577,6 +578,62 @@ describe('read-v2 admission and retirement ownership', () => {
         : ['rejected', 'rejected', 'rejected', 'rejected'])
       expect(h.calls.some(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toBe(failure === 'response')
     } finally { await lease.close() }
+  })
+
+  it.each([true, false])('projects a busy v2 history read with eager history %s into a retryable domain error', async eager => {
+    const h = v2AdmissionHarness()
+    const error = Object.assign(new Error('Session storage is temporarily busy. Retry this operation.'), {
+      code: 'STORAGE_BUSY', retryable: true, retryAfterMs: 100,
+      details: { operation: 'history.view', stage: 'permit', resource: 'session_history_read' },
+    })
+    h.results.set(HISTORY_V2, error)
+    const request = openRequest(undefined, eager)
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    try {
+      await lease.live
+      await expect(lease.readHistory(historyRequest(request.signal))).rejects.toMatchObject({
+        name: 'SessionReadFailure', kind: 'busy', retryable: true, retryAfterMs: 100, cause: error,
+      })
+      expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
+    } finally { await lease.close() }
+  })
+
+  it('keeps automatic live reconciliation retrying after repeated busy v2 history reads', async () => {
+    const h = v2AdmissionHarness()
+    const success = h.results.get(HISTORY_V2)
+    h.results.set(HISTORY_V2, Object.assign(new Error('Session storage is temporarily busy. Retry this operation.'), {
+      code: 'STORAGE_BUSY', retryable: true,
+    }))
+    const request = openRequest(undefined, false)
+    const lease = createV4SessionReadPort(h.rpc).open(request)
+    await lease.live
+    vi.useFakeTimers()
+    let attempts = 0
+    const readThenInstall = vi.fn(async () => {
+      if (++attempts === 3) h.results.set(HISTORY_V2, success)
+      await lease.readHistory(historyRequest(request.signal))
+      return { authoritative: true, live: false, backgroundOnly: false }
+    })
+    const moduleLease = lease as unknown as SessionReadLease
+    const open = vi.fn(() => moduleLease)
+    const api = useChatSessionBootstrap({
+      sessionKey: ref('alpha'), connectionState: ref('connected'),
+      sessionReadLifecycle: { open, current: () => moduleLease },
+      loadHistory: async () => ({ ok: true }),
+      subscribeSession: readThenInstall, reconcileSession: readThenInstall,
+      cancelHistory() {}, cancelSubscription() {},
+    })
+    try {
+      await api.startSessionBootstrap({ includeHistory: false }).live
+      expect(api.livePhase.value).toBe('degraded')
+      await vi.advanceTimersByTimeAsync(500)
+      expect(readThenInstall).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(readThenInstall).toHaveBeenCalledTimes(3)
+      expect(api.livePhase.value).toBe('ready')
+      expect(open).toHaveBeenCalledOnce()
+      expect(h.calls.filter(call => call.method === READ_OPEN_V2)).toHaveLength(1)
+    } finally { api.cancelSessionBootstrap(); await lease.close(); vi.useRealTimers() }
   })
 
   it.each(['closed', 'replaced', 'generation'])('does not promote a late rebase error from a %s owner', async change => {
