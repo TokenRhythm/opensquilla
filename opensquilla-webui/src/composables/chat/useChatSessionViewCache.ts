@@ -1,6 +1,7 @@
 import { computed, onScopeDispose, ref, shallowRef, watch, type Ref } from 'vue'
 import type { ChatMaintenanceEvent, ChatMessage } from '@/types/chat'
 import { createChatViewCaptureBudget } from './chatViewCaptureBudget'
+import { compactChatViewCaptureMessages } from './chatViewCaptureProjection'
 
 interface ViewSnapshot<Presentation, Viewport> {
   messages: ChatMessage[]
@@ -72,13 +73,21 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
     // still owns navigation snapshots; a partial reread has liveReady=false
     // and cannot overwrite the last readable presentation.
     if (!installed && !(retainReadable && historyReady.value && liveReady.value)) return
-    if (installed) remove(key)
     if (maxSessions <= 0) return
     // Clone once on departure: mutable live/history objects cannot change a
     // detached view, and serialization accounts for nested tool/reasoning data.
-    const retainedMessages = options.messages.value.slice(-maxMessages)
-    const budget = createChatViewCaptureBudget(maxBytes)
-    if (!budget.include('messages', retainedMessages)) return
+    let retainedMessages = options.messages.value.slice(-maxMessages)
+    let budget = createChatViewCaptureBudget(maxBytes)
+    if (!budget.include('messages', retainedMessages)) {
+      // Byte/depth/unsafe failures retain the last valid snapshot. Only repeated
+      // history activity graphs get a narrow, bounded presentation fallback.
+      if (budget.rejectionReason !== 'nodes' && budget.rejectionReason !== 'properties') return
+      const projected = compactChatViewCaptureMessages(retainedMessages)
+      if (!projected) return
+      budget = createChatViewCaptureBudget(maxBytes)
+      if (!budget.include('messages', projected)) return
+      retainedMessages = projected
+    }
     const presentation = options.capturePresentation?.(key)
     if (!budget.include('presentation', presentation)) return
     const viewport = options.captureViewport?.(retainedMessages)
@@ -89,6 +98,9 @@ export function useChatSessionViewCache<Presentation = never, Viewport = never>(
       ...JSON.parse(serialized), bytes, epoch, identity: options.deliveryIdentity.value,
     }
     if (!installed) return snapshot
+    // Replacement is transactional: a failed capture must not erase a valid
+    // last-known view. Identity/epoch/reset/terminal retirement still remove it.
+    remove(key)
     snapshots.set(key, snapshot)
     totalBytes += bytes
     while (snapshots.size > maxSessions || totalBytes > maxBytes) {

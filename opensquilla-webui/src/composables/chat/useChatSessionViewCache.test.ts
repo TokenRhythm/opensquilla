@@ -26,6 +26,57 @@ function harness(limits: { maxSessions?: number; maxBytes?: number; maxMessages?
 }
 
 describe('useChatSessionViewCache', () => {
+  it('preserves the current query, terminal receipt and rendered activity when duplicate outcome graphs exceed the traversal budget', () => {
+    const h = harness()
+    const statusHistory = Array.from({ length: 1_600 }, (_, i) => ({ type: 'status' as const, action: 'ran', at: i, label: `step-${i}` }))
+    const outcome = { turnId: 'turn-a', status: 'succeeded', statusHistory }
+    const rows: ChatMessage[] = [
+      { role: 'user', text: 'Current query', ts: null, messageId: 'query', turnId: 'turn-a', turnOutcome: outcome },
+      { ...row('answer', 'Current answer'), turnId: 'turn-a', turnOutcome: outcome, statusHistory },
+      { role: 'maintenance', text: '', ts: null, messageId: 'compact', maintenance: {
+        kind: 'context_compaction', compactionId: 'cmp-a', source: 'manual', state: 'completed', durability: 'durable',
+      } },
+    ]
+    h.install('A', rows)
+    h.switchTo('B')
+    h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(true)
+    expect(h.cache.messages.value.map(message => message.messageId)).toEqual(['query', 'answer', 'compact'])
+    expect(h.cache.messages.value[0]?.text).toBe('Current query')
+    expect(h.cache.messages.value[1]?.turnOutcome?.status).toBe('succeeded')
+    expect(h.cache.messages.value[1]?.statusHistory).toEqual(statusHistory)
+    expect(h.cache.messages.value[2]?.maintenance?.state).toBe('completed')
+    expect(rows[0]?.turnOutcome?.statusHistory).toBe(statusHistory)
+    expect(h.cache.messages.value[1]?.statusHistory).not.toBe(statusHistory)
+    h.scope.stop()
+  })
+
+  it('keeps a matching last-known snapshot when a new bounded capture fails, but never revives one retired by epoch', () => {
+    const h = harness({ maxBytes: 1024 })
+    h.switchTo('B'); h.switchTo('A')
+    h.install('A', [row('new', 'x'.repeat(2_000))])
+    h.switchTo('B'); h.switchTo('A')
+    expect(h.cache.messages.value.map(message => message.messageId)).toEqual(['a'])
+    h.cache.observeEpoch('A', 1)
+    h.install('A', [row('new-epoch', 'x'.repeat(2_000))])
+    h.switchTo('B'); h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it.each(['identity', 'revoked', 'reset', 'terminal'] as const)('does not rescue a failed capture with a snapshot retired by %s', reason => {
+    const h = harness({ maxBytes: 1024 })
+    h.switchTo('B'); h.switchTo('A')
+    if (reason === 'identity') h.deliveryIdentity.value = 'new-owner'
+    else if (reason === 'revoked') h.deliveryIdentity.value = null
+    else if (reason === 'reset') h.cache.invalidate('A')
+    else h.cache.retirePreview('A')
+    h.install('A', [row('new', 'x'.repeat(2_000))])
+    h.switchTo('B'); h.switchTo('A')
+    expect(h.cache.showingPreview.value).toBe(false)
+    h.scope.stop()
+  })
+
   it.each([false, true])('preserves confirmed history after a failed refresh only for the same authority (replaced=%s)', replaced => {
     const authority = ref({ lease: 'original' })
     const h = harness({ currentReadAuthority: () => authority.value })

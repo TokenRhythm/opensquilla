@@ -506,7 +506,7 @@ function contentRefFor(message: ChatRenderedMessage): ContentRangeRef | undefine
 }
 
 function canHydrateContent(message: ChatRenderedMessage): boolean {
-  if (message.previewComplete === true) return false
+  if (props.previewReadOnly || message.previewComplete === true) return false
   // Raw ranges are safe for plain user rows. Rows with persisted
   // protocol JSON, tool results, or legacy control prompts carry
   // `contentRef.view=display`; that endpoint reapplies the server history
@@ -672,7 +672,7 @@ async function performContentHydration(message: ChatRenderedMessage, index: numb
     const text = ref.view === 'display'
       ? await contentRangeCache.readDisplay(ref, { signal: controller.signal })
       : await contentRangeCache.readText(ref, { signal: controller.signal })
-    if (generation === contentHydrationGeneration && !controller.signal.aborted) {
+    if (generation === contentHydrationGeneration && !controller.signal.aborted && !props.previewReadOnly) {
       rememberHydratedContent(key, text, message)
       emit('contentHydrated', message, text)
     }
@@ -689,14 +689,14 @@ async function performContentHydration(message: ChatRenderedMessage, index: numb
 }
 
 async function hydrateMountedContent(): Promise<void> {
-  if (contentHydrationDisposed || props.shareMode
+  if (contentHydrationDisposed || props.shareMode || props.previewReadOnly
     || automaticHydrationOwner?.generation === contentHydrationGeneration) return
   const generation = contentHydrationGeneration
   const owner = { generation, key: undefined as string | undefined }
   automaticHydrationOwner = owner
   try {
     while (!contentHydrationDisposed && automaticHydrationOwner === owner
-      && generation === contentHydrationGeneration && !props.shareMode) {
+      && generation === contentHydrationGeneration && !props.shareMode && !props.previewReadOnly) {
       const entry = renderEntries.value.find(({ index }) => {
         const message = props.messages[index]
         if (!message || !contentRefFor(message) || !canHydrateContent(message)) return false
@@ -945,7 +945,13 @@ const variableLayout = computed(() => {
 })
 const renderEntries = computed(() => variableLayout.value.entries)
 
-watch(() => [props.shareMode, props.sessionKey, props.scrollEpoch, props.contentCacheScope,
+// DOM inert only blocks interaction, not an already running hydration pump.
+// Revoke its generation before any late response can write into a preview.
+watch(() => props.previewReadOnly, preview => {
+  if (preview) resetContentHydrationState(true)
+}, { flush: 'sync' })
+
+watch(() => [props.previewReadOnly, props.shareMode, props.sessionKey, props.scrollEpoch, props.contentCacheScope,
   props.contentCacheGeneration, ...renderEntries.value.map(({ index }) => {
   const message = props.messages[index]
   return message ? [contentHydrationKey(message, index), message.previewComplete, canHydrateContent(message)] : null
