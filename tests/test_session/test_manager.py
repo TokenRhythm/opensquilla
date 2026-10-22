@@ -3656,13 +3656,18 @@ async def test_compact_with_result_legacy_strict_flag_does_not_backfill_or_block
     assert result.skip_reason is None
     assert result.coverage_status == "fail_reported"
     assert result.missing_obligations
-    assert late_critical_path not in str(result.summary_payload)
+    assert late_critical_path not in result.summary
+    assert late_critical_path not in render_structured_summary(result.summary_payload)
+    manifest = result.summary_payload["source_coverage"]["exact_reference_manifest"]
+    assert any(entry["value"] == late_critical_path for entry in manifest["entries"])
     assert len(await manager.get_transcript("agent:main:main")) < len(
         original_transcript
     )
     summaries = await manager.get_summaries("agent:main:main")
     assert len(summaries) == 1
-    assert late_critical_path not in str(summaries[0].summary_payload)
+    assert late_critical_path not in summaries[0].summary_text
+    assert late_critical_path not in render_structured_summary(summaries[0].summary_payload)
+    assert summaries[0].summary_payload["source_coverage"]["exact_reference_manifest"] == manifest
     assert any(late_critical_path in entry.content
                for entry in await manager.get_canonical_transcript("agent:main:main"))
     assert await manager.get_context_states("agent:main:main")

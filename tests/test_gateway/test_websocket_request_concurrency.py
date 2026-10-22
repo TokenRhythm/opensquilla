@@ -545,6 +545,7 @@ async def test_explicit_provider_probe_cancel_closes_stream_and_does_not_block_s
         "onboarding.llmProfile.draft.probe",
         "onboarding.llmProfile.probe",
         "onboarding.provider.probe",
+        "sessions.history.page.v2",
         "sessions.messages.search",
         "sessions.search",
     ]
