@@ -354,7 +354,12 @@ async def test_native_browser_mismatched_error_target_is_not_used_for_recovery(m
 @pytest.mark.parametrize("failure", [
     "legacy", "timeout", "invalid_response", "malformed_json", "oversized_response",
 ])
-async def test_browser_unknown_open_blocks_duplicate_until_next_turn(monkeypatch, failure):
+@pytest.mark.parametrize("first_url", [
+    "HTTPS://EXAMPLE.invalid:443#before", "https://aא.example/login",
+])
+async def test_browser_unknown_open_blocks_duplicate_until_next_turn(
+    monkeypatch, failure, first_url,
+):
     calls = []
 
     def respond(request):
@@ -375,7 +380,7 @@ async def test_browser_unknown_open_blocks_duplicate_until_next_turn(monkeypatch
     context = _native_browser_context(monkeypatch, respond)
     if failure == "oversized_response":
         monkeypatch.setattr(module, "_MAX_RESPONSE_BYTES", 200)
-    first = await _dispatch_browser(context, url="HTTPS://EXAMPLE.invalid:443#before")
+    first = await _dispatch_browser(context, url=first_url)
     assert first.is_error
     assert "do not repeat open without targetRef" in first.content
     for operation, arguments in [
@@ -433,6 +438,124 @@ async def test_browser_unknown_open_cannot_repeat_by_trimming_url_spaces(monkeyp
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("first_url,canonical_url", [
+    ("https://example.invalid/a/../login", "https://example.invalid/login"),
+    ("https://example.invalid/a/./login", "https://example.invalid/a/login"),
+    ("https://example.invalid/a/%2e%2e/login", "https://example.invalid/login"),
+    ("https://example.invalid/a/.%2E/login", "https://example.invalid/login"),
+    ("https://example.invalid/a/%2e./login", "https://example.invalid/login"),
+    ("https://example.invalid/login/%2e", "https://example.invalid/login/"),
+    ("https://example.invalid/a//../login", "https://example.invalid/a/login"),
+    (r"https://example.invalid/a\..\login", "https://example.invalid/login"),
+    ("https:////example.invalid/login", "https://example.invalid/login"),
+    ("https://bücher.example/login", "https://xn--bcher-kva.example/login"),
+    ("https://faß.example/login", "https://xn--fa-hia.example/login"),
+    ("https://aא.example/login", "https://xn--a-0hc.example/login"),
+    ("https://exa\u0870mple.invalid/a", "https://xn--example-tjn.invalid/a"),
+    ("https://%65xample.invalid/login", "https://example.invalid/login"),
+    ("https://example.invalid/登录", "https://example.invalid/%E7%99%BB%E5%BD%95"),
+    ("https://example.invalid/a b?q=two words", "https://example.invalid/a%20b?q=two%20words"),
+    ("https://example.invalid/a^b?q=^", "https://example.invalid/a%5Eb?q=^"),
+    ("http://0x7f.1/login", "http://127.0.0.1/login"),
+    ("http://2130706433/login", "http://127.0.0.1/login"),
+    ("http://[0:0:0:0:0:0:0:1]/login", "http://[::1]/login"),
+])
+@pytest.mark.parametrize("canonical_first", [False, True])
+async def test_browser_unknown_open_blocks_native_equivalent_url_retry(
+    monkeypatch, first_url, canonical_url, canonical_first,
+):
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(409, json={"ok": False, "code": "PAGE_CHANGED"})
+
+    context = _native_browser_context(monkeypatch, respond)
+    first, second = (canonical_url, first_url) if canonical_first else (first_url, canonical_url)
+    initial = await _dispatch_browser(context, url=first)
+    assert initial.is_error and "BROWSER_PAGE_CHANGED" in initial.content
+    retry = await _dispatch_browser(context, url=second)
+    assert retry.is_error and "BROWSER_OPEN_UNRESOLVED" in retry.content
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("uncertain_first", [False, True])
+async def test_browser_uncertain_url_blocks_other_new_tabs_until_outcome_known(
+    monkeypatch, uncertain_first,
+):
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(409, json={"ok": False, "code": "PAGE_CHANGED"})
+
+    context = _native_browser_context(monkeypatch, respond)
+    urls = ["https://aא.example/login", "https://example.invalid/other"]
+    if not uncertain_first:
+        urls.reverse()
+    initial = await _dispatch_browser(context, url=urls[0])
+    assert initial.is_error and "BROWSER_PAGE_CHANGED" in initial.content
+    retry = await _dispatch_browser(context, url=urls[1])
+    assert retry.is_error and "BROWSER_OPEN_UNRESOLVED" in retry.content
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("invalid_url", [
+    "not-a-url", "https://user:pass@example.invalid/", "https://example.invalid/\x00",
+])
+async def test_browser_invalid_url_can_be_corrected_after_known_unstarted_open(
+    monkeypatch, invalid_url,
+):
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return httpx.Response(400, json={"ok": False, "code": "INVALID_REQUEST"})
+        return httpx.Response(200, json={"targetRef": _RETAINED_TARGET})
+
+    context = _native_browser_context(monkeypatch, respond)
+    first = await _dispatch_browser(context, url=invalid_url)
+    assert first.is_error and "BROWSER_REQUEST_INVALID" in first.content
+    assert not (await _dispatch_browser(context, url="https://example.invalid/")).is_error
+    assert len(calls) == 2
+    assert context.browser_open_attempts == {}
+
+
+@pytest.mark.parametrize("first_url,second_url", [
+    ("https://example.invalid/a%2Fb", "https://example.invalid/a/b"),
+    ("https://example.invalid/a//b", "https://example.invalid/a/b"),
+    ("https://example.invalid/Login", "https://example.invalid/login"),
+    ("https://example.invalid/%6Cogin", "https://example.invalid/login"),
+    ("https://example.invalid/login?", "https://example.invalid/login"),
+    ("https://example.invalid/login?q=a+b", "https://example.invalid/login?q=a%20b"),
+    ("https://example.invalid/login?q=^", "https://example.invalid/login?q=%5E"),
+    ("https://example.invalid/login?q=one", "https://example.invalid/login?q=two"),
+    ("https://example.invalid/login?q=1&q=2", "https://example.invalid/login?q=2&q=1"),
+    (None, "https://example.invalid/"),
+    ("about:blank", "https://example.invalid/"),
+    ("https://example.invalid/", "about:blank"),
+])
+async def test_browser_unknown_open_keeps_distinct_native_destinations_independent(
+    monkeypatch, first_url, second_url,
+):
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(409, json={"ok": False, "code": "PAGE_CHANGED"})
+
+    context = _native_browser_context(monkeypatch, respond)
+    if first_url is None:
+        await _dispatch_browser(context)
+    else:
+        await _dispatch_browser(context, url=first_url)
+    result = await _dispatch_browser(context, url=second_url)
+    assert result.is_error and "BROWSER_PAGE_CHANGED" in result.content
+    assert "BROWSER_OPEN_UNRESOLVED" not in result.content
+    assert len(calls) == 2
+
+
 @pytest.mark.parametrize("suffix", ["%20", "\u00a0"])
 async def test_browser_open_keeps_path_whitespace_distinct(monkeypatch, suffix):
     calls = []
@@ -476,7 +599,8 @@ async def test_browser_incomplete_open_receipt_retains_unknown_outcome_guard(mon
     assert len(calls) == 2
 
 
-async def test_browser_unresolved_open_is_isolated_from_other_sessions(monkeypatch):
+@pytest.mark.parametrize("url", ["https://example.invalid/", "https://aא.example/login"])
+async def test_browser_unresolved_open_is_isolated_from_other_sessions(monkeypatch, url):
     calls = []
 
     def respond(request):
@@ -484,9 +608,9 @@ async def test_browser_unresolved_open_is_isolated_from_other_sessions(monkeypat
         return httpx.Response(409, json={"ok": False, "code": "PAGE_CHANGED"})
 
     context = _native_browser_context(monkeypatch, respond)
-    await _dispatch_browser(context, url="https://example.invalid/")
+    await _dispatch_browser(context, url=url)
     await _dispatch_browser(replace(context, session_key="session-two"),
-                            url="https://example.invalid/")
+                            url=url)
     assert len(calls) == 2
 
 
@@ -495,8 +619,9 @@ async def test_browser_unresolved_open_is_isolated_from_other_sessions(monkeypat
     {"ok": False, "code": "INVALID_REQUEST"},
     {"ok": False, "code": "RESOURCE_LIMIT", "outcome": "not_started"},
 ])
+@pytest.mark.parametrize("url", ["https://example.invalid/", "https://aא.example/login"])
 async def test_browser_success_and_known_unstarted_opens_do_not_block_repetition(
-    monkeypatch, response,
+    monkeypatch, response, url,
 ):
     calls = []
 
@@ -506,14 +631,21 @@ async def test_browser_success_and_known_unstarted_opens_do_not_block_repetition
 
     context = _native_browser_context(monkeypatch, respond)
     for _ in range(2):
-        result = await _dispatch_browser(context, url="https://example.invalid/")
+        result = await _dispatch_browser(context, url=url)
         assert result.is_error is (response.get("ok") is False)
         assert "BROWSER_OPEN_UNRESOLVED" not in result.content
     assert len(calls) == 2
     assert context.browser_open_attempts == {}
 
 
-async def test_browser_pending_open_blocks_concurrent_duplicate_and_cancelled_replay():
+@pytest.mark.parametrize("first_url,second_url", [
+    ("https://example.invalid/", "https://example.invalid/#fragment"),
+    ("https://aא.example/login", "https://example.invalid/"),
+    ("https://example.invalid/", "https://aא.example/login"),
+])
+async def test_browser_pending_open_blocks_concurrent_duplicate_and_cancelled_replay(
+    first_url, second_url,
+):
     entered = asyncio.Event()
     finish = asyncio.Event()
     calls = []
@@ -530,15 +662,15 @@ async def test_browser_pending_open_blocks_concurrent_duplicate_and_cancelled_re
     )
     token = current_tool_context.set(context)
     try:
-        task = asyncio.create_task(browser("open", url="https://example.invalid/"))
+        task = asyncio.create_task(browser("open", url=first_url))
         await entered.wait()
         with pytest.raises(SafeToolError, match="BROWSER_OPEN_UNRESOLVED"):
-            await browser("open", url="https://example.invalid/#fragment")
+            await browser("open", url=second_url)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         with pytest.raises(SafeToolError, match="BROWSER_OPEN_UNRESOLVED"):
-            await browser("open", url="https://example.invalid/")
+            await browser("open", url=second_url)
         assert len(calls) == 1
     finally:
         current_tool_context.reset(token)

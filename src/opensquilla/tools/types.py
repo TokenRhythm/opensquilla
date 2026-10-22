@@ -344,7 +344,8 @@ class ToolContext:
     memory_notes_dir: str | None = None
     bootstrap_source_dir: str | None = None
     # Pending and unresolved new-tab attempts, scoped to the accepted turn and
-    # session. Keys contain URL digests; values are curated recovery messages.
+    # session. Keys contain URL digests, or an empty wildcard when normalization
+    # is uncertain; values are curated recovery messages.
     # Append to preserve positional construction for embedded callers.
     browser_open_attempts: dict[tuple[str | None, str, str], str] = field(
         default_factory=dict, repr=False,

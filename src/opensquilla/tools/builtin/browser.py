@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+
+from pydantic import AnyHttpUrl
 
 from opensquilla.browser import DesktopBrowserError
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -16,23 +17,23 @@ from opensquilla.tools.types import PlanAccess, SafeToolError, current_tool_cont
 
 def _open_url_key(url: str | None) -> str:
     value = url or "about:blank"
-    try:
-        # Native HTTP URL parsing trims ASCII spaces. Other surrounding
-        # whitespace must remain distinct; native validation rejects controls.
-        parsed = urlsplit(value.strip(" "))
-        if parsed.scheme.lower() in {"http", "https"} and parsed.hostname:
-            host = parsed.hostname.lower()
-            if ":" in host:
-                host = f"[{host}]"
-            port = parsed.port
-            if port is not None and port != {"http": 80, "https": 443}[parsed.scheme.lower()]:
-                host += f":{port}"
-            # Keep credentials distinct even though navigation rejects them.
-            if "@" in parsed.netloc:
-                host = parsed.netloc.rsplit("@", 1)[0] + "@" + host
-            value = urlunsplit((parsed.scheme.lower(), host, parsed.path or "/", parsed.query, ""))
-    except ValueError:
-        pass  # Native argument validation remains authoritative.
+    if value != "about:blank":
+        # Native validation rejects controls before WHATWG parsing.
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            return ""
+        try:
+            # Use WHATWG normalization for paths, IDNA and IP spellings.
+            parsed = AnyHttpUrl(value)
+        except ValueError:
+            # Native accepts some IDNA labels that this parser rejects. An empty
+            # key conservatively guards every new tab until the outcome is known.
+            return ""
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        # Native URL parsing escapes path carets; this parser preserves them.
+        if "^" in (parsed.path or ""):
+            return ""
+        value = str(parsed).partition("#")[0]
     return hashlib.sha256(value.encode()).hexdigest()
 
 
@@ -128,7 +129,11 @@ async def browser(
     attempt_key = None
     if operation == "open" and not targetRef:
         attempt_key = (context.execution_id, context.session_key, _open_url_key(url))
-        prior = context.browser_open_attempts.get(attempt_key)
+        prior = next((
+            message for prior_key, message in context.browser_open_attempts.items()
+            if prior_key[:2] == attempt_key[:2]
+            and (not prior_key[2] or not attempt_key[2] or prior_key[2] == attempt_key[2])
+        ), None)
         if prior:
             raise SafeToolError(f"BROWSER_OPEN_UNRESOLVED: {prior}")
         # Admission precedes the first await so concurrent opens cannot race.
