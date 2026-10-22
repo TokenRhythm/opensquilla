@@ -2333,15 +2333,64 @@ def _run_mode_lock_payload(
     }
 
 
+def _handle_task_state_read_failure(
+    event: str,
+    exc: Exception,
+    *,
+    operation: str,
+    started: float,
+    session_key: str | None = None,
+) -> None:
+    """Keep availability failures explicit instead of projecting an empty ledger.
+
+    The compatibility readers can delegate to the same storage and read budget.
+    Retrying them after a busy admission cannot provide an independent fallback.
+    Log only exception type and typed read diagnostics: exception text and
+    tracebacks can contain task details or other private stored values.
+    """
+
+    busy = exc if isinstance(exc, StorageBusyError) else (
+        StorageBusyError(
+            operation,
+            waited_ms=max(0, int((time.monotonic() - started) * 1000)),
+            retry_after_ms=100,
+            stage="deadline",
+            resource="session_task_state",
+        ) if isinstance(exc, TimeoutError) else None
+    )
+    fields: dict[str, Any] = {"exception_type": type(exc).__name__}
+    if session_key is not None:
+        fields["session_key"] = session_key
+    if busy is not None:
+        fields.update(
+            operation=busy.operation,
+            waited_ms=busy.waited_ms,
+            retry_after_ms=busy.retry_after_ms,
+        )
+        if busy.stage is not None:
+            fields["stage"] = busy.stage
+        if busy.resource is not None:
+            fields["resource"] = busy.resource
+    log.warning(event, **fields)
+    if busy is not None:
+        if busy is exc:
+            raise busy
+        raise busy from exc
+
+
 async def _list_task_rows(ctx: RpcContext, storage: Any | None, session_key: str) -> list[Any]:
     if storage is not None:
         recent_storage_list = getattr(storage, "list_recent_agent_tasks", None)
         if callable(recent_storage_list):
+            started = time.monotonic()
             try:
                 return list(await recent_storage_list(session_key))
-            except Exception:
-                log.warning(
+            except Exception as exc:
+                _handle_task_state_read_failure(
                     "sessions.recent_agent_task_storage_state_failed",
+                    exc,
+                    operation="list_recent_agent_tasks",
+                    started=started,
                     session_key=session_key,
                 )
 
@@ -2349,20 +2398,28 @@ async def _list_task_rows(ctx: RpcContext, storage: Any | None, session_key: str
     if task_runtime is not None:
         runtime_list = getattr(task_runtime, "list", None)
         if callable(runtime_list):
+            started = time.monotonic()
             try:
                 return list(await runtime_list(session_key=session_key))
-            except Exception:
-                log.warning("sessions.task_runtime_state_failed", session_key=session_key)
+            except Exception as exc:
+                _handle_task_state_read_failure(
+                    "sessions.task_runtime_state_failed", exc,
+                    operation="task_runtime.list", started=started, session_key=session_key,
+                )
 
     if storage is None:
         return []
     storage_list = getattr(storage, "list_agent_tasks", None)
     if not callable(storage_list):
         return []
+    started = time.monotonic()
     try:
         return list(await storage_list(session_key=session_key))
-    except Exception:
-        log.warning("sessions.agent_task_storage_state_failed", session_key=session_key)
+    except Exception as exc:
+        _handle_task_state_read_failure(
+            "sessions.agent_task_storage_state_failed", exc,
+            operation="list_agent_tasks", started=started, session_key=session_key,
+        )
         return []
 
 
@@ -2378,11 +2435,15 @@ async def _list_task_rows_by_session(
     if storage is not None:
         storage_batch = getattr(storage, "list_agent_tasks_for_sessions", None)
         if callable(storage_batch):
+            started = time.monotonic()
             try:
                 grouped = await storage_batch(keys)
                 return {key: list(grouped.get(key, [])) for key in keys}
-            except Exception:
-                log.warning("sessions.agent_task_storage_batch_state_failed")
+            except Exception as exc:
+                _handle_task_state_read_failure(
+                    "sessions.agent_task_storage_batch_state_failed", exc,
+                    operation="list_agent_tasks_for_sessions", started=started,
+                )
 
     return {key: await _list_task_rows(ctx, storage, key) for key in keys}
 
