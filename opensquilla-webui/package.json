@@ -73,7 +73,7 @@
     "@vitejs/plugin-vue": "^6.0.9",
     "ajv": "8.20.0",
     "fake-indexeddb": "6.2.5",
-    "happy-dom": "^20.14.5",
+    "happy-dom": "^21.0.1",
     "json-schema-to-typescript": "16.0.0",
     "json-schema-to-typescript-legacy": "npm:json-schema-to-typescript@15.0.4",
     "typescript": "7.0.2",
