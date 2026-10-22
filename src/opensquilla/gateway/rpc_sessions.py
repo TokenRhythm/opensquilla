@@ -298,6 +298,7 @@ from opensquilla.session.terminal_reply import (
     safe_provider_failure_message,
     sanitize_agent_error,
 )
+from opensquilla.turn_outcome_projection import turn_id_from_context
 
 _d = get_dispatcher()
 
@@ -5350,6 +5351,29 @@ async def _handle_sessions_history_page_v2(params: dict | None, ctx: RpcContext)
     return result
 
 
+def _history_page_turn_ids(items: Sequence[Mapping[str, Any]]) -> set[str]:
+    return {
+        turn_id
+        for item in items
+        if (turn_id := turn_id_from_context(item["message"].get("turn_context"))) is not None
+    }
+
+
+def _history_page_outcomes(
+    outcomes: list[dict[str, Any]], *, candidate_turn_ids: set[str], retained_turn_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Exclude only outcomes proved to belong exclusively to omitted messages.
+
+    Legacy tool joining and hidden rows can leave outcomes without a projected
+    message owner. Keep those intact rather than guessing their attribution.
+    """
+    return [
+        outcome for outcome in outcomes
+        if outcome.get("turn_id") not in candidate_turn_ids
+        or outcome.get("turn_id") in retained_turn_ids
+    ]
+
+
 def _bound_projected_history_page(
     result: dict[str, Any], params: dict, *, key: str,
 ) -> None:
@@ -5358,6 +5382,8 @@ def _bound_projected_history_page(
     target_bytes = min(1_048_576, max(1, int(params.get("target_bytes") or 1_048_576)))
     direction = "before" if params.get("anchor_message_id") else params["direction"]
     items = result["items"]
+    candidate_turn_ids = _history_page_turn_ids(items)
+    outcomes = result["turn_outcomes"]
     while (
         len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()) > target_bytes
     ):
@@ -5367,6 +5393,10 @@ def _bound_projected_history_page(
                 accepted=False,
             )
         items.pop(0 if direction == "before" else -1)
+        result["turn_outcomes"] = _history_page_outcomes(
+            outcomes, candidate_turn_ids=candidate_turn_ids,
+            retained_turn_ids=_history_page_turn_ids(items),
+        )
         message = items[0 if direction == "before" else -1]["message"]
         boundary = message.get(
             "historyCursorBefore" if direction == "before" else "historyCursorAfter",
@@ -5507,12 +5537,22 @@ async def _read_sessions_history_page_v2(
     # Walk from the requested edge: newest suffix for before, oldest prefix
     # for after. Serialize each item once, including its semantic metadata.
     bounded: list[dict[str, Any]] = []
+    candidate_turn_ids = _history_page_turn_ids(items)
+    retained_turn_ids: set[str] = set()
+    outcomes = result["turn_outcomes"]
+    result["turn_outcomes"] = _history_page_outcomes(
+        outcomes, candidate_turn_ids=candidate_turn_ids, retained_turn_ids=retained_turn_ids,
+    )
     item_bytes = 0
     for item in reversed(items) if direction == "before" else items:
         encoded_size = len(
             json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
         candidate_count = len(bounded) + 1
+        next_turn_ids = retained_turn_ids | _history_page_turn_ids([item])
+        next_outcomes = _history_page_outcomes(
+            outcomes, candidate_turn_ids=candidate_turn_ids, retained_turn_ids=next_turn_ids,
+        )
         truncated = candidate_count < len(items)
         legacy_edge = boundary(item, direction) if truncated else legacy.get(
             "oldest_cursor" if direction == "before" else "newest_cursor"
@@ -5523,21 +5563,33 @@ async def _read_sessions_history_page_v2(
         )
         result[f"has_more_{direction}"] = bool(legacy.get("has_more")) or truncated
         result["complete_for_requested_window"] = not truncated
-        # result.items remains [] while calculating the fixed page metadata.
+        # Count only outcomes belonging to this candidate page, plus metadata
+        # whose ownership cannot be established from the display projection.
+        # Do not install the candidate's outcomes until its message also fits.
         overhead = len(
-            json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            json.dumps(
+                {**result, "turn_outcomes": next_outcomes},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
         )
         if overhead + item_bytes + encoded_size + candidate_count - 1 > target_bytes:
             break
         bounded.append(item)
+        retained_turn_ids = next_turn_ids
+        result["turn_outcomes"] = next_outcomes
         item_bytes += encoded_size
     if not bounded and items:
+        metadata_exceeds_budget = overhead > target_bytes
         raise RpcHandlerError(
             "RESPONSE_TOO_LARGE",
-            "A history item exceeds the requested page byte budget",
+            "History metadata exceeds the requested page byte budget"
+            if metadata_exceeds_budget
+            else "A history item and its metadata exceed the requested page byte budget",
             details={
                 "target_bytes": target_bytes,
-                "message_id": items[-1 if direction == "before" else 0]["message_id"],
+                **({} if metadata_exceeds_budget else {
+                    "message_id": items[-1 if direction == "before" else 0]["message_id"],
+                }),
             },
             accepted=False,
         )
