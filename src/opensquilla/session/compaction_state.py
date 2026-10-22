@@ -89,14 +89,28 @@ _MAX_COVERAGE_MISSING_LABELS = 32
 _PATH_RE = re.compile(
     # The slash in a closing markup tag is not an absolute filesystem path.
     r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\.{1,2}/|(?<!<)/|[A-Za-z0-9_.@()+-]+/)"
-    r"(?:[A-Za-z0-9_.@()+-]+(?: [A-Za-z0-9_.@()+-]+)*/)*"
-    r"[A-Za-z0-9_.@()+-]+(?: [A-Za-z0-9_.@()+-]+)*"
+    r"(?:[A-Za-z0-9_.@()+-]+(?:[ \t]+[A-Za-z0-9_.@()+-]+)*[\\/])*"
+    r"[A-Za-z0-9_.@()+-]+(?:[ \t]+[A-Za-z0-9_.@()+-]+)*"
     r"(?:\.[A-Za-z0-9][A-Za-z0-9_.-]{0,15})?"
 )
 _COMMAND_RE = re.compile(
     r"\b(?:(?:uv run )?(?:pytest|ruff|python|mypy|pyright|npm|pnpm|yarn|git|bash|sh|make|cargo)"
     r"|go test)\b[^\n\r]{0,220}"
 )
+_MARKDOWN_CODE_RE = re.compile(
+    r"(?<!`)(?P<fence>`+)(?!`)(?P<body>.*?)(?<!`)(?P=fence)(?!`)", re.DOTALL,
+)
+_JSON_STRING_TOKEN = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+_JSON_STRING_FIELD_RE = re.compile(
+    r"(?<=[{,])[ \t\r\n]*(?P<key>" + _JSON_STRING_TOKEN
+    + r")[ \t\r\n]*:[ \t\r\n]*(?P<value>" + _JSON_STRING_TOKEN + r")",
+)
+_NPM_PACKAGE_PROSE_RE = re.compile(r"npm[ \t]+全局包[ \t]*")
+_NPM_PACKAGE_LITERAL_RE = re.compile(
+    r"(?:@[a-z0-9_.-]+/)?[a-z0-9_.-]+(?:@[a-zA-Z0-9.*+^~<>=|-]+)?",
+)
+_QUOTED_TEXT_RE = re.compile(r"(?P<quote>['\"])(?P<body>(?:\\.|(?!(?P=quote)).)*)(?P=quote)")
+_PATH_FILE_END_RE = re.compile(r"[^\\/ \t]+\.[A-Za-z0-9][A-Za-z0-9_.-]{0,15}(?=[ \t]|$)")
 _ERROR_MARKERS = ("error", "failed", "failure", "traceback", "exit code", "exception")
 _CONSTRAINT_PREFIXES = ("constraint:", "constraints:", "限制:", "要求:")
 _GOAL_PREFIXES = ("goal:", "objective:", "目标:")
@@ -107,13 +121,17 @@ _DECISION_PREFIXES = ("decision:", "rationale:", "reason:", "decided:", "决定:
 # The summarizer updates them from the complete source; substring extraction
 # cannot prove that an old promise or question is still pending.
 _MODEL_UPDATED_STATE_KINDS = frozenset({"current_plan_or_next_action", "unresolved_question"})
+_LITERAL_OBLIGATION_KINDS = frozenset({
+    "file_path", "artifact_path_or_name", "command", "command_reference",
+    "tool_result_id", "pending_tool_or_approval_id", "important_identifier",
+})
 _IDENTIFIER_RE = re.compile(
     r"(?<![A-Za-z0-9_-])att_[A-Za-z0-9_-]{8,160}(?![A-Za-z0-9_-])"
     r"|\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     r"|[0-9a-fA-F]{12,64})\b"
 )
 _ARTIFACT_NAME_RE = re.compile(
-    r"\b[A-Za-z0-9_.@()+-]+(?: [A-Za-z0-9_.@()+-]+)*"
+    r"\b[A-Za-z0-9_.@()+-]+(?:[ \t]+[A-Za-z0-9_.@()+-]+)*"
     r"\.(?:pdf|png|jpe?g|gif|csv|json|md|txt|xlsx?|pptx?|docx?|html?|zip)\b",
     re.IGNORECASE,
 )
@@ -125,12 +143,97 @@ def _entry_value(entry: Any, key: str, default: Any = None) -> Any:
     return getattr(entry, key, default)
 
 
-def _clean_obligation_text(value: Any, *, max_chars: int = _MAX_OBLIGATION_VALUE_CHARS) -> str:
+def _clean_obligation_text(
+    value: Any, *, max_chars: int = _MAX_OBLIGATION_VALUE_CHARS,
+    preserve_whitespace: bool = False,
+) -> str:
     text = _string_value(value)
-    text = re.sub(r"\s+", " ", text).strip(" `\t\r\n,;)]")
+    # Quotes and code can contain significant whitespace. Be conservative even
+    # for unmatched delimiters (including a bounded snippet cut inside one).
+    if not preserve_whitespace and not any(mark in text for mark in ("`", "'", '"')):
+        text = re.sub(r"\s+", " ", text)
+    text = text.strip(" \t\r\n,;)]")
     if len(text) <= max_chars:
         return text
-    return text[: max_chars - 3].rstrip() + "..."
+    # This value is a search snippet, not a display-only preview. Appending an
+    # ellipsis manufactures text that need not occur even in an exact copy.
+    return text[:max_chars].rstrip()
+
+
+def _command_references(text: str, *, _parse_json_fields: bool = True) -> list[str]:
+    code_spans = list(_MARKDOWN_CODE_RE.finditer(text))
+    json_fields = iter(_JSON_STRING_FIELD_RE.finditer(text)) if _parse_json_fields else iter(())
+    field = next(json_fields, None)
+    commands: list[str] = []
+    position = 0
+    while (match := _COMMAND_RE.search(text, position)) is not None:
+        while field is not None and field.end("value") <= match.start():
+            field = next(json_fields, None)
+        if field is not None and field.start("key") <= match.start() < field.end("value"):
+            if match.start() < field.end("key"):
+                # A JSON property named "npm" is not itself a shell command.
+                position = field.end("key")
+            else:
+                # Decode this complete string token only, preserving literal
+                # shell quotes/spaces while excluding the following JSON fields.
+                # One level is enough; do not recursively interpret embedded data.
+                commands.extend(_command_references(
+                    json.loads(field.group("value")), _parse_json_fields=False,
+                ))
+                position = field.end("value")
+            continue
+        surrounding_code = next((
+            span for span in code_spans
+            if span.start("body") <= match.start() < span.end("body")
+        ), None)
+        package_prose = _NPM_PACKAGE_PROSE_RE.match(text, match.start())
+        if surrounding_code is None and package_prose is not None and any(
+            span.start() == package_prose.end()
+            and _NPM_PACKAGE_LITERAL_RE.fullmatch(span.group("body")) is not None
+            for span in code_spans
+        ):
+            # This explicit package description is prose, not "npm <args>".
+            # Keep other unquoted/CJK candidates conservative and continue
+            # scanning so a later real command is not swallowed with the prose.
+            position = package_prose.end()
+            continue
+        end = match.end()
+        if surrounding_code is not None:
+            end = min(end, surrounding_code.end("body"))
+        commands.append(text[match.start():end].rstrip("."))
+        # A closing Markdown fence can precede another command on this line.
+        # Shell backticks outside such a surrounding span remain command text.
+        position = end
+    return commands
+
+
+def _file_paths(text: str) -> list[str]:
+    literal_spans = [
+        *list(_MARKDOWN_CODE_RE.finditer(text)), *list(_QUOTED_TEXT_RE.finditer(text)),
+    ]
+    paths: list[str] = []
+    position = 0
+    while (match := _PATH_RE.search(text, position)) is not None:
+        value = match.group(0)
+        quoted_path = next((
+            span.group("body") for span in literal_spans
+            if span.start("body") == match.start()
+            and _PATH_RE.fullmatch(span.group("body")) is not None
+        ), None)
+        if quoted_path is not None:
+            paths.append(quoted_path)
+            position = match.start() + len(quoted_path)
+            continue
+        # An unquoted path can include a spaced filename, but following prose
+        # is not part of that filename. Extensionless directories remain valid.
+        file_end = _PATH_FILE_END_RE.search(value)
+        if file_end is not None:
+            value = value[:file_end.end()]
+        else:
+            value = re.split(r"[ \t]", value, maxsplit=1)[0]
+        paths.append(value.rstrip("."))
+        position = match.start() + len(value)
+    return paths
 
 
 def _after_label(line: str) -> str:
@@ -299,7 +402,11 @@ def _add_obligation(
 ) -> None:
     if max_obligations <= 0:
         return
-    cleaned = _string_value(value).strip() if preserve_value else _clean_obligation_text(value)
+    cleaned = (
+        _string_value(value).strip() if preserve_value else _clean_obligation_text(
+            value, preserve_whitespace=kind in _LITERAL_OBLIGATION_KINDS,
+        )
+    )
     if not cleaned:
         return
     key = (kind, cleaned.casefold())
@@ -457,7 +564,8 @@ def extract_compaction_obligations(
             source_entry_id=source_entry_id,
             max_obligations=max_obligations,
         )
-        lines = [_clean_obligation_text(line) for line in content.splitlines()]
+        # Do not fold quoted literals before their obligation kind is known.
+        lines = [line.strip() for line in content.splitlines()]
         for line in [line for line in lines if line]:
             lower = line.casefold()
             if role == "user" and lower.startswith(_GOAL_PREFIXES):
@@ -648,22 +756,22 @@ def extract_compaction_obligations(
                                 source_entry_id=source_entry_id,
                                 max_obligations=max_obligations,
                             )
-                        for match in _COMMAND_RE.finditer(result_text):
+                        for command_reference in _command_references(result_text):
                             _add_obligation(
                                 obligations,
                                 seen,
                                 kind="command_reference",
-                                value=match.group(0).rstrip("."),
+                                value=command_reference,
                                 source_role=role,
                                 source_entry_id=source_entry_id,
                                 max_obligations=max_obligations,
                             )
-                        for match in _PATH_RE.finditer(result_text):
+                        for file_path in _file_paths(result_text):
                             _add_obligation(
                                 obligations,
                                 seen,
                                 kind="file_path",
-                                value=match.group(0).rstrip("."),
+                                value=file_path,
                                 source_role=role,
                                 source_entry_id=source_entry_id,
                                 max_obligations=max_obligations,
@@ -692,22 +800,22 @@ def extract_compaction_obligations(
                 source_entry_id=source_entry_id,
                 max_obligations=max_obligations,
             )
-        for match in _PATH_RE.finditer(content):
+        for file_path in _file_paths(content):
             _add_obligation(
                 obligations,
                 seen,
                 kind="file_path",
-                value=match.group(0).rstrip("."),
+                value=file_path,
                 source_role=role,
                 source_entry_id=source_entry_id,
                 max_obligations=max_obligations,
             )
-        for match in _COMMAND_RE.finditer(content):
+        for command_reference in _command_references(content):
             _add_obligation(
                 obligations,
                 seen,
                 kind="command_reference",
-                value=match.group(0).rstrip("."),
+                value=command_reference,
                 source_role=role,
                 source_entry_id=source_entry_id,
                 max_obligations=max_obligations,
@@ -769,21 +877,29 @@ def verify_summary_coverage(
     backfill_missing: bool = True,
     block_missing_critical: bool = False,
 ) -> CoverageResult:
-    """Report a bounded sample of string matches, never repair or reject prose.
+    """Report bounded literal matches, never repair or reject prose.
 
     The legacy keyword arguments remain accepted for older callers, but neither
     enables backfill or blocking. This diagnostic is not semantic validation.
+    Only unquoted prose tolerates whitespace reflow; paths, commands, identifiers
+    and text containing literal delimiters retain their internal whitespace.
     """
 
     try:
-        search_text = summary_text.casefold()
+        literal_search_text = summary_text.casefold()
+        prose_search_text = re.sub(r"\s+", " ", summary_text).casefold()
         checked = covered = 0
         missing: list[str] = []
         for obligation in islice(obligations, _MAX_COVERAGE_OBLIGATIONS):
             if obligation.kind in _MODEL_UPDATED_STATE_KINDS:
                 continue
             checked += 1
-            if obligation.value.casefold() in search_text:
+            literal = obligation.kind in _LITERAL_OBLIGATION_KINDS or any(
+                mark in obligation.value for mark in ("`", "'", '"')
+            )
+            value = obligation.value if literal else re.sub(r"\s+", " ", obligation.value)
+            search_text = literal_search_text if literal else prose_search_text
+            if value.casefold() in search_text:
                 covered += 1
             elif len(missing) < _MAX_COVERAGE_MISSING_LABELS:
                 missing.append(_obligation_label(obligation))
