@@ -7,9 +7,10 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from opensquilla.provider.types import ContentBlockCompaction, Message
-from opensquilla.session.compaction_state import render_structured_summary
+from opensquilla.session.compaction_state import CoverageCheckpoint, render_structured_summary
 from opensquilla.session.context_state_selection import (
     latest_context_state,
     latest_context_states_by_covered_through_id,
@@ -77,6 +78,7 @@ class CompactionContextItem:
     covered_through_id: int
     source_entries: tuple[TranscriptEntry, ...] = ()
     verified_attachment_paths: tuple[str, ...] = ()
+    coverage_checkpoint: CoverageCheckpoint | None = None
 
 
 class CompactionCheckpointUnavailableError(ValueError):
@@ -416,6 +418,16 @@ def compaction_context_fingerprint(
             "compaction_id": record.compaction_id,
             "source": record.source,
             "covered_through_id": record.covered_through_id,
+            "coverage_manifest_present": bool(
+                record.coverage_checkpoint and record.coverage_checkpoint.has_manifest
+            ),
+            "coverage_manifest": (
+                record.coverage_checkpoint.manifest
+                if record.coverage_checkpoint and record.coverage_checkpoint.has_manifest else None
+            ),
+            "coverage_owner": (
+                record.coverage_checkpoint.session_id if record.coverage_checkpoint else None
+            ),
         }
         for record in records
     ], "states": [
@@ -629,6 +641,7 @@ def build_compaction_context_records(
         except (TypeError, ValueError):
             rendered = ""
         source = "context_state"
+        selected_payload = state.payload
         if not rendered.strip() or rendered.strip() == _STRUCTURED_COMPACTION_SUMMARY_HEADER:
             same_generation = [
                 summary for summary in summaries
@@ -650,6 +663,7 @@ def build_compaction_context_records(
                 summary.created_at, summary.id or 0,
             ))
             rendered = fallback.summary_text.strip()
+            selected_payload = fallback.summary_payload or {}
             source = "summary"
         items.append(
             CompactionContextItem(
@@ -657,6 +671,10 @@ def build_compaction_context_records(
                 compaction_id=compaction_id,
                 source=source,
                 covered_through_id=state.covered_through_id,
+                coverage_checkpoint=_coverage_checkpoint(
+                    text=rendered, payload=selected_payload, session_id=state.session_id,
+                    compaction_id=compaction_id, covered_through_id=state.covered_through_id,
+                ),
                 verified_attachment_paths=tuple(
                     item["path"]
                     for item in (
@@ -691,6 +709,11 @@ def build_compaction_context_records(
                 compaction_id=summary.compaction_id,
                 source="summary",
                 covered_through_id=summary.covered_through_id,
+                coverage_checkpoint=_coverage_checkpoint(
+                    text=text, payload=summary.summary_payload or {}, session_id=summary.session_id,
+                    compaction_id=summary.compaction_id,
+                    covered_through_id=summary.covered_through_id,
+                ),
             )
         )
 
@@ -707,3 +730,19 @@ def build_compaction_context_records(
             )
 
     return items
+
+
+def _coverage_checkpoint(
+    *, text: str, payload: dict[str, Any], session_id: str, compaction_id: str | None,
+    covered_through_id: int,
+) -> CoverageCheckpoint:
+    coverage = payload.get("source_coverage")
+    if not isinstance(coverage, dict) or "exact_reference_manifest" not in coverage:
+        return CoverageCheckpoint(
+            text=text, session_id=session_id, compaction_id=compaction_id,
+            covered_through_id=covered_through_id,
+        )
+    return CoverageCheckpoint(
+        text=text, session_id=session_id, compaction_id=compaction_id,
+        covered_through_id=covered_through_id, manifest=coverage["exact_reference_manifest"],
+    )

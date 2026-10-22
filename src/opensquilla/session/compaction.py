@@ -94,9 +94,11 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.compaction_state import (
     CompactionObligation,
+    CoverageCheckpoint,
     CoverageResult,
+    build_coverage_obligations,
     build_structured_summary_from_text,
-    extract_compaction_obligations,
+    coverage_with_manifest,
     render_structured_summary,
     verify_summary_coverage,
 )
@@ -368,6 +370,10 @@ class CompactionRequest:
     # Host-only references from selected checkpoint payloads. Never derive these
     # from model prose or arbitrary historical file_path obligations.
     previous_attachment_paths: tuple[str, ...] = ()
+    previous_coverage_checkpoints: tuple[CoverageCheckpoint, ...] = ()
+    coverage_session_id: str | None = None
+    canonical_coverage_entries: tuple[Any, ...] | None = None
+    canonical_coverage_complete: bool = True
 
 
 @dataclass
@@ -414,6 +420,7 @@ def validate_compaction_artifact(
     obligations: Sequence[CompactionObligation],
     *,
     summary_replay_renderer: Callable[[str], str | None] | None = None,
+    exact_reference_manifest: Mapping[str, Any] | None = None,
 ) -> tuple[CoverageResult, str | None]:
     """Validate the final artifact without repairing or projecting its contents."""
 
@@ -427,6 +434,7 @@ def validate_compaction_artifact(
         replay_summary,
         obligations,
         backfill_missing=False,
+        exact_reference_manifest=exact_reference_manifest,
     )
     if not replay_summary.strip() or replay_summary.strip() == "[Structured Compaction Summary]":
         return coverage, "empty_summary"
@@ -2119,7 +2127,7 @@ def _project_compaction_images(value: Any) -> Any:
 
 
 def _attachment_safe_obligation_entries(
-    entries: Sequence[dict[str, Any]],
+    entries: Sequence[Any],
 ) -> list[dict[str, Any]]:
     """Project attachment envelopes and image blocks before obligations.
 
@@ -2138,9 +2146,9 @@ def _attachment_safe_obligation_entries(
             safe_entry["tool_calls"] = _project_compaction_images(
                 _tool_calls_without_display_snapshots(safe_entry.get("tool_calls"))
             )
-        content = str(entry.get("content") or "")
-        session_id = str(entry.get("session_id") or "compaction")
-        message_id = str(entry.get("message_id") or entry.get("id") or "unknown")
+        content = str(safe_entry.get("content") or "")
+        session_id = str(safe_entry.get("session_id") or "compaction")
+        message_id = str(safe_entry.get("message_id") or safe_entry.get("id") or "unknown")
         try:
             occurrences = extract_attachment_occurrences_from_envelope(
                 content,
@@ -4228,17 +4236,11 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         summary_source = "llm"
 
         obligation_entries = await await_compaction_phase(
-            asyncio.to_thread(_attachment_safe_obligation_entries, to_compact),
-            cfg,
-            phase="validating",
-        )
-        if prev_summary:
-            obligation_entries.insert(
-                0,
-                {"role": "assistant", "content": prev_summary},
-            )
-        obligations = await await_compaction_phase(
-            asyncio.to_thread(extract_compaction_obligations, obligation_entries),
+            asyncio.to_thread(
+                _attachment_safe_obligation_entries,
+                request.canonical_coverage_entries[:len(to_compact)]
+                if request.canonical_coverage_entries is not None else to_compact,
+            ),
             cfg,
             phase="validating",
         )
@@ -4257,11 +4259,22 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         # Their paths are session-workspace relative: resolving them against the
         # Gateway process cwd would silently discard valid references on restart.
         retained_paths.update(request.previous_attachment_paths)
-        existing_paths = {item.value for item in obligations if item.kind == "file_path"}
-        obligations.extend(
-            CompactionObligation(kind="file_path", value=path, critical=True)
-            for path in sorted(retained_paths - existing_paths)
+        obligation_set = await await_compaction_phase(
+            asyncio.to_thread(
+                build_coverage_obligations, obligation_entries,
+                session_id=request.coverage_session_id or request.session_id,
+                previous_checkpoints=request.previous_coverage_checkpoints,
+                previous_summary=prev_summary,
+                verified_attachment_paths=sorted(retained_paths),
+                source_complete=(
+                    request.canonical_coverage_complete and (
+                        request.canonical_coverage_entries is None
+                        or len(request.canonical_coverage_entries) >= len(to_compact)
+                    )
+                ),
+            ), cfg, phase="validating",
         )
+        obligations = obligation_set.obligations
         kept_tokens, kept_chars = await await_compaction_phase(
             asyncio.to_thread(_compaction_source_size, kept, **replay_measure_kwargs),
             cfg,
@@ -4280,6 +4293,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 obligations,
                 block_missing_critical=cfg.coverage_blocking,
                 verified_attachment_paths=sorted(retained_paths),
+                exact_reference_manifest=obligation_set.manifest,
             )
             structured_summary.source_coverage.update(
                 {
@@ -4295,7 +4309,9 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 replay_summary,
                 obligations,
                 summary_replay_renderer=request.summary_replay_renderer,
+                exact_reference_manifest=obligation_set.manifest,
             )
+            coverage = coverage_with_manifest(coverage, obligation_set.manifest)
             structured_summary.source_coverage.update(
                 {
                     "status": coverage.status,

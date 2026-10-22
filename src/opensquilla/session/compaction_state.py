@@ -7,6 +7,7 @@ state, not in this structured summary payload.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -18,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from opensquilla.execution_status import execution_status_for_tool_result
 
+_NO_REFERENCE_MANIFEST = object()
 
 class StructuredCompactionSummary(BaseModel):
     """Portable checkpoint retaining the v1 compatibility field types."""
@@ -63,6 +65,28 @@ class CoverageResult(BaseModel):
     blocked: bool = False
 
 
+@dataclass(frozen=True)
+class CoverageCheckpoint:
+    """Selected host checkpoint metadata; never parsed from model-authored text."""
+
+    text: str
+    session_id: str
+    covered_through_id: int = 0
+    compaction_id: str | None = None
+    manifest: Any = _NO_REFERENCE_MANIFEST
+    source_entries: tuple[Any, ...] = ()
+
+    @property
+    def has_manifest(self) -> bool:
+        return self.manifest is not _NO_REFERENCE_MANIFEST
+
+
+@dataclass(frozen=True)
+class CoverageObligationSet:
+    obligations: tuple[CompactionObligation, ...]
+    manifest: dict[str, Any]
+
+
 class CompactionReport(BaseModel):
     """Inspectable continuity report for destructive compaction."""
 
@@ -86,6 +110,8 @@ class CompactionReport(BaseModel):
 _MAX_OBLIGATION_VALUE_CHARS = 240
 _MAX_COVERAGE_OBLIGATIONS = 64
 _MAX_COVERAGE_MISSING_LABELS = 32
+_EXACT_REFERENCE_KINDS = frozenset({"file_path", "artifact_path_or_name", "important_identifier"})
+_EXACT_REFERENCE_MANIFEST = "exact_reference_manifest"
 _PATH_RE = re.compile(
     # The slash in a closing markup tag is not an absolute filesystem path.
     r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\.{1,2}/|(?<!<)/|[A-Za-z0-9_.@()+-]+/)"
@@ -273,8 +299,12 @@ class _RankedObligation:
 class _BoundedObligationBuffer:
     """Collect bounded per-kind candidates and reserve critical continuity categories."""
 
-    def __init__(self, max_obligations: int) -> None:
+    def __init__(
+        self, max_obligations: int, *, kinds: frozenset[str] | None = None,
+    ) -> None:
         self._max_obligations = max(0, max_obligations)
+        self.kinds = kinds
+        self.truncated = False
         self._candidates: dict[tuple[str, str], _RankedObligation] = {}
         self._next_seen_order = 0
 
@@ -298,6 +328,8 @@ class _BoundedObligationBuffer:
         obligation: CompactionObligation,
         seen: set[tuple[str, str]],
     ) -> None:
+        if self.kinds is not None and obligation.kind not in self.kinds:
+            return
         self._next_seen_order += 1
         if self._max_obligations == 0:
             return
@@ -328,8 +360,11 @@ class _BoundedObligationBuffer:
         )
         del self._candidates[evicted_key]
         seen.discard(evicted_key)
+        self.truncated = True
 
     def values(self) -> list[CompactionObligation]:
+        if len(self._candidates) > self._max_obligations:
+            self.truncated = True
         selected: dict[tuple[str, str], _RankedObligation] = {}
 
         def _select(candidate: _RankedObligation) -> None:
@@ -401,6 +436,13 @@ def _add_obligation(
     preserve_value: bool = False,
 ) -> None:
     if max_obligations <= 0:
+        return
+    if obligations.kinds is not None and kind not in obligations.kinds:
+        return
+    if obligations.kinds is not None and len(_string_value(value)) > _MAX_OBLIGATION_VALUE_CHARS:
+        # A clipped literal is not the original reference. Keep the diagnostic
+        # incomplete rather than persisting its prefix as a complete inventory.
+        obligations.truncated = True
         return
     cleaned = (
         _string_value(value).strip() if preserve_value else _clean_obligation_text(
@@ -515,10 +557,11 @@ def extract_compaction_obligations(
     entries: Sequence[Any],
     *,
     max_obligations: int = 64,
+    _buffer: _BoundedObligationBuffer | None = None,
 ) -> list[CompactionObligation]:
     """Extract bounded high-signal continuity facts before entries are removed."""
 
-    obligations = _BoundedObligationBuffer(max_obligations)
+    obligations = _buffer if _buffer is not None else _BoundedObligationBuffer(max_obligations)
     seen: set[tuple[str, str]] = set()
     issued_tool_call_ids: dict[str, int] = {}
     completed_tool_call_ids: set[str] = set()
@@ -870,12 +913,256 @@ def _command_result_proves_execution(content: str, status: Any) -> bool:
     )
 
 
+def _exact_references(entries: Sequence[Any]) -> tuple[list[CompactionObligation], bool]:
+    buffer = _BoundedObligationBuffer(_MAX_COVERAGE_OBLIGATIONS, kinds=_EXACT_REFERENCE_KINDS)
+    extracted = extract_compaction_obligations(entries, _buffer=buffer)
+    return extracted, not buffer.truncated
+
+
+def _read_reference_manifest(
+    checkpoint: CoverageCheckpoint,
+) -> tuple[list[dict[str, Any]], bool, set[str]]:
+    """Read at most 64 host records, preserving usable evidence on corruption."""
+    raw = checkpoint.manifest
+    reasons: set[str] = set()
+    if not isinstance(raw, dict):
+        return [], False, {"malformed_manifest"}
+    if type(raw.get("schema_version")) is not int or raw.get("schema_version") != 1:
+        reasons.add("unsupported_version")
+    if raw.get("session_id") != checkpoint.session_id:
+        reasons.add("owner_mismatch")
+    if (
+        type(raw.get("covered_through_id")) is not int
+        or raw.get("covered_through_id") != checkpoint.covered_through_id
+        or raw.get("compaction_id") != checkpoint.compaction_id
+    ):
+        reasons.add("checkpoint_mismatch")
+    if raw.get("complete") is not True:
+        reasons.add("inherited_incomplete")
+    entries = raw.get("entries")
+    if not isinstance(entries, list):
+        return [], False, reasons | {"malformed_entries"}
+    if len(entries) > _MAX_COVERAGE_OBLIGATIONS:
+        reasons.add("overflow")
+    valid: list[dict[str, Any]] = []
+    for item in entries[:_MAX_COVERAGE_OBLIGATIONS]:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("kind"), str)
+            or item["kind"] not in _EXACT_REFERENCE_KINDS
+            or not isinstance(item.get("value"), str)
+            or not 0 < len(item["value"]) <= 1024
+            or not item["value"].strip()
+            or not isinstance(item.get("origin"), str)
+            or item["origin"] not in {"canonical", "typed_artifact", "legacy_unclassified"}
+            or not isinstance(item.get("source_session_id"), str)
+            or not 0 < len(item["source_session_id"]) <= 256
+            or not isinstance(item.get("source_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["source_sha256"]) is None
+            or (item.get("source_entry_id") is not None
+                and type(item["source_entry_id"]) is not int)
+            or (item.get("source_compaction_id") is not None
+                and (not isinstance(item["source_compaction_id"], str)
+                     or len(item["source_compaction_id"]) > 256))
+        ):
+            reasons.add("malformed_entry")
+            continue
+        # Copy only the bounded host schema; ignore unrelated/unbounded fields.
+        valid.append({key: item.get(key) for key in (
+            "kind", "value", "origin", "source_session_id", "source_entry_id",
+            "source_sha256", "source_compaction_id",
+        )})
+    return valid, not reasons, reasons
+
+
+def build_coverage_obligations(
+    entries: Sequence[Any],
+    *,
+    session_id: str,
+    previous_checkpoints: Sequence[CoverageCheckpoint] = (),
+    previous_summary: str | None = None,
+    verified_attachment_paths: Sequence[str] = (),
+    source_complete: bool = True,
+) -> CoverageObligationSet:
+    """Carry bounded exact references independently of generated checkpoint prose.
+
+    Legacy text is conservatively classified once. A host manifest then remains
+    the inventory, including references missing from the latest model summary.
+    Other historical diagnostics retain their existing report-only extraction.
+    This does not infer semantic supersession or retire paths from model prose.
+    """
+    references: dict[tuple[str, str], dict[str, Any]] = {}
+    reasons: set[str] = set()
+    if not source_complete:
+        reasons.add("canonical_prefix_incomplete")
+    previous = list(previous_checkpoints)
+    if previous_summary and not previous:
+        previous.append(CoverageCheckpoint(text=previous_summary, session_id=session_id))
+
+    def add(item: dict[str, Any]) -> None:
+        key = (item["kind"], item["value"].casefold())
+        if key in references:
+            # Canonical evidence can strengthen legacy classification, but the
+            # original canonical source survives later generated wording.
+            if (references[key]["origin"] == "legacy_unclassified"
+                    and item["origin"] != "legacy_unclassified"):
+                references[key] = item
+            return
+        if len(references) >= _MAX_COVERAGE_OBLIGATIONS:
+            reasons.add("overflow")
+            return
+        references[key] = item
+
+    def derive(
+        source_entries: Sequence[Any], *, origin: str, owner: str,
+        compaction_id: str | None = None,
+    ) -> None:
+        extracted, complete = _exact_references(source_entries)
+        if not complete:
+            reasons.add("extraction_truncated")
+        by_id = {
+            _entry_value(entry, "id"): entry for entry in source_entries
+            if type(_entry_value(entry, "id")) is int
+        }
+        source_hashes: dict[int | None, str] = {}
+        for obligation in extracted:
+            source = by_id.get(obligation.source_entry_id)
+            # Hash the actual source entry, not the generated checkpoint text or
+            # a truncated candidate. IDs remain useful when prose is identical.
+            if obligation.source_entry_id not in source_hashes:
+                source_hashes[obligation.source_entry_id] = hashlib.sha256(json.dumps(
+                    source if isinstance(source, Mapping) else {
+                        "content": _entry_value(source, "content", ""),
+                        "tool_calls": _entry_value(source, "tool_calls"),
+                    } if source is not None else [
+                        {
+                            "content": _entry_value(entry, "content", ""),
+                            "tool_calls": _entry_value(entry, "tool_calls"),
+                        } for entry in source_entries
+                    ], sort_keys=True, default=str, ensure_ascii=False,
+                ).encode("utf-8")).hexdigest()
+            source_hash = source_hashes[obligation.source_entry_id]
+            add({
+                "kind": obligation.kind, "value": obligation.value, "origin": origin,
+                "source_session_id": owner, "source_entry_id": obligation.source_entry_id,
+                "source_sha256": source_hash, "source_compaction_id": compaction_id,
+            })
+
+    # Inherited references have capacity before new candidates. Missing items
+    # must never disappear merely because the latest summary omitted them.
+    for checkpoint in previous:
+        if checkpoint.source_entries:
+            derive(checkpoint.source_entries, origin="canonical", owner=checkpoint.session_id)
+            continue
+        if checkpoint.manifest is _NO_REFERENCE_MANIFEST:
+            derive(
+                [{"role": "assistant", "content": checkpoint.text}], origin="legacy_unclassified",
+                owner=checkpoint.session_id, compaction_id=checkpoint.compaction_id,
+            )
+            continue
+        inherited, _, inherited_reasons = _read_reference_manifest(checkpoint)
+        reasons.update(inherited_reasons)
+        if checkpoint.session_id != session_id:
+            reasons.add("owner_mismatch")
+            inherited_reasons.add("owner_mismatch")
+        untrusted_identity = bool(inherited_reasons & {
+            "owner_mismatch", "checkpoint_mismatch", "unsupported_version",
+        })
+        for item in inherited:
+            if untrusted_identity:
+                item = {**item, "origin": "legacy_unclassified"}
+            add(item)
+        if inherited_reasons & {
+            "owner_mismatch", "checkpoint_mismatch", "unsupported_version",
+            "malformed_manifest", "malformed_entries", "malformed_entry",
+        }:
+            # Corrupt metadata cannot authorize suppressing a checkpoint's old
+            # candidates. Keep conservative legacy evidence and mark incomplete.
+            # A valid but overflowing inventory remains authoritative for the
+            # records it contains: do not mine new references from its prose.
+            derive(
+                [{"role": "assistant", "content": checkpoint.text}], origin="legacy_unclassified",
+                owner=checkpoint.session_id, compaction_id=checkpoint.compaction_id,
+            )
+    derive(entries, origin="canonical", owner=session_id)
+    for path in verified_attachment_paths:
+        if not isinstance(path, str) or not path or len(path) > 1024:
+            reasons.add("typed_reference_truncated")
+            continue
+        add({
+            "kind": "file_path", "value": path, "origin": "typed_artifact",
+            "source_session_id": session_id, "source_entry_id": None,
+            "source_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+            "source_compaction_id": None,
+        })
+    exact_obligations = [CompactionObligation(
+        kind=item["kind"], value=item["value"], source_entry_id=item["source_entry_id"],
+    ) for item in references.values()]
+    other_entries = [
+        *({"role": "assistant", "content": item.text} for item in previous), *entries,
+    ]
+    # Preserve the established balanced sample of goal/constraint/error and
+    # other diagnostics independently of the exact inventory. Verification adds
+    # at most 64 manifest references to that sample, deduplicating overlaps.
+    obligations = [item for item in extract_compaction_obligations(other_entries)
+                   if item.kind not in _EXACT_REFERENCE_KINDS]
+    obligations.extend(exact_obligations)
+    return CoverageObligationSet(
+        obligations=tuple(obligations),
+        manifest={
+            "schema_version": 1, "session_id": session_id, "compaction_id": None,
+            "covered_through_id": 0, "complete": not reasons,
+            "incomplete_reasons": sorted(reasons)[:8], "entries": list(references.values()),
+        },
+    )
+
+
+def bind_coverage_manifest(
+    payload: dict[str, Any], *, session_id: str, compaction_id: str | None,
+    covered_through_id: int, source_session_id: str | None = None,
+) -> dict[str, Any]:
+    """Bind host metadata at the existing atomic commit/fork boundary.
+
+    A deliberate fork may change the owner, preserving each reference's original
+    source owner. Importing arbitrary foreign metadata cannot grant that proof.
+    The caller's payload is never mutated, including on a failed later commit.
+    """
+    coverage = payload.get("source_coverage")
+    if not isinstance(coverage, dict) or _EXACT_REFERENCE_MANIFEST not in coverage:
+        return payload
+    raw = coverage[_EXACT_REFERENCE_MANIFEST]
+    checkpoint = CoverageCheckpoint(
+        text="", session_id=source_session_id or session_id,
+        compaction_id=compaction_id if source_session_id is not None else None,
+        covered_through_id=covered_through_id if source_session_id is not None else 0,
+        manifest=raw,
+    )
+    records, complete, reasons = _read_reference_manifest(checkpoint)
+    manifest = {
+        "schema_version": 1, "session_id": session_id, "compaction_id": compaction_id,
+        "covered_through_id": covered_through_id, "complete": complete,
+        "incomplete_reasons": sorted(reasons)[:8], "entries": records,
+    }
+    bound_coverage = {**coverage, _EXACT_REFERENCE_MANIFEST: manifest}
+    if not complete and bound_coverage.get("status") == "pass":
+        bound_coverage["status"] = "unknown"
+    return {**payload, "source_coverage": bound_coverage}
+
+
+def coverage_with_manifest(coverage: CoverageResult, manifest: Mapping[str, Any]) -> CoverageResult:
+    """An incomplete inventory may diagnose omissions but cannot prove a pass."""
+    if manifest.get("complete") is not True and coverage.status == "pass":
+        return coverage.model_copy(update={"status": "unknown"})
+    return coverage
+
+
 def verify_summary_coverage(
     summary_text: str,
     obligations: Sequence[CompactionObligation],
     *,
     backfill_missing: bool = True,
     block_missing_critical: bool = False,
+    exact_reference_manifest: Mapping[str, Any] | None = None,
 ) -> CoverageResult:
     """Report bounded literal matches, never repair or reject prose.
 
@@ -890,7 +1177,17 @@ def verify_summary_coverage(
         prose_search_text = re.sub(r"\s+", " ", summary_text).casefold()
         checked = covered = 0
         missing: list[str] = []
-        for obligation in islice(obligations, _MAX_COVERAGE_OBLIGATIONS):
+        candidates = list(islice(obligations, _MAX_COVERAGE_OBLIGATIONS))
+        if exact_reference_manifest is not None:
+            seen = {(item.kind, item.value.casefold()) for item in candidates}
+            for record in exact_reference_manifest.get("entries", [])[:_MAX_COVERAGE_OBLIGATIONS]:
+                key = (record["kind"], record["value"].casefold())
+                if key not in seen:
+                    candidates.append(CompactionObligation(
+                        kind=record["kind"], value=record["value"],
+                    ))
+                    seen.add(key)
+        for obligation in candidates:
             if obligation.kind in _MODEL_UPDATED_STATE_KINDS:
                 continue
             checked += 1
@@ -921,6 +1218,7 @@ def build_structured_summary_from_text(
     *,
     block_missing_critical: bool = False,
     verified_attachment_paths: Sequence[str] = (),
+    exact_reference_manifest: Mapping[str, Any] | None = None,
 ) -> tuple[StructuredCompactionSummary, CoverageResult]:
     """Keep model-authored prose in the v1 payload without semantic sidecars.
 
@@ -928,7 +1226,11 @@ def build_structured_summary_from_text(
     New checkpoints do not turn extracted historical facts into current state.
     """
 
-    coverage = verify_summary_coverage(summary_text, obligations)
+    coverage = verify_summary_coverage(
+        summary_text, obligations, exact_reference_manifest=exact_reference_manifest,
+    )
+    if exact_reference_manifest is not None:
+        coverage = coverage_with_manifest(coverage, exact_reference_manifest)
     summary = StructuredCompactionSummary(
         current_status=summary_text,
         # These are host-materialized references, not facts extracted from prose.
@@ -944,6 +1246,8 @@ def build_structured_summary_from_text(
             "covered_obligations": coverage.covered_obligations,
         },
     )
+    if exact_reference_manifest is not None:
+        summary.source_coverage[_EXACT_REFERENCE_MANIFEST] = dict(exact_reference_manifest)
     return summary, coverage
 
 

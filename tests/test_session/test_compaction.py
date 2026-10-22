@@ -381,8 +381,12 @@ async def test_durable_attachment_summary_receives_id_without_forced_backfill(
     assert result.summary_payload["important_identifiers"] == []
     serialized_payload = json.dumps(result.summary_payload, sort_keys=True)
     replay = compaction_replay_summary(result)
+    # Host-only provenance records diagnostics without inserting the reference
+    # into the model's summary, typed task fields, or replay text.
+    manifest = result.summary_payload["source_coverage"]["exact_reference_manifest"]
+    assert any(item["value"] == occurrence.attachment_id for item in manifest["entries"])
+    assert occurrence.attachment_id not in replay
     for rendered in (serialized_payload, replay):
-        assert occurrence.attachment_id not in rendered
         assert image_data not in rendered
         assert "/private/tmp" not in rendered
         assert "not-an-occurrence-id" not in rendered

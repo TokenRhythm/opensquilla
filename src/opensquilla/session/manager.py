@@ -51,7 +51,9 @@ from opensquilla.session.compaction import (
 from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
 from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError, new_compaction_id
 from opensquilla.session.compaction_state import (
+    CoverageCheckpoint,
     StructuredCompactionSummary,
+    bind_coverage_manifest,
     build_structured_summary_from_text,
     render_structured_summary,
 )
@@ -123,6 +125,19 @@ class CompactionSourceSnapshot:
     previous_covered_through_id: int = 0
     valid: bool = True
     previous_attachment_paths: tuple[str, ...] = ()
+    previous_coverage_checkpoints: tuple[CoverageCheckpoint, ...] = ()
+    coverage_session_id: str | None = None
+
+
+def _coverage_checkpoints(
+    records: Sequence[CompactionContextItem], session_id: str,
+) -> tuple[CoverageCheckpoint, ...]:
+    return tuple(
+        record.coverage_checkpoint or CoverageCheckpoint(
+            text=record.text, session_id=session_id, compaction_id=record.compaction_id,
+            covered_through_id=record.covered_through_id, source_entries=record.source_entries,
+        ) for record in records
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -671,6 +686,7 @@ def _frozen_compaction_prefix_hash(
     config: CompactionConfig,
     consumer_admission_fingerprint: str = "",
     force: bool = False,
+    context_fingerprint: str = "",
 ) -> str:
     """Hash the frozen source plus output- and persistence-affecting settings."""
 
@@ -679,6 +695,7 @@ def _frozen_compaction_prefix_hash(
         digest.update(_stable_json(row).encode("utf-8"))
         digest.update(b"\n")
     request_shape = {
+        "context_fingerprint": context_fingerprint,
         "previous_summary_sha256": hashlib.sha256(
             previous_summary.encode("utf-8")
         ).hexdigest(),
@@ -2258,7 +2275,14 @@ class SessionManager:
                             compaction_id=summary.compaction_id,
                             trigger_reason=summary.trigger_reason,
                             summary_text=summary.summary_text,
-                            summary_payload=summary.summary_payload,
+                            summary_payload=(
+                                bind_coverage_manifest(
+                                    summary.summary_payload, session_id=child.session_id,
+                                    source_session_id=parent.session_id,
+                                    compaction_id=summary.compaction_id,
+                                    covered_through_id=summary.covered_through_id,
+                                ) if summary.summary_payload is not None else None
+                            ),
                             summary_format=summary.summary_format,
                             summary_source=summary.summary_source,
                             coverage_status=summary.coverage_status,
@@ -2281,7 +2305,12 @@ class SessionManager:
                             provider=state.provider,
                             model=state.model,
                             state_kind=state.state_kind,
-                            payload=state.payload,
+                            payload=bind_coverage_manifest(
+                                state.payload, session_id=child.session_id,
+                                source_session_id=parent.session_id,
+                                compaction_id=state.payload.get("compaction_id"),
+                                covered_through_id=state.covered_through_id,
+                            ),
                             covered_through_id=state.covered_through_id,
                             created_at=state.created_at,
                             expires_at=state.expires_at,
@@ -3072,6 +3101,8 @@ class SessionManager:
             previous_attachment_paths=tuple(sorted({
                 path for record in previous_records for path in record.verified_attachment_paths
             })),
+            previous_coverage_checkpoints=_coverage_checkpoints(previous_records, node.session_id),
+            coverage_session_id=node.session_id,
         )
 
     async def resolve_compaction_context(
@@ -3792,6 +3823,7 @@ class SessionManager:
                 config=effective_config,
                 consumer_admission_fingerprint=consumer_admission_fingerprint,
                 force=trigger_reason == "manual",
+                context_fingerprint=previous_context_fingerprint,
             ),
             target_fingerprint=_compaction_target_fingerprint(effective_config),
         )
@@ -3810,6 +3842,9 @@ class SessionManager:
                     path for record in previous_context_records
                     for path in record.verified_attachment_paths
                 })),
+                previous_coverage_checkpoints=_coverage_checkpoints(
+                    previous_context_records, node.session_id,
+                ),
                 preimage=preimage,
                 raw=raw,
                 context_window_tokens=context_window_tokens,
@@ -3854,6 +3889,7 @@ class SessionManager:
         previous_context_fingerprint: str,
         previous_covered_through_id: int,
         previous_attachment_paths: tuple[str, ...],
+        previous_coverage_checkpoints: tuple[CoverageCheckpoint, ...],
         preimage: tuple[tuple[Any, ...], ...],
         raw: list[dict[str, Any]],
         context_window_tokens: int,
@@ -3882,6 +3918,7 @@ class SessionManager:
                 custom_instructions=custom_instructions,
                 previous_summary=previous_summary or None,
                 previous_attachment_paths=previous_attachment_paths,
+                previous_coverage_checkpoints=previous_coverage_checkpoints,
                 summary_replay_renderer=_durable_summary_replay,
                 consumer_admission=consumer_admission,
                 provider_request_correlation=provider_request_correlation,
@@ -4064,6 +4101,15 @@ class SessionManager:
             assert coverage is not None
             # Semantic coverage belongs to generation diagnostics. The writer
             # checks the admitted artifact, never re-extracts or backfills facts.
+            covered_through_id = max(
+                previous_covered_through_id,
+                max((entry.id or 0) for entry in removed_entries) if removed_entries else 0,
+            )
+            if result.summary_payload is not None:
+                result = replace(result, summary_payload=bind_coverage_manifest(
+                    result.summary_payload, session_id=current_node.session_id,
+                    compaction_id=persisted_compaction_id, covered_through_id=covered_through_id,
+                ))
             summary_record = SessionSummary(
                 session_id=current_node.session_id,
                 session_key=session_key,
@@ -4082,12 +4128,7 @@ class SessionManager:
                 kept_count=len(kept_entries),
                 chunk_count=result.chunks_processed,
 
-                covered_through_id=max(
-                    previous_covered_through_id,
-                    max((entry.id or 0) for entry in removed_entries)
-                    if removed_entries
-                    else 0,
-                ),
+                covered_through_id=covered_through_id,
             )
             context_state = self._portable_structured_summary_state(
                 current_node,
@@ -4412,6 +4453,19 @@ class SessionManager:
                 )
                 return CompactionPersistResult(False, rejection)
 
+            covered_through_id = max(
+                previous_covered_through_id,
+                max((entry.id or 0) for entry in removed_entries) if removed_entries else 0,
+            )
+            structured_summary = StructuredCompactionSummary.model_validate(bind_coverage_manifest(
+                structured_summary.model_dump(mode="json"), session_id=node.session_id,
+                compaction_id=persisted_compaction_id, covered_through_id=covered_through_id,
+            ))
+            if (
+                coverage_status == "pass"
+                and structured_summary.source_coverage.get("status") == "unknown"
+            ):
+                coverage_status = "unknown"
             summary_record = SessionSummary(
                 session_id=node.session_id,
                 session_key=session_key,
@@ -4426,12 +4480,7 @@ class SessionManager:
                 removed_count=len(removed_entries),
                 kept_count=persisted_kept_count,
 
-                covered_through_id=max(
-                    previous_covered_through_id,
-                    max((entry.id or 0) for entry in removed_entries)
-                    if removed_entries
-                    else 0,
-                ),
+                covered_through_id=covered_through_id,
             )
 
         if expected_source_entries is not None:

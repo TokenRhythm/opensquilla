@@ -17053,6 +17053,20 @@ class Agent:
                 getattr(source_snapshot, "previous_attachment_paths", ())
                 if source_snapshot is not None else ()
             ),
+            previous_coverage_checkpoints=(
+                getattr(source_snapshot, "previous_coverage_checkpoints", ())
+                if source_snapshot is not None else ()
+            ),
+            coverage_session_id=(
+                getattr(source_snapshot, "coverage_session_id", None)
+                if source_snapshot is not None else None
+            ),
+            canonical_coverage_entries=(
+                tuple(source_snapshot.entries) if source_snapshot is not None else None
+            ),
+            canonical_coverage_complete=(
+                source_snapshot.valid if source_snapshot is not None else True
+            ),
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
                 execution_id=uuid.uuid4().hex,
