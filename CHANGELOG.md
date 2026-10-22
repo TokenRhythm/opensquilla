@@ -17,11 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   panels for files, terminals, and side conversations.
 - Inline interactive visualizations, Mermaid diagrams, and richer Markdown
   rendering during streaming replies.
+- In-conversation text search (Ctrl/Cmd+F), including archived history.
 - Configurable text-to-video generation through TokenRhythm or OpenRouter,
   with generated MP4 delivery and recovery of accepted video jobs.
 
 ### Changed
 
+- Available updates download in the background on supported Windows and macOS
+  Desktop builds, with confirmation before installation.
 - Preserve custom routing model choices during upgrades.
   Project instructions are read at the start of each turn.
 - Clearer usage accounting for media and delegated tasks, with smaller
