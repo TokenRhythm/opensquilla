@@ -1595,7 +1595,7 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
                       :disabled="row.workspaceAvailable === false"
                       @click.stop="startProjectTask(row)"
                     >
-                      <Icon name="chat-plus" :size="16" />
+                      <Icon name="plus" :size="16" />
                     </button>
                   </div>
                 </div>
