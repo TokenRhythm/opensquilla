@@ -141,10 +141,10 @@ def test_openrouter_public_physical_limits_are_available_offline(
 @pytest.mark.parametrize(
     ("provider", "expected_limits"),
     [
-        ("openrouter", [(1_000_000, 131_072), (1_048_576, 393_216),
-                        (1_048_576, 131_072), (1_048_576, 943_718)]),
-        ("tokenrhythm", [(1_000_000, 131_072), (1_000_000, 384_000),
-                         (1_048_576, 131_072), (1_048_576, 1_048_576)]),
+        ("openrouter", [(1_000_000, 65_536), (1_048_576, 943_718),
+                        (1_024_000, 384_000), (1_048_576, 131_072)]),
+        ("tokenrhythm", [(1_000_000, 65_536), (1_000_000, 384_000),
+                         (1_000_000, 384_000), (1_048_576, 131_072)]),
     ],
 )
 def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
@@ -161,8 +161,7 @@ def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
         limits = catalog.resolve_deployment_limits(model, provider=provider)
         expected_request_output = (
             window // 2
-            if (provider == "openrouter" and output >= (window * 9) // 10)
-            or (provider == "tokenrhythm" and output == window)
+            if provider == "openrouter" and output >= (window * 9) // 10
             else output
         )
         assert (limits.context_window, limits.max_output_tokens) == (
@@ -182,7 +181,7 @@ def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
         )
         assert catalog.resolve_vision_support(model, provider_name=provider) == (
             "supported"
-            if tier in {"c0", "c1", "c3"}
+            if tier == "c0" or (provider == "tokenrhythm" and tier == "c1")
             else "unsupported"
         )
         capabilities = catalog.get_capabilities(model, provider_name=provider)
@@ -191,6 +190,36 @@ def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
         assert capabilities.reasoning_format == (
             "openrouter" if provider == "openrouter" else "none"
         )
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "window", "output", "request_output"),
+    [
+        ("openrouter", "deepseek/deepseek-v4.1-flash-1017", 1_048_576, 393_216, 393_216),
+        ("openrouter", "moonshotai/kimi-k3", 1_048_576, 943_718, 524_288),
+        ("tokenrhythm", "deepseek-v4.1-flash-1017", 1_000_000, 384_000, 384_000),
+        ("tokenrhythm", "kimi-k3", 1_048_576, 1_048_576, 524_288),
+    ],
+)
+def test_non_default_router_models_keep_offline_capacity_and_capabilities(
+    provider: str, model: str, window: int, output: int, request_output: int,
+) -> None:
+    """Rolling back recommendations must not weaken existing custom routes."""
+    catalog = ModelCatalog()
+    entry = catalog.resolve_entry(model, provider=provider)
+    assert (entry.context_window, entry.max_output_tokens) == (window, output)
+    assert catalog.resolve_context_window_with_source(model, provider) == (window, "catalog")
+    assert catalog.resolve_max_tokens_with_source(
+        model, provider=provider, capacity_only=True,
+    ) == (output, "catalog")
+    limits = catalog.resolve_deployment_limits(model, provider=provider)
+    assert (limits.context_window, limits.max_output_tokens) == (window, request_output)
+    assert limits.context_window_known and limits.max_output_tokens_known
+    assert catalog.resolve_vision_support(model, provider_name=provider) == "supported"
+    capabilities = catalog.get_capabilities(model, provider_name=provider)
+    assert capabilities.supports_tools and capabilities.supports_vision
+    assert capabilities.supports_reasoning is (provider == "openrouter")
+    assert capabilities.reasoning_format == ("openrouter" if provider == "openrouter" else "none")
 
 
 def test_openrouter_ninety_percent_completion_reserves_half_window() -> None:

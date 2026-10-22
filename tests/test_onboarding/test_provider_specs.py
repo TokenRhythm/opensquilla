@@ -99,7 +99,7 @@ def test_tokenrhythm_preset_wire_exposes_single_model_c3_default():
 
     c3 = row["presets"][0]["tiers"]["c3"]
     assert c3["ensembleEnabled"] is False
-    assert c3["model"] == "kimi-k3"
+    assert c3["model"] == "glm-5.3"
 
 
 def test_tier_payload_preserves_a_legacy_ensemble_selection_mode():

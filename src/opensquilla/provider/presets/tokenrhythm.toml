@@ -11,31 +11,31 @@
 id = "tokenrhythm"
 provider = "tokenrhythm"
 label = "TokenRhythm"
-description = "Curated TokenRhythm router ladder (Qwen3.8 Flash, DeepSeek V4.1 Flash 1017, GLM 5.3, then Kimi K3), applied as inline tiers."
+description = "Curated TokenRhythm router ladder (Qwen3.7 Flash, DeepSeek Flash, DeepSeek V4 Pro 0813, then GLM 5.3), applied as inline tiers."
 default_model = "deepseek-v4-pro-0813"
 
 [tiers.c0]
 provider = "tokenrhythm"
-model = "qwen3.8-flash"
-description = "Fast Qwen3.8 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
+model = "qwen3.7-flash"
+description = "Fast Qwen3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
 supports_image = false
 
 [tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4.1-flash-1017"
-description = "Default DeepSeek V4.1 Flash 1017 route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-flash"
+description = "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [tiers.c2]
 provider = "tokenrhythm"
-model = "glm-5.3"
-description = "Stronger GLM 5.3 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+model = "deepseek-v4-pro-0813"
+description = "Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
 supports_image = false
 
 [tiers.c3]
 provider = "tokenrhythm"
-model = "kimi-k3"
-description = "Highest-tier Kimi K3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
+model = "glm-5.3"
+description = "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
 supports_image = false
 ensemble_enabled = false
 

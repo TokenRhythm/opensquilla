@@ -286,22 +286,24 @@ def test_disabled_openrouter_managed_inline_refreshes_without_enabling() -> None
     assert cfg.squilla_router.tiers == _default_tiers()
 
 
-_PRE_REFRESH_MODELS = {
+# The newer ladder can remain on disk after rolling back the recommendation.
+# Keep it distinct from today's defaults so these tests exercise persistence.
+_NON_CURRENT_MODELS = {
     "tokenrhythm": (
-        "qwen3.7-flash", "deepseek-flash", "deepseek-v4-pro-0813", "glm-5.3",
+        "qwen3.8-flash", "deepseek-v4.1-flash-1017", "glm-5.3", "kimi-k3",
     ),
     "openrouter": (
-        "qwen/qwen3.7-flash", "deepseek/deepseek-v4-flash-0731",
-        "deepseek/deepseek-v4-pro-0813", "z-ai/glm-5.3",
+        "qwen/qwen3.8-flash", "deepseek/deepseek-v4.1-flash-1017",
+        "z-ai/glm-5.3", "moonshotai/kimi-k3",
     ),
 }
 
 
-def _pre_refresh_tiers(provider: str) -> dict[str, dict[str, str]]:
+def _non_current_tiers(provider: str) -> dict[str, dict[str, str]]:
     return {
         name: {"provider": provider, "model": model}
         for name, model in zip(
-            ("c0", "c1", "c2", "c3"), _PRE_REFRESH_MODELS[provider], strict=True,
+            ("c0", "c1", "c2", "c3"), _NON_CURRENT_MODELS[provider], strict=True,
         )
     }
 
@@ -314,7 +316,7 @@ def test_refreshed_managed_ladder_persists_when_becoming_custom(
     from opensquilla.onboarding.mutations import upsert_llm_provider, upsert_router
 
     path = tmp_path / "config.toml"
-    old_tiers = _pre_refresh_tiers(provider)
+    old_tiers = _non_current_tiers(provider)
     path.write_text(tomli_w.dumps({
         "config_version": LATEST_CONFIG_VERSION,
         "llm": {"provider": provider},
@@ -330,6 +332,10 @@ def test_refreshed_managed_ladder_persists_when_becoming_custom(
     preset = get_preset(provider)
     assert preset is not None
     expected = preset.tier_defaults()
+    assert old_tiers != expected
+    assert tuple(expected[tier]["model"] for tier in ("c0", "c1", "c2", "c3")) != (
+        _NON_CURRENT_MODELS[provider]
+    )
     assert cfg.squilla_router.tiers == expected
     # Managed refresh is effective in memory without rewriting a stamped file.
     assert tomllib.loads(path.read_text(encoding="utf-8"))["squilla_router"]["tiers"] == (
@@ -378,7 +384,7 @@ def test_stamped_unmanaged_ladder_is_preserved_on_unrelated_save(
     tmp_path: Path, provider: str, binding: str | None,
 ) -> None:
     path = tmp_path / "config.toml"
-    old_tiers = _pre_refresh_tiers(provider)
+    old_tiers = _non_current_tiers(provider)
     path.write_text(tomli_w.dumps({
         "config_version": LATEST_CONFIG_VERSION,
         "llm": {"provider": provider},
@@ -555,7 +561,7 @@ def test_old_ladder_upgrade_preserves_explicit_reasoning_and_other_tier_options(
         llm={"provider": "openrouter"},
         squilla_router={"preset_binding": "custom", "tiers": tiers},
     )
-    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek/deepseek-v4.1-flash-1017"
+    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek/deepseek-v4-flash-0731"
     assert cfg.squilla_router.tiers["c1"]["thinking_level"] == "low"
     assert cfg.squilla_router.tiers["c1"]["temperature"] == 0.42
 
@@ -720,10 +726,10 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     tiers = cfg.squilla_router.tiers
     assert set(tiers) == {"c0", "c1", "c2", "c3", "image_model"}
     expected_models = {
-        "c0": "qwen3.8-flash",
-        "c1": "deepseek-v4.1-flash-1017",
-        "c2": "glm-5.3",
-        "c3": "kimi-k3",
+        "c0": "qwen3.7-flash",
+        "c1": "deepseek-flash",
+        "c2": "deepseek-v4-pro-0813",
+        "c3": "glm-5.3",
         "image_model": "kimi-k2.6",
     }
     for name, tier in tiers.items():

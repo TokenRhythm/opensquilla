@@ -281,9 +281,9 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
 @pytest.mark.parametrize(
     ("routed_tier", "expected_model", "expect_ensemble"),
     [
-        ("c0", "qwen3.8-flash", False),
-        ("c1", "deepseek-v4.1-flash-1017", False),
-        ("c2", "glm-5.3", False),
+        ("c0", "qwen3.7-flash", False),
+        ("c1", "deepseek-flash", False),
+        ("c2", "deepseek-v4-pro-0813", False),
         # Shared C3 triggers the global plan without replacing the configured
         # direct/fallback selector head.
         ("c3", "deepseek-v4-flash-0731", True),
@@ -339,7 +339,7 @@ async def test_tokenrhythm_router_uses_ensemble_only_for_c3(
         assert provider.profile_name == "static_tokenrhythm_b5"
         assert provider.fallback_model == "deepseek-v4-flash-0731"
         assert turn.model == "deepseek-v4-flash-0731"
-        assert turn.metadata["routed_model_before_ensemble"] == "kimi-k3"
+        assert turn.metadata["routed_model_before_ensemble"] == "glm-5.3"
         assert turn.metadata["ensemble_activation_source"] == "router_tier"
         assert turn.metadata["ensemble_tier_binding"] == "shared"
         assert turn.metadata["ensemble_selection_mode"] == "static_tokenrhythm_b5"
@@ -1995,7 +1995,7 @@ async def test_tokenrhythm_c3_uses_fixed_model_without_ensemble_credential(
     assert calls == []
     assert selector.current_config.model == "deepseek-v4-flash-0731"
     assert turn.model == "deepseek-v4-flash-0731"
-    assert turn.metadata["routed_model_before_ensemble"] == "kimi-k3"
+    assert turn.metadata["routed_model_before_ensemble"] == "glm-5.3"
     assert turn.metadata["ensemble_wrap_skipped_reason"] == (
         "static_tokenrhythm_b5_no_credential"
     )
