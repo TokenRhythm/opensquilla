@@ -291,15 +291,15 @@
                  out-in no longer incurs the old remount/fetch "dead gap". -->
             <template v-if="route.meta.routeTransition === 'none'">
               <KeepAlive v-if="route.meta.keepAlive" :max="12">
-                <component :is="Component" :key="route.meta.viewKey || route.name" />
+                <component :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
               </KeepAlive>
-              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
             </template>
             <Transition v-else name="route-fade" mode="out-in">
               <KeepAlive v-if="route.meta.keepAlive" :max="12">
-                <component :is="Component" :key="route.meta.viewKey || route.name" />
+                <component :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
               </KeepAlive>
-              <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
+              <component v-else :is="Component" :key="route.meta.viewKey || route.name" v-bind="isChatRoute ? { surfaceVisible: !mainPaneHidden } : {}" />
             </Transition>
           </router-view>
           </SettingsBackgroundRoute>
