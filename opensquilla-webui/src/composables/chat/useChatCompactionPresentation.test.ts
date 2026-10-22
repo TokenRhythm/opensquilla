@@ -26,11 +26,13 @@ const installMaintenance = new Function('watch', 'compactStatus', 'messages', ma
   .replace('const maintenance: ChatMaintenanceEvent', 'const maintenance')
   .replace('messages.value[index]!', 'messages.value[index]'))
 const terminalWiring = chatViewSource.match(/showCompactionToast: (\(payload, meta\) => \{[\s\S]*?)\n  },\n  getCompactionPlacement/)?.[1]
-if (!terminalWiring || !chatViewSource.includes('onReadEpoch: sessionViewCache.observeEpoch')) {
+const epochWiring = chatViewSource.match(/onReadEpoch: (\(key, epoch\) => \{[\s\S]*?\n  }),\n  onReadStarted:/)?.[1]
+if (!terminalWiring || !epochWiring) {
   throw new Error('ChatView terminal receipt/epoch wiring is missing')
 }
 const wireTerminals = new Function('sessionKey', 'sessionReadLifecycle', 'deliveryIdentity',
   'showCompactionToast', 'sessionViewCache', `return ${terminalWiring}\n}`)
+const wireReadEpoch = new Function('sessionViewCache', 'scheduleHistorySync', `return ${epochWiring}`)
 
 const ID = 'cmp-cold-reload'
 function page(empty = false): SessionReadHistoryPage {
@@ -53,6 +55,7 @@ function harness() {
   const sessionKey = ref('A')
   const messages = ref<ChatMessage[]>([])
   const schedulePendingDrainAfterTerminal = vi.fn()
+  const scheduleHistorySync = vi.fn()
   const readHistory = vi.fn<() => Promise<SessionReadHistoryPage>>().mockResolvedValue(page())
   const lease = { criticalRequestsQueued: Promise.resolve(), history: {
     latest: readHistory, before: readHistory, after: readHistory,
@@ -70,6 +73,7 @@ function harness() {
     const compaction = useChatCompaction({ sessionKey, schedulePendingDrainAfterTerminal, popAllPendingIntoComposer: () => true })
     const receive = wireTerminals(sessionKey, reader, deliveryIdentity, compaction.showCompactionToast,
       cache) as typeof compaction.showCompactionToast
+    const receiveEpoch = wireReadEpoch(cache, scheduleHistorySync) as (key: string, epoch: number | null) => void
     installMaintenance(watch, compaction.compactStatus, messages)
     const rendered = useChatRenderedMessages({
       messages: cache.messages, sessionKey, isPreview: cache.showingPreview,
@@ -81,7 +85,7 @@ function harness() {
     const display = project(computed, ref(null), { renderedMessages: ref([]) }, rendered.renderedMessages,
       projectInitialCompactionRows, sessionKey, history.historySessionKey, history.historyState,
       cache, compaction.compactStatus) as Readonly<{ value: ChatRenderedMessage[] }>
-    return { cache, history, compaction, display, receive }
+    return { cache, history, compaction, display, receive, receiveEpoch }
   })!
   const element = document.createElement('div')
   const app = createApp({ render: () => h('div', state.display.value.map((message, index) =>
@@ -102,7 +106,7 @@ function harness() {
     return { pending, resolve, reject }
   }
   return { ...state, sessionKey, messages, element, start, readHistory, deferredRead,
-    schedulePendingDrainAfterTerminal,
+    schedulePendingDrainAfterTerminal, scheduleHistorySync,
     stop: () => { app.unmount(); state.history.cleanup(); scope.stop() },
   }
 }
@@ -269,7 +273,7 @@ describe('initial compaction transcript presentation', () => {
 
 async function warmPreview() {
   const h = harness()
-  h.cache.observeEpoch('A', 0)
+  h.receiveEpoch('A', 0)
   await h.history.loadHistory()
   h.start()
   h.cache.liveInstalled('A')
@@ -283,10 +287,46 @@ async function warmPreview() {
   h.messages.value = []
   // The subscription invokes this fast proof under its active lease before
   // replaying the snapshot, while deferred metadata may still be unavailable.
-  h.cache.observeEpoch('A', 0)
+  h.receiveEpoch('A', 0)
   await nextTick()
   return h
 }
+
+describe('early read epoch composition', () => {
+  it('invalidates a changed epoch and schedules replacement history before metadata arrives', async () => {
+    const h = await warmPreview()
+    try {
+      expect(h.cache.showingPreview.value).toBe(true)
+      expect(h.scheduleHistorySync).not.toHaveBeenCalled()
+      const generation = h.cache.generation.value
+      h.receiveEpoch('A', 1)
+      expect(h.cache.generation.value).toBe(generation + 1)
+      expect(h.cache.showingPreview.value).toBe(false)
+      expect(h.cache.ready.value).toBe(false)
+      expect(h.scheduleHistorySync).toHaveBeenCalledOnce()
+      // The later observation of this same epoch cannot schedule a second read.
+      h.receiveEpoch('A', 1)
+      expect(h.cache.generation.value).toBe(generation + 1)
+      expect(h.scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it.each([
+    ['same epoch', 'A', 0],
+    ['unknown epoch', 'A', null],
+    ['inactive session', 'B', 1],
+  ] as const)('keeps the warm view without scheduling history for %s', async (_label, key, epoch) => {
+    const h = await warmPreview()
+    try {
+      const generation = h.cache.generation.value
+      h.receiveEpoch(key, epoch)
+      expect(h.cache.generation.value).toBe(generation)
+      expect(h.cache.showingPreview.value).toBe(true)
+      expect(h.cache.messages.value[0]?.messageId).toBe('user-a')
+      expect(h.scheduleHistorySync).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+})
 
 describe('warm compaction receipt composition', () => {
   it('labels an unverified cached running receipt as recovering without deleting its query or inventing completion', async () => {
