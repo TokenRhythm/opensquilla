@@ -28,6 +28,8 @@ def test_search_docs_describe_runtime_provider_matrix() -> None:
         "TAVILY_API_KEY",
         "Exa",
         "EXA_API_KEY",
+        "Keenable",
+        "KEENABLE_API_KEY",
         "DuckDuckGo",
         "no-key",
         "partial-key",
@@ -38,8 +40,8 @@ def test_search_docs_describe_runtime_provider_matrix() -> None:
     ]:
         assert expected in docs
 
-    assert '"duckduckgo", "bocha", "brave", "iqs", "tavily", or "exa"' in docs
-    assert "web search (DuckDuckGo, Bocha, Brave, IQS, Tavily, or Exa)" in docs
+    assert '"duckduckgo", "bocha", "brave", "iqs", "tavily", "exa", or "keenable"' in docs
+    assert "web search (DuckDuckGo, Bocha, Brave, IQS, Tavily, Exa, or Keenable)" in docs
 
 
 def test_desktop_search_surfaces_use_shared_runtime_provider_catalog() -> None:
@@ -55,6 +57,7 @@ def test_desktop_search_surfaces_use_shared_runtime_provider_catalog() -> None:
         "IQS_SEARCH_API_KEY",
         "TAVILY_API_KEY",
         "EXA_API_KEY",
+        "KEENABLE_API_KEY",
         "Bocha",
         "Alibaba Cloud IQS",
         "Tavily",

@@ -4078,6 +4078,7 @@ async def build_services(
             import opensquilla.search.providers.duckduckgo  # noqa: F401 — registers provider
             import opensquilla.search.providers.exa  # noqa: F401 — registers provider
             import opensquilla.search.providers.iqs  # noqa: F401 — registers provider
+            import opensquilla.search.providers.keenable  # noqa: F401 — registers provider
             import opensquilla.search.providers.tavily  # noqa: F401 — registers provider
             from opensquilla.tools.builtin.web import configure_search
 

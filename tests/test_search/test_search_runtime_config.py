@@ -14,6 +14,7 @@ def _clear_search_env(monkeypatch) -> None:
         "IQS_SEARCH_API_KEY",
         "TAVILY_API_KEY",
         "EXA_API_KEY",
+        "KEENABLE_API_KEY",
         "CUSTOM_EXA_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -99,6 +100,87 @@ def test_resolver_iqs_default_env_orders_iqs_then_duckduckgo(monkeypatch) -> Non
     iqs = runtime.provider_config("iqs")
     assert iqs.available is True
     assert iqs.credential_source == "spec_env"
+
+
+def test_resolver_keenable_is_opt_in_and_skipped_until_selected(monkeypatch) -> None:
+    _clear_search_env(monkeypatch)
+
+    runtime = resolve_search_runtime(SearchRuntimeConfig(provider="duckduckgo"))
+
+    keenable = runtime.provider_config("keenable")
+    assert keenable.requires_api_key is False
+    assert keenable.available is False
+    assert keenable.skipped_reason == "not_selected"
+    for options in (
+        SearchOptions(query="q"),
+        SearchOptions(query="q", mode="technical"),
+        SearchOptions(query="q", recency="week"),
+        SearchOptions(query="q", include_domains=("example.com",)),
+    ):
+        assert "keenable" not in runtime.provider_order(options)
+
+
+def test_resolver_selected_keenable_orders_keenable_then_duckduckgo(monkeypatch) -> None:
+    _clear_search_env(monkeypatch)
+
+    runtime = resolve_search_runtime(SearchRuntimeConfig(provider="keenable"))
+
+    assert runtime.provider_order(SearchOptions(query="q")) == ("keenable", "duckduckgo")
+    assert runtime.provider_order(SearchOptions(query="q", recency="week")) == (
+        "keenable",
+        "duckduckgo",
+    )
+    keenable = runtime.provider_config("keenable")
+    assert keenable.available is True
+    assert keenable.skipped_reason == ""
+    assert keenable.credential_source == "none"
+    assert "api_key" not in keenable.provider_kwargs()
+
+
+def test_resolver_keenable_key_opts_in_and_reaches_provider(monkeypatch) -> None:
+    _clear_search_env(monkeypatch)
+    monkeypatch.setenv("KEENABLE_API_KEY", "keenable-key")
+
+    runtime = resolve_search_runtime(SearchRuntimeConfig(provider="duckduckgo"))
+
+    assert runtime.provider_order(SearchOptions(query="q")) == ("keenable", "duckduckgo")
+    keenable = runtime.provider_config("keenable")
+    assert keenable.available is True
+    assert keenable.credential_source == "spec_env"
+    assert keenable.provider_kwargs()["api_key"] == "keenable-key"
+
+
+def test_resolver_selected_keenable_ranks_after_keyed_providers(monkeypatch) -> None:
+    _clear_search_env(monkeypatch)
+    for key in (
+        "BOCHA_SEARCH_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "IQS_SEARCH_API_KEY",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+    ):
+        monkeypatch.setenv(key, "synthetic-key")
+
+    runtime = resolve_search_runtime(SearchRuntimeConfig(provider="keenable"))
+
+    assert runtime.provider_order(SearchOptions(query="q")) == (
+        "bocha",
+        "tavily",
+        "iqs",
+        "brave",
+        "exa",
+        "keenable",
+        "duckduckgo",
+    )
+    assert runtime.provider_order(SearchOptions(query="q", mode="technical")) == (
+        "exa",
+        "bocha",
+        "brave",
+        "tavily",
+        "iqs",
+        "keenable",
+        "duckduckgo",
+    )
 
 
 def test_resolver_all_key_mode_tie_breakers(monkeypatch) -> None:
@@ -485,6 +567,7 @@ def test_runtime_build_provider_registers_builtin_providers_in_fresh_process(
         "opensquilla.search.providers.tavily",
         "opensquilla.search.providers.brave",
         "opensquilla.search.providers.exa",
+        "opensquilla.search.providers.keenable",
         "opensquilla.search.providers.duckduckgo",
     ):
         monkeypatch.delitem(sys.modules, module_name, raising=False)

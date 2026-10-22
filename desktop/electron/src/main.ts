@@ -2222,6 +2222,14 @@ const SEARCH_PROVIDER_CATALOG: SearchProviderCatalogEntry[] = [
     note: 'Alibaba Cloud web search tuned for agents, with strong Chinese-web coverage.',
     keyPlaceholder: 'IQS_SEARCH_API_KEY',
   },
+  {
+    providerId: 'keenable',
+    label: 'Keenable',
+    envKey: 'KEENABLE_API_KEY',
+    requiresApiKey: false,
+    note: 'Web search built for agents. No key required; a key raises rate limits.',
+    keyPlaceholder: 'KEENABLE_API_KEY',
+  },
 ]
 
 const SEARCH_PROVIDER_BY_ID = new Map(
@@ -3737,6 +3745,7 @@ const SEARCH_PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string
     tavily: 'Freshness-oriented web search for current research.',
     exa: 'Semantic and content-oriented search for research workflows.',
     iqs: 'Alibaba Cloud web search tuned for agents, with strong Chinese-web coverage.',
+    keenable: 'Web search built for agents. No key required; a key raises rate limits.',
   },
   'zh-Hans': {
     duckduckgo: '无需密钥。适合入门的默认选项。',
@@ -3745,6 +3754,7 @@ const SEARCH_PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string
     tavily: '面向时效性的网络搜索，适合最新研究。',
     exa: '面向语义和内容的搜索，适合研究工作流。',
     iqs: '阿里云面向智能体的联网搜索，中文网页覆盖广。',
+    keenable: '面向智能体的联网搜索。无需密钥；配置密钥可提高速率限制。',
   },
   ja: {
     duckduckgo: 'キー不要。始めるのに適したデフォルトです。',
@@ -3753,6 +3763,7 @@ const SEARCH_PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string
     tavily: '最新の調査向けの、鮮度重視のウェブ検索です。',
     exa: '調査ワークフロー向けのセマンティック／コンテンツ指向検索です。',
     iqs: 'エージェント向けに調整された Alibaba Cloud のウェブ検索。中国語ウェブのカバレッジに優れています。',
+    keenable: 'エージェント向けのウェブ検索。キー不要です。キーを設定するとレート制限が緩和されます。',
   },
   fr: {
     duckduckgo: 'Aucune clé requise. Bon choix par défaut pour démarrer.',
@@ -3761,6 +3772,7 @@ const SEARCH_PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string
     tavily: 'Recherche web axée sur la fraîcheur pour la recherche actuelle.',
     exa: 'Recherche sémantique et orientée contenu pour les flux de recherche.',
     iqs: 'Recherche web Alibaba Cloud conçue pour les agents, avec une forte couverture du web chinois.',
+    keenable: 'Recherche web conçue pour les agents. Aucune clé requise ; une clé relève les limites de débit.',
   },
   de: {
     duckduckgo: 'Kein Schlüssel erforderlich. Gute Voreinstellung für den Einstieg.',
@@ -3769,6 +3781,7 @@ const SEARCH_PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string
     tavily: 'Aktualitätsorientierte Websuche für aktuelle Recherche.',
     exa: 'Semantische und inhaltsorientierte Suche für Recherche-Workflows.',
     iqs: 'Alibaba-Cloud-Websuche für Agenten, mit starker Abdeckung des chinesischen Webs.',
+    keenable: 'Websuche für Agenten. Kein Schlüssel erforderlich; ein Schlüssel erhöht die Ratenlimits.',
   },
   es: {
     duckduckgo: 'No se requiere clave. Buena opción predeterminada para empezar.',
@@ -3777,6 +3790,7 @@ const SEARCH_PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string
     tavily: 'Búsqueda web orientada a la actualidad para investigación actual.',
     exa: 'Búsqueda semántica y orientada a contenido para flujos de investigación.',
     iqs: 'Búsqueda web de Alibaba Cloud orientada a agentes, con amplia cobertura de la web china.',
+    keenable: 'Búsqueda web pensada para agentes. No se requiere clave; una clave amplía los límites de uso.',
   },
 }
 

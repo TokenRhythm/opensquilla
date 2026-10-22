@@ -40,6 +40,12 @@ _provider_specs: dict[str, SearchProviderSpec] = {
         env_key="EXA_API_KEY",
         capabilities=frozenset({"web", "freshness", "domain_filter", "semantic", "content"}),
     ),
+    "keenable": SearchProviderSpec(
+        provider_id="keenable",
+        opt_in=True,
+        env_key="KEENABLE_API_KEY",
+        capabilities=frozenset({"web", "freshness", "domain_filter", "content"}),
+    ),
     "perplexity": SearchProviderSpec(
         provider_id="perplexity",
         runtime_supported=False,

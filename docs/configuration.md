@@ -406,10 +406,14 @@ opensquilla configure search --search-provider brave --api-key-env BRAVE_SEARCH_
 opensquilla configure search --search-provider tavily --api-key-env TAVILY_API_KEY
 opensquilla configure search --search-provider exa --api-key-env EXA_API_KEY
 opensquilla configure search --search-provider iqs --api-key-env IQS_SEARCH_API_KEY
+opensquilla configure search --search-provider keenable
 ```
 
 Runtime-supported search providers in this build include DuckDuckGo, Bocha,
-Brave Search, Alibaba Cloud IQS, Tavily, and Exa. DuckDuckGo is the no-key path.
+Brave Search, Alibaba Cloud IQS, Tavily, Exa, and Keenable. DuckDuckGo is the
+no-key path. Keenable also needs no key but is opt-in: it is used only once
+selected as the search provider or when `KEENABLE_API_KEY` is set, and the key
+only raises rate limits.
 A partial-key setup can configure only one keyed provider; an all-key setup can
 expose `BOCHA_SEARCH_API_KEY`, `BRAVE_SEARCH_API_KEY`, `IQS_SEARCH_API_KEY`,
 `TAVILY_API_KEY`, and `EXA_API_KEY` so runtime provider selection can choose by
