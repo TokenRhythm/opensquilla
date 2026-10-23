@@ -580,6 +580,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "mimo": OpenAICompatPolicy(display_name="MiMo"),
     "mistral": OpenAICompatPolicy(display_name="Mistral"),
     "groq": OpenAICompatPolicy(display_name="Groq"),
+    "tsubasa": OpenAICompatPolicy(
+        display_name="Tsubasa",
+        supports_native_json_schema_output=False,
+    ),
     "zhipu": OpenAICompatPolicy(
         display_name="Zhipu",
         official_host="open.bigmodel.cn",

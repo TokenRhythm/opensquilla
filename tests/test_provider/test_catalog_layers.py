@@ -292,6 +292,7 @@ def test_packaged_corrections_file_parses_with_expected_tables() -> None:
         "tencent_token_plan",
         "qwen_token_plan",
         "tokenrhythm",
+        "tsubasa",
         "kimi_coding_openai",
         "kimi_coding_anthropic",
         "minimax",
@@ -303,6 +304,7 @@ def test_packaged_corrections_file_parses_with_expected_tables() -> None:
         "mimo_openai",
         "mimo_anthropic",
     }
+    assert set(payload["tsubasa"]) == {"tsubasa-fast", "tsubasa-pro"}
     assert set(payload["moonshot"]) == {
         "moonshot-v1-8k",
         "moonshot-v1-32k",
