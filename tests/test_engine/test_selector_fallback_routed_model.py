@@ -3521,15 +3521,43 @@ async def test_tool_image_upgrade_binds_real_selector_catalog_budget_and_wire(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["fixed", "disabled", "observe", "subagent"])
+async def test_observe_routes_attachment_and_tool_images_to_same_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.steps.squilla_router import apply_squilla_router
+
+    runtime = _image_continuation_runtime(monkeypatch)
+    runtime.gateway.squilla_router.rollout_phase = "observe"
+    attachment_turn = TurnContext(
+        message="Inspect the sample image.",
+        session_key="agent:main:synthetic-attachment",
+        config=runtime.gateway,
+        provider=runtime.primary,
+        model=runtime.selector.current_config.model,
+        tool_defs=[],
+        system_prompt="",
+        attachments=[{"type": "image", "mime_type": "image/png"}],
+    )
+
+    routed = await apply_squilla_router(attachment_turn)
+    rebound = await runtime.wrapper.prepare_image_continuation(runtime.messages, runtime.config)
+
+    assert routed.metadata["routing_applied"] is True
+    assert routed.metadata["image_input_mode"] == "native"
+    assert rebound is not None
+    assert runtime.wrapper.active_deployment_config().model == routed.model == runtime.image_model
+    assert rebound.model_vision_support == "supported"
+    assert not runtime.primary.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["fixed", "disabled", "subagent"])
 async def test_tool_images_cannot_upgrade_without_active_smart_routing_authority(
     monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
     runtime = _image_continuation_runtime(monkeypatch, automatic=mode != "fixed")
     if mode == "disabled":
         runtime.gateway.squilla_router.enabled = False
-    elif mode == "observe":
-        runtime.gateway.squilla_router.rollout_phase = "observe"
     elif mode == "subagent":
         runtime.wrapper._image_routing_session_key = "agent:main:subagent:synthetic-child"
 
@@ -3627,7 +3655,8 @@ async def test_tool_image_upgrade_checks_complete_retained_history_capacity(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mode", ["router", "fixed_text", "fixed_vision", "ensemble", "no_vision", "call_budget"],
+    "mode",
+    ["router", "observe", "fixed_text", "fixed_vision", "ensemble", "no_vision", "call_budget"],
 )
 async def test_downloaded_image_runs_through_dispatch_and_main_model_capability(
     monkeypatch: pytest.MonkeyPatch, mode: str,
@@ -3638,8 +3667,10 @@ async def test_downloaded_image_runs_through_dispatch_and_main_model_capability(
     from opensquilla.tools.registry import ToolRegistry, get_default_registry
 
     runtime = _image_continuation_runtime(
-        monkeypatch, automatic=mode in {"router", "no_vision", "call_budget"},
+        monkeypatch, automatic=mode in {"router", "observe", "no_vision", "call_budget"},
     )
+    if mode == "observe":
+        runtime.gateway.squilla_router.rollout_phase = "observe"
     if mode == "ensemble":
         runtime.primary.provider_name = "ensemble"
     if mode == "no_vision":
@@ -3704,7 +3735,7 @@ async def test_downloaded_image_runs_through_dispatch_and_main_model_capability(
     assert not [event for event in events if event.kind == "error"], events
     assert any(event.kind == "done" for event in events)
     assert count_provider_image_blocks(runtime.primary.calls[0]["messages"]) == 0
-    if mode == "router":
+    if mode in {"router", "observe"}:
         assert len(runtime.primary.calls) == 1
         assert runtime.wrapper.active_deployment_config().model == runtime.image_model
         call = runtime.built[-1].calls[0]
@@ -3713,7 +3744,7 @@ async def test_downloaded_image_runs_through_dispatch_and_main_model_capability(
         assert runtime.wrapper.active_deployment_config().model == "synthetic/text-small"
         assert len(runtime.built) == 1
         call = runtime.primary.calls[-1]
-    expected_images = int(mode in {"router", "fixed_vision"})
+    expected_images = int(mode in {"router", "observe", "fixed_vision"})
     assert count_provider_image_blocks(call["messages"]) == expected_images
     if expected_images:
         assert f"data:image/png;base64,{runtime.image_data}" in json.dumps(call["payload"])

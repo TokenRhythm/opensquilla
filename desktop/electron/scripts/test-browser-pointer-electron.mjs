@@ -454,6 +454,39 @@ try {
   assert.equal(taskEnd.reconnected, false, 'reconnecting the same task must not restore an idle cursor')
   assert.equal(taskEnd.afterNewMovement, true, 'a new action must reveal the agent cursor')
   assert.equal(taskEnd.untouchedTurn, false, 'a different task waits for its first browser use')
+  const independentDisplay = await app.evaluate(async ({ BrowserWindow, WebContentsView }, origin) => {
+    const owner = new BrowserWindow({ show: true, width: 900, height: 700, webPreferences: { sandbox: true } })
+    const view = new WebContentsView({ webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } })
+    owner.contentView.addChildView(view)
+    view.setBounds({ x: 0, y: 0, width: 800, height: 600 })
+    await view.webContents.loadURL(origin)
+    const driver = new globalThis.__BrowserPlaywrightDriver(view.webContents, () => true)
+    const signal = new AbortController().signal
+    const read = code => view.webContents.executeJavaScript(code)
+    const evaluate = view.webContents.executeJavaScriptInIsolatedWorld.bind(view.webContents)
+    try {
+      // No skill loader or chat activation participates in this browser binding.
+      await read('window.clicks=[];document.addEventListener("click",event=>window.clicks.push({id:event.target.id,trusted:event.isTrusted}))')
+      const snapshot = await driver.snapshot(1, () => {}, signal)
+      const ref = name => snapshot.refs.find(item => item.name === name).ref
+      const first = await driver.act({ action: 'click', ref: ref('Far button') }, 1, () => {}, signal)
+      const displayed = await read('!!document.getElementById("__opensquilla-browser-pointer")')
+      // A renderer failure must not turn accepted input into an error or a retry.
+      view.webContents.executeJavaScriptInIsolatedWorld = (world, ...args) => world === 1004
+        ? Promise.reject(new Error('Synthetic decoration unavailable')) : evaluate(world, ...args)
+      const second = await driver.act({ action: 'click', ref: ref('Near button') }, 1, () => {}, signal)
+      return { first, second, displayed, clicks: await read('window.clicks') }
+    } finally {
+      view.webContents.executeJavaScriptInIsolatedWorld = evaluate
+      await driver.dispose()
+      view.webContents.close()
+      owner.destroy()
+    }
+  }, origin)
+  assert.equal(independentDisplay.displayed, true, 'real browser input must display feedback without a skill or chat activation')
+  assert.equal(independentDisplay.first.performed, true)
+  assert.equal(independentDisplay.second.performed, true)
+  assert.deepEqual(independentDisplay.clicks, [{ id: 'far', trusted: true }, { id: 'near', trusted: true }])
   console.log('Playwright Mouse passed: curved/eased trusted movement, ordered single clicks, mid-motion cancellation/navigation, press/rebound feedback, idle cursor hiding, reduced motion, hidden/reopened surfaces and clean screenshots.')
 } finally {
   await app?.close().catch(() => {})

@@ -264,6 +264,40 @@ def _tool_result_redaction_options(call: ToolCall) -> dict[str, bool]:
     return {}
 
 
+def _redact_tool_result_value(
+    value: Any, *, code_file: bool = False, secret_file: bool = False
+) -> Any:
+    if isinstance(value, str) and (not code_file or secret_file):
+        text = value.lstrip()
+        if text.startswith(("{", "[")):
+            has_duplicate_keys = False
+
+            def collect_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+                nonlocal has_duplicate_keys
+                decoded = dict(pairs)
+                has_duplicate_keys |= len(decoded) != len(pairs)
+                return decoded
+
+            try:
+                # MCP text can append an image note after its JSON payload.
+                payload, end = json.JSONDecoder(object_pairs_hook=collect_object).raw_decode(text)
+                redacted = redact_secret_value(
+                    payload, code_file=code_file, secret_file=secret_file
+                )
+                if redacted == payload and not has_duplicate_keys:
+                    prefix = value[: len(value) - len(text) + end]
+                else:
+                    prefix = json.dumps(redacted, ensure_ascii=False, allow_nan=False)
+                prefix = prefix.encode("utf-8", "backslashreplace").decode("utf-8")
+                suffix = redact_secret_text(
+                    text[end:], code_file=code_file, secret_file=secret_file
+                )
+                return prefix + suffix
+            except (ValueError, RecursionError):
+                pass
+    return redact_secret_value(value, code_file=code_file, secret_file=secret_file)
+
+
 def _registered_terminates_turn(registered: Any) -> bool:
     return bool(getattr(getattr(registered, "spec", None), "terminates_turn", False))
 
@@ -533,7 +567,7 @@ async def finalize(
         result = _redact_grep_search_result(raw_result)
     else:
         redaction_options = _tool_result_redaction_options(call)
-        result = redact_secret_value(
+        result = _redact_tool_result_value(
             raw_result,
             code_file=redaction_options.get("code_file", False),
             secret_file=redaction_options.get("secret_file", False),

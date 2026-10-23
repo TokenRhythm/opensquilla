@@ -35,10 +35,11 @@ from tests.helpers.image_bytes import image_bytes
 class _BrowserProvider:
     provider_name = "openai"
 
-    def __init__(self, model="synthetic-vision", *, route=False, fail=False):
+    def __init__(self, model="synthetic-vision", *, route=False, fail=False, dom_action=False):
         self.model = model
         self.route = route
         self.fail = fail
+        self.dom_action = dom_action
         self.payloads = []
         self.adapter = OpenAIProvider(api_key="dummy", model=model)
 
@@ -77,13 +78,17 @@ class _BrowserProvider:
             yield TextDeltaEvent(text="Inspection complete")
             yield DoneEvent(stop_reason="end_turn")
             return
-        name = "browser_observe" if completed == 0 else "browser_batch"
+        name = "browser_observe" if completed == 0 else (
+            "browser_act" if self.dom_action else "browser_batch"
+        )
         arguments = {"targetRef": "page-fixture", "observationMode": "auto"}
         if name == "browser_batch":
             arguments["actions"] = [{
                 "action": "click", "x": 1, "y": 1,
                 "observationId": "observation-1", "imageId": "image-1",
             }]
+        elif name == "browser_act":
+            arguments = {"targetRef": "page-fixture", "action": "click", "ref": "control-fixture"}
         call_id = f"browser-call-{completed}"
         tool_name = f"mcp__desktop-browser__{name}"
         yield ToolUseStartEvent(tool_use_id=call_id, tool_name=tool_name)
@@ -108,8 +113,14 @@ async def test_unbound_ambient_context_cannot_authorize_coordinate_actions(monke
     await _check_browser_image_route(monkeypatch, mode, unbound_context=True)
 
 
+@pytest.mark.parametrize("mode", ["unsupported", "unknown", "fallback"])
+async def test_browser_dom_action_continues_after_text_only_image_projection(monkeypatch, mode):
+    """Losing native pixels blocks coordinates while preserving ref-based interaction."""
+    await _check_browser_image_route(monkeypatch, mode, dom_action=True)
+
+
 async def _check_browser_image_route(
-    monkeypatch, mode, *, ambient_context=False, unbound_context=False,
+    monkeypatch, mode, *, ambient_context=False, unbound_context=False, dom_action=False,
 ):
     png = base64.b64encode(image_bytes()).decode()
     requests = []
@@ -142,6 +153,7 @@ async def _check_browser_image_route(
                 "targetRef": "page-fixture", "observationId": f"observation-{index}",
                 "consistency": "consistent", "imageStatus": "available",
                 "image": {"imageId": f"image-{index}", "width": 2, "height": 2},
+                "refs": [{"ref": "control-fixture", "role": "button", "name": "Continue"}],
             }
             structured = {"targetRef": "page-fixture", "observation": observation}
             result = {
@@ -157,8 +169,10 @@ async def _check_browser_image_route(
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
         **kwargs, transport=httpx.MockTransport(respond),
     ))
-    primary = _BrowserProvider(route=mode == "routed", fail=mode == "fallback")
-    secondary = _BrowserProvider("synthetic-text-fallback")
+    primary = _BrowserProvider(
+        route=mode == "routed", fail=mode == "fallback", dom_action=dom_action,
+    )
+    secondary = _BrowserProvider("synthetic-text-fallback", dom_action=dom_action)
     support = "unsupported" if mode in {"unsupported", "routed"} else "supported"
     if mode == "unknown":
         support = "unknown"
@@ -232,9 +246,10 @@ async def _check_browser_image_route(
         assert (f"data:image/png;base64,{png}" in continuation_wire) is has_native_image
         assert ("图片未分析" in continuation_wire) is not has_native_image
         assert requests[0]["arguments"]["observationMode"] == "auto"
-        coordinate_allowed = has_native_image and not unbound_context
+        action_allowed = dom_action or has_native_image and not unbound_context
+        action_name = "browser_act" if dom_action else "browser_batch"
         assert [request["name"] for request in requests] == (
-            ["browser_observe", "browser_batch"] if coordinate_allowed else ["browser_observe"]
+            ["browser_observe", action_name] if action_allowed else ["browser_observe"]
         )
         assert all("nativeImageEvidence" not in request.get("_meta", {}) for request in requests)
         expected_before = (
@@ -242,7 +257,12 @@ async def _check_browser_image_route(
         )
         expected_after = primary.model if has_native_image else None
         assert dispatched_targets == [expected_before, expected_after]
-        if not coordinate_allowed:
+        if dom_action:
+            assert requests[-1]["arguments"] == {
+                "targetRef": "page-fixture", "action": "click", "ref": "control-fixture",
+            }
+            assert not results[-1].is_error
+        elif not action_allowed:
             assert results[-1].is_error
             assert "VISION_UNAVAILABLE" in results[-1].content
         if mode == "fallback":

@@ -30,6 +30,7 @@ class RendererTransport implements ConnectOverCDPTransport {
   private readonly ownedAttachment: boolean
   private info: Record<string, unknown> = {}
   private pressedMouse: MouseInput | undefined
+  private pressingMouse: Promise<unknown> | undefined
   private releasingMouse: Promise<void> | undefined
   private closing: Promise<void> | undefined
 
@@ -140,6 +141,18 @@ class RendererTransport implements ConnectOverCDPTransport {
       return await this.contents.debugger.sendCommand(method, { ...params, waitForDebuggerOnStart: false },
         command.sessionId === this.sessionId ? this.nativeSessionId : command.sessionId)
     }
+    if (method === 'Page.captureScreenshot' && command.sessionId === this.sessionId && params.clip) {
+      // Electron's native zoom requires CDP clip bounds in device-independent
+      // pixels, while Playwright supplies CSS bounds for this attached page.
+      const zoom = this.contents.getZoomFactor()
+      if (zoom !== 1) {
+        const clip = params.clip as { x: number; y: number; width: number; height: number; scale: number }
+        return await this.contents.debugger.sendCommand(method, { ...params,
+          clip: { ...clip, x: clip.x * zoom, y: clip.y * zoom,
+            width: clip.width * zoom, height: clip.height * zoom },
+        }, this.nativeSessionId)
+      }
+    }
     if (method === 'Input.dispatchMouseEvent' && command.sessionId === this.sessionId) {
       const guard = this.guard
       const mouseGuard = this.mouseGuard
@@ -163,6 +176,14 @@ class RendererTransport implements ConnectOverCDPTransport {
         return result
       }
       if (params.type === 'mouseMoved' && this.mouseMotion) return await this.mouseMotion(params, send)
+      if (params.type === 'mousePressed') {
+        const pressing = send(params)
+        this.pressingMouse = pressing
+        try { return await pressing }
+        finally { if (this.pressingMouse === pressing) this.pressingMouse = undefined }
+      }
+      // Hidden clicks send events concurrently; release must follow asynchronous validation and press.
+      if (params.type === 'mouseReleased') await this.pressingMouse
       return await send(params)
     }
     return await this.contents.debugger.sendCommand(method, params,
@@ -234,7 +255,61 @@ class RendererTransport implements ConnectOverCDPTransport {
   async waitForClose(): Promise<void> { await this.closing }
 }
 
-type Anchor = { generation: number; element: ElementHandle<Element> }
+function describeBrowserElement(node: Element) {
+  if (!node.isConnected) return null
+  const text = (value: string | null | undefined) => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, 256)
+  const input = node instanceof HTMLInputElement ? node : undefined
+  const textarea = node instanceof HTMLTextAreaElement ? node : undefined
+  const select = node instanceof HTMLSelectElement ? node : undefined
+  const button = node instanceof HTMLButtonElement ? node : undefined
+  const type = input?.type ?? button?.type
+  const inputRoles: Record<string, string> = {
+    button: 'button', submit: 'button', reset: 'button', image: 'button',
+    text: 'textbox', email: 'textbox', password: 'textbox', tel: 'textbox', url: 'textbox',
+    search: 'searchbox', number: 'spinbutton', range: 'slider', checkbox: 'checkbox', radio: 'radio',
+  }
+  const implicitRole = input ? inputRoles[input.type] ?? 'input'
+    : textarea ? 'textbox' : select ? select.multiple || select.size > 1 ? 'listbox' : 'combobox'
+      : node.matches('a[href],area[href]') ? 'link'
+        : node.localName === 'summary' ? 'button' : node.localName
+  const nodeRoot = node.getRootNode() as Document | ShadowRoot
+  const labelledBy = (node.getAttribute('aria-labelledby') ?? '').split(/\s+/).filter(Boolean)
+    .map(id => nodeRoot.getElementById(id)?.textContent ?? '').join(' ')
+  const labels = input?.labels ?? textarea?.labels ?? select?.labels ?? button?.labels
+  const labelText = labels ? Array.from(labels, label => label.textContent ?? '').join(' ') : ''
+  const buttonText = input && ['button', 'submit', 'reset'].includes(input.type)
+    ? input.value || (input.type === 'submit' ? 'Submit' : input.type === 'reset' ? 'Reset' : '')
+    : input?.type === 'image' ? input.alt : ''
+  const label = [labelledBy, node.getAttribute('aria-label'), labelText, buttonText].map(text).find(Boolean)
+  const fallback = [node.getAttribute('placeholder'), node.getAttribute('title')].map(text).find(Boolean) ?? ''
+  const name = label || text((node as HTMLElement).innerText) || fallback
+  const disabled = node.matches(':disabled,[aria-disabled="true"]')
+  const readonly = Boolean(input?.readOnly || textarea?.readOnly || node.getAttribute('aria-readonly') === 'true')
+  const fillable = textarea || (node as HTMLElement).isContentEditable || input && [
+    'text', 'email', 'password', 'tel', 'url', 'search', 'number', 'date', 'datetime-local', 'time', 'month', 'week', 'color', 'range',
+  ].includes(input.type)
+  // The ref describes the action the control accepts, not merely
+  // its HTML tag. Button values are labels; text values are state.
+  const value = input && !['password', 'file'].includes(input.type) ? input.value
+    : textarea?.value ?? select?.value
+  const role = node.getAttribute('role') || implicitRole
+  // Input contents are mutable state, while control names and destinations identify targets.
+  const identity = JSON.stringify([node.localName, role, type ?? '',
+    label || (!fillable ? text((node as HTMLElement).innerText) : '') || fallback,
+    node.getAttribute('href'), node.getAttribute('formaction')])
+  return { identity, tagName: node.localName, role, name, disabled,
+    editable: Boolean(fillable) && !disabled && !readonly && !node.closest('[inert]'),
+    readable: node instanceof HTMLElement && !(input && ['password', 'hidden', 'file'].includes(input.type)),
+    ...((node.scrollHeight > node.clientHeight || node.scrollWidth > node.clientWidth) ? {
+      scroll: { left: node.scrollLeft, top: node.scrollTop, width: node.scrollWidth, height: node.scrollHeight,
+        clientWidth: node.clientWidth, clientHeight: node.clientHeight,
+        overflowX: getComputedStyle(node).overflowX, overflowY: getComputedStyle(node).overflowY },
+    } : {}),
+    ...(type ? { type } : {}), ...(input || textarea ? { readonly } : {}),
+    ...(value !== undefined ? { value: value.slice(0, 1024) } : {}) }
+}
+
+type Anchor = { generation: number; element: ElementHandle<Element>; identity: string }
 const MAX_REFS = 160
 const MAX_SNAPSHOT_NODES = 12_000
 const MAX_SNAPSHOT_SHADOW_ROOTS = 128
@@ -538,35 +613,39 @@ export class BrowserPlaywrightDriver {
     const work = (async () => {
       // Establish the page listener before reading its DOM or pixels.
       await this.run(guard, signal, async () => {})
-      const epoch = this.documentEpoch
-      const before = await this.viewport()
-      const snapshot = await this.snapshot(generation, guard, signal)
-      let screenshot: Awaited<ReturnType<BrowserPlaywrightDriver['screenshot']>> | undefined
-      let imageError: string | undefined
-      if (mode !== 'dom') {
-        try { screenshot = await this.screenshot(guard, signal) }
-        catch (error) {
-          guard()
-          if (signal.aborted) throw error
-          imageError = error instanceof DesktopBrowserError ? error.code : 'SCREENSHOT_UNAVAILABLE'
+      for (let attempt = 0; ; attempt++) {
+        const epoch = this.documentEpoch
+        const before = await this.viewport()
+        const snapshot = await this.snapshot(generation, guard, signal)
+        let screenshot: Awaited<ReturnType<BrowserPlaywrightDriver['screenshot']>> | undefined
+        let imageError: string | undefined
+        if (mode !== 'dom') {
+          try { screenshot = await this.screenshot(guard, signal) }
+          catch (error) {
+            guard()
+            if (signal.aborted) throw error
+            imageError = error instanceof DesktopBrowserError ? error.code : 'SCREENSHOT_UNAVAILABLE'
+          }
         }
+        const after = await this.viewport()
+        guard()
+        const consistent = epoch === this.documentEpoch && this.sameViewport(before, after)
+        // Resample one transient layout/DOM change; never publish mismatched evidence.
+        if (!consistent && attempt === 0 && epoch === this.documentEpoch) continue
+        const observationId = `observation-${randomUUID()}`
+        const imageId = screenshot && consistent ? `image-${randomUUID()}` : undefined
+        if (imageId && screenshot) this.latestVisual = { observationId, imageId, documentEpoch: epoch, generation, viewport: after,
+          capturedAt: Date.now(), imageWidth: screenshot.width, imageHeight: screenshot.height, dataBase64: screenshot.dataBase64 }
+        else this.latestVisual = undefined
+        return { observation: { observationId, documentEpoch: epoch, capturedAt: new Date().toISOString(),
+          consistency: consistent ? 'consistent' : 'changed', consistencyScope: 'main-document-and-viewport', text: snapshot.text,
+          refs: consistent ? snapshot.refs : [], truncated: snapshot.truncated, viewport: after,
+          browserState: this.browserState(), imageStatus: imageId ? 'available' : mode === 'dom' ? 'omitted' : 'unavailable',
+          ...(imageError ? { imageError } : {}),
+          ...(imageId && screenshot ? { image: { imageId, width: screenshot.width, height: screenshot.height,
+            viewportWidth: after.width, viewportHeight: after.height, coordinateSpace: 'image-pixels', mimeType: screenshot.mimeType } } : {}),
+        }, ...(imageId && screenshot ? { dataBase64: screenshot.dataBase64 } : {}) }
       }
-      const after = await this.viewport()
-      guard()
-      const consistent = epoch === this.documentEpoch && this.sameViewport(before, after)
-      const observationId = `observation-${randomUUID()}`
-      const imageId = screenshot && consistent ? `image-${randomUUID()}` : undefined
-      if (imageId && screenshot) this.latestVisual = { observationId, imageId, documentEpoch: epoch, generation, viewport: after,
-        capturedAt: Date.now(), imageWidth: screenshot.width, imageHeight: screenshot.height, dataBase64: screenshot.dataBase64 }
-      else this.latestVisual = undefined
-      return { observation: { observationId, documentEpoch: epoch, capturedAt: new Date().toISOString(),
-        consistency: consistent ? 'consistent' : 'changed', consistencyScope: 'main-document-and-viewport', text: snapshot.text,
-        refs: consistent ? snapshot.refs : [], truncated: snapshot.truncated, viewport: after,
-        browserState: this.browserState(), imageStatus: imageId ? 'available' : mode === 'dom' ? 'omitted' : 'unavailable',
-        ...(imageError ? { imageError } : {}),
-        ...(imageId && screenshot ? { image: { imageId, width: screenshot.width, height: screenshot.height,
-          viewportWidth: after.width, viewportHeight: after.height, coordinateSpace: 'image-pixels', mimeType: screenshot.mimeType } } : {}),
-      }, ...(imageId && screenshot ? { dataBase64: screenshot.dataBase64 } : {}) }
     })()
     this.runningActions.add(work)
     void work.finally(() => this.runningActions.delete(work)).catch(() => {})
@@ -623,18 +702,50 @@ export class BrowserPlaywrightDriver {
       ...(stopReason ? { stopReason, stoppedAt } : {}) }, ...observation }
   }
 
-  async snapshot(generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<{
+  async snapshot(generation: number, assertCurrent: Guard, signal: AbortSignal, scope?: string): Promise<{
     text: string; refs: Record<string, unknown>[]; truncated: boolean
   }> {
+    let scopedRoot: ElementHandle<Element> | undefined
     return await this.run(assertCurrent, signal, async page => {
       this.invalidate()
       const epoch = this.invalidationEpoch
       const assertSnapshot = () => {
         if (epoch !== this.invalidationEpoch) throw new DesktopBrowserError('PAGE_CHANGED', 'The page changed during inspection. Request a new snapshot.')
       }
-      const frames = page.frames().slice(0, 16)
+      const scopeChanged = () => new DesktopBrowserError('SCOPE_CHANGED',
+        'The scope root changed during inspection. Inspect the page again.', 409,
+        { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+      const scopeLocator = scope === undefined ? undefined : page.mainFrame().locator(`css=${scope}`)
+      if (scopeLocator) {
+        const validCss = await page.mainFrame().evaluate(selector => {
+          try { document.querySelector(selector); return true } catch { return false }
+        }, scope!)
+        if (!validCss) throw new DesktopBrowserError('INVALID_SCOPE', 'The scope must be a valid CSS selector.', 400,
+          { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+        const count = await scopeLocator.count()
+        if (count !== 1) throw new DesktopBrowserError(count ? 'SCOPE_AMBIGUOUS' : 'SCOPE_NOT_FOUND',
+          count ? 'The scope matches more than one main-frame element. Use a narrower CSS selector.'
+            : 'The scope does not match a main-frame element. Inspect the page before selecting another scope.', 409,
+          { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+        try { scopedRoot = await scopeLocator.elementHandle({ timeout: ACTION_TIMEOUT_MS }) as ElementHandle<Element> | undefined }
+        catch { assertSnapshot(); throw scopeChanged() }
+        if (!scopedRoot) throw scopeChanged()
+        if (await scopedRoot.evaluate(node => node.matches('iframe,frame'))) {
+          throw new DesktopBrowserError('SCOPE_UNSUPPORTED', 'Scope supports main-frame elements only; iframe contents cannot be selected.', 400,
+            { outcome: 'not_started', retryable: false, recovery: 'inspect' })
+        }
+      }
+      const assertScopeCurrent = async () => {
+        assertSnapshot()
+        if (scopeLocator && scopedRoot && !await scopeLocator.evaluateAll((nodes, root) =>
+          nodes.length === 1 && nodes[0] === root && root.isConnected, scopedRoot).catch(() => false)) {
+          throw scopeChanged()
+        }
+      }
+      await assertScopeCurrent()
+      const frames = scopeLocator ? [page.mainFrame()] : page.frames().slice(0, 16)
       const ranked = []
-      let truncated = page.frames().length > frames.length
+      let truncated = !scopeLocator && page.frames().length > frames.length
       for (const frame of frames) {
         if (frame.isDetached() || !frame.url()) { truncated = true; continue }
         try {
@@ -654,22 +765,25 @@ export class BrowserPlaywrightDriver {
         if (refs.length >= MAX_REFS) { truncated = true; break }
         let collection: Awaited<ReturnType<typeof frame.evaluateHandle>> | undefined
         try {
-          const text = await frame.locator('body').ariaSnapshot({ timeout: frame === page.mainFrame() ? ACTION_TIMEOUT_MS : 1500 })
+          const text = await (scopeLocator ?? frame.locator('body')).ariaSnapshot({ timeout: frame === page.mainFrame() ? ACTION_TIMEOUT_MS : 1500 })
+          await assertScopeCurrent()
           texts.push(`${modal ? '[Active modal]\n' : ''}${frame === page.mainFrame() ? '' : `[Frame ${frame.url().slice(0, 500)}]\n`}${text}`)
-          collection = await frame.evaluateHandle(({ limit, maxNodes, maxShadowRoots }) => {
+          collection = await frame.evaluateHandle(({ limit, maxNodes, maxShadowRoots, scopedRoot }) => {
             const visible = (node: Element) => {
               const rect = node.getBoundingClientRect(), style = getComputedStyle(node)
               return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none'
             }
             const dialogs = Array.from(document.querySelectorAll('dialog:modal,[role="dialog"][aria-modal="true"],[role="alertdialog"]')).filter(visible)
-            const root = dialogs.at(-1) ?? document
+            const root = scopedRoot ?? dialogs.at(-1) ?? document
             // Walk open shadow roots at their host's position in DOM order.
             // The global node/root ceilings keep large or nested pages bounded.
             const controls: Element[] = [], blocks: Element[] = [], textNodes: Element[] = []
             const walkers = [document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)]
+            let first: Element | undefined = scopedRoot ?? undefined
             let seen = 0, shadows = 0
-            while (walkers.length && seen < maxNodes) {
-              const node = walkers.at(-1)!.nextNode() as Element | null
+            while ((first || walkers.length) && seen < maxNodes) {
+              const node = first ?? walkers.at(-1)!.nextNode() as Element | null
+              first = undefined
               if (!node) { walkers.pop(); continue }
               seen++
               if (node.shadowRoot && shadows < maxShadowRoots) {
@@ -691,81 +805,41 @@ export class BrowserPlaywrightDriver {
             return Object.assign([...new Set([...controls, ...blocks, ...textNodes])].slice(0, limit),
               { truncated: walkers.length > 0 || shadows === maxShadowRoots })
           }, { limit: MAX_REFS - refs.length, maxNodes: MAX_SNAPSHOT_NODES,
-            maxShadowRoots: MAX_SNAPSHOT_SHADOW_ROOTS })
+            maxShadowRoots: MAX_SNAPSHOT_SHADOW_ROOTS, scopedRoot })
           for (const [key, handle] of await collection.getProperties()) {
             if (key === 'truncated') { truncated ||= await handle.jsonValue() === true; await handle.dispose(); continue }
             if (!/^\d+$/.test(key)) { await handle.dispose(); continue }
             const element = handle.asElement() as ElementHandle<Element> | null
             if (!element) { await handle.dispose(); continue }
-            const description = await element.evaluate(node => {
-              const text = (value: string | null | undefined) => (value ?? '').replace(/\s+/g, ' ').trim().slice(0, 256)
-              const input = node instanceof HTMLInputElement ? node : undefined
-              const textarea = node instanceof HTMLTextAreaElement ? node : undefined
-              const select = node instanceof HTMLSelectElement ? node : undefined
-              const button = node instanceof HTMLButtonElement ? node : undefined
-              const type = input?.type ?? button?.type
-              const inputRoles: Record<string, string> = {
-                button: 'button', submit: 'button', reset: 'button', image: 'button',
-                text: 'textbox', email: 'textbox', password: 'textbox', tel: 'textbox', url: 'textbox',
-                search: 'searchbox', number: 'spinbutton', range: 'slider', checkbox: 'checkbox', radio: 'radio',
-              }
-              const implicitRole = input ? inputRoles[input.type] ?? 'input'
-                : textarea ? 'textbox' : select ? select.multiple || select.size > 1 ? 'listbox' : 'combobox'
-                  : node.matches('a[href],area[href]') ? 'link'
-                    : node.localName === 'summary' ? 'button' : node.localName
-              const nodeRoot = node.getRootNode() as Document | ShadowRoot
-              const labelledBy = (node.getAttribute('aria-labelledby') ?? '').split(/\s+/).filter(Boolean)
-                .map(id => nodeRoot.getElementById(id)?.textContent ?? '').join(' ')
-              const labels = input?.labels ?? textarea?.labels ?? select?.labels ?? button?.labels
-              const labelText = labels ? Array.from(labels, label => label.textContent ?? '').join(' ') : ''
-              const buttonText = input && ['button', 'submit', 'reset'].includes(input.type)
-                ? input.value || (input.type === 'submit' ? 'Submit' : input.type === 'reset' ? 'Reset' : '')
-                : input?.type === 'image' ? input.alt : ''
-              const name = [labelledBy, node.getAttribute('aria-label'), labelText, buttonText,
-                (node as HTMLElement).innerText, node.getAttribute('placeholder'), node.getAttribute('title')]
-                .map(text).find(Boolean) ?? ''
-              const disabled = node.matches(':disabled,[aria-disabled="true"]')
-              const readonly = Boolean(input?.readOnly || textarea?.readOnly || node.getAttribute('aria-readonly') === 'true')
-              const fillable = textarea || (node as HTMLElement).isContentEditable || input && [
-                'text', 'email', 'password', 'tel', 'url', 'search', 'number', 'date', 'datetime-local', 'time', 'month', 'week',
-              ].includes(input.type)
-              // The ref describes the action the control accepts, not merely
-              // its HTML tag. Button values are labels; text values are state.
-              const value = input && !['password', 'file'].includes(input.type) ? input.value
-                : textarea?.value ?? select?.value
-              return { tagName: node.localName, role: node.getAttribute('role') || implicitRole, name, disabled,
-                editable: Boolean(fillable) && !disabled && !readonly && !node.closest('[inert]'),
-                readable: node instanceof HTMLElement && !(input && ['password', 'hidden', 'file'].includes(input.type)),
-                ...((node.scrollHeight > node.clientHeight || node.scrollWidth > node.clientWidth) ? {
-                  scroll: { left: node.scrollLeft, top: node.scrollTop, width: node.scrollWidth, height: node.scrollHeight,
-                    clientWidth: node.clientWidth, clientHeight: node.clientHeight,
-                    overflowX: getComputedStyle(node).overflowX, overflowY: getComputedStyle(node).overflowY },
-                } : {}),
-                ...(type ? { type } : {}), ...(input || textarea ? { readonly } : {}),
-                ...(value !== undefined ? { value: value.slice(0, 1024) } : {}) }
-            })
+            const state = await element.evaluate(describeBrowserElement)
+            if (!state) { await element.dispose(); continue }
+            const { identity, ...description } = state
             assertSnapshot()
             const ref = `e-${randomUUID()}`
-            this.anchors.set(ref, { generation, element })
+            this.anchors.set(ref, { generation, element, identity })
             refs.push({ ref, ...description, ...(modal ? { modal: true } : {}),
               ...(frame === page.mainFrame() ? {} : { frameUrl: frame.url().slice(0, 8192) }) })
           }
         } catch (error) {
           assertSnapshot()
+          await assertScopeCurrent()
           if (frame === page.mainFrame()) { this.invalidate(); throw error }
           truncated = true
         } finally { await collection?.dispose().catch(() => {}) }
       }
-      assertSnapshot()
+      await assertScopeCurrent()
       const text = texts.join('\n')
       return { text: text.slice(0, 24_000), refs, truncated: truncated || refs.length === MAX_REFS || text.length > 24_000 }
-    })
+    }).catch(error => { if (scope !== undefined) this.invalidate(); throw error })
+      .finally(async () => { await scopedRoot?.dispose().catch(() => {}) })
   }
 
-  private async requireAnchor(ref: string | undefined, generation: number): Promise<Anchor> {
+  private async requireAnchor(ref: string | undefined, generation: number, verifyIdentity = true): Promise<Anchor> {
     const anchor = ref ? this.anchors.get(ref) : undefined
     if (!anchor || anchor.generation !== generation
-      || !await anchor.element.evaluate(node => node.isConnected).catch(() => false)) {
+      || !await (verifyIdentity
+        ? anchor.element.evaluate(describeBrowserElement).then(current => current?.identity === anchor.identity)
+        : anchor.element.evaluate(node => node.isConnected)).catch(() => false)) {
       throw new DesktopBrowserError('STALE_ELEMENT', 'The element reference expired. Request a new snapshot.', 409,
         { outcome: 'not_started', retryable: false, recovery: 'observe' })
     }
@@ -774,7 +848,7 @@ export class BrowserPlaywrightDriver {
 
   async readText(request: DesktopBrowserRequest, generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<Record<string, unknown>> {
     return await this.run(assertCurrent, signal, async () => {
-      const anchor = await this.requireAnchor(request.ref, generation)
+      const anchor = await this.requireAnchor(request.ref, generation, false)
       const maxChars = request.maxChars ?? 16_384
       if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > 65_536) {
         throw new DesktopBrowserError('INVALID_REQUEST', 'maxChars must be an integer from 1 to 65536.', 400)
@@ -978,6 +1052,18 @@ export class BrowserPlaywrightDriver {
       }
       const anchor = request.ref ? await this.requireAnchor(request.ref, generation) : undefined
       const endAnchor = request.endRef ? await this.requireAnchor(request.endRef, generation) : undefined
+      if (!coordinate && (anchor || endAnchor)) {
+        commitGuard = async () => {
+          try {
+            assertCurrent()
+            if (anchor) await this.requireAnchor(request.ref, generation)
+            if (endAnchor) await this.requireAnchor(request.endRef, generation)
+          } catch (error) {
+            if (error instanceof DesktopBrowserError) commitFailure = error
+            throw error
+          }
+        }
+      }
       if (request.action === 'hold' && (!Number.isInteger(request.durationMs) || request.durationMs! < 1 || request.durationMs! > 10_000)) {
         throw new DesktopBrowserError('INVALID_REQUEST', 'Hold durationMs must be an integer from 1 to 10000.', 400)
       }

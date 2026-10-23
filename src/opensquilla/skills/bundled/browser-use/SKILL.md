@@ -21,12 +21,7 @@ metadata:
     risk: medium
     requires_tools:
       - mcp__desktop-browser__browser_tabs
-      - mcp__desktop-browser__browser_open
-      - mcp__desktop-browser__browser_navigate
-      - mcp__desktop-browser__browser_reload
       - mcp__desktop-browser__browser_inspect
-      - mcp__desktop-browser__browser_act
-      - mcp__desktop-browser__browser_screenshot
     capabilities:
       - browser-automation
       - network-read
@@ -41,27 +36,66 @@ may lack optional operations. If the connection or required capability is
 unavailable, state the limitation instead of claiming that a separate browser
 or web search operated the sidebar. Other task-relevant skills remain available.
 
-## Page state
+The basic tools support reading existing pages. Opening, navigating, changing
+pages, and capturing images depend on the tools authorized for this turn;
+check each needed capability before using it.
 
-- When the live `browser_open` schema makes `url` optional, omit it to open a
-  blank page (`about:blank`). Supply an HTTP(S) URL to open a website; older
-  clients may require it. `browser_navigate` requires a URL for the owned page.
-- Use the current `targetRef` to identify a page. Reuse an owned tab when
-  appropriate; closing and reopening it creates a different handle.
-- Inspect or observe before acting when the target is uncertain. Navigation,
-  reload, tab changes, and page updates can invalidate element refs. Use refs
-  from current page evidence; never invent them or carry them across pages.
-- Choose DOM refs or visual actions from the evidence actually available.
-  Batch only related actions permitted by the advertised contract. Check each
-  action's execution state and the resulting observation before relying on it.
-- A tool action completing does not prove the user's goal was met. Verify the
-  resulting page state or exact value when the task requires it. If a scroll
-  reports no change, inspect the affected region or boundary before deciding
-  whether another scroll is useful.
+## Working sequence
+
+1. Call `browser_tabs` to find the conversation's pages. Choose the page that
+   matches the task and keep its `targetRef` for subsequent calls. Reuse a
+   suitable page before creating another one.
+2. If a new page is needed and `browser_open` is available, open it with the
+   required URL. When the task needs an existing page's login or browser
+   storage, supply its owned `targetRef` as `contextTargetRef` if the live
+   schema supports it; a new tab need not share that state by default. When
+   `url` is optional, omit it for a blank page (`about:blank`).
+   `browser_navigate` requires a URL for the existing target. Report a missing
+   capability when it blocks the task.
+3. Read the chosen page with `browser_observe` when available, or
+   `browser_inspect` on clients without it. Reuse current returned page state
+   when it already answers the next question. Prefer DOM refs for ordinary
+   buttons, links, and form fields that the page evidence identifies clearly.
+   Use visual evidence for layout, canvas content, or controls that DOM
+   evidence cannot distinguish, subject to the image requirements below.
+4. Decide what change should be visible, then take a small action using the
+   current evidence and available tools. A short `browser_batch` can combine
+   related field updates and a final action when its live contract permits;
+   inspect the result before another dependent action. For reading tasks,
+   continue gathering the needed evidence without changing the page.
+5. Check each action's execution state and compare the resulting observation
+   with the expected change. If the result lacks enough evidence, observe or
+   inspect the same target. Verify the user's goal or exact destination value
+   before reporting success; a completed tool call alone does not prove it.
+   If a page rejects a submission, check the corrected input with the page's
+   validation action and read its new result before reporting completion.
+
+## Page changes and recovery
+
+- Navigation, reload, tab changes, and page updates can invalidate element
+  refs. After a stale-ref error, inspect the same `targetRef`, find the control
+  in the new evidence, and keep any retry within the returned recovery budget.
+  Stop when that budget is exhausted or the page reports a blocker. Never
+  invent refs, carry them across pages, or reopen a page to reset recovery.
+- For `STALE_OBSERVATION` with `outcome=not_started`, use the returned fresh
+  image or observe the same target before choosing new coordinates. Hover
+  effects may change target pixels during movement; confirm the intended
+  control in the new image before retrying within the recovery budget.
 - `argument_validation` with `outcome=not_started` means that request did not
   execute. For a timeout, protocol failure, or lost response, the outcome may
-  be unknown: inspect the page before repeating a state-changing action.
-  Respect returned recovery limits and blockers.
+  be unknown: inspect the same target before deciding whether another action
+  is needed. Do not repeat a submission while its outcome remains uncertain.
+- If a scroll reports no change, inspect the affected region or boundary
+  before scrolling again. For a long or virtualized list, gather the relevant
+  visible segments and check coverage before claiming the list is complete.
+- If inspection is truncated and its live schema supports `scope`, narrow it
+  to a unique main-frame CSS region only when current page evidence supports
+  that selector. Do not guess selectors or treat a partial inspection as a
+  complete list. If no supported scope is known, report the coverage limit.
+- Identify login, onboarding, permissions, and page dialogs from the current
+  evidence. If login, 2FA, a challenge, or a permission requires the user,
+  describe the specific blocked step. A permission overlay alone does not
+  establish that the browser is logged out.
 
 ## Visual and text evidence
 
@@ -70,6 +104,9 @@ or web search operated the sidebar. Other task-relevant skills remain available.
   with its matching observation/image identity and image-pixel dimensions.
   Never infer coordinates from an ID, filename, scaled preview, or old image.
   If visual input is unavailable, use DOM evidence or report the blocked step.
+  Public `observationId` and `imageId` arguments identify the image you saw;
+  copy them from that observation when the live tool schema requires them.
+  They do not replace the runtime's private image-delivery evidence.
 - Page overviews can summarize text. For exact copying, read the specific
   element with the available precise-text operation, check truncation, and
   read back the destination. Do not treat a truncated or processed result as
