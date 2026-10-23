@@ -45,10 +45,9 @@ OpenSquilla 是一个高效利用 Token 的微内核 AI Agent。本地模型路�
 Ollama、DeepSeek、Gemini、Qwen/DashScope 等 20 多个 LLM 提供商，无需改动你的代码或
 配置结构。
 
-OpenSquilla 0.5.7 正在准备发布，GitHub Release 保持 Draft。当前公开正式版仍为
-0.5.6；下方 0.5.7 下载链接将在正式发布后公开可用。
+OpenSquilla 0.5.7 是当前正式发布版本。
 
-当前正式版下载：[OpenSquilla 0.5.6](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.6)。
+正式版下载：[OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7)。
 
 如需面向任务的产品文档，请从
 [OpenSquilla 产品指南](README.product.md)或[文档索引](docs/README.md)开始。

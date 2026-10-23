@@ -51,10 +51,9 @@ Provider-Schicht spricht mit TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama,
 DeepSeek, Gemini, Qwen/DashScope und über 20 weiteren LLM-Providern —
 ohne Änderung an deinem Code oder deinem Konfigurationsschema.
 
-OpenSquilla 0.5.7 wird für die Veröffentlichung vorbereitet; das GitHub Release bleibt ein Draft.
-Die öffentlich verfügbare stabile Version ist weiterhin 0.5.6. Die folgenden Links für 0.5.7 werden nach der Veröffentlichung verfügbar.
+OpenSquilla 0.5.7 ist die aktuelle stabile Version.
 
-Öffentliche stabile Version: [OpenSquilla 0.5.6](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.6).
+Downloads: [OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7).
 
 Für aufgabenorientierte Produktdokumentation beginnst du am besten mit
 dem [OpenSquilla-Produktleitfaden](README.product.md) oder dem

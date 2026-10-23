@@ -42,10 +42,9 @@ OpenSquilla は、Token を効率的に使うマイクロカーネル AI Agent �
 
 すべての入口——Web UI、CLI、チャットチャネル——が同じループ上で動くため、ツールのディスパッチ、リトライ、判断ログの挙動はどこでも同一です。プラグイン可能なプロバイダ層は TokenRhythm、OpenRouter、OpenAI、Anthropic、Ollama、DeepSeek、Gemini、Qwen/DashScope をはじめとする 20 以上の LLM プロバイダと、あなたのコードや設定スキーマを変えることなくやり取りします。
 
-OpenSquilla 0.5.7 はリリース準備中で、GitHub Release は Draft のままです。
-現在公開されている安定版は 0.5.6 です。以下の 0.5.7 ダウンロードリンクは公開後に利用できます。
+OpenSquilla 0.5.7 が現在の安定版リリースです。
 
-公開済み安定版：[OpenSquilla 0.5.6](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.6)。
+ダウンロード：[OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7)。
 
 タスク指向の製品ドキュメントについては、[OpenSquilla 製品ガイド](README.product.md)または[ドキュメント索引](docs/README.md)から始めてください。
 

@@ -42,10 +42,9 @@ OpenSquilla es un agente de IA con microkernel y eficiente en el uso de tokens. 
 
 Cada punto de entrada —Web UI, CLI y canales de chat— se ejecuta a través de ese mismo bucle, de modo que el envío de herramientas, los reintentos y el registro de decisiones se comportan de forma idéntica en todas partes. Una capa de proveedores conectable se comunica con TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini, Qwen/DashScope y más de 20 proveedores de LLM adicionales, sin ningún cambio en tu código ni en el esquema de configuración.
 
-OpenSquilla 0.5.7 está en preparación; la Release de GitHub permanece en Draft.
-La versión estable pública sigue siendo 0.5.6. Los enlaces de 0.5.7 estarán disponibles tras su publicación.
+OpenSquilla 0.5.7 es la versión estable actual.
 
-Versión estable pública: [OpenSquilla 0.5.6](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.6).
+Descargas: [OpenSquilla 0.5.7](https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.7).
 
 Para documentación de producto orientada a tareas, comienza por la [Guía de producto de OpenSquilla](README.product.md) o el [índice de documentación](docs/README.md).
 

@@ -2,7 +2,7 @@
 
 | Version | Tag | Date | Notes |
 |---|---|---|---|
-| 0.5.7 | v0.5.7 | 2026-10-23 | Draft: document annotations, project Workbench, inline visualizations, and video generation |
+| 0.5.7 | v0.5.7 | 2026-10-23 | Stable: document annotations, project Workbench, inline visualizations, and video generation |
 | 0.5.6 | v0.5.6 | 2026-09-30 | Stable: core reliability fixes, clearer local file references, and Browser Use (Beta) |
 | 0.5.5 | v0.5.5 | 2026-09-23 | Stable: C5 fusion, reliable task continuity, workspace previews, SkillHub, and signed Windows installers |
 | 0.5.4 | v0.5.4 | 2026-08-25 | Stable: HTML document editing beta, optional Runtime Packs, per-session routing, resilient C3 fusion, and cross-platform reliability |
