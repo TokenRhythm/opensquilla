@@ -1785,6 +1785,7 @@ def test_windows_shard_metadata_does_not_invalidate_unrelated_suites(
             "ownership",
         ),
         ("desktop/electron/scripts/test-unsafe-legacy-recovery-no-write.mjs", "workbench"),
+        ("desktop/electron/scripts/test-browser-open-recovery-electron.mjs", "workbench"),
     ],
 )
 def test_desktop_case_manifest_routes_each_known_case_to_its_executing_group(
