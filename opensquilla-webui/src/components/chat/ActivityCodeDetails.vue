@@ -146,7 +146,7 @@ const diffLines = computed(() => source.value.split('\n').map(text => ({
 .activity-code-details__open { width: auto; padding: 0 0.375rem; font: inherit; opacity: 0; }
 .activity-code-details:hover .activity-code-details__open,
 .activity-code-details:focus-within .activity-code-details__open { opacity: 1; }
-.activity-code-details__viewport { min-width: 0; width: 100%; max-height: min(20rem, 45vh); overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; color: var(--text); }
+.activity-code-details__viewport { min-width: 0; width: 100%; max-height: min(20rem, 45vh); overflow: auto; overscroll-behavior: auto; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; color: var(--text); }
 .activity-code-details pre,
 .activity-code-details code { border: 0; border-radius: 0; background: transparent; box-shadow: none; font-family: var(--font-mono); font-size: 0.8125rem; font-weight: 400; line-height: 1.375rem; text-align: left; tab-size: 2; }
 .activity-code-details pre { width: max-content; min-width: 100%; box-sizing: border-box; margin: 0; padding: 0; white-space: pre; }
