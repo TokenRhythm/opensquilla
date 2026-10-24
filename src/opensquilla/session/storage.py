@@ -140,6 +140,8 @@ from opensquilla.session.usage_attribution import (
     read_usage_attributions_on_conn,
 )
 from opensquilla.session.usage_ledger import (
+    LOCAL_PRE_DISPATCH_ORIGIN,
+    LOCAL_WIRE_BODY_REJECTION_REASON,
     UsageBackfillBatch,
     UsageBackfillCursor,
     UsageBackfillEntry,
@@ -4143,6 +4145,10 @@ class SessionStorage:
         persisted = await self._get_usage_event_on_conn(conn, event_id=event_id)
         if persisted is None:
             raise KeyError(f"usage event not found: {event_id}")
+        if persisted.origin == LOCAL_PRE_DISPATCH_ORIGIN:
+            raise UsageLedgerConflictError(
+                "a locally rejected request cannot receive provider usage"
+            )
         if completion.completed_at_ms < persisted.started_at_ms:
             raise ValueError("completed_at_ms must not precede started_at_ms")
 
@@ -4271,7 +4277,8 @@ class SessionStorage:
             """UPDATE session_goals SET usage_coverage = CASE
                 WHEN EXISTS (SELECT 1 FROM usage_events
                     WHERE usage_events.goal_id = session_goals.goal_id
-                    AND (status = 'unknown' OR coverage_status = 'usage_missing'
+                    AND ((status = 'unknown' AND origin != 'local_pre_dispatch')
+                        OR coverage_status = 'usage_missing'
                         OR (status = 'started' AND EXISTS (
                             SELECT 1 FROM agent_tasks AS executor
                             WHERE executor.task_id = COALESCE(
@@ -4369,6 +4376,58 @@ class SessionStorage:
                 WHERE event_id = ? AND status = 'started'
                 """,
                 (completed_at_ms, stable_reason, event_id),
+            )
+            record = await self._get_usage_event_on_conn(conn, event_id=event_id)
+            assert record is not None
+            if record.goal_id is not None:
+                await self._refresh_goal_usage_coverage_on_conn(conn, record.goal_id)
+            return replace(record, transition_applied=True)
+
+    async def mark_usage_event_not_sent(
+        self,
+        event_id: str,
+        *,
+        completed_at_ms: int,
+    ) -> UsageEventRecord:
+        """Terminalize a reserved request rejected by local wire-body admission.
+
+        The row remains auditable, but its origin excludes it from provider
+        usage and incomplete-receipt projections. Repeating this exact terminal
+        transition is idempotent; conflicting terminal outcomes are rejected.
+        """
+
+        if not event_id:
+            raise ValueError("event_id must not be empty")
+        if completed_at_ms < 0:
+            raise ValueError("completed_at_ms must be non-negative")
+        async with self._write_transaction("mark_usage_event_not_sent") as conn:
+            persisted = await self._get_usage_event_on_conn(conn, event_id=event_id)
+            if persisted is None:
+                raise KeyError(f"usage event not found: {event_id}")
+            if (
+                persisted.status == "unknown"
+                and persisted.origin == LOCAL_PRE_DISPATCH_ORIGIN
+                and persisted.unknown_reason == LOCAL_WIRE_BODY_REJECTION_REASON
+            ):
+                return persisted
+            if persisted.status != "started" or persisted.origin != "live_provider":
+                raise UsageLedgerConflictError("usage event has a conflicting terminal outcome")
+            if completed_at_ms < persisted.started_at_ms:
+                raise ValueError("completed_at_ms must not precede started_at_ms")
+            await conn.execute(
+                """
+                UPDATE usage_events
+                SET completed_at_ms = ?, status = 'unknown',
+                    origin = ?, coverage_status = 'not_sent',
+                    missing_cost_entries = 0, unknown_reason = ?
+                WHERE event_id = ? AND status = 'started' AND origin = 'live_provider'
+                """,
+                (
+                    completed_at_ms,
+                    LOCAL_PRE_DISPATCH_ORIGIN,
+                    LOCAL_WIRE_BODY_REJECTION_REASON,
+                    event_id,
+                ),
             )
             record = await self._get_usage_event_on_conn(conn, event_id=event_id)
             assert record is not None

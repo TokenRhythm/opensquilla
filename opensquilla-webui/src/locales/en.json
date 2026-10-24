@@ -4180,6 +4180,8 @@
       "credits": "The model service account has insufficient credits.",
       "modelUnavailable": "The selected model is unavailable.",
       "contextLimit": "The content exceeds this model's capacity. Shorten the input or choose a larger-context model.",
+      "requestTooLarge": "The model service rejected this request as too large. Reduce large attachments or start a new chat with a short summary before trying again.",
+      "outboundRequestTooLarge": "OpenSquilla stopped this request because the content to send exceeds its size limit. Reduce large attachments or start a new chat with a short summary before trying again.",
       "unsupported": "This model does not support this request.",
       "imageUnsupported": "This model does not support images.",
       "ensembleImageUnsupported": "This mode does not support images.",

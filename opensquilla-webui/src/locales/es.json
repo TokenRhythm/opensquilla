@@ -4077,6 +4077,8 @@
       "credits": "La cuenta del servicio del modelo no tiene saldo suficiente.",
       "modelUnavailable": "El modelo seleccionado no está disponible.",
       "contextLimit": "El contenido supera la capacidad del modelo. Acorta la entrada o elige un modelo con más contexto.",
+      "requestTooLarge": "El servicio del modelo rechazó esta solicitud por su tamaño. Reduce los archivos adjuntos grandes o inicia un chat nuevo con un resumen breve antes de volver a intentarlo.",
+      "outboundRequestTooLarge": "OpenSquilla detuvo esta solicitud porque el contenido que se iba a enviar supera su límite de tamaño. Reduce los archivos adjuntos grandes o inicia un chat nuevo con un resumen breve.",
       "unsupported": "Este modelo no admite esta solicitud.",
       "imageUnsupported": "Este modelo no admite imágenes.",
       "ensembleImageUnsupported": "Este modo no admite imágenes.",

@@ -4077,6 +4077,8 @@
       "credits": "Das Guthaben des Modelldienstkontos reicht nicht aus.",
       "modelUnavailable": "Das gewählte Modell ist nicht verfügbar.",
       "contextLimit": "Der Inhalt überschreitet die Modellkapazität. Kürzen Sie die Eingabe oder wählen Sie ein Modell mit größerem Kontextfenster.",
+      "requestTooLarge": "Der Modelldienst hat diese Anfrage wegen ihrer Größe abgelehnt. Entfernen Sie große Anhänge oder beginnen Sie einen neuen Chat mit einer kurzen Zusammenfassung.",
+      "outboundRequestTooLarge": "OpenSquilla hat die Anfrage gestoppt, weil der zu sendende Inhalt die Größenbegrenzung überschreitet. Entfernen Sie große Anhänge oder beginnen Sie einen neuen Chat mit einer kurzen Zusammenfassung.",
       "unsupported": "Dieses Modell unterstützt die Anfrage nicht.",
       "imageUnsupported": "Dieses Modell unterstützt keine Bilder.",
       "ensembleImageUnsupported": "Dieser Modus unterstützt keine Bilder.",

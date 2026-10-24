@@ -262,6 +262,9 @@ class ErrorEvent:
     # Trusted transport evidence, distinct from broad retry classifications.
     # Unknown extensions and protocol/consumer failures cannot authorize replay.
     recovery_origin: RecoveryOrigin = "unknown"
+    # Set only by a local adapter after its final wire-body proof rejects the
+    # request before HTTP dispatch. Never inferred from provider response text.
+    _opensquilla_request_not_dispatched: bool = field(default=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -863,12 +866,26 @@ class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: MessageContent
     _execution_identity_span: tuple[int, int] | None = PrivateAttr(default=None)
+    _recorded_tool_context: bool = PrivateAttr(default=False)
+    _trusted_runtime_notice: bool = PrivateAttr(default=False)
+    # Request-local acknowledgement for a tool image in a native provider
+    # request. None denotes replay written before this evidence was recorded.
+    _tool_image_native_ack: bool | None = PrivateAttr(default=None)
+    _request_only_pending_tool_image: bool = PrivateAttr(default=False)
     reasoning_content: str | None = None
     provider_replay: ProviderReplayState | None = None
 
     @property
     def execution_identity_span(self) -> tuple[int, int] | None:
         return self._execution_identity_span
+
+    @property
+    def is_recorded_tool_context(self) -> bool:
+        return self._recorded_tool_context
+
+    @property
+    def is_trusted_runtime_notice(self) -> bool:
+        return self._trusted_runtime_notice
 
 
 # ---------------------------------------------------------------------------

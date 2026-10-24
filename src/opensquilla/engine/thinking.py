@@ -52,24 +52,23 @@ def drop_reasoning(
                 if not filtered:
                     filtered = [ContentBlockText(text="")]
                 out.append(
-                    Message(
-                        role="assistant",
-                        provider_replay=msg.provider_replay,
-                        content=filtered,
-                        reasoning_content=(
+                    msg.model_copy(
+                        update={
+                            "content": filtered,
+                            "reasoning_content": (
                             msg.reasoning_content if keep_reasoning_content else None
-                        ),
+                            ),
+                        },
                     )
                 )
             else:
                 out.append(
-                    Message(
-                        role="assistant",
-                        provider_replay=msg.provider_replay,
-                        content=msg.content,
-                        reasoning_content=(
+                    msg.model_copy(
+                        update={
+                            "reasoning_content": (
                             msg.reasoning_content if keep_reasoning_content else None
-                        ),
+                            ),
+                        },
                     )
                 )
             continue

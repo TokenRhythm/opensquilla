@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
+import random
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,9 +12,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from PIL import Image
 
 from opensquilla.attachment_refs import write_transcript_material
+from opensquilla.contracts.image_preparation import prepare_tool_result_image
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.agent import _serialize_assistant_replay
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.steps.squilla_router import apply_squilla_router
@@ -25,7 +30,12 @@ from opensquilla.provider import (
     ModelCapabilities,
     TextDeltaEvent,
 )
-from opensquilla.provider.types import ContentBlockImage, ContentBlockText
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockText,
+    ContentBlockToolResult,
+    ContentBlockToolUse,
+)
 from opensquilla.session.attachment_manifest import (
     ATTACHMENT_MANIFEST_PROVIDER,
     ATTACHMENT_MANIFEST_STATE_KIND,
@@ -91,7 +101,7 @@ class _FakeSessionManager:
 @pytest.mark.parametrize("lookback", [0, 1, 2])
 @pytest.mark.parametrize("queued_before_completion", [False, True])
 @pytest.mark.parametrize("prior_user_retained", [False, True])
-async def test_tool_loaded_active_images_ignore_the_legacy_turn_window(
+async def test_tool_loaded_images_route_only_the_immediate_followup(
     lookback: int, queued_before_completion: bool, prior_user_retained: bool,
 ) -> None:
     manager = _FakeSessionManager()
@@ -122,10 +132,14 @@ async def test_tool_loaded_active_images_ignore_the_legacy_turn_window(
         key, exclude_last_user=True, bound_user_message_id="current",
     )
 
-    assert context["history_has_recent_image"] is True
-    if prior_user_retained:
-        assert context["turns_since_last_image"] == (0 if queued_before_completion else 1)
-    assert context["history_image_turn_count"] == 1
+    assert context.get("history_has_recent_image") is (True if queued_before_completion else None)
+    if prior_user_retained and queued_before_completion:
+        assert context["turns_since_last_image"] == 0
+    else:
+        assert "turns_since_last_image" not in context
+    assert context.get("history_image_turn_count") == (
+        1 if queued_before_completion else None
+    )
 
 
 class _CanonicalSessionManager(_FakeSessionManager):
@@ -209,6 +223,66 @@ def _message_has_marker(message: Message, marker: str) -> bool:
         isinstance(block, ContentBlockText) and marker in block.text
         for block in message.content
     ) or isinstance(message.content, str) and marker in message.content
+
+
+@pytest.mark.asyncio
+async def test_prior_tool_images_are_markers_while_user_image_remains_available() -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:tool-image-replay-projection"
+    config = GatewayConfig(llm={"provider": "openai"})
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    await manager.create(key)
+    await manager.append_message(key, "user", _inline_image_envelope("Reference picture."))
+    image_data = _b64(image_bytes(color="#123456"))
+    replay = _serialize_assistant_replay([
+        Message(role="assistant", content=[
+            ContentBlockToolUse(id="view-1", name="image", input={"path": "/tmp/frame.png"}),
+        ]),
+        Message(role="user", content=[
+            ContentBlockToolResult(tool_use_id="view-1", content='{"status":"loaded"}'),
+            *[
+                ContentBlockImage(
+                    media_type="image/png", data=image_data,
+                    local_path=f"/tmp/frame-{index}.png", durable_retained=True,
+                )
+                for index in range(12)
+            ],
+        ]),
+            Message(role="assistant", content="I checked the frame."),
+    ])
+    entry = await manager.append_message(key, "assistant", "I checked the frame.")
+    entry.assistant_replay = replay
+    await manager.append_message(key, "user", "Continue the edit.", "current")
+
+    provider = _CapturingProvider()
+    agent = Agent(provider=provider, config=AgentConfig(
+        max_iterations=1, model_vision_support="supported",
+        preserve_historical_images=True,
+        metadata={"image_context_has_images": True},
+    ))
+    await runner._load_history(agent, key, bound_user_message_id="current")
+    assert sum(
+        isinstance(block, ContentBlockImage)
+        for message in agent._history if isinstance(message.content, list)
+        for block in message.content
+    ) == 13
+    events = [event async for event in agent.run_turn("Continue the edit.")]
+
+    assert any(event.kind == "done" for event in events)
+    sent = provider.calls[0]["messages"]
+    sent_images = [
+        block for message in sent if isinstance(message.content, list)
+        for block in message.content if isinstance(block, ContentBlockImage)
+    ]
+    assert len(sent_images) == 1
+    assert sent_images[0].data == _b64(image_bytes())
+    assert sum(
+        isinstance(block, ContentBlockText) and "历史图片本回合未重新读取" in block.text
+        for message in sent if isinstance(message.content, list)
+        for block in message.content
+    ) == 12
+    assert not any(_message_has_marker(message, "原图已保留") for message in sent)
+    assert entry.assistant_replay == replay
 
 
 @pytest.mark.parametrize("legacy_lookback", [0, 1, 8])
@@ -357,6 +431,10 @@ async def test_retained_tool_image_replay_uses_a_readable_current_session_path(
         assert _build_openai_messages(replayed) == _build_openai_messages(
             decode_assistant_replay(canonical)[-1]
         )
+    else:
+        assert "identical copy of the original image" in json.loads(
+            tool_result.content
+        )["retention_note"]
     token = current_tool_context.set(context)
     try:
         await filesystem.read_file(image.local_path, _tool_use_id="reread")
@@ -366,6 +444,97 @@ async def test_retained_tool_image_replay_uses_a_readable_current_session_path(
     finally:
         current_tool_context.reset(token)
     assert context.tool_result_media["reread"][0]["data"] == _b64(payload)
+
+
+@pytest.mark.parametrize("source_case", ["same_session", "changed_source", "fork", "write_deny"])
+async def test_prepared_tool_image_replay_keeps_original_or_labels_derivative(
+    tmp_path: Path, source_case: str,
+) -> None:
+    from opensquilla.attachment_workspace import AttachmentWorkspaceMaterializer
+    from opensquilla.tools.types import ToolContext
+
+    manager = _FakeSessionManager()
+    key = "agent:main:prepared-tool-image-history"
+    node = await manager.create(key)
+    config = GatewayConfig(workspace_dir=str(tmp_path / "workspace"))
+    materializer = AttachmentWorkspaceMaterializer(
+        media_root=tmp_path / "media", workspace_dir=config.workspace_dir,
+    )
+    output = io.BytesIO()
+    pixels = random.Random(42).randbytes(900 * 900 * 3)
+    Image.frombytes("RGB", (900, 900), pixels).save(output, format="PNG", compress_level=0)
+    original = output.getvalue()
+    prepared = prepare_tool_result_image(original, "image/png")
+    assert prepared.media_type == "image/jpeg"
+    parent_id = node.session_id if source_case in {"same_session", "changed_source"} else "parent"
+    source = materializer.materialize_bytes(
+        original, name="frame.png", mime="image/png", session_id=parent_id,
+    )
+    assert source.rel_path is not None
+    original_path = Path(config.workspace_dir) / source.rel_path
+    if source_case == "changed_source":
+        original_path.write_bytes(image_bytes())
+    source_url = "https://images.example.test/frame.png"
+    receipt = json.dumps({
+        "status": "loaded", "path": source_url, "source_url": source_url,
+        "local_path": source.rel_path, "name": "frame.png",
+    })
+    canonical = _serialize_assistant_replay([
+        Message(role="assistant", content=[ContentBlockToolUse(
+            id="image-read", name="image", input={"path": source_url},
+        )]),
+        Message(role="user", content=[
+            ContentBlockToolResult(tool_use_id="image-read", content=receipt),
+            ContentBlockImage(
+                media_type=prepared.media_type, data=_b64(prepared.data),
+                name="frame.png", source_url=source_url,
+                local_path=source.rel_path, durable_retained=True,
+            ),
+        ]),
+    ])
+    await manager.append_message(key, "user", "Load the frame.")
+    saved = await manager.append_message(key, "assistant", "Frame loaded.")
+    saved.assistant_replay = canonical
+    await manager.append_message(key, "user", "Read the source image again.", "current")
+    context = ToolContext(
+        workspace_dir=config.workspace_dir, workspace_strict=True,
+        artifact_session_id=node.session_id, artifact_media_root=str(tmp_path / "media"),
+        sandbox_gateway_config=config,
+    )
+    if source_case == "write_deny":
+        context.workspace_write_deny_globs = [".opensquilla/attachments/**"]
+    agent = Agent(provider=_CapturingProvider(), tool_context=context, config=AgentConfig(
+        model_vision_support="supported", workspace_dir=config.workspace_dir,
+    ))
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    await runner._load_history(agent, key, bound_user_message_id="current")
+
+    replayed = agent._history[-1]
+    image = next(block for block in replayed.content if isinstance(block, ContentBlockImage))
+    tool_result = next(
+        block for block in replayed.content if isinstance(block, ContentBlockToolResult)
+    )
+    rewritten_receipt = json.loads(tool_result.content)
+    assert image.data == _b64(prepared.data)
+    assert image.media_type == "image/jpeg"
+    assert json.dumps(saved.assistant_replay) == json.dumps(canonical)
+    if source_case == "same_session":
+        assert image.local_path == source.rel_path
+        assert image.name == "frame.png"
+        assert tool_result.content == receipt
+        assert original_path.read_bytes() == original
+    elif source_case == "write_deny":
+        assert image.local_path is None
+        assert "local_path" not in rewritten_receipt
+        assert "No readable local copy" in rewritten_receipt["retention_note"]
+    else:
+        assert image.local_path != source.rel_path
+        assert image.local_path is not None
+        assert image.local_path.endswith("-frame.jpg")
+        assert image.name == rewritten_receipt["name"] == "frame.jpg"
+        assert rewritten_receipt["local_path"] == image.local_path
+        assert "prepared derivative" in rewritten_receipt["retention_note"]
+        assert (Path(config.workspace_dir) / image.local_path).read_bytes() == prepared.data
 
 
 @pytest.mark.parametrize("image_source", ["active", "archive", "bound", "agent_history"])

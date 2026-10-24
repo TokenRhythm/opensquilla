@@ -24,6 +24,7 @@ from opensquilla.gateway.usage_settlement_projection import (
 )
 from opensquilla.provider.fx import canonical_native_per_usd_rates
 from opensquilla.session.cost_rollup import rollup_cost_source
+from opensquilla.session.usage_ledger import LOCAL_PRE_DISPATCH_ORIGIN
 
 _PRESET_DAYS = {
     "today": 1,
@@ -1273,7 +1274,11 @@ async def _query_usage_ledger_once(
     )
     # Storage primary keys already guarantee this; keep adapters/replays from
     # multiplying the same physical event across any reporting dimension.
-    events = list({_text(_field(event, "event_id")): event for event in events}.values())
+    events = list({
+        _text(_field(event, "event_id")): event
+        for event in events
+        if _event_origin(event) != LOCAL_PRE_DISPATCH_ORIGIN
+    }.values())
     # Partition by status in one pass.  Equality-based list membership here is
     # quadratic for the common all-finalized case and becomes visible at only
     # a few thousand ledger rows.

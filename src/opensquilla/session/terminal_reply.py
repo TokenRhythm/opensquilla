@@ -12,6 +12,19 @@ from opensquilla.silent_reply import (
 )
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
+PROVIDER_PAYLOAD_TOO_LARGE_CODE = "provider_payload_too_large"
+PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE = "provider_wire_payload_too_large"
+_REQUEST_SIZE_MESSAGES = {
+    PROVIDER_PAYLOAD_TOO_LARGE_CODE: (
+        "The model provider rejected this request as too large. Reduce large "
+        "attachments or start a new chat with a concise summary before trying again."
+    ),
+    PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE: (
+        "OpenSquilla stopped this request because the content to send exceeds "
+        "its size limit. Reduce large attachments or start a new chat with a "
+        "concise summary before trying again."
+    ),
+}
 CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES = {
     "provider_system_prompt_too_large": (
         "The fixed system instructions exceed the provider request budget. "
@@ -78,6 +91,8 @@ _SAFE_PROVIDER_FAILURE_MESSAGES = {
     ),
     "auth_invalid": "The model provider rejected the configured credentials.",
     "context_overflow": "The request exceeds the model provider's context window.",
+    "payload_too_large": _REQUEST_SIZE_MESSAGES[PROVIDER_PAYLOAD_TOO_LARGE_CODE],
+    "wire_payload_too_large": _REQUEST_SIZE_MESSAGES[PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE],
     "unsupported_feature": "The model provider does not support this request.",
     "insufficient_credits": "The model provider account has insufficient credits.",
     "usage_limit": "The model provider account has reached its usage limit.",
@@ -115,6 +130,8 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "provider_retry_after_deadline",
         "provider_request_budget_exhausted",
         "provider_request_too_large",
+        PROVIDER_PAYLOAD_TOO_LARGE_CODE,
+        PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE,
         "request_error",
         "response_incomplete",
         "synthetic_upstream_failure",
@@ -151,14 +168,33 @@ def safe_provider_failure_code(raw_code: str | None, failure_kind: str | None) -
     """Return a bounded terminal code without relaying provider-controlled text."""
 
     normalized_code = str(raw_code or "").strip().lower().replace("-", "_")
+    normalized_kind = str(failure_kind or "").strip().lower().replace("-", "_")
+    if normalized_kind == "wire_payload_too_large":
+        return PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE
+    if normalized_kind == "payload_too_large":
+        return PROVIDER_PAYLOAD_TOO_LARGE_CODE
+    if normalized_code == PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE:
+        return "provider_error"
     if normalized_code.isascii() and normalized_code.isdigit() and len(normalized_code) <= 3:
         return normalized_code
     if normalized_code in _SAFE_PROVIDER_TERMINAL_CODES:
         return normalized_code
-    normalized_kind = str(failure_kind or "").strip().lower().replace("-", "_")
     if normalized_kind in _SAFE_PROVIDER_FAILURE_MESSAGES:
         return f"provider_{normalized_kind}"
     return "provider_error"
+
+
+def _request_size_code(record_or_payload: Any) -> str | None:
+    for field in ("error_class", "terminal_reason"):
+        code = _normalize(_read_value(record_or_payload, field))
+        if code in _REQUEST_SIZE_MESSAGES:
+            return code
+    kind = _normalize(_read_value(record_or_payload, "failure_kind"))
+    if kind == "wire_payload_too_large":
+        return PROVIDER_WIRE_PAYLOAD_TOO_LARGE_CODE
+    if kind == "payload_too_large":
+        return PROVIDER_PAYLOAD_TOO_LARGE_CODE
+    return None
 
 
 def safe_error_id(value: object) -> str | None:
@@ -185,10 +221,12 @@ def build_terminal_reply(
     del surface, locale  # Reserved for future surface/locale-specific phrasing.
 
     existing = _read_value(record_or_payload, "terminal_message")
+    request_size_code = _request_size_code(record_or_payload)
     if (
         isinstance(existing, str)
         and existing.strip()
         and not _contains_context_payload_marker(existing)
+        and request_size_code is None
     ):
         return existing.strip()
 
@@ -206,6 +244,8 @@ def build_terminal_reply(
         or "stream idle" in error_message
     ):
         return "The task timed out before it could finish."
+    if request_size_code is not None:
+        return _REQUEST_SIZE_MESSAGES[request_size_code]
     if is_context_payload_too_large(record_or_payload) or (
         isinstance(existing, str) and _contains_context_payload_marker(existing)
     ):
@@ -342,6 +382,9 @@ def sanitize_agent_error(
     fallback_error_class: str | None = None,
     fallback_error_message: str = "Agent error",
 ) -> tuple[str | None, str]:
+    request_size_code = _request_size_code(record_or_payload)
+    if request_size_code is not None:
+        return request_size_code, _REQUEST_SIZE_MESSAGES[request_size_code]
     if is_context_payload_too_large(record_or_payload):
         return CONTEXT_PAYLOAD_TOO_LARGE_CODE, build_terminal_reply(record_or_payload)
     if _is_provider_output_truncated(record_or_payload):

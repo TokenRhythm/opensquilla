@@ -90,7 +90,9 @@ def recorded_context_message(messages: list[Message], *, introduction: str) -> M
             ]
         records.append({"role": message.role, "content": content})
     text = introduction + "\n" + json.dumps(records, ensure_ascii=False, separators=(",", ":"))
-    return Message(
+    recorded = Message(
         role="user",
         content=[ContentBlockText(text=text), *media] if media else text,
     )
+    recorded._recorded_tool_context = True
+    return recorded

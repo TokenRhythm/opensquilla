@@ -452,6 +452,11 @@ class DoneEvent:
     assistant_replay: dict[str, Any] | None = field(
         default=None, repr=False, metadata={"private": True}
     )
+    # Positions of committed assistant replies whose physical request carried
+    # native tool images. Persisted only in transcript turn_context.
+    tool_image_native_ack_indexes: list[int] | None = field(
+        default=None, repr=False, metadata={"private": True}
+    )
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -462,8 +467,11 @@ class DoneEvent:
 def public_agent_event_payload(event: Any) -> dict[str, Any]:
     """Serialize an event without copying private provider continuation state."""
     if isinstance(event, DoneEvent):
-        payload = asdict(replace(event, assistant_replay=None))
+        payload = asdict(replace(
+            event, assistant_replay=None, tool_image_native_ack_indexes=None,
+        ))
         payload.pop("assistant_replay", None)
+        payload.pop("tool_image_native_ack_indexes", None)
         return payload
     if isinstance(event, ToolResultEvent) and event.is_error:
         # A failed mutation must never advertise a successful file snapshot,

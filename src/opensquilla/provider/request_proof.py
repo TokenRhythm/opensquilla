@@ -19,7 +19,7 @@ from PIL import Image
 
 from opensquilla.context_budget import hard_input_tokens
 
-from .types import ChatConfig, ContentBlockText, ProviderFinalRequestProjection
+from .types import ChatConfig, ContentBlockText, ErrorEvent, ProviderFinalRequestProjection
 
 _COMPACTED_STRING_MAX_CHARS = 1200
 _COMPACTED_TAIL_STRING_MAX_CHARS = 640
@@ -34,6 +34,10 @@ _CHARS_PER_TOKEN_EQUIVALENT = 4
 # encoding differ, so this is not an upper bound or a model-specific price.
 _IMAGE_MEDIA_TOKEN_FLOOR = 1_024
 _IMAGE_ESTIMATE_GRID_EDGE = 32
+# A transport limit is independent of the model's image/token budget. Base64
+# media can have a small token reserve while making the JSON body enormous.
+_DEFAULT_WIRE_BODY_MAX_BYTES = 24 * 1024 * 1024
+_WIRE_BODY_MAX_BYTES_ENV = "OPENSQUILLA_PROVIDER_REQUEST_MAX_BODY_BYTES"
 # PDF expansion includes page text and images; keep its existing byte reserve.
 _PDF_MEDIA_TOKEN_FLOOR = 4_096
 _PDF_MEDIA_BYTES_PER_TOKEN = 128
@@ -146,6 +150,27 @@ class ProviderRequestBudgetExceededError(RuntimeError):
 
 
 ProviderRequestBudgetExceeded = ProviderRequestBudgetExceededError
+
+
+def local_budget_rejection_event(proof: dict[str, Any]) -> ErrorEvent:
+    """Build a budget error with trusted evidence of a rejected wire body."""
+
+    event = ErrorEvent(
+        message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
+        code="provider_request_budget_exhausted",
+    )
+    used = proof.get("wire_json_bytes")
+    limit = proof.get("wire_body_max_bytes")
+    if (
+        proof.get("wire_byte_budget_exhausted") is True
+        and proof.get("fits_wire_byte_budget") is False
+        and type(used) is int
+        and type(limit) is int
+        and limit > 0
+        and used > limit
+    ):
+        event._opensquilla_request_not_dispatched = True
+    return event
 
 
 @dataclass(frozen=True)
@@ -375,6 +400,19 @@ def provider_request_character_budget(payload: dict[str, Any], config: ChatConfi
     if environment_cap > 0:
         return min(budget, environment_cap) if budget > 0 else environment_cap
     return budget
+
+
+def _wire_body_max_bytes() -> int:
+    """Return the JSON transport guard; zero explicitly disables it."""
+
+    raw = os.environ.get(_WIRE_BODY_MAX_BYTES_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_WIRE_BODY_MAX_BYTES
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return _DEFAULT_WIRE_BODY_MAX_BYTES
+    return parsed if parsed >= 0 else _DEFAULT_WIRE_BODY_MAX_BYTES
 
 
 def _serialized_token_estimate(serialized_payload: str) -> tuple[int, str]:
@@ -1779,6 +1817,10 @@ def project_provider_payload(
     )
     wire_json_chars = len(wire_json)
     wire_json_bytes = len(wire_json.encode("utf-8"))
+    wire_body_max_bytes = _wire_body_max_bytes()
+    fits_wire_byte_budget = (
+        wire_body_max_bytes == 0 or wire_json_bytes <= wire_body_max_bytes
+    )
     budget_payload, media = _budget_projection(
         payload,
         envelope_shape,
@@ -1818,7 +1860,7 @@ def project_provider_payload(
         (token_budget is None and proof_budget <= 0)
         or estimated_tokens <= effective_token_budget
     )
-    fits = fits_char_budget and fits_token_budget
+    fits = fits_char_budget and fits_token_budget and fits_wire_byte_budget
     proof: dict[str, Any] = {
         "projection_adapter": projection_adapter,
         "execution_status_version": 1,
@@ -1926,6 +1968,12 @@ def project_provider_payload(
     if media.excluded_blocks:
         proof["media_chars_excluded"] = media.excluded_chars
         proof["media_blocks_excluded"] = media.excluded_blocks
+    if not fits_wire_byte_budget:
+        proof["wire_json_bytes"] = wire_json_bytes
+        proof["wire_body_max_bytes"] = wire_body_max_bytes
+        proof["fits_wire_byte_budget"] = False
+        proof["wire_byte_budget_exhausted"] = True
+        proof["wire_body_excess_bytes"] = wire_json_bytes - wire_body_max_bytes
     if not fits:
         proof["fallback_reason"] = "provider_request_budget_exhausted"
     return proof
@@ -2044,13 +2092,18 @@ def prove_or_compact_provider_payload(
         # transport's JSON contract. HTTPX rejects NaN/Infinity and other
         # non-JSON values, so validate with the same strictness here and let
         # the coordinator map failures to ``invalid_request``.
-        json.dumps(
+        wire_json = json.dumps(
             payload,
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
         )
-        return payload, None
+        wire_body_max_bytes = _wire_body_max_bytes()
+        if (
+            wire_body_max_bytes == 0
+            or len(wire_json.encode("utf-8")) <= wire_body_max_bytes
+        ):
+            return payload, None
     if not envelope_shape.allow_request_compaction:
         proof = prove_provider_payload(
             payload,
@@ -2079,6 +2132,15 @@ def prove_or_compact_provider_payload(
         )
     except ProviderRequestBudgetExceededError as first_error:
         first_chars = int(first_error.proof["estimated_chars"])
+        # The request-only reducer does not rewrite image/PDF blocks. When
+        # media alone exceeds the transport cap, avoid repeated deep copies
+        # and fail with the exact size evidence for history-level recovery.
+        if (
+            first_error.proof.get("wire_byte_budget_exhausted")
+            and int(first_error.proof.get("media_chars_excluded") or 0)
+            >= int(first_error.proof["wire_body_max_bytes"])
+        ):
+            raise
     else:
         if scrubbed_projection:
             proof["compact_needed"] = True
@@ -2263,7 +2325,18 @@ def prove_provider_payload_from_env(
     except ValueError:
         proof_budget = 0
     if proof_budget <= 0 and token_budget is None:
-        return None
+        wire_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        wire_body_max_bytes = _wire_body_max_bytes()
+        if (
+            wire_body_max_bytes == 0
+            or len(wire_json.encode("utf-8")) <= wire_body_max_bytes
+        ):
+            return None
     return prove_provider_payload(
         payload,
         projection_adapter=projection_adapter,

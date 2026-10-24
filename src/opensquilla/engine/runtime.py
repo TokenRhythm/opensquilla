@@ -19,6 +19,7 @@ import json
 import math
 import os
 import platform
+import stat
 import tempfile
 import time
 import uuid
@@ -63,6 +64,9 @@ from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
 )
 from opensquilla.contracts.attachments import (
+    IMAGE_ATTACHMENT_BYTES as _IMAGE_ATTACHMENT_BYTES,
+)
+from opensquilla.contracts.attachments import (
     IMAGE_ATTACHMENT_MIMES as _IMAGE_ATTACHMENT_MIMES,
 )
 from opensquilla.contracts.attachments import (
@@ -85,7 +89,12 @@ from opensquilla.contracts.attachments import (
 )
 from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.contracts.turn_execution import TurnExecutionContext
-from opensquilla.engine.agent import Agent, ToolHandler, _ToolArgumentProgress
+from opensquilla.engine.agent import (
+    Agent,
+    ToolHandler,
+    _has_historical_tool_image,
+    _ToolArgumentProgress,
+)
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.engine.fallback import FallbackPolicy, sleep_before_retry
@@ -267,6 +276,9 @@ from opensquilla.provider.image_projection import (
     bind_image_attachment_ids,
     classify_image_failure,
     project_messages,
+)
+from opensquilla.provider.image_projection import (
+    count_image_blocks as count_replay_image_blocks,
 )
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
@@ -2328,6 +2340,7 @@ class _SelectorFallbackProvider:
         self._image_probe_forbidden = False
         self._stream_recovery_request: StreamRecoveryRequest | None = None
         self.last_image_request_had_native_images = False
+        self.last_image_request_had_native_tool_images = False
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
         self._fallback_deployment_limits: dict[_FallbackDeploymentIdentity, tuple[int, int]] = {}
         self._fallback_deployment_capabilities: dict[
@@ -2699,6 +2712,9 @@ class _SelectorFallbackProvider:
             ),
         )
         self.last_image_request_had_native_images = projection.output_image_count > 0
+        self.last_image_request_had_native_tool_images = any(
+            _has_historical_tool_image(message) for message in projection.messages
+        )
         if projection.input_image_count and isinstance(turn_metadata, dict):
             # These fields describe the physical leg that is about to run.
             # A previous native probe must not leave stale metadata after a
@@ -4038,6 +4054,7 @@ class _SelectorFallbackProvider:
                     )
                     if isinstance(event, ProviderErrorEvent)
                     and event.code == "provider_request_budget_exhausted"
+                    and not event._opensquilla_request_not_dispatched
                     else 0
                 )
                 local_admission_escalation = local_admission_fallback_index > 0
@@ -4050,6 +4067,7 @@ class _SelectorFallbackProvider:
                 )
                 while (
                     isinstance(event, ProviderErrorEvent)
+                    and not event._opensquilla_request_not_dispatched
                     and not precise_image_capability_rejection
                     and (
                         _should_use_selector_fallback(self.provider_name, event)
@@ -8222,10 +8240,14 @@ class TurnRunner:
             final_text_parts[:] = [partial_text] if partial_text else []
             reasoning_content = "".join(reasoning_parts).strip()
             assistant_replay = None
+            tool_image_native_ack_indexes: list[int] = []
             replay_snapshot = getattr(agent, "current_assistant_replay", None)
             if callable(replay_snapshot):
                 try:
                     assistant_replay = replay_snapshot()
+                    ack_snapshot = getattr(agent, "current_tool_image_native_ack_indexes", None)
+                    if callable(ack_snapshot):
+                        tool_image_native_ack_indexes = ack_snapshot()
                 except Exception:
                     log.warning(
                         "turn_runner.cancelled_replay_snapshot_failed",
@@ -8291,12 +8313,27 @@ class TurnRunner:
                             if cancelled_turn_usage is not None
                             else None
                         )
-                    await _finish_required_cancel_cleanup(
-                        self._append_session_message(
-                            session_key,
-                            **append_kwargs,
-                        )
+                    from opensquilla.engine.history import TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY
+                    from opensquilla.session.turn_context import (
+                        current_turn_context,
+                        turn_context_scope,
                     )
+
+                    durable_context = current_turn_context() or {}
+                    if assistant_replay is not None:
+                        messages = assistant_replay.get("messages")
+                        replay_count = len(messages) if isinstance(messages, list) else 0
+                        durable_context[TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY] = [
+                            index for index in tool_image_native_ack_indexes
+                            if type(index) is int and 0 <= index < replay_count
+                        ]
+                    with turn_context_scope(durable_context):
+                        await _finish_required_cancel_cleanup(
+                            self._append_session_message(
+                                session_key,
+                                **append_kwargs,
+                            )
+                        )
                     execution_context.publish_visible(
                         text=body,
                         generation_epoch=execution_context.generation_epoch,
@@ -11904,7 +11941,9 @@ class TurnRunner:
         user_texts: list[str] = []
         user_contents: list[str] = []
         user_image_flags: list[bool] = []
+        tool_image_flags: list[bool] = []
         unanchored_image_replay = False
+        pending_tool_image = False
         for index, entry in enumerate(entries):
             if getattr(entry, "role", None) == "assistant":
                 # A queued user row can precede the previous turn's completion.
@@ -11915,23 +11954,73 @@ class TurnRunner:
                     from opensquilla.engine.history import (
                         AssistantReplayError,
                         decode_assistant_replay,
+                        restore_tool_image_ack_context,
                     )
-                    from opensquilla.provider.types import ContentBlockImage
+                    from opensquilla.provider.types import (
+                        ContentBlockText,
+                        ContentBlockToolResult,
+                        ContentBlockToolUse,
+                    )
 
                     try:
                         replay_messages = decode_assistant_replay(replay)
+                        turn_context = getattr(entry, "turn_context", None)
+                        restore_tool_image_ack_context(
+                            replay_messages,
+                            turn_context if isinstance(turn_context, dict) else None,
+                        )
                     except AssistantReplayError:
                         replay_messages = []
-                    if any(
-                        isinstance(block, ContentBlockImage)
-                        for message in replay_messages
-                        if isinstance(message.content, list)
-                        for block in message.content
-                    ):
-                        if user_image_flags:
-                            user_image_flags[-1] = True
+                    for replay_message in replay_messages:
+                        blocks = (
+                            replay_message.content
+                            if isinstance(replay_message.content, list)
+                            else []
+                        )
+                        if replay_message.role == "assistant" and (
+                            replay_message._tool_image_native_ack is True
+                            or (
+                                replay_message._tool_image_native_ack is None
+                                and (
+                                    (
+                                        isinstance(replay_message.content, str)
+                                        and bool(replay_message.content.strip())
+                                    )
+                                    or any(
+                                        isinstance(block, ContentBlockToolUse)
+                                        or (
+                                            isinstance(block, ContentBlockText)
+                                            and bool(block.text.strip())
+                                        )
+                                        for block in blocks
+                                    )
+                                )
+                            )
+                        ):
+                            pending_tool_image = False
+                        elif (
+                            replay_message.role == "user"
+                            and any(isinstance(block, ContentBlockToolResult) for block in blocks)
+                            and count_replay_image_blocks([replay_message])
+                        ):
+                            pending_tool_image = True
+                    if count_replay_image_blocks(replay_messages):
+                        if tool_image_flags:
+                            tool_image_flags[-1] = True
                         else:
                             unanchored_image_replay = True
+                elif (
+                    isinstance(getattr(entry, "content", None), str)
+                    and bool(entry.content.strip())
+                ) or bool(getattr(entry, "tool_calls", None)):
+                    from opensquilla.engine.history import TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY
+
+                    turn_context = getattr(entry, "turn_context", None)
+                    if not (
+                        isinstance(turn_context, dict)
+                        and TOOL_IMAGE_NATIVE_ACK_CONTEXT_KEY in turn_context
+                    ):
+                        pending_tool_image = False
             if getattr(entry, "role", None) != "user":
                 continue
             if index in excluded_user_indexes:
@@ -11943,6 +12032,7 @@ class TurnRunner:
                 continue
             user_contents.append(content)
             user_image_flags.append(self._attachment_envelope_has_image(content))
+            tool_image_flags.append(False)
             unpacked = self._maybe_unpack_attachments(content)
             text = unpacked.strip() if isinstance(unpacked, str) else content.strip()
             if len(text) > _ROUTER_HISTORY_USER_MAX_CHARS:
@@ -11953,11 +12043,24 @@ class TurnRunner:
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
+        # A failed post-tool request leaves its final image batch pending even
+        # across later failed user turns. Route the next attempt to vision so
+        # the request-local replay can actually deliver those images.
         image_positions = [index for index, has_image in enumerate(user_image_flags) if has_image]
-        if image_positions or unanchored_image_replay:
+        recent_tool_image = bool(tool_image_flags and tool_image_flags[-1]) or pending_tool_image
+        if (
+            recent_tool_image
+            and tool_image_flags
+            and (len(tool_image_flags) - 1) not in image_positions
+        ):
+            image_positions.append(len(tool_image_flags) - 1)
+        unanchored_recent_tool_image = (
+            unanchored_image_replay or pending_tool_image
+        ) and not user_texts
+        if image_positions or unanchored_recent_tool_image:
             context["history_has_recent_image"] = True
             context["history_image_turn_count"] = (
-                len(image_positions) + int(unanchored_image_replay)
+                len(image_positions) + int(unanchored_recent_tool_image)
             )
         if image_positions:
             turns_since_last_image = len(user_contents) - image_positions[-1] - 1
@@ -14543,6 +14646,7 @@ class TurnRunner:
                 history,
                 history_materializer if retain_history_material else None,
                 attachment_replay_session_id,
+                workspace_dir,
             )
         summary_markers.extend(replay.legacy_summary_markers)
 
@@ -15021,21 +15125,129 @@ class TurnRunner:
         messages: list[Message],
         materializer: AttachmentWorkspaceMaterializer | None,
         session_id: str,
+        workspace_dir: str | Path | None = None,
     ) -> None:
         """Rebind retained tool images to this session without rewriting unchanged replay."""
 
-        from opensquilla.attachment_workspace import _safe_path_segment
+        from opensquilla.attachment_workspace import _safe_filename, _safe_path_segment
         from opensquilla.provider.types import ContentBlockImage, ContentBlockToolResult
 
         current_path_prefix = (
             ".opensquilla", "attachments", _safe_path_segment(session_id, fallback="session"),
         )
+
+        def original_is_readable(path: str, name: str) -> bool:
+            """Accept only an intact immutable image in this session's workspace."""
+            if workspace_dir is None:
+                return False
+            relative = Path(path)
+            parts = relative.parts
+            if (
+                relative.is_absolute()
+                or len(parts) != 4
+                or parts[:3] != current_path_prefix
+                or len(parts[3]) < 14
+                or parts[3][12] != "-"
+                or any(char not in "0123456789abcdef" for char in parts[3][:12])
+                or parts[3][13:] != _safe_filename(name)
+            ):
+                return False
+            original_mime = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".gif": "image/gif", ".webp": "image/webp",
+            }.get(relative.suffix.lower())
+            if original_mime is None:
+                return False
+            root = Path(workspace_dir).expanduser().resolve()
+            source = root.joinpath(*parts)
+            try:
+                if source.parent.resolve(strict=True) != source.parent:
+                    return False
+                before = source.lstat()
+                if not stat.S_ISREG(before.st_mode) or before.st_size > _IMAGE_ATTACHMENT_BYTES:
+                    return False
+                descriptor = os.open(
+                    source,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0),
+                )
+                with os.fdopen(descriptor, "rb") as handle:
+                    opened = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(opened.st_mode) or (
+                        opened.st_dev, opened.st_ino
+                    ) != (before.st_dev, before.st_ino):
+                        return False
+                    payload = handle.read(_IMAGE_ATTACHMENT_BYTES + 1)
+                    after = os.fstat(handle.fileno())
+                if (
+                    len(payload) != before.st_size
+                    or (after.st_size, after.st_mtime_ns) !=
+                    (opened.st_size, opened.st_mtime_ns)
+                    or not hashlib.sha256(payload).hexdigest().startswith(parts[3][:12])
+                ):
+                    return False
+                validate_image_bytes(payload, original_mime)
+                return True
+            except (OSError, ValueError):
+                return False
+
+        def prepared_name(name: str, mime: str) -> str:
+            safe_name = _safe_filename(name)
+            suffix = {
+                "image/png": ".png", "image/jpeg": ".jpg",
+                "image/gif": ".gif", "image/webp": ".webp",
+            }.get(mime)
+            if suffix is None:
+                return safe_name
+            if safe_name.lower().endswith(suffix) or (
+                mime == "image/jpeg" and safe_name.lower().endswith(".jpeg")
+            ):
+                return safe_name
+            return f"{Path(safe_name).stem or 'image'}{suffix}"
+
+        def clear_nested_retention(value: Any) -> tuple[Any, bool]:
+            """Nested tool media has no verified workspace path at this boundary."""
+            if isinstance(value, ContentBlockImage):
+                if value.local_path or value.durable_retained:
+                    return value.model_copy(update={
+                        "local_path": None, "durable_retained": None,
+                    }), True
+                return value, False
+            if isinstance(value, list):
+                changed = False
+                output: list[Any] = []
+                for item in value:
+                    rebound, item_changed = clear_nested_retention(item)
+                    output.append(rebound)
+                    changed = changed or item_changed
+                return (output if changed else value), changed
+            if isinstance(value, dict):
+                if value.get("type") == "image":
+                    if "local_path" not in value and "durable_retained" not in value:
+                        return value, False
+                    mapped_value = dict(value)
+                    mapped_value.pop("local_path", None)
+                    mapped_value.pop("durable_retained", None)
+                    return mapped_value, True
+                if value.get("type") == "tool_result" and "content" in value:
+                    content, changed = clear_nested_retention(value["content"])
+                    if changed:
+                        return {**value, "content": content}, True
+            return value, False
+
         for message in messages:
             if not isinstance(message.content, list):
                 continue
-            paths: dict[tuple[str, str | None], str | None] = {}
+            paths: dict[tuple[str, str | None], tuple[str | None, str | None, bool]] = {}
             blocks = list(message.content)
             for index, block in enumerate(blocks):
+                if isinstance(block, ContentBlockToolResult) and isinstance(
+                    block.content, list
+                ):
+                    nested_content, nested_changed = clear_nested_retention(block.content)
+                    if nested_changed:
+                        blocks[index] = block.model_copy(update={"content": nested_content})
+                    continue
                 if not (
                     isinstance(block, ContentBlockImage)
                     and block.source_type == "base64"
@@ -15044,19 +15256,41 @@ class TurnRunner:
                     and block.name
                 ):
                     continue
+                if original_is_readable(block.local_path, block.name):
+                    continue
+                derivative_name = prepared_name(block.name, block.media_type)
+                try:
+                    source_hash_prefix = Path(block.local_path).name[:12]
+                    original_bytes_copied = (
+                        derivative_name == _safe_filename(block.name)
+                        and len(source_hash_prefix) == 12
+                        and all(char in "0123456789abcdef" for char in source_hash_prefix)
+                        and hashlib.sha256(base64.b64decode(block.data, validate=True))
+                        .hexdigest().startswith(source_hash_prefix)
+                    )
+                except (ValueError, binascii.Error):
+                    original_bytes_copied = False
                 path = (
                     materializer.materialize_image_path(
-                        {"mime": block.media_type, "data": block.data, "name": block.name},
+                        {"mime": block.media_type, "data": block.data,
+                         "name": derivative_name},
                         session_id,
                     ) if materializer is not None else None
                 )
                 if path and path != block.local_path:
-                    paths[(block.local_path, block.source_url)] = path
-                    blocks[index] = block.model_copy(update={"local_path": path})
-                elif not path and Path(block.local_path).parts[:3] != current_path_prefix:
-                    paths[(block.local_path, block.source_url)] = None
-                    blocks[index] = block.model_copy(update={"local_path": None})
+                    paths[(block.local_path, block.source_url)] = (
+                        path, derivative_name, original_bytes_copied,
+                    )
+                    blocks[index] = block.model_copy(update={
+                        "local_path": path, "name": derivative_name,
+                    })
+                elif not path:
+                    paths[(block.local_path, block.source_url)] = (None, None, False)
+                    blocks[index] = block.model_copy(update={
+                        "local_path": None, "durable_retained": None,
+                    })
             if not paths:
+                message.content = blocks
                 continue
             for index, block in enumerate(blocks):
                 if not isinstance(block, ContentBlockToolResult) or not isinstance(
@@ -15077,9 +15311,16 @@ class TurnRunner:
                 identity = (local_path, source_url)
                 if identity not in paths:
                     continue
-                path = paths[identity]
-                if path:
-                    receipt["local_path"] = path
+                rebound_path, rebound_name, original_bytes_copied = paths[identity]
+                if rebound_path and rebound_name:
+                    receipt["local_path"] = rebound_path
+                    receipt["name"] = rebound_name
+                    receipt["retention_note"] = (
+                        "An identical copy of the original image is readable in this session."
+                        if original_bytes_copied else
+                        "The original image is unavailable in this session; this readable "
+                        "file is a prepared derivative used for model input."
+                    )
                 else:
                     receipt.pop("local_path", None)
                     receipt["retention_note"] = (

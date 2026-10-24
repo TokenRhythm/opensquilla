@@ -2636,8 +2636,10 @@ async def test_invalid_response_fallback_skips_text_leg_for_vision_fallback() ->
     ]
 
 
-async def test_local_admission_failure_escalates_to_larger_authorized_leg(
+@pytest.mark.parametrize("wire_rejection", [False, True])
+async def test_local_admission_only_escalates_context_budget_to_larger_leg(
     monkeypatch: Any,
+    wire_rejection: bool,
 ) -> None:
     class _AdmissionProvider:
         provider_name = "openai"
@@ -2650,10 +2652,12 @@ async def test_local_admission_failure_escalates_to_larger_authorized_leg(
         async def chat(self, messages, tools=None, config=None):
             del messages, tools, config
             if not self.fits:
-                yield ErrorEvent(
+                error = ErrorEvent(
                     message='{"reason":"provider_request_budget_exhausted"}',
                     code="provider_request_budget_exhausted",
                 )
+                error._opensquilla_request_not_dispatched = wire_rejection
+                yield error
                 return
             self.network_calls += 1
             yield TextDeltaEvent(text="fallback answer")
@@ -2717,10 +2721,14 @@ async def test_local_admission_failure_escalates_to_larger_authorized_leg(
     ]
 
     assert selector.primary.network_calls == 0
-    assert selector.fallback.network_calls == 1
-    assert any(isinstance(event, TextDeltaEvent) for event in events)
-    assert metadata["executed_model"] == "large-model"
-    assert metadata["router_fallback_reason"] == "local_admission_escalation"
+    if wire_rejection:
+        assert selector.fallback.network_calls == 0
+        assert any(isinstance(event, ErrorEvent) for event in events)
+    else:
+        assert selector.fallback.network_calls == 1
+        assert any(isinstance(event, TextDeltaEvent) for event in events)
+        assert metadata["executed_model"] == "large-model"
+        assert metadata["router_fallback_reason"] == "local_admission_escalation"
 
 
 async def test_local_admission_skips_larger_fallback_with_explicit_tool_denial(

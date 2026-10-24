@@ -69,6 +69,8 @@ const PROVIDER_PRESENTATIONS = new Map<string, ChatErrorPresentation>([
   ['provider_overloaded', presentation('busy')],
   ['auth_invalid', presentation('credentials', 'open-provider-settings')],
   ['context_overflow', presentation('contextLimit', 'choose-model')],
+  ['payload_too_large', presentation('requestTooLarge')],
+  ['wire_payload_too_large', presentation('outboundRequestTooLarge')],
   ['unsupported_feature', presentation('unsupported', 'choose-model')],
   ['insufficient_credits', presentation('credits', 'open-provider-settings')],
   ['usage_limit', presentation('usageLimit')],
@@ -117,6 +119,8 @@ export function chatErrorPresentation(input: ChatErrorPresentationInput): ChatEr
   }
   if (causes.includes('ensemble_multimodal_unsupported')) return presentation('ensembleImageUnsupported', 'choose-model')
   if (causes.includes('image_input_unsupported')) return presentation('imageUnsupported', 'choose-model')
+  if (causes.includes('provider_wire_payload_too_large')) return presentation('outboundRequestTooLarge')
+  if (causes.includes('provider_payload_too_large')) return presentation('requestTooLarge')
   if (causes.some(value => CONTEXT_LIMITS.has(value))) return presentation('contextLimit', 'choose-model')
   if (causes.some(value => ['attachment_capacity_unknown', 'attachment_capacity_unavailable'].includes(value))) {
     return presentation('modelUnavailable', 'open-model-settings')
