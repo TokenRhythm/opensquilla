@@ -7460,8 +7460,12 @@ class Agent:
                                 )
                                 rebound_config = None
                                 if callable(prepare_continuation):
+                                    bounded_admission_messages = await asyncio.to_thread(
+                                        _bound_provider_tool_image_batch,
+                                        request_turn_messages,
+                                    )
                                     rebound_config = prepare_continuation(
-                                        _bound_provider_tool_image_batch(request_turn_messages),
+                                        bounded_admission_messages,
                                         chat_cfg,
                                     )
                                     if inspect.isawaitable(rebound_config):
