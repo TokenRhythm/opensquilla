@@ -2293,7 +2293,11 @@ def _clear_unverified_tool_image_retention(value: Any) -> None:
 
 
 def _has_historical_tool_image(message: Message) -> bool:
-    if not isinstance(message.content, list) or not count_projected_image_blocks([message]):
+    if (
+        not isinstance(message, Message)
+        or not isinstance(message.content, list)
+        or not count_projected_image_blocks([message])
+    ):
         return False
     if any(isinstance(block, ContentBlockToolResult) for block in message.content):
         return True
@@ -7457,7 +7461,8 @@ class Agent:
                                 rebound_config = None
                                 if callable(prepare_continuation):
                                     rebound_config = prepare_continuation(
-                                        request_turn_messages, chat_cfg
+                                        _bound_provider_tool_image_batch(request_turn_messages),
+                                        chat_cfg,
                                     )
                                     if inspect.isawaitable(rebound_config):
                                         rebound_config = await rebound_config

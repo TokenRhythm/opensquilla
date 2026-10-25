@@ -914,6 +914,12 @@ def synthetic_failure_event(kind: ProviderFailureKind) -> ErrorEvent:
         _Kind.PROVIDER_OVERLOADED: ("529", "injected upstream overloaded"),
         _Kind.AUTH_INVALID: ("401", "injected invalid api key"),
         _Kind.CONTEXT_OVERFLOW: ("", "injected context window overflow"),
+        _Kind.PAYLOAD_TOO_LARGE: ("413", "injected request entity too large"),
+        _Kind.WIRE_PAYLOAD_TOO_LARGE: (
+            "provider_request_budget_exhausted",
+            '{"wire_byte_budget_exhausted":true,"fits_wire_byte_budget":false,'
+            '"wire_json_bytes":2,"wire_body_max_bytes":1}',
+        ),
         _Kind.UNSUPPORTED_FEATURE: ("", "injected unsupported feature"),
         _Kind.INSUFFICIENT_CREDITS: ("402", "injected insufficient credits"),
         _Kind.USAGE_LIMIT: ("usage_limit_reached", "injected usage limit reached"),

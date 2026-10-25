@@ -1258,7 +1258,11 @@ async def test_turn_runner_streams_artifact_event_and_persists_history(
         from opensquilla.engine.history import decode_assistant_replay
 
         captured = decode_assistant_replay(assistant.assistant_replay)
-        assert history_capture.history[:-1] == captured
+        # Reload also restores private tool-image acknowledgement state from
+        # turn context; the replay payload carries the public provider messages.
+        assert [message.model_dump() for message in history_capture.history[:-1]] == [
+            message.model_dump() for message in captured
+        ]
         assert history_capture.history[-1].role == "user"
         if native_replay:
             native_assistants = [message for message in captured if message.role == "assistant"]

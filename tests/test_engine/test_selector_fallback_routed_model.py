@@ -52,6 +52,7 @@ from opensquilla.provider.protocol import IMAGE_INPUT_UNSUPPORTED_CODE
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ContentBlockImage,
+    ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
 )
@@ -3329,6 +3330,7 @@ def _image_continuation_runtime(
     automatic: bool = True,
     vision_support: str = "supported",
     target_provider: str = "openrouter",
+    image_context_length: int = 96_000,
 ) -> SimpleNamespace:
     """Exercise real selection and routing with credential-free physical legs."""
 
@@ -3357,7 +3359,7 @@ def _image_continuation_runtime(
         },
         {
             "id": image_model,
-            "context_length": 96_000,
+            "context_length": image_context_length,
             "top_provider": {"max_completion_tokens": 16_000},
             "supported_parameters": ["tools"],
             **({"architecture": {"input_modalities": ["text", "image"]}}
@@ -3730,3 +3732,84 @@ async def test_downloaded_image_runs_through_dispatch_and_main_model_capability(
         assert runtime.metadata["image_input_output_count"] == 0
         assert runtime.metadata["image_input_marker_count"] == 1
     assert context.tool_result_media == {}
+
+
+@pytest.mark.asyncio
+async def test_twelve_tool_frames_use_bounded_capacity_for_vision_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.history import HistoryReplayProjection, project_history_replay_capacity
+
+    runtime = _image_continuation_runtime(monkeypatch, image_context_length=24_000)
+    runtime.primary._streams = [[
+        ToolUseStartEvent(tool_use_id="frames", tool_name="observe"),
+        ToolUseEndEvent(tool_use_id="frames", tool_name="observe", arguments={}),
+        DoneEvent(stop_reason="tool_use"),
+    ]]
+    context = ToolContext(is_owner=True)
+    frames = [
+        b64encode(image_bytes(color=f"#{index:02x}{index:02x}{index:02x}")).decode("ascii")
+        for index in range(12)
+    ]
+
+    async def load_frames(call: Any) -> ToolResult:
+        context.tool_result_media[call.tool_use_id] = [
+            {"mime": "image/png", "data": data, "attachment_id": f"frame-{index}"}
+            for index, data in enumerate(frames)
+        ]
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="Twelve synthetic frames loaded",
+        )
+
+    agent = Agent(
+        provider=runtime.wrapper,
+        config=AgentConfig(
+            model_id="synthetic/text-small",
+            max_iterations=2,
+            max_provider_retries=0,
+            model_vision_support="unsupported",
+            model_capabilities=ModelCapabilities(supports_vision=False, supports_tools=True),
+        ),
+        tool_context=context,
+        tool_handler=load_frames,
+        tool_definitions=[ToolDefinition(
+            name="observe",
+            description="Load synthetic frames.",
+            input_schema=ToolInputSchema(properties={}),
+        )],
+    )
+
+    events = [event async for event in agent.run_turn("Inspect the frames.")]
+
+    assert not [event for event in events if event.kind == "error"], events
+    assert any(event.kind == "done" for event in events)
+    assert len(runtime.primary.calls) == 1
+    assert runtime.wrapper.active_deployment_config().model == runtime.image_model
+    call = runtime.built[-1].calls[0]
+    sent_frames = [
+        block.data
+        for message in call["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ]
+    assert sent_frames == frames[-4:]
+    assert any(
+        "8 images omitted by recency or size limits" in block.text
+        for message in call["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockText)
+    )
+    canonical_history = agent.history_snapshot()
+    assert project_history_replay_capacity(
+        HistoryReplayProjection(messages=tuple(canonical_history)),
+    ).estimated_tokens > 8_000
+    assert sum(
+        isinstance(block, ContentBlockImage)
+        for message in canonical_history
+        if isinstance(message.content, list)
+        for block in message.content
+    ) == 12
