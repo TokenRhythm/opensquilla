@@ -17,8 +17,8 @@
 
 - `desktop/electron/src/tokenrhythm-account.ts` 独立负责 PKCE S256、动态回环回调、随机 state、稳定 installation_id、串行刷新、账号/钱包/Key 状态、退出及待撤销会话。
 - `tokenrhythm-model-proxy.ts` 仅接受受管 Gateway 的临时授权；固定 HTTPS 上游及方法/路径白名单，拒绝浏览器跨源调用、任意目标、查询参数和上游重定向。上游认证头由主进程设置。
-- 账号令牌和模型 Key 仅存于真实 Electron safeStorage 加密的 `account.enc`；临时文件原子替换。存储不可用时拒绝账号登录。显式 `--use-mock-keychain` / `--password-store=basic` 不允许真实账号登录，启动不再自动添加模拟钥匙串开关。
-- 每个 profile、每个官方环境隔离账号目录。正式域名为 `https://tokenrhythm.studio`。macOS 本地测试包通过 `npm run dist:local:test` 内置 `https://gpt.tokenrhythm.studio`，版本为 `0.5.8-test-YYYYMMDD-HHMMSS`，并使用独立测试数据目录；也可显式设置 `OPENSQUILLA_TOKENRHYTHM_ORIGIN=https://…`（无路径、查询、用户名密码）覆盖站点。后端返回的站点链接也需与该源一致。
+- 账号令牌和模型 Key 使用本地 AES-256-GCM 加密，存于 `account.local.enc`，随机密钥存于同目录的 `account.local.key`；目录权限为 `0700`，文件权限为 `0600`（Windows 沿用用户数据目录的访问控制），账号记录临时文件原子替换。它不提供钥匙串对同用户其他进程的隔离，保护依赖本机文件权限。macOS 默认启用 Chromium 模拟钥匙串，启动与 OAuth 不访问真实钥匙串，不弹系统凭据授权框。旧 `account.enc` 保留且不尝试解密，升级后需要重新登录；本地密钥缺失或记录损坏时保留数据并拒绝覆盖。
+- 每个 profile、每个官方环境隔离账号凭据。正式域名为 `https://tokenrhythm.studio`。本地测试包通过 `npm run dist:local:test` 内置 `https://gpt.tokenrhythm.studio`；仅安装包文件名附加 `test-YYYYMMDD-HHMMSS`，应用版本、名称和数据目录与普通包一致，共用对话历史和设置。已有 `-test` 版本的目录选择逻辑也改为共用原目录；旧测试目录不会自动覆盖或合并到原目录。也可显式设置 `OPENSQUILLA_TOKENRHYTHM_ORIGIN=https://…`（无路径、查询、用户名密码）覆盖站点。后端返回的站点链接也需与该源一致。
 - `contracts/desktop/tokenrhythm-account.d.ts` 是 renderer 的展示数据边界，无账号令牌、模型 Key 或本机代理凭证。
 - Gateway 启动环境中的 `OPENSQUILLA_DESKTOP_ACCOUNT_URL/TOKEN` 在加载工具和 dotenv 前移除。`src/opensquilla/desktop_account.py` 在私有进程内获取临时模型凭证，不写入 TOML。
 - 已有配置默认 `credential_source=manual`；新增账号专属连接可保存 `credential_source=account`，但真实账号绑定与 Key 均由加密账号模块持有。删除并存的手动连接保留账号模型/路由，并阻止环境 Key 补位。
@@ -124,7 +124,7 @@ Electron 专项使用模拟上游与加密适配器，需要允许本机回环�
 
 ## 独立 UAT（尚未执行）
 
-macOS 和 Windows 各准备独立 profile、真实系统存储及显式 UAT 站点，确认后端已启用相应 OAuth 客户端及集成接口。不要使用模拟钥匙串测试真实登录。
+macOS 和 Windows 各准备显式隔离的验收 profile 及 UAT 站点，确认后端已启用相应 OAuth 客户端及集成接口。安装包默认与普通版共用数据目录；仅验收脚本显式指定隔离目录。
 
 1. 新安装分别通过密码、短信登录、短信注册及已有网站登录态完成授权；核对取消、重复回调、超时、端口不可用、协议同意和受限账号流程。
 2. 首次登录自动启用；已有有效或无效手动配置不被覆盖。并存来源间切换保留模型与路由，路由/融合均按所选来源计费。
@@ -132,5 +132,5 @@ macOS 和 Windows 各准备独立 profile、真实系统存储及显式 UAT 站�
 4. 断网后显示验证暂停与旧余额时间，不自动重放推理；恢复网络后可验证。覆盖余额不足、限流、钱包失败、Key 禁用/换代。
 5. 退出进行中的账号任务立即中断；离线退出重启后仍未登录，联网后只撤销原会话。换账号不接管旧任务/绑定。
 6. 双设备同账号领取相同 `key_id/generation`，单设备退出不影响另一台设备；不在验收报告中记录 Key 明文。
-7. 检查 renderer、TOML、日志、凭证查看接口和工具子进程环境无长期账号凭证；验证真实 Keychain/DPAPI、存储锁定与重启恢复。
+7. 检查 renderer、TOML、日志、凭证查看接口和工具子进程环境无长期账号凭证；验证无系统钥匙串弹框、本地文件权限、缺失或损坏密钥时拒绝覆盖，以及重启恢复。旧钥匙串凭据应提示重新登录且保留原文件。
 8. 检查浅色/深色、侧栏折叠、键盘焦点、六种语言与桌面更新入口。

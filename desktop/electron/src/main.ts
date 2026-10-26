@@ -4,6 +4,7 @@ import { parse as parseToml } from 'smol-toml'
 import { TokenRhythmAccount, AccountError, hasSavedModelConnection, pauseAccountsForMaintenance, type AccountMaintenancePause } from './tokenrhythm-account.js'
 import { TokenRhythmModelProxy } from './tokenrhythm-model-proxy.js'
 import { resolveAccountOrigin } from './tokenrhythm-environment.js'
+import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from './local-account-secrets.js'
 import type { AccountAction, AccountLink, AccountMediaSource, ModelCredentialSource } from '../../../contracts/desktop/tokenrhythm-account.js'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -135,7 +136,7 @@ import {
   type DesktopCleanupSelection,
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
-import { secretStorageBackendForPolicy } from './secret-storage-policy.js'
+import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
 import { SecretDecryptionCache } from './secret-decryption-cache.js'
 import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
 import {
@@ -622,8 +623,8 @@ interface MacInstallContext {
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-// Keep stable data in its established location. Prerelease binaries receive
-// independent Chromium, credential and Gateway state before any writer starts.
+// Test installers retain the stable app's Chromium, credential and Gateway state.
+// Other prerelease channels select their own state before any writer starts.
 // Changing the update feed never changes this process's active profile.
 const channelUserData = channelUserDataPath(app.getPath('userData'), app.getVersion())
 if (channelUserData !== resolve(app.getPath('userData'))) {
@@ -2523,8 +2524,11 @@ function macCodeSignatureDiagnostic(): string {
 }
 
 function configureChromiumKeychainPolicy(): void {
-  // Account refresh tokens require the real OS credential store even in an
-  // ad-hoc signed development build. Explicit test flags remain detectable.
+  if (shouldUseChromiumMockKeychainForPolicy({
+    envMode: process.env.OPENSQUILLA_DESKTOP_SECRET_STORAGE,
+    platform: process.platform,
+    appPackaged: app.isPackaged,
+  })) app.commandLine.appendSwitch('use-mock-keychain')
 }
 
 function desktopSecretStoragePolicyBackend(): SecretEncryption {
@@ -2577,7 +2581,7 @@ function decryptSecret(encryptedValue: string | undefined, encryption: SecretEnc
   const payload = Buffer.from(encryptedValue, 'base64')
   if (encryption === 'safeStorage') {
     if (desktopSecretStorageBackend() !== 'safeStorage') {
-      throw new Error('Saved desktop credential requires macOS Keychain, but this local build uses plain credential storage.')
+      throw new Error('This credential uses the previous OS storage. Enter the API key again to save it locally.')
     }
     return decryptedSecretCache.resolve(
       activeDesktopProfile().home,
@@ -3511,14 +3515,16 @@ function desktopAccount() {
   if (existing) return existing
   if (updateApplying || isQuitting || desktopCleanupBusy || desktopMigrationBusy) throw new AccountError('ACCOUNT_CLOSING')
   let proxy: TokenRhythmModelProxy
+  const directory = join(profile.home, 'desktop-account', createHash('sha256').update(origin).digest('hex').slice(0, 16))
+  const secrets = new LocalAccountSecrets(directory)
   const account = new TokenRhythmAccount({
-    directory: join(profile.home, 'desktop-account', createHash('sha256').update(origin).digest('hex').slice(0, 16)),
+    directory,
+    storageFile: LOCAL_ACCOUNT_FILE,
+    legacyStorageFile: 'account.enc',
     origin,
-    assertSecureStorage: () => {
-      if (!['darwin', 'win32'].includes(process.platform) || app.commandLine.hasSwitch('use-mock-keychain') || app.commandLine.getSwitchValue('password-store') === 'basic' || !safeStorage.isEncryptionAvailable()) throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE')
-    },
-    encrypt: value => safeStorage.encryptString(value).toString('base64'),
-    decrypt: value => safeStorage.decryptString(Buffer.from(value, 'base64')),
+    assertSecureStorage: () => secrets.assertAvailable(),
+    encrypt: value => secrets.encrypt(value),
+    decrypt: value => secrets.decrypt(value),
     openExternal: url => shell.openExternal(url),
     openAppViaProtocol: app.isPackaged,
     onOpenDesktop: async () => {
@@ -7548,7 +7554,8 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
       + 'OpenSquilla, or use "Reset setup" to start over.'
     )
   }
-  if (!pendingProviderSetup && existing && isConnectionReady(existing)) {
+  const credentialReadable = existing?.encryption !== 'safeStorage' || desktopSecretStoragePolicyBackend() === 'safeStorage'
+  if (!pendingProviderSetup && existing && credentialReadable && isConnectionReady(existing)) {
     // Seed the gateway config from the saved credential only when it does not
     // exist yet. Once it exists the Control UI owns it via RPC, so regenerating
     // it from the credential template here would clobber provider/router/channel

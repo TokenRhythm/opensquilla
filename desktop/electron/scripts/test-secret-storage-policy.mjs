@@ -22,7 +22,7 @@ assert.equal(secretStorageBackendForPolicy({
   platform: 'darwin',
   appPackaged: true,
   codesignDiagnostic: 'Authority=Developer ID Application: OpenSquilla',
-}), 'safeStorage')
+}), 'plain')
 
 assert.equal(secretStorageBackendForPolicy({
   envMode: 'safeStorage',
@@ -64,7 +64,15 @@ assert.equal(shouldUseChromiumMockKeychainForPolicy({
   platform: 'darwin',
   appPackaged: true,
   codesignDiagnostic: 'Authority=Developer ID Application: OpenSquilla',
-}), false)
+}), true)
+
+assert.equal(shouldUseChromiumMockKeychainForPolicy({
+  platform: 'darwin', appPackaged: false,
+}), true, 'development launches must also avoid native Keychain access')
+
+assert.equal(secretStorageBackendForPolicy({
+  platform: 'darwin', appPackaged: false,
+}), 'plain')
 
 assert.equal(shouldUseChromiumMockKeychainForPolicy({
   envMode: undefined,

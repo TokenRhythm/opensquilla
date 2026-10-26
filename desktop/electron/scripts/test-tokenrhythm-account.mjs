@@ -1,11 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { TokenRhythmAccount, pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
 import { TokenRhythmModelProxy, allowedModelRoute } from '../dist/tokenrhythm-model-proxy.js'
+import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
 const scope = 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access'
 const until = async fn => { for(let i=0;i<200;i++){if(fn())return;await new Promise(r=>setTimeout(r,5))}throw Error('condition timeout') }
 async function browserCallback(f, extra = { code: 'browser-once' }) {
@@ -30,10 +31,39 @@ async function fixture(t, options={}) {
   if(path.includes('/managed-key'))return env.keyFailure?Response.json({code:'MANAGED_KEY_DISABLED'},{status:403}):json({account_id:id,app_id:'opensquilla',status:'active',key_id:'key-'+id,generation:1,secret:'model-secret-'+id})
   if(path.endsWith('/session'))return new Response(null,{status:204});throw Error('unhandled route')
  }}
+ if(options.local){const secrets=new LocalAccountSecrets(directory);Object.assign(deps,{storageFile:LOCAL_ACCOUNT_FILE,legacyStorageFile:'account.enc',assertSecureStorage:()=>secrets.assertAvailable(),encrypt:v=>secrets.encrypt(v),decrypt:v=>secrets.decrypt(v)})}
  const account=new TokenRhythmAccount(deps);t.after(async()=>{await account.close();await rm(directory,{recursive:true,force:true})})
  async function login(){await account.login();const url=new URL(opened),callback=new URL(url.searchParams.get('redirect_uri'));callback.search=new URLSearchParams({state:url.searchParams.get('state'),code:'one-use-code'});await fetch(callback);await until(()=>!['authorizing','verifying'].includes(account.snapshot().status));await account.verify();return url}
  return {account,env,calls,login,deps,directory,get opened(){return opened},get refreshes(){return refreshes},setIdentity(v){id=v},advance(ms){now+=ms}}
 }
+test('local file login survives refresh, restart and logout without OS credential storage', async t => {
+ const f=await fixture(t,{local:true});await f.login();await f.account.selectSource('account')
+ assert.ok(!(await readFile(join(f.directory,LOCAL_ACCOUNT_FILE),'utf8')).includes('refresh-a'))
+ f.advance(40_000);await f.account.verify(true);assert.equal(f.refreshes,1)
+ await f.account.close()
+ const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close());await restored.initialize();await restored.verify(true)
+ assert.equal(restored.snapshot().status,'signed_in');assert.equal(restored.snapshot().selectedAccountId,'a')
+ f.env.offline=true;await restored.logout();await restored.close()
+ const loggedOut=new TokenRhythmAccount(f.deps);t.after(()=>loggedOut.close());await loggedOut.initialize()
+ assert.equal(loggedOut.snapshot().status,'signed_out');assert.equal(loggedOut.snapshot().pendingRevocation,true)
+})
+test('legacy OS-encrypted account requests login without decryption or overwriting the old record', async t => {
+ const f=await fixture(t,{local:true});const legacy='synthetic-os-encrypted-record'
+ await writeFile(join(f.directory,'account.enc'),legacy)
+ const decrypt=f.deps.decrypt;let decrypts=0;f.deps.decrypt=v=>{decrypts++;return decrypt(v)}
+ await f.account.initialize();assert.equal(decrypts,0)
+ assert.equal(f.account.snapshot().status,'reauth_required');assert.equal(f.account.snapshot().source,'account')
+ await f.login();assert.equal(f.account.snapshot().status,'signed_in')
+ assert.equal(await readFile(join(f.directory,'account.enc'),'utf8'),legacy)
+ assert.ok(await readFile(join(f.directory,LOCAL_ACCOUNT_FILE),'utf8'))
+})
+test('a missing local key cannot silently reset a saved login or generate a replacement', async t => {
+ const f=await fixture(t,{local:true});await f.login();await f.account.close()
+ await rm(join(f.directory,'account.local.key'))
+ const restored=new TokenRhythmAccount(f.deps);t.after(()=>restored.close());await restored.initialize()
+ assert.equal(restored.snapshot().status,'storage_unavailable');await assert.rejects(()=>restored.login())
+ await assert.rejects(()=>readFile(join(f.directory,'account.local.key')),error=>error.code==='ENOENT')
+})
 test('PKCE/state, display-only boundary, precise decimals, encrypted persistence',async t=>{
  const f=await fixture(t);await f.account.login();const url=new URL(f.opened);assert.equal(url.pathname,'/api/oauth/authorize');assert.equal(url.searchParams.get('code_challenge_method'),'S256');assert.match(url.searchParams.get('installation_id'),/^[a-f0-9-]{36}$/)
  const callback=new URL(url.searchParams.get('redirect_uri'));callback.search='state=wrong&code=bad';assert.equal((await fetch(callback)).status,400);assert.equal(f.account.snapshot().status,'authorizing')

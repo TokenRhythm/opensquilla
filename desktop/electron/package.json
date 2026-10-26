@@ -1,6 +1,6 @@
 {
   "name": "@opensquilla/desktop-electron",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
@@ -35,7 +35,7 @@
     "test:packaged-gateway-reliability-contract": "node --test scripts/test-packaged-gateway-reliability-contract.mjs",
     "test:packaged-single-instance-contract": "node scripts/test-packaged-single-instance-contract.mjs",
     "test:cli-invocation": "npm run build && node scripts/test-cli-invocation.mjs",
-    "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs && node scripts/test-secret-decryption-cache.mjs",
+    "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs && node scripts/test-secret-decryption-cache.mjs && node --test scripts/test-local-account-secrets.mjs",
     "test:tokenrhythm-account": "npm run build && node --test scripts/test-tokenrhythm-account.mjs scripts/test-tokenrhythm-environment.mjs scripts/test-desktop-account-quit.mjs scripts/test-desktop-account-update.mjs scripts/test-desktop-account-cleanup.mjs scripts/test-desktop-account-migration.mjs",
     "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",

@@ -5251,7 +5251,7 @@
     },
     "errors": {
       "generic": "连接验证失败，请刷新账号后重试。",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "系统安全存储不可用，无法登录",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "本地账号存储不可用，无法登录",
       "ACCOUNT_NETWORK_UNAVAILABLE": "暂时无法验证，新的账号调用已暂停",
       "MANAGED_KEY_DISABLED": "账号模型凭证已被停用，请前往网站检查账号状态。",
       "ACCOUNT_LOGIN_TIMEOUT": "等待浏览器授权超时，请重新登录。",

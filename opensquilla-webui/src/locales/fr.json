@@ -5149,7 +5149,7 @@
     },
     "errors": {
       "generic": "Échec de connexion. Actualisez le compte et réessayez.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "Stockage sécurisé du système indisponible",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "Stockage local du compte indisponible",
       "ACCOUNT_NETWORK_UNAVAILABLE": "Vérification impossible ; nouveaux appels suspendus",
       "MANAGED_KEY_DISABLED": "Les identifiants de modèle du compte sont désactivés. Vérifiez votre compte sur le site.",
       "ACCOUNT_LOGIN_TIMEOUT": "Le délai d’autorisation du navigateur a expiré. Reconnectez-vous.",

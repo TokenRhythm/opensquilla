@@ -5252,7 +5252,7 @@
     },
     "errors": {
       "generic": "Connection failed. Refresh your account and retry.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "System secure storage is unavailable",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "Local account storage is unavailable",
       "ACCOUNT_NETWORK_UNAVAILABLE": "Unable to verify; new account calls are paused",
       "MANAGED_KEY_DISABLED": "The account model credential is disabled. Check your account on the website.",
       "ACCOUNT_LOGIN_TIMEOUT": "Browser authorization timed out. Sign in again.",

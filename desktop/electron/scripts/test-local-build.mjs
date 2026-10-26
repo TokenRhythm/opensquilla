@@ -2,11 +2,14 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 
 import {
   createLocalMacBuildConfig, createLocalTestBuildConfig, parseLocalBuildArgs, runLocalBuild,
   withLocalMacBuildEnvironment,
 } from './build-local.mjs'
+
+const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 
 test('local CLI accepts only a packaging target and optional prepared mode', () => {
   assert.deepEqual(parseLocalBuildArgs(['pack']), { mode: 'pack', prepared: false, test: false })
@@ -17,12 +20,15 @@ test('local CLI accepts only a packaging target and optional prepared mode', () 
   }
 })
 
-test('test packages embed UAT, a Shanghai build timestamp and a separate output directory', () => {
+test('test packages keep app identity and version, stamping only the installer filename', () => {
   const config = createLocalTestBuildConfig(new Date('2026-10-26T07:02:03Z'))
   assert.deepEqual(config.extraMetadata, {
-    version: '0.5.8-test-20261026-150203',
+    version: packageVersion,
     opensquillaTokenRhythmOrigin: 'https://gpt.tokenrhythm.studio',
   })
+  assert.equal(config.artifactName, 'OpenSquilla-${version}-test-20261026-150203-${os}-${arch}.${ext}')
+  assert.equal(config.productName, undefined)
+  assert.equal(config.appId, undefined)
   assert.ok(config.directories.output.replaceAll('\\', '/').endsWith('/dist/desktop-electron/test'))
 })
 
@@ -32,7 +38,8 @@ test('test packaging forwards embedded configuration and verifies only its outpu
     platform: 'darwin',
     buildMac: async (mode, config) => {
       assert.equal(mode, 'dist')
-      assert.match(config.extraMetadata.version, /^0\.5\.8-test-\d{8}-\d{6}$/)
+      assert.equal(config.extraMetadata.version, packageVersion)
+      assert.match(config.artifactName, /-test-\d{8}-\d{6}-/)
       assert.equal(config.extraMetadata.opensquillaTokenRhythmOrigin, 'https://gpt.tokenrhythm.studio')
       calls.push('package')
     },
@@ -40,7 +47,7 @@ test('test packaging forwards embedded configuration and verifies only its outpu
       calls.push(script)
       if (script === 'verify:package') {
         assert.ok(env.OPEN_SQUILLA_PACKAGE_OUTPUT.replaceAll('\\', '/').endsWith('/dist/desktop-electron/test'))
-        assert.match(env.OPENSQUILLA_EXPECT_PACKAGE_VERSION, /^0\.5\.8-test-/)
+        assert.equal(env.OPENSQUILLA_EXPECT_PACKAGE_VERSION, packageVersion)
         assert.equal(env.OPENSQUILLA_EXPECT_ACCOUNT_ORIGIN, 'https://gpt.tokenrhythm.studio')
       }
     },
@@ -71,7 +78,8 @@ test('Windows test packages build fresh resources and keep UAT metadata and veri
     buildMac: async () => assert.fail('Windows must not use macOS signing'),
     buildWindowsTest: async (mode, config) => {
       assert.equal(mode, 'dist')
-      assert.match(config.extraMetadata.version, /^0\.5\.8-test-/)
+      assert.equal(config.extraMetadata.version, packageVersion)
+      assert.match(config.artifactName, /-test-\d{8}-\d{6}-/)
       assert.equal(config.extraMetadata.opensquillaTokenRhythmOrigin, 'https://gpt.tokenrhythm.studio')
       calls.push('windows-package')
     },
