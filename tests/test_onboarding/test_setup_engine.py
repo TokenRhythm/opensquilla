@@ -8,9 +8,33 @@ import pytest
 
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config
+from opensquilla.onboarding.router_policy import RouterProviderConflictError
 from opensquilla.onboarding.section_status import SectionStatus
 from opensquilla.onboarding.setup_engine import SetupEngine
 from opensquilla.onboarding.status import get_onboarding_status
+
+
+def test_router_editor_enables_submitted_providers_and_preserves_explicit_opt_out():
+    config = GatewayConfig(llm={"provider": "tokenrhythm", "model": "primary-model"})
+    tiers = {"c3": {"provider": "openrouter", "model": "synthetic/foreign-model"}}
+    engine = SetupEngine(config=config)
+    with pytest.raises(RouterProviderConflictError):
+        engine.apply("router", {
+            "mode": "custom", "tiers": tiers, "crossProviderTiers": False,
+        })
+    assert engine.config.squilla_router.cross_provider_tiers is False
+    result = engine.apply("router", {
+        "mode": "custom", "tiers": tiers, "tierProviderMismatch": "veto",
+    })
+    assert result.config.squilla_router.cross_provider_tiers is True
+    assert result.config.squilla_router.tier_provider_mismatch == "veto"
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1])
+def test_router_editor_rejects_non_boolean_cross_provider_flag(value):
+    engine = SetupEngine(config=GatewayConfig())
+    with pytest.raises(ValueError, match="crossProviderTiers"):
+        engine.apply("router", {"crossProviderTiers": value})
 
 
 def test_setup_engine_applies_provider_and_router_without_persisting_secret(tmp_path):

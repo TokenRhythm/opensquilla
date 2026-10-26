@@ -1771,8 +1771,8 @@ def test_cross_provider_warning_accepts_case_variant_profile_keys(monkeypatch) -
 
 
 def test_upsert_router_surfaces_existing_cross_provider_warning() -> None:
-    # Maintaining an already-executable legacy ladder still reports its
-    # mismatch; newly introducing a foreign dependency requires consent.
+    # An explicit opt-out preserves legacy execution and its mismatch warning.
+    # Ordinary submitted deployments instead select their own providers.
     tiers = {"c2": {"provider": "openai", "model": "gpt-5.5"}}
     cfg = GatewayConfig(llm={"provider": "openrouter"})
     cfg.squilla_router.tiers.update(tiers)
@@ -1780,6 +1780,7 @@ def test_upsert_router_surfaces_existing_cross_provider_warning() -> None:
         cfg,
         mode="recommended",
         tiers=tiers,
+        cross_provider_tiers=False,
     )
     assert any("cross-provider" in w.lower() for w in res.warnings)
 

@@ -789,7 +789,7 @@
       "lifecycle": "stable",
       "name": "onboarding.router.configure",
       "schema": "platform/onboarding-router-configure.schema.json",
-      "schemaSha256": "fc1e17f9043e0ec5d86d8456f4dbee224ac93c80ecfef0f89f2bc8d07900797b"
+      "schemaSha256": "4245ff6e0ff14f92bda59a185a571dd6a4ca5c20d45ebf18d97f67ea32653cee"
     },
     {
       "lifecycle": "stable",
@@ -1455,7 +1455,7 @@
     "generatorSha256": "829c5afc1ad4481e06e232cd30f7746db621efafcc9c29f6dcb01e7eb3b79cad",
     "methodCount": 213,
     "schemaCount": 223,
-    "schemaTreeSha256": "b3a598c652acefcf7ce67b5e706ca87f3b9901c64426e9dea3a79a1a3abdd856",
+    "schemaTreeSha256": "80c689d229c795f27e43c797468cd96a83eba981383b7e5e4bf4d7a4c9d0689c",
     "toolchains": {
       "legacyTypes": {
         "python": {

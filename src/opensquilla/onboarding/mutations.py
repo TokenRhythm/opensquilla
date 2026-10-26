@@ -56,6 +56,7 @@ from opensquilla.onboarding.redaction import (
 )
 from opensquilla.onboarding.router_policy import (
     LlmProfileActivationError,
+    explicitly_selects_cross_provider_tier,
     reconcile_recommended_router,
     validate_router_candidate,
     validate_router_reactivation,
@@ -1176,33 +1177,11 @@ def upsert_router(
             router_payload["tiers"] = merged_tiers
             public_payload["mode"] = "recommended" if follows_managed_preset else "custom"
             public_payload.update({"enabled": True, "tier_profile": None})
-    warnings: list[str] = []
     if router_payload.get("enabled"):
         _validate_router_tiers(
             cast(dict[str, Any], router_payload.get("tiers") or {}),
             default_tier_clean,
         )
-        warnings = _cross_provider_tier_warnings(
-            cast(dict[str, Any], router_payload.get("tiers") or {}),
-            provider,
-            shared_selection_mode=effective_ensemble_selection_mode(config),
-            ensemble_globally_enabled=bool(
-                getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-            ),
-            cross_provider_enabled=bool(router_payload.get("cross_provider_tiers")),
-            tier_provider_mismatch=str(
-                router_payload.get("tier_provider_mismatch") or "route"
-            ),
-            llm_profiles=getattr(config, "llm_profiles", None),
-        )
-        legacy_image_tier = (router_payload.get("tiers") or {}).get("image_model")
-        if isinstance(legacy_image_tier, dict) and legacy_image_tier.get("model"):
-            warnings.append(
-                "The legacy image_model setting is preserved for compatibility "
-                "but is not used for image input. Configure an image-capable "
-                "model in c0-c3; if none can process images, the turn continues "
-                "with an image-not-analyzed marker and keeps the original image."
-            )
 
     new_cfg = _clone(config)
     new_cfg.squilla_router = SquillaRouterConfig(**router_payload)
@@ -1251,12 +1230,39 @@ def upsert_router(
                 new_cfg.mark_force_persist(f"llm_ensemble.{field_name}")
     if shared_tier_enabled:
         _materialize_c3_ensemble_policy_defaults(new_cfg)
-    # Otherwise this is ladder/settings maintenance on an already-enabled
-    # router (the common Web UI tier-table save and CLI default-tier path).
-    # Applying the mode patch here would silently escalate an operator's
+    if (
+        cross_provider_tiers is None
+        and explicitly_selects_cross_provider_tier(new_cfg, tiers)
+    ):
+        # Saving explicit deployments means executing their selected providers.
+        # Preserve an explicit opt-out and keep implicit legacy reactivation
+        # and primary-provider transitions under their existing conflict policy.
+        new_cfg.squilla_router.cross_provider_tiers = True
+    # Ladder/settings maintenance on an already-enabled router preserves its
+    # strategy (the common Web UI tier-table save and CLI default-tier path).
+    # Applying a mode patch here would silently escalate an operator's
     # rollout_phase='observe'/'prompt_only' to live 'full' routing and turn
     # off a running ensemble, so the stored strategy fields are preserved.
     validate_router_reactivation(config, new_cfg)
+    warnings: list[str] = []
+    if new_cfg.squilla_router.enabled:
+        warnings = _cross_provider_tier_warnings(
+            new_cfg.squilla_router.tiers,
+            provider,
+            shared_selection_mode=effective_ensemble_selection_mode(new_cfg),
+            ensemble_globally_enabled=new_cfg.llm_ensemble.enabled,
+            cross_provider_enabled=new_cfg.squilla_router.cross_provider_tiers,
+            tier_provider_mismatch=new_cfg.squilla_router.tier_provider_mismatch,
+            llm_profiles=new_cfg.llm_profiles,
+        )
+        legacy_image_tier = new_cfg.squilla_router.tiers.get("image_model")
+        if isinstance(legacy_image_tier, dict) and legacy_image_tier.get("model"):
+            warnings.append(
+                "The legacy image_model setting is preserved for compatibility "
+                "but is not used for image input. Configure an image-capable "
+                "model in c0-c3; if none can process images, the turn continues "
+                "with an image-not-analyzed marker and keeps the original image."
+            )
     public_payload["default_tier"] = new_cfg.squilla_router.default_tier
     public_payload["tiers"] = redact_router_tiers_payload(new_cfg.squilla_router.tiers)
     public_payload["cross_provider_tiers"] = bool(new_cfg.squilla_router.cross_provider_tiers)
