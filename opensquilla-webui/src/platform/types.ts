@@ -649,6 +649,7 @@ export interface PlatformUpdatesApi {
 }
 
 export interface Platform {
+  account?: import('../../../contracts/desktop/tokenrhythm-account').TokenRhythmAccountApi
   id: PlatformId
   capabilities: PlatformCapabilities
   gateway: PlatformGatewayApi

@@ -260,12 +260,15 @@ def tokenrhythm_transport_fingerprint(
     )
 
 
-def tokenrhythm_public_transport_fingerprint(*, proxy: str) -> str:
+def tokenrhythm_public_transport_fingerprint(*, proxy: str, api_key: str = "") -> str:
     """Return a private refresh identity for the keyless public request."""
 
     proxy_digest = _identity_digest(
         "tokenrhythm-proxy", str(proxy or "").strip()
     )
+    from opensquilla.desktop_account import is_account_credential
+    if is_account_credential(api_key):
+        return _identity_digest("tokenrhythm-account-public-transport", proxy_digest, api_key)
     return _identity_digest("tokenrhythm-public-transport", proxy_digest)
 
 
@@ -1160,7 +1163,8 @@ async def _fetch_tokenrhythm_catalog[CatalogModelT](
     raw_message = ""
     raw_state = ""
     try:
-        async with httpx.AsyncClient(
+        from opensquilla.desktop_account import account_http_client
+        async with account_http_client(api_key,
             timeout=timeout,
             trust_env=_trust_env(),
             proxy=proxy or None,
@@ -1240,16 +1244,19 @@ async def fetch_tokenrhythm_published(
     url: str = TOKENRHYTHM_PUBLIC_CATALOG_URL,
     *,
     proxy: str = "",
+    api_key: str = "",
     timeout: float = 5.0,
 ) -> dict[str, TokenRhythmPublishedModel]:
     """Fetch and normalize the keyless public website catalog."""
 
+    from opensquilla.desktop_account import is_account_credential
+    local_credential = api_key if is_account_credential(api_key) else ""
     headers = provider_app_headers(url)
     try:
         return await _fetch_tokenrhythm_catalog(
             url,
             headers=headers,
-            api_key="",
+            api_key=local_credential,
             proxy=proxy,
             timeout=timeout,
             source="published",

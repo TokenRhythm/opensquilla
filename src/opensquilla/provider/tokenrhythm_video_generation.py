@@ -314,7 +314,9 @@ async def generate_tokenrhythm_video(
     max_bytes: int = _DEFAULT_MAX_BYTES,
     on_job_accepted: VideoJobAcceptedCallback | None = None,
 ) -> VideoGenerationResult:
-    api_root = _api_root(base_url)
+    from opensquilla.desktop_account import OFFICIAL_BASE, is_account_credential
+
+    api_root = _api_root(OFFICIAL_BASE if is_account_credential(api_key) else base_url)
     secret = clean_header_secret(api_key, label="TokenRhythm video API key")
     if not secret:
         raise VideoGenerationError("TokenRhythm video API key is missing")
@@ -332,8 +334,10 @@ async def generate_tokenrhythm_video(
     )
     assert selected_duration is not None
     deadline = time.monotonic() + timeout_seconds
-    async with httpx.AsyncClient(
-        timeout=None, trust_env=trust_env(), follow_redirects=False
+    from opensquilla.desktop_account import account_http_client
+
+    async with account_http_client(
+        secret, timeout=None, trust_env=trust_env(), follow_redirects=False
     ) as client:
         job_id = await _submit(
             client,
@@ -371,7 +375,9 @@ async def resume_tokenrhythm_video(
     poll_interval_seconds: float = 10.0,
     max_bytes: int = _DEFAULT_MAX_BYTES,
 ) -> VideoGenerationResult:
-    api_root = _api_root(base_url)
+    from opensquilla.desktop_account import OFFICIAL_BASE, is_account_credential
+
+    api_root = _api_root(OFFICIAL_BASE if is_account_credential(api_key) else base_url)
     secret = clean_header_secret(api_key, label="TokenRhythm video API key")
     if not secret:
         raise VideoGenerationError("TokenRhythm video API key is missing")
@@ -389,8 +395,10 @@ async def resume_tokenrhythm_video(
         max_bytes=max_bytes,
     )
     deadline = time.monotonic() + timeout_seconds
-    async with httpx.AsyncClient(
-        timeout=None, trust_env=trust_env(), follow_redirects=False
+    from opensquilla.desktop_account import account_http_client
+
+    async with account_http_client(
+        secret, timeout=None, trust_env=trust_env(), follow_redirects=False
     ) as client:
         return await _complete_job(
             client,

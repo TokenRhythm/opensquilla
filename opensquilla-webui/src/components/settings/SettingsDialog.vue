@@ -92,8 +92,9 @@
           >
           <!-- Gateway remains available even when config readiness cannot load,
                because this is where users recover the connection/runtime. -->
+          <SettingsAccountPanel v-if="section === 'account' && isDesktop" />
           <SettingsGatewayPanel
-            v-if="section === 'gateway'"
+            v-else-if="section === 'gateway'"
             :is-desktop="isDesktop"
           />
 
@@ -169,6 +170,8 @@
               @add-provider="requestAddProvider"
               @probe-configured-provider="probeConfiguredProvider"
               @activate-provider="activateProvider"
+              @activate-account="activateAccountProvider"
+              @select-account-provider="requestSelectAccountProvider"
               @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
             <SetupModelStrategyPanel
@@ -267,6 +270,7 @@ import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.v
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
 import SettingsGatewayPanel from '@/components/settings/SettingsGatewayPanel.vue'
 import SettingsGeneralPanel from '@/components/settings/SettingsGeneralPanel.vue'
+import SettingsAccountPanel from '@/components/settings/SettingsAccountPanel.vue'
 import SettingsSecurityPrivacyPanel from '@/components/settings/SettingsSecurityPrivacyPanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
@@ -319,6 +323,7 @@ const {
   discardChanges,
   selectProvider,
   requestSelectConfiguredProvider,
+  requestSelectAccountProvider,
   requestAddProvider,
   cancelProviderEdit,
   setAutoSessionTitles,
@@ -354,6 +359,7 @@ const {
   probeConfiguredProvider,
   cancelConfiguredProviderProbe,
   activateProvider,
+  activateAccountProvider,
   removeProviderProfile,
   updateTierField,
   updateCapabilityField,

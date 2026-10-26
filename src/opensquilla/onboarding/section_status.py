@@ -93,6 +93,10 @@ def llm_section_status(cfg: GatewayConfig) -> SectionStatus:
     missing or undecidable LLM always blocks onboarding.
     """
     llm = cfg.llm
+    from opensquilla.desktop_account import account_credential
+    managed = account_credential(str(getattr(llm, "provider", "")))
+    if managed is not None:
+        return SectionStatus.OK if managed.ready and llm.model else SectionStatus.DEGRADED
     resolution_getter = getattr(cfg, "provider_resolution", None)
     resolution = resolution_getter() if callable(resolution_getter) else {}
     if bool(resolution.get("action_required", False)):

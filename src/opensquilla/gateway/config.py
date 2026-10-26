@@ -554,6 +554,7 @@ class LlmProviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_LLM_")
 
     provider: str = "tokenrhythm"
+    credential_source: Literal["manual", "account"] = "manual"
     model: str = "deepseek-v4-pro-0813"
     api_key: str = ""
     api_key_env: str = ""
@@ -2397,6 +2398,7 @@ class LlmProviderProfile(BaseModel):
     # Remember the provider-scoped direct/fallback model while this deployment
     # is not primary.  Older configs omit it and continue to resolve the
     # provider catalog default; older binaries ignore this additive field.
+    credential_source: Literal["manual", "account"] = "manual"
     model: str = ""
     api_key: str = ""
     api_key_env: str = ""

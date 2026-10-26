@@ -112,7 +112,9 @@
     <!-- Fixed footer: settings and the desktop update entry -->
     <div class="sidebar-foot">
       <SidebarDesktopUpdate @open="openDesktopUpdateSettings" />
+      <SidebarAccountMenu v-if="platform.account" @settings="openSettings" />
       <button
+        v-else
         type="button"
         class="sidebar-fn-item"
         data-icon="settings"
@@ -123,6 +125,8 @@
       </button>
     </div>
   </nav>
+
+  <SidebarAccountMenu v-if="platform.account && !effectiveSidebarOpen" collapsed class="collapsed-account-menu" @settings="openSettings" />
 
   <SidebarResizer
     v-if="effectiveSidebarOpen && isSidebarResizable"
@@ -433,6 +437,7 @@
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/settingsRouteOverlay'
+import SidebarAccountMenu from './components/SidebarAccountMenu.vue'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
@@ -2153,6 +2158,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.collapsed-account-menu { position: fixed; left: 12px; bottom: 12px; z-index: 40; }
 .app-workspace {
   --workspace-header-height: 49px;
   position: relative;

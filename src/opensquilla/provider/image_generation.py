@@ -584,8 +584,10 @@ class TokenRhythmImageGenerationProvider:
         return f"{self._base_url}{path}"
 
     async def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
-        _raise_for_conflicting_official_endpoint(self.provider_id, self._base_url)
         api_key = _api_key_for_request(self, request)
+        from opensquilla.desktop_account import OFFICIAL_BASE, is_account_credential
+        base_url = OFFICIAL_BASE if is_account_credential(api_key) else self._base_url
+        _raise_for_conflicting_official_endpoint(self.provider_id, base_url)
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
 
@@ -600,7 +602,7 @@ class TokenRhythmImageGenerationProvider:
         usage = await reserve_direct_usage_call(
             provider=self.provider_id,
             model=request.model,
-            base_url=self._base_url,
+            base_url=base_url,
         )
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
@@ -608,24 +610,27 @@ class TokenRhythmImageGenerationProvider:
         response: Any = None
         data: Any = None
         try:
-            async with httpx.AsyncClient(
+            from opensquilla.desktop_account import account_http_client
+            async with account_http_client(api_key,
                 timeout=request.timeout_seconds,
                 trust_env=_trust_env(),
                 follow_redirects=False,
             ) as client:
                 response = await client.post(
-                    self._api_url("/v1/images/generations"),
+                    (f"{base_url.rstrip('/')}/images/generations"
+                     if base_url.endswith("/v1")
+                     else f"{base_url.rstrip('/')}/v1/images/generations"),
                     headers={
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
-                        **provider_app_headers(self._base_url),
+                        **provider_app_headers(base_url),
                         **tokenrhythm_install_id_headers(
                             "tokenrhythm",
-                            self._base_url,
+                            base_url,
                         ),
                         **tokenrhythm_correlation_headers(
                             "tokenrhythm",
-                            self._base_url,
+                            base_url,
                             request.provider_request_correlation,
                         ),
                     },

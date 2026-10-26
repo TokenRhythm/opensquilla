@@ -1,3 +1,4 @@
+import { useAccountStore } from '@/stores/account'
 import { inject, provide, ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import i18n from '@/i18n'
 import { MODEL_CAPACITY_KEY, useModelCapacityForm } from './useModelCapacityForm'
@@ -202,6 +203,7 @@ interface SectionDetail {
 }
 
 interface OnboardingStatus {
+  tokenRhythmManual?: { credential?: OnboardingStatus['llmCredentialStatus']; configured?: boolean; ready?: boolean; credentialSource?: string; credentialEnv?: string; reason?: string } | null
   needsOnboarding?: boolean
   hasConfig?: boolean
   llmConfigured?: boolean
@@ -314,6 +316,7 @@ export interface LastProbeStatus {
 }
 
 export interface ConfiguredProviderView {
+  connectionId?: string
   providerId: string
   label: string
   active: boolean
@@ -477,6 +480,8 @@ const setupWorkflow: SetupWorkflow = injectedSetupWorkflow
 const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
 if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
 const providerConfiguration: ProviderConfiguration = injectedProviderConfiguration
+const account = useAccountStore()
+const accountPrimary = computed(() => account.state?.source === 'account' && currentProvider.value === 'tokenrhythm' && account.state.selectedAccountId === account.state.profile?.accountId)
 const modelCapacity = useModelCapacityForm(providerConfiguration)
 provide(MODEL_CAPACITY_KEY, modelCapacity)
 let restoreProviderCapacityDrafts: (() => void) | null = null
@@ -527,6 +532,7 @@ const providerActivation = ref<{
 let providerActivationRequestPending = false
 const providerCredentialRemovalPending = ref(false)
 const providerSelectionKind = ref<'primary' | 'profile' | 'new'>('primary')
+const accountEditing = ref(false)
 // This is an operation intent, not persisted image form state. It is reset for
 // each provider selection and only rendered for the one safe default case:
 // official OpenRouter onboarding while image generation is unconfigured.
@@ -705,7 +711,7 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
   if (!provider) return Promise.resolve()
 
   const selectedProvider = normalizeProviderId(providerForm.selectedProvider.value)
-  if (provider === selectedProvider) {
+  if (provider === selectedProvider && !separateAccountCatalog(provider)) {
     // Keep using the provider form's discovery state for the selected provider
     // so its live catalog feeds both Model Service and Model Routing.
     // A selected stored profile has write-only credentials/endpoint state, so
@@ -782,6 +788,7 @@ async function maybeDiscoverModelsForStrategy(): Promise<void> {
 function maybeDiscoverProviderModels(): Promise<void> {
   if (section.value !== 'provider' || !loaded.value) return Promise.resolve()
   return providerForm.discoverModels({
+    ...editorCredentialCommand(),
     storedProfile: providerSelectionKind.value === 'profile',
   })
 }
@@ -832,7 +839,30 @@ async function loadInitialData() {
 
 onMounted(() => {
   catalogMounted = true
+  void account.init()
   void loadInitialData()
+})
+
+watch([
+  () => account.state?.source,
+  () => account.state?.profile?.accountId,
+  () => account.ready,
+  () => account.state?.selectedAccountId,
+  () => account.state?.mediaSources.image,
+  () => account.state?.mediaSources.video,
+], () => {
+  if (loaded.value && catalogMounted && gatewayAccess.isAvailable && !primaryMutationPending.value) {
+    if (account.ready && account.state?.source === 'account' && !currentProvider.value && !storedProfileIds.value.size) void activateAccountProvider()
+    else void loadData({ preserveProviderDraft: true, preserveDirtySectionDrafts: true })
+  }
+})
+
+// Login can finish while the Gateway is still starting. Complete the empty
+// primary once its configuration has actually loaded, without touching drafts.
+watch([loaded, () => gatewayAccess.isAvailable], () => {
+  if (loaded.value && catalogMounted && gatewayAccess.isAvailable && !primaryMutationPending.value
+    && account.ready && account.state?.source === 'account'
+    && !currentProvider.value && !storedProfileIds.value.size) void activateAccountProvider()
 })
 
 watch(() => gatewayAccess.isAvailable, available => {
@@ -1169,6 +1199,19 @@ const configuredProviders = computed<ConfiguredProviderView[]>(() => {
       lastProbe: lastProbeView(profile.lastProbe),
     })
   }
+  if (account.supported && status.value.tokenRhythmManual) {
+    const manual = status.value.tokenRhythmManual
+    if (!manual.configured) rows.delete('tokenrhythm')
+    else {
+      const previous = rows.get('tokenrhythm')
+      const isActive = active === 'tokenrhythm' && account.state?.source !== 'account'
+      rows.set('tokenrhythm', {
+        providerId: 'tokenrhythm', connectionId: 'tokenrhythm:manual', label: t('account.manualKey'), active: isActive,
+        ready: manual.ready === true, credentialSource: String(manual.credentialSource || 'none'), credentialEnv: String(manual.credentialEnv || ''), endpointSource: previous?.endpointSource || '', reason: String(manual.reason || ''),
+        primaryEligible: !isActive && manual.ready === true, primaryBlockReason: isActive ? 'already_active' : manual.ready ? '' : String(manual.reason || 'credential_missing'), probeModelAvailable: true, lastProbe: previous?.lastProbe || null,
+      })
+    }
+  }
   return Array.from(rows.values()).sort((left, right) => {
     if (left.active !== right.active) return left.active ? -1 : 1
     return left.label.localeCompare(right.label)
@@ -1176,7 +1219,15 @@ const configuredProviders = computed<ConfiguredProviderView[]>(() => {
 })
 
 const configuredProviderIds = computed(() => new Set(
-  configuredProviders.value.map(provider => normalizeProviderId(provider.providerId)),
+  [
+    ...configuredProviders.value.map(provider => normalizeProviderId(provider.providerId)),
+    // Login alone does not create a saved deployment. Account-only connections
+    // enter routing after activation has materialized their primary/profile.
+    ...(account.supported && (
+      (currentProvider.value === 'tokenrhythm' && hasConfiguredPrimaryProvider.value)
+      || storedProfileIds.value.has('tokenrhythm')
+    ) ? ['tokenrhythm'] : []),
+  ],
 ))
 
 const routingProviderOptions = computed(() => {
@@ -1269,6 +1320,7 @@ const selectedProfileStatus = computed(() => configuredProviders.value.find(prov
   normalizeProviderId(provider.providerId) === normalizeProviderId(providerForm.selectedProvider.value)
 )) || null)
 const providerEditorConfig = computed(() => {
+  if (accountEditing.value) return { model: editingPrimaryProvider.value ? config.value.llm?.model || '' : storedProfileConfig('tokenrhythm').model || providerSpec.value?.defaultDirectModel || '' }
   if (editingPrimaryProvider.value) return config.value.llm || {}
   const profile = selectedProfileStatus.value
   const stored = storedProfileConfig(providerForm.selectedProvider.value)
@@ -1301,7 +1353,7 @@ const providerImageGenerationOffer = computed(() => {
     && sameEndpointApiBase(effectiveBaseUrl, spec.defaultBaseUrl),
   )
 })
-const providerFields = computed(() => providerSpec.value?.fields || [])
+const providerFields = computed(() => (providerSpec.value?.fields || []).filter(field => !accountEditing.value || field.name === 'model'))
 const providerCoreFields = computed(() => providerFields.value.filter(f => !isProviderCredentialField(f) && !isProviderAdvancedField(f)))
 const providerAdvancedFields = computed(() => providerFields.value.filter(f => !isProviderCredentialField(f) && isProviderAdvancedField(f)))
 
@@ -1656,7 +1708,7 @@ const providerProbeDisabledReason = computed(() => {
 const providerCredentialPanel = computed<ProviderCredentialPanelState | null>(() => {
   if (!providerSpec.value) return null
   const selectedProviderId = String(providerForm.selectedProvider.value || '').trim().toLowerCase()
-  const primaryCredential = status.value.llmCredentialStatus || {}
+  const primaryCredential = (account.state?.source === 'account' && currentProvider.value === 'tokenrhythm' ? status.value.tokenRhythmManual?.credential : status.value.llmCredentialStatus) || {}
   const savedProviderId = String(primaryCredential.provider || '').trim().toLowerCase()
   const profileCredential = selectedProfileStatus.value
   const savedMatchesSelected = editingPrimaryProvider.value
@@ -1729,7 +1781,7 @@ const providerCredentialPanel = computed<ProviderCredentialPanelState | null>(()
       })
     : (!credentialReady ? t('setup.provider.addKeyToTestHint') : '')
 
-  return {
+  const panel: ProviderCredentialPanelState = {
     providerLabel: providerSpec.value.label || providerForm.selectedProvider.value,
     providerSelected: Boolean(providerForm.selectedProvider.value),
     acceptsApiKey,
@@ -1765,15 +1817,16 @@ const providerCredentialPanel = computed<ProviderCredentialPanelState | null>(()
     // another provider action temporarily locks interactions.
     onHideReveal: () => providerForm.hideRevealedCredential(),
     onReplace: () => {
-      if (!providerInteractionLocked()) providerForm.startCredentialReplace()
+      if (!providerInteractionLocked() && !accountEditing.value) providerForm.startCredentialReplace()
     },
     onCancelReplace: () => {
       if (!providerInteractionLocked()) providerForm.cancelCredentialReplace()
     },
     onRemoveCredential: () => {
-      void removeProviderCredential()
+      if (!accountEditing.value) void removeProviderCredential()
     },
   }
+  return accountEditing.value ? { ...panel, acceptsApiKey: false, requiresApiKey: false, available: account.ready, removable: false, source: 'account', envKey: '', masked: '', revealAllowed: false, revealed: '', apiKeyValue: '', apiKeyEnvValue: '', draftCredentialSource: '', probeReady: account.ready && fieldsReady, reachabilityReady: account.ready, probeDisabledReason: account.ready ? providerProbeDisabledReason.value : t('account.modelUnavailable'), reachabilityDisabledReason: account.ready ? '' : t('account.modelUnavailable'), probeButtonLabel: t('setup.provider.testModel') } : panel
 })
 
 const selectedStoredProfile = computed(() => providerSelectionKind.value === 'profile')
@@ -1957,6 +2010,10 @@ const providerPanel = computed(() => {
   const panel = providerFormPanel.value
   return {
     ...panel,
+    accountSupported: account.supported,
+    accountPrimary: accountPrimary.value,
+    accountEditing: accountEditing.value,
+    accountReady: account.ready,
     busy: providerInteractionLocked(),
     primaryReady: primaryReady.value,
     // Once a primary provider exists, llm.model is owned by Model Routing.
@@ -2061,7 +2118,7 @@ const routerPanel = routerForm.createPanel({
   discoveredModelsByProvider: computed(() => {
     const catalogs: DiscoveredModelsByProvider = { ...tierModelCatalogs.value }
     const provider = normalizeProviderId(providerForm.selectedProvider.value)
-    if (provider) {
+    if (provider && !separateAccountCatalog(provider)) {
       catalogs[provider] = {
         ...providerForm.connection.value,
         models: providerForm.connection.value.models,
@@ -2101,7 +2158,7 @@ const fixedModelCatalog = computed<DiscoveredModelCatalog>(() => {
     modelStrategyForm.fixedProvider.value || currentProvider.value,
   )
   if (!provider) return emptyFixedModelCatalog
-  if (provider === normalizeProviderId(providerForm.selectedProvider.value)) {
+  if (provider === normalizeProviderId(providerForm.selectedProvider.value) && !separateAccountCatalog(provider)) {
     return {
       ...providerForm.connection.value,
       models: providerForm.connection.value.models,
@@ -2574,6 +2631,7 @@ function providerInteractionLocked(): boolean {
 
 function selectProvider(value: string) {
   if (providerInteractionLocked()) return
+  accountEditing.value = false
   providerForm.selectProvider(value)
 }
 
@@ -2589,6 +2647,7 @@ function resetProviderThinkingDraft() {
 }
 
 function applyConfiguredProviderSelection(value: string) {
+  accountEditing.value = false
   resetProviderThinkingDraft()
   const provider = normalizeProviderId(value)
   if (!provider) return
@@ -2607,12 +2666,36 @@ function applyConfiguredProviderSelection(value: string) {
   // Resolve the selected saved deployment without issuing a chat/probe call.
   // initFromConfig/initStoredProfile bumped the form epoch, so a response from
   // the previously selected row cannot overwrite this provider's catalog.
-  void providerForm.discoverModels({ storedProfile: providerSelectionKind.value === 'profile' })
+  void providerForm.discoverModels({ ...manualCredentialCommand(provider), storedProfile: providerSelectionKind.value === 'profile' })
 }
 
 function selectConfiguredProvider(value: string) {
   if (providerInteractionLocked()) return
   applyConfiguredProviderSelection(value)
+}
+
+function applyAccountProviderSelection() {
+  resetProviderThinkingDraft()
+  accountEditing.value = true
+  providerSelectionKind.value = currentProvider.value === 'tokenrhythm' ? 'primary' : 'profile'
+  const model = editingPrimaryProvider.value
+    ? String(config.value.llm?.model || '')
+    : String(storedProfileConfig('tokenrhythm').model || representativeProviderModel('tokenrhythm'))
+  // Hydrate only public model settings. A retained API Key deployment can have
+  // its own endpoint and proxy; none of those fields belongs to this editor.
+  providerForm.initStoredProfile('tokenrhythm', { model })
+  promotedForm.reseedContextWindow(config.value, 'tokenrhythm', model)
+  if (account.ready) void providerForm.discoverModels({ credentialSource: 'account' })
+}
+
+function requestSelectAccountProvider() {
+  if (providerInteractionLocked() || !account.loggedIn) return
+  restoreProviderCapacityDrafts ??= modelCapacity.captureProviderDrafts('tokenrhythm')
+  providerFixedModelDraftSnapshot.value ??= {
+    provider: modelStrategyForm.fixedProvider.value,
+    model: modelStrategyForm.fixedModel.value,
+  }
+  applyAccountProviderSelection()
 }
 
 async function confirmProviderDraftDiscard(): Promise<boolean> {
@@ -2632,7 +2715,7 @@ async function requestSelectConfiguredProvider(value: string) {
       model: modelStrategyForm.fixedModel.value,
     }
   }
-  if (next === normalizeProviderId(providerForm.selectedProvider.value)) {
+  if (!accountEditing.value && next === normalizeProviderId(providerForm.selectedProvider.value)) {
     // Re-clicking the current row is not a navigation. In particular, do not
     // rehydrate from saved config and silently discard the editor's draft.
     return
@@ -2646,12 +2729,14 @@ async function requestAddProvider(value: string) {
   const next = normalizeProviderId(value)
   if (!next || !(await confirmProviderDraftDiscard())) return
   restoreProviderCapacityDrafts ??= modelCapacity.captureProviderDrafts(next)
+  accountEditing.value = false
   providerForm.selectProvider(next)
   onProviderChange()
 }
 
 function cancelProviderEdit() {
   if (providerInteractionLocked()) return
+  const wasAccountEditing = accountEditing.value
   resetProviderThinkingDraft()
   if (restoreProviderCapacityDrafts) restoreProviderCapacityDrafts()
   else modelCapacity.discard(`provider:${normalizeProviderId(providerForm.selectedProvider.value)}`)
@@ -2663,6 +2748,7 @@ function cancelProviderEdit() {
     providerOwnsFixedModelDraft.value = false
   }
   providerFixedModelDraftSnapshot.value = null
+  if (wasAccountEditing) { applyAccountProviderSelection(); return }
   const selected = normalizeProviderId(providerForm.selectedProvider.value)
   if (selected && configuredProviderIds.value.has(selected)) {
     applyConfiguredProviderSelection(selected)
@@ -2904,11 +2990,74 @@ function cancelConfiguredProviderProbe(value: string) {
   configuredProviderProbes.value = next
 }
 
+async function activateAccountProvider() {
+  if (providerInteractionLocked() || !account.ready) return
+  primaryMutationPending.value = true
+  let acknowledged = false
+  let activated = false
+  try {
+    if (currentProvider.value !== 'tokenrhythm') {
+      const command = { providerId: 'tokenrhythm', credentialSource: 'account' as const, imageGenerationIntent: 'preserve' as const }
+      const transition = storedProfileIds.value.has('tokenrhythm')
+        ? await submitPrimaryProviderTransition(command, snapshot => setupWorkflow.profile.activateProfile(snapshot), providerCatalogLabel)
+        : await submitPrimaryProviderTransition({ ...command, model: representativeProviderModel('tokenrhythm') }, snapshot => setupWorkflow.profile.upsertAndActivateProfile(snapshot), providerCatalogLabel)
+      if (!transition) return
+      acknowledged = true
+      acceptPrimaryRouterAction(transition.routerAction)
+    }
+    // Validation uses the current login only within the Gateway operation.
+    // Do not replace a prior account binding until that operation commits.
+    await selectProviderCredentialSource('account')
+    activated = true
+    await loadData({ preserveDirtySectionDrafts: true, throwOnError: true })
+    invalidateReadiness()
+  } catch (error) {
+    if (acknowledged || activated) {
+      pushToast(t(activated ? 'setup.modelStrategy.savedRefreshFailed' : 'setup.provider.primarySavedAdditionalFailed'), { tone: 'warn' })
+    } else await reportPrimaryMutationFailure(error)
+  } finally { primaryMutationPending.value = false }
+}
+
+function separateAccountCatalog(providerId: string): boolean {
+  return account.supported && normalizeProviderId(providerId) === 'tokenrhythm'
+}
+
+function editorCredentialCommand(): { credentialSource?: 'manual' | 'account' } {
+  return accountEditing.value ? { credentialSource: 'account' } : manualCredentialCommand(providerForm.selectedProvider.value)
+}
+
+function manualCredentialCommand(providerId: string): { credentialSource?: 'manual' } {
+  return separateAccountCatalog(providerId) ? { credentialSource: 'manual' } : {}
+}
+
+async function selectManualProviderSource(providerId: string): Promise<void> {
+  if (!separateAccountCatalog(providerId) || account.state?.source === 'manual') return
+  await selectProviderCredentialSource('manual')
+}
+
+async function selectProviderCredentialSource(source: 'manual' | 'account'): Promise<void> {
+  try {
+    await account.selectSource(source)
+  } catch (error) {
+    // A provider mutation may already have committed. Reconcile its identity so an
+    // explicit retry selects the source without replaying that mutation.
+    await loadData({ preserveFormDrafts: true, throwOnError: true }).catch(() => {})
+    throw error
+  }
+}
+
 async function activateProvider(value: string) {
   if (providerInteractionLocked()) return
   const providerId = normalizeProviderId(value)
   const row = configuredProviders.value.find(item => normalizeProviderId(item.providerId) === providerId)
   if (!providerId || !row?.primaryEligible || row.active) return
+  if (providerId === 'tokenrhythm' && currentProvider.value === 'tokenrhythm' && account.supported && account.state?.source === 'account') {
+    primaryMutationPending.value = true
+    try { await account.selectSource('manual'); await loadData({ preserveDirtySectionDrafts: true, throwOnError: true }); invalidateReadiness() }
+    catch (error) { await reportPrimaryMutationFailure(error) }
+    finally { primaryMutationPending.value = false }
+    return
+  }
   providerActivationRequestPending = true
   primaryMutationPending.value = true
   let acknowledged = false
@@ -2925,10 +3074,12 @@ async function activateProvider(value: string) {
     try {
       const transition = await submitPrimaryProviderTransition({
         providerId,
+        ...manualCredentialCommand(providerId),
         imageGenerationIntent: 'preserve',
       }, command => setupWorkflow.profile.activateProfile(command), providerCatalogLabel)
       if (!transition) return
       acknowledged = true
+      await selectManualProviderSource(providerId)
       acceptPrimaryRouterAction(transition.routerAction)
       await loadData({
         preserveDirtySectionDrafts: true,
@@ -3045,7 +3196,7 @@ function updateFixedModel(value: string) {
 }
 
 function updateProviderField(name: string, value: unknown) {
-  if (providerInteractionLocked()) return
+  if (providerInteractionLocked() || (accountEditing.value && name !== 'model')) return
   if (name === 'model' && editingPrimaryProvider.value && hasConfiguredPrimaryProvider.value) {
     if (providerFixedModelDraftSnapshot.value == null) {
       providerFixedModelDraftSnapshot.value = {
@@ -3138,13 +3289,14 @@ async function removeProviderCredential() {
 // form values. Never gates saving. Only the explicit model test needs a model;
 // endpoint reachability can run before the user chooses one.
 async function probeProviderConnection(mode: 'reachability' | 'model' = 'reachability') {
-  if (providerInteractionLocked()) return
+  if (providerInteractionLocked() || (accountEditing.value && !account.ready)) return
   const credentialPanel = providerCredentialPanel.value
   if (!credentialPanel) return
   if (mode === 'reachability' ? !credentialPanel.reachabilityReady : !credentialPanel.probeReady) return
   const storedProfileDraft = selectedStoredProfile.value && providerForm.isDirty.value
   const persistedStoredProfile = selectedStoredProfile.value && !storedProfileDraft
   await providerForm.probeConnection({
+    ...editorCredentialCommand(),
     defaultModel: selectedStoredProfile.value
       ? providerProbeModel.value
       : currentFormModelValue() || providerSpec.value?.defaultModel || '',
@@ -3161,9 +3313,10 @@ async function probeProviderConnection(mode: 'reachability' | 'model' = 'reachab
 }
 
 async function refreshProviderModels() {
-  if (providerInteractionLocked()) return
+  if (providerInteractionLocked() || (accountEditing.value && !account.ready)) return
   const storedProfileDraft = selectedStoredProfile.value && providerForm.isDirty.value
   await providerForm.discoverModels({
+    ...editorCredentialCommand(),
     storedProfile: selectedStoredProfile.value && !storedProfileDraft,
     draftProfile: storedProfileDraft,
     forceRefresh: true,
@@ -3199,7 +3352,8 @@ async function removeProviderProfile(providerId: string) {
   // Defend against stale callers as well as the rendered-list filter. A
   // Router/Ensemble deployment status is not proof that an llm_profile exists,
   // so never show a confirmation or issue a destructive RPC for it.
-  if (!row.active && !storedProfileIds.value.has(provider)) return
+  const accountOwnsPrimary = provider === 'tokenrhythm' && currentProvider.value === provider && account.state?.source === 'account'
+  if (!row.active && !storedProfileIds.value.has(provider) && !accountOwnsPrimary) return
   if (row.active && !primaryProviderRemovalSupported.value) return
   const replacement = row.active
     ? configuredProviders.value.find(item => (
@@ -3230,6 +3384,7 @@ async function removeProviderProfile(providerId: string) {
     primaryLabel: t('setup.provider.removeConfirmPrimary'),
   })
   if (!ok) return
+  let removalAcknowledged = false
   try {
     if (row.active && replacement) {
       // Removing the active profile keeps the existing removal contract. The
@@ -3238,12 +3393,16 @@ async function removeProviderProfile(providerId: string) {
       await setupWorkflow.profile.removeActiveProfile({
         providerId: provider,
         replacementProviderId: replacement.providerId,
+        ...manualCredentialCommand(replacement.providerId),
         ...imageGenerationIntentPayload(replacement.providerId, {
           respectProviderEditorChoice: false,
         }),
       })
+      removalAcknowledged = true
+      await selectManualProviderSource(replacement.providerId)
     } else {
       await setupWorkflow.profile.removeProfile(provider)
+      removalAcknowledged = true
     }
     await loadData({ preserveDirtySectionDrafts: true, throwOnError: true })
     const providerLabel = providerCatalogLabel(provider)
@@ -3274,7 +3433,7 @@ async function removeProviderProfile(providerId: string) {
       ))
     }
   } catch (err) {
-    pushToast(saveFailedMessage(err), { tone: 'danger' })
+    pushToast(removalAcknowledged ? t('setup.provider.primarySavedAdditionalFailed') : saveFailedMessage(err), { tone: removalAcknowledged ? 'warn' : 'danger' })
     // A transport failure can arrive after the gateway committed the atomic
     // mutation but before its response reached this tab. Reconcile the saved
     // provider list without discarding unrelated settings drafts.
@@ -4031,12 +4190,84 @@ function saveProviderAndActivate(): Promise<boolean> {
   return saveProvider({ activate: true })
 }
 
+async function saveAccountProvider(options: SaveOptions): Promise<boolean> {
+  const scope = 'provider:tokenrhythm'
+  if (!account.ready || !modelCapacity.valid(scope)) {
+    pushToast(t(!account.ready ? 'account.modelUnavailable' : 'setup.capacity.invalid'), { tone: 'danger' })
+    return false
+  }
+  const primary = editingPrimaryProvider.value
+  const ownsModel = primary && providerOwnsFixedModelDraft.value
+  const model = currentFormModelValue()
+  const fields = primary ? {
+    ...promotedForm.providerPatches(),
+    ...(thinkingDraftScope.value === 'provider' ? promotedForm.thinkingPatch() ?? {} : {}),
+    ...(ownsModel && modelStrategyForm.fixedModelDirty.value ? { 'llm.model': model } : {}),
+  } : {}
+  const contextPatch = model ? promotedForm.contextWindowPatch('tokenrhythm', model) : null
+  const profileModelChanged = !primary && providerForm.isDirty.value
+  providerSavePending.value = true
+  primaryMutationPending.value = true
+  let wrote = false
+  let restartRequired = false
+  try {
+    // Model policy is shared by provider identity, while credential selection
+    // remains unchanged. Never run a configure/activate credential mutation.
+    if (Object.keys(fields).length) {
+      restartRequired ||= await patchConfig(fields)
+      wrote = true
+      if ('llm.thinking' in fields) promotedForm.acceptLlmThinking(fields['llm.thinking'])
+    }
+    if (profileModelChanged) {
+      const existing = storedProfileIds.value.has('tokenrhythm')
+      const restart = await deepPatchConfig({ llm_profiles: { tokenrhythm: {
+        model,
+        ...(!existing ? { credential_source: 'account' } : {}),
+      } } })
+      restartRequired ||= restart
+      wrote = true
+    }
+    if (contextPatch) {
+      const restart = await deepPatchConfig(contextPatch)
+      restartRequired ||= restart
+      wrote = true
+    }
+    await modelCapacity.save(scope, async patch => {
+      const restart = await deepPatchConfig(patch)
+      restartRequired ||= restart
+      wrote = true
+      return restart
+    })
+    restoreProviderCapacityDrafts = null
+    providerThinkingDraftSnapshot = null
+    if (ownsModel) {
+      providerOwnsFixedModelDraft.value = false
+      providerFixedModelDraftSnapshot.value = null
+    }
+    if (options.reload !== false) {
+      await loadData({ preserveDirtySectionDrafts: true, forceResetModelStrategy: ownsModel, throwOnError: true })
+      applyAccountProviderSelection()
+    }
+    saveToast(options, t(restartRequired ? 'setup.toast.providerSavedRestart' : 'setup.toast.providerSaved'))
+    return true
+  } catch (error) {
+    saveToast(options, wrote
+      ? `${t('setup.capacity.providerPartialSaved')} ${saveFailedMessage(error)}`
+      : saveFailedMessage(error), { tone: wrote ? 'warn' : 'danger' })
+    return false
+  } finally {
+    providerSavePending.value = false
+    primaryMutationPending.value = false
+  }
+}
+
 async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   if (providerInteractionLocked()) return false
   if (!providerForm.selectedProvider.value) {
     pushToast(t('setup.toast.chooseProvider'), { tone: 'danger' })
     return false
   }
+  if (accountEditing.value) return saveAccountProvider(options)
   const capacityScope = `provider:${normalizeProviderId(providerForm.selectedProvider.value)}`
   if (!modelCapacity.valid(capacityScope)) {
     pushToast(t('setup.capacity.invalid'), { tone: 'danger' })
@@ -4195,10 +4426,13 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       if (activateProfile) {
         const transition = await submitPrimaryProviderTransition({
           ...payload,
+          ...manualCredentialCommand(selectedProviderId),
           ...imageGenerationIntentPayload(selectedProviderId),
         }, command => setupWorkflow.profile.upsertAndActivateProfile(command), providerCatalogLabel)
         if (!transition) return false
+        primaryAcknowledged = true
         restartRequired ||= transition.result?.restartRequired === true
+        await selectManualProviderSource(selectedProviderId)
         resolvedRouterAction = transition.routerAction
         replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
         acceptPrimaryRouterAction(resolvedRouterAction)
@@ -4243,6 +4477,9 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     if (!transition) return false
     restartRequired ||= transition.result?.restartRequired === true
     primaryAcknowledged = true
+    // Editing a saved manual connection alongside a healthy account does not
+    // activate it. First-use/recovery and explicit activation do select it.
+    if (options.activate || !primaryReady.value) await selectManualProviderSource(selectedProviderId)
     resolvedRouterAction = transition.routerAction
     replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
     acceptPrimaryRouterAction(resolvedRouterAction)
@@ -4569,9 +4806,13 @@ async function saveModelStrategy(options: SaveOptions & {
       let restart = false
       if (fixedProviderChanged) {
         const providerId = fixedProviderId
+        // Routing chooses a provider, not a new billing source. A retained
+        // manual profile may still be using the explicitly selected account.
+        const manualSource = account.state?.source !== 'account'
         primaryActivationAttempted = true
         const transition = await submitPrimaryProviderTransition({
           providerId, model: fixedModel, imageGenerationIntent: 'preserve',
+          ...(manualSource ? manualCredentialCommand(providerId) : {}),
         }, command => setupWorkflow.profile.activateProfile(command), providerCatalogLabel)
         if (!transition) {
           if (savedAny) await refreshPartialSave(undefined, true)
@@ -4579,6 +4820,9 @@ async function saveModelStrategy(options: SaveOptions & {
           return false
         }
         restart = transition.result?.restartRequired === true
+        fixedSaved = true
+        savedAny = true
+        if (manualSource) await selectManualProviderSource(providerId)
       } else {
         restart = await patchConfig(fixedModelPatches)
       }
@@ -4775,6 +5019,7 @@ async function copyConfigPath() {
     selectProvider,
     selectConfiguredProvider,
     requestSelectConfiguredProvider,
+    requestSelectAccountProvider,
     requestAddProvider,
     cancelProviderEdit,
     setAutoSessionTitles,
@@ -4816,6 +5061,7 @@ async function copyConfigPath() {
     probeConfiguredProvider,
     cancelConfiguredProviderProbe,
     activateProvider,
+    activateAccountProvider,
     removeProviderProfile,
     revealProviderCredential,
     removeProviderCredential,

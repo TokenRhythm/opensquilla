@@ -23,6 +23,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
+from opensquilla.desktop_account import (
+    account_state_for_turn,
+    manual_connection_operation,
+    manual_credential_scope,
+    pin_account_state,
+    reset_account_state,
+)
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.setup_config_runtime import (
@@ -309,10 +316,21 @@ def _profile_probe_port(ctx: RpcContext) -> Any:
     )
 
 
+def _provider_connection_params(params: Any) -> dict[str, Any]:
+    """Account operations accept a model, never caller-supplied credentials."""
+    p = dict(params) if isinstance(params, dict) else {}
+    if p.get("credentialSource") == "account":
+        if str(p.get("providerId", "")).strip().lower() != "tokenrhythm":
+            raise RpcHandlerError("INVALID_REQUEST", "Account source requires TokenRhythm")
+        # Do not let an echoed/manual draft connection bypass managed resolution.
+        p.update(apiKey="", apiKeyEnv="", baseUrl="", proxy="")
+    return p
+
+
 async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_setup import ProbePrimaryProvider
 
-    p = params if isinstance(params, dict) else {}
+    p = _provider_connection_params(params)
     mode, mode_was_explicit = _probe_mode_param(p)
     command = ProbePrimaryProvider(
         provider_id=str(_require(params, "providerId")),
@@ -324,7 +342,38 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
         preserve_api_key=bool(p.get("preserveApiKey", False)),
         mode=mode if mode_was_explicit else None,
     )
-    return cast(dict[str, Any], await _provider_setup(ctx).probe_primary(command))
+    # Probe has historically inspected the saved manual deployment, even when
+    # the desktop account is selected. Only an explicit account request opts in.
+    scope = {**p, "credentialSource": p.get("credentialSource") or "manual"}
+    with _connection_credential_scope(scope):
+        return cast(dict[str, Any], await _provider_setup(ctx).probe_primary(command))
+
+
+@contextmanager
+def _connection_credential_scope(params: Any) -> Iterator[None]:
+    """Validate a connection without changing the desktop's saved binding.
+
+    Refresh once at the operation boundary so preceding desktop IPC changes are
+    visible. Explicit sources apply only to this operation: account activation
+    validates the current login before the UI commits its new account binding.
+    """
+    source = _param(params, "credentialSource", None)
+    if source == "manual":
+        with manual_credential_scope():
+            yield
+        return
+    if source not in {None, "account"}:
+        raise RpcHandlerError("INVALID_REQUEST", "Invalid connection credential source")
+    state = account_state_for_turn()
+    if source == "account":
+        if state is None:
+            raise RpcHandlerError("UNAVAILABLE", "Desktop account is unavailable")
+        state = {**state, "source": "account", "selectedAccountId": state.get("accountId")}
+    token = pin_account_state(state)
+    try:
+        yield
+    finally:
+        reset_account_state(token)
 
 
 async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
@@ -332,7 +381,7 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
         DiscoverPrimaryModels,
     )
 
-    p = params if isinstance(params, dict) else {}
+    p = _provider_connection_params(params)
     command = DiscoverPrimaryModels(
         provider_id=str(_require(params, "providerId")),
         api_key=str(p.get("apiKey", "") or ""),
@@ -342,10 +391,11 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
         force_refresh=_bool_param(params, "forceRefresh"),
         cache_only=_bool_param(params, "cacheOnly"),
     )
-    return cast(
-        dict[str, Any],
-        await _provider_setup(ctx).discover_primary_models(command),
-    )
+    with _connection_credential_scope(params):
+        return cast(
+            dict[str, Any],
+            await _provider_setup(ctx).discover_primary_models(command),
+        )
 
 
 async def _image_generation_models_discover(
@@ -406,10 +456,11 @@ async def _llm_profile_draft_probe(params: Any, ctx: RpcContext) -> dict[str, An
 async def _llm_profile_models_discover(
     params: Any, ctx: RpcContext
 ) -> dict[str, Any]:
-    return cast(
-        dict[str, Any],
-        await _profile_lifecycle(ctx).discover_models(_profile_probe_command(params)),
-    )
+    with _connection_credential_scope(params):
+        return cast(
+            dict[str, Any],
+            await _profile_lifecycle(ctx).discover_models(_profile_probe_command(params)),
+        )
 
 
 async def _llm_profile_draft_models_discover(
@@ -631,22 +682,23 @@ async def _llm_profile_upsert_and_activate(params: Any, ctx: RpcContext) -> dict
         ) from exc
     provider_id = p["providerId"]
     try:
-        result = await _profile_lifecycle(ctx).upsert_and_activate(
-            UpsertAndActivateProfile(
-                provider_id=provider_id,
-                model=p.get("model"),
-                api_key=p.get("apiKey"),
-                api_key_env=p.get("apiKeyEnv"),
-                api_key_env_pool=p.get("apiKeyEnvPool"),
-                keep_current_secret=p.get(
-                    "keepCurrentSecret", p.get("preserveApiKey", False)
+        with _connection_credential_scope(p):
+            result = await _profile_lifecycle(ctx).upsert_and_activate(
+                UpsertAndActivateProfile(
+                    provider_id=provider_id,
+                    model=p.get("model"),
+                    api_key=p.get("apiKey"),
+                    api_key_env=p.get("apiKeyEnv"),
+                    api_key_env_pool=p.get("apiKeyEnvPool"),
+                    keep_current_secret=p.get(
+                        "keepCurrentSecret", p.get("preserveApiKey", False)
+                    ),
+                    base_url=p.get("baseUrl"),
+                    proxy=p.get("proxy"),
+                    router_action=p.get("routerAction", "preserve"),
+                    image_generation_intent=p.get("imageGenerationIntent", "preserve"),
                 ),
-                base_url=p.get("baseUrl"),
-                proxy=p.get("proxy"),
-                router_action=p.get("routerAction", "preserve"),
-                image_generation_intent=p.get("imageGenerationIntent", "preserve"),
             )
-        )
     except LlmProfileActivationError as exc:
         raise RpcHandlerError(
             "ROUTER_PROVIDER_CONFLICT"
@@ -712,15 +764,16 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
         _param(params, "imageGenerationIntent", "preserve")
     )
     try:
-        result = await _profile_lifecycle(ctx).remove_active(
-            RemoveActiveProfile(
-                provider_id=provider_id,
-                replacement_provider_id=replacement_provider_id,
-                replacement_model=replacement_model,
-                router_action=router_action,
-                image_generation_intent=image_generation_intent,
+        with _connection_credential_scope(params):
+            result = await _profile_lifecycle(ctx).remove_active(
+                RemoveActiveProfile(
+                    provider_id=provider_id,
+                    replacement_provider_id=replacement_provider_id,
+                    replacement_model=replacement_model,
+                    router_action=router_action,
+                    image_generation_intent=image_generation_intent,
+                )
             )
-        )
     except LlmProfileActivationError as exc:
         code_by_reason = {
             "primary_pool_unsupported": (
@@ -777,14 +830,15 @@ async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
         "preserve",
     )
     try:
-        result = await _profile_lifecycle(ctx).activate(
-            ActivateProfile(
-                provider_id=provider_id,
-                model=model,
-                router_action=str(router_action),
-                image_generation_intent=str(image_generation_intent),
+        with _connection_credential_scope(params):
+            result = await _profile_lifecycle(ctx).activate(
+                ActivateProfile(
+                    provider_id=provider_id,
+                    model=model,
+                    router_action=str(router_action),
+                    image_generation_intent=str(image_generation_intent),
+                )
             )
-        )
     except LlmProfileActivationError as exc:
         code_by_reason = {
             "primary_pool_unsupported": (
@@ -974,6 +1028,7 @@ async def _usage_accounted_provider_probe(
         return await probe_llm_provider(**probe_kwargs)
 
 
+@manual_connection_operation
 async def _probe_saved_profile(
     command: ProfileProbeCommand,
     *,
@@ -1030,6 +1085,7 @@ async def _probe_saved_profile(
     return result.to_payload()
 
 
+@manual_connection_operation
 async def _probe_draft_profile(
     command: ProfileProbeCommand,
     *,
@@ -1125,6 +1181,7 @@ async def _discover_saved_profile_models(
     return result.to_payload()
 
 
+@manual_connection_operation
 async def _discover_draft_profile_models(
     command: ProfileProbeCommand,
     *,
@@ -1204,7 +1261,20 @@ async def _probe_primary_provider(
         str(provider_id),
         base_url,
     )
-    if same_provider:
+    from opensquilla.desktop_account import OFFICIAL_BASE, account_credential
+
+    managed = account_credential(provider_id)
+    if managed is not None:
+        if not managed.ready:
+            from opensquilla.onboarding.probe import ProviderProbeResult
+
+            return ProviderProbeResult(
+                ok=False, provider_id=provider_id, model=str(command.model or ""),
+                failure_kind="auth_invalid",
+                message="Account model calls are paused; verify the account",
+            ).to_payload()
+        api_key, api_key_env, base_url, proxy = managed.secret, "", OFFICIAL_BASE, ""
+    if same_provider and managed is None:
         if not api_key and not api_key_env and reuse_stored_credentials:
             api_key = str(getattr(cfg.llm, "api_key", "") or "")
             api_key_env = str(getattr(cfg.llm, "api_key_env", "") or "")
@@ -1232,12 +1302,13 @@ async def _probe_primary_provider(
             base_url=base_url,
             proxy=proxy,
             allow_default_api_key_env=(
-                not same_provider or reuse_stored_credentials
+                managed is None and (not same_provider or reuse_stored_credentials)
             ),
             mode=requested_mode,
         )
     if (
-        command.mode is None
+        managed is None
+        and command.mode is None
         and same_provider
         and reuse_stored_credentials
         and not request_overrides
@@ -1340,7 +1411,19 @@ async def _discover_primary_models(
         str(provider_id),
         base_url,
     )
-    if same_provider:
+    from opensquilla.desktop_account import OFFICIAL_BASE, account_credential
+
+    managed = account_credential(provider_id) if not request_overrides else None
+    if managed is not None:
+        if not managed.ready:
+            from opensquilla.onboarding.probe import ProviderModelsDiscoverResult
+
+            return ProviderModelsDiscoverResult(
+                ok=False, provider_id=provider_id, failure_kind="auth_invalid",
+                detail="Account model calls are paused; verify the account",
+            ).to_payload()
+        api_key, api_key_env, base_url, proxy = managed.secret, "", OFFICIAL_BASE, ""
+    if same_provider and managed is None:
         if not api_key and not api_key_env and reuse_stored_credentials:
             api_key = str(getattr(cfg.llm, "api_key", "") or "")
             api_key_env = str(getattr(cfg.llm, "api_key_env", "") or "")
@@ -1356,7 +1439,12 @@ async def _discover_primary_models(
             base_url=base_url,
             proxy=proxy,
             allow_default_api_key_env=(
-                not same_provider or reuse_stored_credentials
+                managed is None
+                and (not same_provider or reuse_stored_credentials)
+                and not (
+                    same_provider
+                    and getattr(cfg.llm, "credential_source", "manual") == "account"
+                )
             ),
             force_refresh=force_refresh,
             cache_only=command.cache_only,

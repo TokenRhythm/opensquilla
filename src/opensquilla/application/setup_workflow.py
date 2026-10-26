@@ -121,6 +121,12 @@ class SetupProfileStatus(TypedDict, total=False):
     lastProbe: dict[str, object]
 
 
+class SetupManualConnectionStatus(SetupProfileStatus, total=False):
+    configured: bool
+    credential: SetupCredentialStatus
+    connectionId: str
+
+
 class SetupSectionDetail(TypedDict, total=False):
     label: str
     status: str
@@ -149,6 +155,7 @@ class SetupStatus(TypedDict):
     llmSource: str
     llmEnvKey: str
     llmCredentialStatus: SetupCredentialStatus
+    tokenRhythmManual: SetupManualConnectionStatus | None
     llmProfileStatus: list[SetupProfileStatus]
     imageGenerationConfigured: bool
     imageGenerationEnabled: bool

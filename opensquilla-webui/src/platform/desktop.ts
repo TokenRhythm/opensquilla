@@ -551,6 +551,14 @@ export function createDesktopPlatform(): Platform {
   const nativeWorkbench = desktopNativeWorkbenchApi(desktopApi)
   return {
     id: 'desktop',
+    account: window.opensquillaDesktop?.getAccountState ? {
+      getState: () => requireDesktopApi().getAccountState!(),
+      action: action => requireDesktopApi().accountAction!(action),
+      selectSource: source => requireDesktopApi().selectAccountSource!(source),
+      selectMediaSource: (kind, source) => requireDesktopApi().selectAccountMediaSource!(kind, source),
+      openLink: link => requireDesktopApi().openAccountLink!(link),
+      onState: callback => requireDesktopApi().onAccountState!(callback),
+    } : undefined,
     capabilities: {
       ...desktopCapabilities,
       hasNativeWorkbenchSurfaces: nativeWorkbench !== undefined,

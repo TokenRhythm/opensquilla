@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
 const webuiRoot = resolve(scriptDirectory, '..')
@@ -14,6 +15,45 @@ export function verifyFontBytes(bytes, font) {
   const sha256 = createHash('sha256').update(bytes).digest('hex')
   if (font.sha256 && sha256 !== font.sha256) throw new Error(`${font.name}: SHA-256 mismatch`)
   return sha256
+}
+
+export async function downloadFontBytes(font, url, {
+  fetchImpl = fetch, attempts = 3, timeoutMs = 600_000,
+  log = console.log, wait = delay,
+} = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    log(`Downloading Office preview font ${font.name} (${(font.bytes / 1024 / 1024).toFixed(1)} MiB), attempt ${attempt}/${attempts}…`)
+    try {
+      const response = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) })
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}`)
+        error.retryable = [408, 429].includes(response.status) || response.status >= 500
+        await response.body?.cancel()
+        throw error
+      }
+      // Reject unexpected response sizes before consuming an unbounded payload.
+      const declaredLength = response.headers.get('content-length')
+      if (declaredLength && Number(declaredLength) !== font.bytes) throw new Error('unexpected Content-Length')
+      const parts = []
+      let length = 0
+      for await (const part of response.body) {
+        length += part.length
+        if (length > font.bytes) throw new Error('download exceeds pinned size')
+        parts.push(part)
+      }
+      const bytes = Buffer.concat(parts)
+      verifyFontBytes(bytes, font)
+      return bytes
+    } catch (error) {
+      const retryable = error.retryable || ['TimeoutError', 'AbortError', 'TypeError'].includes(error.name)
+      const reason = error.name === 'TimeoutError' ? `timed out after ${timeoutMs / 1000}s` : error.message
+      if (!retryable || attempt === attempts) {
+        throw new Error(`Office preview font ${font.name}: ${reason}. URL: ${url}. Check network/proxy access, then run npm run prepare:office-assets to retry.`, { cause: error })
+      }
+      log(`Office preview font ${font.name}: ${reason}; retrying…`)
+      await wait(attempt * 1000)
+    }
+  }
 }
 
 export async function prepareOfficePreviewAssets({ offline = false } = {}) {
@@ -29,20 +69,7 @@ export async function prepareOfficePreviewAssets({ offline = false } = {}) {
     } catch (error) {
       if (offline) throw new Error(`Office preview font cache is missing or invalid: ${font.name}. Run npm run prepare:office-assets once with network access.`, { cause: error })
       const url = `https://raw.githubusercontent.com/notofonts/noto-cjk/${manifest.sourceRevision}/${font.path}`
-      const response = await fetch(url, { signal: AbortSignal.timeout(120_000) })
-      if (!response.ok) throw new Error(`${font.name}: download failed (${response.status})`)
-      // Reject unexpected response sizes before consuming an unbounded payload.
-      const declaredLength = response.headers.get('content-length')
-      if (declaredLength && Number(declaredLength) !== font.bytes) throw new Error(`${font.name}: unexpected Content-Length`)
-      const parts = []
-      let length = 0
-      for await (const part of response.body) {
-        length += part.length
-        if (length > font.bytes) throw new Error(`${font.name}: download exceeds pinned size`)
-        parts.push(part)
-      }
-      bytes = Buffer.concat(parts)
-      verifyFontBytes(bytes, font)
+      bytes = await downloadFontBytes(font, url)
       const temporary = `${destination}.${process.pid}.tmp`
       try {
         await writeFile(temporary, bytes)

@@ -3,7 +3,11 @@
 `npm run prepare:office-assets` prepares the four pinned Noto SC region-subset
 Regular/Bold fonts in `node_modules/.cache/office-preview-fonts`. The first run
 needs access to the immutable upstream URLs; subsequent runs verify the cache
-without network. `node scripts/prepare-office-preview-assets.mjs --offline`
+without network. Downloads report the font and attempt, and retry transient
+network failures up to three times with a 10-minute timeout per attempt.
+Failures include the upstream URL and a preparation command for retrying.
+`npm ci` clears this cache along with `node_modules`.
+`node scripts/prepare-office-preview-assets.mjs --offline`
 fails if anything is missing or corrupted. Normal dev/build commands prepare
 the assets before Vite. Unit-test scripts only verify the cache with `--offline`;
 they never download test dependencies. Run the explicit preparation command as

@@ -347,6 +347,7 @@ class GatewayCredentialResolutionPort(CredentialResolutionPort):
         self._is_owner = is_owner
 
     def reveal_active(self, provider_id: str) -> CredentialRevealResult:
+        from opensquilla.desktop_account import manual_credential_scope
         from opensquilla.gateway.llm_runtime import resolve_llm_credential
         from opensquilla.gateway.rpc import RpcHandlerError
         from opensquilla.onboarding.provider_specs import get_provider_setup_spec
@@ -371,11 +372,12 @@ class GatewayCredentialResolutionPort(CredentialResolutionPort):
                 "onboarding.provider.credential.unsupported_provider",
                 f"Unsupported active provider: {active_provider}",
             ) from exc
-        credential = resolve_llm_credential(
-            self._config,
-            registry_env_key=str(getattr(spec, "env_key", "") or "").strip(),
-            include_runtime_cache=False,
-        )
+        with manual_credential_scope():
+            credential = resolve_llm_credential(
+                self._config,
+                registry_env_key=str(getattr(spec, "env_key", "") or "").strip(),
+                include_runtime_cache=False,
+            )
         if credential.source in {"explicit", "env"} and credential.api_key:
             return CredentialRevealResult(
                 ok=True,
