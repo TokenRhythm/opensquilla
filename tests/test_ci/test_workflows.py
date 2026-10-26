@@ -2960,6 +2960,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     selected_specs = {spec for shard in selector["GENERAL_SHARDS"]
                       for spec in selector["specs_for_suite"](shard)}
     required_specs = {
+        "activity-disclosure-scroll-overflow.spec.ts",
         "assistant-activity.spec.ts",
         "auth-connection-recovery.spec.ts",
         "chat-send-lifecycle.spec.ts",

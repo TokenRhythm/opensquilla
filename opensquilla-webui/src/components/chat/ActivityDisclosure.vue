@@ -424,6 +424,9 @@ const resolvedSummaryLabel = computed(() => {
 }
 
 .assistant-activity__body-inner {
+  /* Keep absolute descendants (including screen-reader text) inside the
+     collapsing clip instead of contributing invisible transcript overflow. */
+  position: relative;
   display: grid;
   min-height: 0;
   min-width: 0;
