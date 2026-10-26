@@ -265,7 +265,7 @@ ignore_missing_imports = true
 
 [dependency-groups]
 desktop-build = ["pyinstaller==6.22.3"]
-wheelhouse-build = ["pip==26.2.1"]
+wheelhouse-build = ["pip==26.2.2"]
 # Frozen sessions.list types are regenerated in a separate, locked environment.
 legacy-contract-codegen = ["datamodel-code-generator==0.81.0"]
 dev = [
