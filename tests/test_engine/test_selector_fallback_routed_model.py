@@ -49,6 +49,7 @@ from opensquilla.provider import (
 from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.protocol import IMAGE_INPUT_UNSUPPORTED_CODE
+from opensquilla.provider.request_proof import local_budget_rejection_event
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ContentBlockImage,
@@ -2653,12 +2654,17 @@ async def test_local_admission_only_escalates_context_budget_to_larger_leg(
         async def chat(self, messages, tools=None, config=None):
             del messages, tools, config
             if not self.fits:
-                error = ErrorEvent(
-                    message='{"reason":"provider_request_budget_exhausted"}',
-                    code="provider_request_budget_exhausted",
+                proof = (
+                    {
+                        "wire_byte_budget_exhausted": True,
+                        "fits_wire_byte_budget": False,
+                        "wire_json_bytes": 101,
+                        "wire_body_max_bytes": 100,
+                    }
+                    if wire_rejection
+                    else {"fits": False, "fits_char_budget": False, "proof_budget": 1}
                 )
-                error._opensquilla_request_not_dispatched = wire_rejection
-                yield error
+                yield local_budget_rejection_event(proof)
                 return
             self.network_calls += 1
             yield TextDeltaEvent(text="fallback answer")

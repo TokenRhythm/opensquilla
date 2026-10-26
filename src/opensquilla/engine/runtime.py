@@ -1658,6 +1658,19 @@ def _should_use_selector_fallback(provider_name: str, event: ProviderErrorEvent)
     }
 
 
+def _is_local_wire_body_rejection(provider_name: str, event: ProviderErrorEvent) -> bool:
+    """Keep the wire-body guard distinct from other unsent budget failures."""
+    return bool(
+        event._opensquilla_request_not_dispatched
+        and classify_provider_error(
+            provider_name=provider_name,
+            status_code=event.http_status,
+            raw_code=event.provider_code or event.code,
+            message=event.message,
+        ) is ProviderFailureKind.WIRE_PAYLOAD_TOO_LARGE
+    )
+
+
 def _report_credential_pool_failure(
     provider_name: str,
     turn_metadata: dict[str, Any] | None,
@@ -4047,6 +4060,12 @@ class _SelectorFallbackProvider:
                         code="incomplete_tool_stream",
                     )
 
+                local_wire_body_rejected = (
+                    isinstance(event, ProviderErrorEvent)
+                    and _is_local_wire_body_rejection(
+                        active_provider_id or self.provider_name, event,
+                    )
+                )
                 local_admission_fallback_index = (
                     self._local_admission_fallback_index(
                         active_config,
@@ -4054,7 +4073,7 @@ class _SelectorFallbackProvider:
                     )
                     if isinstance(event, ProviderErrorEvent)
                     and event.code == "provider_request_budget_exhausted"
-                    and not event._opensquilla_request_not_dispatched
+                    and not local_wire_body_rejected
                     else 0
                 )
                 local_admission_escalation = local_admission_fallback_index > 0
@@ -4067,7 +4086,9 @@ class _SelectorFallbackProvider:
                 )
                 while (
                     isinstance(event, ProviderErrorEvent)
-                    and not event._opensquilla_request_not_dispatched
+                    and not _is_local_wire_body_rejection(
+                        active_provider_id or self.provider_name, event,
+                    )
                     and not precise_image_capability_rejection
                     and (
                         _should_use_selector_fallback(self.provider_name, event)
