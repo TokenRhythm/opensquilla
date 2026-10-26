@@ -30,6 +30,8 @@ interface SavedAccount {
 interface LoginAttempt { state: string; verifier: string; redirect: string; url: string; server: Server; timer: NodeJS.Timeout; epoch: number }
 export interface AccountDependencies {
   directory: string
+  storageFile?: string
+  legacyStorageFile?: string
   origin: string
   assertSecureStorage(): void
   encrypt(value: string): string
@@ -149,7 +151,7 @@ export class TokenRhythmAccount {
     const encrypted = this.deps.encrypt(JSON.stringify(this.saved))
     await this.queueWrite(async () => {
       await mkdir(this.deps.directory, { recursive: true, mode: 0o700 })
-      const target = join(this.deps.directory, 'account.enc')
+      const target = join(this.deps.directory, this.deps.storageFile ?? 'account.enc')
       const temp = `${target}.${randomUUID()}.tmp`
       try {
         await writeFile(temp, encrypted, { mode: 0o600, flag: 'wx' })
@@ -169,7 +171,13 @@ export class TokenRhythmAccount {
   }
   private async restore(): Promise<void> {
     try {
-      const raw = await readFile(join(this.deps.directory, 'account.enc'), 'utf8')
+      const raw = await readFile(join(this.deps.directory, this.deps.storageFile ?? 'account.enc'), 'utf8').catch(async error => {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || !this.deps.legacyStorageFile) throw error
+        // Reading the old OS-encrypted record would trigger native authorization.
+        // Preserve it and let an explicit login establish the new local record.
+        await readFile(join(this.deps.directory, this.deps.legacyStorageFile))
+        throw new AccountError('ACCOUNT_STORAGE_REAUTH_REQUIRED')
+      })
       this.deps.assertSecureStorage()
       const parsed = object(JSON.parse(this.deps.decrypt(raw)))
       if (parsed.version !== 1 || !['manual', 'account'].includes(String(parsed.source)) || !Array.isArray(parsed.pending)) throw new AccountError('ACCOUNT_STORAGE_INVALID')
@@ -192,7 +200,10 @@ export class TokenRhythmAccount {
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
       this.publish({ status: this.saved.tokens ? 'verifying' : 'signed_out' })
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      if (error instanceof AccountError && error.code === 'ACCOUNT_STORAGE_REAUTH_REQUIRED') {
+        this.saved.source = 'account'
+        this.publish({ status: 'reauth_required', errorCode: 'ACCOUNT_LOGIN_REQUIRED' })
+      } else if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         // Never silently replace a record we could not decrypt.
         this.saved.source = 'account'
         this.publish({ status: 'storage_unavailable', errorCode: 'ACCOUNT_STORAGE_UNAVAILABLE' })

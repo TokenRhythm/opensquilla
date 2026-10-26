@@ -1,11 +1,12 @@
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 const scriptPath = fileURLToPath(import.meta.url)
 const packageRoot = resolve(dirname(scriptPath), '..')
+const packageVersion = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')).version
 const testOutputDirectory = resolve(packageRoot, '../../dist/desktop-electron/test')
 
 export function createLocalTestBuildConfig(now = new Date()) {
@@ -17,8 +18,9 @@ export function createLocalTestBuildConfig(now = new Date()) {
   const stamp = `${part('year')}${part('month')}${part('day')}-${part('hour')}${part('minute')}${part('second')}`
   return {
     directories: { output: testOutputDirectory },
+    artifactName: `OpenSquilla-\${version}-test-${stamp}-\${os}-\${arch}.\${ext}`,
     extraMetadata: {
-      version: `0.5.8-test-${stamp}`,
+      version: packageVersion,
       opensquillaTokenRhythmOrigin: 'https://gpt.tokenrhythm.studio',
     },
   }
@@ -148,7 +150,7 @@ export async function runLocalBuild({ mode, prepared, test = false }, {
   await runScript('build')
   await runScript('verify:prepared')
   const overrides = test ? createLocalTestBuildConfig() : {}
-  if (test) console.log(`Local test package: ${overrides.extraMetadata.version}; account/API origin: ${overrides.extraMetadata.opensquillaTokenRhythmOrigin}`)
+  if (test) console.log(`Local test package: ${overrides.artifactName}; app version: ${overrides.extraMetadata.version}; account/API origin: ${overrides.extraMetadata.opensquillaTokenRhythmOrigin}`)
   if (platform === 'win32') await buildWindowsTest(mode, overrides)
   else await buildMac(mode, overrides)
   await runScript('verify:package', test

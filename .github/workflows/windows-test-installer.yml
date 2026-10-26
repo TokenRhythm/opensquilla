@@ -56,7 +56,7 @@ jobs:
         run: |
           python .github/scripts/verify_desktop_slim_size.py --root dist/desktop-electron/test --platform windows
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer exceeds the existing size budget' }
-          $installers = @(Get-ChildItem dist/desktop-electron/test -Filter 'OpenSquilla-0.5.8-test-*-win-x64.exe' -File)
+          $installers = @(Get-ChildItem dist/desktop-electron/test -Filter 'OpenSquilla-*-test-*-win-x64.exe' -File)
           if ($installers.Count -ne 1) { throw 'Expected exactly one Windows UAT test installer' }
           $installer = $installers[0]
           $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -66,7 +66,7 @@ jobs:
         with:
           name: windows-uat-test-installer
           path: |
-            dist/desktop-electron/test/OpenSquilla-0.5.8-test-*-win-x64.exe
+            dist/desktop-electron/test/OpenSquilla-*-test-*-win-x64.exe
             dist/desktop-electron/test/*.sha256
           if-no-files-found: error
           compression-level: 0

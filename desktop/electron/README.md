@@ -130,8 +130,9 @@ the Gateway reports that the model is not configured.
 
 Saving setup validates local fields without requiring a network connection or
 a successful provider test. **Test connection (optional)** reports connectivity
-separately and does not prevent saving or leaving setup. Credentials use Electron
-`safeStorage` when available, and the profile lives under Electron `userData`.
+separately and does not prevent saving or leaving setup. Manual credentials use
+private files on macOS and Electron `safeStorage` on other supported platforms;
+the profile lives under Electron `userData`. OAuth account storage is described below.
 Only TokenRhythm and OpenRouter supply a first-run model preset; other providers
 require an explicit model choice. The local Gateway restarts after setup is saved
 to apply the new configuration.
@@ -198,10 +199,11 @@ an ad-hoc fallback. Local builds never publish artifacts.
 For an internal macOS or Windows UAT installer, run `npm run dist:local:test`. It embeds
 `https://gpt.tokenrhythm.studio` as the account/API origin in the application,
 so OAuth and account model requests use UAT even when launched from Finder.
-The app and installer version is `0.5.8-test-YYYYMMDD-HHMMSS` (Shanghai time).
-Test artifacts are written under `dist/desktop-electron/test/`; test versions
-use a separate `OpenSquilla-test` user data directory. Ordinary packaging keeps
-the source release version and production origin. The explicit runtime
+Only the installer filename adds `test-YYYYMMDD-HHMMSS` (Shanghai time); the app
+retains the source version, name and identity. Test artifacts are written under
+`dist/desktop-electron/test/`. Test and ordinary installers share the existing
+user data directory, including conversation history and preferences. Ordinary
+packaging keeps the production origin. The explicit runtime
 `OPENSQUILLA_TOKENRHYTHM_ORIGIN` override remains available.
 
 After a matching successful Gateway build, use
@@ -216,8 +218,13 @@ Signing passes the dedicated keychain explicitly, temporarily appends it to the
 existing ordered search list, and restores account preferences after success or
 failure. It does not change the default keychain or certificate trust. Retain
 this local identity across rebuilds: replacing it changes the application's
-Keychain identity. Credentials remain encrypted in their existing format; an
-older signing identity may require one native macOS authorization.
+Keychain identity for installations explicitly opting into OS credential storage.
+By default macOS uses private files and Chromium's mock keychain, avoiding native
+credential prompts. OAuth tokens use AES-256-GCM with a random key stored in the
+same private directory; this protects file contents but does not isolate them
+from other processes running as the same user. Legacy OS-encrypted account files
+are retained without decryption and require one browser login to establish the
+new local record. Missing or corrupt local keys never trigger an automatic reset.
 
 The existing `pack`, `dist`, and release signing entries remain available. On
 Windows and Linux, the local entries delegate to those packaging commands.

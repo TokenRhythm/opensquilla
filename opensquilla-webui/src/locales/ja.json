@@ -5149,7 +5149,7 @@
     },
     "errors": {
       "generic": "接続に失敗しました。アカウントを更新して再試行してください。",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "システムの安全なストレージを利用できません",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "ローカルのアカウントストレージを利用できません",
       "ACCOUNT_NETWORK_UNAVAILABLE": "確認できないため、新しい呼び出しを停止しています",
       "MANAGED_KEY_DISABLED": "アカウントのモデル認証情報は無効です。ウェブサイトでアカウントを確認してください。",
       "ACCOUNT_LOGIN_TIMEOUT": "ブラウザーでの認証がタイムアウトしました。再度ログインしてください。",

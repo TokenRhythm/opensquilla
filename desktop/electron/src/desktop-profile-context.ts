@@ -13,10 +13,11 @@ export interface DesktopProfilePaths {
 
 const RECOVERY_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-/** Choose once from the running binary, never from its selected update feed. */
+/** Test installers share the installed app's profile; other prereleases keep their channels. */
 export function channelUserDataPath(userData: string, version: string): string {
   const normalized = version.trim().toLowerCase()
-  if (/^\d+\.\d+\.\d+-test(?:[.-]|$)/.test(normalized)) return `${resolve(userData)}-test`
+  // Keep older timestamped test binaries on the same profile, too.
+  if (/^\d+\.\d+\.\d+-test(?:[.-]|$)/.test(normalized)) return resolve(userData)
   if (/(?:nightly|dev|canary)/.test(normalized)) return `${resolve(userData)}-nightly`
   if (/(?:rc|alpha|beta|preview)/.test(normalized)) return `${resolve(userData)}-preview`
   return resolve(userData)

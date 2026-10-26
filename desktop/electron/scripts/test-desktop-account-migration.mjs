@@ -8,6 +8,7 @@ import test from 'node:test'
 import ts from '@typescript/typescript6'
 import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
 import { AccountError, TokenRhythmAccount, pauseAccountsForMaintenance } from '../dist/tokenrhythm-account.js'
+import { LocalAccountSecrets, LOCAL_ACCOUNT_FILE } from '../dist/local-account-secrets.js'
 
 const source = ts.createSourceFile('main.js', readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
 const functions = new Map(source.statements.filter(ts.isFunctionDeclaration).filter(node => node.name).map(node => [node.name.text, node.getText(source)]))
@@ -32,7 +33,7 @@ function harness(account, { home = '/synthetic-profile', apply = async () => {},
   const window = { loadFile: async () => {}, isDestroyed: () => false, webContents: { send() {} } }
   const env = {
     tokenrhythmAccountOrigin: origin,
-    AccountError, pauseAccountsForMaintenance, createHash, randomUUID, join,
+    AccountError, pauseAccountsForMaintenance, createHash, randomUUID, join, LocalAccountSecrets, LOCAL_ACCOUNT_FILE,
     AbortSignal: { timeout: () => AbortSignal.timeout(timeoutMs) },
     process: { env: {}, platform: 'darwin' },
     TokenRhythmAccount: class extends TokenRhythmAccount { constructor(deps) { super({ ...deps, ...dependencies }) } },
@@ -85,11 +86,13 @@ for (const outcome of ['success', 'failure-before-publication', 'lost-result-aft
       return Response.json({ token_type: 'Bearer', access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600,
         scope: 'profile.read wallet.read managed_key.read managed_key.obtain session.revoke offline_access', account_id: 'a', session_id: 's' })
     } }
-    const account = new TokenRhythmAccount({ directory, origin, ...dependencies, assertSecureStorage() {},
-      encrypt: value => Buffer.from(value).toString('base64'), decrypt: value => Buffer.from(value, 'base64').toString(), openExternal: async () => {} })
+    const secrets = new LocalAccountSecrets(directory)
+    const account = new TokenRhythmAccount({ directory, origin, ...dependencies, storageFile: LOCAL_ACCOUNT_FILE,
+      assertSecureStorage: () => secrets.assertAvailable(),
+      encrypt: value => secrets.encrypt(value), decrypt: value => secrets.decrypt(value), openExternal: async () => {} })
     let published = false
     const h = harness(account, { home, dependencies, receipt: () => published ? { report: {} } : null, apply: async () => {
-      const saved = JSON.parse(Buffer.from(await readFile(join(directory, 'account.enc'), 'utf8'), 'base64').toString())
+      const saved = JSON.parse(secrets.decrypt(await readFile(join(directory, LOCAL_ACCOUNT_FILE), 'utf8')))
       assert.equal(saved.tokens.refreshToken, 'new-refresh')
       assert.equal(h.env.desktopAccounts.size, 0)
       assert.throws(() => h.accountGetter(), /ACCOUNT_CLOSING/, 'cannot recreate an account during publication')
@@ -127,7 +130,8 @@ for (const outcome of ['success', 'failure-before-publication', 'lost-result-aft
     if (published) {
       assert.equal(replacement.snapshot().status, 'signed_out')
       assert.equal(replacement.snapshot().source, 'manual')
-      assert.equal(await exists(join(directory, 'account.enc')), false)
+      assert.equal(await exists(join(directory, LOCAL_ACCOUNT_FILE)), false)
+      assert.equal(await exists(join(directory, 'account.local.key')), false)
     } else {
       assert.equal(replacement.saved.tokens.refreshToken, 'new-refresh')
     }

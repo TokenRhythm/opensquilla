@@ -5149,7 +5149,7 @@
     },
     "errors": {
       "generic": "Verbindung fehlgeschlagen. Konto aktualisieren und erneut versuchen.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "Sicherer Systemspeicher nicht verfügbar",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "Lokaler Kontospeicher nicht verfügbar",
       "ACCOUNT_NETWORK_UNAVAILABLE": "Überprüfung nicht möglich; neue Kontoaufrufe pausiert",
       "MANAGED_KEY_DISABLED": "Der Modellzugang des Kontos ist deaktiviert. Prüfen Sie Ihr Konto auf der Website.",
       "ACCOUNT_LOGIN_TIMEOUT": "Die Browserautorisierung ist abgelaufen. Melden Sie sich erneut an.",

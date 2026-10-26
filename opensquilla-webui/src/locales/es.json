@@ -5149,7 +5149,7 @@
     },
     "errors": {
       "generic": "Error de conexión. Actualiza la cuenta y reintenta.",
-      "ACCOUNT_STORAGE_UNAVAILABLE": "Almacenamiento seguro del sistema no disponible",
+      "ACCOUNT_STORAGE_UNAVAILABLE": "Almacenamiento local de la cuenta no disponible",
       "ACCOUNT_NETWORK_UNAVAILABLE": "No se puede verificar; nuevas llamadas pausadas",
       "MANAGED_KEY_DISABLED": "La credencial del modelo de la cuenta está desactivada. Revisa tu cuenta en el sitio web.",
       "ACCOUNT_LOGIN_TIMEOUT": "La autorización del navegador ha caducado. Inicia sesión de nuevo.",
