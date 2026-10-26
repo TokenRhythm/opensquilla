@@ -18,6 +18,7 @@ import structlog
 import typer
 from pydantic import ValidationError
 
+from opensquilla.cli.config_errors import exit_config_load_error
 from opensquilla.cli.gateway_lifecycle import (
     DESKTOP_CONFIG_OUTSIDE_PROFILE,
     GatewayLifecycleManager,
@@ -227,7 +228,7 @@ def _load_gateway_config(
         return GatewayConfig.load(config_path, read_only=read_only)
     except ValidationError as exc:
         if not has_gateway_port_error(exc):
-            raise
+            exit_config_load_error(exc, config_path)
         _invalid_gateway_port(action=action, json_output=json_output)
     except ConfigParseError as exc:
         console.print(f"[red]Invalid gateway config:[/red] {exc}")

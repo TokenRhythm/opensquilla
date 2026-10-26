@@ -15,6 +15,7 @@ from opensquilla.cli.channel_fields import (
     apply_channel_token,
     parse_channel_field_pairs,
 )
+from opensquilla.cli.config_errors import load_config_or_exit
 from opensquilla.cli.gateway_rpc import confirm_or_exit, run_gateway_sync
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import ACCENT_HEADER, ACCENT_MARKUP
@@ -24,7 +25,6 @@ from opensquilla.onboarding.channel_specs import (
     list_channel_setup_specs,
 )
 from opensquilla.onboarding.config_store import (
-    load_config,
     persist_config,
     resolve_config_path,
 )
@@ -155,7 +155,7 @@ def channels_list(
         if json_output
         else _resolve_and_announce(config_path)
     )
-    cfg = load_config(target)
+    cfg = load_config_or_exit(target)
     entries = list_channel_entries(cfg)
     if json_output:
         print_json(entries)
@@ -261,7 +261,7 @@ def channels_add(
     apply_channel_token(payload, type_name, token)
     payload.update(parse_channel_field_pairs(fields, type_name))
 
-    cfg = load_config(target)
+    cfg = load_config_or_exit(target)
     try:
         result = upsert_channel(cfg, entry_payload=payload)
     except (ValueError, KeyError) as exc:
@@ -282,7 +282,7 @@ def channels_remove(
     config_path: Path | None = typer.Option(None, "--config"),
 ) -> None:
     target = _resolve_and_announce(config_path)
-    cfg = load_config(target)
+    cfg = load_config_or_exit(target)
     try:
         result = remove_channel(cfg, name=name)
     except KeyError as exc:
@@ -299,7 +299,7 @@ def channels_enable(
     config_path: Path | None = typer.Option(None, "--config"),
 ) -> None:
     target = _resolve_and_announce(config_path)
-    cfg = load_config(target)
+    cfg = load_config_or_exit(target)
     try:
         result = set_channel_enabled(cfg, name=name, enabled=True)
     except KeyError as exc:
@@ -316,7 +316,7 @@ def channels_disable(
     config_path: Path | None = typer.Option(None, "--config"),
 ) -> None:
     target = _resolve_and_announce(config_path)
-    cfg = load_config(target)
+    cfg = load_config_or_exit(target)
     try:
         result = set_channel_enabled(cfg, name=name, enabled=False)
     except KeyError as exc:
@@ -340,7 +340,7 @@ def channels_edit(
 ) -> None:
     """Edit an existing channel; blank fields keep current values."""
     target = _resolve_and_announce(config_path)
-    cfg = load_config(target)
+    cfg = load_config_or_exit(target)
     existing = next(
         (
             e.model_dump(mode="python")
