@@ -43,6 +43,7 @@ const env = {
   quitGatewayDrainPromise: null,
   holdQuitForTaskConfirmation: () => false,
   desktopUpdateCheckScheduler: { stop() {} },
+  desktopAccounts: new Map(),
   desktopWriters: { activeCount: 0, close: () => Symbol('quit') },
   quitDeferredForDesktopWriters: false,
   quitWriterAdmission: null,

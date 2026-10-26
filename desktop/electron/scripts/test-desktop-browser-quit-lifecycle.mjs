@@ -93,6 +93,7 @@ function quitHarness(platform = process.platform, { tabCount = 1, activeCount = 
     quitOwnedGateway: () => stopChild(false),
     drainOwnedGatewayForLegacyQuit: () => stopChild(true),
     showDesktopQuitFailure: () => assert.fail('Synthetic Gateway must exit cleanly'),
+    desktopAccounts: new Map(),
     ownedGatewayRecord: () => ({ pid: 1234 }),
     readVerifiedDesktopGatewayActivity: async () => {
       calls.activity += 1

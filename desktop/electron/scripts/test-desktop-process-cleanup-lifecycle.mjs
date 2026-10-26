@@ -466,6 +466,7 @@ await withBudget(async budget => {
     DesktopQuitBudget, process: { platform: 'darwin' },
     systemSessionEnding: false, updateApplying: false, quitGatewayDrainPromise: null,
     holdQuitForTaskConfirmation: () => false, desktopUpdateCheckScheduler: { stop() {} },
+    desktopAccounts: new Map(),
     desktopWriters: { activeCount: 0, close: () => Symbol('quit') },
     quitDeferredForDesktopWriters: false, quitWriterAdmission: null,
     desktopLog() {}, isQuitting: false, cancelGatewayUnexpectedExitRestart() {},

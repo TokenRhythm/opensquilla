@@ -245,6 +245,7 @@ function mainExitHarness() {
       quit: () => { calls.resumedQuits += 1 },
     },
     desktopUpdateCheckScheduler: { stop() {} },
+    desktopAccounts: new Map(),
     systemSessionEnding: false, updateApplying: false, updateInstallHandoffReady: false,
     quitRequestedDuringUpdateDrain: false, quitGatewayDrainPromise: null,
     quitDeferredForDesktopWriters: false, quitWriterAdmission: null,

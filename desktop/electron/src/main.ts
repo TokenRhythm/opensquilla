@@ -1,6 +1,9 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, screen, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { parse as parseToml } from 'smol-toml'
+import { TokenRhythmAccount, AccountError, hasSavedModelConnection, pauseAccountsForMaintenance, type AccountMaintenancePause } from './tokenrhythm-account.js'
+import { TokenRhythmModelProxy } from './tokenrhythm-model-proxy.js'
+import type { AccountAction, AccountLink, AccountMediaSource, ModelCredentialSource } from '../../../contracts/desktop/tokenrhythm-account.js'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
@@ -130,7 +133,7 @@ import {
   type DesktopCleanupSelection,
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
-import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
+import { secretStorageBackendForPolicy } from './secret-storage-policy.js'
 import { SecretDecryptionCache } from './secret-decryption-cache.js'
 import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
 import {
@@ -943,6 +946,7 @@ let recoveryOperationBusy = false
 let recoveryOperationError: string | null = null
 const desktopCleanupPreviews = new DesktopCleanupPreviewStore()
 let desktopCleanupBusy = false
+let desktopMigrationBusy = false
 // Keep the post-exit delete-all helper and its open stdin pipe strongly
 // reachable until Electron exits. The pipe is unref'ed (so it cannot delay
 // exit) but must not be garbage-collected and closed while Chromium still owns
@@ -2512,14 +2516,8 @@ function macCodeSignatureDiagnostic(): string {
 }
 
 function configureChromiumKeychainPolicy(): void {
-  if (shouldUseChromiumMockKeychainForPolicy({
-    envMode: process.env.OPENSQUILLA_DESKTOP_SECRET_STORAGE,
-    platform: process.platform,
-    appPackaged: app.isPackaged,
-    codesignDiagnostic: macCodeSignatureDiagnostic(),
-  })) {
-    app.commandLine.appendSwitch('use-mock-keychain')
-  }
+  // Account refresh tokens require the real OS credential store even in an
+  // ad-hoc signed development build. Explicit test flags remain detectable.
 }
 
 function desktopSecretStoragePolicyBackend(): SecretEncryption {
@@ -3497,6 +3495,91 @@ async function loadDesktopSettings(): Promise<DesktopSettingsSnapshot> {
   return settingsSnapshot(await loadDesktopCredential())
 }
 
+const desktopAccounts = new Map<string, { account: TokenRhythmAccount; proxy: TokenRhythmModelProxy }>()
+function desktopAccount() {
+  const profile = activeDesktopProfile()
+  const origin = process.env.OPENSQUILLA_TOKENRHYTHM_ORIGIN || 'https://tokenrhythm.studio'
+  const identity = `${profile.home}\0${origin}`
+  const existing = desktopAccounts.get(identity)
+  if (existing) return existing
+  if (updateApplying || isQuitting || desktopCleanupBusy || desktopMigrationBusy) throw new AccountError('ACCOUNT_CLOSING')
+  let proxy: TokenRhythmModelProxy
+  const account = new TokenRhythmAccount({
+    directory: join(profile.home, 'desktop-account', createHash('sha256').update(origin).digest('hex').slice(0, 16)),
+    origin,
+    assertSecureStorage: () => {
+      if (!['darwin', 'win32'].includes(process.platform) || app.commandLine.hasSwitch('use-mock-keychain') || app.commandLine.getSwitchValue('password-store') === 'basic' || !safeStorage.isEncryptionAvailable()) throw new AccountError('ACCOUNT_STORAGE_UNAVAILABLE')
+    },
+    encrypt: value => safeStorage.encryptString(value).toString('base64'),
+    decrypt: value => safeStorage.decryptString(Buffer.from(value, 'base64')),
+    openExternal: url => shell.openExternal(url),
+    openAppViaProtocol: app.isPackaged,
+    onOpenDesktop: async () => {
+      if (activeDesktopProfile().home !== profile.home) throw new AccountError('ACCOUNT_CLOSING')
+      await activateMainWindow('tokenrhythm-login')
+    },
+    onState: state => {
+      if (activeDesktopProfile().home !== profile.home) return
+      for (const window of [currentMainWindow(), onboardingWindow]) {
+        if (window && !window.isDestroyed()) window.webContents.send('desktop:account:state', state)
+      }
+    },
+    onInvalidate: () => proxy?.invalidate(),
+    onSignedIn: async () => {
+      const raw = await readOptionalDesktopText(join(profile.home, 'config.toml'))
+      const config = raw ? parseToml(raw) : {}
+      const envConfig = await readOptionalDesktopText(join(profile.home, '.env'))
+      const hasModels = hasSavedModelConnection(config)
+        || Boolean(await readOptionalDesktopText(profile.credentialPath))
+        || Boolean(envConfig && /^\s*(?:export\s+)?[A-Z_]*(?:API_KEY|API_KEY_ENV)\s*=\s*[^\s#]/m.test(envConfig))
+      if (!hasModels && !account.snapshot().selectedAccountId) await account.selectSource('account')
+    },
+  })
+  proxy = new TokenRhythmModelProxy(account)
+  const entry = { account, proxy }
+  desktopAccounts.set(identity, entry)
+  return entry
+}
+
+function requireAccountSender(event: Electron.IpcMainInvokeEvent): void {
+  if (!trustedMainWindowControlIpc(event) && !trustedOnboardingIpc(event)) throw new AccountError('ACCOUNT_IPC_FORBIDDEN')
+  if (updateApplying || isQuitting || desktopCleanupBusy || desktopMigrationBusy) throw new AccountError('ACCOUNT_CLOSING')
+}
+
+ipcMain.handle('desktop:account:get', async event => {
+  requireAccountSender(event)
+  const { account } = desktopAccount()
+  await account.initialize()
+  return account.snapshot()
+})
+ipcMain.handle('desktop:account:action', async (event, action: AccountAction) => {
+  requireAccountSender(event)
+  const { account } = desktopAccount()
+  await account.initialize()
+  switch (action) {
+    case 'login': return account.login()
+    case 'cancel': return account.cancel()
+    case 'reopen': return account.reopen()
+    case 'refresh': await account.verify(true); return account.snapshot()
+    case 'test': return account.testModel()
+    case 'retry-key': return account.retryKey()
+    case 'logout': return account.logout()
+    default: throw new AccountError('INVALID_ACCOUNT_ACTION')
+  }
+})
+ipcMain.handle('desktop:account:source', async (event, source: ModelCredentialSource) => {
+  requireAccountSender(event)
+  return desktopAccount().account.selectSource(source)
+})
+ipcMain.handle('desktop:account:media-source', async (event, kind: 'image' | 'video', source: AccountMediaSource) => {
+  requireAccountSender(event)
+  return desktopAccount().account.selectMediaSource(kind, source)
+})
+ipcMain.handle('desktop:account:link', async (event, link: AccountLink) => {
+  requireAccountSender(event)
+  return desktopAccount().account.openLink(link)
+})
+
 async function saveDesktopSettings(payload: DesktopSettingsPayload): Promise<DesktopSettingsSnapshot> {
   cancelGatewayUnexpectedExitRestart('desktop settings save started')
   const connection = await saveDesktopCredential(payload)
@@ -3856,6 +3939,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'quit.terminating': 'Terminating unresponsive processes…',
     'quit.failed': 'Quit failed: the local Gateway has not stopped safely',
     'quit.failedDetail': 'OpenSquilla has stopped accepting desktop operations. Try Quit again to retry stopping its local processes.',
+    'quit.accountFailed': 'Quit paused: account data is still being saved',
+    'quit.accountFailedDetail': 'OpenSquilla kept running to preserve your sign-in. Wait a moment, then try Quit again.',
     'quit.manualRecovery': 'Quit failed: process cleanup needs manual recovery',
     'quit.manualRecoveryDetail': 'The Gateway has exited, but OpenSquilla could not confirm that all task processes stopped. Retrying cannot safely identify those processes. Save your work in other apps, then sign out of Windows or restart Windows before reopening OpenSquilla.',
     'tray.backgroundTitle': 'OpenSquilla is still running',
@@ -3890,6 +3975,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.writersBusy': 'OpenSquilla is still saving changes. Let it finish, then try installing again.',
     'update.moveToApplications': 'Move OpenSquilla to your Applications folder to enable automatic updates, then try again.',
     'update.gatewayShutdownTimeout': 'OpenSquilla could not stop the local runtime. Try relaunching to update again.',
+    'update.accountSaveFailed': 'Account data is still being saved. Wait a moment, then try installing the update again.',
     'update.mockInstallTitle': 'Mock update restart',
     'update.mockInstallDetail': 'Mock mode: OpenSquilla would restart now to install {version}. No files were changed.',
     'uninstall.confirmTitle': 'Delete local OpenSquilla desktop data?',
@@ -3954,6 +4040,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.badge': 'Required',
     'onboarding.step2.heading': 'Model service setup',
     'onboarding.step2.subtitle': "Connect a model service, or finish later in Settings.",
+    "onboarding.account.login": "Sign in to TokenRhythm",
+    "onboarding.account.reopen": "Reopen browser",
+    "onboarding.account.continueAccount": "Continue with this account",
+    "onboarding.account.retry": "Retry",
+    "onboarding.account.signed_out": "Signed out",
+    "onboarding.account.authorizing": "Waiting for browser authorization…",
+    "onboarding.account.verifying": "Verifying account…",
+    "onboarding.account.signed_in": "Signed in to TokenRhythm",
+    "onboarding.account.unverified": "Unable to verify; new account calls are paused",
+    "onboarding.account.reauth_required": "Session expired. Sign in again.",
+    "onboarding.account.storage_unavailable": "System secure storage is unavailable",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
     'onboarding.step2.tokenrhythmCta': 'Limited-time offer',
@@ -4012,6 +4109,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'quit.terminating': '正在终止未响应的进程…',
     'quit.failed': '退出失败：本地 Gateway 尚未安全停止',
     'quit.failedDetail': 'OpenSquilla 已停止接收桌面操作。请再次点击退出，重试停止它的本地进程。',
+    'quit.accountFailed': '退出已暂停：账号数据尚未保存完成',
+    'quit.accountFailedDetail': 'OpenSquilla 已保持运行以保留登录状态。请稍候，再次点击退出。',
     'quit.manualRecovery': '退出失败：需要手动完成进程清理',
     'quit.manualRecoveryDetail': 'Gateway 已退出，但无法确认所有任务进程均已停止。再次退出也无法安全识别这些进程。请先保存其他应用中的工作，然后注销 Windows 或重启 Windows，再打开 OpenSquilla。',
     'tray.backgroundTitle': 'OpenSquilla 仍在运行',
@@ -4046,6 +4145,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.writersBusy': 'OpenSquilla 仍在保存更改，请等待完成后再次安装。',
     'update.moveToApplications': '请先将 OpenSquilla 移动到"应用程序"文件夹以启用自动更新，然后重试。',
     'update.gatewayShutdownTimeout': 'OpenSquilla 无法停止本地运行时。请再次尝试重启以更新。',
+    'update.accountSaveFailed': '账号数据尚未保存完成。请稍候，再尝试安装更新。',
     'update.mockInstallTitle': '模拟重启更新',
     'update.mockInstallDetail': '模拟模式：OpenSquilla 现在会重启并安装 {version}。没有修改任何文件。',
     'uninstall.confirmTitle': '删除本地 OpenSquilla 桌面数据？',
@@ -4110,6 +4210,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.badge': '必填',
     'onboarding.step2.heading': '模型服务配置',
     'onboarding.step2.subtitle': "连接模型服务，或稍后在设置中完成。",
+    "onboarding.account.login": "登录 TokenRhythm",
+    "onboarding.account.reopen": "重新打开浏览器",
+    "onboarding.account.continueAccount": "使用登录账号进入应用",
+    "onboarding.account.retry": "重试",
+    "onboarding.account.signed_out": "未登录",
+    "onboarding.account.authorizing": "等待浏览器授权…",
+    "onboarding.account.verifying": "正在验证账号…",
+    "onboarding.account.signed_in": "已登录 TokenRhythm",
+    "onboarding.account.unverified": "暂时无法验证，新的账号调用已暂停",
+    "onboarding.account.reauth_required": "会话已失效，请重新登录",
+    "onboarding.account.storage_unavailable": "系统安全存储不可用，无法登录",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
     'onboarding.step2.tokenrhythmCta': '限时福利',
@@ -4191,6 +4302,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.writersBusy': '変更を保存中です。完了後にインストールを再試行してください。',
     'update.moveToApplications': '自動アップデートを有効にするには、OpenSquilla を「アプリケーション」フォルダに移動してから再試行してください。',
     'update.gatewayShutdownTimeout': 'ローカルランタイムを停止できませんでした。もう一度、再起動してアップデートをお試しください。',
+    'update.accountSaveFailed': 'アカウントデータを保存中です。しばらく待ってから、アップデートのインストールを再試行してください。',
     'uninstall.confirmTitle': 'ローカルの OpenSquilla デスクトップデータを削除しますか？',
     'uninstall.confirmMessage': 'このマシン上のローカルデスクトッププロファイルを完全に削除します。',
     'uninstall.confirmDetail': 'セッション、設定、シークレットが削除されます。インストール済みのアプリ自体は残ります。アプリを閉じた後、OS から削除してください。',
@@ -4250,6 +4362,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.badge': '必須',
     'onboarding.step2.heading': 'モデルサービス設定',
     'onboarding.step2.subtitle': "モデルサービスに接続するか、後で設定できます。",
+    "onboarding.account.login": "TokenRhythm にログイン",
+    "onboarding.account.reopen": "ブラウザーを再度開く",
+    "onboarding.account.continueAccount": "このアカウントで続ける",
+    "onboarding.account.retry": "再試行",
+    "onboarding.account.signed_out": "未ログイン",
+    "onboarding.account.authorizing": "ブラウザーでの認証を待っています…",
+    "onboarding.account.verifying": "アカウントを確認中…",
+    "onboarding.account.signed_in": "TokenRhythm にログイン済み",
+    "onboarding.account.unverified": "確認できないため、新しい呼び出しを停止しています",
+    "onboarding.account.reauth_required": "セッションが無効です。再度ログインしてください。",
+    "onboarding.account.storage_unavailable": "システムの安全なストレージを利用できません",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
     'onboarding.step2.tokenrhythmCta': '期間限定特典',
@@ -4333,6 +4456,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.writersBusy': 'OpenSquilla enregistre encore les modifications. Réessayez après leur enregistrement.',
     'update.moveToApplications': 'Déplacez OpenSquilla dans votre dossier Applications pour activer les mises à jour automatiques, puis réessayez.',
     'update.gatewayShutdownTimeout': 'OpenSquilla n\'a pas pu arrêter le runtime local. Réessayez de relancer la mise à jour.',
+    'update.accountSaveFailed': 'Les données du compte sont en cours de sauvegarde. Patientez un instant, puis réessayez d’installer la mise à jour.',
     'uninstall.confirmTitle': 'Supprimer les données locales du bureau OpenSquilla ?',
     'uninstall.confirmMessage': 'Cela supprime définitivement le profil de bureau local sur cette machine.',
     'uninstall.confirmDetail': 'Les sessions, la configuration et les secrets seront supprimés. L’application installée elle-même sera conservée ; supprimez-la via votre système d’exploitation après la fermeture de l’application.',
@@ -4392,6 +4516,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.badge': 'Requis',
     'onboarding.step2.heading': 'Configuration du service de modèles',
     'onboarding.step2.subtitle': "Connectez un service de modèles ou configurez-le plus tard.",
+    "onboarding.account.login": "Se connecter à TokenRhythm",
+    "onboarding.account.reopen": "Rouvrir le navigateur",
+    "onboarding.account.continueAccount": "Continuer avec ce compte",
+    "onboarding.account.retry": "Réessayer",
+    "onboarding.account.signed_out": "Déconnecté",
+    "onboarding.account.authorizing": "En attente d’autorisation dans le navigateur…",
+    "onboarding.account.verifying": "Vérification du compte…",
+    "onboarding.account.signed_in": "Connecté à TokenRhythm",
+    "onboarding.account.unverified": "Vérification impossible ; nouveaux appels suspendus",
+    "onboarding.account.reauth_required": "Session expirée. Reconnectez-vous.",
+    "onboarding.account.storage_unavailable": "Stockage sécurisé du système indisponible",
     'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
     'onboarding.step2.tokenrhythmCta': 'Offre limitée',
@@ -4475,6 +4610,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.writersBusy': 'OpenSquilla speichert noch Änderungen. Versuchen Sie die Installation danach erneut.',
     'update.moveToApplications': 'Verschieben Sie OpenSquilla in Ihren Programme-Ordner, um automatische Updates zu aktivieren, und versuchen Sie es erneut.',
     'update.gatewayShutdownTimeout': 'OpenSquilla konnte die lokale Laufzeitumgebung nicht stoppen. Versuchen Sie erneut, zum Aktualisieren neu zu starten.',
+    'update.accountSaveFailed': 'Die Kontodaten werden noch gespeichert. Warten Sie einen Moment und versuchen Sie dann erneut, das Update zu installieren.',
     'uninstall.confirmTitle': 'Lokale OpenSquilla-Desktop-Daten löschen?',
     'uninstall.confirmMessage': 'Dies löscht das lokale Desktop-Profil auf diesem Gerät dauerhaft.',
     'uninstall.confirmDetail': 'Sitzungen, Konfiguration und Secrets werden entfernt. Die installierte App selbst bleibt erhalten; entfernen Sie sie nach dem Schließen der App über Ihr Betriebssystem.',
@@ -4534,6 +4670,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.badge': 'Erforderlich',
     'onboarding.step2.heading': 'Modellservice konfigurieren',
     'onboarding.step2.subtitle': "Verbinde einen Modelldienst oder richte ihn später ein.",
+    "onboarding.account.login": "Bei TokenRhythm anmelden",
+    "onboarding.account.reopen": "Browser erneut öffnen",
+    "onboarding.account.continueAccount": "Mit diesem Konto fortfahren",
+    "onboarding.account.retry": "Erneut versuchen",
+    "onboarding.account.signed_out": "Abgemeldet",
+    "onboarding.account.authorizing": "Warten auf Browser-Autorisierung…",
+    "onboarding.account.verifying": "Konto wird überprüft…",
+    "onboarding.account.signed_in": "Bei TokenRhythm angemeldet",
+    "onboarding.account.unverified": "Überprüfung nicht möglich; neue Kontoaufrufe pausiert",
+    "onboarding.account.reauth_required": "Sitzung abgelaufen. Erneut anmelden.",
+    "onboarding.account.storage_unavailable": "Sicherer Systemspeicher nicht verfügbar",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
     'onboarding.step2.tokenrhythmCta': 'Zeitlich begrenztes Angebot',
@@ -4617,6 +4764,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.writersBusy': 'OpenSquilla sigue guardando los cambios. Espera a que termine e intenta instalar de nuevo.',
     'update.moveToApplications': 'Mueve OpenSquilla a tu carpeta de Aplicaciones para habilitar las actualizaciones automáticas e inténtalo de nuevo.',
     'update.gatewayShutdownTimeout': 'OpenSquilla no pudo detener el runtime local. Intenta reiniciar para actualizar de nuevo.',
+    'update.accountSaveFailed': 'Los datos de la cuenta aún se están guardando. Espera un momento y vuelve a intentar instalar la actualización.',
     'uninstall.confirmTitle': '¿Eliminar los datos locales de escritorio de OpenSquilla?',
     'uninstall.confirmMessage': 'Esto elimina permanentemente el perfil de escritorio local en esta máquina.',
     'uninstall.confirmDetail': 'Se eliminarán las sesiones, la configuración y los secretos. La aplicación instalada en sí permanecerá; elimínala a través de tu sistema operativo después de cerrar la aplicación.',
@@ -4676,6 +4824,17 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.badge': 'Obligatorio',
     'onboarding.step2.heading': 'Configuración del servicio de modelos',
     'onboarding.step2.subtitle': "Conecta un servicio de modelos o configúralo más tarde.",
+    "onboarding.account.login": "Iniciar sesión en TokenRhythm",
+    "onboarding.account.reopen": "Volver a abrir el navegador",
+    "onboarding.account.continueAccount": "Continuar con esta cuenta",
+    "onboarding.account.retry": "Reintentar",
+    "onboarding.account.signed_out": "Sin sesión",
+    "onboarding.account.authorizing": "Esperando autorización en el navegador…",
+    "onboarding.account.verifying": "Verificando cuenta…",
+    "onboarding.account.signed_in": "Sesión iniciada en TokenRhythm",
+    "onboarding.account.unverified": "No se puede verificar; nuevas llamadas pausadas",
+    "onboarding.account.reauth_required": "Sesión caducada. Inicia sesión otra vez.",
+    "onboarding.account.storage_unavailable": "Almacenamiento seguro del sistema no disponible",
     'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
     'onboarding.step2.tokenrhythmCta': 'Oferta limitada',
@@ -5162,6 +5321,9 @@ function trackDesktopReliabilityWindow(window: BrowserWindow): void {
   window.on('show', refreshDesktopReliabilityForegroundState)
   window.on('hide', refreshDesktopReliabilityForegroundState)
   window.on('focus', refreshDesktopReliabilityForegroundState)
+  window.on('focus', () => {
+    if (!updateApplying && !isQuitting) void desktopAccount().account.verify(true).catch(() => {})
+  })
   window.on('blur', refreshDesktopReliabilityForegroundState)
   window.on('minimize', refreshDesktopReliabilityForegroundState)
   window.on('restore', refreshDesktopReliabilityForegroundState)
@@ -6722,6 +6884,12 @@ function onboardingHtml(
             </div>
           </div>
         </div>
+        <div class="probe-row" id="accountOnboarding">
+          <button class="secondary" type="button" id="accountLogin" data-i18n="onboarding.account.login">${ot('onboarding.account.login')}</button>
+          <button class="secondary" type="button" id="accountCancel" hidden data-i18n="common.cancel">${ot('common.cancel')}</button>
+          <button class="primary" type="button" id="accountContinue" hidden data-i18n="onboarding.account.continueAccount">${ot('onboarding.account.continueAccount')}</button>
+          <span class="probe-status" id="accountStatus" role="status"></span>
+        </div>
         <div class="api-key-field">
           <div class="api-key-head">
             <label class="api-key-label" for="apiKey">
@@ -6827,6 +6995,32 @@ function onboardingHtml(
     const modelRoutingMode = document.getElementById('modelRoutingMode');
     const routerMode = document.getElementById('routerMode');
     const errorBox = document.getElementById('error');
+    let accountSnapshot = null;
+    const accountLogin = document.getElementById('accountLogin');
+    const accountCancel = document.getElementById('accountCancel');
+    const accountContinue = document.getElementById('accountContinue');
+    const accountStatus = document.getElementById('accountStatus');
+    const accountMessages = ${inlineScriptJson(Object.fromEntries(DESKTOP_LOCALES.map(locale => [locale, Object.fromEntries(['signed_out','authorizing','verifying','signed_in','unverified','reauth_required','storage_unavailable'].map(status => [status, DESKTOP_MESSAGES[locale]['onboarding.account.' + status]]))])))};
+    function renderAccount(state) {
+      accountSnapshot = state;
+      const waiting = state.status === 'authorizing' || state.status === 'verifying';
+      accountCancel.hidden = !waiting;
+      accountLogin.disabled = state.status === 'verifying';
+      accountContinue.hidden = state.status !== 'signed_in' || state.keyStatus !== 'ready';
+      accountStatus.textContent = (accountMessages[document.documentElement.lang] || accountMessages.en)[state.status] || '';
+      if (state.profile && state.profile.displayName) accountStatus.textContent += ' · ' + state.profile.displayName;
+    }
+    window.opensquillaDesktop.onAccountState(renderAccount);
+    window.opensquillaDesktop.getAccountState().then(renderAccount).catch(() => {});
+    accountLogin.addEventListener('click', async () => {
+      try { renderAccount(await window.opensquillaDesktop.accountAction(accountSnapshot && accountSnapshot.status === 'authorizing' ? 'reopen' : accountSnapshot && accountSnapshot.profile ? 'retry-key' : 'login')); }
+      catch { accountStatus.textContent = (accountMessages[document.documentElement.lang] || accountMessages.en).unverified; }
+    });
+    accountCancel.addEventListener('click', () => window.opensquillaDesktop.accountAction('cancel').then(renderAccount));
+    accountContinue.addEventListener('click', async () => {
+      accountContinue.disabled = true;
+      try { await window.opensquillaDesktop.completeAccountOnboarding(); } catch { accountContinue.disabled = false; }
+    });
     const apiKey = document.getElementById('apiKey');
     const apiKeyError = document.getElementById('apiKeyError');
     const apiKeyRequiredMarker = document.getElementById('apiKeyRequiredMarker');
@@ -7024,6 +7218,7 @@ function onboardingHtml(
       syncProviderDefaults(false);
       renderModelField();
       render();
+      if (accountSnapshot) renderAccount(accountSnapshot);
       invalidateProbe();
     }
     function currentSearchProvider() {
@@ -9651,6 +9846,9 @@ async function startGateway(): Promise<GatewayState> {
     // capability disabled instead of weakening the transport boundary.
     desktopLog('desktop_browser_transport_unavailable')
   }
+  // The private bridge supplies only process-local credentials to the owned
+  // Gateway; account tokens and shared model keys never enter child env.
+  const accountEnvironment = await desktopAccount().proxy.start()
   const controlUiBasePath = desktopControlUiBasePath(
     await readOptionalDesktopText(join(activeProfile.home, 'config.toml')),
     process.env,
@@ -9720,6 +9918,7 @@ async function startGateway(): Promise<GatewayState> {
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
     ...browserEnvironment,
+    ...accountEnvironment,
     OPENSQUILLA_CONTROL_UI_DIST: desktopRendererDistPath(),
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
@@ -12895,6 +13094,7 @@ async function applyWindowsInstaller(): Promise<void> {
   const candidate = desktopUpdateCandidate
   if (!candidate || desktopUpdateStatus !== 'downloaded' || !verifiedManualInstallerPath) return
   let writerAdmissionToken: symbol | null = null
+  let accountPause: AccountMaintenancePause | null = null
   let installerPath = ''
   const previouslyOwned = liveLifecycleOwnedGatewayProcesses().length > 0
   const profileKey = desktopProfileKey()
@@ -12945,8 +13145,11 @@ async function applyWindowsInstaller(): Promise<void> {
         throw new Error('Another desktop operation superseded the Windows update.')
       }
       writerAdmissionToken = desktopWriters.close('apply signed Windows installer')
+      accountPause = pauseAccountsForMaintenance([...desktopAccounts.values()].map(entry => entry.account))
     },
-    waitForWriters: async (signal) => desktopWriters.waitForAtMost(0, signal),
+    waitForWriters: async (signal) => {
+      await Promise.all([desktopWriters.waitForAtMost(0, signal), accountPause!.wait(signal)])
+    },
     stopGateways: async () => {
       isQuitting = true
       setAppExitPhase('draining', 'stopping Gateway for Windows installer')
@@ -12972,6 +13175,7 @@ async function applyWindowsInstaller(): Promise<void> {
       app.quit()
     },
     recover: async (error, gatewayStopStarted) => {
+      accountPause?.resume()
       const errorCode = error instanceof WindowsUpdatePreparationError
         ? 'install_failed'
         : error instanceof WindowsUpdateSecurityError || error instanceof UpdateChannelError
@@ -13095,11 +13299,29 @@ async function applyDownloadedUpdate(): Promise<void> {
   // been admitted. Close new writers and wait for existing operations to
   // finish naturally before the installer handoff.
   const updateWriterAdmission = desktopWriters.close('apply downloaded update')
+  const accountPause = pauseAccountsForMaintenance([...desktopAccounts.values()].map(entry => entry.account))
   desktopStartupLog('writers_admission_closed', {
     operation: 'auto-updater',
     operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
   })
-  await waitForDesktopWriterOperations()
+  try {
+    await Promise.all([
+      waitForDesktopWriterOperations(),
+      accountPause.wait(AbortSignal.timeout(30_000)),
+    ])
+  } catch (error) {
+    accountPause.resume()
+    const quitResumed = restoreDownloadedUpdateRetryState(pendingVersion, updateWriterAdmission)
+    setDesktopUpdateState({ errorCode: 'install_failed', error: desktopT('update.accountSaveFailed') })
+    if (!quitResumed) {
+      void showUpdateDialog({
+        type: 'error', buttons: ['OK'], title: desktopT('update.errorTitle'),
+        message: desktopT('update.accountSaveFailed'),
+      })
+    }
+    desktopLog('update_account_drain_failed', { error: error instanceof AccountError ? error.code : 'ACCOUNT_STORAGE_UNAVAILABLE' })
+    return
+  }
   desktopStartupLog('writers_drained', {
     operation: 'auto-updater',
     operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
@@ -13114,11 +13336,12 @@ async function applyDownloadedUpdate(): Promise<void> {
   })
   isQuitting = true
   setAppExitPhase('draining', 'stopping Gateway for downloaded update')
-  const exited = await stopOwnedGatewaysForUpdate()
+  const exited = await stopOwnedGatewaysForUpdate().catch(() => false)
   // Re-read the shared ownership set immediately before handoff. There is no
   // await between this check and quitAndInstall, so a child already stopping
   // for Retry/recovery cannot be skipped by the installer lifecycle.
   if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0) {
+    accountPause.resume()
     desktopReliabilityTelemetry.recordUpdateResult({
       outcome: 'timeout',
       durationMs: Math.max(0, Date.now() - telemetryStartedAt),
@@ -13156,6 +13379,7 @@ async function applyDownloadedUpdate(): Promise<void> {
       operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
     })
   } catch (err) {
+    accountPause.resume()
     desktopReliabilityTelemetry.clearUpdateHandoff()
     desktopReliabilityTelemetry.recordUpdateResult({
       outcome: 'fail',
@@ -13905,8 +14129,13 @@ async function applyApprovedDesktopCleanup(
   desktopCleanupBusy = true
   if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   let shouldQuit = false
+  let accountPause: AccountMaintenancePause | null = null
   try {
-    await waitForDesktopWriterOperations(1)
+    accountPause = pauseAccountsForMaintenance([...desktopAccounts.values()].map(entry => entry.account))
+    await Promise.all([
+      waitForDesktopWriterOperations(1),
+      accountPause.wait(AbortSignal.timeout(30_000)),
+    ])
     if (desktopProfileKey(active) !== desktopProfileKey()) {
       return { ok: false, detail: 'The active profile changed. Review the cleanup inventory again.' }
     }
@@ -13946,6 +14175,14 @@ async function applyApprovedDesktopCleanup(
         profile: { kind: 'primary', recoveryId: null },
         detail: 'The cleanup locations changed while the local runtime stopped. Review them again.',
       }
+    }
+
+    if (report.mode !== 'reset-current-settings') {
+      // A failed/partial deletion must not resume an in-memory account whose
+      // credential file may already be gone. Recovery reloads the disk state.
+      const entries = [...desktopAccounts.values()]
+      desktopAccounts.clear()
+      await Promise.all(entries.flatMap(entry => [entry.account.close(), entry.proxy.close()]))
     }
 
     if (report.mode === 'delete-all-user-data') {
@@ -14009,6 +14246,7 @@ async function applyApprovedDesktopCleanup(
     } else {
       desktopWriters.reopen(exclusive.admissionToken)
       desktopCleanupBusy = false
+      accountPause?.resume()
     }
   }
 }
@@ -15112,6 +15350,7 @@ ipcMain.handle('desktop:migration:run', async (
   }
   // A non-modal invitation may still contain a draft for the old profile.
   // Once import owns admission, discard that UI before adopting new credentials.
+  desktopMigrationBusy = true
   if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   let report: Record<string, unknown> | null = null
   let migrationVerified = false
@@ -15125,8 +15364,13 @@ ipcMain.handle('desktop:migration:run', async (
   let restartAllowed = true
   let shouldRestart = true
   let lifecycleOwnsAdmission = false
+  let accountPause: AccountMaintenancePause | null = null
   try {
-    await waitForDesktopWriterOperations(1)
+    accountPause = pauseAccountsForMaintenance([...desktopAccounts.values()].map(entry => entry.account))
+    await Promise.all([
+      waitForDesktopWriterOperations(1),
+      accountPause.wait(AbortSignal.timeout(30_000)),
+    ])
   trustedDesktopMigrationPreview = null
 
   // A live gateway not owned by this process must remain attached and untouched.
@@ -15208,6 +15452,11 @@ ipcMain.handle('desktop:migration:run', async (
     // adoption even if Electron dies after the Python commit but before this IPC
     // handler receives stdout.
     intent = await beginMigrationReconciliationIntent(candidate)
+    // The CLI can replace the target even if its result is lost. Retire every
+    // cached account before publication; success and recovery both reload disk.
+    const accounts = [...desktopAccounts.values()]
+    await Promise.all(accounts.flatMap(entry => [entry.account.close(), entry.proxy.close()]))
+    desktopAccounts.clear()
     const result = await runMigrateCli([
       '--source', candidate.path, '--kind', candidate.kind, '--apply',
       ...(overwrite ? [
@@ -15285,6 +15534,13 @@ ipcMain.handle('desktop:migration:run', async (
     publishDesktopMigrationProgress(migrationVerified ? 'done' : 'error', detail || undefined)
     isQuitting = false
   }
+  } catch (error) {
+    // No gateway has been stopped when the account/writer drain fails.
+    shouldRestart = false
+    failureCode = 'migration_apply_failed'
+    failureStage = 'preflight'
+    detail = error instanceof Error ? error.message : String(error)
+    publishDesktopMigrationProgress('error', detail)
   } finally {
     // Receipt verification, credential adoption (or a durable needs-setup
     // marker), and reconciliation are complete. Reopen writer admission before
@@ -15294,6 +15550,8 @@ ipcMain.handle('desktop:migration:run', async (
     exclusive.finish()
     lifecycleOwnsAdmission = desktopWriters.hasOtherOwner(exclusive.admissionToken)
     desktopWriters.reopen(exclusive.admissionToken)
+    desktopMigrationBusy = false
+    accountPause?.resume()
   }
 
   // Restart via the boot splash on every path unless update/quit closed writer
@@ -16043,6 +16301,13 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
   }
   return await request.promise
 })
+ipcMain.handle('desktop:onboarding:account', async (event) => {
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) throw new AccountError('ACCOUNT_IPC_FORBIDDEN')
+  await desktopAccount().account.selectSource('account')
+  dismissOnboardingFlow(flow)
+  return { ok: true }
+})
 ipcMain.handle('desktop:onboarding:skip', (event) => {
   const flow = onboardingFlows.active
   if (!flow || !trustedOnboardingIpc(event, flow)) {
@@ -16572,27 +16837,27 @@ async function drainOwnedGatewayForLegacyQuit(
   return exited || hasGatewayProcessExited(child)
 }
 
-function showDesktopQuitFailure(): void {
+function showDesktopQuitFailure(accountShutdownFailed = false): void {
   // A retained launch scope is retryable after root exit. Without that scope,
   // a dead root PID cannot safely identify descendants for another tree kill.
   const needsManualRecovery = [...quitUnconfirmedProcessTrees].some(child =>
     hasGatewayProcessExited(child) && !gatewayProcessCleanupContexts.has(child))
-  const titleKey = needsManualRecovery ? 'quit.manualRecovery' : 'quit.failed'
+  const titleKey = needsManualRecovery ? 'quit.manualRecovery' : accountShutdownFailed ? 'quit.accountFailed' : 'quit.failed'
   isQuitting = true
   setAppExitPhase('failed', needsManualRecovery
     ? 'Gateway exited without confirmed process-tree cleanup'
-    : 'Gateway quit did not complete safely')
-  if (needsManualRecovery) setQuitStatus(titleKey)
+    : accountShutdownFailed ? 'account shutdown has not settled' : 'Gateway quit did not complete safely')
+  if (needsManualRecovery || accountShutdownFailed) setQuitStatus(titleKey)
   gatewayState.status = 'error'
   gatewayState.error = desktopT(titleKey)
   publishGatewayConnection()
-  desktopLog('quit_gateway_still_running', {
+  desktopLog(accountShutdownFailed ? 'quit_account_shutdown_pending' : 'quit_gateway_still_running', {
     pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
     needsManualRecovery,
   })
   dialog.showErrorBox(
     desktopT(titleKey),
-    desktopT(needsManualRecovery ? 'quit.manualRecoveryDetail' : 'quit.failedDetail'),
+    desktopT(needsManualRecovery ? 'quit.manualRecoveryDetail' : accountShutdownFailed ? 'quit.accountFailedDetail' : 'quit.failedDetail'),
   )
 }
 
@@ -16674,7 +16939,7 @@ app.on('before-quit', (event) => {
     ...liveLifecycleOwnedGatewayProcesses(),
     ...(!quitFromSignal ? gatewayProcessCleanupContexts.keys() : []),
   ])]
-  if (children.length > 0 || !quitFromSignal || quitUnconfirmedProcessTrees.size > 0) {
+  if (children.length > 0 || !quitFromSignal || quitUnconfirmedProcessTrees.size > 0 || desktopAccounts.size > 0) {
     event.preventDefault()
     setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
     const budget = new DesktopQuitBudget()
@@ -16689,11 +16954,24 @@ app.on('before-quit', (event) => {
         currentChild === child,
       )
       : quitOwnedGateway(child, budget)))
+    // Account tokens rotate on the server before their encrypted record is
+    // replaced. Keep the process alive until those operations and writes have
+    // settled, using the same total deadline as Gateway shutdown. A timeout
+    // remains retryable instead of exiting with a stale refresh token.
+    let accountShutdownFailed = false
+    const accountCleanup = budget.termination(Promise.allSettled(
+      [...desktopAccounts.values()].flatMap(entry => [entry.account.close(), entry.proxy.close()]),
+    )).then(result => {
+      const accountsStopped = result.completed && result.value.every(item => item.status === 'fulfilled')
+      accountShutdownFailed = !accountsStopped
+      return accountsStopped
+    })
     const drain = Promise.all([
       childCleanup,
       budget.cleanup(Promise.allSettled([previewCleanup, surfaceCleanup])),
+      accountCleanup,
     ])
-      .then(([results]) => results.every(Boolean)
+      .then(([results, , accountsClosed]) => accountsClosed && results.every(Boolean)
         && liveLifecycleOwnedGatewayProcesses().length === 0
         && (quitFromSignal || gatewayProcessCleanupContexts.size === 0)
         && quitUnconfirmedProcessTrees.size === 0)
@@ -16717,7 +16995,7 @@ app.on('before-quit', (event) => {
       // Fail closed while owned processes remain live or their tree cleanup
       // cannot be confirmed. Never guess ownership from a PID, port, or health.
       quitGatewayDrainPromise = null
-      showDesktopQuitFailure()
+      showDesktopQuitFailure(accountShutdownFailed)
     })
     return
   }
